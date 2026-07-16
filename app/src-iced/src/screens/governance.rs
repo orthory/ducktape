@@ -4,13 +4,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, row, scrollable, text, text_editor, text_input,
+    Space, button, column, container, row, scrollable, text, text_editor, text_input, tooltip,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_SM, SANS};
+use crate::theme::{
+    self, BODY, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_SM, SANS, SANS_SEMIBOLD,
+    TITLE,
+};
 use crate::view_api::SubmitReceipt;
 
 const MAX_SHARE_ACCOUNTS: usize = 256;
@@ -249,8 +253,20 @@ pub struct State {
     pub loading: bool,
     pub reload_pending: bool,
     pub error: Option<String>,
+    /// A validation error owned by a specific form, rendered inline beneath that
+    /// form's controls instead of the off-screen bottom banner (B2).
+    pub form_error: Option<(FormSlot, String)>,
     pub reload_error: Option<String>,
     pub operations: BTreeMap<String, OperationPhase>,
+}
+
+/// Which form a [`State::form_error`] belongs under, so the reason lands where
+/// the user is looking rather than at the bottom of the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormSlot {
+    ShareSetup,
+    ShareChange,
+    Schedule,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +299,7 @@ impl Default for State {
             loading: false,
             reload_pending: false,
             error: None,
+            form_error: None,
             reload_error: None,
             operations: BTreeMap::new(),
         }
@@ -372,7 +389,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             let allocations = match parse_share_allocations(&state.allocation_text.text()) {
                 Ok(rows) => rows,
                 Err(error) => {
-                    state.error = Some(error);
+                    state.form_error = Some((FormSlot::ShareSetup, error));
                     return None;
                 }
             };
@@ -393,19 +410,25 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             let account_id = match valid_hex(&state.share_account) {
                 Some(value) => value,
                 None => {
-                    state.error = Some(
+                    state.form_error = Some((
+                        FormSlot::ShareChange,
                         "Enter an account hex id and a non-negative integer share value.".into(),
-                    );
+                    ));
                     return None;
                 }
             };
             let Ok(shares) = state.share_value.trim().parse::<u64>() else {
-                state.error =
-                    Some("Enter an account hex id and a non-negative integer share value.".into());
+                state.form_error = Some((
+                    FormSlot::ShareChange,
+                    "Enter an account hex id and a non-negative integer share value.".into(),
+                ));
                 return None;
             };
             if shares > MAX_SAFE_SHARES {
-                state.error = Some(format!("Shares must be at most {MAX_SAFE_SHARES}."));
+                state.form_error = Some((
+                    FormSlot::ShareChange,
+                    format!("Shares must be at most {MAX_SAFE_SHARES}."),
+                ));
                 return None;
             }
             start_proposal(state, Action::SetShares { account_id, shares })
@@ -447,7 +470,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             if let Err(error) =
                 validate_schedule(&draft, upgrade.current_version, data.current_height)
             {
-                state.error = Some(error);
+                state.form_error = Some((FormSlot::Schedule, error));
                 return None;
             }
             let command = start_proposal(
@@ -481,7 +504,10 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
                     && proposal_eligible(state, proposal)
                     && local_vote(state, proposal) != Some(approve)
             });
-            if !eligible || state.busy || operation_in_flight(state, &proposal_id) {
+            // Gate on THIS proposal's own in-flight op, not the global `busy`
+            // flag — an unrelated write must not disable it (M1). Matches the
+            // view enablement at `proposal_card`.
+            if !eligible || operation_in_flight(state, &proposal_id) {
                 return None;
             }
             start(
@@ -495,7 +521,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         Message::Execute(proposal_id) => {
             let open = proposal_by_id(state, &proposal_id)
                 .is_some_and(|proposal| proposal.status == ProposalStatus::Open);
-            if !open || state.busy || operation_in_flight(state, &proposal_id) {
+            if !open || operation_in_flight(state, &proposal_id) {
                 None
             } else {
                 start(state, Command::Execute(proposal_id))
@@ -569,6 +595,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
 fn start(state: &mut State, command: Command) -> Option<Command> {
     state.busy = true;
     state.error = None;
+    state.form_error = None;
     if let Some(proposal_id) = command.proposal_id() {
         state
             .operations
@@ -849,7 +876,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     .height(Length::Fill);
     if let Some(error) = &state.error {
         content = content.push(
-            container(text(error).font(SANS).size(10.5).color(p.danger))
+            container(selectable_error(error, p))
                 .padding([8, 22])
                 .width(Length::Fill),
         );
@@ -859,7 +886,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
             container(
                 text(format!("Live refresh unavailable: {error}"))
                     .font(SANS)
-                    .size(10.5)
+                    .size(LABEL)
                     .color(p.amber),
             )
             .padding([8, 22])
@@ -891,8 +918,8 @@ fn resource_view(resource: &Resource<GovernanceData>, p: Palette) -> Element<'_,
     };
     let mut body = column![
         icons::view(Icon::Governance, 26.0, p.icon_idle),
-        text(title).font(SANS).size(13).color(p.ink),
-        text(detail).font(SANS).size(11.5).color(p.muted_2),
+        text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink),
+        text(detail).font(SANS).size(BODY).color(p.muted_2),
     ]
     .spacing(7)
     .align_x(Alignment::Center);
@@ -938,14 +965,17 @@ fn header(state: &State, data: &GovernanceData, p: Palette) -> Element<'static, 
     };
     container(
         row![
-            text("Governance").font(SANS).size(16).color(p.ink),
+            text("Governance")
+                .font(SANS_SEMIBOLD)
+                .size(HEADING)
+                .color(p.ink),
             text(format!("{open} open · {}", data.proposals.len()))
                 .font(MONO)
-                .size(13)
+                .size(LABEL)
                 .color(p.muted_2),
-            text(format!("height #{}", data.current_height))
+            text(format!("height #{}", group_digits(data.current_height)))
                 .font(MONO)
-                .size(10.5)
+                .size(CAPTION)
                 .color(p.muted_2),
             Space::new().width(Length::Fill),
             if state.loading {
@@ -1016,7 +1046,7 @@ fn shares_panel<'a>(
             .push(
                 text(format!("Validator ballots are the default. Initial share setup also enables share mode. Existing Identity accounts: {accounts}."))
                     .font(SANS)
-                    .size(10.5)
+                    .size(LABEL)
                     .color(p.muted_2),
             )
             .push(
@@ -1025,7 +1055,7 @@ fn shares_panel<'a>(
                         .placeholder("account-hex 100\none-account-per-line 40")
                         .on_action(Message::AllocationEdited)
                         .font(MONO)
-                        .size(10.5)
+                        .size(LABEL)
                         .padding([7, 8])
                         .min_height(58)
                         .max_height(92),
@@ -1033,21 +1063,8 @@ fn shares_panel<'a>(
                 ]
                 .spacing(8),
             );
+        body = push_form_error(body, state, FormSlot::ShareSetup, p);
     } else {
-        let allocations = data
-            .shares
-            .allocations
-            .iter()
-            .map(|allocation| {
-                format!(
-                    "{} · {} · {}",
-                    short_key(&allocation.account_id),
-                    allocation.shares,
-                    format_share_percent(allocation.shares, data.shares.total)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("    ");
         body = body
             .push(
                 row![
@@ -1057,7 +1074,7 @@ fn shares_panel<'a>(
                         "New proposals use one ballot per validator; configured shares are retained."
                     })
                     .font(SANS)
-                    .size(10.5)
+                    .size(LABEL)
                     .color(p.muted_2),
                     Space::new().width(Length::Fill),
                     filled_button(
@@ -1069,7 +1086,7 @@ fn shares_panel<'a>(
                 ]
                 .align_y(Alignment::Center),
             )
-            .push(text(allocations).font(MONO).size(10.5).color(p.ink_soft))
+            .push(allocation_chips(&data.shares, p))
             .push(
                 row![
                     sem_input(
@@ -1078,7 +1095,7 @@ fn shares_panel<'a>(
                         text_input("Account hex", &state.share_account)
                             .on_input(Message::ShareAccountChanged)
                             .font(MONO)
-                            .size(10.5)
+                            .size(LABEL)
                             .padding([7, 8])
                             .width(Length::Fill),
                     ),
@@ -1088,7 +1105,7 @@ fn shares_panel<'a>(
                         text_input("Shares (0 removes)", &state.share_value)
                             .on_input(Message::ShareValueChanged)
                             .font(MONO)
-                            .size(10.5)
+                            .size(LABEL)
                             .padding([7, 8])
                             .width(145),
                     ),
@@ -1096,8 +1113,42 @@ fn shares_panel<'a>(
                 ]
                 .spacing(8),
             );
+        body = push_form_error(body, state, FormSlot::ShareChange, p);
     }
     section(body, p)
+}
+
+/// Configured allocations as a wrapping set of per-item chips, each carrying its
+/// full account hex on hover (M2) — never a run-on mono blob.
+fn allocation_chips(shares: &Shares, p: Palette) -> Element<'static, Message> {
+    let mut chips = row![].spacing(6).align_y(Alignment::Center);
+    for allocation in &shares.allocations {
+        let chip = pill(
+            format!(
+                "{} · {} · {}",
+                short_key(&allocation.account_id),
+                allocation.shares,
+                format_share_percent(allocation.shares, shares.total)
+            ),
+            p.ink_soft,
+            p,
+        );
+        chips = chips.push(tip(chip, allocation.account_id.clone(), p));
+    }
+    chips.wrap().into()
+}
+
+/// Renders a form's own validation error inline beneath its controls (B2).
+fn push_form_error<'a>(
+    body: iced::widget::Column<'a, Message>,
+    state: &State,
+    slot: FormSlot,
+    p: Palette,
+) -> iced::widget::Column<'a, Message> {
+    match &state.form_error {
+        Some((owner, message)) if *owner == slot => body.push(selectable_error(message, p)),
+        _ => body,
+    }
 }
 
 fn proposal_form<'a>(
@@ -1110,15 +1161,15 @@ fn proposal_form<'a>(
         card(
             column![
                 text("Signal proposal")
-                    .font(SANS)
-                    .size(12.5)
+                    .font(SANS_SEMIBOLD)
+                    .size(TITLE)
                     .color(p.ink_soft),
                 text(format!(
                     "Put a question to the {}. Passing binds the signal; it has no on-chain effect of its own.",
                     if data.shares.active { "shareholders" } else { "validator set" }
                 ))
                 .font(SANS)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.muted_2),
                 row![
                     sem_input(
@@ -1128,7 +1179,7 @@ fn proposal_form<'a>(
                             .on_input(Message::SignalChanged)
                             .on_submit(Message::ProposeSignal)
                             .font(SANS)
-                            .size(11.5)
+                            .size(BODY)
                             .padding([8, 9])
                             .width(Length::Fill),
                     ),
@@ -1194,8 +1245,8 @@ fn upgrade_panel<'a>(
                 let mut card_body = column![
                     row![
                         text(pending.name.clone())
-                            .font(SANS)
-                            .size(12.5)
+                            .font(SANS_SEMIBOLD)
+                            .size(TITLE)
                             .color(p.ink),
                         pill(
                             if upgrade.armed {
@@ -1212,12 +1263,12 @@ fn upgrade_panel<'a>(
                         "v{} → v{}    activates at #{}    ready {}/{}",
                         upgrade.current_version,
                         pending.to_version,
-                        pending.activation_height,
+                        group_digits(pending.activation_height),
                         ready,
                         upgrade.members.len()
                     ))
                     .font(MONO)
-                    .size(11)
+                    .size(LABEL)
                     .color(p.ink_soft),
                 ]
                 .spacing(8);
@@ -1226,16 +1277,16 @@ fn upgrade_panel<'a>(
                         row![
                             text(if member.ready { "✓" } else { "○" })
                                 .font(SANS)
-                                .size(12)
+                                .size(BODY)
                                 .color(if member.ready { p.green } else { p.muted_2 }),
                             text(member.display_name.clone())
                                 .font(SANS)
-                                .size(11)
+                                .size(LABEL)
                                 .color(p.ink_soft),
                             Space::new().width(Length::Fill),
                             text(if member.ready { "ready" } else { "arming" })
                                 .font(MONO)
-                                .size(10)
+                                .size(CAPTION)
                                 .color(p.muted_2),
                         ]
                         .spacing(8),
@@ -1252,68 +1303,67 @@ fn upgrade_panel<'a>(
                 ]);
                 body = body.push(card(card_body, p));
             } else if can_propose(state) {
-                body = body.push(card(
-                    column![
-                        text("Schedule upgrade")
-                            .font(SANS)
-                            .size(12.5)
-                            .color(p.ink_soft),
-                        text(format!(
-                            "On v{}, current height #{}. Governance authorizes; the upgrade arms once every validator signals ready.",
-                            upgrade.current_version, data.current_height
-                        ))
-                        .font(SANS)
-                        .size(10.5)
-                        .color(p.muted_2),
-                        row![
-                            sem_input(
-                                "Upgrade name",
-                                &state.upgrade_name,
-                                text_input("Upgrade name", &state.upgrade_name)
-                                    .on_input(Message::UpgradeNameChanged)
-                                    .font(SANS)
-                                    .size(11.5)
-                                    .padding([8, 9])
-                                    .width(Length::Fill),
-                            ),
-                            sem_input(
-                                "Target version",
+                let mut form = column![
+                    text("Schedule upgrade")
+                        .font(SANS_SEMIBOLD)
+                        .size(TITLE)
+                        .color(p.ink_soft),
+                    text(format!(
+                        "On v{}, current height #{}. Governance authorizes; the upgrade arms once every validator signals ready.",
+                        upgrade.current_version, group_digits(data.current_height)
+                    ))
+                    .font(SANS)
+                    .size(LABEL)
+                    .color(p.muted_2),
+                    row![
+                        sem_input(
+                            "Upgrade name",
+                            &state.upgrade_name,
+                            text_input("Upgrade name", &state.upgrade_name)
+                                .on_input(Message::UpgradeNameChanged)
+                                .font(SANS)
+                                .size(BODY)
+                                .padding([8, 9])
+                                .width(Length::Fill),
+                        ),
+                        sem_input(
+                            "Target version",
+                            &state.upgrade_version,
+                            text_input(
+                                &format!("Target version (> {})", upgrade.current_version),
                                 &state.upgrade_version,
-                                text_input(
-                                    &format!("Target version (> {})", upgrade.current_version),
-                                    &state.upgrade_version,
-                                )
-                                .on_input(Message::UpgradeVersionChanged)
-                                .font(MONO)
-                                .size(11)
-                                .padding([8, 9])
-                                .width(165),
-                            ),
-                            sem_input(
-                                "Activation height",
+                            )
+                            .on_input(Message::UpgradeVersionChanged)
+                            .font(MONO)
+                            .size(LABEL)
+                            .padding([8, 9])
+                            .width(165),
+                        ),
+                        sem_input(
+                            "Activation height",
+                            &state.upgrade_height,
+                            text_input(
+                                &format!("Activation height (> {})", group_digits(data.current_height)),
                                 &state.upgrade_height,
-                                text_input(
-                                    &format!("Activation height (> {})", data.current_height),
-                                    &state.upgrade_height,
-                                )
-                                .on_input(Message::UpgradeHeightChanged)
-                                .font(MONO)
-                                .size(11)
-                                .padding([8, 9])
-                                .width(185),
-                            ),
-                            filled_button(
-                                "Propose",
-                                Message::ProposeScheduleUpgrade,
-                                !state.busy,
-                                p,
-                            ),
-                        ]
-                        .spacing(8),
+                            )
+                            .on_input(Message::UpgradeHeightChanged)
+                            .font(MONO)
+                            .size(LABEL)
+                            .padding([8, 9])
+                            .width(185),
+                        ),
+                        filled_button(
+                            "Propose",
+                            Message::ProposeScheduleUpgrade,
+                            !state.busy,
+                            p,
+                        ),
                     ]
                     .spacing(8),
-                    p,
-                ));
+                ]
+                .spacing(8);
+                form = push_form_error(form, state, FormSlot::Schedule, p);
+                body = body.push(card(form, p));
             } else {
                 body = body.push(muted(
                     "No upgrade scheduled. Only an eligible validator can propose one.",
@@ -1356,11 +1406,11 @@ fn proposal_list<'a>(
                     Filter::Settled => "No settled proposals to show.",
                 })
                 .font(SANS)
-                .size(12.5)
+                .size(TITLE)
                 .color(p.muted_2),
                 text("Proposals appear here once an eligible voter opens one.")
                     .font(SANS)
-                    .size(11)
+                    .size(LABEL)
                     .color(p.muted_2),
             ]
             .spacing(6)
@@ -1433,11 +1483,42 @@ fn proposal_card<'a>(
         };
         (Some(copy), tone)
     });
+    // Meta line: proposer (+ full hex tooltip), "this node" when local, and the
+    // proposal id (+ full id tooltip) — the row truncates each, so hover reveals
+    // the copy-worthy full value (P1).
+    let mut meta = row![
+        tip(
+            text(format!("by {}", short_key(&proposal.proposer)))
+                .font(MONO)
+                .size(LABEL)
+                .color(p.muted_2),
+            proposal.proposer.clone(),
+            p,
+        ),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    if proposer_local {
+        meta = meta.push(
+            text("· this node")
+                .font(MONO)
+                .size(LABEL)
+                .color(p.muted_2),
+        );
+    }
+    meta = meta.push(tip(
+        text(format!("· {}", short_key(&proposal.id)))
+            .font(MONO)
+            .size(LABEL)
+            .color(p.muted_2),
+        proposal.id.clone(),
+        p,
+    ));
     let mut body = column![
         row![
             text(proposal.action.label())
-                .font(SANS)
-                .size(13.5)
+                .font(SANS_SEMIBOLD)
+                .size(TITLE)
                 .color(p.ink),
             Space::new().width(Length::Fill),
             pill(proposal.status.label(), tone, p),
@@ -1445,32 +1526,26 @@ fn proposal_card<'a>(
         .align_y(Alignment::Center),
         text(proposal.action.detail())
             .font(SANS)
-            .size(12)
-            .color(p.ink_soft),
-        text(format!(
-            "by {}{} · {}",
-            short_key(&proposal.proposer),
-            if proposer_local { " · this node" } else { "" },
-            short_key(&proposal.id)
-        ))
-        .font(MONO)
-        .size(10.5)
-        .color(p.muted_2),
+            .size(BODY)
+            .color(p.ink_soft)
+            .wrapping(Wrapping::WordOrGlyph)
+            .width(Length::Fill),
+        meta.wrap(),
         row![
             text(format!(
                 "consensus {} → deadline {}",
                 proposal.created_at, proposal.deadline
             ))
             .font(MONO)
-            .size(10)
+            .size(CAPTION)
             .color(p.muted_2),
             if let Some(copy) = operation_copy {
                 text(format!("· {copy}"))
                     .font(MONO)
-                    .size(10)
+                    .size(CAPTION)
                     .color(operation_tone)
             } else {
-                text("").font(MONO).size(10).color(p.muted_2)
+                text("").font(MONO).size(CAPTION).color(p.muted_2)
             },
         ]
         .spacing(8),
@@ -1478,15 +1553,15 @@ fn proposal_card<'a>(
         row![
             text(format!("approve {yes}"))
                 .font(MONO)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.green),
             text(format!("reject {no}"))
                 .font(MONO)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.danger),
             text(format!("· {total} cast"))
                 .font(MONO)
-                .size(10.5)
+                .size(LABEL)
                 .color(p.muted_3),
             Space::new().width(Length::Fill),
             text(match proposal.voting_rule {
@@ -1496,7 +1571,7 @@ fn proposal_card<'a>(
                 _ => format!("needs {threshold} approve"),
             })
             .font(MONO)
-            .size(10.5)
+            .size(LABEL)
             .color(p.muted_3),
         ]
         .spacing(12)
@@ -1504,8 +1579,11 @@ fn proposal_card<'a>(
     ]
     .spacing(8);
     if proposal.status == ProposalStatus::Open {
+        // Scope disability to THIS proposal's in-flight op — an unrelated write
+        // no longer greys every card, and Settle stays live on open proposals
+        // that have no op of their own (M1).
         let operation_in_flight = operation_in_flight(state, &proposal.id);
-        let eligible = proposal_eligible(state, proposal) && !state.busy && !operation_in_flight;
+        let eligible = proposal_eligible(state, proposal) && !operation_in_flight;
         body = body.push(
             row![
                 vote_button(
@@ -1538,7 +1616,7 @@ fn proposal_card<'a>(
                         "Settle"
                     },
                     Message::Execute(proposal.id.clone()),
-                    !state.busy && !operation_in_flight,
+                    !operation_in_flight,
                     p,
                 ),
             ]
@@ -1598,14 +1676,58 @@ fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Me
         .into()
 }
 
+/// Native hover tooltip carrying a full value the row truncates (P1/M2).
+fn tip<'a>(
+    control: impl Into<Element<'a, Message>>,
+    label: impl ToString,
+    p: Palette,
+) -> Element<'a, Message> {
+    tooltip(
+        control,
+        container(
+            text(label.to_string())
+                .font(MONO)
+                .size(CAPTION)
+                .color(p.ink),
+        )
+        .padding([4, 8])
+        .style(move |_| rounded_surface(p.paper, p.border, 6.0)),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
+/// A read-only `text_input` — focusable and selectable so a voter can copy the
+/// reason, but never editable. Mirrors the `workspace.rs` `selectable_error`.
+fn selectable_error(message: &str, p: Palette) -> Element<'static, Message> {
+    text_input("", message)
+        .font(SANS)
+        .size(LABEL)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.danger,
+            placeholder: p.danger,
+            value: p.danger,
+            selection: theme::ACCENTS[0],
+        })
+        .into()
+}
+
 fn section_label(label: &'static str, p: Palette) -> Element<'static, Message> {
-    text(label).font(MONO).size(9.5).color(p.muted_2).into()
+    text(label)
+        .font(SANS_SEMIBOLD)
+        .size(CAPTION)
+        .color(p.muted_2)
+        .into()
 }
 
 fn muted(copy: &str, p: Palette) -> Element<'static, Message> {
     text(copy.to_string())
         .font(SANS)
-        .size(11)
+        .size(LABEL)
         .color(p.muted_2)
         .into()
 }
@@ -1614,7 +1736,7 @@ fn notice(copy: &'static str, p: Palette) -> Element<'static, Message> {
     container(
         row![
             icons::view(Icon::Node, 15.0, p.amber),
-            text(copy).font(SANS).size(12).color(p.amber),
+            text(copy).font(SANS).size(BODY).color(p.amber),
         ]
         .spacing(9)
         .align_y(Alignment::Center),
@@ -1626,7 +1748,7 @@ fn notice(copy: &'static str, p: Palette) -> Element<'static, Message> {
 }
 
 fn pill(label: impl ToString, tone: Color, p: Palette) -> Element<'static, Message> {
-    container(text(label.to_string()).font(SANS).size(10.5).color(tone))
+    container(text(label.to_string()).font(SANS).size(CAPTION).color(tone))
         .padding([3, 8])
         .style(move |_| rounded_surface(p.paper, tone, RADIUS_SM))
         .into()
@@ -1659,7 +1781,7 @@ fn segment_button<'a>(
     message: Message,
     p: Palette,
 ) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(11.5))
+    let btn = button(text(label).font(SANS).size(LABEL))
         .padding([5, 11])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.chip } else { p.paper })),
@@ -1683,7 +1805,7 @@ fn outline_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(11.5))
+    let control = button(text(label).font(SANS).size(BODY))
         .padding([7, 12])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -1695,7 +1817,7 @@ fn outline_button<'a>(
             )),
             text_color: if enabled { p.ink_soft } else { p.muted_2 },
             border: Border {
-                color: p.border_strong,
+                color: if enabled { p.border_strong } else { p.border_soft },
                 width: 1.0,
                 radius: RADIUS_SM.into(),
             },
@@ -1720,7 +1842,7 @@ fn filled_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(11.5))
+    let control = button(text(label).font(SANS).size(BODY))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if enabled { p.filled } else { p.sunken })),
@@ -1753,7 +1875,7 @@ fn vote_button<'a>(
     tone: Color,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(11.5))
+    let control = button(text(label).font(SANS).size(BODY))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.sunken } else { p.paper })),
@@ -1792,6 +1914,20 @@ fn valid_hex(value: &str) -> Option<String> {
 
 fn same_key(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+/// Groups a block height into thousands (`1234567` → `1,234,567`) so long
+/// activation heights stay legible (P7).
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn short_key(value: &str) -> String {
