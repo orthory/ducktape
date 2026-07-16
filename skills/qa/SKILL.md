@@ -71,6 +71,16 @@ Per-instance isolation: the endpoint lives under `XDG_RUNTIME_DIR`, so parallel
 apps isolate by giving each instance its own runtime dir and exporting it
 before calling the CLI.
 
+## Screen unit tests — the test.tsx layer
+
+`app/src-iced/src/test/<surface>.rs` (short names, one file per surface —
+the iced twin of `app/src/test/sim/<surface>.test.tsx`). Render a screen's
+`view(&state)` in `iced_test::simulator`, address widgets with `by::role`,
+assert the `Message` values interactions emit (Elm's callback assert — no
+mocks), and drive screen-local `update` transitions. Runs in the standing
+`cargo test -p ducktape-iced` gate. Harness: `src/test/harness.rs`
+(`sim`/`emitted`/`has`). Below this layer sit the recipes:
+
 ## Recipe QA — two lanes, one recipe
 
 `qa/recipes/*.json` are declarative scenarios that run in BOTH QA lanes

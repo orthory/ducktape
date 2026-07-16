@@ -26,6 +26,8 @@ mod screens;
 mod search;
 mod shell;
 mod terminal_contract;
+#[cfg(test)]
+mod test;
 mod terminal_service;
 mod theme;
 mod transport;
