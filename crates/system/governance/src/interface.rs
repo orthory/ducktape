@@ -149,12 +149,16 @@ pub enum GovMsg {
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        /// the ONE key the token admits — the handler rejects `joiner != target`
-        /// so a blob holder cannot redeem under a key the invite was not minted
-        /// for. raw bytes, mirroring the lobby announce.
+        /// the ONE key the token admits, or EMPTY bytes for a BEARER token.
+        /// targeted: the handler rejects `joiner != target` so a blob holder
+        /// cannot redeem under a key the invite was not minted for. bearer:
+        /// no lock — first valid proof wins the nonce, and bearer is
+        /// Client-role-only (a bearer Resident redeem is rejected). raw
+        /// bytes, mirroring the lobby announce.
         target: Vec<u8>,
-        /// the invite role byte (`Resident = 0`, `Client = 1`); a `Client` token
-        /// is rejected at redeem until the thin-client plane lands.
+        /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
+        /// redeem grants valset resident standing; a `Client` redeem grants
+        /// submit-only client standing in the `clients` module.
         role: u8,
         /// the token's unix-seconds expiry — enforced against block time.
         expires_unix_secs: u64,
