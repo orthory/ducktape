@@ -1,7 +1,7 @@
 //! Onboarding: stage rendering and the messages its controls emit.
 
 use super::harness::*;
-use crate::onboarding::{self, Message, Stage, State};
+use crate::onboarding::{self, EntryMode, Message, Stage, State};
 use crate::theme;
 
 fn at(stage: Stage) -> State {
@@ -58,6 +58,51 @@ fn reveal_legacy_requires_a_password() {
     assert!(
         onboarding::update(&mut ready, Message::Submit).is_some(),
         "a password lets the reveal proceed"
+    );
+}
+
+#[test]
+fn mode_switch_is_inert_while_busy() {
+    // ON-G1: a mode tab clicked mid-custody-op must not wipe the in-flight
+    // secret or drop to another stage — otherwise the late ServiceEvent lands
+    // in the wrong stage.
+    let mut state = at(Stage::Create);
+    state.busy = true;
+    state.password = "in flight".into();
+    assert!(
+        onboarding::update(&mut state, Message::SelectMode(EntryMode::Restore)).is_none(),
+        "SelectMode is a no-op while busy"
+    );
+    assert_eq!(state.stage, Stage::Create, "stage is unchanged");
+    assert_eq!(state.mode, EntryMode::Create, "mode is unchanged");
+    assert!(state.busy, "the in-flight flag survives");
+    assert!(!state.password.is_empty(), "the in-flight secret is not wiped");
+}
+
+#[test]
+fn busy_tabs_do_not_switch_mode() {
+    // ON-G6: the tab is still rendered while busy (so the block is visible) but
+    // carries no on_press, so clicking it emits nothing.
+    let mut state = at(Stage::Create);
+    state.busy = true;
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    let _ = ui.click(by::role(Role::Tab, "Restore"));
+    assert!(!emitted(ui, &Message::SelectMode(EntryMode::Restore)));
+}
+
+#[test]
+fn password_field_is_addressable_by_the_bridge() {
+    // ON-3a: every onboarding input carries a Sem TextInput node so the agent
+    // bridge can focus + type. Secrets omit their value from the tree but stay
+    // drivable by name.
+    let state = at(Stage::Create);
+    let mut ui = sim(onboarding::view(&state, theme::Mode::Light));
+    ui.click(by::role(Role::TextInput, "Password"))
+        .expect("the password field is addressable by name");
+    ui.typewrite("s");
+    assert!(
+        emitted(ui, &Message::PasswordChanged("s".into())),
+        "typing into the tagged field drives the reducer"
     );
 }
 

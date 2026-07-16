@@ -3,7 +3,7 @@
 
 use super::harness::*;
 use crate::screens::workspace::{
-    self, BootError, BootErrorKind, ConnectMode, Message, Stage, State, Workspace,
+    self, AccountLink, BootError, BootErrorKind, ConnectMode, Message, Stage, State, Workspace,
 };
 use crate::theme;
 
@@ -61,5 +61,34 @@ fn activating_a_member_shows_connecting() {
     assert!(
         ui.find("Connecting…").is_ok(),
         "the row being activated shows a busy label instead of nothing"
+    );
+}
+
+#[test]
+fn a_locked_account_warns_before_linking_a_joining_node() {
+    // ON-G5: account_link is now populated from the custody probe, so the
+    // load-bearing safety hint (a locked account silently links a node to
+    // nobody) actually renders on the join-progress screen.
+    let workspace = Workspace {
+        id: "ws-1".into(),
+        name: "Demo".into(),
+        chain_id: "chain-abc".into(),
+        pubkey: "key".into(),
+        member: false,
+    };
+    let state = State {
+        stage: Stage::Joining,
+        workspace: Some(workspace.clone()),
+        workspaces: vec![workspace],
+        account_link: AccountLink::Locked,
+        ..Default::default()
+    };
+    let mut ui = sim(workspace::view(&state, theme::Mode::Light));
+    assert!(
+        ui.find(
+            "Your account is locked — unlock it in the Account view to link this node to you."
+        )
+        .is_ok(),
+        "a locked account surfaces the link-safety hint while joining"
     );
 }

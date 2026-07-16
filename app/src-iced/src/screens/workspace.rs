@@ -9,7 +9,8 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 
 use crate::theme::{
-    self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM, SANS_SEMIBOLD,
+    self, BODY, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS,
+    SANS_MEDIUM, SANS_SEMIBOLD, TITLE,
 };
 
 const CARD_WIDTH: f32 = 440.0;
@@ -99,11 +100,8 @@ pub struct LogTail {
 pub enum AccountLink {
     #[default]
     Hidden,
-    #[allow(dead_code)]
     Locked,
-    #[allow(dead_code)]
     PendingApproval,
-    #[allow(dead_code)]
     WillLink,
 }
 
@@ -238,6 +236,9 @@ pub enum ServiceEvent {
     WorkspaceActivated {
         workspace_id: String,
         result: Result<(), BootFailure>,
+        /// Custody state probed at activation, so join-progress can warn when a
+        /// locked account would silently produce a node linked to nobody.
+        account_link: AccountLink,
     },
     PhaseLoaded {
         workspace_id: String,
@@ -476,7 +477,8 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
         ServiceEvent::WorkspaceActivated {
             workspace_id,
             result,
-        } => workspace_activated(state, &workspace_id, result),
+            account_link,
+        } => workspace_activated(state, &workspace_id, result, account_link),
         ServiceEvent::PhaseLoaded {
             workspace_id,
             result,
@@ -565,6 +567,7 @@ fn workspace_activated(
     state: &mut State,
     workspace_id: &str,
     result: Result<(), BootFailure>,
+    account_link: AccountLink,
 ) -> Option<Command> {
     if !is_current_workspace(state, workspace_id) {
         return None;
@@ -573,6 +576,13 @@ fn workspace_activated(
         .workspace
         .as_ref()
         .is_some_and(|workspace| workspace.member);
+    // The link hint is a join-only concern; members re-entering their own
+    // network never render it.
+    state.account_link = if member {
+        AccountLink::Hidden
+    } else {
+        account_link
+    };
     match result {
         Ok(()) if member => {
             state.busy = false;
@@ -754,8 +764,8 @@ fn connect_view(state: &State, p: Palette) -> Element<'_, Message> {
 
     let header = row![
         column![
-            text(title).font(SANS_SEMIBOLD).size(16).color(p.ink),
-            text(subtitle).font(SANS_MEDIUM).size(12).color(p.muted),
+            text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink),
+            text(subtitle).font(SANS_MEDIUM).size(BODY).color(p.muted),
         ]
         .spacing(5)
         .width(Length::Fill),
@@ -863,16 +873,16 @@ fn join_code_card(state: &State, p: Palette) -> Element<'_, Message> {
         column![
             text("YOUR JOIN CODE")
                 .font(SANS_SEMIBOLD)
-                .size(10.5)
+                .size(CAPTION)
                 .color(p.muted_2),
             text("Send this code to whoever is inviting you — invites are locked to it.")
                 .font(SANS_MEDIUM)
-                .size(11)
+                .size(BODY)
                 .color(p.muted),
             row![
                 text(code)
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.ink_soft)
                     .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .width(Length::Fill),
@@ -892,7 +902,7 @@ fn networks(state: &State, p: Palette) -> Element<'_, Message> {
     let mut list = Column::new().spacing(6).push(
         text("YOUR NETWORKS")
             .font(SANS_SEMIBOLD)
-            .size(10.5)
+            .size(CAPTION)
             .color(p.muted_2),
     );
     let active_id = state.workspace.as_ref().map(|workspace| workspace.id.as_str());
@@ -901,17 +911,17 @@ fn networks(state: &State, p: Palette) -> Element<'_, Message> {
         let trailing = if connecting {
             text("Connecting…")
                 .font(SANS_MEDIUM)
-                .size(10)
+                .size(CAPTION)
                 .color(theme::ACCENTS[0])
         } else {
             text(workspace.chain_id.clone())
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(p.muted_2)
         };
         let select = button(
             row![
-                text(workspace.name.clone()).font(SANS_SEMIBOLD).size(12),
+                text(workspace.name.clone()).font(SANS_SEMIBOLD).size(BODY),
                 Space::new().width(Length::Fill),
                 trailing,
             ]
@@ -973,7 +983,7 @@ fn join_progress(state: &State, p: Palette) -> Element<'_, Message> {
 
     let mut content = Column::new().spacing(0);
     if state.workspaces.len() <= 1 {
-        content = content.push(step_rail(p));
+        content = content.push(crate::onboarding::step_rail(3, p));
     }
     content = content
         .push(Space::new().height(13))
@@ -984,14 +994,14 @@ fn join_progress(state: &State, p: Palette) -> Element<'_, Message> {
                 format!("Joining {name}")
             })
             .font(SANS_SEMIBOLD)
-            .size(20)
+            .size(HEADING)
             .color(p.filled),
         )
         .push(Space::new().height(5))
         .push(
             text("Parked nodes wait for admission, then sync finalized history and promote.")
                 .font(SANS)
-                .size(13)
+                .size(BODY)
                 .color(p.muted),
         )
         .push(Space::new().height(18))
@@ -1005,13 +1015,13 @@ fn join_progress(state: &State, p: Palette) -> Element<'_, Message> {
             p,
         ))
         .push(Space::new().height(20))
-        .push(text("THIS NODE'S KEY").font(MONO).size(10).color(p.muted_2))
+        .push(text("THIS NODE'S KEY").font(MONO).size(CAPTION).color(p.muted_2))
         .push(Space::new().height(8))
         .push(node_key(pubkey, state.copied_node_key, p));
     if let Some(hint) = state.account_link.hint() {
         content = content
             .push(Space::new().height(8))
-            .push(text(hint).font(SANS).size(10.5).color(p.muted_2));
+            .push(text(hint).font(SANS).size(BODY).color(p.muted_2));
     }
     content = content.push(Space::new().height(22));
     for (index, (label, detail)) in JOIN_STEPS.iter().enumerate() {
@@ -1109,9 +1119,9 @@ fn join_step(
         column![
             text(label)
                 .font(SANS)
-                .size(13.5)
+                .size(BODY)
                 .color(if active { p.ink_soft } else { p.muted_2 }),
-            text(detail).font(MONO).size(11).color(detail_color),
+            text(detail).font(MONO).size(LABEL).color(detail_color),
         ]
         .spacing(2),
     ]
@@ -1127,7 +1137,7 @@ fn step_icon(visual: StepVisual, p: Palette) -> Element<'static, Message> {
         StepVisual::Pending => ("", Color::TRANSPARENT, p.border_strong, p.muted_2),
         StepVisual::Failed => ("!", p.danger_soft, p.danger_border, p.red),
     };
-    container(text(label).font(MONO).size(11).color(color))
+    container(text(label).font(MONO).size(LABEL).color(color))
         .width(19)
         .height(19)
         .center_x(19)
@@ -1160,12 +1170,13 @@ fn node_key(pubkey: String, copied: bool, p: Palette) -> Element<'static, Messag
         row![
             text(label)
                 .font(MONO)
-                .size(11)
+                .size(LABEL)
                 .color(p.muted_3)
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                 .width(Length::Fill),
             text(if copied { "copied" } else { "copy" })
                 .font(SANS_SEMIBOLD)
-                .size(11)
+                .size(LABEL)
                 .color(if copied { p.green } else { theme::ACCENTS[0] }),
         ]
         .spacing(10)
@@ -1193,7 +1204,14 @@ fn node_key(pubkey: String, copied: bool, p: Palette) -> Element<'static, Messag
 }
 
 fn fatal_line(copy: String, p: Palette) -> Element<'static, Message> {
-    container(text(copy).font(MONO).size(11).color(p.red))
+    container(
+        text(copy)
+            .font(MONO)
+            .size(BODY)
+            .color(p.red)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .width(Length::Fill),
+    )
         .width(Length::Fill)
         .padding([8, 10])
         .style(move |_| bordered(p.danger_soft, p.danger_border, RADIUS_SM))
@@ -1246,9 +1264,9 @@ fn node_failed(state: &State, p: Palette) -> Element<'_, Message> {
     }
 
     let mut content = column![
-        text(title).font(SANS_SEMIBOLD).size(13).color(p.danger),
+        text(title).font(SANS_SEMIBOLD).size(BODY).color(p.danger),
         Space::new().height(6),
-        text(reason).font(MONO).size(11.5).color(p.ink),
+        selectable_value(reason, p.ink),
         Space::new().height(14),
         actions,
     ]
@@ -1256,7 +1274,7 @@ fn node_failed(state: &State, p: Palette) -> Element<'_, Message> {
     if state.show_log && !boot.log_tail.trim().is_empty() {
         content = content.push(Space::new().height(14)).push(
             container(scrollable(
-                text(&boot.log_tail).font(MONO).size(10.5).color(p.ink_soft),
+                text(&boot.log_tail).font(MONO).size(CAPTION).color(p.ink_soft),
             ))
             .height(260)
             .padding(10)
@@ -1266,7 +1284,7 @@ fn node_failed(state: &State, p: Palette) -> Element<'_, Message> {
     if let Some(path) = &boot.log_path {
         content = content
             .push(Space::new().height(10))
-            .push(text(path).font(MONO).size(10).color(p.muted));
+            .push(selectable_value(path, p.muted));
     }
 
     let failure = container(content)
@@ -1309,9 +1327,9 @@ fn forget_confirmation(state: &State, p: Palette) -> Element<'_, Message> {
         "Delete network"
     };
     let content = column![
-        text(title).font(SANS_SEMIBOLD).size(15).color(p.filled),
+        text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.filled),
         Space::new().height(8),
-        text(copy).font(SANS).size(12).color(p.muted_3),
+        text(copy).font(SANS).size(BODY).color(p.muted_3),
         Space::new().height(16),
         row![
             Space::new().width(Length::Fill),
@@ -1333,14 +1351,14 @@ fn forget_confirmation(state: &State, p: Palette) -> Element<'_, Message> {
                 width: 1.0,
                 radius: RADIUS_LG.into(),
             },
-            shadow: pop_shadow(),
+            shadow: pop_shadow(p),
             ..Default::default()
         });
     modal_root(confirmation, p)
 }
 
 fn icon_close(p: Palette) -> Element<'static, Message> {
-    let btn = button(text("✕").font(SANS_MEDIUM).size(16))
+    let btn = button(text("✕").font(SANS_MEDIUM).size(TITLE))
         .width(26)
         .height(26)
         .padding(0)
@@ -1371,7 +1389,7 @@ fn field<'a>(
     text_input(placeholder, value)
         .on_input(on_input)
         .padding([9, 11])
-        .size(12.5)
+        .size(BODY)
         .font(font)
         .style(move |_, status| iced::widget::text_input::Style {
             background: Background::Color(p.sunken),
@@ -1419,7 +1437,7 @@ fn tab(
     p: Palette,
 ) -> Element<'static, Message> {
     let btn = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1436,10 +1454,7 @@ fn tab(
         },
         shadow: if active {
             Shadow {
-                color: Color {
-                    a: 0.05,
-                    ..Color::from_rgb8(40, 38, 34)
-                },
+                color: Color { a: 0.05, ..p.shadow },
                 offset: Vector::new(0.0, 1.0),
                 blur_radius: 2.0,
             }
@@ -1457,7 +1472,7 @@ fn tab(
 fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
     let enabled = message.is_some();
     let btn = button(
-        container(text(label).font(SANS_SEMIBOLD).size(12.5))
+        container(text(label).font(SANS_SEMIBOLD).size(BODY))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1493,7 +1508,7 @@ fn outline_enabled(
     enabled: bool,
     p: Palette,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(10.5))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([5, 10])
         .on_press_maybe(enabled.then_some(message))
         .style(move |_, status| outline_style(p, enabled, status));
@@ -1506,7 +1521,7 @@ fn outline_enabled(
 }
 
 fn ghost(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([6, 12])
         .on_press(message)
         .style(move |_, status| outline_style(p, true, status));
@@ -1522,7 +1537,7 @@ fn danger_button(
     filled: bool,
     p: Palette,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(10.5))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([8, 10])
         .on_press(message)
         .style(move |_, status| iced::widget::button::Style {
@@ -1548,7 +1563,7 @@ fn danger_button(
 }
 
 fn danger_primary(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([7, 14])
         .on_press(message)
         .style(move |_, status| iced::widget::button::Style {
@@ -1576,16 +1591,22 @@ fn danger_primary(label: &'static str, message: Message, p: Palette) -> Element<
 /// selectable; a read-only `text_input` (no `on_input`) stays focusable and
 /// supports select + copy while rendering like the inline error text it replaces.
 fn selectable_error<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
+    selectable_value(message, p.red)
+}
+
+/// A selectable/copyable value at an arbitrary ink colour — for boot-failure
+/// reasons and log paths the user lifts out to debug, not only red errors.
+fn selectable_value<'a>(message: &'a str, ink: Color) -> Element<'a, Message> {
     text_input("", message)
         .font(MONO)
-        .size(11.5)
+        .size(BODY)
         .padding(0)
         .style(move |_, _| iced::widget::text_input::Style {
             background: Background::Color(Color::TRANSPARENT),
             border: Border::default(),
-            icon: p.red,
-            placeholder: p.red,
-            value: p.red,
+            icon: ink,
+            placeholder: ink,
+            value: ink,
             selection: theme::ACCENTS[0],
         })
         .into()
@@ -1600,7 +1621,7 @@ fn dialog_button(
     // Symmetric vertical padding centers the label; a fixed `.height(32)` with
     // top-anchored button content (iced positions children at padding top-left)
     // left the text stuck to the top of the button.
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([8, 12])
         .on_press(message)
         .style(move |_, status| iced::widget::button::Style {
@@ -1627,7 +1648,7 @@ fn dialog_button(
 
 fn link_button(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
     let btn = button(
-        container(text(label).font(SANS_SEMIBOLD).size(11).color(p.muted))
+        container(text(label).font(SANS_SEMIBOLD).size(LABEL).color(p.muted))
             .width(Length::Fill)
             .center_x(Length::Fill),
     )
@@ -1639,63 +1660,6 @@ fn link_button(label: &'static str, message: Message, p: Palette) -> Element<'st
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Link, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
     btn.into()
-}
-
-fn step_rail(p: Palette) -> Element<'static, Message> {
-    let mut rail = row![].spacing(9).align_y(Alignment::Center);
-    for (index, label) in ["Account", "Workspace", "Connect"].into_iter().enumerate() {
-        let step = index + 1;
-        let done = step < 3;
-        let current = step == 3;
-        let marker = container(
-            text(if done { "✓".into() } else { step.to_string() })
-                .font(MONO)
-                .size(9)
-                .color(if current {
-                    p.on_filled
-                } else if done {
-                    p.green
-                } else {
-                    p.muted_2
-                }),
-        )
-        .width(17)
-        .height(17)
-        .center_x(17)
-        .center_y(17)
-        .style(move |_| {
-            bordered(
-                if current {
-                    p.filled
-                } else if done {
-                    green_tint(p)
-                } else {
-                    Color::TRANSPARENT
-                },
-                if current {
-                    p.filled
-                } else if done {
-                    p.green
-                } else {
-                    p.border_strong
-                },
-                9.0,
-            )
-        });
-        rail = rail.push(marker).push(
-            text(label)
-                .font(SANS_SEMIBOLD)
-                .size(10.5)
-                .color(if current { p.ink } else { p.muted_2 }),
-        );
-        if step < 3 {
-            rail = rail.push(
-                container(Space::new().width(22).height(1))
-                    .style(move |_| rounded(p.border_strong, 0.0)),
-            );
-        }
-    }
-    rail.into()
 }
 
 fn card<'a>(
@@ -1714,18 +1678,15 @@ fn card<'a>(
                 width: 1.0,
                 radius: RADIUS_LG.into(),
             },
-            shadow: pop_shadow(),
+            shadow: pop_shadow(p),
             ..Default::default()
         })
         .into()
 }
 
-fn pop_shadow() -> Shadow {
+fn pop_shadow(p: Palette) -> Shadow {
     Shadow {
-        color: Color {
-            a: 0.13,
-            ..Color::BLACK
-        },
+        color: Color { a: 0.13, ..p.shadow },
         offset: Vector::new(0.0, 8.0),
         blur_radius: 28.0,
     }
@@ -1898,6 +1859,7 @@ mod tests {
                 Message::Service(ServiceEvent::WorkspaceActivated {
                     workspace_id: "team".into(),
                     result: Ok(()),
+                    account_link: AccountLink::WillLink,
                 })
             ),
             Some(Command::PollPhase {
@@ -1993,6 +1955,7 @@ mod tests {
                         kind: BootErrorKind::StartupFailure,
                         reason: "address already in use".into(),
                     }),
+                    account_link: AccountLink::Hidden,
                 })
             ),
             Some(Command::LoadLog {
