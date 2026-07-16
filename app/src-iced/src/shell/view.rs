@@ -786,30 +786,16 @@ fn permission_button(
     primary: bool,
     p: theme::Palette,
 ) -> Element<'static, Message> {
-    button(container(text(label).size(theme::LABEL)).center_x(Length::Fill))
+    let t = theme::ui_for(&p);
+    let variant = if primary {
+        crate::ui::button::ButtonVariant::Default
+    } else {
+        crate::ui::button::ButtonVariant::Outline
+    };
+    crate::ui::button::button(label, &t)
+        .variant(variant)
         .width(Length::Fill)
-        .padding([7, 10])
         .on_press(message)
-        .style(move |_, status| button::Style {
-            background: Some(Background::Color(if primary {
-                if matches!(status, button::Status::Hovered) {
-                    p.ink_soft
-                } else {
-                    p.filled
-                }
-            } else if matches!(status, button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            })),
-            text_color: if primary { p.on_filled } else { p.ink },
-            border: Border {
-                color: if primary { p.filled } else { p.border },
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..button::Style::default()
-        })
         .into()
 }
 
