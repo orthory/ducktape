@@ -84,3 +84,7 @@ windows-capture = "2.0.0"
 name = "cef-probe"
 path = "src/bin/cef_probe.rs"
 required-features = ["cef-browser"]
+
+[dev-dependencies]
+# Headless in-process UI tests (Simulator/Emulator) — pulls no iced_winit.
+iced_test = "=0.14.0"

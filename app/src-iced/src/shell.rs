@@ -46,6 +46,8 @@ use crate::workspace_service;
 
 #[cfg(all(feature = "agent", debug_assertions))]
 pub(crate) mod agent_wire;
+#[cfg(all(feature = "agent", debug_assertions))]
+mod preset;
 mod browser_session;
 mod view;
 #[cfg(feature = "cef-browser")]
@@ -399,6 +401,12 @@ impl Default for Shell {
 
 impl Shell {
     fn boot() -> (Self, Task<Message>) {
+        // Dev-only: DUCKTAPE_PRESET=<name> boots a named fixture state (e.g.
+        // ui-demo skips onboarding for chrome-level agent QA).
+        #[cfg(all(feature = "agent", debug_assertions))]
+        if let Some(boot) = preset::from_env() {
+            return boot;
+        }
         let (main, open_main) = window::open(desktop::main_settings());
         let mut state = Self::default();
         state.desktop.main = Some(main);
@@ -487,7 +495,11 @@ fn tray_screen_available(screen: Screen, local_managed: bool) -> bool {
 }
 
 pub fn run() -> iced::Result {
-    let result = iced::daemon(Shell::boot, update, view::view)
+    let daemon = iced::daemon(Shell::boot, update, view::view);
+    // Dev-only: named boot presets for iced_test's Emulator lane.
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let daemon = daemon.presets(preset::all());
+    let result = daemon
         .title(|state: &Shell, id| desktop::title(&state.desktop, id, state.notifications.unread))
         .theme(|state: &Shell, _| theme::iced_theme(state.mode, state.accent))
         .default_font(theme::SANS)
