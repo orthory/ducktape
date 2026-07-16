@@ -7,6 +7,10 @@
 //! under `#[cfg(all(feature = "agent", debug_assertions))]`, so a release
 //! binary links it but never boots the server or attaches an adapter.
 
+pub mod collect;
 pub mod protocol;
+pub mod sem;
 
+pub use collect::{to_accesskit, Collector, FlatNode, SnapshotSlot, WindowSnapshot};
 pub use protocol::{Cmd, Cond, Intent, Rect, Request, Response, Role, SemNode, Target};
+pub use sem::{sem, Sem, SemProbe};
