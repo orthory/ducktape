@@ -498,6 +498,26 @@ fn update(state: &mut Shell, message: Message) -> Task<Message> {
         Message::MainOpened(id) => {
             state.desktop.main = Some(id);
             state.window_size = desktop::MAIN_SIZE;
+            // P0 spike stub: prove the AccessKit seam end-to-end. Replaced by
+            // the real semantic tree in the agent snapshot loop.
+            #[cfg(all(feature = "agent", debug_assertions))]
+            {
+                use iced_winit::accesskit as ak;
+                let mut root = ak::Node::new(ak::Role::Window);
+                root.set_label("Ducktape");
+                let mut probe = ak::Node::new(ak::Role::Button);
+                probe.set_label("agent-probe");
+                root.set_children(vec![ak::NodeId(1)]);
+                iced_winit::agent::set_tree(
+                    id,
+                    ak::TreeUpdate {
+                        nodes: vec![(ak::NodeId(0), root), (ak::NodeId(1), probe)],
+                        tree: Some(ak::Tree::new(ak::NodeId(0))),
+                        tree_id: ak::TreeId::ROOT,
+                        focus: ak::NodeId(0),
+                    },
+                );
+            }
             if let Err(error) = mac_tray::init() {
                 tracing::warn!(
                     target: "ducktape::shell",

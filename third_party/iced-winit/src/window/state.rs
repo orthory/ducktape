@@ -115,6 +115,17 @@ where
             .unwrap_or(mouse::Cursor::Unavailable)
     }
 
+    // AGENT SEAM: synthetic input must move the hit-test cursor exactly like
+    // real input; widgets hit-test against this state, not the event stream.
+    #[cfg(feature = "agent")]
+    pub fn agent_set_cursor(&mut self, position: crate::core::Point) {
+        let scale = f64::from(self.viewport.scale_factor());
+        self.cursor_position = Some(winit::dpi::PhysicalPosition::new(
+            f64::from(position.x) * scale,
+            f64::from(position.y) * scale,
+        ));
+    }
+
     pub fn modifiers(&self) -> winit::keyboard::ModifiersState {
         self.modifiers
     }

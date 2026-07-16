@@ -45,6 +45,21 @@ fn globals() -> &'static Globals {
     })
 }
 
+/// The platform adapters' async plumbing (zbus on Linux) may require an
+/// ambient Tokio reactor; the winit event-loop thread has none, so the agent
+/// owns a tiny one and enters it around every adapter interaction.
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("iced-agent-a11y")
+            .enable_all()
+            .build()
+            .expect("build agent tokio runtime")
+    })
+}
+
 /// Replays the last pushed tree when the platform activates accessibility.
 struct Activation {
     last_tree: Arc<Mutex<Option<accesskit::TreeUpdate>>>,
@@ -81,7 +96,9 @@ pub(crate) fn attach(
     window: &Arc<winit::window::Window>,
 ) {
     let g = globals();
+    log::info!("agent: attaching AccessKit adapter to window {id:?}");
     let last_tree = Arc::new(Mutex::new(None));
+    let _reactor = runtime().enter();
     let adapter = accesskit_winit::Adapter::with_direct_handlers(
         event_loop,
         window,
@@ -94,8 +111,8 @@ pub(crate) fn attach(
         },
         Deactivation,
     );
-    g.winit_to_iced.lock().unwrap().insert(window.id(), id);
-    g.slots.lock().unwrap().insert(
+    let _ = g.winit_to_iced.lock().unwrap().insert(window.id(), id);
+    let _ = g.slots.lock().unwrap().insert(
         id,
         Slot {
             adapter,
@@ -115,11 +132,12 @@ pub(crate) fn process_event(
         return;
     };
     if let Some(slot) = g.slots.lock().unwrap().get_mut(&id) {
+        let _reactor = runtime().enter();
         slot.adapter.process_event(&slot.window, event);
     }
     if matches!(event, winit::event::WindowEvent::Destroyed) {
-        g.slots.lock().unwrap().remove(&id);
-        g.winit_to_iced.lock().unwrap().remove(&winit_id);
+        let _ = g.slots.lock().unwrap().remove(&id);
+        let _ = g.winit_to_iced.lock().unwrap().remove(&winit_id);
     }
 }
 
@@ -128,6 +146,7 @@ pub fn set_tree(id: Id, update: accesskit::TreeUpdate) {
     let g = globals();
     if let Some(slot) = g.slots.lock().unwrap().get_mut(&id) {
         *slot.last_tree.lock().unwrap() = Some(update.clone());
+        let _reactor = runtime().enter();
         slot.adapter.update_if_active(|| update);
     }
 }

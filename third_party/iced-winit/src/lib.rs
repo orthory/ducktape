@@ -26,6 +26,12 @@ pub use program::runtime;
 pub use runtime::futures;
 pub use winit;
 
+// AGENT SEAM: dev-only agent instrumentation (adapter, tree push, injection).
+#[cfg(feature = "agent")]
+pub mod agent;
+#[cfg(feature = "agent")]
+pub use accesskit;
+
 pub mod clipboard;
 pub mod conversion;
 
@@ -209,6 +215,10 @@ where
                 winit::event::WindowEvent::Resized(_)
                     | winit::event::WindowEvent::Moved(_)
             );
+
+            // AGENT SEAM: adapters see every window event (activation, focus).
+            #[cfg(feature = "agent")]
+            crate::agent::process_event(window_id, &event);
 
             self.process_event(
                 event_loop,
@@ -401,11 +411,19 @@ where
                                     };
                                 }
 
+                                let window = Arc::new(window);
+
+                                // AGENT SEAM: attach the AccessKit adapter
+                                // while the window is still invisible (the
+                                // adapter requires pre-visibility creation).
+                                #[cfg(feature = "agent")]
+                                crate::agent::attach(event_loop, id, &window);
+
                                 self.process_event(
                                     event_loop,
                                     Event::WindowCreated {
                                         id,
-                                        window: Arc::new(window),
+                                        window,
                                         exit_on_close_request,
                                         make_visible: visible,
                                         on_open,
@@ -1123,6 +1141,22 @@ async fn run_instance<P>(
                         if actions > 0 {
                             proxy.free_slots(actions);
                             actions = 0;
+                        }
+
+                        // AGENT SEAM: synthetic events enter the same
+                        // per-window vector real input lands in; cursor moves
+                        // also update the window's hit-test cursor state.
+                        #[cfg(feature = "agent")]
+                        for (id, event) in crate::agent::drain_injected() {
+                            if let Some(window) = window_manager.get_mut(id) {
+                                if let core::Event::Mouse(
+                                    mouse::Event::CursorMoved { position },
+                                ) = &event
+                                {
+                                    window.state.agent_set_cursor(*position);
+                                }
+                                events.push((id, event));
+                            }
                         }
 
                         if events.is_empty()

@@ -35,6 +35,13 @@ license = "MIT"
 repository = "https://github.com/iced-rs/iced"
 
 [features]
+# AGENT SEAM: dev-only agent instrumentation (AccessKit adapter, tree push,
+# synthetic event injection). See AGENT-FORK.md.
+agent = [
+    "dep:accesskit",
+    "dep:accesskit_winit",
+    "dep:tokio",
+]
 debug = ["iced_debug/enable"]
 default = [
     "x11",
@@ -61,6 +68,35 @@ x11 = [
 [lib]
 name = "iced_winit"
 path = "src/lib.rs"
+
+# AGENT SEAM: optional AccessKit stack for the `agent` feature.
+[dependencies.accesskit]
+version = "=0.24.1"
+optional = true
+
+# tokio mode, not the async-io default: the workspace already unifies zbus
+# with its `tokio` feature (rfd -> ashpd), which switches zbus's executor
+# globally; accesskit's unix adapter must ride the same reactor. The agent
+# module enters its own runtime around every adapter call.
+[dependencies.accesskit_winit]
+version = "=0.33.2"
+optional = true
+default-features = false
+features = [
+    "accesskit_unix",
+    "tokio",
+    "rwh_06",
+]
+
+# AGENT SEAM: ambient reactor for the platform adapters' async plumbing.
+[dependencies.tokio]
+version = "1"
+features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+]
+optional = true
 
 [dependencies.iced_debug]
 version = "0.14.0"
