@@ -27,6 +27,7 @@ mod harness;
 mod members;
 mod onboarding;
 mod pages;
+mod operator;
 mod settings;
 mod terminal;
 mod workspace;

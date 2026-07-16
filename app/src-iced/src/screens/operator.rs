@@ -4,10 +4,13 @@
 //! the host performs node I/O and returns a [`ServiceEvent`].
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
+use iced::{Alignment, Background, Border, Color, Element, Font, Length, Padding, Shadow, Vector};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{
+    self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM,
+    SANS, SANS_SEMIBOLD, TITLE,
+};
 
 const PAGE_PAD: f32 = 22.0;
 
@@ -66,6 +69,7 @@ impl Default for State {
             node: NodeState {
                 data: Resource::Loading,
                 active_tab: NodeTab::Overview,
+                busy: false,
                 copied: None,
                 log_filter: String::new(),
                 error: None,
@@ -86,7 +90,9 @@ impl Default for State {
                 data: Resource::Loading,
                 chosen: None,
                 applying: false,
+                applied: false,
                 setup_check: None,
+                setup_agent: None,
                 error: None,
             },
             metrics: MetricsState {
@@ -129,6 +135,15 @@ pub enum Command {
     PauseMetrics(bool),
 }
 
+/// Which gateway mutation completed, so the reducer can pick the right note and
+/// reload behavior instead of stamping one hardcoded string on every success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayAction {
+    Saved,
+    Removed,
+    StarterCreated,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServiceEvent {
     NodeLoaded(Result<Option<NodeSnapshot>, String>),
@@ -140,6 +155,10 @@ pub enum ServiceEvent {
     MetricsLoaded(Result<Option<MetricsSnapshot>, String>),
     ActionFinished {
         screen: Screen,
+        result: Result<(), String>,
+    },
+    GatewayActionFinished {
+        kind: GatewayAction,
         result: Result<(), String>,
     },
 }
@@ -186,6 +205,7 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
         ServiceEvent::NodeLoaded(result) => {
             state.node.data = resource(result);
             state.node.error = None;
+            state.node.busy = false;
         }
         ServiceEvent::GatewayLoaded(result) => state.gateway.data = resource(result),
         ServiceEvent::GatewayRouteLoaded(result) => match result {
@@ -203,18 +223,13 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
         ServiceEvent::MetricsLoaded(result) => state.metrics.data = resource(result),
         ServiceEvent::ActionFinished { screen, result } => match (screen, result) {
             (Screen::Node, Ok(())) => return Some(Command::LoadNode),
-            (Screen::Node, Err(error)) => state.node.error = Some(error),
-            (Screen::Gateway, Ok(())) => {
-                state.gateway.busy = false;
-                state.gateway.note = Some("Route saved.".into());
-                return Some(Command::LoadGateway);
-            }
-            (Screen::Gateway, Err(error)) => {
-                state.gateway.busy = false;
-                state.gateway.note = Some(error);
+            (Screen::Node, Err(error)) => {
+                state.node.busy = false;
+                state.node.error = Some(error);
             }
             (Screen::Sandbox, Ok(())) => {
                 state.sandbox.applying = false;
+                state.sandbox.applied = true;
                 return Some(Command::LoadSandbox);
             }
             (Screen::Sandbox, Err(error)) => {
@@ -223,8 +238,35 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
             }
             _ => {}
         },
+        // Each gateway mutation carries its own identity, so the note and the
+        // reload behavior follow the action: a Remove must not read "Route
+        // saved.", and a StarterCreated must not reload (that would discard the
+        // in-progress editor draft the operator is meant to review then Save).
+        ServiceEvent::GatewayActionFinished { kind, result } => {
+            state.gateway.busy = false;
+            match result {
+                Ok(()) => {
+                    state.gateway.note = Some(gateway_action_note(kind));
+                    if matches!(kind, GatewayAction::Saved | GatewayAction::Removed) {
+                        return Some(Command::LoadGateway);
+                    }
+                }
+                Err(error) => state.gateway.note = Some(error),
+            }
+        }
     }
     None
+}
+
+fn gateway_action_note(kind: GatewayAction) -> String {
+    match kind {
+        GatewayAction::Saved => "Route saved. Register a Duck name to make it browsable.",
+        GatewayAction::Removed => "Route removed. Its signed revision tombstone prevents replay.",
+        GatewayAction::StarterCreated => {
+            "Starter created in the route's DuckFS root. Save when ready."
+        }
+    }
+    .into()
 }
 
 fn resource<T>(result: Result<Option<T>, String>) -> Resource<T> {
@@ -277,11 +319,11 @@ fn center_state<'a>(
 ) -> Element<'a, Message> {
     let mut body = column![
         icon_tile(icon, 42.0, p),
-        text(title.to_string()).font(SANS).size(14).color(p.muted_3),
-        text(detail.to_string())
-            .font(SANS)
-            .size(11.5)
-            .color(p.muted_2)
+        text(title.to_string())
+            .font(SANS_SEMIBOLD)
+            .size(BODY_LG)
+            .color(p.muted_3),
+        text(detail.to_string()).font(SANS).size(BODY).color(p.muted_2)
     ]
     .spacing(9)
     .align_x(Alignment::Center);
@@ -307,8 +349,11 @@ fn error_state<'a>(
     container(
         column![
             icon_tile(icon, 42.0, p),
-            text(title.to_string()).font(SANS).size(14).color(p.ink),
-            text(detail).font(MONO).size(11.5).color(p.red),
+            text(title.to_string())
+                .font(SANS_SEMIBOLD)
+                .size(BODY_LG)
+                .color(p.ink),
+            selectable_text(detail, MONO, BODY, p.red),
             outline_button("Retry", Message::Load(screen), true, p)
         ]
         .spacing(9)
@@ -322,24 +367,79 @@ fn error_state<'a>(
     .into()
 }
 
-fn screen_header(
-    label: &'static str,
+/// The one header bar for every operator screen (Node, Gateway, Modules,
+/// Metrics, Sandbox): a 56px paper bar with the title, an optional mono count,
+/// and a right-aligned action slot, closed by a single 1px bottom rule. There is
+/// deliberately no subtitle in the bar — verbose intros move to the first body
+/// row so one bar fits all five screens.
+fn section_header<'a>(
+    title: &'static str,
     count: Option<usize>,
+    actions: Option<Element<'a, Message>>,
     p: Palette,
-) -> Element<'static, Message> {
-    let mut content = row![text(label).font(SANS).size(16).color(p.ink)]
+) -> Element<'a, Message> {
+    let mut content = row![text(title).font(SANS_SEMIBOLD).size(TITLE).color(p.ink)]
         .spacing(10)
         .align_y(Alignment::Center);
     if let Some(count) = count {
-        content = content.push(text(count.to_string()).font(MONO).size(13).color(p.muted_2));
+        content = content.push(text(count.to_string()).font(MONO).size(CAPTION).color(p.muted_2));
     }
-    container(content)
-        .width(Length::Fill)
-        .height(56)
-        .padding([0, 22])
-        .align_y(Alignment::Center)
-        .style(move |_| bottom_border(p.paper, p.border_soft))
-        .into()
+    content = content.push(Space::new().width(Length::Fill));
+    if let Some(actions) = actions {
+        content = content.push(actions);
+    }
+    column![
+        container(content)
+            .width(Length::Fill)
+            .height(56)
+            .padding([0, 22])
+            .align_y(Alignment::Center)
+            .style(move |_| surface(p.paper)),
+        divider_soft(p),
+    ]
+    .into()
+}
+
+/// A compact, natural-width header action (Start / Stop). Unlike `filled_button`
+/// / `danger_button` — which are Fill-width form CTAs — this hugs its label so
+/// it sits right-aligned in the header instead of ballooning across it.
+fn header_button<'a>(
+    label: impl ToString,
+    message: Message,
+    danger: bool,
+    enabled: bool,
+    p: Palette,
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let (bg, fg) = if !enabled {
+        (p.border_soft, p.muted_2)
+    } else if danger {
+        (p.red, p.paper)
+    } else {
+        (p.filled, p.on_filled)
+    };
+    let button = button(text(label.clone()).font(SANS).size(LABEL))
+        .padding([7, 13])
+        .style(move |_, _| iced::widget::button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: fg,
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+    let button = if enabled {
+        button.on_press(message)
+    } else {
+        button
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn card<'a>(content: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
@@ -359,10 +459,7 @@ fn card_style(p: Palette) -> iced::widget::container::Style {
             radius: RADIUS_LG.into(),
         },
         shadow: Shadow {
-            color: Color {
-                a: 0.05,
-                ..Color::from_rgb8(40, 38, 34)
-            },
+            color: Color { a: 0.05, ..p.shadow },
             offset: Vector::new(0.0, 1.0),
             blur_radius: 2.0,
         },
@@ -389,24 +486,8 @@ fn rounded_surface(color: Color, border: Color, radius: f32) -> iced::widget::co
     }
 }
 
-fn bottom_border(bg: Color, border: Color) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        background: Some(Background::Color(bg)),
-        border: Border {
-            color: border,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
-fn top_border(bg: Color, border: Color) -> iced::widget::container::Style {
-    bottom_border(bg, border)
-}
-
 fn section_label(label: &'static str, p: Palette) -> Element<'static, Message> {
-    text(label).font(MONO).size(9.5).color(p.muted_2).into()
+    text(label).font(MONO).size(CAPTION).color(p.muted_2).into()
 }
 
 fn divider(p: Palette) -> Element<'static, Message> {
@@ -416,8 +497,39 @@ fn divider(p: Palette) -> Element<'static, Message> {
         .into()
 }
 
+fn divider_soft(p: Palette) -> Element<'static, Message> {
+    container(Space::new().height(1))
+        .width(Length::Fill)
+        .style(move |_| surface(p.border_soft))
+        .into()
+}
+
+/// Read-only but selectable text, so a hash / id / log line / error the operator
+/// wants to paste into a report can actually be lifted out. A styled
+/// non-editable `text_input` (iced's `text()` cannot be selected).
+fn selectable_text<'a>(
+    value: &'a str,
+    font: Font,
+    size: f32,
+    color: Color,
+) -> Element<'a, Message> {
+    text_input("", value)
+        .font(font)
+        .size(size)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: color,
+            placeholder: color,
+            value: color,
+            selection: theme::ACCENTS[0],
+        })
+        .into()
+}
+
 fn notice<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.muted))
+    container(text(copy).font(SANS).size(BODY).color(p.muted))
         .width(Length::Fill)
         .padding([10, 13])
         .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_MD))
@@ -425,7 +537,7 @@ fn notice<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
 }
 
 fn warning<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.amber))
+    container(text(copy).font(SANS).size(BODY).color(p.amber))
         .width(Length::Fill)
         .padding([10, 13])
         .style(move |_| rounded_surface(p.danger_soft, p.danger_border, RADIUS_MD))
@@ -433,7 +545,7 @@ fn warning<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
 }
 
 fn error_banner<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(12).color(p.danger))
+    container(selectable_text(copy, SANS, BODY, p.danger))
         .width(Length::Fill)
         .padding([10, 13])
         .style(move |_| rounded_surface(p.danger_soft, p.danger_border, RADIUS_MD))
@@ -455,7 +567,7 @@ fn pill(label: impl ToString, tone: Color, p: Palette) -> Element<'static, Messa
         row![
             container(Space::new().width(6).height(6))
                 .style(move |_| rounded_surface(tone, tone, 99.0)),
-            text(label.to_string()).font(MONO).size(10).color(tone)
+            text(label.to_string()).font(MONO).size(CAPTION).color(tone)
         ]
         .spacing(6)
         .align_y(Alignment::Center),
@@ -473,9 +585,9 @@ fn stat_card(
 ) -> Element<'static, Message> {
     container(
         column![
-            text(label).font(MONO).size(8.5).color(p.muted_2),
-            text(value).font(MONO).size(20).color(p.ink),
-            text(hint).font(SANS).size(11).color(p.muted_2)
+            text(label).font(MONO).size(CAPTION).color(p.muted_2),
+            text(value).font(MONO).size(HEADING).color(p.ink),
+            text(hint).font(SANS).size(CAPTION).color(p.muted_2)
         ]
         .spacing(4),
     )
@@ -498,17 +610,17 @@ fn copy_value(
         row![
             text(label.to_string())
                 .font(MONO)
-                .size(9)
+                .size(CAPTION)
                 .color(p.muted_2)
                 .width(130),
             text(short(value, 20, 12))
                 .font(MONO)
-                .size(11.5)
+                .size(LABEL)
                 .color(p.ink_soft),
             Space::new().width(Length::Fill),
             text(if copied { "COPIED" } else { "COPY" })
                 .font(MONO)
-                .size(9)
+                .size(CAPTION)
                 .color(if copied { p.green } else { p.muted_2 }),
         ]
         .spacing(12)
@@ -546,7 +658,7 @@ fn segment_button<'a>(
     message: Message,
     p: Palette,
 ) -> Element<'a, Message> {
-    let btn = button(text(label).font(SANS).size(11.5))
+    let btn = button(text(label).font(SANS).size(LABEL))
         .padding([6, 17])
         .style(move |_, _| iced::widget::button::Style {
             background: active.then_some(Background::Color(p.paper)),
@@ -576,7 +688,7 @@ fn outline_button<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(11.5))
+    let button = button(text(label.clone()).font(SANS).size(LABEL))
         .padding([7, 13])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -618,22 +730,26 @@ fn filled_button<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(11.5))
-        .width(Length::Fill)
-        .padding([8, 14])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(if enabled {
-                p.filled
-            } else {
-                p.border_soft
-            })),
-            text_color: if enabled { p.on_filled } else { p.muted_2 },
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
+    let button = button(
+        container(text(label.clone()).font(SANS).size(LABEL))
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([8, 14])
+    .style(move |_, _| iced::widget::button::Style {
+        background: Some(Background::Color(if enabled {
+            p.filled
+        } else {
+            p.border_soft
+        })),
+        text_color: if enabled { p.on_filled } else { p.muted_2 },
+        border: Border {
+            radius: RADIUS_SM.into(),
             ..Default::default()
-        });
+        },
+        ..Default::default()
+    });
     let button = if enabled {
         button.on_press(message)
     } else {
@@ -654,22 +770,26 @@ fn danger_button<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(11.5))
-        .width(Length::Fill)
-        .padding([8, 14])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(if enabled {
-                p.red
-            } else {
-                p.border_soft
-            })),
-            text_color: if enabled { p.paper } else { p.muted_2 },
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
+    let button = button(
+        container(text(label.clone()).font(SANS).size(LABEL))
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([8, 14])
+    .style(move |_, _| iced::widget::button::Style {
+        background: Some(Background::Color(if enabled {
+            p.red
+        } else {
+            p.border_soft
+        })),
+        text_color: if enabled { p.paper } else { p.muted_2 },
+        border: Border {
+            radius: RADIUS_SM.into(),
             ..Default::default()
-        });
+        },
+        ..Default::default()
+    });
     let button = if enabled {
         button.on_press(message)
     } else {
@@ -691,7 +811,7 @@ fn toggle_button<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(10.5))
+    let button = button(text(label.clone()).font(SANS).size(LABEL))
         .padding([6, 10])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.filled } else { p.paper })),
@@ -730,7 +850,7 @@ fn labeled_input<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     column![
-        text(label).font(SANS).size(10).color(p.muted_3),
+        text(label).font(SANS).size(LABEL).color(p.muted_3),
         sem_input(
             label,
             value,
@@ -738,7 +858,7 @@ fn labeled_input<'a>(
                 .on_input(on_input)
                 .padding([7, 8])
                 .font(MONO)
-                .size(11)
+                .size(LABEL)
         )
     ]
     .spacing(5)
@@ -776,11 +896,11 @@ fn confirm_card(
 ) -> Element<'static, Message> {
     container(
         column![
-            text(title.to_string()).font(SANS).size(14).color(p.ink),
-            text(detail.to_string())
-                .font(SANS)
-                .size(11.5)
-                .color(p.muted_3),
+            text(title.to_string())
+                .font(SANS_SEMIBOLD)
+                .size(BODY_LG)
+                .color(p.ink),
+            text(detail.to_string()).font(SANS).size(BODY).color(p.muted_3),
             row![
                 outline_button("Cancel", cancel, true, p),
                 filled_button(confirm, accept, true, p)
@@ -801,12 +921,12 @@ fn section_panel_header(
     p: Palette,
 ) -> Element<'static, Message> {
     let mut line = row![
-        text(label).font(MONO).size(9.5).color(p.muted_2),
+        text(label).font(MONO).size(CAPTION).color(p.muted_2),
         Space::new().width(Length::Fill)
     ]
     .align_y(Alignment::Center);
     if let Some(right) = right {
-        line = line.push(text(right).font(MONO).size(10).color(p.muted_2));
+        line = line.push(text(right).font(MONO).size(CAPTION).color(p.muted_2));
     }
     line.into()
 }
@@ -913,6 +1033,80 @@ mod tests {
         );
         assert!(state.sandbox.applying);
         assert_eq!(state.sandbox.chosen, None);
+    }
+
+    #[test]
+    fn gateway_notes_and_reloads_follow_the_action_kind() {
+        let mut state = State::default();
+        // Remove must report a removal (not "Route saved.") and reload.
+        assert_eq!(
+            update(
+                &mut state,
+                Message::Service(ServiceEvent::GatewayActionFinished {
+                    kind: GatewayAction::Removed,
+                    result: Ok(()),
+                })
+            ),
+            Some(Command::LoadGateway)
+        );
+        let removed = state.gateway.note.clone().unwrap();
+        assert!(removed.contains("removed"), "note was: {removed}");
+        assert!(!removed.contains("saved"));
+
+        // Save reads as saved and reloads.
+        state.gateway.busy = true;
+        assert_eq!(
+            update(
+                &mut state,
+                Message::Service(ServiceEvent::GatewayActionFinished {
+                    kind: GatewayAction::Saved,
+                    result: Ok(()),
+                })
+            ),
+            Some(Command::LoadGateway)
+        );
+        assert!(!state.gateway.busy);
+        assert!(state.gateway.note.as_deref().unwrap().contains("saved"));
+
+        // Create-starter must NOT reload — a reload would discard the editor
+        // draft the operator is meant to review then Save.
+        state.gateway.draft.label = "keepme".into();
+        assert_eq!(
+            update(
+                &mut state,
+                Message::Service(ServiceEvent::GatewayActionFinished {
+                    kind: GatewayAction::StarterCreated,
+                    result: Ok(()),
+                })
+            ),
+            None
+        );
+        assert_eq!(state.gateway.draft.label, "keepme");
+        assert!(state.gateway.note.as_deref().unwrap().contains("Starter"));
+    }
+
+    #[test]
+    fn sandbox_apply_success_raises_the_applied_flash() {
+        let mut state = State::default();
+        state.sandbox.applying = true;
+        assert_eq!(
+            update(
+                &mut state,
+                Message::Service(ServiceEvent::ActionFinished {
+                    screen: Screen::Sandbox,
+                    result: Ok(()),
+                })
+            ),
+            Some(Command::LoadSandbox)
+        );
+        assert!(state.sandbox.applied);
+        assert!(!state.sandbox.applying);
+        // The next mode choice clears the one-shot flash.
+        update(
+            &mut state,
+            Message::Sandbox(SandboxMessage::Choose(SandboxMode::Off)),
+        );
+        assert!(!state.sandbox.applied);
     }
 
     #[test]

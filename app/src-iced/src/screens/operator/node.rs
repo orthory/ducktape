@@ -113,6 +113,10 @@ pub struct NodeSnapshot {
 pub struct NodeState {
     pub data: Resource<NodeSnapshot>,
     pub active_tab: NodeTab,
+    /// A managed Start/Stop is in flight; disables + relabels the trigger so a
+    /// multi-second boot can't be double-submitted. Cleared when the reload the
+    /// action schedules resolves (`NodeLoaded`).
+    pub busy: bool,
     pub copied: Option<String>,
     pub log_filter: String,
     pub error: Option<String>,
@@ -130,8 +134,16 @@ pub enum NodeMessage {
 pub(super) fn update(state: &mut NodeState, message: NodeMessage) -> Option<Command> {
     match message {
         NodeMessage::SelectTab(tab) => state.active_tab = tab,
-        NodeMessage::Start => return Some(Command::StartNode),
-        NodeMessage::Stop => return Some(Command::StopNode),
+        NodeMessage::Start => {
+            state.busy = true;
+            state.error = None;
+            return Some(Command::StartNode);
+        }
+        NodeMessage::Stop => {
+            state.busy = true;
+            state.error = None;
+            return Some(Command::StopNode);
+        }
         NodeMessage::Copy { key, value } => {
             state.copied = Some(key);
             return Some(Command::CopyText(value));
@@ -168,8 +180,7 @@ pub(super) fn view(state: &NodeState, p: Palette) -> Element<'_, Message> {
             } else {
                 ("Offline", p.amber)
             };
-            let mut top = row![
-                text("This node").font(SANS).size(16).color(p.ink),
+            let mut actions = row![
                 pill(status.0, status.1, p),
                 pill(
                     snapshot.role.pill(),
@@ -180,17 +191,29 @@ pub(super) fn view(state: &NodeState, p: Palette) -> Element<'_, Message> {
                     },
                     p
                 ),
-                Space::new().width(Length::Fill),
             ]
             .spacing(10)
             .align_y(Alignment::Center);
             if snapshot.managed {
-                top = top.push(if snapshot.connected {
-                    danger_button("Stop", Message::Node(NodeMessage::Stop), true, p)
+                actions = actions.push(if snapshot.connected {
+                    header_button(
+                        if state.busy { "Stopping…" } else { "Stop" },
+                        Message::Node(NodeMessage::Stop),
+                        true,
+                        !state.busy,
+                        p,
+                    )
                 } else {
-                    filled_button("Start", Message::Node(NodeMessage::Start), true, p)
+                    header_button(
+                        if state.busy { "Starting…" } else { "Start" },
+                        Message::Node(NodeMessage::Start),
+                        false,
+                        !state.busy,
+                        p,
+                    )
                 });
             }
+            let header = section_header("Node", None, Some(actions.into()), p);
 
             let mut tabs = row![].spacing(3).align_y(Alignment::Center);
             for (tab, label) in NodeTab::ALL {
@@ -202,38 +225,53 @@ pub(super) fn view(state: &NodeState, p: Palette) -> Element<'_, Message> {
                 ));
             }
 
+            // The identity/version meta line and the tab strip are pinned
+            // outside the scrollable — in the port they were the first rows
+            // inside it and scrolled away with the content.
+            let pinned = container(
+                column![
+                    text(format!(
+                        "peer {} · ducktape-node v{}",
+                        short(&snapshot.peer, 12, 8),
+                        snapshot.version
+                    ))
+                    .font(MONO)
+                    .size(CAPTION)
+                    .color(p.muted_2),
+                    container(tabs).padding(3).style(move |_| rounded_surface(
+                        p.titlebar,
+                        p.border_soft,
+                        RADIUS_LG
+                    )),
+                ]
+                .spacing(10),
+            )
+            .padding(Padding {
+                top: 14.0,
+                right: 22.0,
+                bottom: 12.0,
+                left: 22.0,
+            });
+
             let body = match state.active_tab {
                 NodeTab::Overview => node_overview(snapshot, state, p),
                 NodeTab::Connections => connections_view(snapshot, p),
                 NodeTab::Permissions => permissions_view(snapshot, p),
                 NodeTab::Logs => logs_view(snapshot, state, p),
             };
-            let mut content = column![
-                top,
-                text(format!(
-                    "peer {} · ducktape-node v{}",
-                    short(&snapshot.peer, 12, 8),
-                    snapshot.version
-                ))
-                .font(MONO)
-                .size(10.5)
-                .color(p.muted_2),
-                container(tabs).padding(3).style(move |_| rounded_surface(
-                    p.titlebar,
-                    p.border_soft,
-                    RADIUS_LG
-                )),
-                body,
-            ]
-            .spacing(12);
+            let mut content = column![body].spacing(12);
             if let Some(error) = &state.error {
                 content = content.push(error_banner(error, p));
             }
-            container(scrollable(container(content).padding(PAGE_PAD)))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(move |_| surface(p.canvas))
-                .into()
+            container(column![
+                header,
+                pinned,
+                scrollable(container(content).padding(PAGE_PAD)),
+            ])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| surface(p.canvas))
+            .into()
         }
     }
 }
@@ -248,14 +286,17 @@ fn node_overview<'a>(
             row![
                 icon_tile(Icon::Node, 36.0, p),
                 column![
-                    text(snapshot.role.title()).font(SANS).size(14).color(p.ink),
+                    text(snapshot.role.title())
+                        .font(SANS_SEMIBOLD)
+                        .size(BODY_LG)
+                        .color(p.ink),
                     text(format!(
                         "{} · peer {}",
                         snapshot.workspace_name,
                         short(&snapshot.peer, 14, 8)
                     ))
                     .font(MONO)
-                    .size(10.5)
+                    .size(CAPTION)
                     .color(p.muted_3),
                 ]
                 .spacing(3),
@@ -264,7 +305,7 @@ fn node_overview<'a>(
             .align_y(Alignment::Center),
             text(snapshot.role.detail())
                 .font(SANS)
-                .size(12)
+                .size(BODY)
                 .color(p.ink_softer),
         ]
         .spacing(13),
@@ -338,11 +379,11 @@ fn connections_view(snapshot: &NodeSnapshot, p: Palette) -> Element<'_, Message>
                     column![
                         text(short(&peer.peer, 16, 10))
                             .font(MONO)
-                            .size(12)
+                            .size(LABEL)
                             .color(p.ink),
                         text(format!("{} · {}", peer.direction, peer.age))
                             .font(MONO)
-                            .size(10.5)
+                            .size(CAPTION)
                             .color(p.muted_2),
                     ]
                     .spacing(3),
@@ -357,6 +398,37 @@ fn connections_view(snapshot: &NodeSnapshot, p: Palette) -> Element<'_, Message>
     rows.into()
 }
 
+fn perm_header(label: &'static str, active: bool, width: f32, p: Palette) -> Element<'static, Message> {
+    container(
+        text(label)
+            .font(MONO)
+            .size(CAPTION)
+            .color(if active { p.ink } else { p.muted_2 }),
+    )
+    .width(width)
+    .align_x(Alignment::End)
+    .into()
+}
+
+fn perm_cell(allowed: bool, active: bool, width: f32, p: Palette) -> Element<'static, Message> {
+    let color = if !allowed {
+        p.muted_2
+    } else if active {
+        p.green
+    } else {
+        p.muted_3
+    };
+    container(
+        text(if allowed { "✓" } else { "—" })
+            .font(MONO)
+            .size(BODY)
+            .color(color),
+    )
+    .width(width)
+    .align_x(Alignment::End)
+    .into()
+}
+
 fn permissions_view(snapshot: &NodeSnapshot, p: Palette) -> Element<'_, Message> {
     let validator = snapshot.role.validator();
     let rows = [
@@ -367,40 +439,36 @@ fn permissions_view(snapshot: &NodeSnapshot, p: Palette) -> Element<'_, Message>
         ("Admit waiting workspaces", true, false),
         ("Local daemon controls", snapshot.managed, false),
     ];
+    // Both columns are always shown so the operator can see what each role can
+    // do, with the node's own role highlighted.
     let mut matrix = column![
-        row![
-            text("capability").font(SANS).size(11).color(p.muted),
+        container(row![
+            text("Capability").font(SANS).size(LABEL).color(p.muted),
             Space::new().width(Length::Fill),
-            text(if validator {
-                "VALIDATOR"
-            } else {
-                "REMOTE / GUEST"
-            })
-            .font(MONO)
-            .size(9)
-            .color(p.muted_2),
-        ]
+            perm_header("VALIDATOR", validator, 80.0, p),
+            perm_header("GUEST / REMOTE", !validator, 118.0, p),
+        ])
         .padding([10, 14])
     ];
     for (label, for_validator, for_guest) in rows {
-        let allowed = if validator { for_validator } else { for_guest };
+        matrix = matrix.push(divider_soft(p));
         matrix = matrix.push(
             container(row![
-                text(label).font(SANS).size(12).color(p.ink_soft),
+                text(label).font(SANS).size(BODY).color(p.ink_soft),
                 Space::new().width(Length::Fill),
-                text(if allowed { "✓" } else { "—" })
-                    .font(MONO)
-                    .size(12)
-                    .color(if allowed { p.green } else { p.muted_2 }),
+                perm_cell(for_validator, validator, 80.0, p),
+                perm_cell(for_guest, !validator, 118.0, p),
             ])
-            .padding([11, 14])
-            .style(move |_| top_border(Color::TRANSPARENT, p.border_soft)),
+            .padding([11, 14]),
         );
     }
     column![
-        text("Node permissions").font(SANS).size(18).color(p.ink),
+        text("Node permissions")
+            .font(SANS_SEMIBOLD)
+            .size(BODY_LG)
+            .color(p.ink),
         text("The role comes from committed membership; daemon controls also require a locally managed workspace.")
-            .font(SANS).size(12).color(p.muted),
+            .font(SANS).size(BODY).color(p.muted),
         card(matrix, p),
     ].spacing(9).into()
 }
@@ -418,9 +486,10 @@ fn logs_view<'a>(
             .on_input(|value| Message::Node(NodeMessage::LogFilterChanged(value)))
             .padding([8, 10])
             .font(MONO)
-            .size(11.5)
+            .size(LABEL)
     )]
     .spacing(8);
+    let mut list = column![].spacing(0);
     let mut count = 0;
     for line in &snapshot.logs {
         let haystack =
@@ -428,35 +497,42 @@ fn logs_view<'a>(
         if !filter.is_empty() && !haystack.contains(&filter) {
             continue;
         }
+        if count > 0 {
+            list = list.push(divider_soft(p));
+        }
         count += 1;
-        lines = lines.push(
+        list = list.push(
             container(
                 row![
                     text(&line.timestamp)
                         .font(MONO)
-                        .size(10)
+                        .size(CAPTION)
                         .color(p.muted_2)
                         .width(90),
                     text(&line.level)
                         .font(MONO)
-                        .size(10)
+                        .size(CAPTION)
                         .color(level_color(&line.level, p))
                         .width(52),
                     text(&line.target)
                         .font(MONO)
-                        .size(10)
+                        .size(CAPTION)
                         .color(p.muted)
                         .width(140),
-                    text(&line.message).font(MONO).size(10.5).color(p.ink_soft),
+                    // The message is the copy target — selectable, and Fill-width
+                    // so a long line scrolls within its cell instead of clipping.
+                    container(selectable_text(&line.message, MONO, CAPTION, p.ink_soft))
+                        .width(Length::Fill),
                 ]
                 .spacing(8),
             )
-            .padding([7, 9])
-            .style(move |_| top_border(Color::TRANSPARENT, p.border_soft)),
+            .padding([7, 9]),
         );
     }
     if count == 0 {
         lines = lines.push(notice("No log lines match this filter.", p));
+    } else {
+        lines = lines.push(list);
     }
     card(lines, p)
 }
