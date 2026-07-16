@@ -8,7 +8,7 @@ use qrcode::{QrCode, types::Color as QrColor};
 use zeroize::Zeroize as _;
 
 use crate::icons::Icon;
-use crate::theme::{MONO, Palette, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{BODY, CAPTION, LABEL, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS};
 use crate::view_api::{MemberKeyKind, Resource, decode_link_response, encode_link_response};
 
 use super::user::{
@@ -957,7 +957,10 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
             .padding([9, 12]),
         );
     } else {
-        for workspace in &data.workspaces {
+        for (index, workspace) in data.workspaces.iter().enumerate() {
+            if index > 0 {
+                networks = networks.push(divider(p));
+            }
             networks = networks.push(workspace_row(workspace, p));
         }
     }
@@ -1665,10 +1668,13 @@ fn account_confirmation(
 }
 
 fn code_box(value: &str, p: Palette) -> Element<'static, Message> {
+    // Security-critical, human-verified strings (challenge/response codes, relay
+    // and enrollment URLs). 8.5px mono was below legibility for fingerprint
+    // matching; CAPTION mono, still glyph-wrapping to fit its container.
     container(
         text(value.to_string())
             .font(MONO)
-            .size(8.5)
+            .size(CAPTION)
             .color(p.muted)
             .wrapping(iced::widget::text::Wrapping::Glyph),
     )
@@ -1833,61 +1839,90 @@ fn sem_input<'a>(
     input.into()
 }
 
+fn active_chip(p: Palette) -> Element<'static, Message> {
+    container(text("ACTIVE").font(MONO).size(CAPTION).color(p.green))
+        .padding([2, 6])
+        .style(move |_| iced::widget::container::Style {
+            background: Some(Background::Color(p.sunken)),
+            border: Border {
+                color: p.green,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
 fn workspace_row(workspace: &WorkspaceRow, p: Palette) -> Element<'static, Message> {
-    let btn = button(
+    // The whole name/id/standing span is the mouse path (row click → Enter); the
+    // trailing cell is a real, interactive Enter button (the keyboard/AT path)
+    // for inactive rows, or a non-interactive ACTIVE chip for the active one.
+    let standing_cell: Element<'static, Message> = if workspace.active {
+        container(standing_chip(workspace.standing, p))
+            .width(Length::FillPortion(1))
+            .into()
+    } else {
+        text("—")
+            .font(MONO)
+            .size(CAPTION)
+            .color(p.muted_3)
+            .width(Length::FillPortion(1))
+            .into()
+    };
+    let select = button(
         row![
             text(workspace.name.clone())
                 .font(SANS)
-                .size(12)
+                .size(BODY)
                 .color(p.ink)
                 .width(Length::FillPortion(1)),
             text(workspace.network_id.clone())
                 .font(MONO)
-                .size(11)
+                .size(LABEL)
                 .color(p.muted)
                 .width(Length::FillPortion(1)),
-            text(if workspace.active {
-                workspace.standing.label()
-            } else {
-                "—"
-            })
-            .font(MONO)
-            .size(9)
-            .color(if workspace.active { p.ink } else { p.muted_3 })
-            .width(Length::FillPortion(1)),
-            text(if workspace.active { "ACTIVE" } else { "Enter" })
-                .font(MONO)
-                .size(9)
-                .color(if workspace.active { p.green } else { p.muted_3 })
-                .width(Length::FillPortion(1))
+            standing_cell,
         ]
         .spacing(4)
         .align_y(Alignment::Center),
     )
-    .width(Length::Fill)
+    .width(Length::FillPortion(3))
     .padding([9, 12])
+    .on_press(Message::Home(HomeMessage::SwitchWorkspace(
+        workspace.id.clone(),
+    )))
     .style(move |_, status| iced::widget::button::Style {
         background: matches!(status, iced::widget::button::Status::Hovered)
             .then_some(Background::Color(p.titlebar)),
         text_color: p.ink,
-        border: Border {
-            color: p.border_soft,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
+        border: Border::default(),
         ..Default::default()
-    })
-    .on_press(Message::Home(HomeMessage::SwitchWorkspace(
-        workspace.id.clone(),
-    )));
+    });
     #[cfg(all(feature = "agent", debug_assertions))]
-    return iced_agent_plugin::sem(
-        iced_agent_plugin::Role::ListItem,
-        workspace.name.clone(),
-        btn,
-    );
-    #[cfg(not(all(feature = "agent", debug_assertions)))]
-    btn.into()
+    let select =
+        iced_agent_plugin::sem(iced_agent_plugin::Role::ListItem, workspace.name.clone(), select);
+
+    let action = if workspace.active {
+        active_chip(p)
+    } else {
+        outline(
+            "Enter",
+            Message::Home(HomeMessage::SwitchWorkspace(workspace.id.clone())),
+            p,
+        )
+    };
+
+    row![
+        select,
+        container(action)
+            .width(Length::FillPortion(1))
+            .padding([9, 12])
+            .align_x(Alignment::End),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn short(value: &str) -> String {

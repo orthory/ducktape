@@ -12,7 +12,8 @@ use zeroize::Zeroize as _;
 
 use crate::icons::{self, Icon};
 use crate::theme::{
-    self, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM, SANS_SEMIBOLD,
+    self, CAPTION, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_MEDIUM,
+    SANS_SEMIBOLD,
 };
 
 const CARD_WIDTH: f32 = 440.0;
@@ -872,7 +873,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
     };
 
     let body = if state.first_run && !state.is_ready() {
-        column![step_rail(p), content]
+        column![step_rail(1, p), content]
             .align_x(Alignment::Center)
             .spacing(18)
     } else {
@@ -1411,49 +1412,76 @@ fn mode_tabs(state: &State, p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-fn step_rail(p: Palette) -> Element<'static, Message> {
-    let mut items = row![].align_y(Alignment::Center).spacing(9);
+/// The onboarding chrome's Account → Workspace → Connect progress rail.
+///
+/// One parameterized implementation shared by the identity gate (`active = 1`)
+/// and workspace join-progress (`active = 3`); steps before `active` render a
+/// green ✓ done marker, the `active` step renders filled/current, later steps
+/// pending. Message-agnostic (no interactive elements) so both screens reuse it.
+pub fn step_rail<'a, M: 'a>(active: u8, p: Palette) -> Element<'a, M> {
+    let green_tint = Color { a: 0.12, ..p.green };
+    let mut rail = row![].align_y(Alignment::Center).spacing(9);
     for (index, label) in ["Account", "Workspace", "Connect"].into_iter().enumerate() {
-        if index > 0 {
-            items = items.push(container(Space::new().width(22).height(1)).style(move |_| {
+        let step = (index + 1) as u8;
+        let done = step < active;
+        let current = step == active;
+        let marker = container(
+            text(if done {
+                "✓".to_string()
+            } else {
+                step.to_string()
+            })
+            .font(MONO)
+            .size(CAPTION)
+            .color(if current {
+                p.on_filled
+            } else if done {
+                p.green
+            } else {
+                p.muted_2
+            }),
+        )
+        .width(17)
+        .height(17)
+        .center_x(17)
+        .center_y(17)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(if current {
+                p.filled
+            } else if done {
+                green_tint
+            } else {
+                Color::TRANSPARENT
+            })),
+            border: Border {
+                color: if current {
+                    p.filled
+                } else if done {
+                    p.green
+                } else {
+                    p.border_strong
+                },
+                width: 1.0,
+                radius: 9.0.into(),
+            },
+            ..Default::default()
+        });
+        rail = rail.push(marker).push(
+            text(label)
+                .font(SANS_SEMIBOLD)
+                .size(CAPTION)
+                .color(if current { p.ink } else { p.muted_2 }),
+        );
+        if step < 3 {
+            rail = rail.push(container(Space::new().width(22).height(1)).style(move |_| {
                 container::Style {
                     background: Some(Background::Color(p.border_strong)),
                     ..Default::default()
                 }
             }));
         }
-        let active = index == 0;
-        items = items.push(
-            row![
-                container(
-                    text((index + 1).to_string())
-                        .font(MONO)
-                        .size(9)
-                        .color(if active { p.on_filled } else { p.muted_2 })
-                )
-                .width(17)
-                .height(17)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center)
-                .style(move |_| container::Style {
-                    background: active.then_some(Background::Color(p.filled)),
-                    border: Border {
-                        color: if active { p.filled } else { p.border_strong },
-                        width: 1.0,
-                        radius: 99.0.into()
-                    },
-                    ..Default::default()
-                }),
-                text(label)
-                    .font(SANS)
-                    .size(10.5)
-                    .color(if active { p.ink } else { p.muted_2 }),
-            ]
-            .spacing(9)
-            .align_y(Alignment::Center),
-        );
     }
-    items.into()
+    rail.into()
 }
 
 fn gate_card<'a>(

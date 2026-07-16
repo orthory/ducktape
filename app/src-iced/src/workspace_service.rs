@@ -2,9 +2,10 @@
 
 use serde_json::Value;
 
-use crate::backend::{Backend, Workspace as BackendWorkspace};
+use crate::backend::{Backend, IdentityStatus, Workspace as BackendWorkspace};
 use crate::screens::workspace::{
-    BootErrorKind, BootFailure, Command, LogTail, Phase, PhaseReport, ServiceEvent, Workspace,
+    AccountLink, BootErrorKind, BootFailure, Command, LogTail, Phase, PhaseReport, ServiceEvent,
+    Workspace,
 };
 use crate::transport::NodeClient;
 
@@ -40,13 +41,15 @@ pub async fn execute(backend: Option<Backend>, command: Command) -> ServiceEvent
             ServiceEvent::RemoteConnected(result)
         }
         Command::ActivateWorkspace { workspace_id } | Command::RetryWorkspace { workspace_id } => {
+            let result = backend
+                .activate_workspace(workspace_id.clone())
+                .await
+                .map(|_| ())
+                .map_err(boot_failure);
             ServiceEvent::WorkspaceActivated {
-                workspace_id: workspace_id.clone(),
-                result: backend
-                    .activate_workspace(workspace_id)
-                    .await
-                    .map(|_| ())
-                    .map_err(boot_failure),
+                account_link: account_link(&backend).await,
+                workspace_id,
+                result,
             }
         }
         Command::PollPhase {
@@ -124,6 +127,7 @@ fn error_event(command: Command, error: String) -> ServiceEvent {
             ServiceEvent::WorkspaceActivated {
                 workspace_id,
                 result: Err(boot_failure(error)),
+                account_link: AccountLink::Hidden,
             }
         }
         Command::PollPhase { workspace_id, .. } | Command::CheckJoinReady { workspace_id } => {
@@ -145,6 +149,23 @@ fn error_event(command: Command, error: String) -> ServiceEvent {
             result: Err(error),
         },
         _ => ServiceEvent::WorkspacesLoaded(Err(error)),
+    }
+}
+
+/// The account-link state to show while a node joins: a locked account is the
+/// load-bearing warning (it silently produces a node linked to nobody); a
+/// pending device link is informational; otherwise the node will link on
+/// admission. Probe failures fall back to no hint rather than a wrong one.
+async fn account_link(backend: &Backend) -> AccountLink {
+    match backend.identity_state().await {
+        Ok(state) if state.state == IdentityStatus::Locked => return AccountLink::Locked,
+        Ok(_) => {}
+        Err(_) => return AccountLink::Hidden,
+    }
+    if matches!(backend.link_pending().await, Ok(Some(_))) {
+        AccountLink::PendingApproval
+    } else {
+        AccountLink::WillLink
     }
 }
 

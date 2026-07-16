@@ -99,11 +99,8 @@ pub struct LogTail {
 pub enum AccountLink {
     #[default]
     Hidden,
-    #[allow(dead_code)]
     Locked,
-    #[allow(dead_code)]
     PendingApproval,
-    #[allow(dead_code)]
     WillLink,
 }
 
@@ -238,6 +235,9 @@ pub enum ServiceEvent {
     WorkspaceActivated {
         workspace_id: String,
         result: Result<(), BootFailure>,
+        /// Custody state probed at activation, so join-progress can warn when a
+        /// locked account would silently produce a node linked to nobody.
+        account_link: AccountLink,
     },
     PhaseLoaded {
         workspace_id: String,
@@ -476,7 +476,8 @@ fn service_event(state: &mut State, event: ServiceEvent) -> Option<Command> {
         ServiceEvent::WorkspaceActivated {
             workspace_id,
             result,
-        } => workspace_activated(state, &workspace_id, result),
+            account_link,
+        } => workspace_activated(state, &workspace_id, result, account_link),
         ServiceEvent::PhaseLoaded {
             workspace_id,
             result,
@@ -565,6 +566,7 @@ fn workspace_activated(
     state: &mut State,
     workspace_id: &str,
     result: Result<(), BootFailure>,
+    account_link: AccountLink,
 ) -> Option<Command> {
     if !is_current_workspace(state, workspace_id) {
         return None;
@@ -573,6 +575,13 @@ fn workspace_activated(
         .workspace
         .as_ref()
         .is_some_and(|workspace| workspace.member);
+    // The link hint is a join-only concern; members re-entering their own
+    // network never render it.
+    state.account_link = if member {
+        AccountLink::Hidden
+    } else {
+        account_link
+    };
     match result {
         Ok(()) if member => {
             state.busy = false;
@@ -973,7 +982,7 @@ fn join_progress(state: &State, p: Palette) -> Element<'_, Message> {
 
     let mut content = Column::new().spacing(0);
     if state.workspaces.len() <= 1 {
-        content = content.push(step_rail(p));
+        content = content.push(crate::onboarding::step_rail(3, p));
     }
     content = content
         .push(Space::new().height(13))
@@ -1641,63 +1650,6 @@ fn link_button(label: &'static str, message: Message, p: Palette) -> Element<'st
     btn.into()
 }
 
-fn step_rail(p: Palette) -> Element<'static, Message> {
-    let mut rail = row![].spacing(9).align_y(Alignment::Center);
-    for (index, label) in ["Account", "Workspace", "Connect"].into_iter().enumerate() {
-        let step = index + 1;
-        let done = step < 3;
-        let current = step == 3;
-        let marker = container(
-            text(if done { "✓".into() } else { step.to_string() })
-                .font(MONO)
-                .size(9)
-                .color(if current {
-                    p.on_filled
-                } else if done {
-                    p.green
-                } else {
-                    p.muted_2
-                }),
-        )
-        .width(17)
-        .height(17)
-        .center_x(17)
-        .center_y(17)
-        .style(move |_| {
-            bordered(
-                if current {
-                    p.filled
-                } else if done {
-                    green_tint(p)
-                } else {
-                    Color::TRANSPARENT
-                },
-                if current {
-                    p.filled
-                } else if done {
-                    p.green
-                } else {
-                    p.border_strong
-                },
-                9.0,
-            )
-        });
-        rail = rail.push(marker).push(
-            text(label)
-                .font(SANS_SEMIBOLD)
-                .size(10.5)
-                .color(if current { p.ink } else { p.muted_2 }),
-        );
-        if step < 3 {
-            rail = rail.push(
-                container(Space::new().width(22).height(1))
-                    .style(move |_| rounded(p.border_strong, 0.0)),
-            );
-        }
-    }
-    rail.into()
-}
-
 fn card<'a>(
     content: impl Into<Element<'a, Message>>,
     width: f32,
@@ -1898,6 +1850,7 @@ mod tests {
                 Message::Service(ServiceEvent::WorkspaceActivated {
                     workspace_id: "team".into(),
                     result: Ok(()),
+                    account_link: AccountLink::WillLink,
                 })
             ),
             Some(Command::PollPhase {
@@ -1993,6 +1946,7 @@ mod tests {
                         kind: BootErrorKind::StartupFailure,
                         reason: "address already in use".into(),
                     }),
+                    account_link: AccountLink::Hidden,
                 })
             ),
             Some(Command::LoadLog {
