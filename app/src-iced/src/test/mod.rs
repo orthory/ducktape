@@ -13,6 +13,9 @@
 //! (`qa/recipes/*.json`, `lane: both`), and anything only a living process
 //! shows — subscriptions, multi-window, node/CEF (`lane: fleet` recipes,
 //! `ops/iced-fleet`). See `skills/qa/SKILL.md` for the full lane doctrine.
+//!
+//! Transaction round-trips against a deterministic embedded node belong in
+//! the sim lane (`src/shell/sim/`, `cargo test -p ducktape-iced shell::sim`).
 
 mod harness;
 mod onboarding;

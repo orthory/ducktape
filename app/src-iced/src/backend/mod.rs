@@ -21,6 +21,11 @@ use std::path::{Component, Path, PathBuf};
 
 use node_control::NodeControl;
 
+// The sim lane (`shell::sim::signing`) installs an in-process signing override
+// through this choke-point re-export; production builds never see it.
+#[cfg(test)]
+pub(crate) use node_control::install_verb_override;
+
 pub use crate::view_api::{
     LinkResponse, MemberKeyKind, decode_link_response, encode_link_response,
 };

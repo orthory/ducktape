@@ -88,3 +88,8 @@ required-features = ["cef-browser"]
 [dev-dependencies]
 # Headless in-process UI tests (Simulator/Emulator) — pulls no iced_winit.
 iced_test = "=0.14.0"
+# The embedded sim lane (shell/sim): in-process deterministic node + frame signing.
+simnode = { path = "../../bin/simnode" }
+node.workspace = true
+sdk.workspace = true
+commonware-cryptography.workspace = true

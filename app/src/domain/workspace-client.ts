@@ -126,18 +126,10 @@ export const workspaceLogTail = (id: string): Promise<LogTail> =>
 export const workspaceRuntimeFacts = (id: string): Promise<RuntimeFacts> =>
   invoke<RuntimeFacts>("workspace_runtime_facts", { id });
 
-/** Both shareable forms of a workspace invite, LOCKED to `target` (the
- *  invitee's join code / pubkey hex — every invite is targeted, no bearer
- *  invites). `short` is the coordinator-hosted `🦆://<name>/<id>` link (null
- *  when the coordinator was unreachable/refused); `blob` is the
- *  self-contained fallback that joins without any coordinator. */
-export interface InviteForms {
-  short: string | null;
-  blob: string;
-}
-
-export const inviteBlob = (id: string, target: string): Promise<InviteForms> =>
-  invoke<InviteForms>("workspace_invite_blob", { id, target });
+/** The self-contained one-line invite blob, LOCKED to `target` (the invitee's
+ *  join code / pubkey hex — every invite is targeted, no bearer invites). */
+export const inviteBlob = (id: string, target: string): Promise<string> =>
+  invoke<string>("workspace_invite_blob", { id, target });
 
 /** The invitee's JOIN CODE: pre-mint the identity a future join will adopt and
  *  return its pubkey hex. Hand this to the inviter so the invite locks to it. */
