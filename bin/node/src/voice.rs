@@ -119,6 +119,9 @@ pub fn spawn_hub(
         .expect("spawn voice-hub thread")
 }
 
+/// one flow's roster: the raw ed25519 keys its session currently lists.
+type Roster = HashSet<[u8; 32]>;
+
 /// The `(service, flow)` pairs this node's operator is live on, each carrying
 /// the flow's roster — the peers the session's `recipients` watch currently
 /// lists. Shared between the plane's admission checks (per datagram) and the
@@ -132,9 +135,6 @@ pub fn spawn_hub(
 /// discipline is no defence (an adversary does not run our fan-out), so the
 /// roster is enforced HERE, on receive, at demux: not in the roster → dropped,
 /// counted rogue, never queued.
-/// one flow's roster: the raw ed25519 keys its session currently lists.
-type Roster = HashSet<[u8; 32]>;
-
 #[derive(Default)]
 struct ActiveFlows(Mutex<HashMap<(Service, FlowId), Roster>>);
 
