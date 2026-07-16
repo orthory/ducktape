@@ -46,7 +46,9 @@ pub enum RejectCode {
     /// a lagging view cannot tell removed from not-yet-seen; the joiner fails
     /// over to another member.
     IssuerUnknown,
-    /// V8: the token's role is not redeemable this generation (`Client`).
+    /// V8: the token's role does not redeem over the LOBBY GATE. a `Client`
+    /// token grants submit-only standing and redeems via `user-redeem-invite`
+    /// (`/v1/submit`) — a node join has nothing to gain from it.
     RoleUnsupported,
     /// §3.2: the member could not settle the gate in time (timeout / submit
     /// failure). NON-TERMINAL — the joiner tries another member.

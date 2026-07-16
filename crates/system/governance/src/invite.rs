@@ -216,8 +216,9 @@ mod tests {
 
     #[test]
     fn a_client_role_survives_the_signature_and_role_bytes_round_trip() {
-        // a Client token verifies cryptographically — the redeem gate, not the
-        // signature, is what defers the thin-client plane.
+        // a Client token verifies cryptographically — the ROLE decides which
+        // standing plane the grant lands in (clients vs valset), never the
+        // signature math.
         let issuer = ed25519::PrivateKey::from_seed(1);
         let target = ed25519::PrivateKey::from_seed(2);
         let nonce = [9u8; INVITE_NONCE_LEN];

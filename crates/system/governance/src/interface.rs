@@ -140,9 +140,10 @@ pub enum GovMsg {
     /// proof-of-possession (all raw bytes, mirroring the lobby announce);
     /// the module re-verifies both signatures against the network binding,
     /// requires the issuer to be a CURRENT member, and enforces single-use
-    /// via the redeemed-nonce set in consensus state. success emits
-    /// `ValsetMsg::Grant { key: joiner }` in the same block — the joiner
-    /// becomes a full node (mesh + statesync standing, no quorum seat).
+    /// via the redeemed-nonce set in consensus state. success emits the
+    /// role's grant in the same block: `Resident` → `ValsetMsg::Grant`
+    /// (full node standing — mesh + statesync, no quorum seat), `Client` →
+    /// `ClientsMsg::Grant` (submit authorization only).
     Redeem {
         issuer: Vec<u8>,
         nonce: Vec<u8>,

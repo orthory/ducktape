@@ -114,8 +114,9 @@ with the source. App-hash flag day: pre-existing networks must re-seed
   the client flow — a parked node redeeming a Client invite would gate-fail
   terminally anyway; fail at paste time instead.
 - Lobby gate V8 and the intro doorbell already refuse `role != Resident`
-  terminally; bearer never rides them (bearer ⇒ Client). One new test pins
-  that a bearer token at the lobby gate still answers `RoleUnsupported`.
+  terminally; bearer never rides them (bearer ⇒ Client). A new lobby test
+  pins that a bearer token verifies as `Client` — i.e. it lands exactly on
+  those existing role gates, never on an admission path.
 - `lobby::verify_join_request` keeps working for targeted tokens (its only
   callers are resident paths); it learns to DECODE the optional-target token
   but treats bearer as V8-refusable, not admittable.
