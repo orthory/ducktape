@@ -158,8 +158,6 @@ pub fn redeem_reject_outcome(reason: Option<&str>) -> (RejectCode, bool) {
         (RejectCode::BadProof, true)
     } else if r.contains("does not verify for this network") {
         (RejectCode::BadToken, true)
-    } else if r.contains("client invites are not redeemable") {
-        (RejectCode::RoleUnsupported, true)
     } else if r.contains("no longer part of this network") {
         (RejectCode::IssuerUnknown, false) // V7 stays non-terminal
     } else {

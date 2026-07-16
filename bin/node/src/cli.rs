@@ -1622,8 +1622,11 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // parking a node that will only ever be refused at the lobby.
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
+    // defense in depth: decode enforces bearer⇒Client and the Client role
+    // was refused above, but a panic at a paste-untrusted-input boundary is
+    // never acceptable — fail as an error if either guard ever drifts.
     let Some(invite_target) = invite.token.target.clone() else {
-        unreachable!("bearer invites are client-role-only and were refused above");
+        return Err("bearer invites are client-only — redeem with `user-redeem-invite`".into());
     };
     if invite_target != key.public_key() {
         return Err(format!(

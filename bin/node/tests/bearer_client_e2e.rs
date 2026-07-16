@@ -1,5 +1,5 @@
 //! bearer client invite, end to end over a real HTTP surface: mint with
-//! `invite --client`, redeem with `user-redeem-invite` as a fresh user key,
+//! `invite --role client`, redeem with `user-redeem-invite` as a fresh user key,
 //! observe client standing in consensus, and pin single-use first-wins
 //! against a second key on the same blob.
 

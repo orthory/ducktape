@@ -147,6 +147,13 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
         0 => (None, INVITE_TOKEN_BEARER_LEN),
         other => return Err(format!("unknown invite token kind {other}")),
     };
+    // the semantic rule rides the decoder so EVERY consumer inherits it: a
+    // bearer token is Client-role-only (mint cannot produce the combination;
+    // a self-signed blob can claim it, and consensus would reject it — but
+    // no decoder should hand it onward as a valid token either).
+    if target.is_none() && bytes[pos] != InviteRole::Client.as_u8() {
+        return Err("bearer invite tokens are client-only".into());
+    }
     if bytes.len() != expect_len {
         return Err(format!(
             "invite token must be {expect_len} bytes for its kind, got {}",
@@ -980,6 +987,36 @@ mod tests {
             &invite.token,
             &proof
         ));
+    }
+
+    #[test]
+    fn a_self_signed_bearer_resident_blob_fails_decode_not_panics() {
+        // an attacker CAN self-sign this combination (it is its own issuer);
+        // mint never produces it and consensus rejects it, but the decoder
+        // must refuse to hand it onward as a valid token — every consumer
+        // (join paste, user-redeem-invite) inherits this one guard.
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![format!(
+                "{}@127.0.0.1:52200",
+                hex_bytes(issuer.public_key().as_ref())
+            )],
+            reach: vec![],
+            coordination: None,
+        };
+        let hostile = mint_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            None,
+            InviteRole::Resident,
+            u64::MAX,
+        );
+        let blob = encode_invite(&d, &hostile, None, &[], &issuer).expect("encode");
+        let err = decode_invite(&blob).expect_err("refused at decode");
+        assert!(err.contains("client-only"), "{err}");
     }
 
     #[test]
