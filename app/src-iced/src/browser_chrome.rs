@@ -400,7 +400,31 @@ pub fn view(state: &State, mode: Mode, cef_ready: bool) -> Element<'_, Message> 
         });
     let address = sem_input("Address", &state.address, address);
 
+    // Trust chip: derived from the committed host — SNAPSHOT (network) vs
+    // SIGNED (account route). Shown only once a page has committed.
     let mut pill = row![].spacing(6).align_y(Alignment::Center);
+    if !state.is_idle() {
+        let network = is_network_url(state.runtime_url());
+        let (label, fg) = if network {
+            ("SNAPSHOT", p.blue)
+        } else {
+            ("SIGNED", p.green)
+        };
+        let chip = container(text(label).font(MONO).size(CAPTION).color(fg))
+            .padding([2, 6])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(Color { a: 0.14, ..fg })),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 999.0.into(),
+                },
+                ..container::Style::default()
+            });
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let chip = iced_agent_plugin::sem(iced_agent_plugin::Role::Label, label, chip);
+        pill = pill.push(chip);
+    }
     if !state
         .address
         .get(..7)
