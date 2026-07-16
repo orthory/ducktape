@@ -15,6 +15,7 @@ use crate::theme::{
     self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM,
     SANS, SANS_SEMIBOLD, TITLE,
 };
+use crate::ui;
 
 const MAX_DISPLAY_NAME_LEN: usize = 64;
 
@@ -683,6 +684,7 @@ fn header(data: &MembersData, p: Palette) -> Element<'static, Message> {
 }
 
 fn filter_bar(state: &State, p: Palette) -> Element<'_, Message> {
+    let t = theme::ui_for(&p);
     let mut filters = row![].spacing(7).align_y(Alignment::Center);
     for (filter, label) in Filter::ALL {
         filters = filters.push(segment_button(
@@ -699,11 +701,8 @@ fn filter_bar(state: &State, p: Palette) -> Element<'_, Message> {
             container(sem_input(
                 "Search",
                 &state.query,
-                text_input("Search name or key…", &state.query)
+                ui::input::input("Search name or key…", &state.query, &t)
                     .on_input(Message::SearchChanged)
-                    .font(SANS)
-                    .size(BODY)
-                    .padding([7, 10])
                     .width(Length::Fill),
             ))
             .width(Length::Fill)
@@ -822,6 +821,7 @@ fn pending_joins(
 }
 
 fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let valid = valid_public_key(&state.invitee_code).is_some();
     let revealing = state.in_flight.as_deref() == Some("invite");
     let reveal: Element<'a, Message> = if revealing {
@@ -851,11 +851,9 @@ fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
             sem_input(
                 "invitee join code (64 hex)",
                 &state.invitee_code,
-                text_input("invitee join code (64 hex)", &state.invitee_code)
+                ui::input::input("invitee join code (64 hex)", &state.invitee_code, &t)
                     .on_input(Message::InviteeCodeChanged)
                     .font(MONO)
-                    .size(LABEL)
-                    .padding([8, 9])
                     .width(Length::Fill),
             ),
             reveal,
@@ -968,6 +966,7 @@ fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
 }
 
 fn admit_card(state: &State, p: Palette) -> Element<'_, Message> {
+    let t = theme::ui_for(&p);
     let valid = valid_public_key(&state.joiner_key).is_some();
     let admitting = state.in_flight.as_deref() == Some("admit");
     let admit: Element<'_, Message> = if admitting {
@@ -989,11 +988,9 @@ fn admit_card(state: &State, p: Palette) -> Element<'_, Message> {
                 sem_input(
                     "Paste joiner public key…",
                     &state.joiner_key,
-                    text_input("Paste joiner public key…", &state.joiner_key)
+                    ui::input::input("Paste joiner public key…", &state.joiner_key, &t)
                         .on_input(Message::JoinerKeyChanged)
                         .font(MONO)
-                        .size(LABEL)
-                        .padding([8, 9])
                         .width(Length::Fill),
                 ),
                 admit,
@@ -1014,24 +1011,15 @@ fn member_list<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
         .filter(|member| member.matches(state.filter, &query))
         .collect();
     if visible.is_empty() {
-        return container(
-            column![
-                icons::view(Icon::Members, 26.0, p.icon_idle),
-                text(format!("No {} to show.", state.filter.empty_label()))
-                    .font(SANS)
-                    .size(TITLE)
-                    .color(p.muted_2),
-                text("This view only lists keys reported by the valset module.")
-                    .font(SANS)
-                    .size(LABEL)
-                    .color(p.muted_2),
-            ]
-            .spacing(6)
-            .align_x(Alignment::Center),
+        let t = theme::ui_for(&p);
+        return ui::empty_state::empty_state(
+            Some(icons::view(Icon::Members, 26.0, p.icon_idle).into()),
+            format!("No {} to show.", state.filter.empty_label()),
+            "This view only lists keys reported by the valset module.",
+            &t,
         )
-        .width(Length::Fill)
         .height(Length::Fill)
-        .center(Length::Fill)
+        .align_y(Alignment::Center)
         .into();
     }
 
@@ -1133,6 +1121,7 @@ fn member_row<'a>(
 ) -> Element<'a, Message> {
     let key = member.normalized_key();
     if state.rename_key.as_deref() == Some(key.as_str()) {
+        let t = theme::ui_for(&p);
         let rename_placeholder = short_key(&member.key);
         return container(
             row![
@@ -1140,12 +1129,9 @@ fn member_row<'a>(
                 sem_input(
                     "device key",
                     &state.rename_draft,
-                    text_input(&rename_placeholder, &state.rename_draft)
+                    ui::input::input(&rename_placeholder, &state.rename_draft, &t)
                         .on_input(Message::RenameChanged)
                         .on_submit(Message::CommitRename)
-                        .font(SANS)
-                        .size(BODY)
-                        .padding([7, 10])
                         .width(Length::Fill),
                 ),
                 filled_button("Save", Message::CommitRename, true, p),
@@ -1595,25 +1581,20 @@ fn working_pill(label: &'static str, p: Palette) -> Element<'static, Message> {
 }
 
 fn notice(copy: &'static str, p: Palette) -> Element<'static, Message> {
-    container(
-        row![
-            icons::view(Icon::Node, 15.0, p.amber),
-            text(copy).font(SANS).size(BODY).color(p.amber),
-        ]
-        .spacing(9)
-        .align_y(Alignment::Center),
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy).size(t.typography.sm),
+        ui::alert::AlertVariant::Warning,
+        &t,
     )
-    .width(Length::Fill)
-    .padding([11, 13])
-    .style(move |_| rounded_surface(p.sunken, p.amber, RADIUS_LG))
     .into()
 }
 
 fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
-    container(body)
+    let t = theme::ui_for(&p);
+    ui::surface::surface(body, ui::surface::SurfaceVariant::Card, &t)
         .width(Length::Fill)
         .padding([12, 13])
-        .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_LG))
         .into()
 }
 
@@ -1719,29 +1700,13 @@ fn outline_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(BODY))
-        .padding([7, 12])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if enabled && matches!(status, iced::widget::button::Status::Hovered) {
-                    p.titlebar
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: if enabled { p.ink_soft } else { p.muted_2 },
-            border: Border {
-                color: if enabled { p.border_strong } else { p.border_soft },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let control = if enabled {
-        control.on_press(message)
-    } else {
-        control
-    };
+    let t = theme::ui_for(&p);
+    let control = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
         .disabled(!enabled)
@@ -1756,23 +1721,12 @@ fn filled_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(BODY))
-        .padding([7, 12])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(if enabled { p.filled } else { p.sunken })),
-            text_color: if enabled { p.on_filled } else { p.muted_2 },
-            border: Border {
-                color: if enabled { p.filled } else { p.border_soft },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let control = if enabled {
-        control.on_press(message)
-    } else {
-        control
-    };
+    let t = theme::ui_for(&p);
+    let control = ui::button::button(label, &t)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
         .disabled(!enabled)
@@ -1787,22 +1741,13 @@ fn danger_button<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
-    let control = button(text(label).font(SANS).size(BODY))
-        .padding([7, 12])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(if enabled { p.danger } else { p.sunken })),
-            text_color: if enabled { p.paper } else { p.muted_2 },
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-    let control = if enabled {
-        control.on_press(message)
-    } else {
-        control
-    };
+    let t = theme::ui_for(&p);
+    let control = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Destructive)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
         .disabled(!enabled)
