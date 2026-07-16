@@ -23,9 +23,11 @@ fn live_listing() -> FileListing {
 fn fresh_shared_root_offers_the_first_folder() {
     // A brand-new chain answers "path not found" for /shared. The adapter
     // synthesizes an empty writeable listing instead of a dead error screen, so
-    // the network can create its very first directory.
+    // the network can create its very first directory. The string is the
+    // WRAPPED form the service layer actually delivers, parens and all —
+    // matching the raw module string here once masked a live failure.
     let mut state = State::default();
-    file_browser::loaded(&mut state, Err("files: path not found".into()));
+    file_browser::loaded(&mut state, Err("Module(files: path not found)".into()));
     assert!(
         matches!(&state.data, Resource::Ready(listing) if !listing.read_only),
         "a fresh /shared must be a writeable Ready listing"

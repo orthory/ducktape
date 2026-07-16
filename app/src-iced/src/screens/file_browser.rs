@@ -362,9 +362,12 @@ pub fn loaded(state: &mut State, result: Result<Option<FileListing>, String>) ->
         // creates it. That is an empty, writeable directory, not an error:
         // hard-erroring here bricked the whole tab on every new network
         // (mirrors the original app's DEFAULT_DIR && snapshot==null guard).
+        // `contains`, not `ends_with`: the service layer wraps the module
+        // error as `Module(files: path not found)` — a trailing paren the
+        // module's raw string doesn't have.
         Err(error)
             if state.columns.is_empty()
-                && error.ends_with("path not found")
+                && error.contains("path not found")
                 && snapshot(state).is_none() =>
         {
             let listing = FileListing {
@@ -1669,7 +1672,7 @@ mod tests {
     #[test]
     fn fresh_chain_missing_shared_root_is_empty_and_writeable() {
         let mut state = State::default();
-        loaded(&mut state, Err("files: path not found".into()));
+        loaded(&mut state, Err("Module(files: path not found)".into()));
         let Resource::Ready(listing) = &state.data else {
             panic!("expected a synthesized listing, got {:?}", state.data);
         };
@@ -1683,7 +1686,7 @@ mod tests {
     fn missing_path_below_a_loaded_root_stays_an_error() {
         let mut state = State::default();
         loaded(&mut state, Ok(Some(listing("/shared", None))));
-        loaded(&mut state, Err("files: path not found".into()));
+        loaded(&mut state, Err("Module(files: path not found)".into()));
         assert!(state.error.is_some(), "a real miss must surface, not vanish");
     }
 
