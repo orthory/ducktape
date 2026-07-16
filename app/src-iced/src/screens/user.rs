@@ -3,11 +3,12 @@
 //! Views are intentionally transport-free. [`update`] emits a typed
 //! [`Command`]; the host performs it and returns a [`ServiceEvent`].
 
-use iced::widget::{Space, button, column, container, row, text, text_input};
-use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
+use iced::widget::{Space, column, container, row, text, text_input};
+use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS};
+use crate::theme::{self, MONO, Palette, RADIUS_LG, SANS};
+use crate::ui;
 use crate::view_api::DropToken;
 #[cfg(test)]
 use crate::view_api::LinkResponse;
@@ -817,26 +818,13 @@ pub(super) fn danger_outline<'a>(
     message: Message,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let label = label.to_string();
-    let btn = button(text(label.clone()).font(SANS).size(12))
-        .padding([7, 10])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    p.danger_soft
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: p.danger,
-            border: Border {
-                color: p.danger_border,
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        })
-        .on_press(message);
+    let btn = ui::button::button(label.clone(), &t)
+        .variant(ui::button::ButtonVariant::DestructiveOutline)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -853,22 +841,11 @@ pub(super) fn center_state<'a>(
     icon: Icon,
     p: Palette,
 ) -> Element<'a, Message> {
-    container(
-        column![
-            icon_tile(icon, 42.0, p),
-            text(title).font(SANS).size(14).color(p.muted_3),
-            text(detail).font(SANS).size(11.5).color(p.muted_2)
-        ]
-        .spacing(9)
-        .align_x(Alignment::Center)
-        .max_width(360),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .align_x(Alignment::Center)
-    .align_y(Alignment::Center)
-    .padding(24)
-    .into()
+    let t = theme::ui_for(&p);
+    ui::empty_state::empty_state(Some(icon_tile(icon, 42.0, p)), title, detail, &t)
+        .height(Length::Fill)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 pub(super) fn error_state<'a>(
@@ -900,31 +877,13 @@ pub(super) fn card<'a>(
     content: impl Into<Element<'a, Message>>,
     p: Palette,
 ) -> Element<'a, Message> {
-    container(content)
+    let t = theme::ui_for(&p);
+    // ponytail: toolkit card padding (24) is too airy for these dense panels;
+    // keep 15 on the toolkit Card surface until a density token exists.
+    ui::surface::surface(content, ui::surface::SurfaceVariant::Card, &t)
         .width(Length::Fill)
         .padding(15)
-        .style(move |_| card_style(p))
         .into()
-}
-
-fn card_style(p: Palette) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        background: Some(Background::Color(p.paper)),
-        border: Border {
-            color: p.border,
-            width: 1.0,
-            radius: RADIUS_LG.into(),
-        },
-        shadow: Shadow {
-            color: Color {
-                a: 0.05,
-                ..Color::from_rgb8(40, 38, 34)
-            },
-            offset: Vector::new(0.0, 1.0),
-            blur_radius: 2.0,
-        },
-        ..Default::default()
-    }
 }
 
 pub(super) fn surface(color: Color) -> iced::widget::container::Style {
@@ -975,27 +934,8 @@ pub(super) fn field_enabled<'a>(
     enabled: bool,
     p: Palette,
 ) -> iced::widget::TextInput<'a, Message> {
-    text_input(placeholder, value)
-        .on_input_maybe(enabled.then_some(on_input))
-        .padding([8, 10])
-        .size(12.5)
-        .font(SANS)
-        .style(move |_, status| iced::widget::text_input::Style {
-            background: Background::Color(p.sunken),
-            border: Border {
-                color: if matches!(status, iced::widget::text_input::Status::Focused { .. }) {
-                    theme::ACCENTS[0]
-                } else {
-                    p.border_strong
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            icon: p.muted,
-            placeholder: p.muted_2,
-            value: p.ink,
-            selection: theme::ACCENTS[0],
-        })
+    let t = theme::ui_for(&p);
+    ui::input::input(placeholder, value, &t).on_input_maybe(enabled.then_some(on_input))
 }
 
 pub(super) fn plain_input<'a>(
@@ -1042,34 +982,14 @@ pub(super) fn outline_enabled<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(12))
-        .padding([7, 10])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if enabled && matches!(status, iced::widget::button::Status::Hovered) {
-                    p.hover
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: if enabled { p.ink_soft } else { p.muted_2 },
-            border: Border {
-                color: if enabled {
-                    p.border_strong
-                } else {
-                    p.border_soft
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let button = if enabled {
-        button.on_press(message)
-    } else {
-        button
-    };
+    let button = ui::button::button(label.clone(), &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
         .disabled(!enabled)
@@ -1084,32 +1004,13 @@ pub(super) fn filled<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(12.5))
+    let button = ui::button::button(label.clone(), &t)
         .width(Length::Fill)
-        .padding([8, 13])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(if enabled {
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    p.ink_soft
-                } else {
-                    p.filled
-                }
-            } else {
-                p.border_soft
-            })),
-            text_color: if enabled { p.on_filled } else { p.muted_2 },
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-    let button = if enabled {
-        button.on_press(message)
-    } else {
-        button
-    };
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
         .disabled(!enabled)
@@ -1144,55 +1045,34 @@ pub(super) fn section_header(
     content.into()
 }
 pub(super) fn divider(p: Palette) -> Element<'static, Message> {
-    container(Space::new().height(1))
-        .width(Length::Fill)
-        .style(move |_| surface(p.border))
-        .into()
+    ui::separator::horizontal(&theme::ui_for(&p)).into()
 }
 pub(super) fn notice<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.muted))
-        .width(Length::Fill)
-        .padding([10, 13])
-        .style(move |_| iced::widget::container::Style {
-            background: Some(Background::Color(p.sunken)),
-            border: Border {
-                color: p.border,
-                width: 1.0,
-                radius: RADIUS_MD.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy).size(t.typography.sm).color(t.palette.muted_foreground),
+        ui::alert::AlertVariant::Default,
+        &t,
+    )
+    .into()
 }
 pub(super) fn notice_owned(copy: String, p: Palette) -> Element<'static, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.muted))
-        .width(Length::Fill)
-        .padding([10, 13])
-        .style(move |_| iced::widget::container::Style {
-            background: Some(Background::Color(p.sunken)),
-            border: Border {
-                color: p.border,
-                width: 1.0,
-                radius: RADIUS_MD.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy).size(t.typography.sm).color(t.palette.muted_foreground),
+        ui::alert::AlertVariant::Default,
+        &t,
+    )
+    .into()
 }
 pub(super) fn error_banner<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(12).color(p.danger))
-        .width(Length::Fill)
-        .padding([10, 16])
-        .style(move |_| iced::widget::container::Style {
-            background: Some(Background::Color(p.danger_soft)),
-            border: Border {
-                color: p.danger_border,
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy).size(t.typography.sm),
+        ui::alert::AlertVariant::Destructive,
+        &t,
+    )
+    .into()
 }
 
 pub(super) fn avatar(name: &str, size: f32, p: Palette) -> Element<'static, Message> {

@@ -180,6 +180,18 @@ pub const fn ui(mode: Mode, accent: Color) -> crate::ui::theme::Theme {
     .with_accent(accent)
 }
 
+/// Toolkit tokens for view code that only has a `Palette` in scope. The focus
+/// ring keeps the default accent — matching the hardcoded `ACCENTS[0]` those
+/// helpers already used; plumb `ui(mode, accent)` where the real accent exists.
+pub fn ui_for(p: &Palette) -> crate::ui::theme::Theme {
+    let mode = if p.paper == DARK.paper {
+        Mode::Dark
+    } else {
+        Mode::Light
+    };
+    ui(mode, ACCENTS[0])
+}
+
 pub fn iced_theme(mode: Mode, accent: Color) -> Theme {
     let p = palette(mode);
     Theme::custom(

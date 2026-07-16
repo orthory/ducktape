@@ -1,3 +1,5 @@
+// local fork: adds DestructiveOutline — Ducktape's soft outlined danger action
+// (destructive text/border on the surface color, tinted on hover).
 use super::theme::{Theme, alpha, mix};
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::text::IntoFragment;
@@ -9,6 +11,7 @@ pub enum ButtonVariant {
     #[default]
     Default,
     Destructive,
+    DestructiveOutline,
     Outline,
     Secondary,
     Ghost,
@@ -167,6 +170,12 @@ pub fn style(
             palette.secondary,
             0.0,
         ),
+        ButtonVariant::DestructiveOutline => (
+            None,
+            palette.destructive,
+            mix(palette.destructive, palette.background, 0.45),
+            1.0,
+        ),
         ButtonVariant::Outline => (None, palette.foreground, palette.input, 1.0),
         ButtonVariant::Ghost => (None, palette.foreground, Color::TRANSPARENT, 0.0),
         ButtonVariant::Link => (None, palette.primary, Color::TRANSPARENT, 0.0),
@@ -174,6 +183,9 @@ pub fn style(
 
     match status {
         iced_button::Status::Hovered => match variant {
+            ButtonVariant::DestructiveOutline => {
+                background = Some(mix(palette.background, palette.destructive, 0.06));
+            }
             ButtonVariant::Outline | ButtonVariant::Ghost => {
                 background = Some(palette.accent);
                 foreground = palette.accent_foreground;
@@ -182,6 +194,9 @@ pub fn style(
             _ => background = background.map(|color| mix(color, foreground, 0.08)),
         },
         iced_button::Status::Pressed => match variant {
+            ButtonVariant::DestructiveOutline => {
+                background = Some(mix(palette.background, palette.destructive, 0.12));
+            }
             ButtonVariant::Outline | ButtonVariant::Ghost => {
                 background = Some(mix(palette.accent, palette.foreground, 0.08));
                 foreground = palette.accent_foreground;
