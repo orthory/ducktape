@@ -18,7 +18,9 @@
 //! the sim lane (`src/shell/sim/`, `cargo test -p ducktape-iced shell::sim`).
 
 mod chat;
+mod governance;
 mod harness;
+mod members;
 mod onboarding;
 mod settings;
 mod terminal;
