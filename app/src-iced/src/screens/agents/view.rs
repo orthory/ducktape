@@ -3,7 +3,7 @@
 use std::ops::Deref;
 
 use iced::widget::{
-    Button, Space, button, checkbox, column, container, row, scrollable, text, text_input,
+    Space, button, checkbox, column, container, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
 
@@ -152,7 +152,7 @@ fn roster<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'a, M
 
 fn roster_row(agent: &AgentRecord, selected: bool, p: Colors) -> Element<'static, Message> {
     let active = agent.status == AgentStatus::Active;
-    button(
+    let select = button(
         row![
             avatar(&agent.display_name, 36.0, p.filled, p.on_filled, p),
             column![
@@ -194,8 +194,15 @@ fn roster_row(agent: &AgentRecord, selected: bool, p: Colors) -> Element<'static
         },
         ..Default::default()
     })
-    .on_press(Message::SelectAgent(agent.id.clone()))
-    .into()
+    .on_press(Message::SelectAgent(agent.id.clone()));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        agent.display_name.clone(),
+        select,
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    select.into()
 }
 
 fn detail_pane<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'a, Message> {
@@ -431,14 +438,22 @@ fn skill_editor(state: &State, p: Colors) -> Element<'_, Message> {
     }
     skills = skills.push(
         row![
-            text_input("Skill name", &draft.skill_name)
-                .font(SANS)
-                .size(11.5)
-                .on_input(Message::SkillNameChanged),
-            text_input("/skills/name", &draft.skill_prefix)
-                .font(MONO)
-                .size(11.5)
-                .on_input(Message::SkillPrefixChanged),
+            sem_input(
+                "Skill name",
+                &draft.skill_name,
+                text_input("Skill name", &draft.skill_name)
+                    .font(SANS)
+                    .size(11.5)
+                    .on_input(Message::SkillNameChanged),
+            ),
+            sem_input(
+                "Skill prefix",
+                &draft.skill_prefix,
+                text_input("/skills/name", &draft.skill_prefix)
+                    .font(MONO)
+                    .size(11.5)
+                    .on_input(Message::SkillPrefixChanged),
+            ),
             secondary_button(
                 if draft.skill_load == LoadMode::Always {
                     "Always"
@@ -1406,8 +1421,8 @@ fn header_tab(
     tab: Tab,
     active: Tab,
     p: Colors,
-) -> Button<'static, Message> {
-    button(
+) -> Element<'static, Message> {
+    let btn = button(
         row![
             text(label).font(SANS_SEMIBOLD).size(12),
             container(text(count).font(MONO).size(10).color(if tab == active {
@@ -1448,7 +1463,11 @@ fn header_tab(
         },
         ..Default::default()
     })
-    .on_press(Message::SelectTab(tab))
+    .on_press(Message::SelectTab(tab));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn segment_button(
@@ -1456,8 +1475,8 @@ fn segment_button(
     policy: WatchPolicyKind,
     active: WatchPolicyKind,
     p: Colors,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(10.5))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(10.5))
         .padding([6, 9])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if policy == active {
@@ -1481,7 +1500,11 @@ fn segment_button(
             },
             ..Default::default()
         })
-        .on_press(Message::WatchPolicyChanged(policy))
+        .on_press(Message::WatchPolicyChanged(policy));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn filter_button(
@@ -1489,8 +1512,8 @@ fn filter_button(
     filter: RunFilter,
     active: RunFilter,
     p: Colors,
-) -> Button<'static, Message> {
-    button(text(label).font(SANS_SEMIBOLD).size(11))
+) -> Element<'static, Message> {
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
         .padding([5, 10])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if filter == active {
@@ -1510,7 +1533,11 @@ fn filter_button(
             },
             ..Default::default()
         })
-        .on_press(Message::SelectRunFilter(filter))
+        .on_press(Message::SelectRunFilter(filter));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn capability_strip(capability: &str, p: Colors) -> Element<'static, Message> {
@@ -1557,6 +1584,27 @@ fn policy_text(policy: &TurnPolicy, data: &AgentData) -> String {
     }
 }
 
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn labeled_input<'a>(
     label: &'static str,
     placeholder: &'a str,
@@ -1566,10 +1614,14 @@ fn labeled_input<'a>(
 ) -> Element<'a, Message> {
     column![
         section_label(label, p),
-        text_input(placeholder, value)
-            .font(SANS)
-            .size(12.5)
-            .on_input(on_input)
+        sem_input(
+            label,
+            value,
+            text_input(placeholder, value)
+                .font(SANS)
+                .size(12.5)
+                .on_input(on_input),
+        )
     ]
     .spacing(5)
     .width(Length::Fill)
@@ -1585,10 +1637,14 @@ fn labeled_mono_input<'a>(
 ) -> Element<'a, Message> {
     column![
         section_label(label, p),
-        text_input(placeholder, value)
-            .font(MONO)
-            .size(12.5)
-            .on_input(on_input)
+        sem_input(
+            label,
+            value,
+            text_input(placeholder, value)
+                .font(MONO)
+                .size(12.5)
+                .on_input(on_input),
+        )
     ]
     .spacing(5)
     .width(Length::Fill)
@@ -1778,9 +1834,9 @@ fn secondary_button(
     label: &'static str,
     message: Option<Message>,
     p: Colors,
-) -> Button<'static, Message> {
+) -> Element<'static, Message> {
     let enabled = message.is_some();
-    button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
         .padding([7, 12])
         .style(move |_, status| button::Style {
             background: Some(Background::Color(
@@ -1798,7 +1854,13 @@ fn secondary_button(
             },
             ..Default::default()
         })
-        .on_press_maybe(message)
+        .on_press_maybe(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn run_link_button(
@@ -1806,8 +1868,9 @@ fn run_link_button(
     message: Message,
     tone: Color,
     p: Colors,
-) -> Button<'static, Message> {
-    button(text(label).font(MONO).size(10.5))
+) -> Element<'static, Message> {
+    let _name = label.clone();
+    let btn = button(text(label).font(MONO).size(10.5))
         .padding([2, 7])
         .style(move |_, status| button::Style {
             background: Some(Background::Color(
@@ -1825,16 +1888,20 @@ fn run_link_button(
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, _name, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn primary_button(
     label: &'static str,
     message: Option<Message>,
     p: Colors,
-) -> Button<'static, Message> {
+) -> Element<'static, Message> {
     let enabled = message.is_some();
-    button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
         .padding([7, 12])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if enabled { p.accent } else { p.chip })),
@@ -1855,16 +1922,22 @@ fn primary_button(
             },
             ..Default::default()
         })
-        .on_press_maybe(message)
+        .on_press_maybe(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn on_dark_button(
     label: &'static str,
     message: Option<Message>,
     p: Colors,
-) -> Button<'static, Message> {
+) -> Element<'static, Message> {
     let enabled = message.is_some();
-    button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
         .padding([7, 12])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(mix(p.filled, p.on_filled, 0.07))),
@@ -1880,7 +1953,13 @@ fn on_dark_button(
             },
             ..Default::default()
         })
-        .on_press_maybe(message)
+        .on_press_maybe(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn surface(color: Color) -> container::Style {

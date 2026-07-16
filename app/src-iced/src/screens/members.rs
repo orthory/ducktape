@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use iced::widget::{
-    Button, Space, button, column, container, image, row, scrollable, text, text_input,
+    Space, button, column, container, image, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
@@ -649,12 +649,16 @@ fn filter_bar(state: &State, p: Palette) -> Element<'_, Message> {
         row![
             filters,
             Space::new().width(Length::Fill),
-            text_input("Search name or key…", &state.query)
-                .on_input(Message::SearchChanged)
-                .font(SANS)
-                .size(11.5)
-                .padding([7, 10])
-                .width(260),
+            sem_input(
+                "Search",
+                &state.query,
+                text_input("Search name or key…", &state.query)
+                    .on_input(Message::SearchChanged)
+                    .font(SANS)
+                    .size(11.5)
+                    .padding([7, 10])
+                    .width(260),
+            ),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
@@ -772,12 +776,16 @@ fn invite_card<'a>(state: &'a State, data: &'a MembersData, p: Palette) -> Eleme
             .size(10.5)
             .color(p.muted_2),
         row![
-            text_input("invitee join code (64 hex)", &state.invitee_code)
-                .on_input(Message::InviteeCodeChanged)
-                .font(MONO)
-                .size(10.5)
-                .padding([8, 9])
-                .width(Length::Fill),
+            sem_input(
+                "invitee join code (64 hex)",
+                &state.invitee_code,
+                text_input("invitee join code (64 hex)", &state.invitee_code)
+                    .on_input(Message::InviteeCodeChanged)
+                    .font(MONO)
+                    .size(10.5)
+                    .padding([8, 9])
+                    .width(Length::Fill),
+            ),
             filled_button(
                 reveal_label,
                 Message::RevealInvite,
@@ -866,12 +874,16 @@ fn admit_card(state: &State, p: Palette) -> Element<'_, Message> {
                 .size(10.5)
                 .color(p.muted_2),
             row![
-                text_input("Paste joiner public key…", &state.joiner_key)
-                    .on_input(Message::JoinerKeyChanged)
-                    .font(MONO)
-                    .size(11)
-                    .padding([8, 9])
-                    .width(Length::Fill),
+                sem_input(
+                    "Paste joiner public key…",
+                    &state.joiner_key,
+                    text_input("Paste joiner public key…", &state.joiner_key)
+                        .on_input(Message::JoinerKeyChanged)
+                        .font(MONO)
+                        .size(11)
+                        .padding([8, 9])
+                        .width(Length::Fill),
+                ),
                 outline_button("Admit", Message::AdmitJoiner, valid && !state.busy, p,),
             ]
             .spacing(8)
@@ -1012,13 +1024,17 @@ fn member_row<'a>(
         return container(
             row![
                 avatar(member, 32.0, p),
-                text_input("device key", &state.rename_draft)
-                    .on_input(Message::RenameChanged)
-                    .on_submit(Message::CommitRename)
-                    .font(SANS)
-                    .size(13.5)
-                    .padding([7, 10])
-                    .width(Length::Fill),
+                sem_input(
+                    "device key",
+                    &state.rename_draft,
+                    text_input("device key", &state.rename_draft)
+                        .on_input(Message::RenameChanged)
+                        .on_submit(Message::CommitRename)
+                        .font(SANS)
+                        .size(13.5)
+                        .padding([7, 10])
+                        .width(Length::Fill),
+                ),
                 filled_button("Save", Message::CommitRename, true, p),
                 bare_button("×", Message::CancelRename, p),
             ]
@@ -1097,6 +1113,12 @@ fn member_row<'a>(
         ..Default::default()
     })
     .on_press(Message::Select(member.key.clone()));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let open = iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        member.display_name.clone(),
+        open,
+    );
 
     let mut line = row![open].align_y(Alignment::Center);
     if member.is_local && member.bound_account.is_some() {
@@ -1408,13 +1430,34 @@ fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Me
         .into()
 }
 
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn segment_button<'a>(
     label: &'a str,
     active: bool,
     message: Message,
     p: Palette,
-) -> Button<'a, Message> {
-    button(text(label).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let btn = button(text(label).font(SANS).size(11.5))
         .padding([5, 11])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.chip } else { p.paper })),
@@ -1425,14 +1468,22 @@ fn segment_button<'a>(
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
-fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Button<'a, Message> {
-    button(text(label).font(SANS).size(11.5).color(p.muted_3))
+fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
+    let btn = button(text(label).font(SANS).size(11.5).color(p.muted_3))
         .padding(6)
         .style(|_, _| iced::widget::button::Style::default())
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn outline_button<'a>(
@@ -1440,7 +1491,7 @@ fn outline_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let control = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, status| iced::widget::button::Style {
@@ -1459,11 +1510,17 @@ fn outline_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let control = if enabled {
         control.on_press(message)
     } else {
         control
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    control.into()
 }
 
 fn filled_button<'a>(
@@ -1471,7 +1528,7 @@ fn filled_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let control = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
@@ -1484,11 +1541,17 @@ fn filled_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let control = if enabled {
         control.on_press(message)
     } else {
         control
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    control.into()
 }
 
 fn danger_button<'a>(
@@ -1496,7 +1559,7 @@ fn danger_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let control = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
@@ -1508,11 +1571,17 @@ fn danger_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let control = if enabled {
         control.on_press(message)
     } else {
         control
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    control.into()
 }
 
 fn valid_public_key(value: &str) -> Option<String> {

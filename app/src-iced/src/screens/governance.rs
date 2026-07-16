@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use iced::widget::{
-    Button, Space, button, column, container, row, scrollable, text, text_editor, text_input,
+    Space, button, column, container, row, scrollable, text, text_editor, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length};
 
@@ -1071,18 +1071,26 @@ fn shares_panel<'a>(
             .push(text(allocations).font(MONO).size(10.5).color(p.ink_soft))
             .push(
                 row![
-                    text_input("Account hex", &state.share_account)
-                        .on_input(Message::ShareAccountChanged)
-                        .font(MONO)
-                        .size(10.5)
-                        .padding([7, 8])
-                        .width(Length::Fill),
-                    text_input("Shares (0 removes)", &state.share_value)
-                        .on_input(Message::ShareValueChanged)
-                        .font(MONO)
-                        .size(10.5)
-                        .padding([7, 8])
-                        .width(145),
+                    sem_input(
+                        "Account hex",
+                        &state.share_account,
+                        text_input("Account hex", &state.share_account)
+                            .on_input(Message::ShareAccountChanged)
+                            .font(MONO)
+                            .size(10.5)
+                            .padding([7, 8])
+                            .width(Length::Fill),
+                    ),
+                    sem_input(
+                        "Shares (0 removes)",
+                        &state.share_value,
+                        text_input("Shares (0 removes)", &state.share_value)
+                            .on_input(Message::ShareValueChanged)
+                            .font(MONO)
+                            .size(10.5)
+                            .padding([7, 8])
+                            .width(145),
+                    ),
                     filled_button("Propose change", Message::ProposeSetShares, can, p),
                 ]
                 .spacing(8),
@@ -1112,13 +1120,17 @@ fn proposal_form<'a>(
                 .size(10.5)
                 .color(p.muted_2),
                 row![
-                    text_input("Describe what the set should signal…", &state.signal_text)
-                        .on_input(Message::SignalChanged)
-                        .on_submit(Message::ProposeSignal)
-                        .font(SANS)
-                        .size(11.5)
-                        .padding([8, 9])
-                        .width(Length::Fill),
+                    sem_input(
+                        "Signal",
+                        &state.signal_text,
+                        text_input("Describe what the set should signal…", &state.signal_text)
+                            .on_input(Message::SignalChanged)
+                            .on_submit(Message::ProposeSignal)
+                            .font(SANS)
+                            .size(11.5)
+                            .padding([8, 9])
+                            .width(Length::Fill),
+                    ),
                     filled_button("Propose", Message::ProposeSignal, can, p),
                 ]
                 .spacing(8),
@@ -1253,30 +1265,42 @@ fn upgrade_panel<'a>(
                         .size(10.5)
                         .color(p.muted_2),
                         row![
-                            text_input("Upgrade name", &state.upgrade_name)
-                                .on_input(Message::UpgradeNameChanged)
-                                .font(SANS)
-                                .size(11.5)
-                                .padding([8, 9])
-                                .width(Length::Fill),
-                            text_input(
-                                &format!("Target version (> {})", upgrade.current_version),
+                            sem_input(
+                                "Upgrade name",
+                                &state.upgrade_name,
+                                text_input("Upgrade name", &state.upgrade_name)
+                                    .on_input(Message::UpgradeNameChanged)
+                                    .font(SANS)
+                                    .size(11.5)
+                                    .padding([8, 9])
+                                    .width(Length::Fill),
+                            ),
+                            sem_input(
+                                "Target version",
                                 &state.upgrade_version,
-                            )
-                            .on_input(Message::UpgradeVersionChanged)
-                            .font(MONO)
-                            .size(11)
-                            .padding([8, 9])
-                            .width(165),
-                            text_input(
-                                &format!("Activation height (> {})", data.current_height),
+                                text_input(
+                                    &format!("Target version (> {})", upgrade.current_version),
+                                    &state.upgrade_version,
+                                )
+                                .on_input(Message::UpgradeVersionChanged)
+                                .font(MONO)
+                                .size(11)
+                                .padding([8, 9])
+                                .width(165),
+                            ),
+                            sem_input(
+                                "Activation height",
                                 &state.upgrade_height,
-                            )
-                            .on_input(Message::UpgradeHeightChanged)
-                            .font(MONO)
-                            .size(11)
-                            .padding([8, 9])
-                            .width(185),
+                                text_input(
+                                    &format!("Activation height (> {})", data.current_height),
+                                    &state.upgrade_height,
+                                )
+                                .on_input(Message::UpgradeHeightChanged)
+                                .font(MONO)
+                                .size(11)
+                                .padding([8, 9])
+                                .width(185),
+                            ),
                             filled_button(
                                 "Propose",
                                 Message::ProposeScheduleUpgrade,
@@ -1607,13 +1631,34 @@ fn pill(label: impl ToString, tone: Color, p: Palette) -> Element<'static, Messa
         .into()
 }
 
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
 fn segment_button<'a>(
     label: &'a str,
     active: bool,
     message: Message,
     p: Palette,
-) -> Button<'a, Message> {
-    button(text(label).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let btn = button(text(label).font(SANS).size(11.5))
         .padding([5, 11])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(if active { p.chip } else { p.paper })),
@@ -1624,7 +1669,11 @@ fn segment_button<'a>(
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn outline_button<'a>(
@@ -1632,7 +1681,7 @@ fn outline_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let control = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, status| iced::widget::button::Style {
@@ -1651,11 +1700,17 @@ fn outline_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let control = if enabled {
         control.on_press(message)
     } else {
         control
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    control.into()
 }
 
 fn filled_button<'a>(
@@ -1663,7 +1718,7 @@ fn filled_button<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let control = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
@@ -1676,11 +1731,17 @@ fn filled_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let control = if enabled {
         control.on_press(message)
     } else {
         control
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    control.into()
 }
 
 fn vote_button<'a>(
@@ -1690,7 +1751,7 @@ fn vote_button<'a>(
     enabled: bool,
     tone: Color,
     p: Palette,
-) -> Button<'a, Message> {
+) -> Element<'a, Message> {
     let control = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
@@ -1707,11 +1768,17 @@ fn vote_button<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let control = if enabled {
         control.on_press(message)
     } else {
         control
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, control)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    control.into()
 }
 
 fn valid_hex(value: &str) -> Option<String> {
