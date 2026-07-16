@@ -162,16 +162,23 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
         Resource::Ready(blocks) => format!("{} blocks", blocks.len()),
         _ => "—".into(),
     };
+    // Unified node-section header idiom (§4.1): 56px paper bar, TITLE title in
+    // semibold, mono CAPTION count beside it, bottom rule. Matches Modules/
+    // Gateway's `screen_header` so the whole rail reads as one system.
     let header = container(
         row![
-            text("Explorer").font(SANS).size(13).color(p.ink),
+            text("Explorer")
+                .font(SANS_SEMIBOLD)
+                .size(theme::TITLE)
+                .color(p.ink),
+            text(count).font(MONO).size(theme::CAPTION).color(p.muted_2),
             Space::new().width(Length::Fill),
-            text(count).font(MONO).size(11).color(p.muted),
         ]
+        .spacing(10)
         .align_y(Alignment::Center),
     )
     .height(56)
-    .padding([0, 17])
+    .padding([0, 22])
     .align_y(Alignment::Center)
     .style(move |_| bottom_rule(p.paper, p.border_soft));
 
