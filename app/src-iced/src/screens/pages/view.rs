@@ -15,6 +15,7 @@ use super::{
 };
 use crate::icons::{self, Icon};
 use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS, SANS_SEMIBOLD};
+use crate::ui;
 use crate::view_api::Resource;
 
 const PAGES_RAIL_WIDTH: f32 = 224.0;
@@ -1151,25 +1152,13 @@ fn doc_tabs(data: &PagesData, p: Palette) -> Element<'static, Message> {
 }
 
 fn no_page(p: Palette) -> Element<'static, Message> {
-    container(
-        column![
-            icon_tile(Icon::Pages, 42.0, p),
-            text("No page open")
-                .font(SANS_SEMIBOLD)
-                .size(theme::BODY_LG)
-                .color(p.ink),
-            text("Pick a page from the rail, or create one to start writing.")
-                .font(SANS)
-                .size(theme::BODY)
-                .color(p.muted),
-        ]
-        .spacing(6)
-        .align_x(Alignment::Center)
-        .max_width(330),
+    ui::empty_state::empty_state(
+        Some(icon_tile(Icon::Pages, 42.0, p)),
+        "No page open",
+        "Pick a page from the rail, or create one to start writing.",
+        &theme::ui_for(&p),
     )
-    .width(Length::Fill)
     .height(Length::Fill)
-    .align_x(Alignment::Center)
     .align_y(Alignment::Center)
     .into()
 }
@@ -1251,27 +1240,7 @@ fn field<'a>(
     on_input: impl Fn(String) -> Message + 'a,
     p: Palette,
 ) -> iced::widget::TextInput<'a, Message> {
-    text_input(placeholder, value)
-        .on_input(on_input)
-        .padding([6, 9])
-        .size(theme::BODY)
-        .font(SANS)
-        .style(move |_, status| iced::widget::text_input::Style {
-            background: Background::Color(p.sunken),
-            border: Border {
-                color: if matches!(status, iced::widget::text_input::Status::Focused { .. }) {
-                    theme::ACCENTS[0]
-                } else {
-                    p.border_strong
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            icon: p.muted,
-            placeholder: p.muted_2,
-            value: p.ink,
-            selection: theme::ACCENTS[0],
-        })
+    ui::input::input(placeholder, value, &theme::ui_for(&p)).on_input(on_input)
 }
 
 fn plain_input<'a>(
@@ -1326,34 +1295,14 @@ fn outline_enabled<'a>(
     enabled: bool,
     p: Palette,
 ) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(theme::LABEL))
-        .padding([6, 9])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if enabled && matches!(status, iced::widget::button::Status::Hovered) {
-                    p.hover
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: if enabled { p.ink_soft } else { p.muted_2 },
-            border: Border {
-                color: if enabled {
-                    p.border_strong
-                } else {
-                    p.border_soft
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
-    let button = if enabled {
-        button.on_press(message)
-    } else {
-        button
-    };
+    let button = ui::button::button(label.clone(), &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
         .disabled(!enabled)
@@ -1365,26 +1314,13 @@ fn outline_enabled<'a>(
 /// Neutral-destructive button in the danger triad (danger ink / danger-soft
 /// hover / danger-border), for `Delete page` and the block actions menu.
 fn danger_outline<'a>(label: impl ToString, message: Message, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let label = label.to_string();
-    let btn = button(text(label.clone()).font(SANS).size(theme::LABEL))
-        .padding([6, 9])
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    p.danger_soft
-                } else {
-                    p.paper
-                },
-            )),
-            text_color: p.danger,
-            border: Border {
-                color: p.danger_border,
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        })
-        .on_press(message);
+    let btn = ui::button::button(label.clone(), &t)
+        .variant(ui::button::ButtonVariant::DestructiveOutline)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -1397,18 +1333,11 @@ fn destructive_confirmation(
     cancel: Message,
     p: Palette,
 ) -> Element<'static, Message> {
-    let delete = button(text("Delete").font(SANS_SEMIBOLD).size(theme::LABEL))
-        .padding([6, 12])
-        .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(p.danger)),
-            text_color: Color::WHITE,
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .on_press(confirm);
+    let delete = ui::button::button("Delete", &theme::ui_for(&p))
+        .variant(ui::button::ButtonVariant::Destructive)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(confirm)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     let delete = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Delete", delete);
     container(
@@ -1518,24 +1447,31 @@ fn avatar(name: &str, size: f32, p: Palette) -> Element<'static, Message> {
 }
 
 fn divider(p: Palette) -> Element<'static, Message> {
-    container(Space::new().height(1))
-        .width(Length::Fill)
-        .style(move |_| panel(p.border_soft, Color::TRANSPARENT))
-        .into()
+    ui::separator::horizontal(&theme::ui_for(&p)).into()
 }
 
 fn notice<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(theme::BODY).color(p.muted))
-        .padding(9)
-        .style(move |_| soft_panel(p.sunken, p.border_soft, RADIUS_SM))
-        .into()
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy)
+            .size(t.typography.sm)
+            .color(t.palette.muted_foreground),
+        ui::alert::AlertVariant::Default,
+        &t,
+    )
+    .into()
 }
 
 fn notice_owned(copy: String, p: Palette) -> Element<'static, Message> {
-    container(text(copy).font(SANS).size(theme::BODY).color(p.muted))
-        .padding(9)
-        .style(move |_| soft_panel(p.sunken, p.border_soft, RADIUS_SM))
-        .into()
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
+        text(copy)
+            .size(t.typography.sm)
+            .color(t.palette.muted_foreground),
+        ui::alert::AlertVariant::Default,
+        &t,
+    )
+    .into()
 }
 
 /// Page error — selectable, so the user can copy exactly what went wrong.
