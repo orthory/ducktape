@@ -24,6 +24,8 @@ pub enum Icon {
     Moon,
     Node,
     Pages,
+    Plus,
+    Refresh,
     Sandbox,
     Search,
     Settings,
@@ -75,6 +77,10 @@ impl Icon {
                 "<circle cx='12' cy='5' r='3'/><circle cx='5' cy='19' r='3'/><circle cx='19' cy='19' r='3'/><path d='m10.5 7.5-4 8M13.5 7.5l4 8M8 19h8'/>"
             }
             Self::Pages => "<path d='M5 3h10l4 4v14H5Z'/><path d='M15 3v5h4M8 12h8M8 16h8'/>",
+            Self::Plus => "<path d='M12 5v14M5 12h14'/>",
+            Self::Refresh => {
+                "<path d='M21 12a9 9 0 1 1-2.6-6.4L21 8'/><path d='M21 3v5h-5'/>"
+            }
             Self::Sandbox => "<path d='m12 2 9 5-9 5-9-5Z'/><path d='m3 12 9 5 9-5M3 17l9 5 9-5'/>",
             Self::Search => "<circle cx='11' cy='11' r='7'/><path d='m20 20-4-4'/>",
             Self::Settings => {

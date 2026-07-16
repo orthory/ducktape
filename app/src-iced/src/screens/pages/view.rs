@@ -9,16 +9,23 @@ use iced::{Alignment, Background, Border, Color, Element, Length};
 
 use super::{
     BlockKind, BlockMove, CommentTarget, EditorState, InlineMark, Message, PageBlock,
-    PageCommentThread, PageDocument, PageMeta, PagesData, State, block_descendant_count,
-    block_hidden_by_collapse, block_kind_label, block_placeholder, byte_for_utf16,
-    editor_selection_utf16, next_block_kind, page_block_input_id, slash_options,
+    PageCommentThread, PageDocument, PageMeta, PagePresence, PagesData, State, all_block_kinds,
+    block_descendant_count, block_hidden_by_collapse, block_kind_label, block_placeholder,
+    byte_for_utf16, editor_selection_utf16, page_block_input_id, slash_options,
 };
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_SM, SANS};
+use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS, SANS_SEMIBOLD};
 use crate::view_api::Resource;
 
 const PAGES_RAIL_WIDTH: f32 = 224.0;
 const DOC_COLUMN_MAX: f32 = 780.0;
+/// Per-depth indent of a block, matching the reducer's tree math.
+const INDENT: f32 = 26.0;
+/// Reserved left margin that reveals the drag/menu grips on hover, so the
+/// editor text keeps one left edge whether the gutter is shown or not.
+const GUTTER_WIDTH: f32 = 34.0;
+/// Fixed marker column so prose and marked blocks share a text baseline.
+const MARKER_WIDTH: f32 = 22.0;
 
 pub fn view(state: &State, p: Palette) -> Element<'_, Message> {
     match &state.data {
@@ -50,39 +57,49 @@ fn shell<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let pages = data.map(|data| data.pages.as_slice()).unwrap_or_default();
-    let mut rail = column![
-        container(
-            row![
-                icon_tile(Icon::Pages, 24.0, p),
-                text("Pages").font(SANS).size(13).color(p.ink),
-                Space::new().width(Length::Fill),
-                outline("+", Message::NewPage, p),
-                outline("↻", Message::Refresh, p),
-            ]
-            .spacing(9)
-            .align_y(Alignment::Center)
-        )
-        .height(52)
-        .padding(0)
-        .align_y(Alignment::Center)
-        .style(move |_| bottom_border(p.sidebar, p.border_soft)),
+    // Full-bleed header strip: background only, with a divider drawn under it —
+    // never a four-side `Border` box around shrink-width content.
+    let header = container(
+        row![
+            filled_chip(Icon::Pages, 24.0, p),
+            text("Pages")
+                .font(SANS_SEMIBOLD)
+                .size(theme::BODY)
+                .color(p.ink),
+            Space::new().width(Length::Fill),
+            ghost_icon(Icon::Plus, 15.0, Message::NewPage, "New page", p),
+            ghost_icon(Icon::Refresh, 14.0, Message::Refresh, "Refresh pages", p),
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(52)
+    .padding([0, 14])
+    .align_y(Alignment::Center)
+    .style(move |_| surface(p.sidebar));
+
+    let mut body = column![
         container(
             row![
                 icons::view(Icon::Search, 13.0, p.muted_2),
                 sem_input(
                     "Search",
                     &state.query,
-                    field("Search", &state.query, Message::QueryChanged, p),
+                    field("Search pages", &state.query, Message::QueryChanged, p),
                 ),
             ]
             .spacing(8)
             .align_y(Alignment::Center)
         )
-        .height(32),
-        text("WORKSPACE").font(MONO).size(9).color(p.muted_2),
+        .height(34),
+        text("WORKSPACE")
+            .font(MONO)
+            .size(theme::CAPTION)
+            .color(p.muted_2),
     ]
-    .spacing(8)
-    .padding([0, 14]);
+    .spacing(10)
+    .padding([12, 14]);
     let needle = state.query.trim().to_lowercase();
     let visible = pages
         .iter()
@@ -93,7 +110,7 @@ fn shell<'a>(
         })
         .collect::<Vec<_>>();
     if visible.is_empty() {
-        rail = rail.push(notice(
+        body = body.push(notice(
             if needle.is_empty() {
                 "No pages yet. Use + to start writing."
             } else {
@@ -103,7 +120,7 @@ fn shell<'a>(
         ));
     } else {
         for page in visible {
-            rail = rail.push(page_button(
+            body = body.push(page_button(
                 page,
                 page_depth(pages, &page.id),
                 pages
@@ -116,12 +133,15 @@ fn shell<'a>(
             ));
         }
     }
-    let rail = container(scrollable(rail))
-        .width(PAGES_RAIL_WIDTH)
-        .height(Length::Fill)
-        // Square full-height side panel butted against the module rail / window edge.
-        // bottom_border == panel with radius 0, so reuse it rather than a rounded panel.
-        .style(move |_| bottom_border(p.sidebar, p.border_soft));
+    let rail = container(column![
+        header,
+        divider(p),
+        scrollable(body).height(Length::Fill),
+    ])
+    .width(PAGES_RAIL_WIDTH)
+    .height(Length::Fill)
+    // Square full-height side panel butted against the module rail / window edge.
+    .style(move |_| bottom_border(p.sidebar, p.border_soft));
     let main = override_body
         .unwrap_or_else(|| data.map_or_else(|| no_page(p), |data| pages_main(state, data, p)));
     row![
@@ -132,60 +152,34 @@ fn shell<'a>(
 }
 
 fn pages_main<'a>(state: &'a State, data: &'a PagesData, p: Palette) -> Element<'a, Message> {
-    let tabs = if data.open_tabs.is_empty() {
-        Space::new().height(0).into()
-    } else {
-        doc_tabs(data, p)
-    };
     let document = data.document.as_ref().map_or_else(
         || no_page(p),
         |document| document_view(state, document, &data.pages, p),
     );
-    column![tabs, document].into()
+    if data.open_tabs.is_empty() {
+        document
+    } else {
+        column![doc_tabs(data, p), divider(p), document].into()
+    }
 }
 
 fn document_view<'a>(
     state: &'a State,
     document: &'a PageDocument,
-    pages: &'a [PageMeta],
+    _pages: &'a [PageMeta],
     p: Palette,
 ) -> Element<'a, Message> {
-    let header = container(
-        row![
-            text(
-                document
-                    .ancestry
-                    .iter()
-                    .map(|page| if page.title.is_empty() {
-                        "Untitled"
-                    } else {
-                        &page.title
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" / ")
-            )
-            .font(SANS)
-            .size(13)
-            .color(p.ink),
-            if document.presence.is_empty() {
-                text("").font(MONO).size(9)
-            } else {
-                text(format!("{} editing", document.presence.len()))
-                    .font(MONO)
-                    .size(9)
-                    .color(p.green)
-            },
-            Space::new().width(Length::Fill),
-            outline("+ Child page", Message::CreateChildPage, p),
-            outline("Delete page", Message::RequestDeletePage, p),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .height(52)
-    .padding([0, 24])
-    .align_y(Alignment::Center)
-    .style(move |_| bottom_border(p.paper, p.border_soft));
-    let target_label = match &state.comment_target {
+    let header = document_header(document, p);
+
+    // A comment thread anchored to a real block hangs under that block; anything
+    // else (a whole-page note) stays with the page.
+    let is_block = |id: &str| document.blocks.iter().any(|block| block.id == id);
+    let composer_block: Option<&str> = match &state.comment_target {
+        Some(CommentTarget::New { target, .. }) if is_block(target) => Some(target.as_str()),
+        Some(CommentTarget::Reply { target, .. }) if is_block(target) => Some(target.as_str()),
+        _ => None,
+    };
+    let composer_label = match &state.comment_target {
         Some(CommentTarget::Reply { .. }) => "Reply to this thread",
         Some(CommentTarget::New {
             anchor: Some(_), ..
@@ -193,48 +187,78 @@ fn document_view<'a>(
         Some(CommentTarget::New { .. }) => "Comment on selected block",
         None => "Comment on this page",
     };
-    let mut blocks = column![
-        sem_input(
-            "Page title",
-            &document.title,
-            plain_input("Untitled", &document.title, Message::TitleChanged, p)
-                .on_submit(Message::CommitTitle),
-        ),
-        row![
-            icon_tile(Icon::Chat, 22.0, p),
-            compact_editor(
-                &state.comment_draft,
-                target_label,
-                Message::CommentAction,
-                p
-            ),
-            outline_enabled(
-                "Comment",
-                Message::AddComment,
-                !state.comment_draft.text().trim().is_empty(),
-                p
-            ),
-        ]
-        .spacing(9)
-        .align_y(Alignment::Center),
-        divider(p),
-    ]
-    .spacing(14)
-    .padding([44, 80]);
+
+    let mut body = column![sem_input(
+        "Page title",
+        &document.title,
+        plain_input("Untitled", &document.title, Message::TitleChanged, p)
+            .on_submit(Message::CommitTitle),
+    )]
+    .spacing(12)
+    .padding([40, 80]);
+
+    // Page-level threads + (when nothing block-targeted is active) the composer.
     for thread in &document.comment_threads {
-        blocks = blocks.push(comment_thread(state, document, thread, p));
-    }
-    for (index, block) in document.blocks.iter().enumerate() {
-        if !block_hidden_by_collapse(document, &state.collapsed_blocks, block) {
-            blocks = blocks.push(
-                mouse_area(block_row(state, document, index, block, p))
-                    .on_enter(Message::HoverBlock(index))
-                    .on_release(Message::DropDraggedBlock),
-            );
+        if !is_block(&thread.target) {
+            body = body.push(comment_thread(state, document, thread, p));
         }
     }
+    if composer_block.is_none() {
+        body = body.push(comment_composer(&state.comment_draft, composer_label, p));
+    }
+    body = body.push(divider(p));
+
+    for (index, block) in document.blocks.iter().enumerate() {
+        if block_hidden_by_collapse(document, &state.collapsed_blocks, block) {
+            continue;
+        }
+        // Drop indicator on the hovered edge while a drag is live (D1).
+        if state.dragging_block.is_some() && state.drag_hover == Some(index) {
+            body = body.push(drop_indicator(p));
+        }
+        body = body.push(
+            mouse_area(block_row(state, document, index, block, p))
+                .on_enter(Message::HoverBlock(index))
+                .on_exit(Message::BlockRowExited(index))
+                .on_release(Message::DropDraggedBlock),
+        );
+        // Threads and the composer for this specific block hang beneath it.
+        for thread in &document.comment_threads {
+            if thread.target == block.id {
+                body = body.push(under_block(block.depth, comment_thread(state, document, thread, p)));
+            }
+        }
+        if composer_block == Some(block.id.as_str()) {
+            body = body.push(under_block(
+                block.depth,
+                comment_composer(&state.comment_draft, composer_label, p),
+            ));
+        }
+        if state.pending_block_delete.as_deref() == Some(block.id.as_str()) {
+            let descendants = block_descendant_count(document, &block.id);
+            body = body.push(under_block(
+                block.depth,
+                destructive_confirmation(
+                    if descendants == 0 {
+                        "Delete this block? This cannot be undone.".into()
+                    } else {
+                        format!(
+                            "Delete this block and its {descendants} nested {}? This cannot be undone.",
+                            if descendants == 1 { "block" } else { "blocks" }
+                        )
+                    },
+                    Message::ConfirmRemoveBlock,
+                    Message::CancelRemoveBlock,
+                    p,
+                ),
+            ));
+        }
+    }
+
+    body = body.push(add_block_affordance(p));
+
     if state.pending_page_delete {
-        blocks = blocks.push(destructive_confirmation(
+        body = body.push(destructive_confirmation(
             format!(
                 "Delete page “{}” and all of its blocks? This cannot be undone.",
                 if document.title.trim().is_empty() {
@@ -248,68 +272,8 @@ fn document_view<'a>(
             p,
         ));
     }
-    if let Some(id) = &state.pending_block_delete
-        && document.blocks.iter().any(|block| &block.id == id)
-    {
-        let descendants = block_descendant_count(document, id);
-        blocks = blocks.push(destructive_confirmation(
-            if descendants == 0 {
-                "Delete this block? This cannot be undone.".into()
-            } else {
-                format!(
-                    "Delete this block and its {descendants} nested {}? This cannot be undone.",
-                    if descendants == 1 { "block" } else { "blocks" }
-                )
-            },
-            Message::ConfirmRemoveBlock,
-            Message::CancelRemoveBlock,
-            p,
-        ));
-    }
-    let mut add = row![].spacing(5);
-    for (label, kind) in [
-        ("Text", BlockKind::Paragraph),
-        ("Heading", BlockKind::Heading1),
-        ("To-do", BlockKind::Todo),
-        ("Toggle", BlockKind::Toggle),
-        ("Quote", BlockKind::Quote),
-        ("Code", BlockKind::Code),
-        ("Callout", BlockKind::Callout),
-        ("Divider", BlockKind::Divider),
-    ] {
-        add = add.push(outline(label, Message::AddBlock(kind), p));
-    }
-    blocks = blocks.push(
-        column![
-            text("ADD BLOCK").font(MONO).size(9.5).color(p.muted_2),
-            add.wrap(),
-        ]
-        .spacing(7)
-        .padding([14, 0]),
-    );
-    let mut parent_picker = row![
-        text("MOVE PAGE").font(MONO).size(9.5).color(p.muted_2),
-        outline("Top level", Message::SetPageParent(None), p),
-    ]
-    .spacing(5);
-    for parent in pages
-        .iter()
-        .filter(|parent| parent.id != document.id)
-        .take(24)
-    {
-        parent_picker = parent_picker.push(outline(
-            if parent.title.trim().is_empty() {
-                "Untitled".into()
-            } else {
-                parent.title.clone()
-            },
-            Message::SetPageParent(Some(parent.id.clone())),
-            p,
-        ));
-    }
-    blocks = blocks.push(parent_picker.wrap());
     if state.paste_dropped > 0 {
-        blocks = blocks.push(notice_owned(
+        body = body.push(notice_owned(
             format!(
                 "{} pasted lines were dropped at the 60-block safety limit.",
                 state.paste_dropped
@@ -318,12 +282,13 @@ fn document_view<'a>(
         ));
     }
     if let Some(error) = &state.error {
-        blocks = blocks.push(error_banner(error, p));
+        body = body.push(selectable_error(error, p));
     }
     column![
         header,
+        divider(p),
         container(scrollable(
-            container(blocks)
+            container(body)
                 .max_width(DOC_COLUMN_MAX)
                 .width(Length::Fill)
         ))
@@ -334,6 +299,51 @@ fn document_view<'a>(
     .into()
 }
 
+fn document_header<'a>(document: &'a PageDocument, p: Palette) -> Element<'a, Message> {
+    let mut crumbs = row![].spacing(4).align_y(Alignment::Center);
+    let last = document.ancestry.len().saturating_sub(1);
+    for (index, page) in document.ancestry.iter().enumerate() {
+        let title = if page.title.trim().is_empty() {
+            "Untitled"
+        } else {
+            &page.title
+        };
+        if index == last {
+            crumbs = crumbs.push(
+                text(title.to_owned())
+                    .font(SANS_SEMIBOLD)
+                    .size(theme::BODY)
+                    .color(p.ink),
+            );
+        } else {
+            crumbs = crumbs.push(crumb_button(title, page.id.clone(), p));
+            crumbs = crumbs.push(text("/").font(SANS).size(theme::BODY).color(p.muted_2));
+        }
+    }
+    let presence: Element<'a, Message> = if document.presence.is_empty() {
+        Space::new().width(0).into()
+    } else {
+        presence_bar(&document.presence, p)
+    };
+    container(
+        row![
+            crumbs,
+            Space::new().width(Length::Fill),
+            presence,
+            outline("+ Child page", Message::CreateChildPage, p),
+            danger_outline("Delete page", Message::RequestDeletePage, p),
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(52)
+    .padding([0, 24])
+    .align_y(Alignment::Center)
+    .style(move |_| surface(p.paper))
+    .into()
+}
+
 fn block_row<'a>(
     state: &'a State,
     document: &'a PageDocument,
@@ -341,14 +351,8 @@ fn block_row<'a>(
     block: &'a PageBlock,
     p: Palette,
 ) -> Element<'a, Message> {
-    let marker = match block.kind {
-        BlockKind::Bulleted => "•",
-        BlockKind::Numbered => "1.",
-        BlockKind::Todo if block.checked => "☑",
-        BlockKind::Todo => "☐",
-        BlockKind::Quote => "│",
-        _ => "",
-    };
+    let hovered = state.hovered_block.as_deref() == Some(block.id.as_str());
+    let menu_open = state.menu_open_block.as_deref() == Some(block.id.as_str());
     let size = match block.kind {
         BlockKind::Heading1 => 26.0,
         BlockKind::Heading2 => 22.0,
@@ -356,11 +360,29 @@ fn block_row<'a>(
         BlockKind::Code => 13.5,
         _ => 15.0,
     };
-    let peer_count = document
-        .presence
-        .iter()
-        .filter(|presence| presence.block.as_deref() == Some(&block.id))
-        .count();
+
+    // Left gutter: drag grip + actions menu, revealed on hover (or while its
+    // menu is open); otherwise reserved blank space so text never shifts.
+    let gutter: Element<'a, Message> = if hovered || menu_open {
+        row![drag_grip(index, p), menu_trigger(index, p)]
+            .spacing(1)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        Space::new().width(GUTTER_WIDTH).into()
+    };
+
+    // Marker: only the kinds that carry one in the contract.
+    let marker: Element<'a, Message> = match block.kind {
+        BlockKind::Bulleted => marker_glyph("•", p),
+        BlockKind::Numbered => marker_glyph("1.", p),
+        BlockKind::Todo => checkbox_marker(index, block.checked, p),
+        BlockKind::Toggle if !block.children.is_empty() => {
+            chevron_marker(index, state.collapsed_blocks.contains(&block.id), p)
+        }
+        _ => Space::new().width(MARKER_WIDTH).into(),
+    };
+
     let input: Element<'a, Message> = if block.kind == BlockKind::Divider {
         container(Space::new().height(1))
             .width(Length::Fill)
@@ -446,79 +468,70 @@ fn block_row<'a>(
             .color(p.ink)
             .into()
     };
-    let mut editor = column![
+
+    // Center column: a formatting bar rides above the editor only when this
+    // block is focused and has a live selection (the floating-toolbar analogue).
+    let selected = state.focused_block.as_deref() == Some(block.id.as_str())
+        && editor_selection_utf16(state, &block.id, &block.text)
+            .is_some_and(|(start, end)| start < end);
+    let center: Element<'a, Message> = if selected {
+        column![marks_bar(index, p), input]
+            .spacing(6)
+            .width(Length::Fill)
+            .into()
+    } else {
+        container(input).width(Length::Fill).into()
+    };
+
+    let peer_count = document
+        .presence
+        .iter()
+        .filter(|presence| presence.block.as_deref() == Some(&block.id))
+        .count();
+    let open_threads = document
+        .comment_threads
+        .iter()
+        .filter(|thread| thread.target == block.id && !thread.resolved)
+        .count();
+    let right: Element<'a, Message> = if open_threads > 0 || hovered {
+        comment_button(index, open_threads, peer_count, p)
+    } else if peer_count > 0 {
+        text(format!("{peer_count} here"))
+            .font(MONO)
+            .size(theme::CAPTION)
+            .color(p.green)
+            .into()
+    } else {
+        Space::new().width(0).into()
+    };
+
+    let mut stack = column![
         row![
-            Space::new().width((block.depth * 26) as f32),
-            mouse_area(container(text("⠿").font(MONO).size(12).color(p.muted_2)).padding([5, 3]))
-                .on_press(Message::BeginBlockDrag(index)),
-            if block.kind == BlockKind::Todo {
-                outline(marker, Message::ToggleChecked(index), p)
-            } else {
-                outline(
-                    block_kind_label(block.kind),
-                    Message::SetBlockKind(index, next_block_kind(block.kind)),
-                    p,
-                )
-            },
-            input,
-            if peer_count > 0 {
-                Element::from(
-                    text(format!("{peer_count} here"))
-                        .font(MONO)
-                        .size(9)
-                        .color(p.green),
-                )
-            } else {
-                Element::from(Space::new().width(0))
-            },
-            if block.kind == BlockKind::Toggle {
-                outline(
-                    if state.collapsed_blocks.contains(&block.id) {
-                        "▸"
-                    } else {
-                        "▾"
-                    },
-                    Message::ToggleBlockCollapsed(index),
-                    p,
-                )
-            } else {
-                outline_enabled("·", Message::Refresh, false, p)
-            },
-            outline("×", Message::RequestRemoveBlock(index), p),
+            Space::new().width((block.depth as f32) * INDENT),
+            gutter,
+            marker,
+            center,
+            right,
         ]
         .spacing(6)
-        .align_y(Alignment::Center),
+        .align_y(Alignment::Start),
     ]
     .spacing(4);
-    let mut tools = row![
-        Space::new().width((block.depth * 26 + 42) as f32),
-        outline("↑", Message::MoveBlock(index, BlockMove::Up), p),
-        outline("↓", Message::MoveBlock(index, BlockMove::Down), p),
-        outline("←", Message::MoveBlock(index, BlockMove::Outdent), p),
-        outline("→", Message::MoveBlock(index, BlockMove::Indent), p),
-        outline("Paste", Message::PasteFromClipboard(index), p),
-        outline("Comment", Message::CommentOnBlock(index), p),
-    ]
-    .spacing(4);
-    for mark in [
-        InlineMark::Bold,
-        InlineMark::Italic,
-        InlineMark::Underline,
-        InlineMark::Strikethrough,
-        InlineMark::Code,
-    ] {
-        let selected = editor_selection_utf16(state, &block.id, &block.text)
-            .is_some_and(|(start, end)| start < end);
-        tools = tools.push(outline_enabled(
-            mark.label(),
-            Message::ToggleMark(index, mark),
-            selected,
-            p,
-        ));
+    if menu_open {
+        stack = stack.push(
+            row![
+                Space::new().width((block.depth as f32) * INDENT + GUTTER_WIDTH),
+                block_menu(index, block, p),
+            ]
+            .spacing(0),
+        );
     }
-    editor = editor.push(tools.wrap());
+    // Slash menu: kind picker shown while the block text is a `/query`.
     if state.slash_for == Some(index) {
-        let mut slash = row![Space::new().width((block.depth * 26 + 42) as f32)].spacing(4);
+        let mut slash = row![
+            Space::new().width((block.depth as f32) * INDENT + GUTTER_WIDTH + MARKER_WIDTH)
+        ]
+        .spacing(4);
         for kind in slash_options(&block.text) {
             slash = slash.push(outline(
                 block_kind_label(kind),
@@ -526,9 +539,310 @@ fn block_row<'a>(
                 p,
             ));
         }
-        editor = editor.push(slash.wrap());
+        stack = stack.push(slash.wrap());
     }
-    editor.into()
+    stack.into()
+}
+
+fn block_menu<'a>(index: usize, block: &'a PageBlock, p: Palette) -> Element<'a, Message> {
+    let mut turn_into = row![].spacing(4);
+    for kind in all_block_kinds() {
+        if kind == block.kind {
+            continue;
+        }
+        turn_into = turn_into.push(outline(
+            block_kind_label(kind),
+            Message::SetBlockKind(index, kind),
+            p,
+        ));
+    }
+    container(
+        column![
+            // Reorder is drag-first; these keep single-step moves and block
+            // paste reachable without the old always-on toolbar.
+            row![
+                outline("Move up", Message::MoveBlock(index, BlockMove::Up), p),
+                outline("Move down", Message::MoveBlock(index, BlockMove::Down), p),
+                outline("Paste below", Message::PasteFromClipboard(index), p),
+            ]
+            .spacing(4)
+            .wrap(),
+            danger_outline("Delete block", Message::RequestRemoveBlock(index), p),
+            divider(p),
+            text("Turn into")
+                .font(MONO)
+                .size(theme::CAPTION)
+                .color(p.muted_2),
+            turn_into.wrap(),
+        ]
+        .spacing(7),
+    )
+    .padding(10)
+    .max_width(320)
+    .style(move |_| soft_panel(p.paper, p.border, RADIUS_MD))
+    .into()
+}
+
+fn marks_bar<'a>(index: usize, p: Palette) -> Element<'a, Message> {
+    let mut bar = row![].spacing(2).align_y(Alignment::Center);
+    for mark in [
+        InlineMark::Bold,
+        InlineMark::Italic,
+        InlineMark::Underline,
+        InlineMark::Strikethrough,
+        InlineMark::Code,
+    ] {
+        bar = bar.push(mark_button(index, mark, p));
+    }
+    container(bar)
+        .padding([3, 4])
+        .style(move |_| soft_panel(p.paper, p.border_soft, RADIUS_MD))
+        .into()
+}
+
+fn mark_button<'a>(index: usize, mark: InlineMark, p: Palette) -> Element<'a, Message> {
+    let label = mark.label();
+    let btn = button(
+        text(label)
+            .font(SANS_SEMIBOLD)
+            .size(theme::CAPTION)
+            .color(p.ink_soft),
+    )
+    .padding([3, 7])
+    .style(move |_, status| iced::widget::button::Style {
+        background: matches!(status, iced::widget::button::Status::Hovered)
+            .then_some(Background::Color(p.hover)),
+        text_color: p.ink_soft,
+        border: Border {
+            radius: RADIUS_SM.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .on_press(Message::ToggleMark(index, mark));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn comment_button<'a>(
+    index: usize,
+    open_threads: usize,
+    peer_count: usize,
+    p: Palette,
+) -> Element<'a, Message> {
+    let label = if open_threads > 0 {
+        format!("{open_threads}")
+    } else {
+        "Comment".to_string()
+    };
+    let mut inner = row![icons::view(Icon::Chat, 13.0, p.muted_3)]
+        .spacing(5)
+        .align_y(Alignment::Center);
+    inner = inner.push(
+        text(label)
+            .font(SANS)
+            .size(theme::LABEL)
+            .color(p.muted_3),
+    );
+    if peer_count > 0 {
+        inner = inner.push(
+            text(format!("· {peer_count} here"))
+                .font(MONO)
+                .size(theme::CAPTION)
+                .color(p.green),
+        );
+    }
+    let btn = button(inner)
+        .padding([4, 8])
+        .style(move |_, status| iced::widget::button::Style {
+            background: matches!(status, iced::widget::button::Status::Hovered)
+                .then_some(Background::Color(p.hover)),
+            text_color: p.muted_3,
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .on_press(Message::CommentOnBlock(index));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Comment", btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn drag_grip<'a>(index: usize, p: Palette) -> Element<'a, Message> {
+    mouse_area(
+        container(text("⠿").font(MONO).size(theme::LABEL).color(p.muted_2)).padding([4, 3]),
+    )
+    .on_press(Message::BeginBlockDrag(index))
+    .into()
+}
+
+fn menu_trigger<'a>(index: usize, p: Palette) -> Element<'a, Message> {
+    let btn = button(text("⋮").font(SANS_SEMIBOLD).size(theme::BODY).color(p.muted_2))
+        .padding([2, 6])
+        .style(move |_, status| iced::widget::button::Style {
+            background: matches!(status, iced::widget::button::Status::Hovered)
+                .then_some(Background::Color(p.hover)),
+            text_color: p.muted_2,
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .on_press(Message::ToggleBlockMenu(index));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Block actions", btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn marker_glyph<'a>(glyph: &'a str, p: Palette) -> Element<'a, Message> {
+    container(text(glyph).font(SANS).size(15.0).color(p.muted))
+        .width(MARKER_WIDTH)
+        .padding([5, 0])
+        .align_x(Alignment::Center)
+        .into()
+}
+
+fn checkbox_marker<'a>(index: usize, checked: bool, p: Palette) -> Element<'a, Message> {
+    let btn = button(
+        text(if checked { "☑" } else { "☐" })
+            .font(SANS)
+            .size(15.0)
+            .color(if checked { p.filled } else { p.muted }),
+    )
+    .padding([3, 0])
+    .width(MARKER_WIDTH)
+    .style(move |_, _| iced::widget::button::Style {
+        background: None,
+        text_color: if checked { p.filled } else { p.muted },
+        border: Border::default(),
+        ..Default::default()
+    })
+    .on_press(Message::ToggleChecked(index));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::Button,
+        if checked { "Uncheck" } else { "Check" },
+        btn,
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn chevron_marker<'a>(index: usize, collapsed: bool, p: Palette) -> Element<'a, Message> {
+    let btn = button(
+        text(if collapsed { "▸" } else { "▾" })
+            .font(SANS)
+            .size(13.0)
+            .color(p.muted),
+    )
+    .padding([4, 0])
+    .width(MARKER_WIDTH)
+    .style(move |_, _| iced::widget::button::Style {
+        background: None,
+        text_color: p.muted,
+        border: Border::default(),
+        ..Default::default()
+    })
+    .on_press(Message::ToggleBlockCollapsed(index));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Toggle children", btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn add_block_affordance<'a>(p: Palette) -> Element<'a, Message> {
+    let btn = button(
+        row![
+            icons::view(Icon::Plus, 13.0, p.muted_2),
+            text("Add a block, or type ‘/’ for commands")
+                .font(SANS)
+                .size(theme::BODY)
+                .color(p.muted_2),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([9, 6])
+    .style(move |_, status| iced::widget::button::Style {
+        background: matches!(status, iced::widget::button::Status::Hovered)
+            .then_some(Background::Color(p.hover)),
+        text_color: p.muted_2,
+        border: Border {
+            radius: RADIUS_SM.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .on_press(Message::AddBlock(BlockKind::Paragraph));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Add a block", btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn drop_indicator<'a>(p: Palette) -> Element<'a, Message> {
+    let _ = p;
+    container(Space::new().height(2))
+        .width(Length::Fill)
+        .style(|_| iced::widget::container::Style {
+            background: Some(Background::Color(theme::ACCENTS[0])),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn under_block<'a>(depth: usize, content: Element<'a, Message>) -> Element<'a, Message> {
+    row![
+        Space::new().width((depth as f32) * INDENT + GUTTER_WIDTH),
+        content,
+    ]
+    .spacing(0)
+    .into()
+}
+
+fn comment_composer<'a>(
+    draft: &'a EditorState,
+    label: &'a str,
+    p: Palette,
+) -> Element<'a, Message> {
+    row![
+        icons::view(Icon::Chat, 16.0, p.muted_3),
+        compact_editor(draft, label, Message::CommentAction, p),
+        outline_enabled(
+            "Comment",
+            Message::AddComment,
+            !draft.text().trim().is_empty(),
+            p
+        ),
+    ]
+    .spacing(9)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn presence_bar<'a>(presence: &'a [PagePresence], p: Palette) -> Element<'a, Message> {
+    let mut avatars = row![].spacing(2).align_y(Alignment::Center);
+    for peer in presence.iter().take(4) {
+        avatars = avatars.push(avatar(&peer.peer, 22.0, p));
+    }
+    row![
+        avatars,
+        text(format!("{} editing", presence.len()))
+            .font(MONO)
+            .size(theme::CAPTION)
+            .color(p.green),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn comment_thread<'a>(
@@ -554,14 +868,14 @@ fn comment_thread<'a>(
                 "Comment"
             })
             .font(MONO)
-            .size(9.5)
+            .size(theme::CAPTION)
             .color(if thread.resolved { p.green } else { p.amber }),
             text(excerpt.map_or_else(
                 || format!("on {}", short(&thread.target)),
                 |value| format!("“{}”", short(&value))
             ))
             .font(MONO)
-            .size(9.5)
+            .size(theme::CAPTION)
             .color(p.muted_2),
             Space::new().width(Length::Fill),
             outline(
@@ -596,7 +910,7 @@ fn comment_thread<'a>(
         let mut item = column![
             row![
                 avatar(&comment.author, 20.0, p),
-                text(body).font(SANS).size(12).color(p.ink_soft),
+                text(body).font(SANS).size(theme::BODY).color(p.ink_soft),
                 Space::new().width(Length::Fill),
                 if own && !comment.deleted {
                     Element::from(outline(
@@ -608,7 +922,7 @@ fn comment_thread<'a>(
                     Element::from(Space::new().width(0))
                 },
                 if own && !comment.deleted {
-                    Element::from(outline(
+                    Element::from(danger_outline(
                         "Delete",
                         Message::DeleteComment(comment.id.clone()),
                         p,
@@ -641,7 +955,7 @@ fn comment_thread<'a>(
     }
     container(comments)
         .padding(10)
-        .style(move |_| panel(p.sunken, p.border_soft))
+        .style(move |_| soft_panel(p.sunken, p.border_soft, RADIUS_SM))
         .into()
 }
 
@@ -655,14 +969,14 @@ fn page_button(
 ) -> Element<'static, Message> {
     let open = button(
         row![
-            text("▱").font(SANS).size(12).color(p.muted_2),
+            text("▱").font(SANS).size(theme::LABEL).color(p.muted_2),
             text(if page.title.is_empty() {
                 "Untitled".into()
             } else {
                 page.title.clone()
             })
             .font(SANS)
-            .size(12.5)
+            .size(theme::LABEL)
             .color(if active { p.ink } else { p.ink_softer }),
         ]
         .spacing(8),
@@ -690,17 +1004,20 @@ fn page_button(
         },
         open,
     );
+    // A childless page reserves the chevron's width with plain space, never a
+    // dead disabled dot masquerading as a control (D2).
+    let toggle: Element<'static, Message> = if has_children {
+        outline(
+            if collapsed { "▸" } else { "▾" },
+            Message::TogglePageCollapsed(page.id.clone()),
+            p,
+        )
+    } else {
+        Space::new().width(18).into()
+    };
     row![
         Space::new().width((depth.min(8) * 12) as f32),
-        if has_children {
-            outline(
-                if collapsed { "▸" } else { "▾" },
-                Message::TogglePageCollapsed(page.id.clone()),
-                p,
-            )
-        } else {
-            outline_enabled("·", Message::Refresh, false, p)
-        },
+        toggle,
         open,
     ]
     .spacing(3)
@@ -749,7 +1066,7 @@ fn page_hidden_by_collapse(pages: &[PageMeta], collapsed: &[String], id: &str) -
 
 fn doc_tabs(data: &PagesData, p: Palette) -> Element<'static, Message> {
     let active = data.document.as_ref().map(|document| document.id.as_str());
-    let mut tabs = row![].spacing(2).padding([0, 10]);
+    let mut tabs = row![].spacing(4).padding([0, 10]).align_y(Alignment::Center);
     for id in &data.open_tabs {
         let title = data
             .pages
@@ -759,69 +1076,94 @@ fn doc_tabs(data: &PagesData, p: Palette) -> Element<'static, Message> {
             .filter(|title| !title.is_empty())
             .unwrap_or("Untitled");
         let selected = Some(id.as_str()) == active;
-        let open = button(text(title.to_owned()).font(SANS).size(11.5))
-            .height(32)
-            .padding([0, 9])
-            .style(move |_, _| iced::widget::button::Style {
-                background: None,
-                text_color: if selected { p.ink } else { p.ink_softer },
-                border: Border::default(),
-                ..Default::default()
-            })
-            .on_press(Message::OpenPage(id.clone()));
+        let open = button(
+            text(truncate_end(title, 24))
+                .font(SANS)
+                .size(theme::LABEL)
+                .color(if selected { p.ink } else { p.ink_softer }),
+        )
+        .padding([7, 9])
+        .style(move |_, _| iced::widget::button::Style {
+            background: None,
+            text_color: if selected { p.ink } else { p.ink_softer },
+            border: Border::default(),
+            ..Default::default()
+        })
+        .on_press(Message::OpenPage(id.clone()));
         #[cfg(all(feature = "agent", debug_assertions))]
         let open = iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, title.to_owned(), open);
+        let underline = container(Space::new().height(2))
+            .width(Length::Fill)
+            .style(move |_| iced::widget::container::Style {
+                background: Some(Background::Color(if selected {
+                    p.filled
+                } else {
+                    Color::TRANSPARENT
+                })),
+                ..Default::default()
+            });
         tabs = tabs.push(
             container(
-                row![
-                    open,
-                    button(text("×").font(SANS).size(10))
-                        .height(32)
-                        .padding([0, 6])
-                        .style(move |_, status| iced::widget::button::Style {
-                            background: matches!(status, iced::widget::button::Status::Hovered)
+                column![
+                    row![
+                        open,
+                        button(icons::view(Icon::Close, 11.0, p.muted))
+                            .padding([6, 5])
+                            .style(move |_, status| iced::widget::button::Style {
+                                background: matches!(
+                                    status,
+                                    iced::widget::button::Status::Hovered
+                                )
                                 .then_some(Background::Color(p.hover)),
-                            text_color: p.muted,
-                            border: Border::default(),
-                            ..Default::default()
-                        })
-                        .on_press(Message::CloseTab(id.clone())),
+                                text_color: p.muted,
+                                border: Border {
+                                    radius: RADIUS_SM.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            })
+                            .on_press(Message::CloseTab(id.clone())),
+                    ]
+                    .align_y(Alignment::Center),
+                    underline,
                 ]
-                .align_y(Alignment::Center),
+                .spacing(4),
             )
-            .height(34)
+            .max_width(200)
             .style(move |_| iced::widget::container::Style {
                 background: selected.then_some(Background::Color(p.paper)),
-                border: Border {
-                    color: if selected {
-                        p.filled
-                    } else {
-                        Color::TRANSPARENT
-                    },
-                    width: if selected { 2.0 } else { 0.0 },
-                    radius: RADIUS_SM.into(),
-                },
                 ..Default::default()
             }),
         );
     }
-    container(tabs)
-        .height(34)
-        .style(move |_| bottom_border(p.sidebar, p.border_soft))
-        .into()
+    container(
+        scrollable(tabs)
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new(),
+            ))
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(36)
+    .align_y(Alignment::Center)
+    .style(move |_| surface(p.sidebar))
+    .into()
 }
 
 fn no_page(p: Palette) -> Element<'static, Message> {
     container(
         column![
             icon_tile(Icon::Pages, 42.0, p),
-            text("No page open").font(SANS).size(14).color(p.ink),
+            text("No page open")
+                .font(SANS_SEMIBOLD)
+                .size(theme::BODY_LG)
+                .color(p.ink),
             text("Pick a page from the rail, or create one to start writing.")
                 .font(SANS)
-                .size(12)
+                .size(theme::BODY)
                 .color(p.muted),
         ]
-        .spacing(5)
+        .spacing(6)
         .align_x(Alignment::Center)
         .max_width(330),
     )
@@ -836,8 +1178,11 @@ fn empty_state<'a>(title: &'a str, detail: &'a str, p: Palette) -> Element<'a, M
     container(
         column![
             icon_tile(Icon::Pages, 38.0, p),
-            text(title).font(SANS).size(14).color(p.ink),
-            text(detail).font(SANS).size(12).color(p.muted),
+            text(title)
+                .font(SANS_SEMIBOLD)
+                .size(theme::BODY_LG)
+                .color(p.ink),
+            selectable_center(detail, p),
         ]
         .spacing(7)
         .align_x(Alignment::Center)
@@ -850,6 +1195,24 @@ fn empty_state<'a>(title: &'a str, detail: &'a str, p: Palette) -> Element<'a, M
     .into()
 }
 
+/// The empty-state detail line — selectable, because an error message shown
+/// here is exactly the text a user needs to copy.
+fn selectable_center<'a>(detail: &'a str, p: Palette) -> Element<'a, Message> {
+    text_input("", detail)
+        .font(SANS)
+        .size(theme::BODY)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.muted,
+            placeholder: p.muted,
+            value: p.muted,
+            selection: theme::ACCENTS[0],
+        })
+        .into()
+}
+
 fn compact_editor<'a>(
     state: &'a EditorState,
     placeholder: &'a str,
@@ -860,7 +1223,7 @@ fn compact_editor<'a>(
         .placeholder(placeholder)
         .on_action(on_action)
         .padding([7, 9])
-        .size(12)
+        .size(theme::BODY)
         .font(SANS)
         .min_height(36)
         .max_height(120)
@@ -891,7 +1254,7 @@ fn field<'a>(
     text_input(placeholder, value)
         .on_input(on_input)
         .padding([6, 9])
-        .size(12)
+        .size(theme::BODY)
         .font(SANS)
         .style(move |_, status| iced::widget::text_input::Style {
             background: Background::Color(p.sunken),
@@ -921,7 +1284,7 @@ fn plain_input<'a>(
         .on_input(on_input)
         .padding([5, 0])
         .size(28)
-        .font(SANS)
+        .font(SANS_SEMIBOLD)
         .style(move |_, _| iced::widget::text_input::Style {
             background: Background::Color(Color::TRANSPARENT),
             border: Border::default(),
@@ -964,7 +1327,7 @@ fn outline_enabled<'a>(
     p: Palette,
 ) -> Element<'a, Message> {
     let label = label.to_string();
-    let button = button(text(label.clone()).font(SANS).size(11.5))
+    let button = button(text(label.clone()).font(SANS).size(theme::LABEL))
         .padding([6, 9])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -999,16 +1362,45 @@ fn outline_enabled<'a>(
     button.into()
 }
 
+/// Neutral-destructive button in the danger triad (danger ink / danger-soft
+/// hover / danger-border), for `Delete page` and the block actions menu.
+fn danger_outline<'a>(label: impl ToString, message: Message, p: Palette) -> Element<'a, Message> {
+    let label = label.to_string();
+    let btn = button(text(label.clone()).font(SANS).size(theme::LABEL))
+        .padding([6, 9])
+        .style(move |_, status| iced::widget::button::Style {
+            background: Some(Background::Color(
+                if matches!(status, iced::widget::button::Status::Hovered) {
+                    p.danger_soft
+                } else {
+                    p.paper
+                },
+            )),
+            text_color: p.danger,
+            border: Border {
+                color: p.danger_border,
+                width: 1.0,
+                radius: RADIUS_SM.into(),
+            },
+            ..Default::default()
+        })
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
 fn destructive_confirmation(
     copy: String,
     confirm: Message,
     cancel: Message,
     p: Palette,
 ) -> Element<'static, Message> {
-    let delete = button(text("Delete").font(SANS).size(11.5))
-        .padding([6, 10])
+    let delete = button(text("Delete").font(SANS_SEMIBOLD).size(theme::LABEL))
+        .padding([6, 12])
         .style(move |_, _| iced::widget::button::Style {
-            background: Some(Background::Color(p.red)),
+            background: Some(Background::Color(p.danger)),
             text_color: Color::WHITE,
             border: Border {
                 radius: RADIUS_SM.into(),
@@ -1021,14 +1413,66 @@ fn destructive_confirmation(
     let delete = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Delete", delete);
     container(
         column![
-            text(copy).font(SANS).size(12).color(p.ink_soft),
-            row![delete, outline("Cancel", cancel, p)].spacing(6),
+            text(copy).font(SANS).size(theme::BODY).color(p.ink_soft),
+            // Cancel left, destructive confirm right.
+            row![outline("Cancel", cancel, p), delete].spacing(6),
         ]
         .spacing(8),
     )
-    .padding(10)
-    .style(move |_| panel(p.sunken, p.red))
+    .padding(11)
+    .style(move |_| soft_panel(p.danger_soft, p.danger_border, RADIUS_MD))
     .into()
+}
+
+fn filled_chip(icon: Icon, size: f32, p: Palette) -> Element<'static, Message> {
+    container(icons::view(icon, size * 0.58, p.on_filled))
+        .width(size)
+        .height(size)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_| iced::widget::container::Style {
+            background: Some(Background::Color(p.filled)),
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn ghost_icon(
+    icon: Icon,
+    size: f32,
+    message: Message,
+    label: &'static str,
+    p: Palette,
+) -> Element<'static, Message> {
+    let btn = button(
+        container(icons::view(icon, size, p.muted_3))
+            .padding([5, 6])
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center),
+    )
+    .padding(0)
+    .style(move |_, status| iced::widget::button::Style {
+        background: matches!(status, iced::widget::button::Status::Hovered)
+            .then_some(Background::Color(p.hover)),
+        text_color: p.muted_3,
+        border: Border {
+            radius: RADIUS_SM.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    {
+        let _ = label;
+        btn.into()
+    }
 }
 
 fn icon_tile(icon: Icon, size: f32, p: Palette) -> Element<'static, Message> {
@@ -1081,38 +1525,68 @@ fn divider(p: Palette) -> Element<'static, Message> {
 }
 
 fn notice<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.muted))
+    container(text(copy).font(SANS).size(theme::BODY).color(p.muted))
         .padding(9)
-        .style(move |_| panel(p.sunken, p.border_soft))
+        .style(move |_| soft_panel(p.sunken, p.border_soft, RADIUS_SM))
         .into()
 }
 
 fn notice_owned(copy: String, p: Palette) -> Element<'static, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.muted))
+    container(text(copy).font(SANS).size(theme::BODY).color(p.muted))
         .padding(9)
-        .style(move |_| panel(p.sunken, p.border_soft))
+        .style(move |_| soft_panel(p.sunken, p.border_soft, RADIUS_SM))
         .into()
 }
 
-fn error_banner<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
-    container(text(copy).font(SANS).size(11.5).color(p.red))
-        .padding(9)
-        .style(move |_| panel(p.sunken, p.red))
-        .into()
+/// Page error — selectable, so the user can copy exactly what went wrong.
+fn selectable_error<'a>(copy: &'a str, p: Palette) -> Element<'a, Message> {
+    container(
+        text_input("", copy)
+            .font(SANS)
+            .size(theme::BODY)
+            .padding(0)
+            .style(move |_, _| iced::widget::text_input::Style {
+                background: Background::Color(Color::TRANSPARENT),
+                border: Border::default(),
+                icon: p.danger,
+                placeholder: p.danger,
+                value: p.danger,
+                selection: theme::ACCENTS[0],
+            }),
+    )
+    .padding(9)
+    .style(move |_| soft_panel(p.danger_soft, p.danger_border, RADIUS_SM))
+    .into()
 }
 
 fn panel(color: Color, border: Color) -> iced::widget::container::Style {
+    soft_panel(color, border, RADIUS_SM)
+}
+
+fn soft_panel(color: Color, border: Color, radius: f32) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(Background::Color(color)),
         border: Border {
             color: border,
             width: 1.0,
-            radius: RADIUS_SM.into(),
+            radius: radius.into(),
         },
         ..Default::default()
     }
 }
 
+/// Background-only container style — no border box. Section separation is a
+/// dedicated 1px `divider`, never a four-side `Border`.
+fn surface(color: Color) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(color)),
+        ..Default::default()
+    }
+}
+
+/// Full-height side-panel frame: background plus a hairline edge against the
+/// window. (iced `Border` is uniform; at full size this reads as the panel's
+/// right/bottom rule, not a box around shrink content.)
 fn bottom_border(bg: Color, border: Color) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(Background::Color(bg)),
@@ -1122,6 +1596,42 @@ fn bottom_border(bg: Color, border: Color) -> iced::widget::container::Style {
             radius: 0.0.into(),
         },
         ..Default::default()
+    }
+}
+
+fn crumb_button(title: &str, id: String, p: Palette) -> Element<'static, Message> {
+    let title = title.to_owned();
+    let btn = button(text(title.clone()).font(SANS).size(theme::BODY).color(p.muted))
+        .padding([3, 5])
+        .style(move |_, status| iced::widget::button::Style {
+            background: matches!(status, iced::widget::button::Status::Hovered)
+                .then_some(Background::Color(p.hover)),
+            text_color: if matches!(status, iced::widget::button::Status::Hovered) {
+                p.ink
+            } else {
+                p.muted
+            },
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .on_press(Message::OpenPage(id));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, title, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn truncate_end(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_owned()
+    } else {
+        format!(
+            "{}…",
+            value.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
