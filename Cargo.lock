@@ -3777,7 +3777,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.7.4",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -5519,7 +5519,7 @@ dependencies = [
 [[package]]
 name = "iced-agent-plugin"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f5c01c03a108328980c119154103008677cf7ae6"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#0e0c722d6c6164fc5a1f9c6881be397a3cdfe086"
 dependencies = [
  "base64",
  "iced",
@@ -5715,7 +5715,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
-source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f5c01c03a108328980c119154103008677cf7ae6"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#0e0c722d6c6164fc5a1f9c6881be397a3cdfe086"
 dependencies = [
  "accesskit",
  "accesskit_winit",
