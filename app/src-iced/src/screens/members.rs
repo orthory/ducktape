@@ -437,6 +437,12 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             None
         }
         Message::ConfirmAction => {
+            // Only one member write in flight at a time. If one already is, keep
+            // the confirm card up (the Confirm button is disabled meanwhile) so
+            // the intent survives and submits once `busy` clears.
+            if state.busy {
+                return None;
+            }
             let pending = state.pending.take()?;
             let member = member_by_key(state, &pending.key)?;
             if !action_allowed(state, pending.action, member) {
@@ -563,7 +569,10 @@ fn can_admin(state: &State) -> bool {
 }
 
 fn action_allowed(state: &State, action: MemberAction, member: &Member) -> bool {
-    if !can_admin(state) || state.busy {
+    // Eligibility only — NOT `busy`. `AskAction` uses this to open a local
+    // confirm card (no write), so an unrelated in-flight write must not block it
+    // (M1). The actual write is serialized at `ConfirmAction`.
+    if !can_admin(state) {
         return false;
     }
     match action {
@@ -587,7 +596,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
         filter_bar(state, p),
         admin_actions(state, data, p),
         if let Some(pending) = &state.pending {
-            confirm_card(pending, p)
+            confirm_card(pending, state.busy, p)
         } else {
             Space::new().height(0).into()
         },
@@ -1451,7 +1460,7 @@ fn member_detail(member: &Member, state: &State, p: Palette) -> Element<'static,
     .into()
 }
 
-fn confirm_card(pending: &PendingAction, p: Palette) -> Element<'static, Message> {
+fn confirm_card(pending: &PendingAction, busy: bool, p: Palette) -> Element<'static, Message> {
     container(
         row![
             column![
@@ -1471,10 +1480,12 @@ fn confirm_card(pending: &PendingAction, p: Palette) -> Element<'static, Message
             .spacing(5)
             .width(Length::Fill),
             outline_button("Cancel", Message::CancelAction, true, p),
+            // Disabled while a write is in flight so the enabled state matches
+            // `ConfirmAction`'s `busy` guard — no live-but-inert control (M1).
             if pending.action == MemberAction::Promote {
-                filled_button(pending.action.confirm(), Message::ConfirmAction, true, p)
+                filled_button(pending.action.confirm(), Message::ConfirmAction, !busy, p)
             } else {
-                danger_button(pending.action.confirm(), Message::ConfirmAction, true, p)
+                danger_button(pending.action.confirm(), Message::ConfirmAction, !busy, p)
             },
         ]
         .spacing(10)

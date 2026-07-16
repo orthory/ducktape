@@ -2,7 +2,8 @@
 
 use super::harness::*;
 use crate::screens::members::{
-    self, BoundAccount, Member, MembersData, Message, Provider, Resource, State, Tier,
+    self, BoundAccount, Command, Member, MemberAction, MembersData, Message, Provider, Resource,
+    State, Tier,
 };
 use crate::theme;
 
@@ -90,5 +91,28 @@ fn only_the_acting_row_shows_a_working_state() {
     assert!(
         !has(&mut ui, Role::Button, "Promote"),
         "the acting row's own actions are replaced while it works"
+    );
+}
+
+#[test]
+fn an_unrelated_write_still_lets_other_rows_open_a_confirm_card() {
+    // M1: the row buttons only ASK (open a local confirm card, no write), so an
+    // unrelated in-flight write must not turn them into dead controls. The
+    // submit is what serializes.
+    let mut state = ready();
+    state.busy = true;
+    state.in_flight = Some("invite".into());
+    members::update(&mut state, Message::AskAction(MemberAction::Promote, RESIDENT.into()));
+    assert!(
+        state.pending.is_some(),
+        "Promote on an unrelated row must open the confirm card despite the busy flag"
+    );
+    // The submit itself stays serialized until the in-flight write settles.
+    assert_eq!(members::update(&mut state, Message::ConfirmAction), None);
+    state.busy = false;
+    state.in_flight = None;
+    assert_eq!(
+        members::update(&mut state, Message::ConfirmAction),
+        Some(Command::PromoteMember(RESIDENT.into()))
     );
 }

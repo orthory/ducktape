@@ -68,6 +68,15 @@ fn settle_stays_live_while_an_unrelated_write_is_in_flight() {
             .any(|message| matches!(message, Message::Execute(id) if id == "signal:1")),
         "clicking Settle emits Execute for the open proposal"
     );
+    // The live button is only honest if `update` actually acts on the message
+    // while `busy` is set — otherwise the control is enabled but inert.
+    assert!(
+        matches!(
+            governance::update(&mut state, Message::Execute("signal:1".into())),
+            Some(governance::Command::Execute(id)) if id == "signal:1"
+        ),
+        "Execute must be honored under an unrelated busy flag, not silently dropped"
+    );
 }
 
 #[test]

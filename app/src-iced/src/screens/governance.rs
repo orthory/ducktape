@@ -504,7 +504,10 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
                     && proposal_eligible(state, proposal)
                     && local_vote(state, proposal) != Some(approve)
             });
-            if !eligible || state.busy || operation_in_flight(state, &proposal_id) {
+            // Gate on THIS proposal's own in-flight op, not the global `busy`
+            // flag — an unrelated write must not disable it (M1). Matches the
+            // view enablement at `proposal_card`.
+            if !eligible || operation_in_flight(state, &proposal_id) {
                 return None;
             }
             start(
@@ -518,7 +521,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
         Message::Execute(proposal_id) => {
             let open = proposal_by_id(state, &proposal_id)
                 .is_some_and(|proposal| proposal.status == ProposalStatus::Open);
-            if !open || state.busy || operation_in_flight(state, &proposal_id) {
+            if !open || operation_in_flight(state, &proposal_id) {
                 None
             } else {
                 start(state, Command::Execute(proposal_id))
