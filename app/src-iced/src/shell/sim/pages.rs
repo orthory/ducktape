@@ -23,11 +23,22 @@ fn new_page_creates_a_document_round_trip() {
     );
     // The committed page re-renders from node state — Ok chains a LoadPages
     // re-query, so `pages.data` is node data, not a local echo.
-    let titles: Vec<String> = match &ui.shell().user_screens.pages.data {
-        Resource::Ready(data) => data.pages.iter().map(|p| p.title.clone()).collect(),
+    let data = match &ui.shell().user_screens.pages.data {
+        Resource::Ready(data) => data,
         other => panic!("pages list not loaded into the render model: {other:?}"),
     };
-    assert_eq!(titles, vec!["Untitled"], "the created page renders in the list");
+    let titles: Vec<String> = data.pages.iter().map(|p| p.title.clone()).collect();
+    assert_eq!(
+        titles,
+        vec!["Untitled"],
+        "the created page renders in the list"
+    );
+    let document = data
+        .document
+        .as_ref()
+        .expect("the created page is the open document");
+    assert_eq!(document.id, data.pages[0].id);
+    assert_eq!(document.title, "Untitled");
 
     let listed = ui.node_query("pages", serde_json::json!("list_pages"));
     assert!(

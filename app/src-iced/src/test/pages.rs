@@ -170,6 +170,21 @@ fn rail_header_new_and_refresh_are_ghost_buttons() {
     assert!(emitted(ui, &Message::NewPage));
 }
 
+#[test]
+fn new_page_opens_pending_document() {
+    let mut state = rail_state(vec![meta("doc", "Notes", None)]);
+    let Some(Effect::CreatePage {
+        parent: Some(request),
+    }) = pages::update(&mut state, Message::NewPage)
+    else {
+        panic!("expected page create");
+    };
+    let document = state.document().expect("new page is active");
+    assert_eq!(document.title, "Untitled");
+    assert_eq!(tabs(&state), vec![document.id.clone()]);
+    assert_eq!(request, format!("{}\0", document.id));
+}
+
 // The "cannot create any document" incident: a failed create lands in a state
 // with NO open document, and the error used to render only inside an open
 // document's body — the click looked like it did nothing.

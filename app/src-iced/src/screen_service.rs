@@ -529,13 +529,7 @@ fn author_name(value: &Value) -> String {
         .to_string()
 }
 
-fn fresh_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{prefix}-{nanos:x}")
-}
+pub(crate) use crate::view_api::fresh_id;
 
 fn clock_time(timestamp: u64) -> String {
     let seconds = timestamp % 86_400;

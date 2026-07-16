@@ -5,7 +5,7 @@
 
 use iced::widget::text_editor;
 
-use crate::view_api::Resource;
+use crate::view_api::{Resource, fresh_id};
 
 mod view;
 
@@ -513,7 +513,7 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             state.query = value;
             None
         }
-        Message::NewPage => Some(Effect::CreatePage { parent: None }),
+        Message::NewPage => Some(begin_page_create(state, None)),
         Message::DismissError => {
             state.error = None;
             None
@@ -611,9 +611,10 @@ pub fn update(state: &mut State, message: Message) -> Option<Effect> {
             page: page_document(state)?.id.clone(),
             kind,
         }),
-        Message::CreateChildPage => Some(Effect::CreatePage {
-            parent: Some(page_document(state)?.id.clone()),
-        }),
+        Message::CreateChildPage => {
+            let parent = page_document(state)?.id.clone();
+            Some(begin_page_create(state, Some(parent)))
+        }
         Message::RequestDeletePage => {
             page_document(state)?;
             state.pending_page_delete = true;
@@ -1527,6 +1528,39 @@ fn location(state: &State) -> (Option<String>, Vec<String>) {
             data.open_tabs.clone(),
         ),
         _ => (None, Vec::new()),
+    }
+}
+
+fn begin_page_create(state: &mut State, parent: Option<String>) -> Effect {
+    let id = fresh_id("page");
+    let document = PageDocument {
+        id: id.clone(),
+        title: "Untitled".into(),
+        ancestry: Vec::new(),
+        blocks: Vec::new(),
+        page_comments: 0,
+        comment_threads: Vec::new(),
+        presence: Vec::new(),
+        self_key: None,
+    };
+    reset_page_transients(state);
+    match &mut state.data {
+        Resource::Ready(data) => {
+            data.open_tabs.push(id.clone());
+            data.document = Some(document);
+        }
+        _ => {
+            state.data = Resource::Ready(PagesData {
+                pages: Vec::new(),
+                open_tabs: vec![id.clone()],
+                document: Some(document),
+            });
+        }
+    }
+    // ponytail: reuse the forwarded Command slot; give CreatePage typed fields
+    // when the screen/command boundary can change together.
+    Effect::CreatePage {
+        parent: Some(format!("{id}\0{}", parent.unwrap_or_default())),
     }
 }
 
