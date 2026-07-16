@@ -816,7 +816,7 @@ fn connect_view(state: &State, p: Palette) -> Element<'_, Message> {
     let mut content = column![header, tabs, fields].spacing(16);
 
     if let Some(error) = &state.error {
-        content = content.push(text(error).font(MONO).size(11.5).color(p.red));
+        content = content.push(selectable_error(error, p));
     }
     let enabled = !state.busy && can_submit(state);
     let submit_label = if state.busy {
@@ -861,6 +861,7 @@ fn join_code_card(state: &State, p: Palette) -> Element<'_, Message> {
                     .font(MONO)
                     .size(10.5)
                     .color(p.ink_soft)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .width(Length::Fill),
                 outline_enabled("Copy", Message::CopyJoinCode, state.join_code.is_some(), p,),
             ]
@@ -1542,15 +1543,36 @@ fn danger_primary(label: &'static str, message: Message, p: Palette) -> Element<
     btn.into()
 }
 
+/// Error/status text the user can select and copy. iced 0.14 `text` is not
+/// selectable; a read-only `text_input` (no `on_input`) stays focusable and
+/// supports select + copy while rendering like the inline error text it replaces.
+fn selectable_error<'a>(message: &'a str, p: Palette) -> Element<'a, Message> {
+    text_input("", message)
+        .font(MONO)
+        .size(11.5)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: p.red,
+            placeholder: p.red,
+            value: p.red,
+            selection: theme::ACCENTS[0],
+        })
+        .into()
+}
+
 fn dialog_button(
     label: &'static str,
     message: Message,
     danger: bool,
     p: Palette,
 ) -> Element<'static, Message> {
+    // Symmetric vertical padding centers the label; a fixed `.height(32)` with
+    // top-anchored button content (iced positions children at padding top-left)
+    // left the text stuck to the top of the button.
     let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
-        .height(32)
-        .padding([0, 12])
+        .padding([8, 12])
         .on_press(message)
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(if danger {
