@@ -16,13 +16,15 @@
 //! - Two per-use [`DataPlane`]s over the overlay ([`crate::voice_plane`]),
 //!   built lazily once the reachability plane has the interface up.
 //! - An [`AdmissionPolicy`] over the node's ACTIVE flows, keyed by
-//!   `(Service, FlowId)`: this node receives (and emits) call media only for
-//!   flows its own operator has a live huddle session on — the mic and control
-//!   flows on `Service::Voice`, the camera flow on `Service::Video`. The
-//!   overlay already authenticates every peer by its source `/128`;
-//!   roster-level gating is the client's job (it steers the fan-out from
-//!   consensus state), and unadmitted traffic drops counted at the plane per
-//!   its default-deny contract.
+//!   `(Service, FlowId)` and carrying each flow's ROSTER: this node receives
+//!   (and emits) call media only for flows its own operator has a live huddle
+//!   session on — the mic and control flows on `Service::Voice`, the camera
+//!   flow on `Service::Video` — and only from/to peers the session's
+//!   `recipients` watch lists. The overlay authenticates every peer by its
+//!   source `/128` (identity); the roster is the authorization on top: flow
+//!   ids are derivable from public channel ids, so without it any network
+//!   member could inject media into a call it is not part of. Unadmitted
+//!   traffic drops counted at the plane per its default-deny contract.
 //! - The hub loop — drains [`noded::RealtimeSessionRequest`]s from the app
 //!   surface and runs one huddle plus one Pages-presence session at a time.
 //!   A huddle owns a [`VoiceEngine`] on the channel-derived audio flow plus
@@ -117,26 +119,60 @@ pub fn spawn_hub(
         .expect("spawn voice-hub thread")
 }
 
-/// The `(service, flow)` pairs this node's operator is live on. Shared between
-/// the plane's admission checks (per datagram) and the hub (session
-/// open/close). A session admits three: mic + control on `Service::Voice`,
-/// camera on `Service::Video`.
+/// The `(service, flow)` pairs this node's operator is live on, each carrying
+/// the flow's roster — the peers the session's `recipients` watch currently
+/// lists. Shared between the plane's admission checks (per datagram) and the
+/// hub (session open/close/roster change). A session admits three: mic +
+/// control on `Service::Voice`, camera on `Service::Video`.
+///
+/// The roster is what makes admission PEER-aware: the overlay authenticates a
+/// sender's `/128`, but membership alone must not admit media into a call —
+/// any member can derive a channel's flow ids, so a member outside the huddle
+/// could otherwise inject straight into a live mix. Sender-side fan-out
+/// discipline is no defence (an adversary does not run our fan-out), so the
+/// roster is enforced HERE, on receive, at demux: not in the roster → dropped,
+/// counted rogue, never queued.
+/// one flow's roster: the raw ed25519 keys its session currently lists.
+type Roster = HashSet<[u8; 32]>;
+
 #[derive(Default)]
-struct ActiveFlows(Mutex<HashSet<(Service, FlowId)>>);
+struct ActiveFlows(Mutex<HashMap<(Service, FlowId), Roster>>);
 
 impl ActiveFlows {
+    /// register a flow with an EMPTY roster: everything drops until the
+    /// session's first `recipients` update lands (mirrors the send side,
+    /// which also fans out to nobody until the roster arrives).
     fn insert(&self, key: (Service, FlowId)) {
-        self.0.lock().expect("flows lock").insert(key);
+        self.0
+            .lock()
+            .expect("flows lock")
+            .insert(key, HashSet::new());
     }
 
     fn remove(&self, key: &(Service, FlowId)) {
         self.0.lock().expect("flows lock").remove(key);
     }
+
+    /// replace the roster on every one of a session's flows (mic, camera and
+    /// control move together — one huddle, one roster).
+    fn set_roster(&self, keys: &[(Service, FlowId)], roster: &[[u8; 32]]) {
+        let allowed: Roster = roster.iter().copied().collect();
+        let mut flows = self.0.lock().expect("flows lock");
+        for key in keys {
+            if let Some(entry) = flows.get_mut(key) {
+                entry.clone_from(&allowed);
+            }
+        }
+    }
 }
 
 impl AdmissionPolicy for ActiveFlows {
-    fn permits(&self, _peer: PeerId, service: Service, flow: FlowId) -> bool {
-        self.0.lock().expect("flows lock").contains(&(service, flow))
+    fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
+        self.0
+            .lock()
+            .expect("flows lock")
+            .get(&(service, flow))
+            .is_some_and(|allowed| allowed.contains(&peer.0))
     }
 }
 
@@ -568,7 +604,7 @@ async fn run_presence_session<T: DataPlaneTransport>(
     datagram: DatagramFlow<T>,
     mut control_in: mpsc::Receiver<noded::PresenceControlIn>,
     control_out: mpsc::Sender<noded::PresenceControlOut>,
-    recipients: watch::Receiver<Vec<[u8; 32]>>,
+    mut recipients: watch::Receiver<Vec<[u8; 32]>>,
     flows: Arc<ActiveFlows>,
     registered: Vec<(Service, FlowId)>,
 ) {
@@ -581,8 +617,14 @@ async fn run_presence_session<T: DataPlaneTransport>(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            changed = recipients.changed() => {
+                let Ok(()) = changed else { break };
+                flows.set_roster(&registered, &recipients.borrow());
+            }
             inbound = datagram.recv() => {
                 let (peer, frame) = inbound;
+                // demux already roster-gates (set_roster above); this re-check
+                // covers datagrams queued before a roster SHRINK drained.
                 if !recipients.borrow().contains(&peer.0) {
                     continue;
                 }
@@ -653,7 +695,7 @@ async fn run_session<T: DataPlaneTransport>(
     video_out: mpsc::Sender<chat::call_wire::PeerFrame>,
     mut control_in: mpsc::Receiver<noded::CallControlIn>,
     control_out: mpsc::Sender<noded::CallControlOut>,
-    recipients: watch::Receiver<Vec<[u8; 32]>>,
+    mut recipients: watch::Receiver<Vec<[u8; 32]>>,
     flows: Arc<ActiveFlows>,
     registered: Vec<(Service, FlowId)>,
 ) {
@@ -687,6 +729,13 @@ async fn run_session<T: DataPlaneTransport>(
 
     loop {
         tokio::select! {
+            changed = recipients.changed() => {
+                // the roster IS the receive gate: push it into admission so
+                // demux admits exactly the huddle's peers. Err = the client
+                // dropped its lane; the session is over either way.
+                let Ok(()) = changed else { break };
+                flows.set_roster(&registered, &recipients.borrow());
+            }
             captured = pcm_in.recv() => {
                 let Some(captured) = captured else { break };
                 if captured.len() != FRAME_SAMPLES {
@@ -1167,6 +1216,44 @@ mod tests {
         req_tx
     }
 
+    /// a loud 500 Hz square wave — NOT a constant frame: Opus's SILK high-pass
+    /// strips DC, so a constant stimulus carries energy only in the encoder's
+    /// first few (step-transient) packets. A receiver admitted mid-stream —
+    /// exactly what roster-gated admission produces — would then hear silence
+    /// forever, failing the test on a codec artifact real mic audio never has.
+    /// A tone keeps every packet energetic, so lateness never matters.
+    fn loud_frame() -> Vec<i16> {
+        (0..FRAME_SAMPLES)
+            .map(|i| if (i / 48) % 2 == 0 { 8000 } else { -8000 })
+            .collect()
+    }
+
+    /// pump loud frames from `a` until `b` plays out energy — proves the whole
+    /// path (a's send admission, the link, b's receive admission) is open.
+    /// Doubles as the gate barrier ahead of one-shot video/control sends:
+    /// roster updates reach admission asynchronously, so a test must not
+    /// one-shot a frame it cannot resend until audio proves the gate open.
+    async fn wait_audio_crosses(
+        session_a: &noded::CallSession,
+        session_b: &mut noded::CallSession,
+    ) {
+        let loud = loud_frame();
+        let heard = async {
+            loop {
+                let _ = session_a.pcm_in.send(loud.clone()).await;
+                let Some(mixed) = session_b.mixed_out.recv().await else {
+                    panic!("receiving session ended early");
+                };
+                if mixed.iter().any(|s| s.abs() > 1000) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), heard)
+            .await
+            .expect("audio must cross the hubs");
+    }
+
     /// open (or replace) a session on channel "general" over a hub lane.
     async fn open(lane: noded::CallLane) -> noded::CallSession {
         let (reply, opened) = tokio::sync::oneshot::channel();
@@ -1270,23 +1357,15 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
+        // symmetric roster: receive admission is roster-gated, so B hears A
+        // only once B lists A.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         // a loud constant frame from a — b must eventually play out energy.
-        let loud = vec![8000i16; FRAME_SAMPLES];
-        let heard = async {
-            loop {
-                let _ = session_a.pcm_in.send(loud.clone()).await;
-                let Some(mixed) = session_b.mixed_out.recv().await else {
-                    panic!("session b ended early");
-                };
-                if mixed.iter().any(|s| s.abs() > 1000) {
-                    break;
-                }
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(10), heard)
-            .await
-            .expect("audio must cross the hubs");
+        wait_audio_crosses(&session_a, &mut session_b).await;
 
         // replace a's session with a new one on the SAME channel: teardown
         // must release the flows so the re-open succeeds.
@@ -1295,6 +1374,110 @@ mod tests {
             !session_a2.pcm_in.is_closed(),
             "replacement session must be live"
         );
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// receive admission is what a flow's roster means: unknown flow denies,
+    /// a live flow with no roster denies everyone, and only currently
+    /// rostered peers pass.
+    #[test]
+    fn admission_requires_both_a_live_flow_and_a_rostered_peer() {
+        let flows = ActiveFlows::default();
+        let key = (Service::Voice, channel_flow("general"));
+        let (peer_a, peer_b) = (PeerId([1; 32]), PeerId([2; 32]));
+
+        assert!(!flows.permits(peer_a, key.0, key.1), "unknown flow admits");
+        flows.insert(key);
+        assert!(
+            !flows.permits(peer_a, key.0, key.1),
+            "an empty roster (pre-first-update) must deny everyone"
+        );
+        flows.set_roster(&[key], &[[1; 32]]);
+        assert!(flows.permits(peer_a, key.0, key.1));
+        assert!(
+            !flows.permits(peer_b, key.0, key.1),
+            "membership alone must not admit — only the roster does"
+        );
+        flows.set_roster(&[key], &[[2; 32]]);
+        assert!(!flows.permits(peer_a, key.0, key.1), "a removed peer stays");
+        assert!(flows.permits(peer_b, key.0, key.1));
+        flows.remove(&key);
+        assert!(!flows.permits(peer_b, key.0, key.1), "teardown must close");
+    }
+
+    /// the receive gate end-to-end: a network member whose datagrams reach
+    /// this node's media ports but who is NOT in the session's roster must
+    /// never surface — not in the audio mix, not as a video frame, not as a
+    /// control beacon. Sender-side fan-out discipline is no defence (an
+    /// adversary does not run our fan-out; flow ids derive from public
+    /// channel ids), so the roster is enforced at receive demux. Listing the
+    /// peer afterwards proves the drop was the gate and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn media_from_a_member_outside_the_roster_never_surfaces() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        // A fans out to B, but B does NOT list A: on the wire this is exactly
+        // a member injecting into a call whose roster excludes it.
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+
+        // audio: pump loud frames through ~1 s of B's playout; every mixed
+        // frame must stay silent.
+        let loud = loud_frame();
+        let mut quiet_frames = 0;
+        while quiet_frames < 50 {
+            let _ = session_a.pcm_in.send(loud.clone()).await;
+            match tokio::time::timeout(Duration::from_secs(2), session_b.mixed_out.recv()).await {
+                Ok(Some(mixed)) => {
+                    assert!(
+                        mixed.iter().all(|s| s.abs() <= 1000),
+                        "an unlisted member's audio reached the mix"
+                    );
+                    quiet_frames += 1;
+                }
+                Ok(None) => panic!("session b ended early"),
+                Err(_) => panic!("playout stalled"),
+            }
+        }
+
+        // video: a keyframe from A must never reach B's webview...
+        session_a
+            .video_in
+            .send(chat::call_wire::CapturedFrame {
+                keyframe: true,
+                ts_ms: 7,
+                data: vec![0xA0; 5000],
+            })
+            .await
+            .expect("session a alive");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), session_b.video_out.recv())
+                .await
+                .is_err(),
+            "an unlisted member's video reached the webview"
+        );
+        // ...and neither must A's 1 Hz control beacon (the second of quiet
+        // playout above means at least one beacon was sent and dropped).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), session_b.control_out.recv())
+                .await
+                .is_err(),
+            "an unlisted member's control message reached the webview"
+        );
+
+        // list A → the same traffic crosses: the drops above were the roster
+        // gate, not plumbing.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
+        wait_audio_crosses(&session_a, &mut session_b).await;
         drop((req_a_tx, req_b_tx));
     }
 
@@ -1377,13 +1560,16 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
-        // B lists A too: a real huddle roster is symmetric, and B's 1 Hz ctl
-        // tick evicts receive lanes for peers NOT in its recipients — without
-        // this, a tick landing mid-keyframe would drop A's in-progress frame.
+        // B lists A too: a real huddle roster is symmetric, receive admission
+        // is roster-gated, and B's 1 Hz ctl tick evicts receive lanes for
+        // peers NOT in its recipients — without this, a tick landing
+        // mid-keyframe would drop A's in-progress frame.
         session_b
             .recipients
             .send(vec![key_a])
             .expect("session b alive");
+        // gate barrier: the video sends below are one-shot.
+        wait_audio_crosses(&session_a, &mut session_b).await;
 
         // position-dependent fills (not uniform bytes) so a fragment-ordering
         // or reassembly regression in the hub path shows up — a reordered or
@@ -1466,6 +1652,11 @@ mod tests {
             .recipients
             .send(vec![key_a])
             .expect("session b alive");
+        // gate barrier BEFORE any video flows: if frame 0 raced the roster
+        // into a closed gate, the loss filter's one dropped fragment would be
+        // wasted on a frame the demux discarded whole, and no keyframe
+        // request would ever fire.
+        wait_audio_crosses(&session_a, &mut session_b).await;
         let mut control_a = session_a.control_out;
 
         // frame 0 loses a fragment (incomplete); frame 1 completes.
@@ -1525,11 +1716,16 @@ mod tests {
 
         let session_a = open(req_a_tx.clone()).await;
         let mut session_b = open(req_b_tx.clone()).await;
-        // A beacons to its recipients — B must be one of them.
+        // A beacons to its recipients — B must be one of them; B's receive
+        // admission is roster-gated, so B must list A right back.
         session_a
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         session_a
             .control_in
@@ -1905,12 +2101,16 @@ mod overlay_e2e {
             .send(vec![a.raw_key])
             .expect("session b alive");
 
-        // loud constant audio from A must surface as energy in B's mixed
+        // loud tonal audio from A must surface as energy in B's mixed
         // playout, having crossed: A's hub runtime → its overlay socket → the
         // WireGuard tunnel → B's overlay socket → B's jitter buffer → Opus
         // decode → mix. A generous deadline covers the handshake + the bind
-        // retry loop.
-        let loud = vec![8000i16; FRAME_SAMPLES];
+        // retry loop. A 500 Hz square, not a constant frame: SILK's high-pass
+        // strips DC, so with roster-gated admission a receiver that misses
+        // the encoder's first packets would otherwise hear converged silence.
+        let loud: Vec<i16> = (0..FRAME_SAMPLES)
+            .map(|i| if (i / 48) % 2 == 0 { 8000 } else { -8000 })
+            .collect();
         let heard = async {
             loop {
                 let _ = session_a.pcm_in.send(loud.clone()).await;
