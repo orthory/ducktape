@@ -289,6 +289,21 @@ fn validate_invocation(args: &[&str], stdin_lines: &[&str]) -> Result<(), String
     Ok(())
 }
 
+/// Test-only in-process verb override. The sim lane installs a closure that
+/// answers the `user-*` signing verbs with `node::encode_frame` over a
+/// generated key, so `cargo test` needs no `ducktape-node` binary. An
+/// installed override is authoritative: verbs it does not recognize are
+/// errors, never a silent fall-through to a subprocess.
+#[cfg(test)]
+pub(crate) type VerbOverride =
+    Box<dyn Fn(&[&str], &[&str]) -> Result<String, String> + Send + Sync>;
+#[cfg(test)]
+static VERB_OVERRIDE: OnceLock<VerbOverride> = OnceLock::new();
+#[cfg(test)]
+pub(crate) fn install_verb_override(handler: VerbOverride) {
+    let _ = VERB_OVERRIDE.set(handler);
+}
+
 #[allow(dead_code)]
 pub(super) fn run_verb(args: &[&str]) -> Result<String, String> {
     run_verb_inner(args, &[])
@@ -300,6 +315,10 @@ pub(super) fn run_verb_with_stdin(args: &[&str], stdin_lines: &[&str]) -> Result
 }
 
 fn run_verb_inner(args: &[&str], stdin_lines: &[&str]) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(handler) = VERB_OVERRIDE.get() {
+        return handler(args, stdin_lines);
+    }
     validate_invocation(args, stdin_lines)?;
     let verb = args.first().copied().unwrap_or("");
     let binary = resolve_node_bin()?;
