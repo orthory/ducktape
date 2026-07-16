@@ -92,10 +92,17 @@ pub async fn execute(cmd: Cmd, shared: &Shared) -> Result<Value, String> {
             Ok(json!({ "typed": text.chars().count() }))
         }
         Cmd::Press { key, modifiers } => {
-            let named = named_key(&key).ok_or_else(|| format!("unknown key '{key}'"))?;
+            // Named keys (enter/tab/escape/…) or a single character chord
+            // (e.g. `press k --mod ctrl` for the search palette).
+            let k = match named_key(&key) {
+                Some(named) => keyboard::Key::Named(named),
+                None if key.chars().count() == 1 => {
+                    keyboard::Key::Character(key.to_lowercase().into())
+                }
+                None => return Err(format!("unknown key '{key}'")),
+            };
             let mods = parse_modifiers(&modifiers);
             let id = default_window(shared)?;
-            let k = keyboard::Key::Named(named);
             inject(
                 id,
                 Event::Keyboard(keyboard::Event::KeyPressed {

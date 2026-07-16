@@ -54,6 +54,25 @@ pub fn run() -> iced::Result {
     #[cfg(all(feature = "cef-browser", target_os = "macos"))]
     browser::prepare_macos_application();
 
+    // Dev builds add the agent's in-memory log ring next to the fmt output so
+    // the bridge's `logs` tool can serve recent events.
+    #[cfg(all(feature = "agent", debug_assertions))]
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+        let (ring, logs) = iced_agent_plugin::ring_layer();
+        let _ = shell::agent_wire::LOGS.set(logs);
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "ducktape=info,ducktape_iced=info".into()),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(ring)
+            .try_init()
+            .ok();
+    }
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

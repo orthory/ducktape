@@ -488,6 +488,17 @@ cef::wrap_app! {
                     Some(&CefString::from("ozone-platform")),
                     Some(&CefString::from("x11")),
                 );
+                // Dev-only agent tooling: expose CDP so Browser-pane content is
+                // drivable over Chromium's own protocol. The port is picked at
+                // startup and published in the agent endpoint registry; a
+                // release build never appends the switch.
+                #[cfg(all(feature = "agent", debug_assertions))]
+                if let Some(port) = crate::browser::agent_cdp_port() {
+                    command_line.append_switch_with_value(
+                        Some(&CefString::from("remote-debugging-port")),
+                        Some(&CefString::from(port.to_string().as_str())),
+                    );
+                }
             }
         }
     }
@@ -1131,6 +1142,30 @@ fn close_partially_created_browser(host: &BrowserHost, closed: &AtomicBool) -> R
 fn ensure_cef_reusable(armed: bool) -> Result<(), String> {
     armed.then_some(()).ok_or_else(|| {
         "CEF runtime is not safe to reuse after a failed browser lifecycle operation".into()
+    })
+}
+
+/// Dev-only agent tooling: the CDP port CEF's browser process listens on.
+/// Picked once by binding an ephemeral loopback port; published through the
+/// agent endpoint registry so drivers can reach Browser-pane content over
+/// Chromium's own protocol.
+#[cfg(all(feature = "agent", debug_assertions))]
+pub(crate) fn agent_cdp_port() -> Option<u16> {
+    use std::sync::OnceLock;
+    static PORT: OnceLock<Option<u16>> = OnceLock::new();
+    *PORT.get_or_init(|| {
+        std::net::TcpListener::bind(("127.0.0.1", 0))
+            .and_then(|listener| listener.local_addr())
+            .map(|addr| addr.port())
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "ducktape::agent",
+                    reason = "cdp_port_unavailable",
+                    %error,
+                    "could not reserve a CDP port; browser pane not agent-drivable"
+                );
+            })
+            .ok()
     })
 }
 

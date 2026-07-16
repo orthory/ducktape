@@ -3922,6 +3922,7 @@ dependencies = [
  "git2",
  "html5ever",
  "iced",
+ "iced-agent-plugin",
  "iced_winit",
  "image",
  "libc",

@@ -72,6 +72,12 @@ impl AgentHandle {
     /// starts serving. `logs` is the reader half of the ring the app installed
     /// in its subscriber (see [`ring_layer`](crate::logs::ring_layer)).
     pub fn boot(app_id: &str, logs: LogsHandle) -> AgentHandle {
+        Self::boot_with_cdp(app_id, logs, None)
+    }
+
+    /// Like [`AgentHandle::boot`], also publishing a CDP URL for embedded
+    /// Chromium content (the Browser pane) in `endpoint.json`.
+    pub fn boot_with_cdp(app_id: &str, logs: LogsHandle, cdp: Option<String>) -> AgentHandle {
         let shared = Arc::new(Shared::new(logs));
         let (tx, rx) = std::sync::mpsc::channel();
         let server_shared = Arc::clone(&shared);
@@ -105,7 +111,7 @@ impl AgentHandle {
             .expect("agent bridge thread reported bind result")
             .expect("agent bridge bound loopback port");
 
-        let endpoint_path = write_endpoint(app_id, addr.port());
+        let endpoint_path = write_endpoint(app_id, addr.port(), cdp.as_deref());
         tracing::info!(target: "iced::agent", port = addr.port(), "agent bridge listening");
 
         AgentHandle {
@@ -216,7 +222,7 @@ fn base_dir() -> PathBuf {
 }
 
 /// Writes the discovery file and returns its path.
-fn write_endpoint(app_id: &str, port: u16) -> PathBuf {
+fn write_endpoint(app_id: &str, port: u16, cdp: Option<&str>) -> PathBuf {
     let dir = base_dir().join("iced-agent").join(app_id);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!(target: "iced::agent", reason = "endpoint_dir_failed", error = %e);
@@ -232,7 +238,7 @@ fn write_endpoint(app_id: &str, port: u16) -> PathBuf {
         "host": "127.0.0.1",
         "port": port,
         "pid": std::process::id(),
-        "cdp": serde_json::Value::Null,
+        "cdp": cdp,
     });
     if let Err(e) = std::fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap_or_default()) {
         tracing::warn!(target: "iced::agent", reason = "endpoint_write_failed", error = %e);

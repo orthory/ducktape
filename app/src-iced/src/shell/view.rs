@@ -179,13 +179,19 @@ fn notification_time(at: u64) -> String {
 }
 
 pub(super) fn view(state: &Shell, id: window::Id) -> Element<'_, Message> {
-    match state.desktop.kind(id) {
+    let kind = state.desktop.kind(id);
+    let content = match kind {
         desktop::Kind::Main => main_view(state),
         desktop::Kind::Huddle => {
             huddle_ui::window_view(&state.huddle, huddle_context(state)).map(Message::Huddle)
         }
         desktop::Kind::Tray => tray_view(state),
-    }
+    };
+    // Dev-only: the window root is the anchor of the agent's semantic tree;
+    // its name ("main"/"huddle"/"tray") is the tools' window key.
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let content = super::agent_wire::root(kind, content);
+    content
 }
 
 fn huddle_context(state: &Shell) -> huddle_ui::ViewContext<'_> {
@@ -1195,18 +1201,21 @@ fn section_button<'a>(
 ) -> Element<'a, Message> {
     let p = theme::palette(state.mode);
     let active = state.section == section;
-    button(text(label).size(8))
+    let tab = button(text(label).size(8))
         .height(28)
         .padding([0, 5])
         .on_press(Message::Section(section))
-        .style(move |_, status| tab_style(p, active, status))
-        .into()
+        .style(move |_, status| tab_style(p, active, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, tab);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    tab.into()
 }
 
 fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
     let p = theme::palette(state.mode);
     let active = state.screen() == screen;
-    button(
+    let nav = button(
         column![
             icons::view(
                 screen.icon(),
@@ -1224,8 +1233,11 @@ fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
     .height(54)
     .padding([7, 2])
     .on_press(Message::Navigate(screen))
-    .style(move |_, status| tab_style(p, active, status))
-    .into()
+    .style(move |_, status| tab_style(p, active, status));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, screen.label(), nav);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    nav.into()
 }
 
 fn rounded(background: Color, radius: f32) -> container::Style {
