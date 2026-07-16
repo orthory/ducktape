@@ -9,7 +9,7 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Vector};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_SM, SANS};
+use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_SM, SANS, SANS_SEMIBOLD};
 use crate::view_api::{DropToken, Resource};
 
 const COLUMN_WIDTH: f32 = 286.0;
@@ -350,6 +350,36 @@ pub fn loaded(state: &mut State, result: Result<Option<FileListing>, String>) {
             state.columns.clear();
             state.selected = None;
             state.data = Resource::Empty;
+        }
+        // A fresh chain has no `/shared` yet — the files module answers
+        // `path not found` for the default write root until the first write
+        // creates it. That is an empty, writeable directory, not an error:
+        // hard-erroring here bricked the whole tab on every new network
+        // (mirrors the original app's DEFAULT_DIR && snapshot==null guard).
+        Err(error)
+            if state.columns.is_empty()
+                && error.ends_with("path not found")
+                && snapshot(state).is_none() =>
+        {
+            let listing = FileListing {
+                path: "/shared".into(),
+                entries: Vec::new(),
+                preview: None,
+                read_only: false,
+                refreshing: false,
+                head: None,
+                snapshot: None,
+                history: Vec::new(),
+                diff: Vec::new(),
+            };
+            state.columns.push(DirectoryColumn {
+                path: listing.path.clone(),
+                entries: Vec::new(),
+                refreshing: false,
+                snapshot: None,
+            });
+            state.data = Resource::Ready(listing);
+            state.error = None;
         }
         Err(error) if state.columns.is_empty() => state.data = Resource::Error(error),
         Err(error) => state.error = Some(error),
@@ -990,29 +1020,70 @@ fn history_button(selected: bool, p: Palette) -> iced::widget::button::Style {
 }
 
 fn breadcrumb(path: &str, p: Palette) -> Element<'static, Message> {
-    let mut crumbs = row![outline(
-        "root",
-        Message::OpenEntry("/".into(), FileKind::Directory),
-        p,
-    )]
-    .spacing(3)
-    .align_y(Alignment::Center);
-    let mut current = String::new();
-    for segment in path
+    let segments: Vec<&str> = path
         .trim_matches('/')
         .split('/')
         .filter(|segment| !segment.is_empty())
-    {
+        .collect();
+    // A path, not a row of buttons: borderless text crumbs joined by ›, the
+    // current (last) segment bold and non-clickable.
+    let mut crumbs = row![].spacing(3).align_y(Alignment::Center);
+    if segments.is_empty() {
+        crumbs = crumbs.push(
+            text("root")
+                .font(SANS_SEMIBOLD)
+                .size(theme::LABEL)
+                .color(p.ink),
+        );
+        return crumbs.into();
+    }
+    crumbs = crumbs.push(crumb_link(
+        "root",
+        Message::OpenEntry("/".into(), FileKind::Directory),
+        p,
+    ));
+    let mut current = String::new();
+    let last = segments.len() - 1;
+    for (index, segment) in segments.into_iter().enumerate() {
         current.push('/');
         current.push_str(segment);
-        crumbs = crumbs.push(text("›").font(SANS).size(11).color(p.muted_2));
-        crumbs = crumbs.push(outline(
-            segment,
-            Message::OpenEntry(current.clone(), FileKind::Directory),
-            p,
-        ));
+        crumbs = crumbs.push(text("›").font(SANS).size(theme::LABEL).color(p.muted_2));
+        if index == last {
+            crumbs = crumbs.push(
+                text(segment.to_string())
+                    .font(SANS_SEMIBOLD)
+                    .size(theme::LABEL)
+                    .color(p.ink),
+            );
+        } else {
+            crumbs = crumbs.push(crumb_link(
+                segment.to_string(),
+                Message::OpenEntry(current.clone(), FileKind::Directory),
+                p,
+            ));
+        }
     }
     crumbs.into()
+}
+
+fn crumb_link(
+    label: impl text::IntoFragment<'static>,
+    message: Message,
+    p: Palette,
+) -> Element<'static, Message> {
+    button(text(label).font(SANS).size(theme::LABEL))
+        .padding([1, 3])
+        .on_press(message)
+        .style(move |_, status| iced::widget::button::Style {
+            background: None,
+            text_color: if matches!(status, iced::widget::button::Status::Hovered) {
+                p.ink
+            } else {
+                p.muted
+            },
+            ..iced::widget::button::Style::default()
+        })
+        .into()
 }
 
 fn drop_overlay(target: &str, p: Palette) -> Element<'static, Message> {
@@ -1370,6 +1441,27 @@ fn short(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_chain_missing_shared_root_is_empty_and_writeable() {
+        let mut state = State::default();
+        loaded(&mut state, Err("files: path not found".into()));
+        let Resource::Ready(listing) = &state.data else {
+            panic!("expected a synthesized listing, got {:?}", state.data);
+        };
+        assert_eq!(listing.path, "/shared");
+        assert!(listing.entries.is_empty());
+        assert!(!listing.read_only, "the synthesized root must accept writes");
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn missing_path_below_a_loaded_root_stays_an_error() {
+        let mut state = State::default();
+        loaded(&mut state, Ok(Some(listing("/shared", None))));
+        loaded(&mut state, Err("files: path not found".into()));
+        assert!(state.error.is_some(), "a real miss must surface, not vanish");
+    }
 
     fn listing(path: &str, snapshot: Option<&str>) -> FileListing {
         FileListing {
