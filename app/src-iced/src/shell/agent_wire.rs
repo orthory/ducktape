@@ -104,7 +104,12 @@ pub(super) fn tick(state: &mut Shell) -> Task<Message> {
                     let reply = Mutex::new(Some(reply));
                     tasks.push(iced::window::screenshot(id).then(move |shot| {
                         if let Some(reply) = reply.lock().unwrap().take() {
-                            let _ = reply.send(encode_png(&shot));
+                            let png = encode_png(&shot);
+                            // A dropped reply surfaces as a bridge error;
+                            // never answer success with an empty image.
+                            if !png.is_empty() {
+                                let _ = reply.send(png);
+                            }
                         }
                         Task::none()
                     }));
@@ -185,7 +190,7 @@ fn click_node(
         .iter()
         .flat_map(|snap| snap.flat.iter())
         .find(|node| node.r#ref == reference)
-        .map(|node| node.bounds.clone());
+        .map(|node| node.bounds);
     let Some(bounds) = bounds else { return };
     let position = iced::Point::new(
         bounds.x + bounds.width / 2.0,

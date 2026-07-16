@@ -14,9 +14,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::core::window::Id;
 
 /// Per-window adapter + the winit window it belongs to.
+///
+/// The window is held weakly: a strong clone here would keep the OS window
+/// alive past close, so `WindowEvent::Destroyed` (our cleanup signal) would
+/// never fire.
 struct Slot {
     adapter: accesskit_winit::Adapter,
-    window: Arc<winit::window::Window>,
+    window: std::sync::Weak<winit::window::Window>,
     /// Last tree pushed, replayed on activation and dumpable for QA.
     last_tree: Arc<Mutex<Option<accesskit::TreeUpdate>>>,
 }
@@ -116,7 +120,7 @@ pub(crate) fn attach(
         id,
         Slot {
             adapter,
-            window: Arc::clone(window),
+            window: Arc::downgrade(window),
             last_tree,
         },
     );
@@ -132,8 +136,10 @@ pub(crate) fn process_event(
         return;
     };
     if let Some(slot) = g.slots.lock().unwrap().get_mut(&id) {
-        let _reactor = runtime().enter();
-        slot.adapter.process_event(&slot.window, event);
+        if let Some(window) = slot.window.upgrade() {
+            let _reactor = runtime().enter();
+            slot.adapter.process_event(&window, event);
+        }
     }
     if matches!(event, winit::event::WindowEvent::Destroyed) {
         let _ = g.slots.lock().unwrap().remove(&id);
@@ -173,7 +179,9 @@ pub fn inject(id: Id, event: crate::core::Event) {
     g.injected.lock().unwrap().push((id, event));
     g.injected_flag.store(true, Ordering::Release);
     if let Some(slot) = g.slots.lock().unwrap().get(&id) {
-        slot.window.request_redraw();
+        if let Some(window) = slot.window.upgrade() {
+            window.request_redraw();
+        }
     }
 }
 

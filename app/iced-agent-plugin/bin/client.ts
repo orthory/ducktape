@@ -4,7 +4,9 @@
 export const DEFAULT_APP_ID = "com.ducktape.app";
 
 export function endpointPath(appId: string): string {
-  const base = process.env.XDG_RUNTIME_DIR || process.env.TMPDIR || "/tmp";
+  // Must mirror the bridge's base_dir order (XDG_RUNTIME_DIR|TMPDIR|TMP|/tmp).
+  const base =
+    process.env.XDG_RUNTIME_DIR || process.env.TMPDIR || process.env.TMP || "/tmp";
   return `${base}/iced-agent/${appId}/endpoint.json`;
 }
 
