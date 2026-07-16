@@ -835,44 +835,49 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
         .align_y(Alignment::Center),
     )
     .on_press(Message::Window(WindowAction::Drag));
-    let search = button(
-        row![
-            icons::view(Icon::Search, 14.0, p.muted_2),
-            text("Search").size(12).color(p.muted),
-            Space::new().width(Length::Fill),
-            text(if cfg!(target_os = "macos") {
-                "⌘ K"
-            } else {
-                "Ctrl K"
-            })
-            .size(10)
-            .color(p.muted_2),
-        ]
-        .height(Length::Fill)
-        .spacing(8)
-        .align_y(Alignment::Center),
-    )
-    .padding([0, 12])
-    .width(340)
-    .height(28)
-    .on_press_maybe(
-        (state.onboarding.is_ready() && !state.workspace_overlay).then_some(Message::ToggleSearch),
-    )
-    .style(move |_, status| button::Style {
-        background: Some(Background::Color(
-            if matches!(status, button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
+    // Search only reaches anything once onboarding is done and a workspace is
+    // entered (not on the pre-workspace overlay). Hide the affordance otherwise
+    // rather than showing a dead, unpressable button.
+    let show_search = state.onboarding.is_ready() && !state.workspace_overlay;
+    let search: Option<Element<'_, Message>> = show_search.then(|| {
+        button(
+            row![
+                icons::view(Icon::Search, 14.0, p.muted_2),
+                text("Search").size(12).color(p.muted),
+                Space::new().width(Length::Fill),
+                text(if cfg!(target_os = "macos") {
+                    "⌘ K"
+                } else {
+                    "Ctrl K"
+                })
+                .size(10)
+                .color(p.muted_2),
+            ]
+            .height(Length::Fill)
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([0, 12])
+        .width(340)
+        .height(28)
+        .on_press(Message::ToggleSearch)
+        .style(move |_, status| button::Style {
+            background: Some(Background::Color(
+                if matches!(status, button::Status::Hovered) {
+                    p.hover
+                } else {
+                    p.paper
+                },
+            )),
+            text_color: p.ink,
+            border: Border {
+                color: p.border,
+                width: 1.0,
+                radius: 8.0.into(),
             },
-        )),
-        text_color: p.ink,
-        border: Border {
-            color: p.border,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..button::Style::default()
+            ..button::Style::default()
+        })
+        .into()
     });
     let mut bell_content = row![icons::view(
         Icon::Bell,
@@ -946,21 +951,21 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
             ));
     }
     let native_titlebar_inset = Space::new().width(if cfg!(target_os = "macos") { 68 } else { 0 });
-    container(
-        row![
-            row![native_titlebar_inset, back, forward, identity]
-                .spacing(2)
-                .align_y(Alignment::Center)
-                .width(Length::FillPortion(1)),
-            search,
-            container(controls)
-                .width(Length::FillPortion(1))
-                .align_x(iced::alignment::Horizontal::Right),
-        ]
-        .padding([0, 10])
-        .spacing(12)
-        .align_y(Alignment::Center),
-    )
+    let mut bar = row![
+        row![native_titlebar_inset, back, forward, identity]
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .width(Length::FillPortion(1)),
+    ];
+    if let Some(search) = search {
+        bar = bar.push(search);
+    }
+    bar = bar.push(
+        container(controls)
+            .width(Length::FillPortion(1))
+            .align_x(iced::alignment::Horizontal::Right),
+    );
+    container(bar.padding([0, 10]).spacing(12).align_y(Alignment::Center))
     .height(TITLEBAR_HEIGHT)
     .style(move |_| container::Style {
         background: Some(Background::Color(p.titlebar)),
@@ -1352,5 +1357,47 @@ fn rail_circle(
             radius: 17.0.into(),
         },
         ..button::Style::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready_shell() -> Shell {
+        let mut shell = Shell::default();
+        shell.onboarding.stage = crate::onboarding::Stage::Ready;
+        shell
+    }
+
+    #[test]
+    fn search_hidden_until_a_workspace_is_entered() {
+        // Fresh install, onboarding incomplete: no Search affordance at all.
+        let fresh = Shell::default();
+        assert!(
+            iced_test::simulator(titlebar(&fresh))
+                .find("Search")
+                .is_err(),
+            "search must be hidden before onboarding completes"
+        );
+
+        // Onboarded but parked on the pre-workspace overlay: still hidden.
+        let mut overlay = ready_shell();
+        overlay.workspace_overlay = true;
+        assert!(
+            iced_test::simulator(titlebar(&overlay))
+                .find("Search")
+                .is_err(),
+            "search must be hidden on the pre-workspace overlay"
+        );
+
+        // Onboarded with a workspace entered (overlay closed): search appears.
+        let entered = ready_shell();
+        assert!(
+            iced_test::simulator(titlebar(&entered))
+                .find("Search")
+                .is_ok(),
+            "search must show once a workspace is entered"
+        );
     }
 }
