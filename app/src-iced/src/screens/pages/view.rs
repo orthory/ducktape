@@ -2,7 +2,7 @@
 
 use iced::keyboard;
 use iced::widget::{
-    Button, Space, button, column, container, mouse_area, row, scrollable, text, text_editor,
+    Space, button, column, container, mouse_area, row, scrollable, text, text_editor,
     text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length};
@@ -69,7 +69,11 @@ fn shell<'a>(
         container(
             row![
                 icons::view(Icon::Search, 13.0, p.muted_2),
-                field("Search", &state.query, Message::QueryChanged, p),
+                sem_input(
+                    "Search",
+                    &state.query,
+                    field("Search", &state.query, Message::QueryChanged, p),
+                ),
             ]
             .spacing(8)
             .align_y(Alignment::Center)
@@ -188,8 +192,12 @@ fn document_view<'a>(
         None => "Comment on this page",
     };
     let mut blocks = column![
-        plain_input("Untitled", &document.title, Message::TitleChanged, p)
-            .on_submit(Message::CommitTitle),
+        sem_input(
+            "Page title",
+            &document.title,
+            plain_input("Untitled", &document.title, Message::TitleChanged, p)
+                .on_submit(Message::CommitTitle),
+        ),
         row![
             icon_tile(Icon::Chat, 22.0, p),
             compact_editor(
@@ -670,6 +678,16 @@ fn page_button(
         ..Default::default()
     })
     .on_press(Message::OpenPage(page.id.clone()));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let open = iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        if page.title.is_empty() {
+            "Untitled".to_string()
+        } else {
+            page.title.clone()
+        },
+        open,
+    );
     row![
         Space::new().width((depth.min(8) * 12) as f32),
         if has_children {
@@ -681,7 +699,7 @@ fn page_button(
         } else {
             outline_enabled("·", Message::Refresh, false, p)
         },
-        open.width(Length::Fill),
+        open,
     ]
     .spacing(3)
     .align_y(Alignment::Center)
@@ -739,19 +757,22 @@ fn doc_tabs(data: &PagesData, p: Palette) -> Element<'static, Message> {
             .filter(|title| !title.is_empty())
             .unwrap_or("Untitled");
         let selected = Some(id.as_str()) == active;
+        let open = button(text(title.to_owned()).font(SANS).size(11.5))
+            .height(32)
+            .padding([0, 9])
+            .style(move |_, _| iced::widget::button::Style {
+                background: None,
+                text_color: if selected { p.ink } else { p.ink_softer },
+                border: Border::default(),
+                ..Default::default()
+            })
+            .on_press(Message::OpenPage(id.clone()));
+        #[cfg(all(feature = "agent", debug_assertions))]
+        let open = iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, title.to_owned(), open);
         tabs = tabs.push(
             container(
                 row![
-                    button(text(title.to_owned()).font(SANS).size(11.5))
-                        .height(32)
-                        .padding([0, 9])
-                        .style(move |_, _| iced::widget::button::Style {
-                            background: None,
-                            text_color: if selected { p.ink } else { p.ink_softer },
-                            border: Border::default(),
-                            ..Default::default()
-                        })
-                        .on_press(Message::OpenPage(id.clone())),
+                    open,
                     button(text("×").font(SANS).size(10))
                         .height(32)
                         .padding([0, 6])
@@ -909,7 +930,28 @@ fn plain_input<'a>(
         })
 }
 
-fn outline<'a>(label: impl ToString, message: Message, p: Palette) -> Button<'a, Message> {
+/// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
+/// carrying `value`. Compiled out entirely unless the agent bridge is built.
+#[cfg(all(feature = "agent", debug_assertions))]
+fn sem_input<'a>(
+    name: &'static str,
+    value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(value.to_string())
+        .into()
+}
+#[cfg(not(all(feature = "agent", debug_assertions)))]
+fn sem_input<'a>(
+    _name: &'static str,
+    _value: &str,
+    input: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    input.into()
+}
+
+fn outline<'a>(label: impl ToString, message: Message, p: Palette) -> Element<'a, Message> {
     outline_enabled(label, message, true, p)
 }
 
@@ -918,8 +960,9 @@ fn outline_enabled<'a>(
     message: Message,
     enabled: bool,
     p: Palette,
-) -> Button<'a, Message> {
-    let button = button(text(label.to_string()).font(SANS).size(11.5))
+) -> Element<'a, Message> {
+    let label = label.to_string();
+    let button = button(text(label.clone()).font(SANS).size(11.5))
         .padding([6, 9])
         .style(move |_, status| iced::widget::button::Style {
             background: Some(Background::Color(
@@ -941,11 +984,17 @@ fn outline_enabled<'a>(
             },
             ..Default::default()
         });
-    if enabled {
+    let button = if enabled {
         button.on_press(message)
     } else {
         button
-    }
+    };
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, button)
+        .disabled(!enabled)
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    button.into()
 }
 
 fn destructive_confirmation(
@@ -954,25 +1003,24 @@ fn destructive_confirmation(
     cancel: Message,
     p: Palette,
 ) -> Element<'static, Message> {
+    let delete = button(text("Delete").font(SANS).size(11.5))
+        .padding([6, 10])
+        .style(move |_, _| iced::widget::button::Style {
+            background: Some(Background::Color(p.red)),
+            text_color: Color::WHITE,
+            border: Border {
+                radius: RADIUS_SM.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .on_press(confirm);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    let delete = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Delete", delete);
     container(
         column![
             text(copy).font(SANS).size(12).color(p.ink_soft),
-            row![
-                button(text("Delete").font(SANS).size(11.5))
-                    .padding([6, 10])
-                    .style(move |_, _| iced::widget::button::Style {
-                        background: Some(Background::Color(p.red)),
-                        text_color: Color::WHITE,
-                        border: Border {
-                            radius: RADIUS_SM.into(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
-                    .on_press(confirm),
-                outline("Cancel", cancel, p),
-            ]
-            .spacing(6),
+            row![delete, outline("Cancel", cancel, p)].spacing(6),
         ]
         .spacing(8),
     )

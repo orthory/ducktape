@@ -252,7 +252,7 @@ fn block_row(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
         block.ops.len().to_string()
     };
 
-    button(
+    let btn = button(
         row![
             fixed_cell(format!("#{}", block.height), 72.0, p.ink, true),
             fill_cell(short_hex(&block.hash), p.ink_softer, true),
@@ -292,8 +292,15 @@ fn block_row(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
         },
         ..Default::default()
     })
-    .on_press(Message::Open(block.height))
-    .into()
+    .on_press(Message::Open(block.height));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        format!("#{}", block.height),
+        btn,
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn block_detail(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
@@ -545,23 +552,19 @@ fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Me
         .into()
 }
 
-fn bare_button<'a>(
-    label: &'a str,
-    message: Message,
-    p: Palette,
-) -> iced::widget::Button<'a, Message> {
-    button(text(label).font(SANS).size(11.5).color(p.muted_3))
+fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
+    let btn = button(text(label).font(SANS).size(11.5).color(p.muted_3))
         .padding(0)
         .style(|_, _| iced::widget::button::Style::default())
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
-fn outline_button<'a>(
-    label: &'a str,
-    message: Message,
-    p: Palette,
-) -> iced::widget::Button<'a, Message> {
-    button(text(label).font(SANS).size(11.5))
+fn outline_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
+    let btn = button(text(label).font(SANS).size(11.5))
         .padding([7, 12])
         .style(move |_, _| iced::widget::button::Style {
             background: Some(Background::Color(p.paper)),
@@ -573,7 +576,11 @@ fn outline_button<'a>(
             },
             ..Default::default()
         })
-        .on_press(message)
+        .on_press(message);
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
 }
 
 fn short_hex(value: &str) -> String {
