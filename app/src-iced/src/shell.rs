@@ -1673,6 +1673,15 @@ fn global_shortcut(
             Some(Message::PageShortcut(PageShortcut::Activate))
         }
         iced::keyboard::Key::Named(Named::Escape) => Some(Message::CloseOverlays),
+        // Arrow keys walk the search results. Harmless when the palette is
+        // closed (search::update guards MoveSelection on `open`), and the
+        // focused input's `on_submit` handles Enter to activate the selection.
+        iced::keyboard::Key::Named(Named::ArrowDown) => {
+            Some(Message::Search(search::Message::MoveSelection(1)))
+        }
+        iced::keyboard::Key::Named(Named::ArrowUp) => {
+            Some(Message::Search(search::Message::MoveSelection(-1)))
+        }
         _ => None,
     }
 }
