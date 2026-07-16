@@ -387,7 +387,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
             terminal_notice(
                 "codex session is not running",
                 terminal_p.muted_2,
-                None,
+                Some(("Start", Message::Start)),
                 terminal_p
             )
         ]
@@ -417,7 +417,7 @@ pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
             terminal_notice(
                 state.error.as_deref().unwrap_or("terminal session failed"),
                 terminal_p.danger,
-                Some(Message::Retry),
+                Some(("Retry", Message::Retry)),
                 terminal_p,
             )
         ]
@@ -617,19 +617,20 @@ fn shared_command_panel(state: &State, p: theme::Palette) -> Element<'_, Message
 fn terminal_notice<'a>(
     label: &'a str,
     color: Color,
-    retry: Option<Message>,
+    action: Option<(&'static str, Message)>,
     p: &'a theme::Palette,
 ) -> Element<'a, Message> {
     let mut content = column![text(label).size(13).font(SANS).color(color)]
         .spacing(12)
         .align_x(Alignment::Center);
-    if let Some(message) = retry {
-        let retry_btn = button(text("Retry").size(12))
+    if let Some((action_label, message)) = action {
+        let action_btn = button(text(action_label).size(12))
             .on_press(message)
             .padding([7, 14]);
         #[cfg(all(feature = "agent", debug_assertions))]
-        let retry_btn = iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Retry", retry_btn);
-        content = content.push(retry_btn);
+        let action_btn =
+            iced_agent_plugin::sem(iced_agent_plugin::Role::Button, action_label, action_btn);
+        content = content.push(action_btn);
     }
     container(content)
         .width(Length::Fill)

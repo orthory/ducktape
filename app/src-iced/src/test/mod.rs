@@ -14,6 +14,9 @@
 //! shows — subscriptions, multi-window, node/CEF (`lane: fleet` recipes,
 //! `ops/iced-fleet`). See `skills/qa/SKILL.md` for the full lane doctrine.
 
+mod chat;
 mod harness;
 mod onboarding;
 mod settings;
+mod terminal;
+mod workspace;
