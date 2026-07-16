@@ -240,13 +240,16 @@ impl ValidatorRuntime<'_> {
             );
             return;
         }
-        // V8: role supported. only `Resident` is redeemable this generation;
-        // a `Client` token is signed and carried but not admittable yet.
+        // V8: role supported. only `Resident` redeems over the lobby gate; a
+        // `Client` token grants submit-only standing and redeems via
+        // `user-redeem-invite` (`/v1/submit`) — a node join has nothing to
+        // gain from it, so the gate refuses terminally.
         if verified.role != config::InviteRole::Resident {
             reject(
                 &mut answer,
                 lobby::RejectCode::RoleUnsupported,
-                "this invite role is not redeemable yet — the thin-client plane lands separately"
+                "a client invite is not redeemable at a node join — it grants submit \
+                 access; redeem it with `ducktape-node user-redeem-invite`"
                     .into(),
                 true,
             );

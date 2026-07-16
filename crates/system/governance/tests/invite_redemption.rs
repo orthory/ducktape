@@ -42,22 +42,28 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 
 /// re-state the invite-grant preimage here rather than reach into
 /// `governance::invite` (private): a preimage drift in the crate then FAILS
-/// these tests loudly instead of silently signing a stale shape.
+/// these tests loudly instead of silently signing a stale shape. a kind
+/// byte (`1` ‖ target for targeted, `0` for bearer) precedes the role.
 fn grant_preimage_for_tests(
     binding: &[u8],
     nonce: &[u8],
-    target: &PrivateKey,
+    target: Option<&PrivateKey>,
     role: InviteRole,
     expires: u64,
 ) -> Vec<u8> {
-    [
-        binding,
-        nonce,
-        target.public_key().as_ref(),
-        &[role.as_u8()],
-        &expires.to_le_bytes(),
-    ]
-    .concat()
+    let mut out = Vec::new();
+    out.extend_from_slice(binding);
+    out.extend_from_slice(nonce);
+    match target {
+        Some(t) => {
+            out.push(1);
+            out.extend_from_slice(t.public_key().as_ref());
+        }
+        None => out.push(0),
+    }
+    out.push(role.as_u8());
+    out.extend_from_slice(&expires.to_le_bytes());
+    out
 }
 
 /// mint as `issuer`, locked to `target`, with explicit role and expiry (fixed
@@ -70,11 +76,26 @@ fn mint_for(
     expires: u64,
 ) -> InviteToken {
     let nonce = [nonce_byte; INVITE_NONCE_LEN];
-    let msg = grant_preimage_for_tests(BINDING, &nonce, target, role, expires);
+    let msg = grant_preimage_for_tests(BINDING, &nonce, Some(target), role, expires);
     InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        target: target.public_key(),
+        target: Some(target.public_key()),
+        role,
+        expires_unix_secs: expires,
+        sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
+    }
+}
+
+/// mint a BEARER token as `issuer` — no target lock; role is the caller's so
+/// the client-only rule can be pinned from the outside.
+fn mint_bearer_for(issuer: &PrivateKey, nonce_byte: u8, role: InviteRole, expires: u64) -> InviteToken {
+    let nonce = [nonce_byte; INVITE_NONCE_LEN];
+    let msg = grant_preimage_for_tests(BINDING, &nonce, None, role, expires);
+    InviteToken {
+        issuer: issuer.public_key(),
+        nonce,
+        target: None,
         role,
         expires_unix_secs: expires,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
@@ -89,7 +110,12 @@ fn redeem_msg(token: &InviteToken, joiner: &PrivateKey) -> Vec<u8> {
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: key_bytes(joiner),
         proof: proof.encode().as_ref().to_vec(),
-        target: token.target.as_ref().to_vec(),
+        // empty target bytes = bearer, mirroring the wire rule.
+        target: token
+            .target
+            .as_ref()
+            .map(|t| t.as_ref().to_vec())
+            .unwrap_or_default(),
         role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
     })
@@ -299,7 +325,7 @@ fn forged_or_unauthorized_redemptions_are_refused() {
             token_sig: token.sig.encode().as_ref().to_vec(),
             joiner: key_bytes(&substituted), // == target, so the lock check passes
             proof: proof.encode().as_ref().to_vec(),
-            target: token.target.as_ref().to_vec(),
+            target: token.target.as_ref().expect("targeted").as_ref().to_vec(),
             role: token.role.as_u8(),
             expires_unix_secs: token.expires_unix_secs,
         });
@@ -562,7 +588,7 @@ fn a_client_token_still_enforces_target_lock_and_join_proof() {
             token_sig: token.sig.encode().as_ref().to_vec(),
             joiner: key_bytes(&real_target), // == target, so the lock passes
             proof: proof.encode().as_ref().to_vec(),
-            target: token.target.as_ref().to_vec(),
+            target: token.target.as_ref().expect("targeted").as_ref().to_vec(),
             role: token.role.as_u8(),
             expires_unix_secs: token.expires_unix_secs,
         });
@@ -572,5 +598,52 @@ fn a_client_token_still_enforces_target_lock_and_join_proof() {
         assert!(format!("{err:?}").contains("proof-of-possession"), "{err:?}");
 
         assert!(clients(&host).await.is_empty(), "nothing was granted");
+    });
+}
+
+#[test]
+fn a_bearer_client_redeem_grants_client_standing_first_wins() {
+    block_on(async {
+        let mut host = gov_host();
+        let issuer = keypair(1);
+        let token = mint_bearer_for(&issuer, 60, InviteRole::Client, u64::MAX);
+
+        // key A — any key at all, no target lock — takes the grant.
+        let a = keypair(61);
+        submit_as(&mut host, &key_bytes(&a), 1, redeem_msg(&token, &a))
+            .await
+            .expect("bearer client redeem");
+        assert!(clients(&host).await.contains(&key_bytes(&a)), "A holds client standing");
+        assert!(residents(&host).await.is_empty(), "bearer grants NO resident standing");
+
+        // key B presents the SAME token with its OWN valid proof: the nonce
+        // is spent — single-use first-wins is the whole bearer containment.
+        let b = keypair(62);
+        let err = submit_as(&mut host, &key_bytes(&b), 2, redeem_msg(&token, &b))
+            .await
+            .expect_err("second redemption of a bearer token");
+        assert!(format!("{err:?}").contains("already redeemed"), "{err:?}");
+        assert!(!clients(&host).await.contains(&key_bytes(&b)), "B gained nothing");
+    });
+}
+
+#[test]
+fn a_bearer_resident_token_is_rejected_as_client_only() {
+    block_on(async {
+        let mut host = gov_host();
+        let issuer = keypair(1);
+        // a WELL-FORMED bearer Resident token (valid sig over the v2
+        // preimage): the rule is semantic, not cryptographic.
+        let token = mint_bearer_for(&issuer, 63, InviteRole::Resident, u64::MAX);
+        let joiner = keypair(64);
+        let err = submit_as(&mut host, &key_bytes(&joiner), 1, redeem_msg(&token, &joiner))
+            .await
+            .expect_err("bearer resident redeem");
+        assert!(
+            format!("{err:?}").contains("bearer invites are client-only"),
+            "{err:?}"
+        );
+        assert!(residents(&host).await.is_empty(), "no resident standing granted");
+        assert!(clients(&host).await.is_empty(), "no client standing granted");
     });
 }
