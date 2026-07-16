@@ -1,0 +1,24 @@
+[package]
+name = "iced-agent-plugin"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+# `advanced` for the Operation/Widget traits; `tiny-skia` + `x11` so the crate
+# compiles standalone (`cargo test -p iced-agent-plugin`): without a renderer
+# backend iced::Renderer degrades to `()` (not a `core::Renderer`), and Unix
+# hits a display-backend compile_error without x11/wayland. In the workspace
+# build these features simply unify with ducktape-iced's fuller set.
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "tiny-skia", "x11", "tokio"] }
+# The agent fork (via [patch.crates-io]); its `agent` feature re-exports
+# accesskit and the set_tree/inject/last_tree/window_ids seam API.
+iced_winit = { version = "=0.14.0", default-features = false, features = ["agent"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+base64 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

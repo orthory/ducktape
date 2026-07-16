@@ -82,6 +82,7 @@ members = [
     "bin/mcp",
     # app — native desktop shell (the React client remains the web twin)
     "app/src-iced",
+    "app/iced-agent-plugin",
 ]
 
 [workspace.package]

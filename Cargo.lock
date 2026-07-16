@@ -5515,6 +5515,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced-agent-plugin"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "iced",
+ "iced_winit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "iced_core"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
