@@ -20,7 +20,7 @@ pub(super) async fn load_chat(
     let channels = variant_array(&reply, "channels")?
         .iter()
         .filter_map(parse_channel)
-        .filter(|channel| !channel.id.contains(':'))
+        .filter(|channel| !is_module_channel(&channel.id))
         .collect::<Vec<_>>();
     if channels.is_empty() {
         return Ok(None);
@@ -296,12 +296,13 @@ pub(super) async fn create_channel(
     name: String,
     policy: PostPolicy,
 ) -> Result<(), String> {
+    let channel = crate::screens::chat::channel_id(&name);
     chat_write(
         backend,
         client,
         json!({
             "create_channel": {
-                "channel_id": slug(&name),
+                "channel_id": channel.clone(),
                 "name": name,
                 "post_policy": match policy {
                     PostPolicy::Open => "open",
@@ -310,7 +311,24 @@ pub(super) async fn create_channel(
             }
         }),
     )
-    .await
+    .await?;
+    // create_channel seeds NO members, so a members_only channel would lock its
+    // own creator out — nobody, not even the creator, could post. Seed the
+    // creator's own account key straight after (the same key posts are signed
+    // with: identity_state().pubkey is the account key, not the node key).
+    if policy == PostPolicy::MembersOnly
+        && let Some(backend) = backend
+        && let Some(pubkey) = backend.identity_state().await?.pubkey
+    {
+        let user = user_content_service::user_key_bytes(&pubkey)?;
+        chat_write(
+            Some(backend),
+            client,
+            json!({ "set_membership": { "channel_id": channel, "user": user, "member": true } }),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn send_message(
@@ -969,29 +987,15 @@ fn blocks_text(value: &Value) -> String {
         .join("\n")
 }
 
-pub(super) fn slug(name: &str) -> String {
-    let mut slug = name
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    while slug.contains("--") {
-        slug = slug.replace("--", "-");
+/// Hide non-conversational lanes from the rail: module channels carry a ':' and
+/// shared-terminal command channels are `term-<16 hex>` (mirrors the original
+/// `isModuleChannel` in chat-client.ts).
+fn is_module_channel(id: &str) -> bool {
+    if id.contains(':') {
+        return true;
     }
-    slug = slug.trim_matches('-').to_string();
-    if slug.is_empty() {
-        fresh_id("channel")
-    } else {
-        slug.truncate(64);
-        slug
-    }
+    id.strip_prefix("term-")
+        .is_some_and(|rest| rest.len() == 16 && rest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]
@@ -1072,8 +1076,19 @@ mod tests {
 
     #[test]
     fn identifiers_are_safe_and_bounded() {
-        assert_eq!(slug("  Release Planning  "), "release-planning");
-        assert!(slug("한글").starts_with("channel-"));
-        assert!(slug(&"x".repeat(100)).len() <= 64);
+        use crate::screens::chat::channel_id;
+        assert_eq!(channel_id("  Release Planning  "), "release-planning");
+        // No ASCII alphanumerics ⇒ empty id; the update layer refuses the create
+        // rather than minting an unaddressable channel (matches channelIdOf).
+        assert!(channel_id("한글").is_empty());
+        assert!(channel_id(&"x".repeat(100)).len() <= 64);
+    }
+
+    #[test]
+    fn module_and_terminal_lanes_are_hidden() {
+        assert!(is_module_channel("agent:eddy"));
+        assert!(is_module_channel("term-0123456789abcdef"));
+        assert!(!is_module_channel("general"));
+        assert!(!is_module_channel("term-short"));
     }
 }
