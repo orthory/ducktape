@@ -12,11 +12,11 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
                 column![
                     icons::view(Icon::Bell, 22.0, p.muted_2),
                     text("You're all caught up")
-                        .size(12.5)
+                        .size(theme::BODY)
                         .font(theme::SANS_SEMIBOLD)
                         .color(p.ink),
                     text("Mentions, replies, huddles, runs, Forge, and governance activity appear here.")
-                        .size(10.5)
+                        .size(theme::CAPTION)
                         .color(p.muted),
                 ]
                 .spacing(8)
@@ -52,22 +52,22 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
                     column![
                         row![
                             text(if expanded { "▾" } else { "▸" })
-                                .size(10.5)
+                                .size(theme::CAPTION)
                                 .color(p.muted_2),
                             text(group.label.clone())
-                                .size(11)
+                                .size(theme::LABEL)
                                 .font(theme::SANS_SEMIBOLD)
                                 .width(Length::Fill),
                             text(notification_time(
                                 state.notifications.recent[group.indices[0]].at
                             ))
-                            .size(9.5)
+                            .size(theme::CAPTION)
                             .color(p.muted_2),
                         ]
                         .spacing(6)
                         .align_y(Alignment::Center),
                         text(group.summary(&state.notifications.recent))
-                            .size(10.5)
+                            .size(theme::CAPTION)
                             .color(p.muted),
                     ]
                     .spacing(3),
@@ -95,7 +95,7 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
     }
     let mut header = row![
         text("Notifications")
-            .size(13)
+            .size(theme::BODY)
             .font(theme::SANS_SEMIBOLD)
             .color(p.ink)
             .width(Length::Fill),
@@ -103,7 +103,7 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
     .align_y(Alignment::Center);
     let count = state.notifications.recent.len();
     if count > 0 {
-        header = header.push(text(count.to_string()).size(10).font(theme::MONO).color(p.muted_2));
+        header = header.push(text(count.to_string()).size(theme::CAPTION).font(theme::MONO).color(p.muted_2));
     }
     let panel = container(column![
         container(header).padding(iced::Padding {
@@ -126,10 +126,7 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
             radius: 8.0.into(),
         },
         shadow: iced::Shadow {
-            color: Color {
-                a: 0.18,
-                ..Color::BLACK
-            },
+            color: Color { a: 0.18, ..p.shadow },
             offset: iced::Vector::new(0.0, 8.0),
             blur_radius: 24.0,
         },
@@ -161,10 +158,10 @@ fn notification_item_row<'a>(
         column![
             row![
                 text(&item.title)
-                    .size(11.5)
+                    .size(theme::LABEL)
                     .font(theme::SANS_SEMIBOLD)
                     .width(Length::Fill),
-                text(notification_time(item.at)).size(9.5).color(p.muted_2),
+                text(notification_time(item.at)).size(theme::CAPTION).color(p.muted_2),
             ]
             .spacing(8),
             text(if item.body.is_empty() {
@@ -172,7 +169,7 @@ fn notification_item_row<'a>(
             } else {
                 &item.body
             })
-            .size(10.5)
+            .size(theme::CAPTION)
             .color(p.muted),
         ]
         .spacing(4),
@@ -254,7 +251,7 @@ fn main_view(state: &Shell) -> Element<'_, Message> {
     let mut content = column![titlebar(state)].spacing(0);
     if let Some(error) = &state.backend_error {
         content = content.push(
-            container(text(format!("Desktop backend unavailable: {error}")).size(11))
+            container(text(format!("Desktop backend unavailable: {error}")).size(theme::BODY))
                 .padding([7, 14])
                 .width(Length::Fill)
                 .style(move |_| {
@@ -387,7 +384,7 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
         button(
             row![
                 icons::view(Icon::Close, 15.0, dim),
-                text("Quit").size(11.5).color(text_color)
+                text("Quit").size(theme::LABEL).color(text_color)
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -404,12 +401,12 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
         tray_module_detail(state.tray_selected, text_color, dim)
     };
     let header = row![
-        container(text("D").size(11).color(Color::WHITE))
+        container(text("D").size(theme::LABEL).color(Color::WHITE))
             .center_x(24)
             .center_y(24)
             .style(move |_| rounded(theme::ACCENTS[0], 6.0)),
         column![
-            text("Ducktape").size(12.5).font(theme::SANS_SEMIBOLD),
+            text("Ducktape").size(theme::BODY).font(theme::SANS_SEMIBOLD),
             text(if connected {
                 "●  Connected"
             } else if state.node_client.is_some() {
@@ -417,7 +414,7 @@ fn tray_view(state: &Shell) -> Element<'_, Message> {
             } else {
                 "●  Stopped"
             })
-            .size(10)
+            .size(theme::CAPTION)
             .font(theme::MONO)
             .color(if connected {
                 Color::from_rgb8(92, 180, 95)
@@ -480,7 +477,7 @@ fn tray_nav(
                 15.0,
                 if selected { Color::WHITE } else { dim }
             ),
-            text(screen.label()).size(11.5).color(text_color)
+            text(screen.label()).size(theme::LABEL).color(text_color)
         ]
         .spacing(7)
         .align_y(Alignment::Center),
@@ -502,7 +499,7 @@ fn tray_launch(
     button(
         row![
             icons::view(icon, 15.0, dim),
-            text(label).size(11.5).color(text_color)
+            text(label).size(theme::LABEL).color(text_color)
         ]
         .spacing(8)
         .align_y(Alignment::Center),
@@ -591,7 +588,7 @@ fn tray_node_detail(state: &Shell, text_color: Color, dim: Color) -> Element<'_,
         .map(|snapshot| format!("{} installed", snapshot.modules.len()))
         .unwrap_or_else(|| "—".into());
     let mut detail = column![
-        text("Node").size(15).font(theme::SANS_SEMIBOLD),
+        text("Node").size(theme::TITLE).font(theme::SANS_SEMIBOLD),
         tray_field("Network", &workspace, text_color, dim),
         tray_field("Key", &node_key, text_color, dim),
         tray_field("Role", role, text_color, dim),
@@ -600,7 +597,7 @@ fn tray_node_detail(state: &Shell, text_color: Color, dim: Color) -> Element<'_,
         tray_field("Members", &members, text_color, dim),
         tray_field("Modules", &modules, text_color, dim),
         Space::new().height(8),
-        text("SOFTWARE").size(10).color(dim),
+        text("SOFTWARE").size(theme::CAPTION).color(dim),
         tray_field("Version", env!("CARGO_PKG_VERSION"), text_color, dim),
         Space::new().height(Length::Fill),
     ]
@@ -621,14 +618,14 @@ fn tray_module_detail(screen: Screen, text_color: Color, dim: Color) -> Element<
                 .center_y(26)
                 .style(move |_| rounded(Color::from_rgba8(255, 255, 255, 0.10), 7.0)),
             text(screen.label())
-                .size(13)
+                .size(theme::BODY)
                 .font(theme::SANS_SEMIBOLD)
                 .color(text_color),
         ]
         .spacing(9)
         .align_y(Alignment::Center),
         text("Open this module in the main Ducktape window.")
-            .size(11)
+            .size(theme::CAPTION)
             .color(dim),
         Space::new().height(Length::Fill),
         tray_open_button(screen, text_color),
@@ -638,7 +635,7 @@ fn tray_module_detail(screen: Screen, text_color: Color, dim: Color) -> Element<
 }
 
 fn tray_open_button(screen: Screen, text_color: Color) -> Element<'static, Message> {
-    button(container(text("Open in console").size(11.5)).center_x(Length::Fill))
+    button(container(text("Open in console").size(theme::LABEL)).center_x(Length::Fill))
         .width(Length::Fill)
         .padding([7, 10])
         .style(move |_, status| tray_button_style(status, text_color, true))
@@ -681,8 +678,8 @@ fn tray_field(
     dim: Color,
 ) -> Element<'static, Message> {
     row![
-        text(label).size(10.5).color(dim).width(70),
-        text(value.to_owned()).size(11).color(text_color),
+        text(label).size(theme::CAPTION).color(dim).width(70),
+        text(value.to_owned()).size(theme::CAPTION).color(text_color),
     ]
     .align_y(Alignment::Center)
     .into()
@@ -703,26 +700,26 @@ fn permission_prompt_view(prompt: &PermissionPrompt, mode: Mode) -> Element<'_, 
             "screen-capture" => "Your screen",
             other => other,
         };
-        permissions = permissions.push(text(format!("• {label}")).size(12.5));
+        permissions = permissions.push(text(format!("• {label}")).size(theme::BODY));
     }
     let card = container(
         column![
-            container(text("Remote content").size(10.5).color(p.danger))
+            container(text("Remote content").size(theme::CAPTION).color(p.danger))
                 .padding([2, 7])
                 .style(move |_| bordered(p.danger_soft, p.danger_border, 4.0)),
             column![
-                text(site).size(14).font(theme::SANS_SEMIBOLD),
+                text(site).size(theme::BODY_LG).font(theme::SANS_SEMIBOLD),
                 text(&prompt.origin)
-                    .size(10.5)
+                    .size(theme::CAPTION)
                     .font(theme::MONO)
                     .color(p.muted),
             ]
             .spacing(3),
-            column![text("wants to use:").size(12).color(p.muted), permissions].spacing(4),
+            column![text("wants to use:").size(theme::LABEL).color(p.muted), permissions].spacing(4),
             text(
                 "This is a page published on your Ducktape network. It is not part of Ducktape and it is not asking for these on Ducktape's behalf."
             )
-            .size(11.5)
+            .size(theme::LABEL)
             .color(p.muted),
             Space::new().height(Length::Fill),
             permission_button(
@@ -789,7 +786,7 @@ fn permission_button(
     primary: bool,
     p: theme::Palette,
 ) -> Element<'static, Message> {
-    button(container(text(label).size(12)).center_x(Length::Fill))
+    button(container(text(label).size(theme::LABEL)).center_x(Length::Fill))
         .width(Length::Fill)
         .padding([7, 10])
         .on_press(message)
@@ -818,7 +815,6 @@ fn permission_button(
 
 fn titlebar(state: &Shell) -> Element<'_, Message> {
     let p = theme::palette(state.mode);
-    let (connection_label, connection_color) = titlebar_connection(state, p);
     let back = icon_button(
         Icon::ChevronLeft,
         "Back",
@@ -836,7 +832,7 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
     let identity = mouse_area(
         container(
             row![
-                container(text("D").size(11).color(p.on_filled))
+                container(text("D").size(theme::LABEL).color(p.on_filled))
                     .center_x(22)
                     .center_y(22)
                     .style(move |_| rounded(p.filled, 5.0)),
@@ -853,8 +849,15 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
                             }
                         }),
                 )
-                .size(12),
-                text(connection_label).size(9).color(connection_color),
+                .size(theme::LABEL),
+                container(
+                    text(titlebar_mode(state))
+                        .size(theme::CAPTION)
+                        .font(theme::MONO)
+                        .color(Color::WHITE),
+                )
+                .padding([2, 5])
+                .style(move |_| rounded(state.accent, 4.0)),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -872,14 +875,14 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
         button(
             row![
                 icons::view(Icon::Search, 14.0, p.muted_2),
-                text("Search").size(12).color(p.muted),
+                text("Search").size(theme::LABEL).color(p.muted),
                 Space::new().width(Length::Fill),
                 text(if cfg!(target_os = "macos") {
                     "⌘ K"
                 } else {
                     "Ctrl K"
                 })
-                .size(10)
+                .size(theme::CAPTION)
                 .color(p.muted_2),
             ]
             .height(Length::Fill)
@@ -927,7 +930,7 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
                 } else {
                     state.notifications.unread.to_string()
                 })
-                .size(8.5)
+                .size(theme::CAPTION)
                 .font(theme::MONO)
                 .color(Color::WHITE),
             )
@@ -1041,23 +1044,17 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
     .into()
 }
 
-pub(super) fn titlebar_connection(state: &Shell, p: &theme::Palette) -> (String, Color) {
+/// The left identity's mode badge. Only the mode word — the block height and
+/// liveness live on the right (see `titlebar_status`), so nothing is rendered
+/// twice. `USER` = a client/remote node with no local workspace, `LOCAL` = a
+/// node this app manages, `OFFLINE` = no node at all.
+pub(super) fn titlebar_mode(state: &Shell) -> &'static str {
     if state.node_client.is_none() {
-        return ("OFFLINE".into(), p.muted_2);
-    }
-    let mode = if state.active_workspace.is_some() {
+        "OFFLINE"
+    } else if state.active_workspace.is_some() {
         "LOCAL"
     } else {
-        "REMOTE"
-    };
-    if !state.node_stream_connected {
-        return (format!("{mode} · RECONNECTING"), p.amber);
-    }
-    match &state.operator.node.data {
-        operator_screens::Resource::Ready(snapshot) if snapshot.connected => {
-            (format!("{mode} · #{}", snapshot.height), p.green)
-        }
-        _ => (format!("{mode} · CONNECTED"), p.green),
+        "USER"
     }
 }
 
@@ -1118,17 +1115,21 @@ pub(super) fn workspace_initials(name: &str) -> String {
 fn network_rail(state: &Shell) -> Element<'_, Message> {
     let p = theme::palette(state.mode);
     let item = |letter: String, active: bool, message| {
-        button(container(text(letter).size(13)).center_x(34).center_y(34))
+        button(container(text(letter).size(theme::TITLE)).center_x(40).center_y(40))
             .padding(0)
             .on_press(message)
             .style(move |_, status| rail_circle(p, state.accent, active, status))
     };
-    let mut networks = column![item(
-        "⌂".into(),
-        state.screen() == Screen::Home,
-        Message::Navigate(Screen::Home),
-    )]
-    .spacing(10)
+    let mut networks = column![
+        item(
+            "⌂".into(),
+            state.screen() == Screen::Home,
+            Message::Navigate(Screen::Home),
+        ),
+        container(Space::new().width(26).height(1))
+            .style(move |_| container::Style::default().background(p.border)),
+    ]
+    .spacing(8)
     .align_x(Alignment::Center);
     for workspace in &state.workspace.workspaces {
         let active = state
@@ -1169,22 +1170,15 @@ fn module_rail(state: &Shell) -> Element<'_, Message> {
     let on_operator =
         state.section == Section::Operator || Screen::OPERATOR.contains(&state.screen());
     let show_operator = state.active_workspace.is_some() || on_operator;
-    let tabs = if show_operator {
-        row![
-            section_button("USER", Section::User, state),
-            section_button("NODE", Section::Operator, state),
-        ]
-        .spacing(2)
-    } else {
-        row![section_button("USER", Section::User, state)].spacing(2)
-    };
     let screens = if on_operator {
         &Screen::OPERATOR[..]
     } else {
         &Screen::USER[..]
     };
-    let mut modules = column![tabs].spacing(4).align_x(Alignment::Center);
-    modules = modules.push(Space::new().height(2));
+    let mut modules = column![mode_segments(state, show_operator)]
+        .spacing(4)
+        .align_x(Alignment::Center);
+    modules = modules.push(Space::new().height(4));
     for &screen in screens {
         modules = modules.push(module_button(screen, state));
     }
@@ -1202,7 +1196,7 @@ fn module_rail(state: &Shell) -> Element<'_, Message> {
                         18.0,
                         p.icon_idle,
                     ),
-                    text("Theme").size(9).color(p.muted),
+                    text("Theme").size(theme::CAPTION).color(p.muted),
                 ]
                 .spacing(5)
                 .align_x(Alignment::Center)
@@ -1261,7 +1255,7 @@ fn screen_view(state: &Shell) -> Element<'_, Message> {
     let screen = state.screen();
     container(
         column![
-            container(text(screen.label()).size(16))
+            container(text(screen.label()).size(theme::TITLE))
                 .height(50)
                 .width(Length::Fill)
                 .align_y(Alignment::Center)
@@ -1277,8 +1271,8 @@ fn screen_view(state: &Shell) -> Element<'_, Message> {
             container(
                 column![
                     icons::view(screen.icon(), 30.0, p.icon_idle),
-                    text(screen.label()).size(16),
-                    text("Native iced surface").size(12).color(p.muted),
+                    text(screen.label()).size(theme::TITLE),
+                    text("Native iced surface").size(theme::LABEL).color(p.muted),
                 ]
                 .spacing(10)
                 .align_x(Alignment::Center),
@@ -1314,28 +1308,85 @@ fn icon_button<'a>(
     .padding(8)
     .on_press_maybe(enabled.then_some(message))
     .style(move |_, status| transparent_button(p, status));
-    tooltip(control, text(label).size(11), tooltip::Position::Bottom)
+    tooltip(control, text(label).size(theme::CAPTION), tooltip::Position::Bottom)
         .gap(6)
         .padding(6)
         .into()
 }
 
-fn section_button<'a>(
+/// USER / NODE mode switch as a real horizontal segmented control. The original
+/// stacks the two segments vertically (`flexDirection: column`); per the user
+/// override this lays them side by side. Icons ride *over* their labels inside
+/// each segment so both fit the 74px rail without cramping — a beside-label
+/// layout overflows two segments at readable sizes.
+fn mode_segments(state: &Shell, show_operator: bool) -> Element<'_, Message> {
+    let p = theme::palette(state.mode);
+    let mut track = row![segment(Icon::Members, "USER", Section::User, state)].spacing(3);
+    if show_operator {
+        track = track.push(segment(Icon::Node, "NODE", Section::Operator, state));
+    }
+    container(track.width(Length::Fill))
+        .width(Length::Fill)
+        .padding(3)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(p.sunken)),
+            border: Border {
+                color: p.border_soft,
+                width: 1.0,
+                radius: theme::RADIUS_MD.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn segment<'a>(
+    icon: Icon,
     label: &'static str,
     section: Section,
     state: &Shell,
 ) -> Element<'a, Message> {
     let p = theme::palette(state.mode);
     let active = state.section == section;
-    let tab = button(container(text(label).size(8)).center_y(Length::Fill))
-        .height(28)
-        .padding([0, 5])
-        .on_press(Message::Section(section))
-        .style(move |_, status| tab_style(p, active, status));
+    let seg = button(
+        column![
+            icons::view(icon, 13.0, if active { p.on_filled } else { p.icon_idle }),
+            text(label)
+                .size(theme::CAPTION)
+                .font(theme::MONO)
+                .color(if active { p.on_filled } else { p.muted }),
+        ]
+        .spacing(3)
+        .align_x(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .padding([6, 0])
+    .on_press(Message::Section(section))
+    .style(move |_, status| segment_style(p, active, status));
     #[cfg(all(feature = "agent", debug_assertions))]
-    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, tab);
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Tab, label, seg);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
-    tab.into()
+    seg.into()
+}
+
+fn segment_style(p: &theme::Palette, active: bool, status: button::Status) -> button::Style {
+    let background = if active {
+        Some(Background::Color(p.filled))
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        Some(Background::Color(p.hover))
+    } else {
+        None
+    };
+    button::Style {
+        background,
+        text_color: if active { p.on_filled } else { p.muted },
+        border: Border {
+            radius: theme::RADIUS_SM.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
 }
 
 fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
@@ -1349,7 +1400,7 @@ fn module_button<'a>(screen: Screen, state: &Shell) -> Element<'a, Message> {
                 if active { p.ink } else { p.icon_idle }
             ),
             text(screen.label())
-                .size(9)
+                .size(theme::CAPTION)
                 .color(if active { p.ink } else { p.muted }),
         ]
         .width(Length::Fill)
@@ -1449,7 +1500,9 @@ fn rail_circle(
         border: Border {
             color: if active { p.paper } else { p.border },
             width: if active { 2.0 } else { 1.0 },
-            radius: 17.0.into(),
+            // Idle chip is a circle (r20 on a 40px tile); active morphs to the
+            // Slack-style squircle (r13).
+            radius: (if active { 13.0 } else { 20.0 }).into(),
         },
         ..button::Style::default()
     }
