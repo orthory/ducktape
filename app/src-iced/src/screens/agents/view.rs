@@ -3,12 +3,15 @@
 use std::ops::Deref;
 
 use iced::widget::{
-    Space, button, checkbox, column, container, row, scrollable, text, text_input,
+    Space, button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS, SANS_SEMIBOLD};
+use crate::theme::{
+    self, BODY, BODY_LG, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM,
+    SANS, SANS_SEMIBOLD, TITLE,
+};
 
 use super::run_log::{SemanticLogKind, semantic_log_rows};
 use super::*;
@@ -54,9 +57,19 @@ pub fn view(state: &State, mode: theme::Mode, accent: Color) -> Element<'_, Mess
     };
     let header = header(state, data, p);
     let body: Element<'_, Message> = match &state.data {
-        Resource::Loading => center_state("Loading agents...", "", p),
-        Resource::Empty => center_state("No agent data", "The workspace has not loaded yet.", p),
-        Resource::Error(error) => center_state("Agents unavailable", error, p),
+        Resource::Loading => center_state("Loading agents...", "", None, p),
+        Resource::Empty => center_state(
+            "No agent data",
+            "The workspace has not loaded yet.",
+            None,
+            p,
+        ),
+        Resource::Error(error) => center_state(
+            "Agents unavailable",
+            error,
+            Some(Message::Load),
+            p,
+        ),
         Resource::Ready(data) => match state.tab {
             Tab::Agents => agents_tab(state, data, p),
             Tab::AutoReply => auto_reply_tab(state, data, p),
@@ -72,11 +85,11 @@ pub fn view(state: &State, mode: theme::Mode, accent: Color) -> Element<'_, Mess
 fn header<'a>(state: &'a State, data: Option<&'a AgentData>, p: Colors) -> Element<'a, Message> {
     let agents = data.map_or(0, |data| data.agents.len());
     let watches = data.map_or(0, |data| data.watches.len());
-    let runs = data.map_or(0, |data| data.pending_runs.len() + data.recent_runs.len());
+    let runs = data.map_or(0, |data| data.pending_runs.len());
     container(
         row![
             icon_tile(Icon::Agent, 30.0, p),
-            text("Agents").font(SANS_SEMIBOLD).size(18).color(p.ink),
+            text("Agents").font(SANS_SEMIBOLD).size(HEADING).color(p.ink),
             Space::new().width(Length::Fill),
             container(
                 row![
@@ -113,18 +126,19 @@ fn agents_tab<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'
 
 fn roster<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'a, Message> {
     let selected = selected_agent(state).map(|agent| agent.id.as_str());
-    let mut list = column![
-        row![
-            section_label("ROSTER", p),
-            Space::new().width(Length::Fill),
-            text(format!("{} total", data.agents.len()))
-                .font(MONO)
-                .size(10.5)
-                .color(p.muted_2)
-        ]
-        .padding([14, 14])
-        .align_y(Alignment::Center)
-    ];
+    // The ROSTER header stays pinned above the scroll (contract keeps it fixed);
+    // it scrolled away with the list before.
+    let header = row![
+        section_label("ROSTER", p),
+        Space::new().width(Length::Fill),
+        text(format!("{} total", data.agents.len()))
+            .font(MONO)
+            .size(CAPTION)
+            .color(p.muted_2)
+    ]
+    .padding([14, 14])
+    .align_y(Alignment::Center);
+    let mut list = column![];
     if data.agents.is_empty() {
         list = list.push(empty_state(
             "No agents yet",
@@ -140,7 +154,7 @@ fn roster<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'a, M
             ));
         }
     }
-    container(scrollable(list))
+    container(column![header, scrollable(list)])
         .width(ROSTER_WIDTH)
         .height(Length::Fill)
         .style(move |_| container::Style {
@@ -157,46 +171,60 @@ fn roster<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'a, M
 
 fn roster_row(agent: &AgentRecord, selected: bool, p: Colors) -> Element<'static, Message> {
     let active = agent.status == AgentStatus::Active;
+    // A 3px accent bar flush to the left edge marks the selected row (contract
+    // `boxShadow: inset 3px 0 0 accent`); the list owns the frame, so the row
+    // itself is borderless — a per-row 4-side box doubled every divider.
+    let accent_bar = container(Space::new())
+        .width(3)
+        .height(Length::Fill)
+        .style(move |_| surface(if selected { p.accent } else { Color::TRANSPARENT }));
     let select = button(
         row![
-            avatar(&agent.display_name, 36.0, p.filled, p.on_filled, p),
-            column![
-                text(agent.display_name.clone())
-                    .font(SANS_SEMIBOLD)
-                    .size(13.5)
-                    .color(if selected { p.accent } else { p.ink }),
-                row![
-                    status_dot(if active { p.green } else { p.amber }),
-                    text(if active { "Active" } else { "Paused" })
-                        .font(SANS)
-                        .size(10.5)
-                        .color(p.muted_3),
-                    text("·").color(p.icon_idle),
-                    text(capability_short(&agent.capability))
-                        .font(MONO)
-                        .size(10.5)
-                        .color(p.muted_2)
+            accent_bar,
+            row![
+                avatar(&agent.display_name, 36.0, p.filled, p.on_filled, p),
+                column![
+                    text(agent.display_name.clone())
+                        .font(SANS_SEMIBOLD)
+                        .size(BODY_LG)
+                        .color(if selected { p.accent } else { p.ink }),
+                    row![
+                        status_dot(if active { p.green } else { p.amber }),
+                        text(if active { "Active" } else { "Paused" })
+                            .font(SANS)
+                            .size(LABEL)
+                            .color(p.muted_3),
+                        text("·").size(LABEL).color(p.icon_idle),
+                        text(capability_short(&agent.capability))
+                            .font(MONO)
+                            .size(LABEL)
+                            .color(p.muted_2)
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
                 ]
-                .spacing(6)
-                .align_y(Alignment::Center)
+                .spacing(3)
+                .width(Length::Fill)
             ]
-            .spacing(3)
+            .spacing(12)
+            .padding(Padding {
+                top: 12.0,
+                right: 14.0,
+                bottom: 12.0,
+                left: 11.0,
+            })
+            .align_y(Alignment::Center)
             .width(Length::Fill)
         ]
-        .spacing(12)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding([12, 14])
+    .padding(0)
     .style(move |_, status| button::Style {
         background: (selected || matches!(status, button::Status::Hovered))
             .then_some(Background::Color(if selected { p.sunken } else { p.hover })),
         text_color: p.ink,
-        border: Border {
-            color: p.border_soft,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
+        border: Border::default(),
         ..Default::default()
     })
     .on_press(Message::SelectAgent(agent.id.clone()));
@@ -247,10 +275,10 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
                         p,
                     ),
                     column![
-                        text("Add an agent").font(SANS_SEMIBOLD).size(13.5).color(p.ink),
+                        text("Add an agent").font(SANS_SEMIBOLD).size(BODY_LG).color(p.ink),
                         text("Give it a name, pick what it runs on, and curate the documents it carries.")
                             .font(SANS)
-                            .size(11.5)
+                            .size(BODY)
                             .color(p.muted_2)
                     ]
                     .spacing(3)
@@ -259,23 +287,20 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
                 ]
                 .spacing(12)
                 .align_y(Alignment::Start),
-                row![
-                    labeled_input(
-                        "AGENT DISPLAY NAME",
-                        "Triage Agent…",
-                        &draft.display_name,
-                        Message::RegisterNameChanged,
-                        p,
-                    ),
-                    labeled_input(
-                        "RUNS ON",
-                        "codex_gpt-5_medium",
-                        &draft.capability,
-                        Message::RegisterCapabilityChanged,
-                        p,
-                    )
-                ]
-                .spacing(9),
+                labeled_input(
+                    "AGENT DISPLAY NAME",
+                    "Triage Agent…",
+                    &draft.display_name,
+                    Message::RegisterNameChanged,
+                    p,
+                ),
+                runs_on_picker(
+                    &draft.capability,
+                    &data.capabilities,
+                    data.capability_status,
+                    Message::RegisterCapabilityChanged,
+                    p,
+                ),
                 skill_editor(state, p),
                 permission_grid(&draft.allowed_actions, false, p),
                 section_label("RESOURCE CAPS", p),
@@ -283,7 +308,7 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
                     .label("Can search the global skill library")
                     .on_toggle(Message::RegisterLibraryChanged)
                     .size(15)
-                    .text_size(10.5),
+                    .text_size(BODY),
                 row![
                     labeled_mono_input(
                         "FORGE READ REPOSITORIES",
@@ -354,7 +379,7 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
                 .spacing(9),
                 text("Maximum live calls across the recursive call tree; completed calls release their slot. 0 disables calls and the runtime hard cap is 8.")
                     .font(SANS)
-                    .size(10.5)
+                    .size(BODY)
                     .color(p.muted_2),
                 secondary_button(
                     if draft.advanced { "Hide advanced" } else { "Advanced" },
@@ -370,7 +395,7 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
                         p,
                     )
                 } else {
-                    text(format!("Agent id: {}", draft.id())).font(MONO).size(10.5).color(p.muted_2).into()
+                    text(format!("Agent id: {}", draft.id())).font(MONO).size(LABEL).color(p.muted_2).into()
                 },
                 row![
                     Space::new().width(Length::Fill),
@@ -389,18 +414,6 @@ fn register_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Elemen
         )
     ]
     .spacing(9);
-    if data.capability_status == CapabilityStatus::Error {
-        form = form.push(
-            row![
-                text("Could not load executor capabilities.")
-                    .font(SANS)
-                    .size(11.5)
-                    .color(p.red),
-                secondary_button("Retry", Some(Message::RetryCapabilities), p)
-            ]
-            .spacing(8),
-        );
-    }
     if let Some(error) = &state.error {
         form = form.push(error_banner(error, p));
     }
@@ -428,13 +441,14 @@ fn skill_editor(state: &State, p: Colors) -> Element<'_, Message> {
                 ),
                 text(skill.name.clone())
                     .font(SANS_SEMIBOLD)
-                    .size(12)
+                    .size(BODY)
                     .color(p.ink),
                 text(skill.source_prefix.clone())
                     .font(MONO)
-                    .size(10.5)
+                    .size(LABEL)
                     .color(p.muted_2)
-                    .width(Length::Fill),
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::WordOrGlyph),
                 secondary_button("Remove", Some(Message::RemoveSkill(index)), p)
             ]
             .spacing(9)
@@ -448,7 +462,7 @@ fn skill_editor(state: &State, p: Colors) -> Element<'_, Message> {
                 &draft.skill_name,
                 text_input("Skill name", &draft.skill_name)
                     .font(SANS)
-                    .size(11.5)
+                    .size(BODY)
                     .on_input(Message::SkillNameChanged),
             ),
             sem_input(
@@ -456,7 +470,7 @@ fn skill_editor(state: &State, p: Colors) -> Element<'_, Message> {
                 &draft.skill_prefix,
                 text_input("/skills/name", &draft.skill_prefix)
                     .font(MONO)
-                    .size(11.5)
+                    .size(BODY)
                     .on_input(Message::SkillPrefixChanged),
             ),
             secondary_button(
@@ -499,14 +513,10 @@ fn agent_detail<'a>(
             column![
                 text(agent.display_name.clone())
                     .font(SANS_SEMIBOLD)
-                    .size(20)
+                    .size(HEADING)
                     .color(p.on_filled),
                 row![
-                    text(agent.id.clone()).font(MONO).size(11).color(mix(
-                        p.filled,
-                        p.on_filled,
-                        0.7
-                    )),
+                    selectable_mono(&agent.id, mix(p.filled, p.on_filled, 0.7), p),
                     on_dark_pill(
                         if active { "ACTIVE" } else { "PAUSED" },
                         if active { p.green } else { p.amber },
@@ -557,15 +567,34 @@ fn agent_detail<'a>(
         container(capability_strip(&agent.capability, p))
             .padding([12, 14])
             .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_MD)),
-        section_label("CURATED SKILLS", p)
+        section_label("IDENTITY", p),
     ]
     .spacing(8)
     .padding(18);
+    // A legacy/invalid id has no address it can be reached at — show none, never
+    // a fabricated one.
+    if let Some(address) = agent_address(&agent.id) {
+        body = body.push(info_row("Address", &address, p));
+    }
+    body = body
+        .push(info_row("Owner", &agent.owner.label(), p))
+        .push(info_row("Skills", &skills_summary(&agent.skills), p))
+        .push(info_row("Updated", &agent.updated_at, p))
+        .push(section_label("SKILLS", p))
+        .push(
+            text(
+                "Always-loaded documents are pasted into every run — they are this agent's \
+                 persona. The others are listed by name and opened only when a job calls for one.",
+            )
+            .font(SANS)
+            .size(BODY)
+            .color(p.muted_2),
+        );
     if agent.skills.is_empty() {
         body = body.push(
-            text("No curated skills.")
+            text("No skills curated — this agent runs on the task instructions alone.")
                 .font(SANS)
-                .size(11.5)
+                .size(BODY)
                 .color(p.muted_2),
         );
     } else {
@@ -573,22 +602,12 @@ fn agent_detail<'a>(
             body = body.push(skill_row(skill, p));
         }
     }
-    body = body
-        .push(section_label("IDENTITY", p))
-        .push(info_row(
-            "Agent address",
-            &format!("{}@agents.duck", agent.id),
-            p,
-        ))
-        .push(info_row("Owner", &agent.owner.label(), p))
-        .push(info_row("Created", &agent.created_at, p))
-        .push(info_row("Updated", &agent.updated_at, p))
-        .push(section_label("PERMISSIONS", p));
+    body = body.push(section_label("PERMISSIONS", p));
     if agent.allowed_actions.is_empty() {
         body = body.push(
             text("Can't take any actions yet.")
                 .font(SANS)
-                .size(11.5)
+                .size(BODY)
                 .color(p.muted_2),
         );
     } else {
@@ -656,30 +675,27 @@ fn edit_form<'a>(
     let form = column![
         horizontal_divider(p),
         section_label("EDIT AGENT", p),
-        row![
-            labeled_input(
-                "DISPLAY NAME",
-                "Name",
-                &edit.display_name,
-                Message::EditNameChanged,
-                p
-            ),
-            labeled_input(
-                "RUNS ON",
-                "Capability",
-                &edit.capability,
-                Message::EditCapabilityChanged,
-                p
-            )
-        ]
-        .spacing(9),
+        labeled_input(
+            "DISPLAY NAME",
+            "Name",
+            &edit.display_name,
+            Message::EditNameChanged,
+            p
+        ),
+        runs_on_picker(
+            &edit.capability,
+            &data.capabilities,
+            data.capability_status,
+            Message::EditCapabilityChanged,
+            p,
+        ),
         permission_grid(&edit.allowed_actions, true, p),
         section_label("RESOURCE CAPS", p),
         checkbox(edit.library_read)
             .label("Can search the global skill library")
             .on_toggle(Message::EditLibraryChanged)
             .size(15)
-            .text_size(10.5),
+            .text_size(BODY),
         row![
             labeled_mono_input(
                 "FORGE READ REPOSITORIES",
@@ -750,7 +766,7 @@ fn edit_form<'a>(
         .spacing(9),
         text("Maximum live calls across the recursive call tree; completed calls release their slot. 0 disables calls and the runtime hard cap is 8.")
             .font(SANS)
-            .size(10.5)
+            .size(BODY)
             .color(p.muted_2),
         row![
             Space::new().width(Length::Fill),
@@ -788,10 +804,21 @@ fn permission_grid<'a>(selected: &'a [String], editing: bool, p: Colors) -> Elem
                     }
                 })
                 .size(15)
-                .text_size(10.5),
+                .text_size(BODY),
         );
     }
     grid.into()
+}
+
+fn skills_summary(skills: &[SkillRef]) -> String {
+    if skills.is_empty() {
+        return "none".into();
+    }
+    let always = skills
+        .iter()
+        .filter(|skill| skill.load == LoadMode::Always)
+        .count();
+    format!("{always} always · {} on demand", skills.len() - always)
 }
 
 fn skill_row(skill: &SkillRef, p: Colors) -> Element<'static, Message> {
@@ -812,16 +839,22 @@ fn skill_row(skill: &SkillRef, p: Colors) -> Element<'static, Message> {
             ),
             text(skill.name.clone())
                 .font(SANS_SEMIBOLD)
-                .size(12)
+                .size(BODY)
                 .color(p.ink),
             text(format!(
                 "{}/SKILL.md",
                 skill.source_prefix.trim_end_matches('/')
             ))
             .font(MONO)
-            .size(10.5)
+            .size(LABEL)
             .color(p.muted_2)
             .width(Length::Fill)
+            .wrapping(text::Wrapping::WordOrGlyph),
+            secondary_button(
+                "Open",
+                Some(Message::OpenSkillFiles(skill.source_prefix.clone())),
+                p,
+            )
         ]
         .spacing(9)
         .align_y(Alignment::Center),
@@ -835,10 +868,10 @@ fn missing_agent(id: &str, p: Colors) -> Element<'static, Message> {
     card(
         column![
             icon_tile(Icon::Agent, 46.0, p),
-            text("Agent not found").font(SANS_SEMIBOLD).size(16).color(p.ink),
+            text("Agent not found").font(SANS_SEMIBOLD).size(TITLE).color(p.ink),
             text(format!("{id} isn’t in this workspace’s roster — it may have been removed since it was mentioned."))
                 .font(SANS)
-                .size(12)
+                .size(BODY)
                 .color(p.muted_2),
             primary_button("Back to the roster", Some(Message::ClearExplicitSelection), p)
         ]
@@ -855,11 +888,11 @@ fn no_agents(p: Colors) -> Element<'static, Message> {
             icon_tile(Icon::Agent, 46.0, p),
             text("No agents yet")
                 .font(SANS_SEMIBOLD)
-                .size(16)
+                .size(TITLE)
                 .color(p.ink),
             text("Add your first agent to start automating chats and tasks.")
                 .font(SANS)
-                .size(12)
+                .size(BODY)
                 .color(p.muted_2),
             primary_button("+ Add agent", Some(Message::StartAdding), p)
         ]
@@ -875,7 +908,7 @@ fn auto_reply_tab<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Eleme
         section_label("AUTO-REPLY", p),
         text("Choose which channels agents watch and when they answer.")
             .font(SANS)
-            .size(11.5)
+            .size(BODY)
             .color(p.muted_2)
     ]
     .spacing(7)
@@ -888,7 +921,10 @@ fn auto_reply_tab<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Eleme
             p,
         ));
     } else {
-        for watch in &data.watches {
+        for (index, watch) in data.watches.iter().enumerate() {
+            if index > 0 {
+                watches = watches.push(horizontal_divider(p));
+            }
             watches = watches.push(watch_row(watch, data, p));
         }
     }
@@ -919,8 +955,8 @@ fn watch_row(watch: &Watch, data: &AgentData, p: Colors) -> Element<'static, Mes
                 .align_y(Alignment::Center)
                 .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_SM)),
             column![
-                text(format!("# {label}")).font(MONO).size(12).color(p.ink),
-                text(policy).font(SANS).size(11.5).color(p.muted_2)
+                text(format!("# {label}")).font(MONO).size(BODY).color(p.ink),
+                text(policy).font(SANS).size(BODY).color(p.muted_2)
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -934,7 +970,6 @@ fn watch_row(watch: &Watch, data: &AgentData, p: Colors) -> Element<'static, Mes
         .align_y(Alignment::Center),
     )
     .padding([12, 14])
-    .style(move |_| bottom_rule(p.paper, p.border_soft))
     .into()
 }
 
@@ -943,12 +978,18 @@ fn watch_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'
         state.watch.policy != WatchPolicyKind::Assigned || !state.watch.assigned_agent.is_empty();
     let mut form = column![
         section_label("ADD A CHANNEL", p),
-        labeled_input(
+        labeled_pick_list(
             "CHANNEL",
             data.channels
-                .first()
-                .map_or("general", |channel| channel.name.as_str()),
-            &state.watch.channel_id,
+                .iter()
+                .map(|channel| PickOption {
+                    value: channel.id.clone(),
+                    label: channel.name.clone(),
+                })
+                .collect(),
+            Some(state.watch.channel_id.clone()),
+            "Choose a channel",
+            "No channels yet — create one in Chat first.",
             Message::WatchChannelChanged,
             p,
         ),
@@ -978,12 +1019,18 @@ fn watch_form<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element<'
     .spacing(9)
     .padding(16);
     if state.watch.policy == WatchPolicyKind::Assigned {
-        form = form.push(labeled_input(
-            "AGENT",
+        form = form.push(labeled_pick_list(
+            "WHICH AGENT",
             data.agents
-                .first()
-                .map_or("agent-id", |agent| agent.id.as_str()),
-            &state.watch.assigned_agent,
+                .iter()
+                .map(|agent| PickOption {
+                    value: agent.id.clone(),
+                    label: agent.display_name.clone(),
+                })
+                .collect(),
+            Some(state.watch.assigned_agent.clone()),
+            "Choose an agent",
+            "No agents yet — register one first.",
             Message::WatchAssignedChanged,
             p,
         ));
@@ -1037,17 +1084,34 @@ fn activity_tab<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element
             section_label("HISTORY", p),
             text(data.recent_runs.len())
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(p.muted_2)
         ]
         .spacing(8)
         .align_y(Alignment::Center),
     );
     if let Some(error) = &data.recent_runs_error {
-        body = body.push(error_banner(
-            &format!("Run history unavailable: {error}"),
-            p,
-        ));
+        body = body.push(
+            container(
+                column![
+                    text("Run history unavailable")
+                        .font(SANS)
+                        .size(LABEL)
+                        .color(p.red),
+                    selectable_line(error, p.red, p),
+                ]
+                .spacing(2),
+            )
+            .width(Length::Fill)
+            .padding([7, 9])
+            .style(move |_| {
+                rounded_surface(
+                    mix(p.paper, p.red, 0.09),
+                    mix(p.paper, p.red, 0.25),
+                    RADIUS_SM,
+                )
+            }),
+        );
     }
     if data.recent_runs.is_empty() && data.recent_runs_error.is_none() {
         body = body.push(card(
@@ -1073,33 +1137,38 @@ fn activity_tab<'a>(state: &'a State, data: &'a AgentData, p: Colors) -> Element
 }
 
 fn job_worker(data: &AgentData, p: Colors) -> Element<'static, Message> {
+    let pending = data.job_worker_pending;
     card(
         row![
             icon_tile(Icon::Agent, 34.0, p),
             column![
                 text("Jobs worker")
                     .font(SANS_SEMIBOLD)
-                    .size(13.5)
+                    .size(BODY_LG)
                     .color(p.ink),
                 text("Let active agents claim work from the jobs board.")
                     .font(SANS)
-                    .size(11.5)
+                    .size(BODY)
                     .color(p.muted_2),
-                text("Current committed status is not readable on this network.")
-                    .font(SANS)
-                    .size(10.5)
-                    .color(p.muted_2)
+                text(if pending {
+                    "Waiting for confirmation…"
+                } else {
+                    "Current committed status is not readable on this network."
+                })
+                .font(SANS)
+                .size(BODY)
+                .color(if pending { p.amber } else { p.muted_2 })
             ]
             .spacing(3)
             .width(Length::Fill),
             secondary_button(
-                "Enable",
-                (!data.job_worker_pending).then_some(Message::SetJobWorker(true)),
+                "Enable worker",
+                (!pending).then_some(Message::SetJobWorker(true)),
                 p,
             ),
             secondary_button(
-                "Disable",
-                (!data.job_worker_pending).then_some(Message::SetJobWorker(false)),
+                "Disable worker",
+                (!pending).then_some(Message::SetJobWorker(false)),
                 p,
             )
         ]
@@ -1114,11 +1183,12 @@ fn usage_card(usage: Option<&Usage>, p: Colors) -> Element<'static, Message> {
     let Some(usage) = usage else {
         return card(
             row![
-                text("Usage").font(SANS_SEMIBOLD).size(13).color(p.ink),
+                text("Usage").font(SANS_SEMIBOLD).size(BODY_LG).color(p.ink),
                 Space::new().width(Length::Fill),
-                text("No usage yet").font(SANS).size(11.5).color(p.muted_2)
+                text("No usage yet").font(SANS).size(BODY).color(p.muted_2)
             ]
-            .padding([12, 14]),
+            .padding([12, 14])
+            .align_y(Alignment::Center),
             p,
         );
     };
@@ -1153,53 +1223,91 @@ fn run_row(
         .find(|channel| channel.id == run.channel_id)
         .map_or(run.channel_id.clone(), |channel| channel.name.clone());
     let expanded = state.expanded_run_logs.contains(&run.dispatch_id);
+    // The lease is expired when no views remain — the run has stalled and can be
+    // force-reassigned. `PendingRun` carries no `reassignable`/`maxAttempts`
+    // flag yet (data-plane deferred), so an expired lease is the honest proxy:
+    // it never offers reassign on a healthy run.
+    // ponytail: expired-lease heuristic; swap for the node's `reassignable`
+    // flag when the lease wire carries it.
+    let reassignable = run.lease_remaining == Some(0);
+    let (status_label, status_tone) = if reassignable {
+        ("LEASE EXPIRED", p.red)
+    } else {
+        ("WORKING…", p.amber)
+    };
+    let identity = row![
+        text(agent.clone())
+            .font(SANS_SEMIBOLD)
+            .size(BODY_LG)
+            .color(p.ink),
+        pill(status_label, status_tone, p),
+        if run.job_id.is_some() {
+            pill("JOB", p.purple, p)
+        } else {
+            pill("CHAT", p.blue, p)
+        },
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let mut chips = row![text(if let Some(job) = &run.job_id {
+        format!("job {job} · dispatch {}", short(&run.dispatch_id))
+    } else {
+        format!(
+            "#{channel} · message {} · dispatch {}",
+            run.anchor_sequence,
+            short(&run.dispatch_id)
+        )
+    })
+    .font(MONO)
+    .size(LABEL)
+    .color(p.muted_2)]
+    .spacing(7)
+    .align_y(Alignment::Center);
+    if run.requested_by_me {
+        chips = chips.push(pill("you", p.muted_3, p));
+    }
+    let mut actions = row![secondary_button(
+        if expanded { "Hide log" } else { "Live log" },
+        Some(Message::ToggleRunLog(run.dispatch_id.clone())),
+        p,
+    )]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if reassignable {
+        // Pass the current attempt (the node increments); an unconditional
+        // `attempt + 1` double-incremented and the reassign was rejected.
+        actions = actions.push(secondary_button(
+            "Force reassign",
+            (!run.pending).then_some(Message::ReassignRun(run.run_id.clone(), run.attempt)),
+            p,
+        ));
+    }
+    actions = actions.push(secondary_button(
+        "Cancel",
+        (!run.pending).then_some(Message::CancelRun(run.run_id.clone())),
+        p,
+    ));
     let mut content = column![
-        row![
-            avatar(&agent, 34.0, p.filled, p.on_filled, p),
-            column![
-                row![
-                    text(agent).font(SANS_SEMIBOLD).size(13).color(p.ink),
-                    pill("RUNNING", p.blue, p)
+        column![
+            row![
+                avatar(&agent, 34.0, p.filled, p.on_filled, p),
+                column![
+                    identity.wrap(),
+                    chips.wrap(),
+                    text(run.created_at.clone())
+                        .font(SANS)
+                        .size(LABEL)
+                        .color(p.muted_2)
                 ]
-                .spacing(8),
-                text(if let Some(job) = &run.job_id {
-                    format!("job {job} · dispatch {}", short(&run.dispatch_id))
-                } else {
-                    format!(
-                        "#{channel} · message {} · dispatch {}",
-                        run.anchor_sequence,
-                        short(&run.dispatch_id)
-                    )
-                })
-                .font(MONO)
-                .size(10.5)
-                .color(p.muted_2),
-                text(run.created_at.clone())
-                    .font(SANS)
-                    .size(10.5)
-                    .color(p.muted_2)
+                .spacing(4)
+                .width(Length::Fill),
             ]
-            .spacing(4)
-            .width(Length::Fill),
-            secondary_button(
-                if expanded { "Hide log" } else { "Live log" },
-                Some(Message::ToggleRunLog(run.dispatch_id.clone())),
-                p,
-            ),
-            secondary_button(
-                "Reassign",
-                (!run.pending).then_some(Message::ReassignRun(run.run_id.clone(), run.attempt + 1)),
-                p,
-            ),
-            secondary_button(
-                "Cancel",
-                (!run.pending).then_some(Message::CancelRun(run.run_id.clone())),
-                p,
-            )
+            .spacing(11)
+            .align_y(Alignment::Center),
+            actions.wrap(),
         ]
-        .spacing(11)
+        .spacing(8)
         .padding([12, 14])
-        .align_y(Alignment::Center)
     ];
     if expanded {
         content = content.push(run_log_pane(&run.dispatch_id, false, state, p));
@@ -1259,7 +1367,7 @@ fn history_row(
             p,
         ));
     } else {
-        metadata = metadata.push(text(target).font(MONO).size(10.5).color(p.muted_2));
+        metadata = metadata.push(text(target).font(MONO).size(LABEL).color(p.muted_2));
     }
     if run.degraded {
         metadata = metadata.push(pill("DEGRADED", p.amber, p));
@@ -1286,24 +1394,24 @@ fn history_row(
             metadata.push(pill(&format!("PR #{number}"), p.green, p))
         };
     }
-    metadata = metadata
-        .push(Space::new().width(Length::Fill))
-        .push(secondary_button(
-            if expanded { "Hide log" } else { "Log" },
-            Some(Message::ToggleRunLog(run.dispatch_id.clone())),
-            p,
-        ));
+    metadata = metadata.push(secondary_button(
+        if expanded { "Hide log" } else { "Log" },
+        Some(Message::ToggleRunLog(run.dispatch_id.clone())),
+        p,
+    ));
     if let Some(reference) = &run.output_ref {
-        metadata = metadata.push(text(short(reference)).font(MONO).size(9.5).color(p.muted_2));
+        metadata = metadata.push(text(short(reference)).font(MONO).size(CAPTION).color(p.muted_2));
     }
     let mut content = column![
         row![
             avatar(&agent, 30.0, p.filled, p.on_filled, p),
-            text(agent).font(SANS_SEMIBOLD).size(12.5).color(p.ink)
+            text(agent).font(SANS_SEMIBOLD).size(BODY_LG).color(p.ink)
         ]
         .spacing(9)
         .align_y(Alignment::Center),
-        metadata,
+        // A non-wrapping row of up to ~8 pills/buttons overflows a narrow pane and
+        // clips the trailing Log button; `.wrap()` reflows to multiple lines.
+        metadata.wrap(),
     ]
     .spacing(8)
     .padding([10, 12]);
@@ -1325,7 +1433,7 @@ fn run_log_pane(
         output = output.push(
             text(format!("live log tail: {dropped} older events omitted"))
                 .font(MONO)
-                .size(10)
+                .size(CAPTION)
                 .color(p.amber),
         );
     }
@@ -1361,14 +1469,20 @@ fn run_log_pane(
             };
             output = output.push(
                 row![
-                    text(label).font(MONO).size(9).color(p.muted_2).width(52),
-                    text(row.text).font(MONO).size(10.5).color(color),
+                    text(label).font(MONO).size(CAPTION).color(p.muted_2).width(52),
+                    text(row.text)
+                        .font(MONO)
+                        .size(LABEL)
+                        .color(color)
+                        .width(Length::Fill)
+                        .wrapping(text::Wrapping::WordOrGlyph),
                 ]
                 .spacing(8),
             );
         }
     }
-    if log.is_none_or(|log| log.entries.is_empty()) {
+    let has_output = log.is_some_and(|log| !log.entries.is_empty());
+    if !has_output {
         let unavailable = log.is_some_and(|log| log.unavailable);
         output = output.push(
             text(if unavailable {
@@ -1379,15 +1493,29 @@ fn run_log_pane(
                 "Waiting for retained output..."
             })
             .font(SANS)
-            .size(11.5)
+            .size(BODY)
             .color(p.muted_2),
         );
     }
-    container(scrollable(output.spacing(3)))
-        .height(Length::Fixed(180.0))
+    // A read-only `text` has no selection, so the Copy button is the only way to
+    // lift a command, stack trace, or error line out of the log — the pane's
+    // whole reason to exist. It flattens the visible rows to the clipboard.
+    let header = row![
+        Space::new().width(Length::Fill),
+        secondary_button(
+            "Copy",
+            has_output.then(|| Message::CopyRunLog(dispatch_id.to_owned())),
+            p,
+        )
+    ]
+    .align_y(Alignment::Center);
+    // Shrink-to-content capped at 220 so a 3-line log is 3 lines tall (a dead
+    // fixed-180 pane reserved blank space a short log never fills).
+    let body = container(scrollable(output.spacing(3)).width(Length::Fill))
+        .max_height(220.0)
         .padding([8, 10])
-        .style(move |_| rounded_surface(p.canvas, p.border_soft, RADIUS_SM))
-        .into()
+        .style(move |_| rounded_surface(p.canvas, p.border_soft, RADIUS_SM));
+    column![header, body].spacing(6).into()
 }
 
 pub(super) fn run_duration(run: &RunRecord) -> String {
@@ -1429,8 +1557,8 @@ fn header_tab(
 ) -> Element<'static, Message> {
     let btn = button(
         row![
-            text(label).font(SANS_SEMIBOLD).size(12),
-            container(text(count).font(MONO).size(10).color(if tab == active {
+            text(label).font(SANS_SEMIBOLD).size(LABEL),
+            container(text(count).font(MONO).size(CAPTION).color(if tab == active {
                 p.accent
             } else {
                 p.muted_2
@@ -1459,7 +1587,7 @@ fn header_tab(
         },
         shadow: if tab == active {
             Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.07),
+                color: Color { a: 0.07, ..p.shadow },
                 offset: Vector::new(0.0, 1.0),
                 blur_radius: 3.0,
             }
@@ -1481,7 +1609,7 @@ fn segment_button(
     active: WatchPolicyKind,
     p: Colors,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(10.5))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([6, 9])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if policy == active {
@@ -1518,7 +1646,7 @@ fn filter_button(
     active: RunFilter,
     p: Colors,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(11))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
         .padding([5, 10])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if filter == active {
@@ -1551,14 +1679,14 @@ fn capability_strip(capability: &str, p: Colors) -> Element<'static, Message> {
     let mut strip = row![
         text(provider)
             .font(SANS_SEMIBOLD)
-            .size(12.5)
+            .size(BODY)
             .color(p.accent)
     ]
     .spacing(8)
     .align_y(Alignment::Center);
     if let Some(model) = parts.get(1) {
-        strip = strip.push(text("›").font(MONO).size(12).color(p.icon_idle));
-        strip = strip.push(text((*model).to_owned()).font(MONO).size(11.5).color(p.ink));
+        strip = strip.push(text("›").font(MONO).size(LABEL).color(p.icon_idle));
+        strip = strip.push(text((*model).to_owned()).font(MONO).size(BODY).color(p.ink));
     }
     if let Some(effort) = parts.get(2) {
         strip = strip.push(pill(&effort.to_uppercase(), p.accent, p));
@@ -1610,6 +1738,325 @@ fn sem_input<'a>(
     input.into()
 }
 
+/// A pick_list option that shows `label` but carries an opaque `value`.
+#[derive(Clone, PartialEq, Eq)]
+struct PickOption {
+    value: String,
+    label: String,
+}
+
+impl std::fmt::Display for PickOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// A labeled pick_list over records, or a disabled note when the list is empty.
+/// Replaces the free-text channel/agent inputs (§B): typing a channel *name*
+/// stored a bogus id and the watch never fired.
+fn labeled_pick_list<'a>(
+    label: &'static str,
+    options: Vec<PickOption>,
+    selected: Option<String>,
+    placeholder: &'static str,
+    empty_note: &'static str,
+    on_select: fn(String) -> Message,
+    p: Colors,
+) -> Element<'a, Message> {
+    let control: Element<'a, Message> = if options.is_empty() {
+        disabled_note(empty_note, p)
+    } else {
+        let current = selected
+            .as_ref()
+            .and_then(|value| options.iter().find(|option| &option.value == value).cloned());
+        pick_list(options, current, move |option: PickOption| on_select(option.value))
+            .placeholder(placeholder)
+            .text_size(BODY)
+            .width(Length::Fill)
+            .into()
+    };
+    column![section_label(label, p), control]
+        .spacing(5)
+        .width(Length::Fill)
+        .into()
+}
+
+fn disabled_note(message: &'static str, p: Colors) -> Element<'static, Message> {
+    container(text(message).font(SANS).size(BODY).color(p.muted_2))
+        .width(Length::Fill)
+        .padding([8, 10])
+        .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_SM))
+        .into()
+}
+
+/// Parse a capability tag into `(provider, model, effort)`. A 3-part
+/// `provider_model_effort` splits; a bare tag has no model/effort; any other
+/// `_`-containing shape is opaque (the whole tag is its own provider key).
+fn parse_capability_tag(tag: &str) -> (String, Option<String>, Option<String>) {
+    if !tag.contains('_') {
+        return (tag.to_owned(), None, None);
+    }
+    let parts: Vec<&str> = tag.split('_').collect();
+    if parts.len() == 3 && parts.iter().all(|part| !part.is_empty()) {
+        (parts[0].to_owned(), Some(parts[1].to_owned()), Some(parts[2].to_owned()))
+    } else {
+        (tag.to_owned(), None, None)
+    }
+}
+
+#[derive(Clone)]
+struct TagEntry {
+    key: String,
+    model: Option<String>,
+    effort: Option<String>,
+    tag: String,
+    announced: bool,
+}
+
+/// The cascading provider → model → effort picker over `data.capabilities`
+/// (§A). A free-text "RUNS ON" silently greyed Register/Save on any tag that
+/// wasn't an exact announced string; here every pick resolves to one announced
+/// (or pinned-offline) tag.
+fn runs_on_picker<'a>(
+    value: &'a str,
+    capabilities: &'a [String],
+    status: CapabilityStatus,
+    on_change: fn(String) -> Message,
+    p: Colors,
+) -> Element<'a, Message> {
+    if status != CapabilityStatus::Ready || capabilities.is_empty() {
+        return runs_on_unavailable(value, status, p);
+    }
+
+    let mut entries: Vec<TagEntry> = capabilities
+        .iter()
+        .map(|tag| {
+            let (key, model, effort) = parse_capability_tag(tag);
+            TagEntry { key, model, effort, tag: tag.clone(), announced: true }
+        })
+        .collect();
+    // Pin an off-registry stored value so it stays selectable; every option it
+    // adds carries "(offline)" so an edit never silently rewrites the executor.
+    if !value.is_empty() && !capabilities.iter().any(|tag| tag == value) {
+        let (key, model, effort) = parse_capability_tag(value);
+        entries.push(TagEntry { key, model, effort, tag: value.to_owned(), announced: false });
+    }
+
+    let current = (!value.is_empty()).then(|| parse_capability_tag(value));
+    let group_key = current.as_ref().map_or(String::new(), |tag| tag.0.clone());
+    let model_key = current.as_ref().and_then(|tag| tag.1.clone()).unwrap_or_default();
+    let current_effort = current.as_ref().and_then(|tag| tag.2.clone());
+    let group: Vec<TagEntry> = entries
+        .iter()
+        .filter(|entry| entry.key == group_key)
+        .cloned()
+        .collect();
+
+    let offline_mark = |offline: bool, label: &str| {
+        if offline {
+            format!("{label} (offline)")
+        } else {
+            label.to_owned()
+        }
+    };
+
+    // Provider select.
+    let mut provider_options: Vec<PickOption> = Vec::new();
+    for entry in &entries {
+        if provider_options.iter().any(|option| option.value == entry.key) {
+            continue;
+        }
+        let offline = !entries.iter().any(|other| other.key == entry.key && other.announced);
+        provider_options.push(PickOption {
+            value: entry.key.clone(),
+            label: offline_mark(offline, &title_case(&entry.key)),
+        });
+    }
+    let provider_selected = (!group_key.is_empty())
+        .then(|| provider_options.iter().find(|option| option.value == group_key).cloned())
+        .flatten();
+    let provider_entries = entries.clone();
+    let provider = pick_list(
+        provider_options,
+        provider_selected,
+        move |option: PickOption| on_change(pick_provider(&provider_entries, &option.value)),
+    )
+    .placeholder("Choose an executor…")
+    .text_size(BODY)
+    .width(Length::Fill);
+
+    // Model select.
+    let models: Vec<String> = group
+        .iter()
+        .filter_map(|entry| entry.model.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut model_options: Vec<PickOption> = Vec::new();
+    if group.iter().any(|entry| entry.model.is_none()) || models.is_empty() {
+        let offline = !group.is_empty()
+            && !group.iter().any(|entry| entry.model.is_none() && entry.announced);
+        model_options.push(PickOption { value: String::new(), label: offline_mark(offline, "Default") });
+    }
+    for model in &models {
+        let offline = !group
+            .iter()
+            .any(|entry| entry.model.as_deref() == Some(model) && entry.announced);
+        model_options.push(PickOption { value: model.clone(), label: offline_mark(offline, model) });
+    }
+    let model_selected = model_options.iter().find(|option| option.value == model_key).cloned();
+    let model_group = group.clone();
+    let model_effort = current_effort.clone();
+    let model_group_key = group_key.clone();
+    let model = pick_list(model_options, model_selected, move |option: PickOption| {
+        on_change(pick_model(&model_group, &model_group_key, model_effort.as_deref(), &option.value))
+    })
+    .text_size(BODY)
+    .width(Length::Fill);
+
+    // Effort select.
+    let effort_options: Vec<PickOption> = if model_key.is_empty() {
+        vec![PickOption { value: String::new(), label: "Default".into() }]
+    } else {
+        group
+            .iter()
+            .filter(|entry| entry.model.as_deref() == Some(model_key.as_str()))
+            .filter_map(|entry| entry.effort.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|effort| {
+                let offline = !group.iter().any(|entry| {
+                    entry.model.as_deref() == Some(model_key.as_str())
+                        && entry.effort.as_deref() == Some(effort.as_str())
+                        && entry.announced
+                });
+                PickOption { value: effort.clone(), label: offline_mark(offline, &effort) }
+            })
+            .collect()
+    };
+    let effort_selected = effort_options
+        .iter()
+        .find(|option| Some(&option.value) == current_effort.as_ref())
+        .or_else(|| effort_options.iter().find(|option| option.value.is_empty()))
+        .cloned();
+    let effort_group = group.clone();
+    let effort_model_key = model_key.clone();
+    let effort = pick_list(effort_options, effort_selected, move |option: PickOption| {
+        on_change(pick_effort(&effort_group, &effort_model_key, &option.value))
+    })
+    .text_size(BODY)
+    .width(Length::Fill);
+
+    let mut picker = column![
+        section_label("RUNS ON", p),
+        provider,
+        row![
+            column![section_label("MODEL", p), model].spacing(4).width(Length::Fill),
+            column![section_label("EFFORT", p), effort].spacing(4).width(Length::Fill),
+        ]
+        .spacing(9),
+    ]
+    .spacing(6)
+    .width(Length::Fill);
+    if !value.is_empty() {
+        picker = picker.push(
+            text(value.to_owned())
+                .font(MONO)
+                .size(CAPTION)
+                .color(p.muted_2)
+                .width(Length::Fill)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
+    picker.into()
+}
+
+fn runs_on_unavailable<'a>(
+    value: &'a str,
+    status: CapabilityStatus,
+    p: Colors,
+) -> Element<'a, Message> {
+    let failed = status == CapabilityStatus::Error;
+    let guidance = if failed {
+        "Could not load the provider registry. Check the node connection, then retry."
+    } else if status == CapabilityStatus::Loading {
+        "Loading available LLM providers from the network…"
+    } else {
+        "No LLM provider is available. Under Node → Sandbox, choose an execution mode, then \
+         restart the node. Available providers appear here automatically."
+    };
+    let mut column = column![
+        section_label("RUNS ON", p),
+        disabled_note(
+            if failed {
+                "Providers unavailable"
+            } else if status == CapabilityStatus::Loading {
+                "Loading providers…"
+            } else {
+                "No provider available"
+            },
+            p,
+        ),
+        text(guidance).font(SANS).size(BODY).color(p.muted_2),
+    ]
+    .spacing(6)
+    .width(Length::Fill);
+    if !value.is_empty() {
+        column = column.push(
+            text(value.to_owned())
+                .font(MONO)
+                .size(CAPTION)
+                .color(p.muted_2)
+                .width(Length::Fill)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
+    if failed {
+        column = column.push(secondary_button("Retry", Some(Message::RetryCapabilities), p));
+    }
+    column.into()
+}
+
+fn pick_provider(entries: &[TagEntry], key: &str) -> String {
+    let list: Vec<&TagEntry> = entries.iter().filter(|entry| entry.key == key).collect();
+    let first_model = list.first().and_then(|entry| entry.model.clone());
+    list.iter()
+        .find(|entry| entry.model.is_none())
+        .or_else(|| {
+            list.iter()
+                .find(|entry| entry.model == first_model && entry.effort.as_deref() == Some("medium"))
+        })
+        .or_else(|| list.first())
+        .map_or_else(|| key.to_owned(), |entry| entry.tag.clone())
+}
+
+fn pick_model(group: &[TagEntry], group_key: &str, effort: Option<&str>, model: &str) -> String {
+    if model.is_empty() {
+        return group
+            .iter()
+            .find(|entry| entry.model.is_none())
+            .map_or_else(|| group_key.to_owned(), |entry| entry.tag.clone());
+    }
+    let list: Vec<&TagEntry> = group
+        .iter()
+        .filter(|entry| entry.model.as_deref() == Some(model))
+        .collect();
+    list.iter()
+        .find(|entry| entry.effort.as_deref() == effort)
+        .or_else(|| list.iter().find(|entry| entry.effort.as_deref() == Some("medium")))
+        .or_else(|| list.first())
+        .map_or_else(|| model.to_owned(), |entry| entry.tag.clone())
+}
+
+fn pick_effort(group: &[TagEntry], model_key: &str, effort: &str) -> String {
+    group
+        .iter()
+        .find(|entry| {
+            entry.model.as_deref() == Some(model_key) && entry.effort.as_deref() == Some(effort)
+        })
+        .map_or_else(|| effort.to_owned(), |entry| entry.tag.clone())
+}
+
 fn labeled_input<'a>(
     label: &'static str,
     placeholder: &'a str,
@@ -1624,7 +2071,7 @@ fn labeled_input<'a>(
             value,
             text_input(placeholder, value)
                 .font(SANS)
-                .size(12.5)
+                .size(BODY)
                 .on_input(on_input),
         )
     ]
@@ -1647,7 +2094,7 @@ fn labeled_mono_input<'a>(
             value,
             text_input(placeholder, value)
                 .font(MONO)
-                .size(12.5)
+                .size(BODY)
                 .on_input(on_input),
         )
     ]
@@ -1659,11 +2106,19 @@ fn labeled_mono_input<'a>(
 fn info_row(label: &'static str, value: &str, p: Colors) -> Element<'static, Message> {
     container(
         row![
-            text(label).font(MONO).size(11).color(p.muted_2),
-            Space::new().width(Length::Fill),
-            text(value.to_owned()).font(MONO).size(11).color(p.muted_3)
+            text(label).font(MONO).size(LABEL).color(p.muted_2),
+            Space::new().width(14),
+            // A spaceless id/address (`id@agents.duck`) is one unbreakable word;
+            // WordOrGlyph + width(Fill) wraps it instead of overflowing the pane.
+            text(value.to_owned())
+                .font(MONO)
+                .size(LABEL)
+                .color(p.muted_3)
+                .width(Length::Fill)
+                .wrapping(text::Wrapping::WordOrGlyph)
         ]
-        .spacing(14),
+        .spacing(0)
+        .align_y(Alignment::Center),
     )
     .padding([9, 11])
     .style(move |_| rounded_surface(p.paper, p.border, RADIUS_SM))
@@ -1673,7 +2128,7 @@ fn info_row(label: &'static str, value: &str, p: Colors) -> Element<'static, Mes
 fn stat(label: &'static str, value: String, p: Colors) -> Element<'static, Message> {
     column![
         section_label(label, p),
-        text(value).font(MONO).size(16).color(p.ink)
+        text(value).font(MONO).size(TITLE).color(p.ink)
     ]
     .spacing(5)
     .width(Length::Fill)
@@ -1728,13 +2183,13 @@ fn status_dot(color: Color) -> Element<'static, Message> {
 fn section_label(label: &str, p: Colors) -> Element<'static, Message> {
     text(label.to_owned())
         .font(MONO)
-        .size(9)
+        .size(CAPTION)
         .color(p.muted_2)
         .into()
 }
 
 fn pill(label: &str, tone: Color, p: Colors) -> Element<'static, Message> {
-    container(text(label.to_owned()).font(MONO).size(9).color(tone))
+    container(text(label.to_owned()).font(MONO).size(CAPTION).color(tone))
         .padding([3, 7])
         .style(move |_| rounded_surface(mix(p.paper, tone, 0.09), mix(p.paper, tone, 0.25), 5.0))
         .into()
@@ -1744,7 +2199,7 @@ fn on_dark_pill(label: &str, tone: Color, p: Colors) -> Element<'static, Message
     container(
         text(label.to_owned())
             .font(MONO)
-            .size(9)
+            .size(CAPTION)
             .color(mix(p.on_filled, tone, 0.35)),
     )
     .padding([3, 7])
@@ -1774,7 +2229,7 @@ fn card_style(p: Colors) -> container::Style {
             radius: RADIUS_LG.into(),
         },
         shadow: Shadow {
-            color: Color::from_rgba8(0, 0, 0, 0.06),
+            color: Color { a: 0.06, ..p.shadow },
             offset: Vector::new(0.0, 1.0),
             blur_radius: 3.0,
         },
@@ -1787,11 +2242,11 @@ fn empty_state(title: &str, detail: &str, p: Colors) -> Element<'static, Message
         icon_tile(Icon::Agent, 36.0, p),
         text(title.to_owned())
             .font(SANS_SEMIBOLD)
-            .size(14)
+            .size(BODY_LG)
             .color(p.muted_3),
         text(detail.to_owned())
             .font(SANS)
-            .size(11.5)
+            .size(BODY)
             .color(p.muted_2)
     ]
     .spacing(8)
@@ -1800,18 +2255,26 @@ fn empty_state(title: &str, detail: &str, p: Colors) -> Element<'static, Message
     .into()
 }
 
-fn center_state<'a>(title: &str, detail: &str, p: Colors) -> Element<'a, Message> {
+fn center_state<'a>(
+    title: &str,
+    detail: &'a str,
+    retry: Option<Message>,
+    p: Colors,
+) -> Element<'a, Message> {
     let mut content = column![
         icon_tile(Icon::Agent, 46.0, p),
         text(title.to_owned())
             .font(SANS_SEMIBOLD)
-            .size(16)
+            .size(TITLE)
             .color(p.ink)
     ]
     .spacing(10)
     .align_x(Alignment::Center);
     if !detail.is_empty() {
-        content = content.push(text(detail.to_owned()).font(SANS).size(12).color(p.muted_2));
+        content = content.push(selectable_line(detail, p.muted_2, p));
+    }
+    if retry.is_some() {
+        content = content.push(primary_button("Retry", retry, p));
     }
     container(content)
         .width(Length::Fill)
@@ -1821,8 +2284,8 @@ fn center_state<'a>(title: &str, detail: &str, p: Colors) -> Element<'a, Message
         .into()
 }
 
-fn error_banner(error: &str, p: Colors) -> Element<'static, Message> {
-    container(text(error.to_owned()).font(SANS).size(11).color(p.red))
+fn error_banner<'a>(error: &'a str, p: Colors) -> Element<'a, Message> {
+    container(selectable_line(error, p.red, p))
         .width(Length::Fill)
         .padding([7, 9])
         .style(move |_| {
@@ -1835,13 +2298,49 @@ fn error_banner(error: &str, p: Colors) -> Element<'static, Message> {
         .into()
 }
 
+/// A read-only, selectable line — an error/hash/id/address the operator can
+/// copy. A `text` widget cannot be selected; a caret-less read-only `text_input`
+/// stays focusable and copyable (the `workspace.rs` idiom).
+fn selectable_line<'a>(value: &'a str, ink: Color, p: Colors) -> Element<'a, Message> {
+    text_input("", value)
+        .font(SANS)
+        .size(BODY)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: ink,
+            placeholder: ink,
+            value: ink,
+            selection: p.accent,
+        })
+        .into()
+}
+
+/// A read-only, selectable mono value — hashes, ids, addresses.
+fn selectable_mono<'a>(value: &'a str, ink: Color, p: Colors) -> Element<'a, Message> {
+    text_input("", value)
+        .font(MONO)
+        .size(LABEL)
+        .padding(0)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: ink,
+            placeholder: ink,
+            value: ink,
+            selection: p.accent,
+        })
+        .into()
+}
+
 fn secondary_button(
     label: &'static str,
     message: Option<Message>,
     p: Colors,
 ) -> Element<'static, Message> {
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(BODY))
         .padding([7, 12])
         .style(move |_, status| button::Style {
             background: Some(Background::Color(
@@ -1853,7 +2352,7 @@ fn secondary_button(
             )),
             text_color: if enabled { p.ink_soft } else { p.muted_2 },
             border: Border {
-                color: p.border_strong,
+                color: if enabled { p.border_strong } else { p.border },
                 width: 1.0,
                 radius: RADIUS_SM.into(),
             },
@@ -1875,7 +2374,7 @@ fn run_link_button(
     p: Colors,
 ) -> Element<'static, Message> {
     let _name = label.clone();
-    let btn = button(text(label).font(MONO).size(10.5))
+    let btn = button(text(label).font(MONO).size(LABEL))
         .padding([2, 7])
         .style(move |_, status| button::Style {
             background: Some(Background::Color(
@@ -1906,7 +2405,7 @@ fn primary_button(
     p: Colors,
 ) -> Element<'static, Message> {
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(BODY))
         .padding([7, 12])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(if enabled { p.accent } else { p.chip })),
@@ -1918,7 +2417,7 @@ fn primary_button(
             },
             shadow: if enabled {
                 Shadow {
-                    color: Color::from_rgba8(160, 90, 60, 0.3),
+                    color: Color { a: 0.3, ..p.shadow },
                     offset: Vector::new(0.0, 1.0),
                     blur_radius: 2.0,
                 }
@@ -1942,7 +2441,7 @@ fn on_dark_button(
     p: Colors,
 ) -> Element<'static, Message> {
     let enabled = message.is_some();
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(12))
+    let btn = button(text(label).font(SANS_SEMIBOLD).size(BODY))
         .padding([7, 12])
         .style(move |_, _| button::Style {
             background: Some(Background::Color(mix(p.filled, p.on_filled, 0.07))),
@@ -1952,7 +2451,7 @@ fn on_dark_button(
                 mix(p.filled, p.on_filled, 0.45)
             },
             border: Border {
-                color: mix(p.filled, p.on_filled, 0.22),
+                color: mix(p.filled, p.on_filled, if enabled { 0.22 } else { 0.12 }),
                 width: 1.0,
                 radius: RADIUS_SM.into(),
             },

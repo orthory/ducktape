@@ -461,6 +461,8 @@ pub enum Message {
     CancelRun(String),
     ReassignRun(String, u32),
     ToggleRunLog(String),
+    CopyRunLog(String),
+    OpenSkillFiles(String),
     OpenRunAnchor { channel_id: String, sequence: u64 },
     OpenRunPullRequest { channel_id: String, number: u64 },
     RunLog(RunLogEvent),
@@ -501,6 +503,7 @@ pub enum Command {
         run_id: String,
         attempt: u32,
     },
+    CopyText(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +544,15 @@ pub fn reduce(state: &mut State, message: Message) -> Option<Effect> {
                 repository: repository.to_owned(),
                 item: Some(number),
             })))
+        }
+        Message::OpenSkillFiles(prefix) => {
+            let path = prefix.trim_end_matches('/');
+            (!path.is_empty()).then(|| {
+                Effect::Intent(AppIntent::Navigate(Route::File {
+                    path: path.to_owned(),
+                    directory: true,
+                }))
+            })
         }
         message => update(state, message).map(Effect::Command),
     }
@@ -858,7 +870,17 @@ pub fn update(state: &mut State, message: Message) -> Option<Command> {
             }
             None
         }
-        Message::OpenRunAnchor { .. } | Message::OpenRunPullRequest { .. } => None,
+        Message::CopyRunLog(dispatch_id) => {
+            let text = state
+                .run_logs
+                .get(&dispatch_id)
+                .map(run_log::flatten_for_copy)
+                .filter(|text| !text.is_empty())?;
+            Some(Command::CopyText(text))
+        }
+        Message::OpenRunAnchor { .. }
+        | Message::OpenRunPullRequest { .. }
+        | Message::OpenSkillFiles(_) => None,
         Message::RunLog(event) => {
             run_log::apply_event(&mut state.run_logs, &state.expanded_run_logs, event);
             None
@@ -882,8 +904,7 @@ fn service(state: &mut State, event: ServiceEvent) -> Option<Command> {
             };
             if let Resource::Ready(data) = &state.data {
                 if state.register.capability.is_empty() {
-                    state.register.capability =
-                        data.capabilities.first().cloned().unwrap_or_default();
+                    state.register.capability = default_capability(&data.capabilities);
                 }
                 if state.watch.channel_id.is_empty() {
                     state.watch.channel_id = data
@@ -897,6 +918,9 @@ fn service(state: &mut State, event: ServiceEvent) -> Option<Command> {
             (Resource::Ready(data), Ok(capabilities)) => {
                 data.capabilities = capabilities;
                 data.capability_status = CapabilityStatus::Ready;
+                if state.register.capability.is_empty() {
+                    state.register.capability = default_capability(&data.capabilities);
+                }
             }
             (Resource::Ready(data), Err(error)) => {
                 data.capability_status = CapabilityStatus::Error;
@@ -939,6 +963,31 @@ fn selected_agent(state: &State) -> Option<&AgentRecord> {
         Some(id) => data.agents.iter().find(|agent| &agent.id == id),
         None => data.agents.first(),
     }
+}
+
+/// The address an agent can be reached at, or `None` when its id is not a valid
+/// DNS label (a legacy/invalid id has no address — show none, never a false
+/// one). Mirrors the tauri `agentAddress` guard.
+pub(super) fn agent_address(id: &str) -> Option<String> {
+    (!id.is_empty() && slug(id) == id).then(|| format!("{id}@agents.duck"))
+}
+
+/// A sane starting executor when the register form has no capability yet: the
+/// first announced provider/model, preferring its medium effort. Matches the
+/// tauri picker's default-adoption so a single-executor node needs no choice.
+pub(super) fn default_capability(capabilities: &[String]) -> String {
+    let Some(first) = capabilities.first() else {
+        return String::new();
+    };
+    let base: Vec<&str> = first.split('_').take(2).collect();
+    capabilities
+        .iter()
+        .find(|tag| {
+            let parts: Vec<&str> = tag.split('_').collect();
+            parts.len() == 3 && parts[..2] == base[..] && parts[2] == "medium"
+        })
+        .cloned()
+        .unwrap_or_else(|| first.clone())
 }
 
 pub fn forge_item_channel(channel_id: &str) -> Option<(&str, u64)> {
@@ -1240,6 +1289,83 @@ mod tests {
             Some(Command::Load)
         );
         assert!(!state.busy);
+    }
+
+    #[test]
+    fn agent_address_only_exists_for_a_valid_label() {
+        assert_eq!(
+            agent_address("triage-agent"),
+            Some("triage-agent@agents.duck".into())
+        );
+        assert_eq!(agent_address("agent0"), Some("agent0@agents.duck".into()));
+        // Legacy / non-label ids have no address — never fabricate one.
+        assert_eq!(agent_address("Triage_Agent"), None);
+        assert_eq!(agent_address("-leading"), None);
+        assert_eq!(agent_address("trailing-"), None);
+        assert_eq!(agent_address(""), None);
+        assert_eq!(agent_address(&"a".repeat(64)), None);
+    }
+
+    #[test]
+    fn default_capability_prefers_the_first_provider_medium_effort() {
+        assert_eq!(
+            default_capability(&[
+                "codex_gpt-5_low".into(),
+                "codex_gpt-5_medium".into(),
+                "codex_gpt-5_high".into(),
+            ]),
+            "codex_gpt-5_medium"
+        );
+        // No medium announced → fall back to the first announced tag.
+        assert_eq!(
+            default_capability(&["codex_gpt-5_high".into()]),
+            "codex_gpt-5_high"
+        );
+        assert_eq!(default_capability(&[]), "");
+    }
+
+    #[test]
+    fn copy_run_log_flattens_the_visible_rows() {
+        let mut state = State::default();
+        let dispatch_id = "cd".repeat(32);
+        state.expanded_run_logs.push(dispatch_id.clone());
+        state.run_logs.insert(
+            dispatch_id.clone(),
+            RunLog {
+                entries: vec![
+                    RunLogEntry::Line {
+                        stream: RunStream::Stdout,
+                        text: "cargo build".into(),
+                    },
+                    RunLogEntry::Line {
+                        stream: RunStream::Stderr,
+                        text: "error: boom".into(),
+                    },
+                ],
+                ..RunLog::default()
+            },
+        );
+        let command = update(&mut state, Message::CopyRunLog(dispatch_id));
+        let Some(Command::CopyText(text)) = command else {
+            panic!("copy should emit clipboard text");
+        };
+        assert!(text.contains("cargo build"));
+        assert!(text.contains("error: boom"));
+    }
+
+    #[test]
+    fn open_skill_files_navigates_to_the_prefix() {
+        let mut state = State::default();
+        assert_eq!(
+            reduce(
+                &mut state,
+                Message::OpenSkillFiles("/shared/skills/triage/".into())
+            ),
+            Some(Effect::Intent(AppIntent::Navigate(Route::File {
+                path: "/shared/skills/triage".into(),
+                directory: true,
+            })))
+        );
     }
 
     #[test]
