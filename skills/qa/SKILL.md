@@ -71,6 +71,33 @@ Per-instance isolation: the endpoint lives under `XDG_RUNTIME_DIR`, so parallel
 apps isolate by giving each instance its own runtime dir and exporting it
 before calling the CLI.
 
+## Recipe QA — two lanes, one recipe
+
+`qa/recipes/*.json` are declarative scenarios that run in BOTH QA lanes
+(format: iced-agent-browser README "Recipes"):
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p ducktape-iced qa_recipes  # in-process lane
+ops/iced-fleet up 2 && ops/iced-fleet run qa/recipes/*.json && ops/iced-fleet down
+make ui-qa                                                  # both lanes
+```
+
+**Lane doctrine — pick the lane by what the test must prove, not by habit:**
+
+| Lane | Use when | Not for |
+|---|---|---|
+| **in-process** (`lane: both`, default) — `iced_test::Simulator` + the shell's `update` loop, plain `cargo test` | Pure UI logic `update()`+`view()` can prove: navigation, state transitions, widget presence/labels | Anything async or process-level |
+| **agent/fleet** (`lane: fleet`) — live headless binaries via the bridge | What only a living process shows: subscription-driven global shortcuts, multi-window lifecycle, real node/CEF effects, screenshots, a11y | Logic already provable in-process (wasting a live boot on it) |
+
+Rule of thumb: *if `update()`+`view()` can prove it, it's in-process; the
+agent lane is for what only a living process can lie about.* Every recipe
+SHOULD stay `lane: both` unless it needs fleet-only machinery.
+
+Live-lane semantics differ on purpose: nothing is synchronous on a live app,
+so the runner treats recipe `expect` as "eventually within 3 s"; in-process
+keeps single-shot asserts. Fleet instances are cattle — `run` re-boots the
+slot with each recipe's `preset`, so recipes never see each other's state.
+
 ## Headless bring-up (Linux)
 
 ```bash

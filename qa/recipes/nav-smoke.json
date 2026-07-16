@@ -1,0 +1,13 @@
+{
+  "name": "nav-smoke",
+  "preset": "ui-demo",
+  "steps": [
+    { "click":  { "role": "button", "name": "Pages" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "pages" } } },
+    { "click":  { "role": "button", "name": "Forge" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "forge" } } },
+    { "click":  { "role": "button", "name": "Chat" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "chat" } } },
+    { "expect": { "node": { "role": "tab", "name": "USER", "exists": true } } }
+  ]
+}

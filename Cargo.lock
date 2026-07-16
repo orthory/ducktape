@@ -5519,7 +5519,7 @@ dependencies = [
 [[package]]
 name = "iced-agent-plugin"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f7a6f63bed03fcd67f03121e6bfeae74c5d85dea"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f5c01c03a108328980c119154103008677cf7ae6"
 dependencies = [
  "base64",
  "iced",
@@ -5715,7 +5715,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
-source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f7a6f63bed03fcd67f03121e6bfeae74c5d85dea"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#f5c01c03a108328980c119154103008677cf7ae6"
 dependencies = [
  "accesskit",
  "accesskit_winit",

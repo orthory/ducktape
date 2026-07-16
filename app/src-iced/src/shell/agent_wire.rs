@@ -78,15 +78,7 @@ pub(super) fn tick(state: &mut Shell) -> Task<Message> {
     }
 
     // Curated state projection: reviewed fields only, never key material.
-    *handle.state_slot().lock().unwrap() = serde_json::json!({
-        "screen": format!("{:?}", state.screen()).to_lowercase(),
-        "section": format!("{:?}", state.section).to_lowercase(),
-        "history_len": state.history.len(),
-        "has_workspace": state.active_workspace.is_some(),
-        "unread": state.notifications.unread,
-        "search_open": state.search.open,
-        "quitting": state.quitting,
-    });
+    *handle.state_slot().lock().unwrap() = project_state(state);
 
     let mut tasks = vec![];
     for command in handle.drain_ui() {
@@ -137,19 +129,39 @@ pub(super) fn root(kind: desktop::Kind, content: Element<'_, Message>) -> Elemen
     sem(Role::Window, name, content)
 }
 
+/// The curated state projection both QA lanes read: the bridge's `state`
+/// tool and the in-process recipe interpreter evaluate the SAME fields.
+/// Reviewed fields only, never key material.
+pub(super) fn project_state(state: &Shell) -> serde_json::Value {
+    serde_json::json!({
+        "screen": format!("{:?}", state.screen()).to_lowercase(),
+        "section": format!("{:?}", state.section).to_lowercase(),
+        "mode": format!("{:?}", state.mode).to_lowercase(),
+        "history_len": state.history.len(),
+        "has_workspace": state.active_workspace.is_some(),
+        "unread": state.notifications.unread,
+        "search_open": state.search.open,
+        "quitting": state.quitting,
+    })
+}
+
 fn apply_intent(intent: Intent) -> Task<Message> {
+    intent_message(intent).map(Task::done).unwrap_or_else(Task::none)
+}
+
+/// Curated intent → shell message; `None` for unknown targets. Shared by the
+/// live bridge and the in-process recipe interpreter.
+pub(super) fn intent_message(intent: Intent) -> Option<Message> {
     match intent {
         Intent::Section { name } => match name.to_lowercase().as_str() {
-            "user" => Task::done(Message::Section(Section::User)),
-            "operator" => Task::done(Message::Section(Section::Operator)),
-            _ => Task::none(),
+            "user" => Some(Message::Section(Section::User)),
+            "operator" => Some(Message::Section(Section::Operator)),
+            _ => None,
         },
-        Intent::Navigate { url } => screen_by_name(&url)
-            .map(|screen| Task::done(Message::Navigate(screen)))
-            .unwrap_or_else(Task::none),
-        Intent::ToggleTheme => Task::done(Message::ToggleTheme),
+        Intent::Navigate { url } => screen_by_name(&url).map(Message::Navigate),
+        Intent::ToggleTheme => Some(Message::ToggleTheme),
         // v1 opens the palette; the query is typed via synthetic input.
-        Intent::Search { query: _ } => Task::done(Message::ToggleSearch),
+        Intent::Search { query: _ } => Some(Message::ToggleSearch),
     }
 }
 

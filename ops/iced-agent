@@ -17,11 +17,15 @@ if [ -z "$rev" ]; then
   exit 1
 fi
 CACHE="$HOME/.cache/iced-agent-browser"
-if [ ! -d "$CACHE/.git" ]; then
-  git clone -q https://github.com/byeongsu-hong/iced-agent-browser "$CACHE"
-fi
-if [ "$(git -C "$CACHE" rev-parse HEAD)" != "$rev" ]; then
-  git -C "$CACHE" fetch -q origin "$rev"
-  git -C "$CACHE" checkout -q "$rev"
-fi
+# Serialize clone/checkout: parallel fleet instances race on git's index.lock.
+(
+  flock 9
+  if [ ! -d "$CACHE/.git" ]; then
+    git clone -q https://github.com/byeongsu-hong/iced-agent-browser "$CACHE"
+  fi
+  if [ "$(git -C "$CACHE" rev-parse HEAD)" != "$rev" ]; then
+    git -C "$CACHE" fetch -q origin "$rev"
+    git -C "$CACHE" checkout -q "$rev"
+  fi
+) 9>"$CACHE.lock"
 exec bun "$CACHE/plugin/bin/$entry" "$@"
