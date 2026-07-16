@@ -52,6 +52,7 @@ impl RecoveryPhrase {
         &self.0
     }
 
+    #[allow(dead_code)]
     pub fn words(&self) -> impl Iterator<Item = &str> {
         self.0.split_whitespace()
     }

@@ -3138,10 +3138,12 @@ mod tests {
 
     #[test]
     fn history_navigation_skips_an_unavailable_terminal() {
-        let mut shell = Shell::default();
-        shell.history = vec![Screen::Chat, Screen::Terminal, Screen::Node];
-        shell.history_index = 2;
-        shell.section = Section::Operator;
+        let mut shell = Shell {
+            history: vec![Screen::Chat, Screen::Terminal, Screen::Node],
+            history_index: 2,
+            section: Section::Operator,
+            ..Shell::default()
+        };
 
         drop(update(&mut shell, Message::Back));
         assert_eq!(shell.screen(), Screen::Chat);

@@ -89,6 +89,7 @@ impl Backend {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn found_workspace(&self, name: String) -> Result<Workspace, String> {
         self.create_workspace(name).await
     }
@@ -102,6 +103,7 @@ impl Backend {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn import_remote_workspace(
         &self,
         name: String,
@@ -162,6 +164,7 @@ impl Backend {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn switch_workspace(&self, id: String) -> Result<WorkspaceActivation, String> {
         self.activate_workspace(id).await
     }
@@ -194,6 +197,7 @@ impl Backend {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn restart_workspace_node(&self, id: String) -> Result<WorkspaceNodeStatus, String> {
         let root = self.root.clone();
         self.control
@@ -211,6 +215,7 @@ impl Backend {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn workspace_node_status(&self, id: String) -> Result<WorkspaceNodeStatus, String> {
         let root = self.root.clone();
         self.control
@@ -221,6 +226,7 @@ impl Backend {
             .await
     }
 
+    #[allow(dead_code)]
     pub async fn workspace_node_ready(&self, id: String) -> Result<bool, String> {
         Ok(self.workspace_node_status(id).await?.ready)
     }

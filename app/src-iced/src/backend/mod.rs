@@ -95,6 +95,7 @@ impl Backend {
         Ok(self.workspace_snapshot().await?.workspaces)
     }
 
+    #[allow(dead_code)]
     pub async fn active_workspace(&self) -> Result<Option<Workspace>, String> {
         Ok(self.workspace_snapshot().await?.active)
     }

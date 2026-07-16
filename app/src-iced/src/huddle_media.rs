@@ -47,6 +47,10 @@ pub enum FailureKind {
     ScreenUnavailable,
     DeviceSelection,
     Codec,
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux", target_os = "windows"),
+        allow(dead_code)
+    )]
     Unsupported,
 }
 

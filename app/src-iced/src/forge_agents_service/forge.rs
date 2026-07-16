@@ -793,6 +793,7 @@ async fn set_item_state(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_review(
     backend: Option<&Backend>,
     node: Option<&NodeClient>,

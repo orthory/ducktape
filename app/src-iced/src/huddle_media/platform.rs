@@ -568,13 +568,15 @@ impl MediaBackend for Backend {
     }
 }
 
+type OpenAudioResult = Result<(AudioStreams, SyncSender<Box<[i16; FRAME_SAMPLES]>>), String>;
+
 fn open_audio(
     muted: Arc<AtomicBool>,
     level: Arc<AtomicU8>,
     outgoing: tokio::sync::mpsc::Sender<DriverOutgoing>,
     microphone: Option<usize>,
     speaker: Option<usize>,
-) -> Result<(AudioStreams, SyncSender<Box<[i16; FRAME_SAMPLES]>>), String> {
+) -> OpenAudioResult {
     let host = cpal::default_host();
     let input_device = match microphone {
         Some(index) => host
@@ -956,7 +958,7 @@ impl ScreenSource {
             .with_queue_depth(2)
             .with_minimum_frame_interval(&interval);
         let (tx, frames) = sync_channel(SCREEN_FRAME_QUEUE);
-        let mut stream = SCStream::new(&filter, &config);
+        let mut stream = SCStream::new(filter, &config);
         stream.add_output_handler(
             move |sample: CMSampleBuffer, output_type: SCStreamOutputType| {
                 if output_type != SCStreamOutputType::Screen {

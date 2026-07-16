@@ -79,7 +79,7 @@ mod imp {
             };
         }
         let active = application_active();
-        let became_active = LAST_ACTIVE.replace(active) == false && active;
+        let became_active = !LAST_ACTIVE.replace(active) && active;
         became_active.then_some(Event::Open)
     }
 

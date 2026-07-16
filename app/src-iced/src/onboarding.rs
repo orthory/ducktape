@@ -394,6 +394,7 @@ impl Default for State {
 }
 
 impl State {
+    #[allow(dead_code)]
     pub fn new() -> (Self, Command) {
         (Self::default(), Command::LoadIdentity)
     }
@@ -402,6 +403,7 @@ impl State {
         matches!(self.stage, Stage::Ready)
     }
 
+    #[allow(dead_code)]
     pub const fn shows_first_run_steps(&self) -> bool {
         self.first_run
     }

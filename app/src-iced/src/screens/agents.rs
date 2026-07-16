@@ -46,6 +46,7 @@ pub enum AgentStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityStatus {
+    #[allow(dead_code)]
     Loading,
     Ready,
     Error,
@@ -503,6 +504,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     Command(Command),
     Intent(AppIntent),
@@ -1207,8 +1209,10 @@ mod tests {
 
     #[test]
     fn assigned_watch_requires_an_agent() {
-        let mut state = State::default();
-        state.data = Resource::Ready(data());
+        let mut state = State {
+            data: Resource::Ready(data()),
+            ..State::default()
+        };
         state.watch.channel_id = "general".into();
         state.watch.policy = WatchPolicyKind::Assigned;
         assert_eq!(update(&mut state, Message::AddWatch), None);
@@ -1224,8 +1228,10 @@ mod tests {
 
     #[test]
     fn successful_mutation_reloads_committed_state() {
-        let mut state = State::default();
-        state.busy = true;
+        let mut state = State {
+            busy: true,
+            ..State::default()
+        };
         assert_eq!(
             update(
                 &mut state,

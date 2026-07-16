@@ -76,6 +76,7 @@ pub enum Control {
         sharing: bool,
     },
     RequestKeyframe(String),
+    #[allow(dead_code)]
     Stop,
 }
 

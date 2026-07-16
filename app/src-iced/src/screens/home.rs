@@ -619,8 +619,11 @@ pub(super) fn update(state: &mut HomeState, message: HomeMessage) -> Option<Comm
         }
         HomeMessage::EditNodeLabel(key, label) => {
             state.account.editing_node = Some(key);
-            state.account.node_label_draft =
-                (label != "Device").then_some(label).unwrap_or_default();
+            state.account.node_label_draft = if label != "Device" {
+                label
+            } else {
+                String::new()
+            };
             None
         }
         HomeMessage::NodeLabelChanged(value) => {
@@ -1024,7 +1027,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
     if let Some(key) = state.account.pending_unbind.as_deref() {
         body = body.push(account_confirmation(
             "Unbind this device?",
-            &format!(
+            format!(
                 "{} will stop belonging to this account on the active network. Its validator seat is separate.",
                 short(key)
             ),
@@ -1186,7 +1189,7 @@ fn home_content<'a>(state: &'a HomeState, data: &'a HomeData, p: Palette) -> Ele
     if let Some(key) = state.account.pending_remove.as_deref() {
         body = body.push(account_confirmation(
             "Remove this key from your account?",
-            &format!(
+            format!(
                 "{} can no longer sign as this account. Other account keys keep working.",
                 short(key)
             ),

@@ -774,26 +774,26 @@ fn chat_empty_shell<'a>(
             if let Some(sequence) = data.and_then(|data| data.history_window) {
                 stream = stream.push(notice_owned(format!("Older history around message #{sequence}. Select this channel again to jump to latest."), p));
             }
-            if let Some(data) = data {
-                if !data.tags.is_empty() {
-                    let mut tags = row![].spacing(5);
-                    for tag in &data.tags {
-                        tags = tags.push(outline(
-                            format!("#{} · {}", tag.label, tag.count),
-                            Message::Chat(ChatMessageEvent::FilterTag(tag.label.clone())),
-                            p,
-                        ));
-                    }
-                    stream = stream.push(tags);
+            if let Some(data) = data
+                && !data.tags.is_empty()
+            {
+                let mut tags = row![].spacing(5);
+                for tag in &data.tags {
+                    tags = tags.push(outline(
+                        format!("#{} · {}", tag.label, tag.count),
+                        Message::Chat(ChatMessageEvent::FilterTag(tag.label.clone())),
+                        p,
+                    ));
                 }
+                stream = stream.push(tags);
             }
             let mut last_day: Option<&str> = None;
             for message in messages {
                 let day = message.day.as_deref();
-                if let Some(label) = day {
-                    if day != last_day {
-                        stream = stream.push(day_divider(label, p));
-                    }
+                if let Some(label) = day
+                    && day != last_day
+                {
+                    stream = stream.push(day_divider(label, p));
                 }
                 last_day = day;
                 stream = stream.push(message_row(
@@ -1001,6 +1001,7 @@ fn day_divider<'a>(day: &'a str, p: Palette) -> Element<'a, Message> {
     .align_y(Alignment::Center)
     .into()
 }
+#[allow(clippy::too_many_arguments)]
 fn message_row<'a>(
     message: &'a ChatMessage,
     archived: bool,

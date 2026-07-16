@@ -60,6 +60,7 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Load(Screen),
     AccountTick,

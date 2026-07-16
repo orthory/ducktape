@@ -127,6 +127,7 @@ pub struct FileRefs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct MetricsSample {
     pub time_ms: u64,
     pub text: String,
@@ -385,6 +386,7 @@ impl NodeClient {
 
     /// Decode one `metrics` WebSocket tail item. The same parser is used for
     /// endpoint and stream samples so their trust boundary stays identical.
+    #[allow(dead_code)]
     pub fn metrics_tail(item: &Value) -> Result<MetricsSample, NodeError> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -482,6 +484,9 @@ impl NodeClient {
         Ok(reply.digest)
     }
 
+    // Kept for the bounded blob-read capability; the current files screen only
+    // exercises the higher-level listing and paging endpoints.
+    #[allow(dead_code)]
     pub async fn get_blob(&self, digest: &str) -> Result<Vec<u8>, NodeError> {
         let digest = safe_digest(digest)?;
         let response = self
@@ -680,6 +685,7 @@ impl NodeClient {
         .map_err(|_| NodeError::new(ErrorKind::BadBody, "files refs reply is invalid"))
     }
 
+    #[allow(dead_code)]
     pub async fn files_commit(&self, body: Value) -> Result<SubmitReceipt, NodeError> {
         self.post_json("v1/files/commit", &body).await
     }
@@ -740,7 +746,7 @@ impl NodeClient {
             let mut attempts = 0u32;
             loop {
                 attempts = attempts.saturating_add(1);
-                if attempts == 1 || attempts % 10 == 0 {
+                if attempts == 1 || attempts.is_multiple_of(10) {
                     tracing::debug!(
                         target: "ducktape::shell",
                         attempts,
@@ -796,7 +802,7 @@ impl NodeClient {
         let (mut sink, mut source) = socket.split();
         let subscribe = serde_json::to_string(&ClientFrame::Subscribe { topics, resume })
             .map_err(|_| NodeError::new(ErrorKind::BadBody, "could not encode subscription"))?;
-        sink.send(Message::Text(subscribe.into()))
+        sink.send(Message::Text(subscribe))
             .await
             .map_err(|_| {
                 NodeError::new(ErrorKind::Refused, "could not subscribe to node stream")
