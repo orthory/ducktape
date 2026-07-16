@@ -20,6 +20,7 @@
 mod chat;
 mod harness;
 mod onboarding;
+mod operator;
 mod settings;
 mod terminal;
 mod workspace;
