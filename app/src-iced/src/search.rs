@@ -601,12 +601,12 @@ pub fn view(state: &State, mode: Mode, content_left_inset: f32) -> Element<'_, M
         container(input)
             .padding([12, 16])
             .width(Length::Fill)
-            .style(move |_| bottom_border(p.paper, p.border_soft)),
+            .style(move |_| bottom_border(p.border_soft)),
         scrollable(container(groups).padding(Padding {
             top: 8.0,
-            right: 8.0,
+            right: 16.0,
             bottom: 12.0,
-            left: 8.0,
+            left: 16.0,
         }))
         .height(Length::Shrink),
     ])
@@ -683,9 +683,9 @@ fn result_group<'a>(
     ]
     .padding(Padding {
         top: 0.0,
-        right: 2.0,
+        right: 0.0,
         bottom: 0.0,
-        left: 10.0,
+        left: 0.0,
     })
     .spacing(2)
 }
@@ -751,9 +751,12 @@ fn bordered(background: Color, border: Color, radius: f32) -> container::Style {
     }
 }
 
-fn bottom_border(background: Color, border: Color) -> container::Style {
+/// A full-bleed hairline under the search input, drawn as a downward shadow so
+/// the fill stays transparent — a paper fill here would paint square corners
+/// over the panel's rounded top and make the modal look broken.
+fn bottom_border(border: Color) -> container::Style {
     container::Style {
-        background: Some(Background::Color(background)),
+        background: Some(Background::Color(Color::TRANSPARENT)),
         border: Border {
             color: border,
             width: 0.0,

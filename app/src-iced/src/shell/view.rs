@@ -10,14 +10,21 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
         items = items.push(
             container(
                 column![
-                    text("No notifications").size(12).font(theme::SANS_SEMIBOLD),
-                    text("Mentions, replies, huddles, runs, Forge, and governance updates appear here.")
+                    icons::view(Icon::Bell, 22.0, p.muted_2),
+                    text("You're all caught up")
+                        .size(12.5)
+                        .font(theme::SANS_SEMIBOLD)
+                        .color(p.ink),
+                    text("Mentions, replies, huddles, runs, Forge, and governance activity appear here.")
                         .size(10.5)
                         .color(p.muted),
                 ]
-                .spacing(5),
+                .spacing(8)
+                .align_x(Alignment::Center),
             )
-            .padding([14, 12]),
+            .width(Length::Fill)
+            .padding([30, 20])
+            .center_x(Length::Fill),
         );
     } else {
         let groups = notifications::groups(&state.notifications.recent, |id| {
@@ -86,24 +93,48 @@ fn notifications_overlay(state: &Shell) -> Element<'_, Message> {
             }
         }
     }
-    let panel = container(
-        column![
-            row![
-                text("Notifications")
-                    .size(12.5)
-                    .font(theme::SANS_SEMIBOLD)
-                    .width(Length::Fill),
-                text("Seen").size(9.5).font(theme::MONO).color(p.muted),
-            ]
-            .align_y(Alignment::Center),
-            scrollable(items).height(Length::Shrink),
-        ]
-        .spacing(6),
-    )
+    let mut header = row![
+        text("Notifications")
+            .size(13)
+            .font(theme::SANS_SEMIBOLD)
+            .color(p.ink)
+            .width(Length::Fill),
+    ]
+    .align_y(Alignment::Center);
+    let count = state.notifications.recent.len();
+    if count > 0 {
+        header = header.push(text(count.to_string()).size(10).font(theme::MONO).color(p.muted_2));
+    }
+    let panel = container(column![
+        container(header).padding(iced::Padding {
+            top: 11.0,
+            right: 12.0,
+            bottom: 11.0,
+            left: 12.0,
+        }),
+        container(Space::new().width(Length::Fill).height(1))
+            .style(move |_| container::Style::default().background(p.border_soft)),
+        scrollable(container(items).padding(6)).height(Length::Shrink),
+    ])
     .width(320)
     .max_height(400)
-    .padding(4)
-    .style(move |_| bordered(p.paper, p.border, 8.0));
+    .style(move |_| container::Style {
+        background: Some(Background::Color(p.paper)),
+        border: Border {
+            color: p.border,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color {
+                a: 0.18,
+                ..Color::BLACK
+            },
+            offset: iced::Vector::new(0.0, 8.0),
+            blur_radius: 24.0,
+        },
+        ..container::Style::default()
+    });
     let anchored = container(panel)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -904,6 +935,12 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
             .style(move |_| rounded(state.accent, 8.0)),
         );
     }
+    let tip = match state.notifications.unread {
+        0 => "Notifications".to_string(),
+        1 => "1 new notification".to_string(),
+        100.. => "99+ new notifications".to_string(),
+        n => format!("{n} new notifications"),
+    };
     let bell = tooltip(
         button(bell_content)
             .padding([3, 8])
@@ -918,7 +955,9 @@ fn titlebar(state: &Shell) -> Element<'_, Message> {
                 },
                 ..button::Style::default()
             }),
-        text("Notifications").size(11),
+        container(text(tip).size(11).color(p.ink))
+            .padding([4, 8])
+            .style(move |_| bordered(p.paper, p.border, 6.0)),
         tooltip::Position::Bottom,
     )
     .gap(6)
