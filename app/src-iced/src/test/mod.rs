@@ -23,6 +23,7 @@ mod chat;
 mod files;
 mod forge;
 mod governance;
+mod explorer;
 mod harness;
 mod members;
 mod onboarding;
