@@ -20,8 +20,9 @@ use crate::sem::SemProbe;
 pub type SnapshotSlot = Arc<Mutex<Vec<WindowSnapshot>>>;
 
 /// A flattened, ref-addressable view of one node, for `find` / target resolve.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FlatNode {
+    #[serde(rename = "ref")]
     pub r#ref: String,
     pub role: Role,
     pub name: String,
