@@ -543,20 +543,37 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
+    // `--client` mints a BEARER Client invite: no target lock, submit-only
+    // standing, 1-day default TTL. everything else stays a targeted Resident
+    // invite locked to the ONE key it admits.
+    let bearer_client = flags.contains_key("client");
     let ttl_days: u64 = match flags.get("ttl-days") {
         Some(v) => v.parse().map_err(|e| format!("--ttl-days {v:?}: {e}"))?,
+        None if bearer_client => config::DEFAULT_BEARER_INVITE_TTL_DAYS,
         None => config::DEFAULT_INVITE_TTL_DAYS,
     };
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
-    // every invite is locked to the ONE key it admits — no bearer invites.
-    let target = flags.get("target").ok_or(
-        "--target <invitee-pubkey-hex> is required: every invite is locked to \
-         the person it admits. the invitee gets their code from the app's \
-         join screen or `ducktape-node keygen --dir <workspace>`",
-    )?;
-    let target = config::decode_key(target)?;
+    let target = if bearer_client {
+        if flags.contains_key("target") {
+            return Err(
+                "--client mints a bearer invite — it has no --target; drop one of the flags"
+                    .into(),
+            );
+        }
+        None
+    } else {
+        // a resident invite is locked to the ONE key it admits — no bearer
+        // path onto the resident plane exists.
+        let target = flags.get("target").ok_or(
+            "--target <invitee-pubkey-hex> is required: every resident invite is locked \
+             to the person it admits (mint a bearer CLIENT invite with --client). the \
+             invitee gets their code from the app's join screen or `ducktape-node keygen \
+             --dir <workspace>`",
+        )?;
+        Some(config::decode_key(target)?)
+    };
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
@@ -716,14 +733,22 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .as_secs()
         + ttl_days * 24 * 60 * 60;
     // the expiry now lives INSIDE the token (signed), not as a separate blob
-    // field; the token is minted against the invitee's key with Resident role.
-    let token = config::mint_invite_token(
-        &key,
-        descriptor.genesis_namespace().as_bytes(),
-        &target,
-        config::InviteRole::Resident,
-        expires,
-    );
+    // field; targeted mints against the invitee's key with Resident role,
+    // `--client` mints a bearer Client token.
+    let token = match &target {
+        Some(target) => config::mint_invite_token(
+            &key,
+            descriptor.genesis_namespace().as_bytes(),
+            target,
+            config::InviteRole::Resident,
+            expires,
+        ),
+        None => config::mint_bearer_client_token(
+            &key,
+            descriptor.genesis_namespace().as_bytes(),
+            expires,
+        ),
+    };
     let blob_string = config::encode_invite(
         &invite_descriptor,
         &token,
@@ -731,6 +756,13 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         &fronts,
         &key,
     )?;
+    if bearer_client {
+        eprintln!(
+            "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
+             redeem with: ducktape-node user-redeem-invite <blob> --node <member-http-url> \
+             --key <user.key>"
+        );
+    }
     println!("{blob_string}");
     Ok(())
 }
@@ -1562,6 +1594,16 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         return Err("join needs exactly one <invite blob>".into());
     };
     let invite = config::decode_invite(blob)?;
+    // a CLIENT invite grants submit access, not a node — a node redeeming it
+    // would gate-fail terminally at the lobby (V8); fail at paste time with
+    // the right pointer instead. (bearer invites are client-only, so this
+    // also filters every bearer blob.)
+    if invite.token.role == config::InviteRole::Client {
+        return Err("this is a CLIENT invite — it grants submit access, not a node. \
+                    redeem it with `ducktape-node user-redeem-invite <blob> --node \
+                    <member-http-url> --key <user.key>`"
+            .into());
+    }
     let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
@@ -1570,11 +1612,14 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // parking a node that will only ever be refused at the lobby.
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
-    if invite.token.target != key.public_key() {
+    let Some(invite_target) = invite.token.target.clone() else {
+        unreachable!("bearer invites are client-role-only and were refused above");
+    };
+    if invite_target != key.public_key() {
         return Err(format!(
             "this invite is locked to a different key.\n  invite target: {}\n  this workspace: {me_hex}\n\
              hand the inviter THIS key (the join code) and ask for a fresh invite.",
-            hex_bytes(invite.token.target.as_ref()),
+            hex_bytes(invite_target.as_ref()),
         )
         .into());
     }

@@ -50,20 +50,49 @@ pub fn mint_invite_token(
     role: InviteRole,
     expires_unix_secs: u64,
 ) -> InviteToken {
+    mint_token(signer, binding, Some(target), role, expires_unix_secs)
+}
+
+/// mint a BEARER Client token: no target lock — the first key to present a
+/// valid join proof takes the grant, and the nonce set makes that
+/// exactly-once. Client role BY CONSTRUCTION: this is the only bearer
+/// constructor, so no bearer path onto the resident plane exists.
+pub fn mint_bearer_client_token(
+    signer: &ed25519::PrivateKey,
+    binding: &[u8],
+    expires_unix_secs: u64,
+) -> InviteToken {
+    mint_token(signer, binding, None, InviteRole::Client, expires_unix_secs)
+}
+
+/// the shared mint core — re-states the v2 grant preimage (`binding ‖ nonce ‖
+/// kind[‖ target] ‖ role ‖ expires_le`) because `grant_preimage` is private
+/// to the governance crate; a drift fails the crypto tests loudly.
+fn mint_token(
+    signer: &ed25519::PrivateKey,
+    binding: &[u8],
+    target: Option<&ed25519::PublicKey>,
+    role: InviteRole,
+    expires_unix_secs: u64,
+) -> InviteToken {
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let msg = [
-        binding,
-        &nonce,
-        target.as_ref(),
-        &[role.as_u8()],
-        &expires_unix_secs.to_le_bytes(),
-    ]
-    .concat();
+    let mut msg = Vec::new();
+    msg.extend_from_slice(binding);
+    msg.extend_from_slice(&nonce);
+    match target {
+        Some(t) => {
+            msg.push(1);
+            msg.extend_from_slice(t.as_ref());
+        }
+        None => msg.push(0),
+    }
+    msg.push(role.as_u8());
+    msg.extend_from_slice(&expires_unix_secs.to_le_bytes());
     InviteToken {
         issuer: signer.public_key(),
         nonce,
-        target: target.clone(),
+        target: target.cloned(),
         role,
         expires_unix_secs,
         sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
@@ -71,15 +100,23 @@ pub fn mint_invite_token(
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
-/// packed token: `issuer(32) ‖ nonce(16) ‖ target(32) ‖ role(1) ‖ expires_le(8)
-/// ‖ sig(64)` = 153 bytes.
-const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 32 + 1 + 8 + 64;
+/// packed token v2: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32) if
+/// kind==1] ‖ role(1) ‖ expires_le(8) ‖ sig(64)` — 154 bytes targeted, 122
+/// bearer.
+const INVITE_TOKEN_TARGETED_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 32 + 1 + 8 + 64;
+const INVITE_TOKEN_BEARER_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 1 + 8 + 64;
 
 fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
-    let mut out = Vec::with_capacity(INVITE_TOKEN_LEN);
+    let mut out = Vec::with_capacity(INVITE_TOKEN_TARGETED_LEN);
     out.extend_from_slice(t.issuer.as_ref());
     out.extend_from_slice(&t.nonce);
-    out.extend_from_slice(t.target.as_ref());
+    match &t.target {
+        Some(target) => {
+            out.push(1);
+            out.extend_from_slice(target.as_ref());
+        }
+        None => out.push(0),
+    }
     out.push(t.role.as_u8());
     out.extend_from_slice(&t.expires_unix_secs.to_le_bytes());
     out.extend_from_slice(t.sig.encode().as_ref());
@@ -87,20 +124,35 @@ fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
 }
 
 fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
-    if bytes.len() != INVITE_TOKEN_LEN {
+    let issuer = ed25519::PublicKey::decode(bytes.get(..32).ok_or("invite token truncated")?)
+        .map_err(|e| format!("invite token issuer: {e}"))?;
+    let mut nonce = [0u8; INVITE_NONCE_LEN];
+    nonce.copy_from_slice(
+        bytes
+            .get(32..32 + INVITE_NONCE_LEN)
+            .ok_or("invite token truncated")?,
+    );
+    let mut pos = 32 + INVITE_NONCE_LEN;
+    let kind = *bytes.get(pos).ok_or("invite token truncated")?;
+    pos += 1;
+    let (target, expect_len) = match kind {
+        1 => {
+            let t = ed25519::PublicKey::decode(
+                bytes.get(pos..pos + 32).ok_or("invite token truncated")?,
+            )
+            .map_err(|e| format!("invite token target: {e}"))?;
+            pos += 32;
+            (Some(t), INVITE_TOKEN_TARGETED_LEN)
+        }
+        0 => (None, INVITE_TOKEN_BEARER_LEN),
+        other => return Err(format!("unknown invite token kind {other}")),
+    };
+    if bytes.len() != expect_len {
         return Err(format!(
-            "invite token must be {INVITE_TOKEN_LEN} bytes, got {}",
+            "invite token must be {expect_len} bytes for its kind, got {}",
             bytes.len()
         ));
     }
-    let issuer = ed25519::PublicKey::decode(&bytes[..32])
-        .map_err(|e| format!("invite token issuer: {e}"))?;
-    let mut nonce = [0u8; INVITE_NONCE_LEN];
-    nonce.copy_from_slice(&bytes[32..32 + INVITE_NONCE_LEN]);
-    let mut pos = 32 + INVITE_NONCE_LEN;
-    let target = ed25519::PublicKey::decode(&bytes[pos..pos + 32])
-        .map_err(|e| format!("invite token target: {e}"))?;
-    pos += 32;
     let role = InviteRole::from_u8(bytes[pos])?;
     pos += 1;
     let expires_unix_secs = u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
@@ -313,6 +365,11 @@ pub const INVITE_ENVELOPE_NAMESPACE: &[u8] = b"ducktape-invite-envelope";
 /// otherwise. single-use bounds the damage of a leaked blob; expiry bounds a
 /// LOST one.
 pub const DEFAULT_INVITE_TTL_DAYS: u64 = 7;
+
+/// bearer invites default MUCH shorter: anyone holding the blob can redeem
+/// it until its single use is spent, so the unredeemed-leak window stays a
+/// day, not a week. `--ttl-days` still overrides.
+pub const DEFAULT_BEARER_INVITE_TTL_DAYS: u64 = 1;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -553,7 +610,11 @@ fn pack_invite(
 
     // the token now carries its OWN expiry (no separate blob-level field) —
     // decode enforces it from `token.expires_unix_secs`.
-    out.extend_from_slice(&pack_invite_token(token));
+    // length-prefixed: the v2 token is variable-width (bearer carries no
+    // target bytes), so the reader learns how much to take.
+    let tok = pack_invite_token(token);
+    out.push(u8::try_from(tok.len()).expect("a packed token fits u8"));
+    out.extend_from_slice(&tok);
 
     // the fronts block rides AFTER the fixed-length token, inside the signed
     // envelope, but is NEVER fed to `genesis_namespace` (advisory reachability,
@@ -661,7 +722,8 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
 
     // the token carries its own expiry now (no separate blob-level field);
     // enforce it against the injected clock right after unpacking.
-    let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
+    let tok_len = r.u8()? as usize;
+    let token = unpack_invite_token(r.take(tok_len)?)?;
     let expires_unix_secs = token.expires_unix_secs;
     if now_unix_secs >= expires_unix_secs {
         return Err("this invite has expired — ask for a fresh one".into());
@@ -873,6 +935,51 @@ mod tests {
             !verify_join_proof(&thief, binding.as_bytes(), &invite.token, &proof),
             "a substituted key fails the proof"
         );
+    }
+
+    #[test]
+    fn a_bearer_client_token_roundtrips_the_file_and_blob_codecs() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let me = issuer.public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "127.0.0.1:52200");
+        let binding = d.genesis_namespace();
+        let token = mint_bearer_client_token(&issuer, binding.as_bytes(), u64::MAX);
+        assert_eq!(token.role, InviteRole::Client);
+        assert!(token.target.is_none());
+        assert!(verify_invite_token(&token, binding.as_bytes()));
+
+        // packed-token codec: bearer width, exact roundtrip.
+        let packed = pack_invite_token(&token);
+        assert_eq!(packed.len(), INVITE_TOKEN_BEARER_LEN);
+        assert_eq!(unpack_invite_token(&packed).expect("token roundtrip"), token);
+
+        // token FILE roundtrip (the joining side persists it 0600).
+        let dir = tmp("bearer-token-file");
+        save_invite_token(&dir, &token).expect("save");
+        assert_eq!(load_invite_token(&dir).expect("load"), Some(token.clone()));
+
+        // full blob roundtrip: the variable-width token rides length-prefixed.
+        let blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.token, token);
+
+        // ANY key may prove possession against a bearer token.
+        let redeemer = ed25519::PrivateKey::from_seed(11);
+        let proof = sign_join_proof(&redeemer, binding.as_bytes(), &invite.token);
+        assert!(verify_join_proof(
+            &redeemer.public_key(),
+            binding.as_bytes(),
+            &invite.token,
+            &proof
+        ));
     }
 
     #[test]

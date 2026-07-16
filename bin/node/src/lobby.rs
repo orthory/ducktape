@@ -118,7 +118,12 @@ pub fn gate_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
-        target: token.target.as_ref().to_vec(),
+        // empty target bytes = bearer, the wire-wide rule.
+        target: token
+            .target
+            .as_ref()
+            .map(|t| t.as_ref().to_vec())
+            .unwrap_or_default(),
         role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
     }
@@ -201,8 +206,16 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
         .map_err(|e| format!("issuer key: {e}"))?;
     let joiner = ed25519::PublicKey::decode(joiner.as_slice())
         .map_err(|e| format!("joiner key: {e}"))?;
-    let target = ed25519::PublicKey::decode(target.as_slice())
-        .map_err(|e| format!("target key: {e}"))?;
+    // empty target bytes = a BEARER token (Client-role-only by mint rule; a
+    // bearer Resident could only be a forgery and dies on the signature).
+    let target = if target.is_empty() {
+        None
+    } else {
+        Some(
+            ed25519::PublicKey::decode(target.as_slice())
+                .map_err(|e| format!("target key: {e}"))?,
+        )
+    };
     let role = InviteRole::from_u8(*role)?;
     if nonce.len() != INVITE_NONCE_LEN {
         return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
@@ -224,11 +237,16 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
     };
     // signature first (kills a tampered target/role/expiry), THEN the target
     // lock (named BEFORE the proof check so the error names the real problem:
-    // a blob holder announcing under its own valid self-proof).
+    // a blob holder announcing under its own valid self-proof). a BEARER
+    // token has no lock — any key may claim it; the ROLE gates downstream
+    // (ingress V8, the intro doorbell) are what keep it off the resident
+    // plane.
     if !crate::config::verify_invite_token(&token, binding) {
         return Err("invite token signature does not verify for this network".into());
     }
-    if target != joiner {
+    if let Some(t) = &token.target
+        && *t != joiner
+    {
         return Err(
             "invite is locked to a different key — this invite was minted for someone else".into(),
         );
@@ -323,7 +341,11 @@ pub fn intro_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
-        target: token.target.as_ref().to_vec(),
+        target: token
+            .target
+            .as_ref()
+            .map(|t| t.as_ref().to_vec())
+            .unwrap_or_default(),
         role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
         wg_public_key: wg_public_key.to_vec(),
@@ -489,6 +511,30 @@ mod tests {
         };
         let err = verify_join_request(&forged, BINDING).expect_err("refused");
         assert!(err.contains("proof-of-possession"), "{err}");
+    }
+
+    #[test]
+    fn a_bearer_token_at_the_gate_verifies_as_client_and_dies_on_the_role_gates() {
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let joiner = ed25519::PrivateKey::from_seed(2);
+        let token = crate::config::mint_bearer_client_token(&issuer, BINDING, u64::MAX);
+
+        // crypto passes — ANY key may claim a bearer token (no target lock) —
+        let msg = gate_request(&joiner, BINDING, &token);
+        let verified = verify_join_request(&msg, BINDING).expect("bearer verifies");
+        // — but it comes out role=Client, which ingress V8 and the intro
+        // doorbell terminally refuse: no bearer path onto the resident plane.
+        assert_eq!(verified.role, InviteRole::Client);
+        assert_eq!(verified.joiner, joiner.public_key());
+
+        // the intro half rides the same verify and pins the same role.
+        let intro = intro_request(&joiner, BINDING, &token, [9u8; 32]);
+        let verified = verify_intro(&intro, BINDING).expect("bearer intro verifies");
+        assert_eq!(verified.joiner, joiner.public_key());
+        assert!(
+            intro.role != InviteRole::Resident.as_u8(),
+            "the doorbell's role gate sees Client and refuses a tunnel"
+        );
     }
 
     #[test]
