@@ -667,6 +667,15 @@ impl SimHandle {
     where
         F: FnOnce(oneshot::Sender<T>) -> SimCommand,
     {
+        // fail CLOSED once a fatal commit halted the host. `halt` tears down the
+        // serve loop but not the actor (this live handle still holds a control
+        // sender), so without this guard a post-fatal step/state/set_auto/
+        // peer_block would answer Ok on a corrupt host — every embedded method
+        // routes through here, so one check covers all. `wait` surfaces the same
+        // reason for the binary path.
+        if let Some(reason) = self.fatal.lock().expect("fatal flag poisoned").clone() {
+            return Err(reason);
+        }
         let mut sender = self
             .control
             .clone()
@@ -1708,5 +1717,38 @@ async fn strip_receipt_op_hash(
         Some(new_body) => Response::from_parts(parts, Body::from(new_body)),
         // not a json object (unexpected) — pass the original bytes through.
         None => Response::from_parts(parts, Body::from(bytes)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// once a fatal reason is recorded, the embedded control surface fails
+    /// closed — every method routes through `call`, so one guard covers all.
+    /// we set the flag DIRECTLY rather than provoke a real `SubmitError::Fatal`
+    /// (there is no cheap way to force host corruption); the guard is the unit
+    /// under test. `wait`'s path is unchanged and covered by the binary suite.
+    #[test]
+    fn fatal_flag_fails_the_embedded_control_surface_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let handle = boot(
+            dir.path(),
+            "127.0.0.1:0".parse().expect("addr"),
+            SimOpts::default(),
+        )
+        .expect("boot");
+        assert!(handle.state().is_ok(), "healthy before the flag is set");
+
+        *handle.fatal.lock().expect("fatal") = Some("boom".into());
+        assert_eq!(handle.step().unwrap_err(), "boom");
+        assert_eq!(handle.state().unwrap_err(), "boom");
+        assert_eq!(handle.set_auto(false).unwrap_err(), "boom");
+        assert_eq!(
+            handle
+                .peer_block(serde_json::json!({ "target": "chat", "payload": {} }))
+                .unwrap_err(),
+            "boom",
+        );
     }
 }
