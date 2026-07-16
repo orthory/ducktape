@@ -1,8 +1,26 @@
 # Iced sim lane — transaction round-trips against simnode
 
-**Date:** 2026-07-16
+**Date:** 2026-07-16 (v2 — in-process pivot, user directive: foundry-true)
 **Branch:** `feat/iced-sim-lane` → PR into `feat/iced-app`
-**Status:** approved design
+**Status:** approved design; supersedes v1's child-process backend
+
+> **v2 pivot:** the sim is EMBEDDED, not spawned. `simnode` is now a library
+> (phase A: `docs/superpowers/specs/2026-07-16-simnode-lib-design.md`, PR to
+> `dev`): `simnode::boot(storage, "127.0.0.1:0", SimOpts { auto: true, .. })`
+> returns a synchronous `SimHandle`; the app's real `NodeClient` speaks real
+> HTTP to the in-process listener. Frame signing also goes in-process: a
+> test-only override at the single verb choke-point (`run_verb_inner`,
+> `backend/node_control.rs`) answers `user-key status` and `user-sign-frame`
+> using `node::encode_frame` with a generated ed25519 key — no `user.key`
+> file, no `create_identity`, no `ducktape-node` binary, production
+> subprocess path untouched. Consequences: plain `cargo test -p ducktape-iced`
+> is self-contained (no prebuilt binaries, no loud-skip machinery, no
+> `DUCKTAPE_SIM_REQUIRE`, no `DUCKTAPE_NODE_BIN` export); `ducktape-iced`
+> gains dev-deps on `simnode`, `node`, `sdk`, and the workspace ed25519
+> crate. Sections below describing the child process, binary resolution,
+> the identity fixture via `create_identity`, and the Make prebuild are
+> superseded accordingly; the SimShell surface, task pump, and proof
+> scenarios are unchanged.
 
 ## Problem
 
