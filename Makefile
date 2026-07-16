@@ -50,23 +50,25 @@ cef-env:
 ## Native iced development app with the matching local node binary. macOS
 ## runs from a staged .app. Windows runs only through CEF's sandbox-owning
 ## bootstrap + Rust client DLL pair. Linux can run the flat debug executable.
+## Keep incremental builds for the node, but disable them for the async-heavy
+## iced crate: rustc 1.96 can otherwise ICE on stale obligation fingerprints.
 ifeq ($(HOST_OS),Darwin)
 dev: cef-env
 	$(CARGO) build -p node-bin
-	$(CARGO) build -p ducktape-iced
+	CARGO_INCREMENTAL=0 $(CARGO) build -p ducktape-iced
 	bash ops/stage-macos-iced-app.sh debug
 	bash ops/check-macos-cef-bundle.sh target/debug/bundle/macos/Ducktape.app
 	target/debug/bundle/macos/Ducktape.app/Contents/MacOS/ducktape
 else ifeq ($(HOST_OS),Windows)
 dev: cef-env
 	$(CARGO) build -p node-bin
-	$(CARGO) build -p ducktape-iced --lib
+	CARGO_INCREMENTAL=0 $(CARGO) build -p ducktape-iced --lib
 	powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops/stage-windows-app.ps1 -Configuration debug -NoArchive
 	target/debug/bundle/windows/Ducktape/Ducktape.exe
 else
 dev: cef-env
 	$(CARGO) build -p node-bin
-	DUCKTAPE_NODE_BIN="$(abspath target/debug/ducktape-node)" $(CARGO) run -p ducktape-iced
+	CARGO_INCREMENTAL=0 DUCKTAPE_NODE_BIN="$(abspath target/debug/ducktape-node)" $(CARGO) run -p ducktape-iced
 endif
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
