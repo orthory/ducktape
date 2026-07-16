@@ -5518,13 +5518,13 @@ dependencies = [
 [[package]]
 name = "iced-agent-plugin"
 version = "0.1.0"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#98264824cbf56803ac90a8257f4e266be3e8fb2b"
 dependencies = [
  "base64",
  "iced",
  "iced_winit",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -5687,6 +5687,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
+source = "git+https://github.com/byeongsu-hong/iced-agent-browser#98264824cbf56803ac90a8257f4e266be3e8fb2b"
 dependencies = [
  "accesskit",
  "accesskit_winit",

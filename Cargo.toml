@@ -235,6 +235,6 @@ rand_core = "0.6.4"
 # The agent fork of iced_winit: crates.io 0.14.0 + `// AGENT SEAM` blocks
 # (AccessKit adapter, tree push, synthetic event injection), dev-only via the
 # `agent` feature. Lives in the
-# byeongsu-hong/iced-agent-browser submodule (AGENT-FORK.md inside).
+# byeongsu-hong/iced-agent-browser repo (git dep; AGENT-FORK.md inside).
 [patch.crates-io]
-iced_winit = { path = "third_party/iced-agent-browser/iced-winit" }
+iced_winit = { git = "https://github.com/byeongsu-hong/iced-agent-browser" }
