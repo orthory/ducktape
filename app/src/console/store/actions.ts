@@ -3334,7 +3334,7 @@ export function createActions({
       }
       Promise.resolve()
         .then(() => ws.inviteBlob(active.id, code))
-        .then((forms) => patch({ inviteBlob: forms.blob, inviteShort: forms.short }))
+        .then((blob) => patch({ inviteBlob: blob }))
         .catch(fail);
     },
 

@@ -429,9 +429,6 @@ export interface ConsoleState {
   onboardingPhase: PhaseReport | null;
   /** The active workspace's full invite blob, once revealed for sharing. */
   inviteBlob: string | null;
-  /** The coordinator-hosted `🦆://<name>/<id>` short link for the revealed
-   *  invite, when the coordinator accepted it; null on the full-blob-only path. */
-  inviteShort: string | null;
   /** This device's JOIN CODE (a pre-generated identity pubkey) for the
    *  onboarding join flow — handed to an inviter so the invite locks to it. */
   joinCode: string | null;
@@ -1031,7 +1028,6 @@ export const createInitialState = (): ConsoleState => {
     deleteNeedsForce: null,
     onboardingPhase: null,
     inviteBlob: null,
-    inviteShort: null,
     joinCode: null,
   };
 };
