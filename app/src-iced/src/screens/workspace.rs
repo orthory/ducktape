@@ -12,6 +12,7 @@ use crate::theme::{
     self, BODY, CAPTION, HEADING, LABEL, MONO, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, SANS,
     SANS_MEDIUM, SANS_SEMIBOLD, TITLE,
 };
+use crate::ui;
 
 const CARD_WIDTH: f32 = 440.0;
 const JOIN_WIDTH: f32 = 430.0;
@@ -868,8 +869,9 @@ fn can_submit(state: &State) -> bool {
 }
 
 fn join_code_card(state: &State, p: Palette) -> Element<'_, Message> {
+    let t = theme::ui_for(&p);
     let code = state.join_code.as_deref().unwrap_or("generating…");
-    container(
+    ui::surface::surface(
         column![
             text("YOUR JOIN CODE")
                 .font(SANS_SEMIBOLD)
@@ -892,13 +894,15 @@ fn join_code_card(state: &State, p: Palette) -> Element<'_, Message> {
             .align_y(Alignment::Center),
         ]
         .spacing(6),
+        ui::surface::SurfaceVariant::Card,
+        &t,
     )
     .padding([10, 11])
-    .style(move |_| bordered(p.paper, p.border, RADIUS_SM))
     .into()
 }
 
 fn networks(state: &State, p: Palette) -> Element<'_, Message> {
+    let t = theme::ui_for(&p);
     let mut list = Column::new().spacing(6).push(
         text("YOUR NETWORKS")
             .font(SANS_SEMIBOLD)
@@ -954,9 +958,7 @@ fn networks(state: &State, p: Palette) -> Element<'_, Message> {
         list = list.push(row![select, remove].spacing(6).align_y(Alignment::Center));
     }
     column![
-        container(Space::new().height(1))
-            .width(Length::Fill)
-            .style(move |_| rounded(p.border, 0.0)),
+        ui::separator::horizontal(&t),
         Space::new().height(13),
         list,
     ]
@@ -1147,16 +1149,13 @@ fn step_icon(visual: StepVisual, p: Palette) -> Element<'static, Message> {
 }
 
 fn progress_bar(progress: u16, fatal: bool, p: Palette) -> Element<'static, Message> {
-    let progress = progress.clamp(1, 100);
-    let filled = container(Space::new())
-        .width(Length::FillPortion(progress))
-        .height(5)
-        .style(move |_| rounded(if fatal { p.red } else { p.filled }, 3.0));
-    let empty = Space::new().width(Length::FillPortion(100 - progress));
-    container(row![filled, empty].spacing(0))
-        .height(5)
-        .style(move |_| rounded(p.hover, 3.0))
-        .into()
+    let t = theme::ui_for(&p);
+    let variant = if fatal {
+        ui::progress::ProgressVariant::Destructive
+    } else {
+        ui::progress::ProgressVariant::Default
+    };
+    ui::progress::progress(f32::from(progress.clamp(1, 100)), variant, &t).into()
 }
 
 fn node_key(pubkey: String, copied: bool, p: Palette) -> Element<'static, Message> {
@@ -1204,18 +1203,18 @@ fn node_key(pubkey: String, copied: bool, p: Palette) -> Element<'static, Messag
 }
 
 fn fatal_line(copy: String, p: Palette) -> Element<'static, Message> {
-    container(
+    let t = theme::ui_for(&p);
+    ui::alert::alert(
         text(copy)
             .font(MONO)
             .size(BODY)
             .color(p.red)
             .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .width(Length::Fill),
+        ui::alert::AlertVariant::Destructive,
+        &t,
     )
-        .width(Length::Fill)
-        .padding([8, 10])
-        .style(move |_| bordered(p.danger_soft, p.danger_border, RADIUS_SM))
-        .into()
+    .into()
 }
 
 fn node_failed(state: &State, p: Palette) -> Element<'_, Message> {
@@ -1287,11 +1286,10 @@ fn node_failed(state: &State, p: Palette) -> Element<'_, Message> {
             .push(selectable_value(path, p.muted));
     }
 
-    let failure = container(content)
-        .width(Length::Fill)
+    let t = theme::ui_for(&p);
+    let failure = ui::alert::alert(content, ui::alert::AlertVariant::Destructive, &t)
         .max_width(FAILED_WIDTH)
-        .padding(20)
-        .style(move |_| bordered(p.danger_soft, p.danger_border, RADIUS_LG));
+        .padding(20);
     container(failure)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1358,21 +1356,12 @@ fn forget_confirmation(state: &State, p: Palette) -> Element<'_, Message> {
 }
 
 fn icon_close(p: Palette) -> Element<'static, Message> {
-    let btn = button(text("✕").font(SANS_MEDIUM).size(TITLE))
-        .width(26)
-        .height(26)
-        .padding(0)
+    let t = theme::ui_for(&p);
+    let btn = ui::button::Button::new(text("✕").font(SANS_MEDIUM).size(TITLE), &t)
+        .variant(ui::button::ButtonVariant::Ghost)
+        .size(ui::button::ButtonSize::Icon)
         .on_press(Message::Dismiss)
-        .style(move |_, status| iced::widget::button::Style {
-            background: matches!(status, iced::widget::button::Status::Hovered)
-                .then_some(Background::Color(p.hover)),
-            text_color: p.muted,
-            border: Border {
-                radius: RADIUS_SM.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, "Close", btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -1386,27 +1375,10 @@ fn field<'a>(
     font: iced::Font,
     p: Palette,
 ) -> iced::widget::TextInput<'a, Message> {
-    text_input(placeholder, value)
+    let t = theme::ui_for(&p);
+    ui::input::input(placeholder, value, &t)
         .on_input(on_input)
-        .padding([9, 11])
-        .size(BODY)
         .font(font)
-        .style(move |_, status| iced::widget::text_input::Style {
-            background: Background::Color(p.sunken),
-            border: Border {
-                color: if matches!(status, iced::widget::text_input::Status::Focused { .. }) {
-                    theme::ACCENTS[0]
-                } else {
-                    p.border_strong
-                },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            icon: p.muted,
-            placeholder: p.muted_2,
-            value: p.ink,
-            selection: theme::ACCENTS[0],
-        })
 }
 
 /// Dev-only text-input tagging: wraps `input` in a `TextInput` semantic node
@@ -1470,30 +1442,15 @@ fn tab(
 }
 
 fn primary<'a>(label: &'a str, message: Option<Message>, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
     let enabled = message.is_some();
-    let btn = button(
-        container(text(label).font(SANS_SEMIBOLD).size(BODY))
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding([10, 0])
-    .on_press_maybe(message)
-    .style(move |_, status| iced::widget::button::Style {
-        background: Some(Background::Color(if !enabled {
-            p.chip
-        } else if matches!(status, iced::widget::button::Status::Hovered) {
-            p.ink_soft
-        } else {
-            p.filled
-        })),
-        text_color: if enabled { p.on_filled } else { p.muted_3 },
-        border: Border {
-            radius: RADIUS_MD.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    });
+    let mut builder = ui::button::button(label, &t)
+        .width(Length::Fill)
+        .disabled(!enabled);
+    if let Some(message) = message {
+        builder = builder.on_press(message);
+    }
+    let btn = builder.into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -1508,10 +1465,13 @@ fn outline_enabled(
     enabled: bool,
     p: Palette,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([5, 10])
-        .on_press_maybe(enabled.then_some(message))
-        .style(move |_, status| outline_style(p, enabled, status));
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .disabled(!enabled)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::Button, label, btn)
         .disabled(!enabled)
@@ -1521,10 +1481,12 @@ fn outline_enabled(
 }
 
 fn ghost(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([6, 12])
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
         .on_press(message)
-        .style(move |_, status| outline_style(p, true, status));
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -1537,25 +1499,17 @@ fn danger_button(
     filled: bool,
     p: Palette,
 ) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([8, 10])
+    let t = theme::ui_for(&p);
+    let variant = if filled {
+        ui::button::ButtonVariant::Destructive
+    } else {
+        ui::button::ButtonVariant::DestructiveOutline
+    };
+    let btn = ui::button::button(label, &t)
+        .variant(variant)
+        .size(ui::button::ButtonSize::Small)
         .on_press(message)
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(if filled {
-                p.red
-            } else if matches!(status, iced::widget::button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            })),
-            text_color: if filled { p.on_filled } else { p.red },
-            border: Border {
-                color: if filled { p.red } else { p.border },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -1563,24 +1517,11 @@ fn danger_button(
 }
 
 fn danger_primary(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([7, 14])
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Destructive)
         .on_press(message)
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(
-                if matches!(status, iced::widget::button::Status::Hovered) {
-                    p.red
-                } else {
-                    p.danger
-                },
-            )),
-            text_color: Color::WHITE,
-            border: Border {
-                radius: RADIUS_MD.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -1618,28 +1559,17 @@ fn dialog_button(
     danger: bool,
     p: Palette,
 ) -> Element<'static, Message> {
-    // Symmetric vertical padding centers the label; a fixed `.height(32)` with
-    // top-anchored button content (iced positions children at padding top-left)
-    // left the text stuck to the top of the button.
-    let btn = button(text(label).font(SANS_SEMIBOLD).size(LABEL))
-        .padding([8, 12])
+    let t = theme::ui_for(&p);
+    let variant = if danger {
+        ui::button::ButtonVariant::Destructive
+    } else {
+        ui::button::ButtonVariant::Outline
+    };
+    let btn = ui::button::button(label, &t)
+        .variant(variant)
+        .size(ui::button::ButtonSize::Small)
         .on_press(message)
-        .style(move |_, status| iced::widget::button::Style {
-            background: Some(Background::Color(if danger {
-                p.red
-            } else if matches!(status, iced::widget::button::Status::Hovered) {
-                p.hover
-            } else {
-                p.paper
-            })),
-            text_color: if danger { p.on_filled } else { p.ink_soft },
-            border: Border {
-                color: if danger { p.red } else { p.border_strong },
-                width: 1.0,
-                radius: RADIUS_SM.into(),
-            },
-            ..Default::default()
-        });
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
@@ -1647,15 +1577,13 @@ fn dialog_button(
 }
 
 fn link_button(label: &'static str, message: Message, p: Palette) -> Element<'static, Message> {
-    let btn = button(
-        container(text(label).font(SANS_SEMIBOLD).size(LABEL).color(p.muted))
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding(4)
-    .on_press(message)
-    .style(|_, _| iced::widget::button::Style::default());
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Link)
+        .size(ui::button::ButtonSize::Small)
+        .width(Length::Fill)
+        .on_press(message)
+        .into_widget();
     #[cfg(all(feature = "agent", debug_assertions))]
     return iced_agent_plugin::sem(iced_agent_plugin::Role::Link, label, btn);
     #[cfg(not(all(feature = "agent", debug_assertions)))]
