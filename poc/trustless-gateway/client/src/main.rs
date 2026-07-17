@@ -209,12 +209,8 @@ async fn seal_cmd(args: SealArgs) -> Result<()> {
     let expected = Measurement::from_hex(&args.measurement)?;
     let gw = Gateway::resolve(&args.gw)?;
 
-    let att = gw.attestation().await?;
-    let quote = BASE64.decode(&att.quote_b64).context("quote base64")?;
-
     // Verify BEFORE releasing anything.
-    let report_data = verify_quote(mode, &quote, &expected).await?;
-    let (seal_pk, _sess_pk) = attest::split_report_data(&report_data);
+    let seal_pk = attested_seal_pk(&gw, mode, &expected).await?;
     println!(
         "✓ quote verified: measurement matches audited image ({}…), seal key bound",
         &expected.to_hex()[..12]
@@ -288,11 +284,7 @@ async fn handshake_token(
     expected: &Measurement,
     sub: &str,
 ) -> Result<String> {
-    let att = gw.attestation().await?;
-    let quote = BASE64.decode(&att.quote_b64).context("quote base64")?;
-    let report_data = verify_quote(mode, &quote, expected).await?;
-    let (seal_pk, _sess_pk) = attest::split_report_data(&report_data);
-
+    let seal_pk = attested_seal_pk(gw, mode, expected).await?;
     let (client_eph_pk, session_key) = handshake::client_handshake(&seal_pk);
     let resp: SessionResponse = gw
         .route(gw.http.post(gw.url("/session")))
@@ -324,6 +316,20 @@ fn resolve_refresh_token(args: &SealArgs) -> Result<String> {
             .context("claudeAiOauth.refreshToken not found");
     }
     bail!("provide --refresh-token or --credentials");
+}
+
+/// Fetch the enclave quote, verify it (per vendor), and return the attested
+/// `seal_pk` — the X25519 key both the credential seal and the session handshake
+/// bind to. Anything downstream trusts `seal_pk` ONLY because this verified it.
+async fn attested_seal_pk(
+    gw: &Gateway,
+    mode: AttestMode,
+    expected: &Measurement,
+) -> Result<[u8; 32]> {
+    let att = gw.attestation().await?;
+    let quote = BASE64.decode(&att.quote_b64).context("quote base64")?;
+    let report_data = verify_quote(mode, &quote, expected).await?;
+    Ok(attest::split_report_data(&report_data).0)
 }
 
 async fn verify_quote(
@@ -439,8 +445,7 @@ fn snp_parse(quote: &[u8]) -> Result<([u8; attest::MRTD_LEN], [u8; attest::REPOR
 #[cfg(feature = "snp")]
 fn snp_inspect(quote: &[u8]) -> Result<(String, [u8; attest::REPORT_DATA_LEN], Vec<String>)> {
     let (meas, rd) = snp_parse(quote)?;
-    let extra = vec!["MEASUREMENT (SEV-SNP launch digest)".to_string()];
-    Ok((hex::encode(meas), rd, extra))
+    Ok((hex::encode(meas), rd, Vec::new()))
 }
 
 #[cfg(not(feature = "snp"))]

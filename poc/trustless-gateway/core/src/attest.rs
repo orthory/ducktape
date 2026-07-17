@@ -13,7 +13,9 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey};
 
 pub const REPORT_DATA_LEN: usize = 64;
-pub const MRTD_LEN: usize = 48; // TDX MRTD is SHA-384
+/// Launch-measurement length: TDX MRTD and AMD SEV-SNP measurement are both
+/// SHA-384 (48 bytes), so the SNP path reuses this too.
+pub const MRTD_LEN: usize = 48;
 
 /// The expected launch measurement (MRTD) of the audited host image. In the
 /// PoC it is a CLI flag; production pins it on Ducktape consensus.
@@ -51,15 +53,6 @@ pub enum AttestMode {
 }
 
 impl AttestMode {
-    /// The `configfs-tsm` `provider` string for this vendor, or `None` for mock.
-    pub fn tsm_provider(self) -> Option<&'static str> {
-        match self {
-            Self::Mock => None,
-            Self::Tdx => Some("tdx_guest"),
-            Self::Snp => Some("sev_guest"),
-        }
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Mock => "mock",
@@ -83,6 +76,11 @@ impl std::str::FromStr for AttestMode {
 
 /// REPORTDATA is exactly the two pubkeys concatenated (32 + 32 = 64), so the
 /// quote *is* the key binding — no hashing, no trusting a side-channel field.
+/// `seal_pk` is load-bearing today (credential seal + session handshake bind to
+/// it). `sess_pk` binds the token-signing key into the SAME attestation so a
+/// verifier could later check a token was signed by the attested enclave
+/// offline; no current caller does, but it costs 32 bytes and completes the
+/// binding.
 pub fn make_report_data(seal_pk: &[u8; 32], sess_pk: &[u8; 32]) -> [u8; REPORT_DATA_LEN] {
     let mut rd = [0u8; REPORT_DATA_LEN];
     rd[..32].copy_from_slice(seal_pk);

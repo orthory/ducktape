@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `GET /attestation` — the enclave quote. The seal + session pubkeys are read
+/// `GET /attestation` — the enclave quote. The seal key used downstream is read
 /// out of the quote's verified REPORTDATA, never trusted from a JSON field.
 /// `vendor` ("mock" | "tdx" | "snp") only selects which verifier the client
 /// runs; it is not itself trusted — the quote's own format authenticates it.

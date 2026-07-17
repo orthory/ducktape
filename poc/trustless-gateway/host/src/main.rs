@@ -102,7 +102,12 @@ struct AppState {
     http: reqwest::Client,
     cfg: Config,
     oauth: Mutex<Option<Oauth>>,
-    /// Remaining request budget per session `sub`.
+    /// Single-flight gate around the OAuth refresh: held across the token POST so
+    /// two concurrent callers cannot both spend the same rotating refresh token.
+    refresh_gate: tokio::sync::Mutex<()>,
+    /// Remaining request budget per session `sub`. ponytail: refillable by asking
+    /// for a new /session and unbounded in `sub` — fine for the PoC (the overlay
+    /// ACL gates who may reach it); a real deployment caps/evicts it.
     budgets: Mutex<HashMap<String, u32>>,
 }
 
@@ -164,6 +169,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             max_requests: args.max_requests,
         },
         oauth: Mutex::new(None),
+        refresh_gate: tokio::sync::Mutex::new(()),
         budgets: Mutex::new(HashMap::new()),
     });
 
@@ -394,13 +400,18 @@ async fn proxy_inner(
 /// Exchange the refresh token for a fresh access token (and rotated refresh
 /// token). Mirrors the current broker's OAuth refresh.
 async fn refresh_now(st: &AppState) -> Result<()> {
-    let refresh = st
-        .oauth
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|o| o.refresh_token.clone())
-        .context("no credential to refresh")?;
+    // Single-flight: only one refresh runs at a time. Concurrent callers queue
+    // here rather than each POSTing the same refresh token.
+    let _gate = st.refresh_gate.lock().await;
+    // Re-check under the gate — a caller we queued behind may have just done it.
+    let refresh = {
+        let g = st.oauth.lock().unwrap();
+        let o = g.as_ref().context("no credential to refresh")?;
+        if !o.access_token.is_empty() && o.expires_at > now_secs() {
+            return Ok(());
+        }
+        o.refresh_token.clone()
+    };
 
     let resp = st
         .http
