@@ -31,8 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sdk::{
-    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
-    StateSyncHandle,
+    Continuation, Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, Relay,
+    ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
 use sha2::{Digest, Sha256};
 
@@ -257,8 +257,18 @@ pub struct BatchOutcome {
     pub app_hash: StateRoot,
     /// one outcome per input op, in input order.
     pub members: Vec<MemberOutcome>,
+    /// derived continuation members, `(parent input index, outcome)` in
+    /// release order (a parent's continuation releases immediately after that
+    /// parent's disposition settles). NOT counted in [`members`](Self::members)
+    /// — the 1:1 input-order contract there holds; a continuation is envelope-
+    /// derived work, dispatched `Origin::Module(parent_target)` with the relay
+    /// slot populated, and isolated exactly like a member (a rejecting
+    /// continuation never takes its parent's committed stage down). empty when
+    /// no input op carried a continuation.
+    pub continuations: Vec<(usize, MemberOutcome)>,
     /// aggregate events, in drain order: every applied member's trace in input
-    /// order, then the once-per-block injections.
+    /// order (each parent's accepted continuation immediately after it), then
+    /// the once-per-block injections.
     pub events: Vec<Event>,
     /// the dispatch trace from the once-per-block System injections
     /// (`pending_advance` / `pending_modreg_advance` / `pending_deliveries`),
@@ -275,6 +285,79 @@ pub enum MemberOutcome {
     /// the accepted members replayed, so it left no trace on committed state. the
     /// reason is the drain [`Error`] rendered to a string.
     Rejected { reason: String },
+}
+
+/// one submitted op at the batch seam: the verified origin and root msg the
+/// `(Origin, Msg)` pair always carried, plus the envelope's optional
+/// continuation and its content id. [`Host::submit_block`] wraps bare pairs
+/// into continuation-free `BlockOp`s, so pre-envelope callers are untouched;
+/// the node's frame drain builds these directly once the v3 wiring lands.
+#[derive(Clone, Debug)]
+pub struct BlockOp {
+    /// the frame's verified authorship — the envelope AUTHOR, threaded into
+    /// the continuation relay's `author` slot.
+    pub origin: Origin,
+    /// the root msg (the PARENT op of any attached continuation).
+    pub msg: Msg,
+    /// the envelope's `continue` body, released after the parent's
+    /// disposition settles. depth 1 by shape ([`sdk::Continuation`]).
+    pub continuation: Option<Continuation>,
+    /// the envelope's content id (frame id), threaded into the relay slot for
+    /// correlation. all-zero for pre-envelope callers — a relay never
+    /// materializes without a continuation, so the placeholder is unread.
+    pub frame: [u8; 32],
+}
+
+impl BlockOp {
+    /// a continuation-free op — the [`Host::submit_block`] wrapping.
+    pub fn bare(origin: Origin, msg: Msg) -> Self {
+        Self {
+            origin,
+            msg,
+            continuation: None,
+            frame: [0; 32],
+        }
+    }
+}
+
+/// one accepted drain unit (a member op or a released continuation) inside
+/// [`Host::apply_block`]'s per-op isolation: the inputs needed to REPLAY it
+/// verbatim after an isolation rollback, plus its authoritative trace.
+struct AcceptedUnit {
+    origin: Origin,
+    msg: Msg,
+    /// the relay the unit's root dispatch carried (continuations only) —
+    /// captured at first execution and reused verbatim on replay (determinism
+    /// makes recapture equal; reuse is the cheaper identity).
+    relay: Option<Relay>,
+    /// where the unit's outcome lands in the [`BatchOutcome`].
+    slot: UnitSlot,
+    events: Vec<Event>,
+    dispatches: Vec<DispatchRecord>,
+}
+
+/// the [`BatchOutcome`] slot an [`AcceptedUnit`]'s trace is written to.
+enum UnitSlot {
+    /// `members[i]` — an input op.
+    Member(usize),
+    /// `continuations[row]` — a derived continuation unit.
+    Continuation(usize),
+}
+
+/// cap a parent rejection reason for the relay's `Err` arm at
+/// [`sdk::MAX_RELAY_ERROR_BYTES`], truncating on a char boundary — identical
+/// on every node (the string itself is deterministic; the cap keeps a prose
+/// reason from bloating a consensus op).
+fn cap_relay_reason(reason: &Error) -> String {
+    let mut s = reason.to_string();
+    if s.len() > sdk::MAX_RELAY_ERROR_BYTES {
+        let mut cut = sdk::MAX_RELAY_ERROR_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+    s
 }
 
 /// a finalized consensus boundary the host is allowed to serve from.
@@ -1125,6 +1208,22 @@ impl Host {
         ctx: BlockContext,
         ops: Vec<(Origin, Msg)>,
     ) -> Result<BatchOutcome, SubmitError> {
+        let ops = ops
+            .into_iter()
+            .map(|(origin, msg)| BlockOp::bare(origin, msg))
+            .collect();
+        self.apply_block(ctx, ops, None).await
+    }
+
+    /// [`Host::submit_block`] over full [`BlockOp`]s — the entry for envelope
+    /// ops that may carry a continuation. a parent's continuation is released
+    /// immediately after that parent's disposition settles, as its own
+    /// isolated unit (see [`BatchOutcome::continuations`]).
+    pub async fn submit_block_ops(
+        &mut self,
+        ctx: BlockContext,
+        ops: Vec<BlockOp>,
+    ) -> Result<BatchOutcome, SubmitError> {
         self.apply_block(ctx, ops, None).await
     }
 
@@ -1142,6 +1241,10 @@ impl Host {
         ops: Vec<(Origin, Msg)>,
         commit_only: &BTreeSet<ModuleId>,
     ) -> Result<BatchOutcome, SubmitError> {
+        let ops = ops
+            .into_iter()
+            .map(|(origin, msg)| BlockOp::bare(origin, msg))
+            .collect();
         self.apply_block(ctx, ops, Some(commit_only)).await
     }
 
@@ -1152,7 +1255,7 @@ impl Host {
     async fn apply_block(
         &mut self,
         ctx: BlockContext,
-        ops: Vec<(Origin, Msg)>,
+        ops: Vec<BlockOp>,
         commit_only: Option<&BTreeSet<ModuleId>>,
     ) -> Result<BatchOutcome, SubmitError> {
         // block-constant across every dispatch this block — the agreed values.
@@ -1180,38 +1283,60 @@ impl Host {
             injections.push_back((Origin::System, deliver));
         }
 
-        // 2. per-op isolation. `touched` and the modules' own staging accumulate
-        // ACROSS members (never committed mid-batch); a member that rejects rolls
-        // the whole stage back and replays the accepted members, so its rejection
-        // leaves no trace on committed state.
+        // 2. per-op isolation, over UNITS: each input op is one unit, and its
+        // envelope continuation (if any) is a DERIVED unit released right
+        // after the parent's disposition settles — with the SAME isolation (a
+        // rejecting continuation rolls back and the accepted units replay, so
+        // it never takes its parent's stage down). `touched` and the modules'
+        // own staging accumulate ACROSS units (never committed mid-batch);
+        // accepted units (parents AND continuations) all replay on a later
+        // rejection — one shared stage.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
-        // accepted members and their authoritative traces, parallel arrays in
-        // input order; `acc_pos[k]` is the input index of accepted member `k`.
-        let mut accepted: Vec<(Origin, Msg)> = Vec::new();
-        let mut acc_traces: Vec<(Vec<Event>, Vec<DispatchRecord>)> = Vec::new();
-        let mut acc_pos: Vec<usize> = Vec::new();
+        let mut accepted: Vec<AcceptedUnit> = Vec::new();
         let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
+        let mut continuations: Vec<(usize, MemberOutcome)> = Vec::new();
 
-        for (i, (origin, msg)) in ops.into_iter().enumerate() {
+        for (i, op) in ops.into_iter().enumerate() {
+            let BlockOp {
+                origin,
+                msg,
+                continuation,
+                frame,
+            } = op;
+
+            // the parent unit.
             let mut ev: Vec<Event> = Vec::new();
             let mut di: Vec<DispatchRecord> = Vec::new();
             let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
+            // the relay outcome the continuation (if any) will carry: the
+            // parent's declared output on accept, its capped deterministic
+            // rejection string on reject. the CONTINUATION ALWAYS FIRES —
+            // dropping it on failure would strand the very reentry flow the
+            // envelope composed it for.
+            let relay_outcome: Result<Vec<u8>, String>;
             match self
                 .drain_queue(
                     height,
                     consensus_time,
                     protocol_version,
                     queue,
+                    None,
                     &mut touched,
                     &mut ev,
                     &mut di,
                 )
                 .await
             {
-                Ok(()) => {
-                    accepted.push((origin, msg));
-                    acc_traces.push((ev, di));
-                    acc_pos.push(i);
+                Ok(output) => {
+                    relay_outcome = Ok(output.unwrap_or_default());
+                    accepted.push(AcceptedUnit {
+                        origin: origin.clone(),
+                        msg: msg.clone(),
+                        relay: None,
+                        slot: UnitSlot::Member(i),
+                        events: ev,
+                        dispatches: di,
+                    });
                     // authoritative trace is written after the loop (step 3);
                     // this placeholder is overwritten there.
                     results[i] = Some(MemberOutcome::Applied {
@@ -1219,67 +1344,111 @@ impl Host {
                     });
                 }
                 Err(reason) => {
-                    // ISOLATE: this member's partial stage is entangled with the
-                    // accepted members' stage (one shared per-module stage), so
+                    // ISOLATE: this unit's partial stage is entangled with the
+                    // accepted units' stage (one shared per-module stage), so
                     // roll the WHOLE stage back, then replay only the accepted
-                    // members to rebuild their writes without this one.
+                    // units to rebuild their writes without this one.
                     self.abort_all(&mut touched).await?;
-                    for (k, (o, m)) in accepted.iter().enumerate() {
-                        let mut rev: Vec<Event> = Vec::new();
-                        let mut rdi: Vec<DispatchRecord> = Vec::new();
-                        let rq: VecDeque<(Origin, Msg)> = VecDeque::from([(o.clone(), m.clone())]);
-                        // an accepted member drained Ok in this same context
-                        // before; a reject on replay is NON-DETERMINISM → fatal.
-                        self.drain_queue(
-                            height,
-                            consensus_time,
-                            protocol_version,
-                            rq,
-                            &mut touched,
-                            &mut rev,
-                            &mut rdi,
-                        )
-                        .await
-                        .map_err(|re| {
-                            // the kernel's ONLY in-band detector of module
-                            // non-determinism, and the most fork-relevant event that
-                            // can occur — a module that rejects on replay what it
-                            // accepted on first execution. it was being wrapped into
-                            // a FatalError mislabelled as an Abort-phase boundary
-                            // fault and returned in SILENCE.
-                            tracing::error!(
-                                target: "ducktape::consensus",
-                                module = %m.target,
-                                error = %re,
-                                "NON-DETERMINISTIC module: rejected on replay what it \
-                                 accepted during per-op isolation — this node's state \
-                                 may diverge from its peers"
-                            );
-                            SubmitError::Fatal(FatalError {
-                                module: m.target.clone(),
-                                phase: BoundaryPhase::Abort,
-                                source: Error::Module(format!(
-                                    "non-deterministic reject replaying accepted batch \
-                                     member during per-op isolation: {re}"
-                                )),
-                            })
-                        })?;
-                        acc_traces[k] = (rev, rdi);
-                    }
+                    self.replay_accepted(
+                        height,
+                        consensus_time,
+                        protocol_version,
+                        &mut accepted,
+                        &mut touched,
+                    )
+                    .await?;
+                    relay_outcome = Err(cap_relay_reason(&reason));
                     results[i] = Some(MemberOutcome::Rejected {
                         reason: reason.to_string(),
                     });
                 }
             }
+
+            // the derived continuation unit: `Origin::Module(parent_target)`
+            // is the sending LANE; the authenticated AUTHOR travels in the
+            // relay slot (the authorization rule — attaching a continuation
+            // grants nothing).
+            let Some(cont) = continuation else { continue };
+            let relay = Relay {
+                author: origin,
+                parent_target: msg.target.clone(),
+                parent_frame: frame,
+                outcome: relay_outcome,
+            };
+            let corigin = Origin::Module(msg.target);
+            let cmsg = Msg {
+                target: cont.target,
+                payload: cont.payload,
+            };
+            let mut cev: Vec<Event> = Vec::new();
+            let mut cdi: Vec<DispatchRecord> = Vec::new();
+            let cqueue: VecDeque<(Origin, Msg)> =
+                VecDeque::from([(corigin.clone(), cmsg.clone())]);
+            match self
+                .drain_queue(
+                    height,
+                    consensus_time,
+                    protocol_version,
+                    cqueue,
+                    Some(relay.clone()),
+                    &mut touched,
+                    &mut cev,
+                    &mut cdi,
+                )
+                .await
+            {
+                Ok(_cont_output) => {
+                    // a continuation's own declared output has no consumer —
+                    // depth 1 by shape means nothing continues IT.
+                    let row = continuations.len();
+                    continuations.push((
+                        i,
+                        MemberOutcome::Applied {
+                            dispatches: Vec::new(),
+                        },
+                    ));
+                    accepted.push(AcceptedUnit {
+                        origin: corigin,
+                        msg: cmsg,
+                        relay: Some(relay),
+                        slot: UnitSlot::Continuation(row),
+                        events: cev,
+                        dispatches: cdi,
+                    });
+                }
+                Err(reason) => {
+                    self.abort_all(&mut touched).await?;
+                    self.replay_accepted(
+                        height,
+                        consensus_time,
+                        protocol_version,
+                        &mut accepted,
+                        &mut touched,
+                    )
+                    .await?;
+                    continuations.push((
+                        i,
+                        MemberOutcome::Rejected {
+                            reason: reason.to_string(),
+                        },
+                    ));
+                }
+            }
         }
 
-        // 3. write each accepted member's authoritative trace and accumulate the
-        // aggregate events in input order (accepted / acc_traces / acc_pos are
-        // all in input order).
+        // 3. write each accepted unit's authoritative trace into its slot and
+        // accumulate the aggregate events in execution order (input order,
+        // each parent's accepted continuation immediately after it).
         let mut events: Vec<Event> = Vec::new();
-        for ((ev, di), pos) in acc_traces.into_iter().zip(acc_pos.iter()) {
-            events.extend(ev);
-            results[*pos] = Some(MemberOutcome::Applied { dispatches: di });
+        for unit in accepted {
+            events.extend(unit.events);
+            let outcome = MemberOutcome::Applied {
+                dispatches: unit.dispatches,
+            };
+            match unit.slot {
+                UnitSlot::Member(pos) => results[pos] = Some(outcome),
+                UnitSlot::Continuation(row) => continuations[row].1 = outcome,
+            }
         }
 
         // 4. drain the once-per-block injections ONCE, on top of the accepted
@@ -1294,6 +1463,7 @@ impl Host {
                 consensus_time,
                 protocol_version,
                 injections,
+                None,
                 &mut touched,
                 &mut sys_events,
                 &mut system_dispatches,
@@ -1351,6 +1521,7 @@ impl Host {
         Ok(BatchOutcome {
             app_hash: self.app_hash(),
             members: results.into_iter().map(Option::unwrap).collect(),
+            continuations,
             events,
             system_dispatches,
         })
@@ -1378,6 +1549,64 @@ impl Host {
             Some(f) => Err(SubmitError::Fatal(f)),
             None => Ok(()),
         }
+    }
+
+    /// replay every accepted unit (member op or released continuation) after
+    /// an isolation rollback, rebuilding their staged writes and overwriting
+    /// their authoritative traces. an accepted unit drained Ok in this same
+    /// context before, so a reject on replay is NON-DETERMINISM → fatal.
+    async fn replay_accepted(
+        &mut self,
+        height: u64,
+        consensus_time: u64,
+        protocol_version: u32,
+        accepted: &mut [AcceptedUnit],
+        touched: &mut BTreeSet<ModuleId>,
+    ) -> Result<(), SubmitError> {
+        for unit in accepted.iter_mut() {
+            let mut rev: Vec<Event> = Vec::new();
+            let mut rdi: Vec<DispatchRecord> = Vec::new();
+            let rq: VecDeque<(Origin, Msg)> =
+                VecDeque::from([(unit.origin.clone(), unit.msg.clone())]);
+            self.drain_queue(
+                height,
+                consensus_time,
+                protocol_version,
+                rq,
+                unit.relay.clone(),
+                touched,
+                &mut rev,
+                &mut rdi,
+            )
+            .await
+            .map_err(|re| {
+                // the kernel's ONLY in-band detector of module
+                // non-determinism, and the most fork-relevant event that
+                // can occur — a module that rejects on replay what it
+                // accepted on first execution. it was being wrapped into
+                // a FatalError mislabelled as an Abort-phase boundary
+                // fault and returned in SILENCE.
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    module = %unit.msg.target,
+                    error = %re,
+                    "NON-DETERMINISTIC module: rejected on replay what it \
+                     accepted during per-op isolation — this node's state \
+                     may diverge from its peers"
+                );
+                SubmitError::Fatal(FatalError {
+                    module: unit.msg.target.clone(),
+                    phase: BoundaryPhase::Abort,
+                    source: Error::Module(format!(
+                        "non-deterministic reject replaying accepted batch \
+                         member during per-op isolation: {re}"
+                    )),
+                })
+            })?;
+            unit.events = rev;
+            unit.dispatches = rdi;
+        }
+        Ok(())
     }
 
     /// the block's dispatch DRAIN: route the root op, run its `execute`, and
@@ -1446,6 +1675,7 @@ impl Host {
             consensus_time,
             protocol_version,
             queue,
+            None,
             touched,
             &mut events,
             &mut dispatches,
@@ -1464,6 +1694,13 @@ impl Host {
     /// (never cleared), so a caller can thread one set of sinks across several
     /// calls or hand in fresh ones per call. the dispatch budget is per-call:
     /// each queue-run gets a fresh [`MAX_DISPATCHES`].
+    ///
+    /// `relay` rides ONLY the queue's ROOT dispatch (a released continuation);
+    /// follow-ups never inherit it — the relay slot marks "this dispatch IS
+    /// the continuation", nothing downstream. the return is the root
+    /// dispatch's declared output ([`Ctx::set_output`]) — what a parent's
+    /// continuation relays on its `Ok` arm; `None` when the root declared
+    /// nothing (relayed as empty).
     #[allow(clippy::too_many_arguments)]
     async fn drain_queue(
         &mut self,
@@ -1471,17 +1708,20 @@ impl Host {
         consensus_time: u64,
         protocol_version: u32,
         mut queue: VecDeque<(Origin, Msg)>,
+        mut relay: Option<Relay>,
         touched: &mut BTreeSet<ModuleId>,
         events: &mut Vec<Event>,
         dispatches: &mut Vec<DispatchRecord>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<Vec<u8>>, Error> {
         let mut n: u32 = 0;
+        let mut root_output: Option<Vec<u8>> = None;
 
         while let Some((origin, msg)) = queue.pop_front() {
             n += 1;
             if n > MAX_DISPATCHES {
                 return Err(Error::BudgetExceeded);
             }
+            let is_root = n == 1;
 
             // remove → owned module, decoupled from the map's borrow.
             let mut me = self
@@ -1515,6 +1755,10 @@ impl Host {
                 registry: &self.registry, // the rest — for query routing
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
+                // the relay rides the root dispatch only: `take` empties the
+                // slot after the first iteration, so follow-ups see `None`.
+                relay: if is_root { relay.take() } else { None },
+                out_output: None,
             };
 
             // owned `me` (&mut) and `ctx` (holding &rest) are disjoint borrows,
@@ -1525,12 +1769,29 @@ impl Host {
             let HostCtx {
                 out_msgs,
                 out_events,
+                out_output,
                 ..
             } = ctx;
 
             // reinsert BEFORE propagating any error — a module never vanishes.
             self.registry.insert(msg.target.clone(), me);
             res?;
+
+            // an oversized declared output is a deterministic REJECTION of the
+            // op, never a truncation (the saga oversize discipline: bytes that
+            // would ride a consensus lane are capped loudly at the source).
+            if let Some(out) = &out_output
+                && out.len() > sdk::MAX_OUTPUT_BYTES
+            {
+                return Err(Error::Module(format!(
+                    "op output exceeds cap ({} > {})",
+                    out.len(),
+                    sdk::MAX_OUTPUT_BYTES
+                )));
+            }
+            if is_root {
+                root_output = out_output;
+            }
 
             // record this (successful) dispatch for the deterministic trace. only
             // committed blocks yield a BlockOutcome, so a later abort discards the
@@ -1552,7 +1813,7 @@ impl Host {
             events.extend(out_events);
         }
 
-        Ok(())
+        Ok(root_output)
     }
 }
 
@@ -1565,6 +1826,11 @@ struct HostCtx<'a> {
     registry: &'a BTreeMap<ModuleId, Box<dyn Module>>,
     out_msgs: Vec<Msg>,
     out_events: Vec<Event>,
+    /// the relay slot — `Some` iff THIS dispatch is a released continuation.
+    relay: Option<Relay>,
+    /// the op's declared output ([`Ctx::set_output`]), staged with the
+    /// dispatch; the drain caps it and threads the root's into the relay.
+    out_output: Option<Vec<u8>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1604,6 +1870,14 @@ impl Ctx for HostCtx<'_> {
 
     fn emit_msg(&mut self, msg: Msg) {
         self.out_msgs.push(msg);
+    }
+
+    fn relay(&self) -> Option<&Relay> {
+        self.relay.as_ref()
+    }
+
+    fn set_output(&mut self, bytes: Vec<u8>) {
+        self.out_output = Some(bytes);
     }
 
     fn emit_event(&mut self, ev: Event) {

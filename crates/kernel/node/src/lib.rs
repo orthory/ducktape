@@ -84,7 +84,7 @@ use commonware_cryptography::{
     Signer as _, Verifier as _,
     ed25519::{PrivateKey, PublicKey, Signature},
 };
-use sdk::Origin;
+use sdk::{Continuation, Origin};
 
 /// the signing domain for op frames. domain-separated so an op signature can
 /// never double as a consensus vote, an endpoint advertisement, or any other
@@ -244,6 +244,126 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
 pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
     let (origin, seq, ..) = split_frame(bytes)?;
     Some((origin.to_vec(), seq))
+}
+
+// ---- op-frame v3: the continuation-capable envelope --------------------------
+
+/// the signing domain for op-frame v3 — the v2 preimage plus a trailing
+/// continuation section (`cont_flag(u8)`, then `[len target][target]
+/// [len payload][payload]` when the flag is `1`). BOTH arms are inside the
+/// signed preimage: the signature binds the continuation to its parent op, so
+/// nobody can graft one onto (or strip one off) someone else's transaction.
+/// domain-separated from v2 so neither codec's signature can ever verify
+/// under the other's parse — a v2-era signature is structurally dead under
+/// v3 and vice versa. acceptance is protocol-version-gated at the drain (the
+/// upgrade-module flag-day); until then the live v2 decoder deterministically
+/// rejects any v3 frame (its flag/continuation bytes fail the v2 signature
+/// split).
+pub const FRAME_NS_V3: &[u8] = b"ducktape:op-frame:v3";
+
+/// read one byte off the front of `buf`.
+fn take_byte(buf: &mut &[u8]) -> Option<u8> {
+    let (head, rest) = buf.split_at_checked(1)?;
+    *buf = rest;
+    Some(head[0])
+}
+
+/// the v3 signed preimage AND wire prefix: the v2 preimage with the
+/// continuation section appended. depth 1 is BY SHAPE — the continuation
+/// section has no continuation slot of its own, so a nested continuation is
+/// unrepresentable rather than merely validated.
+fn frame_preimage_v3(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation>) -> Vec<u8> {
+    let mut out = frame_preimage(origin, seq, msg);
+    match cont {
+        None => out.push(0),
+        Some(c) => {
+            out.push(1);
+            let target = c.target.as_bytes();
+            out.extend_from_slice(&(target.len() as u64).to_le_bytes());
+            out.extend_from_slice(target);
+            out.extend_from_slice(&(c.payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&c.payload);
+        }
+    }
+    out
+}
+
+/// frame and SIGN a locally-originated msg with an optional envelope
+/// continuation, under the v3 domain. the v3 twin of [`encode_frame`].
+pub fn encode_frame_v3(
+    signer: &PrivateKey,
+    seq: u64,
+    msg: &Msg,
+    cont: Option<&Continuation>,
+) -> Vec<u8> {
+    let origin = signer.public_key();
+    let mut frame = frame_preimage_v3(origin.as_ref(), seq, msg, cont);
+    let sig = signer.sign(FRAME_NS_V3, &frame);
+    frame.extend_from_slice(sig.as_ref());
+    frame
+}
+
+/// decode a v3 frame back to `(Origin, Msg, Option<Continuation>)`, VERIFYING
+/// the signature under the v3 domain first. rejects deterministically on: a
+/// parse failure, a `cont_flag` outside `{0, 1}` (exactly one valid encoding
+/// per frame), a signature that does not bind the WHOLE preimage
+/// (continuation included), or a continuation payload over
+/// [`sdk::MAX_CONTINUATION_BYTES`].
+pub fn decode_frame_v3(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
+    let parse_err = || Error::Host(sdk::Error::Module("v3 frame does not parse".into()));
+    let mut buf = bytes;
+    let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
+    // seq is ordering/replay metadata, consumed but not surfaced (v2 parity).
+    let Some(_seq) = take_u64(&mut buf) else {
+        return Err(parse_err());
+    };
+    let target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
+        .map_err(|_| parse_err())?;
+    let payload = take_slice(&mut buf).ok_or_else(parse_err)?;
+    let cont = match take_byte(&mut buf).ok_or_else(parse_err)? {
+        0 => None,
+        1 => {
+            let cont_target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
+                .map_err(|_| parse_err())?;
+            let cont_payload = take_slice(&mut buf).ok_or_else(parse_err)?;
+            Some(Continuation {
+                target: cont_target.to_string(),
+                payload: cont_payload.to_vec(),
+            })
+        }
+        flag => {
+            return Err(Error::Host(sdk::Error::Module(format!(
+                "v3 frame cont_flag {flag} is not 0|1"
+            ))));
+        }
+    };
+    let preimage_len = bytes.len() - buf.len();
+    let pubkey = PublicKey::decode(origin)
+        .map_err(|e| Error::Host(sdk::Error::Module(format!("v3 frame origin: {e}"))))?;
+    let sig = Signature::decode(buf)
+        .map_err(|e| Error::Host(sdk::Error::Module(format!("v3 frame signature: {e}"))))?;
+    if !pubkey.verify(FRAME_NS_V3, &bytes[..preimage_len], &sig) {
+        return Err(Error::Host(sdk::Error::Module(
+            "v3 frame signature does not bind this op (and continuation) to its origin".into(),
+        )));
+    }
+    if let Some(c) = &cont
+        && c.payload.len() > sdk::MAX_CONTINUATION_BYTES
+    {
+        return Err(Error::Host(sdk::Error::Module(format!(
+            "continuation payload exceeds cap ({} > {})",
+            c.payload.len(),
+            sdk::MAX_CONTINUATION_BYTES
+        ))));
+    }
+    Ok((
+        Origin::External(origin.to_vec()),
+        Msg {
+            target: target.to_string(),
+            payload: payload.to_vec(),
+        },
+        cont,
+    ))
 }
 
 // ============================================================================
