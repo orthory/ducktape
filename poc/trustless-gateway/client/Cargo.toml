@@ -1,0 +1,30 @@
+[package]
+name = "tcg-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tcg-client"
+path = "src/main.rs"
+
+[features]
+# Real TDX quote verification via dcap-qvl. Off by default so the mock demo
+# builds with no extra deps; build with `--features tdx` on the TDX box.
+tdx = ["dep:dcap-qvl"]
+# AMD SEV-SNP report parsing (structural; the KDS/VCEK signature verify is the
+# follow-up). No extra deps — the report layout is fixed. Build with
+# `--features snp` on the SEV-SNP box.
+snp = []
+
+[dependencies]
+tcg-core = { path = "../core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dcap-qvl = { version = "0.3", optional = true }
