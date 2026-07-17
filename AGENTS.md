@@ -48,14 +48,10 @@
 - Never stop desktop/QA processes with `pkill -f` — a pattern match will
   cheerfully kill an editor, a grep, or this script. Find them by process cwd,
   executable, and workspace config or let the native app shut them down.
-- Review the PR from a clean context before merging: re-read the diff against
-  `dev`, check for scope creep and missing verification, and address actionable
-  feedback before deciding mergeability.
-- Merge to `dev` only when confidence is high: the change is understood, the
-  relevant gates are green or any skips are justified, and the clean-context
-  review has no blocking concerns. If confidence is medium or low, leave the PR
-  open with the risks, failed checks, or follow-up review needed instead of
-  merging by default.
+- Merge to `dev` only when confidence is high: the change is understood and the
+  relevant gates are green or any skips are justified. If confidence is medium
+  or low, leave the PR open with the risks, failed checks, or follow-up review
+  needed instead of merging by default.
 
 ## Logging
 
