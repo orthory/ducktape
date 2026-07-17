@@ -40,6 +40,24 @@ carried by the envelope — composed and signed up front, inspectable at
 admission, bounded by construction — not orchestration state living in a
 module or a client.
 
+**Awaits are order positions.** The unifying read: consensus admits
+exactly ONE scheduler — the ordered drain — and every await is a POSITION
+in its order. An await whose resumption lands in the SAME position (a
+deterministic read) may be real stack suspension, invisible to ordering.
+An await whose resumption lands in a LATER position cannot hold a stack
+at all: a parked frame is node-local memory, and nothing outside the
+app-hash may carry program state across blocks — so the frame must be
+reified into committed data, which is exactly what a continuation is.
+This system is an async runtime whose heap is the app-hash: the ticket is
+the suspended frame, `Resolve` is the waker, the `Release` injection is
+the executor, the deadline crank is the timeout, and `continue` is
+`.then()`. `.await` is syntactic sugar over reentrance; ordering is the
+semantics. The corollary that keeps the primitive honest: whatever
+survives a cross-position await is SCHEMA, not stack — module state plus
+the continuation payload — which is why depth-1 continuations over
+explicit committed state is the primitive, and any future
+`.await`-across-effects sugar must lower to it.
+
 ## Decisions (locked)
 
 - Every transaction envelope gains an optional **`continue`** field carrying
