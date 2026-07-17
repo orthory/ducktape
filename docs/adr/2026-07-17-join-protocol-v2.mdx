@@ -1,7 +1,7 @@
 # ADR: Join Protocol v2 — bearer invites, sealed doorbell, no lobby identity
 
-Date: 2026-07-17. Status: **Accepted** (implementation in progress on
-`feat/join-v2`: items §2 and §4 landed; §3 and §5 in flight). Supersedes the
+Date: 2026-07-17. Status: **Accepted — implemented** (§1–§5 all landed; merged
+to `dev` in PR #672, 2026-07-17). Supersedes the
 invite/gate half of [Join Protocol v1](./2026-07-13-join-protocol.mdx) — that
 ADR is now **HISTORICAL** for everything it says about targeted invites, the
 lobby channel, and the lobby transport identity.
@@ -63,7 +63,7 @@ issuer's envelope signature, so the joiner knows it offline):
 An on-path observer on hostile wifi learns nothing; a captured intro cannot be
 replayed to redeem.
 
-## 3. Mandatory WireGuard (§R3) — *in flight*
+## 3. Mandatory WireGuard (§R3) — *implemented*
 
 Data planes (voice/video/agent/gateway) ride the overlay ONLY — no mesh
 fallback — so a WG-less workspace is a silently degraded tier. v2 deletes the
@@ -74,7 +74,7 @@ coordinator). Minting refuses without a configured reachability plane. The
 effect dial (`Tun`/`Socket`/`Fake`) is unchanged — `Socket` (userspace, no
 privileges) is the default; `Fake` remains the test shape.
 
-## 4. The gate rides the doorbell; the lobby dies (§R4, §R5) — *in flight*
+## 4. The gate rides the doorbell; the lobby dies (§R4, §R5) — *implemented*
 
 v1 verified the invite twice: once at the intro doorbell (before installing the
 tunnel) and again over a mesh `CHANNEL_LOBBY` entered under a shared
