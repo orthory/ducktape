@@ -72,6 +72,9 @@ pub(super) async fn wire(
     // the AMBIENT coordinator override (node.toml `primary_coordinator`);
     // `None` = the compiled-in default, exactly as before the key existed.
     primary_coordinator: Option<String>,
+    // the TCP relay override (node.toml `coordinator_relay`); `None` = derive
+    // the relay from the ambient coordinator set (host at TCP/443).
+    coordinator_relay: Option<String>,
     // the WireGuard bind/advertise split (node.toml `wireguard_advertised`).
     wireguard_advertised: Option<Ingress>,
     coord_cap: &Option<nat_traversal::CoordCap>,
@@ -165,6 +168,10 @@ pub(super) async fn wire(
     // promotion reboot via the persisted mesh, start connected
     // instead of assembling. Without `wireguard_listen` the channel
     // just stays legal — black-hole.
+    // the joiner's TCP relay fallback endpoints (Join v2 item 2), derived
+    // from the SAME ambient coordinator set before it moves into the plane
+    // below. empty = fallback off.
+    let mut relay_endpoints: Vec<String> = Vec::new();
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
         let (reach_tx, mut reach_rx) =
             network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
@@ -187,6 +194,7 @@ pub(super) async fn wire(
                             Vec::new()
                         }
                     };
+                relay_endpoints = coordinator_relays(coordinator_relay.as_deref(), &coordinators);
                 Some(wire_reachability_plane(
                     &context,
                     &label,
@@ -287,6 +295,19 @@ pub(super) async fn wire(
                     let race_label = label.clone();
                     let race_admitted = admitted.clone();
                     let cap_dir = workspace.clone();
+                    // the TCP relay fallback (item 2): the same signer + cap
+                    // every rendezvous request presents, over the relay list
+                    // derived above. `None` (no coordinators, or disabled)
+                    // keeps the race UDP-only, exactly as before the item.
+                    let race_relay = if relay_endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(first_contact_join::RelayFallback {
+                            relays: relay_endpoints,
+                            signer: signer.clone(),
+                            cap: coord_cap.clone(),
+                        })
+                    };
                     // an exhausted race is honest-terminal ONLY for a fresh
                     // join (no checkpoint): a bad invite must exit loudly,
                     // never spin silently. a RESTART with standing (the
@@ -309,6 +330,7 @@ pub(super) async fn wire(
                                 keypair.clone(),
                                 race_label.clone(),
                                 std::time::Duration::from_secs(90),
+                                race_relay.clone(),
                             )
                             .await;
                             match outcome {
@@ -431,5 +453,79 @@ pub(super) async fn wire(
         relay_rx,
         admitted,
         voice_requests,
+    }
+}
+
+/// TCP/443: the relay lane's deployed port — the one port every network
+/// forwards, which is the whole reason the lane exists (Join v2 item 2).
+const RELAY_FALLBACK_PORT: u16 = 443;
+
+/// the relay endpoint derived from one coordinator ingress: SAME host,
+/// TCP/443. `SocketAddr`'s Display brackets an IPv6 ip, so the derived string
+/// stays `to_socket_addrs`-parseable.
+fn relay_endpoint_of(ingress: &Ingress) -> String {
+    match ingress {
+        Ingress::Socket(addr) => {
+            std::net::SocketAddr::new(addr.ip(), RELAY_FALLBACK_PORT).to_string()
+        }
+        Ingress::Dns { host, .. } => format!("{host}:{RELAY_FALLBACK_PORT}"),
+    }
+}
+
+/// the joiner's TCP relay list (item 2): an explicit `coordinator_relay`
+/// REPLACES the derived list outright; its disable sentinels mirror
+/// `primary_coordinator`'s exactly (`"none"`/`"off"`/`"direct"`, and
+/// blank = absent); absent derives one relay per ambient coordinator at
+/// [`RELAY_FALLBACK_PORT`].
+fn coordinator_relays(override_raw: Option<&str>, coordinators: &[Ingress]) -> Vec<String> {
+    match override_raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("none" | "off" | "direct") => Vec::new(),
+        Some(explicit) => vec![explicit.to_string()],
+        None => coordinators.iter().map(relay_endpoint_of).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dns_ingress(host_port: &str) -> Ingress {
+        config::coordinator_ingress(Some(host_port))
+            .expect("dialable")
+            .expect("not disabled")
+    }
+
+    #[test]
+    fn relay_endpoints_derive_coordinator_hosts_at_443_bracketing_v6() {
+        let coords = [
+            Ingress::Socket("203.0.113.9:3478".parse().unwrap()),
+            // the bracket case: a bare v6 ip + ":443" would not re-parse.
+            Ingress::Socket("[2001:db8::7]:3478".parse().unwrap()),
+            dns_ingress("p2p.example.com:3478"),
+        ];
+        assert_eq!(
+            coordinator_relays(None, &coords),
+            vec![
+                "203.0.113.9:443".to_string(),
+                "[2001:db8::7]:443".to_string(),
+                "p2p.example.com:443".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_override_replaces_the_derived_list_and_sentinels_disable() {
+        let derived = [Ingress::Socket("203.0.113.9:3478".parse().unwrap())];
+        // an explicit relay REPLACES derivation (host AND port verbatim).
+        assert_eq!(
+            coordinator_relays(Some("relay.example.com:8443"), &derived),
+            vec!["relay.example.com:8443".to_string()]
+        );
+        // the primary_coordinator sentinel set disables the lane outright.
+        for sentinel in ["none", "off", "direct"] {
+            assert!(coordinator_relays(Some(sentinel), &derived).is_empty());
+        }
+        // blank mirrors absent: derive, exactly like primary_coordinator.
+        assert_eq!(coordinator_relays(Some("  "), &derived).len(), 1);
     }
 }

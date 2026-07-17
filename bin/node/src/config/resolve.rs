@@ -112,6 +112,12 @@ pub struct Resolved {
     /// log) rather than aborting boot. `None` = re-derive the compiled
     /// default, exactly like today.
     pub primary_coordinator: Option<String>,
+    /// the TCP relay override (`NodeToml::coordinator_relay`), raw and
+    /// unvalidated — consumed at the join-race wiring site so a bad value
+    /// DEGRADES (relay fallback dark, honest terminal) rather than aborting
+    /// boot, the `primary_coordinator` discipline. `None` = derive the relay
+    /// from the ambient coordinator (its host at TCP/443).
+    pub coordinator_relay: Option<String>,
     /// the WireGuard endpoint this node advertises, resolved once
     /// (`NodeToml::wireguard_advertised`); `None` = derive it from
     /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
@@ -327,6 +333,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // here, so a joiner persists a delivered cap into it.
         workspace: base.to_path_buf(),
         primary_coordinator: raw.primary_coordinator,
+        coordinator_relay: raw.coordinator_relay,
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -643,6 +650,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         coordination: Coordination::Private,
         coord_cap: None,
         primary_coordinator: raw.primary_coordinator,
+        coordinator_relay: raw.coordinator_relay,
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -1168,6 +1176,38 @@ mod tests {
             resolved.primary_coordinator.as_deref(),
             Some("203.0.113.9:3478")
         );
+    }
+
+    /// `coordinator_relay` (Join v2 item 2) rides resolve exactly like
+    /// `primary_coordinator`: the key ABSENT resolves to `None` — the
+    /// zero-config joiner default, deriving the relay from the ambient
+    /// coordinator at the wiring site; the disable sentinel and an explicit
+    /// override both ride the raw string through, unvalidated at resolve
+    /// time (consumed lazily so a bad value degrades rather than aborting
+    /// boot).
+    #[test]
+    fn coordinator_relay_key_survives_resolve_default_absent_and_explicit() {
+        let dir = tmp("coordinator-relay-key");
+        let base = "id = 0\nlisten = \"127.0.0.1:52261\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        std::fs::write(dir.join("node.toml"), base).expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
+        assert_eq!(
+            resolved.coordinator_relay, None,
+            "absent key: derive the relay from the ambient coordinator at the point of use"
+        );
+
+        for (value, expect) in [
+            ("none", "none"),
+            ("relay.example.com:8443", "relay.example.com:8443"),
+        ] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}coordinator_relay = \"{value}\"\n"),
+            )
+            .expect("write");
+            let resolved = resolve(&dir.join("node.toml")).expect("resolve value");
+            assert_eq!(resolved.coordinator_relay.as_deref(), Some(expect));
+        }
     }
 
     /// `wireguard_advertised` (change 3, issue #331): the key ABSENT resolves

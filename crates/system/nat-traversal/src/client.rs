@@ -730,15 +730,35 @@ pub async fn run_coordinator_workers_with_metrics(
     workers: usize,
     metrics: CoordinatorMetrics,
 ) {
+    run_coordinator_workers_with_metrics_using(
+        sock,
+        Coordinator::with_policy(policy),
+        workers,
+        metrics,
+    )
+    .await
+}
+
+/// [`run_coordinator_workers_with_metrics`] over a caller-built
+/// [`Coordinator`] — the seam that lets the TCP relay lane share the serving
+/// coordinator's advert book ([`Coordinator::adverts`]) instead of the loops
+/// constructing a private one internally.
+pub async fn run_coordinator_workers_with_metrics_using(
+    sock: UdpSocket,
+    mut coord: Coordinator,
+    workers: usize,
+    metrics: CoordinatorMetrics,
+) {
     assert!(matches!(workers, 1 | 4), "workers must be 1 or 4");
     if workers == 1 {
-        return run_coordinator_with_metrics(sock, Coordinator::with_policy(policy), metrics).await;
+        return run_coordinator_with_metrics(sock, coord, metrics).await;
     }
 
-    let policy = Arc::new(policy);
+    // The worker pool verifies against the SAME policy Arc the coordinator
+    // holds — one policy for inline dispatch and every worker thread.
     // ponytail: keep one ordered state actor; shard by NodeKey only if profiles
     // show it saturating before the auth workers.
-    let mut coord = Coordinator::with_shared_policy(policy.clone());
+    let policy = coord.shared_policy();
     let capacity = workers * (AUTH_QUEUE_DEPTH + 1);
     let (result_tx, mut results) = mpsc::channel(capacity);
     let auth = AuthWorkers::spawn(policy, workers, capacity, result_tx);

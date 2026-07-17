@@ -42,6 +42,10 @@ pub(crate) struct BootEnv {
     /// raw — resolved via `config::coordinator_ingress` at each plane-wiring
     /// site so a bad value degrades there instead of aborting boot.
     pub(crate) primary_coordinator: Option<String>,
+    /// the TCP relay override (`node.toml coordinator_relay`), raw — consumed
+    /// by the joiner's first-contact wiring (Join v2 item 2); `None` derives
+    /// the relay from the ambient coordinator there.
+    pub(crate) coordinator_relay: Option<String>,
     /// the WireGuard bind/advertise split (`node.toml wireguard_advertised`),
     /// threaded into `wire_reachability_plane` at both plane-wiring sites.
     pub(crate) wireguard_advertised: Option<Ingress>,
@@ -99,6 +103,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coord_cap,
         workspace,
         primary_coordinator,
+        coordinator_relay,
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -333,6 +338,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coord_cap,
         workspace,
         primary_coordinator,
+        coordinator_relay,
         wireguard_advertised,
         sync_candidates,
         chain_id,

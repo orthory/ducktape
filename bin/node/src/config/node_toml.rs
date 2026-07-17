@@ -74,6 +74,13 @@ pub struct NodeToml {
     /// coordination outright; the key ABSENT (the pre-feature default)
     /// re-derives the compiled default at runtime — bit-identical to today.
     pub primary_coordinator: Option<String>,
+    /// the TCP relay a joiner's first-contact fallback dials when every UDP
+    /// path is dead (Join v2 item 2). `"host:port"` REPLACES the derived
+    /// list; `"none"`/`"off"`/`"direct"` disables the fallback outright
+    /// (mirroring `primary_coordinator`'s sentinels); the key ABSENT (the
+    /// zero-config joiner default) derives the relay from the ambient
+    /// coordinator — coordinator host, TCP/443.
+    pub coordinator_relay: Option<String>,
     /// the UDP endpoint this node advertises for its WireGuard tunnel,
     /// independent of `wireguard_listen` (which stays bind-only): a
     /// concrete `"host:port"` (hostname resolved once at plane start, like
