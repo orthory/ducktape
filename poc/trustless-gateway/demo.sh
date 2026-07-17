@@ -36,7 +36,7 @@ echo "== run (Computation Provider) =="
 OUT=$("$CLIENT_BIN" run --host "$HOST" --sub demo --prompt "hi")
 echo "$OUT"
 
-if echo "$OUT" | grep -q "MOCK-REPLY-OK"; then
+if echo "$OUT" | grep -q "TRUSTLESS-GATEWAY-OK"; then
     echo "PASS ✅  — sandbox got a model reply through the enclave, never touching the credential"
 else
     echo "FAIL ❌  — no reply through the proxy"

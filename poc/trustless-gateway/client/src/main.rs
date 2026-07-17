@@ -30,6 +30,16 @@ enum Cmd {
     Inspect(InspectArgs),
     Seal(SealArgs),
     Run(RunArgs),
+    /// Mint a scoped session token and print it (for ANTHROPIC_AUTH_TOKEN).
+    Token(TokenArgs),
+}
+
+#[derive(Args)]
+struct TokenArgs {
+    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    host: String,
+    #[arg(long, default_value = "demo")]
+    sub: String,
 }
 
 #[derive(Args)]
@@ -79,7 +89,21 @@ async fn main() -> Result<()> {
         Cmd::Inspect(a) => inspect_cmd(a).await,
         Cmd::Seal(a) => seal_cmd(a).await,
         Cmd::Run(a) => run_cmd(a).await,
+        Cmd::Token(a) => token_cmd(a).await,
     }
+}
+
+async fn token_cmd(args: TokenArgs) -> Result<()> {
+    let sess: SessionResponse = reqwest::Client::new()
+        .post(format!("{}/session", args.host))
+        .json(&SessionRequest { sub: args.sub })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    println!("{}", sess.token);
+    Ok(())
 }
 
 async fn inspect_cmd(args: InspectArgs) -> Result<()> {

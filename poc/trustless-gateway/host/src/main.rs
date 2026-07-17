@@ -15,10 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::State;
-use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
+use axum::extract::{OriginalUri, State};
+use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -161,7 +161,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/attestation", get(attestation))
         .route("/credential", post(credential))
         .route("/session", post(session))
-        .route("/v1/messages", post(messages))
+        // Proxy the whole Anthropic /v1/* surface (Claude Code calls
+        // /v1/messages and /v1/messages/count_tokens, not just messages).
+        .route("/v1/*rest", any(proxy))
         .with_state(state);
 
     let listener = TcpListener::bind(&args.listen).await?;
@@ -239,14 +241,29 @@ async fn session(
     Json(SessionResponse { token: token::issue(&st.sess_sk, &claims) })
 }
 
-async fn messages(State(st): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
-    match messages_inner(&st, &headers, body).await {
+async fn proxy(
+    State(st): State<Arc<AppState>>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match proxy_inner(&st, method, &uri, &headers, body).await {
         Ok(r) => r,
         Err(e) => e.into_response(),
     }
 }
 
-async fn messages_inner(st: &AppState, headers: &HeaderMap, body: Bytes) -> Result<Response, AppErr> {
+async fn proxy_inner(
+    st: &AppState,
+    method: Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, AppErr> {
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
+    eprintln!("[host] proxy {method} {path_and_query}");
+
     let bearer = headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -293,14 +310,21 @@ async fn messages_inner(st: &AppState, headers: &HeaderMap, body: Bytes) -> Resu
         .filter(|a| !a.is_empty())
         .ok_or_else(|| AppErr(StatusCode::BAD_GATEWAY, "no credential loaded".into()))?;
 
-    let url = format!("{}/v1/messages", st.cfg.anthropic_base.trim_end_matches('/'));
-    let mut rb = st.http.post(&url).bearer_auth(&access).body(body.to_vec());
-    for h in ["content-type", "anthropic-version", "anthropic-beta", "accept"] {
-        if let Some(v) = headers.get(h) {
-            rb = rb.header(h, v);
+    let url = format!("{}{}", st.cfg.anthropic_base.trim_end_matches('/'), path_and_query);
+    let mut rb = st.http.request(method, &url).body(body.to_vec());
+    // Forward the caller's headers verbatim, minus ones we own or that would
+    // break the relay. bearer_auth then plants the real credential.
+    for (name, value) in headers.iter() {
+        if matches!(
+            name.as_str(),
+            "authorization" | "host" | "content-length" | "accept-encoding"
+        ) {
+            continue;
         }
+        rb = rb.header(name, value);
     }
     let resp = rb
+        .bearer_auth(&access)
         .send()
         .await
         .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("upstream: {e}")))?;

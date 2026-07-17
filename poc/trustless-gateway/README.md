@@ -31,8 +31,17 @@ exposure). Hermetic dev demo: both mock.
 ## Run (hermetic, any box)
 
 ```sh
-./demo.sh        # mock attest + mock upstream, asserts a reply through the enclave
+./demo.sh              # mock attest + mock upstream, asserts a reply through the enclave
+./demo-claude-code.sh  # the REAL `claude` CLI runs through the enclave with only a temp session token
 ```
+
+`demo-claude-code.sh` drives the real Claude Code CLI against the host with
+`ANTHROPIC_BASE_URL=<host>` + `ANTHROPIC_AUTH_TOKEN=<session token>`. The mock
+upstream emits a valid Anthropic SSE, so it is fully local (no real Anthropic,
+no ToS exposure) yet exercises the whole custody path: seal → temp token →
+Claude Code → host swaps token→credential → reply. To point at real Anthropic
+(spends subscription; account-sharing exposure): set `UPSTREAM_BASE`,
+`OAUTH_URL`, `CREDS` (see the script header).
 
 ## Run (full scenario on an Intel TDX box)
 
