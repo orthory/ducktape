@@ -19,6 +19,13 @@
 //!   `BootstrapCoordinatedInvitePeer` through the joiner's AMBIENT coordinator
 //!   until the ack rides back over the punched underlay.
 //!
+//! Item 2 adds a THIRD, last-resort mechanic: when the UDP race exhausts every
+//! offered path (the network eats outbound UDP), the SAME candidates are
+//! re-raced through the coordinator's TCP/443 relay lane ([`RelayFallback`]) —
+//! the sealed intro rides a TCP stream to the relay, which forwards it to the
+//! member as one UDP datagram and pumps the member's sealed acks back. The
+//! member needs zero changes; only the joiner's transport differs.
+//!
 //! The decision logic (union building, TUN-mode filtering, first-ack-wins,
 //! honest terminal) is pure and unit-tested; the two real mechanics live below
 //! it and are exercised end-to-end against a live plane.
@@ -30,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::ed25519;
+use commonware_cryptography::{Signer as _, ed25519};
 use futures::StreamExt as _;
 
 use crate::config::Front;
@@ -38,6 +45,14 @@ use crate::lobby;
 
 /// how long each attempt paces a retry / waits for an ack.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// hard bound on the TCP relay fallback race (item 2) — the same pattern as
+/// the UDP race's `window`: a mute relay must not hang the join.
+const RELAY_WINDOW: Duration = Duration::from_secs(60);
+
+/// how long one relay TCP connect may take before failing over to the next
+/// relay in the list.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// one first-contact path in the race: the inviter or one front, in a single
 /// shape. `endpoint Some` ⇒ a DIRECT underlay endpoint (`host:wg_port`);
@@ -255,12 +270,37 @@ where
     }
 }
 
+/// the TCP relay fallback (item 2): how the race reaches candidates once
+/// every UDP path is exhausted. Built by the caller from the AMBIENT
+/// coordinator set (relay host = coordinator host, TCP/443) or an explicit
+/// `coordinator_relay` override — never from the invite.
+#[derive(Clone)]
+pub struct RelayFallback {
+    /// relay endpoints (`host:port`), walked in order per candidate (failover
+    /// — the `discover_reflexive_failover` philosophy) and resolved
+    /// per-attempt via `to_socket_addrs`, like `Candidate` endpoints.
+    pub relays: Vec<String>,
+    /// this node's identity signer — every [`nat_traversal::RelayIntro`]
+    /// carries a fresh proof-of-possession it signs.
+    pub signer: ed25519::PrivateKey,
+    /// the genesis-issued coordinator capability, when the network's relay
+    /// gates privately (the same cap every rendezvous request presents).
+    pub cap: Option<nat_traversal::CoordCap>,
+}
+
 /// the real driver: race the candidate union using #260's two mechanics. The
 /// intro datagram is built ONCE by the caller (this joiner's own token-signed
 /// intro) and reused across every candidate. `keypair` is this joiner's OWN
 /// WireGuard keypair — post-verify acks arrive SEALED to it (the coordinator
 /// cap must never cross in the clear). `window` bounds the whole race; each
 /// attempt paces itself at [`RETRY_INTERVAL`].
+///
+/// `relay` is the last resort (item 2): a settled UDP outcome (`Admitted`,
+/// terminal `Rejected`) returns untouched, but a UDP-exhausted Terminal
+/// re-races the SAME candidates through the TCP relay lane before giving up —
+/// and a Terminal from BOTH lanes folds the two stories into one reason, so
+/// the exit-3 log names udp and relay alike.
+#[allow(clippy::too_many_arguments)]
 pub async fn drive_first_contact(
     reach: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     candidates: Vec<Candidate>,
@@ -269,6 +309,7 @@ pub async fn drive_first_contact(
     keypair: Arc<reachability::WireGuardKeypair>,
     label: String,
     window: Duration,
+    relay: Option<RelayFallback>,
 ) -> FirstContactOutcome {
     let tried = candidates.len();
     let iters = (window.as_secs() / RETRY_INTERVAL.as_secs()).max(1) as u32;
@@ -303,16 +344,91 @@ pub async fn drive_first_contact(
     // The window is a HARD bound, not just loop pacing: an attempt parked on
     // a reply the plane never sends (its command loop stalled) would
     // otherwise hang the race forever — no Terminal, no exit, no log line.
-    match tokio::time::timeout(window, race_first_contact(candidates, attempt)).await {
+    let udp_outcome =
+        match tokio::time::timeout(window, race_first_contact(candidates.clone(), attempt)).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => FirstContactOutcome::Terminal {
+                tried,
+                reason: format!(
+                    "join window ({}s) elapsed with no candidate acked — every path stayed dark \
+                     (reachability plane unresponsive or peers unreachable)",
+                    window.as_secs()
+                ),
+            },
+        };
+    // the gate SETTLED over UDP (admitted, or terminally refused): the relay
+    // lane exists only for the exhausted case, never to second-guess an
+    // authoritative answer.
+    let (udp_tried, udp_reason) = match udp_outcome {
+        FirstContactOutcome::Terminal { tried, reason } => (tried, reason),
+        settled => return settled,
+    };
+    // an empty candidate set gives the relay nothing to reach either.
+    let Some(relay) = relay.filter(|r| !r.relays.is_empty() && tried > 0) else {
+        return FirstContactOutcome::Terminal {
+            tried: udp_tried,
+            reason: udp_reason,
+        };
+    };
+    // once-per-race lifecycle fact: the join changed lanes.
+    tracing::info!(
+        target: "ducktape::join",
+        event = "join_relay_fallback",
+        node = %label,
+        nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+        relays = relay.relays.len(),
+        tried = udp_tried,
+        "every UDP first-contact path exhausted — engaging the TCP relay fallback"
+    );
+    // the SAME derivation the rendezvous path registers under
+    // (`reachability_plane.rs`): a `NodeKey` IS the raw ed25519 identity
+    // bytes, so the relay's advert-book lookup and its PoP check agree with
+    // the members' own registrations.
+    let caller = reachability::node_key(reachability::identity_of(&relay.signer.public_key()));
+    let relay = Arc::new(relay);
+    let relay_attempt_of = |candidate: Candidate| {
+        let relay = relay.clone();
+        let intro = intro.clone();
+        let token_nonce = token_nonce.clone();
+        let keypair = keypair.clone();
+        let label = label.clone();
+        async move { relay_attempt(relay, caller, intro, token_nonce, keypair, candidate, label).await }
+    };
+    // same HARD bound as the UDP race: a mute relay (TCP accepts, nothing
+    // ever comes back) must not hang the join past its window.
+    let fallback_outcome = match tokio::time::timeout(
+        RELAY_WINDOW,
+        race_first_contact(candidates, relay_attempt_of),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(_elapsed) => FirstContactOutcome::Terminal {
             tried,
             reason: format!(
-                "join window ({}s) elapsed with no candidate acked — every path stayed dark \
-                 (reachability plane unresponsive or peers unreachable)",
-                window.as_secs()
+                "relay window ({}s) elapsed with no candidate acked through any relay",
+                RELAY_WINDOW.as_secs()
             ),
         },
+    };
+    match fallback_outcome {
+        FirstContactOutcome::Terminal { reason, .. } => {
+            tracing::warn!(
+                target: "ducktape::join",
+                node = %label,
+                nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+                attempts = tried,
+                reason = "relay_fallback_exhausted",
+                "TCP relay fallback EXHAUSTED — no candidate acked through any relay"
+            );
+            // fold BOTH lanes' stories into the one honest terminal the
+            // caller's exit-3 log surfaces: udp and relay each named.
+            FirstContactOutcome::Terminal {
+                tried,
+                reason: format!("udp: {udp_reason}; relay: {reason}"),
+            }
+        }
+        settled => settled,
     }
 }
 
@@ -584,6 +700,158 @@ async fn coordinated_attempt(
         "first-contact candidate EXHAUSTED — no ack within the join window"
     );
     AttemptResult::Failed("coordinated intro was not acked within the join window".into())
+}
+
+/// what one relay yielded for a candidate: `Resolved` settles the whole
+/// attempt (bubbles into the race); `NextRelay` fails over to the next relay
+/// in the list, carrying the reason the last one is worthless.
+enum RelayLane {
+    Resolved(AttemptResult),
+    NextRelay(String),
+}
+
+/// RELAY (item 2): the same doorbell, reached through a TCP relay. Seal the
+/// intro fresh to THIS candidate's WireGuard key (exactly like the UDP
+/// attempts — the bearer token never crosses in the clear), then walk the
+/// relay list in order until one carries a gate-resolving ack back.
+async fn relay_attempt(
+    relay: Arc<RelayFallback>,
+    caller: nat_traversal::NodeKey,
+    intro: Vec<u8>,
+    token_nonce: Vec<u8>,
+    keypair: Arc<reachability::WireGuardKeypair>,
+    candidate: Candidate,
+    label: String,
+) -> AttemptResult {
+    let sealed_intro = reachability::seal(&candidate.wg, &intro);
+    let target = reachability::node_key(reachability::identity_of(&candidate.key));
+    let mut last_failure = String::from("no relay endpoint was usable");
+    for endpoint in &relay.relays {
+        // resolved per-attempt, like Candidate endpoints — DNS may have moved
+        // between race rounds.
+        let addr = match endpoint.to_socket_addrs().map(|mut addrs| addrs.next()) {
+            Ok(Some(addr)) => addr,
+            Ok(None) => {
+                last_failure = format!("relay endpoint {endpoint:?} did not resolve");
+                continue;
+            }
+            Err(e) => {
+                last_failure = format!("relay endpoint {endpoint:?} unusable ({e})");
+                continue;
+            }
+        };
+        let session = drive_one_relay(
+            &relay,
+            caller,
+            target,
+            &sealed_intro,
+            &token_nonce,
+            &keypair,
+            &candidate,
+            addr,
+            &label,
+        )
+        .await;
+        match session {
+            RelayLane::Resolved(result) => return result,
+            RelayLane::NextRelay(reason) => last_failure = reason,
+        }
+    }
+    AttemptResult::Failed(last_failure)
+}
+
+/// one relay session: connect, then retransmit at the announcer cadence —
+/// a FRESH [`nat_traversal::RelayIntro`] signature each send (the
+/// coordinator's 30 s freshness window makes reusing one across a long
+/// session wrong) — reading each pause out for a Forwarded ack. The outer
+/// [`RELAY_WINDOW`] timeout is the real bound on this loop, so no second
+/// counter caps the sends.
+#[allow(clippy::too_many_arguments)]
+async fn drive_one_relay(
+    relay: &RelayFallback,
+    caller: nat_traversal::NodeKey,
+    target: nat_traversal::NodeKey,
+    sealed_intro: &[u8],
+    token_nonce: &[u8],
+    keypair: &reachability::WireGuardKeypair,
+    candidate: &Candidate,
+    addr: SocketAddr,
+    label: &str,
+) -> RelayLane {
+    let mut conn = match nat_traversal::RelayConn::connect(addr, RELAY_CONNECT_TIMEOUT).await {
+        Ok(conn) => conn,
+        Err(e) => return RelayLane::NextRelay(format!("relay {addr} connect failed ({e})")),
+    };
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let intro_frame = nat_traversal::RelayFrame::Intro(nat_traversal::sign_relay_intro(
+            &relay.signer,
+            caller,
+            target,
+            sealed_intro.to_vec(),
+            nat_traversal::now_secs(),
+            relay.cap.clone(),
+        ));
+        if conn.send(&intro_frame).await.is_err() {
+            return RelayLane::NextRelay(format!("relay {addr} stream broke mid-send"));
+        }
+        // read THIS pause out fully before retransmitting: junk frames must
+        // not accelerate the cadence past the UDP announcer's.
+        let deadline = tokio::time::Instant::now() + RETRY_INTERVAL;
+        loop {
+            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match conn.recv(remaining).await {
+                Ok(nat_traversal::RelayFrame::Forwarded { payload }) => {
+                    // identical semantics to the UDP announcer: `Installed`
+                    // (or junk) keeps announcing; anything resolving settles.
+                    if let Some(reply) = open_ack(keypair, token_nonce, &payload)
+                        && let Some(result) = ack_resolution(reply)
+                    {
+                        return RelayLane::Resolved(result);
+                    }
+                }
+                Ok(nat_traversal::RelayFrame::Error { reason }) => {
+                    let token = String::from_utf8_lossy(&reason).into_owned();
+                    if reason == nat_traversal::REASON_TARGET_UNREGISTERED {
+                        // THIS candidate has no live advert behind the relay
+                        // — the next relay cannot help it. fail the CANDIDATE,
+                        // naming the lane's stable token.
+                        return RelayLane::Resolved(AttemptResult::Failed(format!(
+                            "relay says {token}: the member is not relay-reachable"
+                        )));
+                    }
+                    // not_authorized / session_limit / anything else refused
+                    // US at this relay — the next relay may not.
+                    return RelayLane::NextRelay(format!("relay {addr} refused ({token})"));
+                }
+                // the relay never speaks the client's frame; a stream that
+                // does is broken.
+                Ok(nat_traversal::RelayFrame::Intro(_)) => {
+                    return RelayLane::NextRelay(format!("relay {addr} spoke a client frame"));
+                }
+                // the pause elapsed silent — retransmit (the timeout IS the
+                // pacing, exactly like the UDP announcer's read timeout).
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(_) => {
+                    return RelayLane::NextRelay(format!("relay {addr} stream broke mid-read"));
+                }
+            }
+        }
+        tracing::debug!(
+            target: "ducktape::join",
+            node = %label,
+            nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+            peer = %noded::hex_bytes(&candidate.key.as_ref()[..4]),
+            via = "relay",
+            relay = %addr,
+            attempt,
+            "first-contact intro not yet acked — retrying"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -872,6 +1140,7 @@ mod tests {
                 keypair,
                 "mute-plane".into(),
                 window,
+                None,
             ),
         )
         .await
@@ -899,5 +1168,256 @@ mod tests {
             outcome,
             FirstContactOutcome::Terminal { tried: 0, .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // the TCP relay fallback mule (item 2): a UDP-dead joiner against a REAL
+    // relay listener, real sockets, real seals — the point of the whole item.
+
+    const MULE_BINDING: &[u8] = b"net#relaymule@feedface";
+
+    /// a reachability plane that ACKS installs and nothing else — enough for
+    /// the direct announcer to run against the black hole.
+    fn install_only_plane() -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let reachability::ReachabilityCommand::InstallInvitePeer { reply, .. } = cmd {
+                    let _ = reply.0.send(Ok(()));
+                }
+            }
+        });
+        tx
+    }
+
+    /// the joiner's side of the mule: identity signer, WG keypair (post-verify
+    /// acks arrive sealed to it), token-signed intro, and the token nonce —
+    /// the same bundle wiring.rs builds before the race.
+    fn mule_joiner(
+        dir: &std::path::Path,
+    ) -> (
+        ed25519::PrivateKey,
+        Arc<reachability::WireGuardKeypair>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let issuer = ed25519::PrivateKey::from_seed(80);
+        let token = crate::config::mint_invite_token(
+            &issuer,
+            MULE_BINDING,
+            crate::config::InviteRole::Resident,
+            u64::MAX,
+        );
+        let joiner = ed25519::PrivateKey::from_seed(81);
+        let keypair = Arc::new(
+            reachability::WireGuardKeypair::load_or_generate(&dir.join("joiner.key"))
+                .unwrap()
+                .0,
+        );
+        let intro = lobby::encode_intro(&lobby::intro_request(
+            &joiner,
+            MULE_BINDING,
+            &token,
+            keypair.public_key().0,
+        ));
+        (joiner, keypair, intro, token.nonce.to_vec())
+    }
+
+    /// a live relay listener over `coordinator`'s advert book, PoP-gated on
+    /// both ends — the deployed topology in miniature.
+    async fn relay_rig(
+        coordinator: &nat_traversal::Coordinator,
+    ) -> (SocketAddr, nat_traversal::RelayMetrics) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = nat_traversal::RelayMetrics::default();
+        tokio::spawn(nat_traversal::run_relay_listener(
+            listener,
+            Arc::new(nat_traversal::AuthPolicy::Open { require_pop: true }),
+            coordinator.adverts(),
+            metrics.clone(),
+        ));
+        (addr, metrics)
+    }
+
+    /// a UDP-dead direct candidate: both its underlay endpoint and its intro
+    /// listener point at `black_hole` — bound, never served, never answering.
+    fn black_hole_candidate(
+        member_key: ed25519::PublicKey,
+        wg: [u8; 32],
+        hole: SocketAddr,
+    ) -> Candidate {
+        Candidate {
+            key: member_key,
+            wg,
+            mesh_port: 52200,
+            endpoint: Some(hole.to_string()),
+            intro: Some(hole.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_udp_dead_joiner_completes_the_join_over_the_tcp_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (joiner_signer, keypair, intro, token_nonce) = mule_joiner(dir.path());
+
+        // the member: real identity + real WG keypair, but its only UDP
+        // presence is (a) the black hole the invite's endpoint names and
+        // (b) the rendezvous-registered socket only the relay can reach.
+        let member_signer = ed25519::PrivateKey::from_seed(82);
+        let member_key = member_signer.public_key();
+        let member_wg = reachability::WireGuardKeypair::load_or_generate(&dir.path().join("m.key"))
+            .unwrap()
+            .0;
+        let black_hole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let candidate = black_hole_candidate(
+            member_key.clone(),
+            member_wg.public_key().0,
+            black_hole.local_addr().unwrap(),
+        );
+
+        // the relay rig: the member's advert seeded into the coordinator's
+        // book exactly where the UDP rendezvous would put it.
+        let member_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let member_addr = member_udp.local_addr().unwrap();
+        let mut coordinator =
+            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Open {
+                require_pop: true,
+            });
+        coordinator.handle_at(
+            member_addr,
+            nat_traversal::Msg::Register {
+                key: reachability::node_key(reachability::identity_of(&member_key)),
+            },
+            nat_traversal::now_secs(),
+        );
+        let (relay_addr, metrics) = relay_rig(&coordinator).await;
+
+        // the fake member: the REAL member-side codepath shape end to end —
+        // open the seal with its own WG key, decode + verify the intro
+        // against the network binding, then answer the observed source with
+        // an `Admitted` ack sealed to the joiner's announced WG key.
+        let member_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, src) = member_udp
+                .recv_from(&mut buf)
+                .await
+                .expect("forwarded datagram");
+            let opened = member_wg
+                .open_sealed(&buf[..n])
+                .expect("the relayed intro is sealed to the member's WG key");
+            let request = lobby::decode_intro(&opened).expect("decodes");
+            let verified =
+                lobby::verify_intro(&request, MULE_BINDING).expect("verifies against the binding");
+            let ack = lobby::encode_intro_ack(&lobby::IntroAck {
+                nonce: verified.nonce.to_vec(),
+                reply: lobby::IntroReply::Admitted {
+                    height: 7,
+                    cap: None,
+                },
+            });
+            member_udp
+                .send_to(&reachability::seal(&verified.wg_public_key, &ack), src)
+                .await
+                .expect("ack sent");
+        });
+
+        // fails-before: with no relay fallback the UDP-dead race is the
+        // pre-item-2 exit-3 shape — an honest Terminal.
+        let reach = install_only_plane();
+        let window = Duration::from_secs(4);
+        let no_relay = drive_first_contact(
+            reach.clone(),
+            vec![candidate.clone()],
+            intro.clone(),
+            token_nonce.clone(),
+            keypair.clone(),
+            "relay-mule".into(),
+            window,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(no_relay, FirstContactOutcome::Terminal { tried: 1, .. }),
+            "a UDP-dead joiner without the fallback stays terminal: {no_relay:?}"
+        );
+
+        // passes-after: the same race with the fallback rides TCP to the
+        // relay and comes back ADMITTED.
+        let outcome = drive_first_contact(
+            reach,
+            vec![candidate],
+            intro,
+            token_nonce,
+            keypair,
+            "relay-mule".into(),
+            window,
+            Some(RelayFallback {
+                relays: vec![relay_addr.to_string()],
+                signer: joiner_signer,
+                cap: None,
+            }),
+        )
+        .await;
+        match outcome {
+            FirstContactOutcome::Admitted { key, height, .. } => {
+                assert_eq!(key, member_key);
+                assert_eq!(height, 7);
+            }
+            other => panic!("expected Admitted over the relay, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(2), member_task)
+            .await
+            .expect("member task finishes")
+            .expect("member-side assertions hold");
+        let m = metrics.snapshot();
+        assert!(m.forwards >= 1, "the relay forwarded the intro: {m:?}");
+        assert!(m.replies >= 1, "the member's ack rode back: {m:?}");
+    }
+
+    #[tokio::test]
+    async fn relay_fallback_with_an_unregistered_target_names_the_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let (joiner_signer, keypair, intro, token_nonce) = mule_joiner(dir.path());
+
+        // nobody ever registered with this coordinator: the relay must refuse
+        // with `target_unregistered`, and the folded terminal must NAME it.
+        let coordinator =
+            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Open {
+                require_pop: true,
+            });
+        let (relay_addr, _metrics) = relay_rig(&coordinator).await;
+
+        let member_key = ed25519::PrivateKey::from_seed(83).public_key();
+        let black_hole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let candidate =
+            black_hole_candidate(member_key, [7u8; 32], black_hole.local_addr().unwrap());
+
+        let outcome = drive_first_contact(
+            install_only_plane(),
+            vec![candidate],
+            intro,
+            token_nonce,
+            keypair,
+            "relay-mule-unregistered".into(),
+            Duration::from_secs(2),
+            Some(RelayFallback {
+                relays: vec![relay_addr.to_string()],
+                signer: joiner_signer,
+                cap: None,
+            }),
+        )
+        .await;
+        match outcome {
+            FirstContactOutcome::Terminal { tried, reason } => {
+                assert_eq!(tried, 1);
+                assert!(
+                    reason.contains("target_unregistered"),
+                    "the honest failure names the relay lane's token: {reason}"
+                );
+                assert!(reason.contains("udp:"), "both lanes are named: {reason}");
+            }
+            other => panic!("expected Terminal naming target_unregistered, got {other:?}"),
+        }
     }
 }

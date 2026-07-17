@@ -1,18 +1,23 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coordinator_bin::{process_cpu_ns, process_rss_bytes, select_policy};
-use nat_traversal::{CoordinatorMetrics, run_coordinator_workers_with_metrics};
-use tokio::net::UdpSocket;
+use nat_traversal::{
+    Coordinator, CoordinatorMetrics, RelayMetrics, run_coordinator_workers_with_metrics_using,
+    run_relay_listener,
+};
+use tokio::net::{TcpListener, UdpSocket};
 
 const USAGE: &str = "\
 ducktape coordinator
 
 Usage:
-  coordinator [--listen <addr>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml> | --allow-anonymous]
+  coordinator [--listen <addr>] [--relay-listen <addr|none>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml> | --allow-anonymous]
 
 Options:
   --listen <addr>              UDP bind address [default: 0.0.0.0:3478]
+  --relay-listen <addr|none>   TCP relay-lane bind; \"none\" disables [default: 0.0.0.0:443]
   --workers <1|4>              Signature-verification workers [default: 1]
   --metrics-interval <secs>    Structured metrics period; 0 disables [default: 10]
   --genesis-set <network.toml> Private mode: pin admission to genesis validators
@@ -31,7 +36,8 @@ fn validate_args(args: &[String]) -> std::io::Result<()> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--listen" | "--workers" | "--metrics-interval" | "--genesis-set" => {
+            "--listen" | "--relay-listen" | "--workers" | "--metrics-interval"
+            | "--genesis-set" => {
                 let flag = &args[i];
                 let Some(value) = args.get(i + 1).filter(|v| !v.starts_with("--")) else {
                     return Err(std::io::Error::new(
@@ -41,6 +47,8 @@ fn validate_args(args: &[String]) -> std::io::Result<()> {
                 };
                 if flag == "--listen" {
                     parse_addr(flag, value)?;
+                } else if flag == "--relay-listen" {
+                    parse_relay_listen(value)?;
                 } else if flag == "--workers" {
                     parse_workers(value)?;
                 } else if flag == "--metrics-interval" {
@@ -74,6 +82,16 @@ fn parse_addr(flag: &str, raw: &str) -> std::io::Result<SocketAddr> {
     })
 }
 
+/// `--relay-listen` takes an addr like `--listen`, or the literal `none` to
+/// disable the lane. A malformed value is a HARD error, same contract as
+/// `--listen`: a typo must never silently change what gets bound.
+fn parse_relay_listen(raw: &str) -> std::io::Result<Option<SocketAddr>> {
+    if raw == "none" {
+        return Ok(None);
+    }
+    parse_addr("--relay-listen", raw).map(Some)
+}
+
 fn parse_workers(raw: &str) -> std::io::Result<usize> {
     match raw {
         "1" => Ok(1),
@@ -94,7 +112,7 @@ fn parse_metrics_interval(raw: &str) -> std::io::Result<u64> {
     })
 }
 
-async fn log_metrics(metrics: CoordinatorMetrics, seconds: u64) {
+async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, seconds: u64) {
     let mut ticker = tokio::time::interval(Duration::from_secs(seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
@@ -117,11 +135,12 @@ async fn log_metrics(metrics: CoordinatorMetrics, seconds: u64) {
         };
         last_cpu = cpu;
         let m = metrics.snapshot();
+        let r = relay_metrics.snapshot();
         let rss_mib = process_rss_bytes()
             .map(|rss| format!("{:.2}", rss as f64 / 1_048_576.0))
             .unwrap_or_else(|| "na".into());
         eprintln!(
-            "coordinator_metrics | traffic received={} authenticated={} rejected={} legacy={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
+            "coordinator_metrics | traffic received={} authenticated={} rejected={} legacy={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
             m.received,
             m.authenticated,
             m.rejected,
@@ -132,6 +151,11 @@ async fn log_metrics(metrics: CoordinatorMetrics, seconds: u64) {
             m.inflight,
             m.inflight_max,
             m.saturated,
+            r.sessions_opened,
+            r.sessions_rejected,
+            r.forwards,
+            r.replies,
+            r.expired,
         );
     }
 }
@@ -156,13 +180,21 @@ async fn main() -> std::io::Result<()> {
         None => "0.0.0.0:3478".parse().expect("default addr parses"),
     };
 
+    // `--relay-listen <addr|none>` selects the TCP relay-lane bind; the same
+    // hard-error contract as `--listen` (only the literal "none" disables).
+    let relay_listen = match arg_value("--relay-listen") {
+        Some(raw) => parse_relay_listen(&raw)?,
+        None => Some("0.0.0.0:443".parse().expect("default relay addr parses")),
+    };
+
     // The per-network authorization policy, selected from CLI flags:
     //   --genesis-set <network.toml>  => Private (PoP + pinned valset admission)
     //   --allow-anonymous             => fully-open (legacy, no auth)
     //   (no flag)                     => public with proof-of-possession
     // A malformed --genesis-set path/file is a HARD error, never a silent
-    // fall-through to a weaker policy.
-    let policy = select_policy(&args)?;
+    // fall-through to a weaker policy. The Arc is shared verbatim with the
+    // relay lane: ONE policy gates both the UDP loops and the TCP relay.
+    let policy = Arc::new(select_policy(&args)?);
     let workers = match arg_value("--workers") {
         Some(raw) => parse_workers(&raw)?,
         None => 1,
@@ -175,10 +207,44 @@ async fn main() -> std::io::Result<()> {
     let sock = UdpSocket::bind(listen).await?;
     // the address line stays parseable (tooling/tests read its tail).
     eprintln!("coordinator listening on {}", sock.local_addr()?);
+
+    // One Coordinator serves the UDP loops AND lends its advert book to the
+    // relay, so a relayed intro resolves targets from the SAME registry the
+    // rendezvous keepalives maintain.
+    let coord = Coordinator::with_shared_policy(policy.clone());
+    let relay_metrics = RelayMetrics::default();
+    if let Some(relay_addr) = relay_listen {
+        match TcpListener::bind(relay_addr).await {
+            Ok(listener) => {
+                // parseable like the UDP line above (tooling/tests read its tail).
+                eprintln!(
+                    "coordinator relay listening on tcp/{}",
+                    listener.local_addr()?
+                );
+                tokio::spawn(run_relay_listener(
+                    listener,
+                    policy.clone(),
+                    coord.adverts(),
+                    relay_metrics.clone(),
+                ));
+            }
+            Err(error) => {
+                // The relay is a FALLBACK lane: failing to bind it (EACCES on
+                // 443 as non-root is the everyday dev case) must not take the
+                // UDP rendezvous down with it. Warn loudly and keep serving.
+                eprintln!("WARNING: relay lane disabled: binding tcp/{relay_addr} failed: {error}");
+            }
+        }
+    }
+
     let metrics = CoordinatorMetrics::default();
     if metrics_interval != 0 {
-        tokio::spawn(log_metrics(metrics.clone(), metrics_interval));
+        tokio::spawn(log_metrics(
+            metrics.clone(),
+            relay_metrics.clone(),
+            metrics_interval,
+        ));
     }
-    run_coordinator_workers_with_metrics(sock, policy, workers, metrics).await;
+    run_coordinator_workers_with_metrics_using(sock, coord, workers, metrics).await;
     Ok(())
 }

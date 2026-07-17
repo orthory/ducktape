@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::NodeKey;
 
@@ -187,6 +188,37 @@ impl AdvertBook {
             .filter(|(_, a)| !self.expired(a, now))
             .find(|(_, a)| a.reflexive == src)
             .map(|(k, _)| *k)
+    }
+}
+
+/// One [`AdvertBook`] shared between the UDP rendezvous state machine (the
+/// [`crate::Coordinator`], which owns every write) and the TCP relay lane
+/// (`crate::relay`, which only resolves targets). The relay MUST read the same
+/// book the rendezvous maintains: a member's reflexive is wherever its live
+/// keepalives say it is, and a second book would drift.
+///
+/// A `std::sync::Mutex`, not tokio's: every lock scope is a single book
+/// operation and is NEVER held across an await. Both UDP serving loops are
+/// single-threaded, so contention is limited to the (rare) relay resolution.
+#[derive(Clone)]
+pub struct SharedAdverts(Arc<Mutex<AdvertBook>>);
+
+impl SharedAdverts {
+    pub(crate) fn wrap(book: AdvertBook) -> Self {
+        Self(Arc::new(Mutex::new(book)))
+    }
+
+    /// The key's live reflexive (`None` once expired) —
+    /// [`AdvertBook::current`] behind the shared lock.
+    pub fn current(&self, key: NodeKey, now: u64) -> Option<SocketAddr> {
+        self.lock().current(key, now)
+    }
+
+    /// A poisoned lock only means another holder panicked mid-operation; the
+    /// book is a plain map whose worst partial state is one stale entry, so
+    /// keep serving joins rather than wedging every future lock on it.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, AdvertBook> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

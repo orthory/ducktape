@@ -8,7 +8,7 @@ use commonware_cryptography::ed25519;
 use lru::LruCache;
 
 use crate::AuthRequest;
-use crate::advert::{AdvertBook, AdvertOutcome};
+use crate::advert::{AdvertBook, AdvertOutcome, SharedAdverts};
 use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Msg, NodeKey};
 
@@ -106,9 +106,14 @@ impl AuthVerifier {
 /// The untrusted entry helper. Maps a node key to the reflexive address the
 /// coordinator observed for it, and brokers a simultaneous-open. Holds no key
 /// material, no plaintext, no mesh authority — and never carries peer traffic:
-/// rendezvous only, no relay.
+/// rendezvous only; the TCP relay lane (`crate::relay`) moves sealed bytes it
+/// cannot read, resolving targets from this coordinator's shared book.
 pub struct Coordinator {
-    adverts: AdvertBook,
+    /// Behind [`SharedAdverts`] so the TCP relay lane can resolve targets from
+    /// the SAME book the UDP rendezvous maintains. Lock scopes are tiny and
+    /// never held across an await (every handler here is sync), and the UDP
+    /// serving loops are single-threaded, so the lock is uncontended.
+    adverts: SharedAdverts,
     auth: AuthVerifier,
     rejects: u64,
 }
@@ -116,7 +121,7 @@ pub struct Coordinator {
 impl Default for Coordinator {
     fn default() -> Self {
         Self {
-            adverts: AdvertBook::default(),
+            adverts: SharedAdverts::wrap(AdvertBook::default()),
             auth: AuthVerifier::new(AuthPolicy::default()), // fully-open
             rejects: 0,
         }
@@ -133,9 +138,12 @@ impl Coordinator {
         Self::with_shared_policy(Arc::new(policy))
     }
 
-    pub(crate) fn with_shared_policy(policy: Arc<AuthPolicy>) -> Self {
+    /// Construct over an already-shared policy — the seam for serving the SAME
+    /// policy on both the UDP loops and the TCP relay lane without cloning the
+    /// (possibly large) genesis set.
+    pub fn with_shared_policy(policy: Arc<AuthPolicy>) -> Self {
         Self {
-            adverts: AdvertBook::default(),
+            adverts: SharedAdverts::wrap(AdvertBook::default()),
             auth: AuthVerifier::with_shared_policy(policy),
             rejects: 0,
         }
@@ -146,9 +154,22 @@ impl Coordinator {
     /// short-lived rigs shrink it.
     pub fn with_policy_and_ttl(policy: AuthPolicy, ttl_secs: u64) -> Self {
         Self {
-            adverts: AdvertBook::with_ttl(ttl_secs),
+            adverts: SharedAdverts::wrap(AdvertBook::with_ttl(ttl_secs)),
             ..Self::with_policy(policy)
         }
+    }
+
+    /// A cloneable read handle on this coordinator's advert book — what the
+    /// TCP relay lane resolves targets through, so a relayed intro reaches the
+    /// member exactly where the UDP rendezvous currently believes it lives.
+    pub fn adverts(&self) -> SharedAdverts {
+        self.adverts.clone()
+    }
+
+    /// The policy `Arc` this coordinator verifies against (shared with the
+    /// worker pool by the `_using` serving seam in `client.rs`).
+    pub(crate) fn shared_policy(&self) -> Arc<AuthPolicy> {
+        self.auth.policy.clone()
     }
 
     /// Count of requests dropped by the auth gate (observability).
@@ -260,6 +281,10 @@ impl Coordinator {
         caller: Option<NodeKey>,
         now: u64,
     ) -> CoordinatorReplies {
+        // One guard per request: this handler is sync (no awaits to hold it
+        // across) and both UDP loops are single-threaded, so the only other
+        // contender is a relay session's read-only resolution.
+        let mut adverts = self.adverts.lock();
         match msg {
             Msg::BindRequest { .. } => {
                 CoordinatorReplies::from_iter([(from, Msg::BindResponse { reflexive: from })])
@@ -267,7 +292,7 @@ impl Coordinator {
             Msg::Register { key } => {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
-                self.adverts.observe(key, from, now);
+                adverts.observe(key, from, now);
                 CoordinatorReplies::new()
             }
             Msg::Readvertise { key, nonce } => {
@@ -277,11 +302,11 @@ impl Coordinator {
                 // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
-                self.adverts.readvertise(key, from, nonce, now);
+                adverts.readvertise(key, from, nonce, now);
                 CoordinatorReplies::new()
             }
             Msg::Lookup { key } => {
-                let target = self.adverts.current(key, now);
+                let target = adverts.current(key, now);
                 let response = (
                     from,
                     Msg::LookupResponse {
@@ -296,7 +321,7 @@ impl Coordinator {
                     // if it never registered (the target still learns the
                     // caller's reflexive to punch back).
                     let caller_key = caller
-                        .or_else(|| self.adverts.key_for_src(from, now))
+                        .or_else(|| adverts.key_for_src(from, now))
                         .unwrap_or(NodeKey([0u8; 32]));
                     CoordinatorReplies::from([
                         response,
@@ -342,7 +367,7 @@ impl Coordinator {
         nonce: u64,
         now: u64,
     ) -> AdvertOutcome {
-        self.adverts.readvertise(key, src, nonce, now)
+        self.adverts.lock().readvertise(key, src, nonce, now)
     }
 }
 

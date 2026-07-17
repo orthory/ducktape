@@ -11,10 +11,20 @@ crossbeam-channel = { workspace = true }
 lru = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "sync", "time"] }
+# io-util: the relay lane's TCP framing (read_exact/write_all) — a feature on
+# the existing tokio dep, not a new dependency.
+tokio = { workspace = true, features = ["net", "sync", "time", "io-util"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+    "net",
+    "rt",
+    "time",
+    "sync",
+    "macros",
+    "rt-multi-thread",
+    "io-util",
+] }
 
 [features]
 simnat = []
