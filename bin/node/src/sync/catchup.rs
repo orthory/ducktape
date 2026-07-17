@@ -26,17 +26,18 @@ pub(crate) async fn apply_verified_suffix_frame(
     host.realize_module_swaps(served.height, code_source)
         .await
         .map_err(|e| format!("code-swap realization at height {}: {e}", served.height))?;
-    // the served frame is a BATCH: decode its members and apply as ONE block,
-    // exactly like the live drain and recovery replay, so the disposition,
-    // roots, and app-hash reproduce what the peer served. disposition is
-    // DRAIN-based (any member applied or a System injection ran), never
-    // app-hash-based.
+    // the served frame is a BATCH: decode its members (a v3 envelope
+    // re-applies WITH its continuation) and apply as ONE block, exactly like
+    // the live drain and recovery replay, so the disposition, roots, and
+    // app-hash reproduce what the peer served. disposition is DRAIN-based
+    // (any member or released continuation applied, or a System injection
+    // ran), never app-hash-based.
     let (outcome, dispatches) = match node::decode_batch(&served.frame) {
         Ok(members) => {
             let mut ops = Vec::new();
             for member in &members {
-                if let Ok(pair) = node::decode_frame(member) {
-                    ops.push(pair);
+                if let Ok(op) = node::decode_member(member) {
+                    ops.push(op);
                 }
             }
             let ctx = host::BlockContext {
@@ -45,19 +46,10 @@ pub(crate) async fn apply_verified_suffix_frame(
                 consensus_time: served.height,
                 origin: sdk::Origin::System,
             };
-            match host.submit_block(ctx, ops).await {
+            match host.submit_block_ops(ctx, ops).await {
                 Ok(batch) => {
-                    let mut dispatches = Vec::new();
-                    let mut any_applied = false;
-                    for member in batch.members {
-                        if let host::MemberOutcome::Applied { dispatches: d } = member {
-                            any_applied = true;
-                            dispatches.extend(d);
-                        }
-                    }
-                    let has_system = !batch.system_dispatches.is_empty();
-                    dispatches.extend(batch.system_dispatches);
-                    let outcome = if any_applied || has_system {
+                    let (ran, dispatches) = batch.into_trace();
+                    let outcome = if ran {
                         node::Disposition::Applied
                     } else {
                         node::Disposition::Rejected
