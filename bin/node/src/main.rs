@@ -389,7 +389,6 @@ fn run_node(
             peers.clone(),
             validators.clone(),
             sync_candidates,
-            joiner,
             listen,
             advertised,
             bootstrappers,

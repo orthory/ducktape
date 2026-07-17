@@ -147,6 +147,7 @@ pub(crate) async fn run(
         invite_token,
         invite_wireguard,
         invite_fronts,
+        workspace.clone(),
         voice_requests,
         overlay_slot.clone(),
     )
@@ -163,7 +164,6 @@ pub(crate) async fn run(
         validators,
         wireguard_listen,
         wireguard_effect,
-        invite_token,
         checkpoint_blocks,
         sync_index,
         announce_capabilities,

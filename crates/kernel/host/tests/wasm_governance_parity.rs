@@ -166,15 +166,13 @@ fn execute(id: &str) -> Msg {
 /// proof-of-possession) into the Redeem op — deterministic: the nonce is
 /// caller-chosen and ed25519 signing is deterministic.
 fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &Ed) -> Msg {
-    // target-locked, Resident-role, far-future expiry — the current grant
-    // preimage (binding || nonce || kind[|| target] || role || expires_le;
-    // kind 1 = targeted).
+    // bearer (기명 dropped in v2), Resident-role, far-future expiry — the v2
+    // grant preimage (binding || nonce || role || expires_le; no kind, no
+    // target).
     let expires: u64 = 4_102_444_800; // 2100-01-01 — far future, wall-clock-shaped
     let token_msg = [
         binding,
         nonce.as_slice(),
-        &[1u8],
-        joiner.public_key().as_ref(),
         &[InviteRole::Resident.as_u8()],
         &expires.to_le_bytes(),
     ]
@@ -183,7 +181,6 @@ fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &E
     let token = InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        target: Some(joiner.public_key()),
         role: InviteRole::Resident,
         expires_unix_secs: expires,
         sig: token_sig.clone(),
@@ -195,7 +192,6 @@ fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &E
         token_sig: token_sig.as_ref().to_vec(),
         joiner: ed_pub(joiner),
         proof: proof.as_ref().to_vec(),
-        target: ed_pub(joiner),
         role: InviteRole::Resident.as_u8(),
         expires_unix_secs: expires,
     })
@@ -806,7 +802,6 @@ async fn rejections_inner() {
                     token_sig,
                     joiner: joiner.clone(),
                     proof,
-                    target: joiner,
                     role: InviteRole::Resident.as_u8(),
                     expires_unix_secs: 4_102_444_800,
                 });

@@ -1273,7 +1273,6 @@ impl Governance {
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        target: Vec<u8>,
         role: u8,
         expires_unix_secs: u64,
     ) -> Result<(), Error> {
@@ -1303,24 +1302,13 @@ impl Governance {
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
         let role = invite::InviteRole::from_u8(role).map_err(Error::Module)?;
-        // empty target bytes = a BEARER token. bearer is CLIENT-ONLY: no
-        // bearer path onto the resident plane exists — reject before any
-        // other work so the error names the real rule, not a side effect.
-        if target.is_empty() && role != invite::InviteRole::Client {
-            return Err(Error::Module("bearer invites are client-only".into()));
-        }
-        let target_key = if target.is_empty() {
-            None
-        } else {
-            Some(
-                ed25519::PublicKey::decode(target.as_slice())
-                    .map_err(|e| Error::Module(format!("target key: {e}")))?,
-            )
-        };
+        // EVERY invite is bearer (기명 dropped in Join Protocol v2): there is
+        // no target lock. The join proof below binds the redemption to
+        // whichever key presents it, and the nonce set makes that
+        // exactly-once — that is the whole containment story.
         let token = invite::InviteToken {
             issuer: issuer_key,
             nonce: nonce_arr,
-            target: target_key,
             role,
             expires_unix_secs,
             sig,
@@ -1329,14 +1317,6 @@ impl Governance {
             return Err(Error::Module(
                 "invite token signature does not verify for this network".into(),
             ));
-        }
-        // a TARGETED invite admits exactly ONE key; a blob holder redeeming
-        // under a different key is refused (compares the raw Vec<u8> args —
-        // cheap, exact). a BEARER invite has no lock: the join proof binds
-        // the redemption to whichever key redeems first, and the nonce set
-        // below makes that exactly-once.
-        if !target.is_empty() && joiner != target {
-            return Err(Error::Module("invite is locked to another key".into()));
         }
         // expiry is NOT enforced here: `consensus_time` is block height on
         // this chain, so no deterministic wall clock exists in-consensus.
@@ -1475,22 +1455,11 @@ impl Module for Governance {
                 token_sig,
                 joiner,
                 proof,
-                target,
                 role,
                 expires_unix_secs,
             } => {
-                self.handle_redeem(
-                    ctx,
-                    issuer,
-                    nonce,
-                    token_sig,
-                    joiner,
-                    proof,
-                    target,
-                    role,
-                    expires_unix_secs,
-                )
-                .await
+                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof, role, expires_unix_secs)
+                    .await
             }
         }
     }

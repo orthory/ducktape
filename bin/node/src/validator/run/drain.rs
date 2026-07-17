@@ -37,8 +37,8 @@ impl ValidatorRuntime<'_> {
             media_peers,
             blob_peers,
             reach_cmd,
-            lobby_tx,
             relay_tx,
+            gate_outcomes,
             next_seq,
             prev_ckpt,
             signer,
@@ -173,17 +173,20 @@ impl ValidatorRuntime<'_> {
             if d.disposition == node::Disposition::Discarded {
                 continue;
             }
-            // resolve a HELD JOIN GATE (ADR §3.2): the joiner's Admitted/
-            // Rejected reply was held against this Redeem frame — now the drain
-            // knows its consensus fate. Applied ⇒ the AUTHORITATIVE Admitted at
-            // the committed height (carrying the coord cap); Rejected ⇒ map the
+            // resolve a HELD JOIN GATE (ADR §3.2 / Join v2 §4): the joiner's
+            // outcome was held against this Redeem frame — now the drain knows
+            // its consensus fate. Applied ⇒ the AUTHORITATIVE Admitted at the
+            // committed height (carrying the coord cap); Rejected ⇒ map the
             // module reason to a code + terminal bit (chiefly a spent-nonce
-            // race the pre-filter missed). a gate frame is EXCLUSIVELY a gate,
-            // so resolve and move on.
+            // race the pre-filter missed). the outcome goes into the shared
+            // `gate_outcomes` map, where the intro doorbell answers the
+            // joiner's next tunnel retransmit — this loop owns no doorbell
+            // socket. a gate frame is EXCLUSIVELY a gate, so resolve and move
+            // on.
             if let Some(gate) = pending_gates.remove(&d.id) {
                 gating.remove(&gate.joiner);
                 let reply = match d.disposition {
-                    node::Disposition::Applied => lobby::GateMsg::Admitted {
+                    node::Disposition::Applied => lobby::IntroReply::Admitted {
                         height: d.height,
                         cap: gate.cap,
                     },
@@ -201,14 +204,14 @@ impl ValidatorRuntime<'_> {
                             .iter()
                             .any(|r| r.as_slice() == gate.joiner.as_slice());
                         if admitted {
-                            lobby::GateMsg::Admitted {
+                            lobby::IntroReply::Admitted {
                                 height: d.height,
                                 cap: gate.cap,
                             }
                         } else {
                             let (code, terminal) =
                                 lobby::redeem_reject_outcome(d.reason.as_deref());
-                            lobby::GateMsg::Rejected {
+                            lobby::IntroReply::Rejected {
                                 code,
                                 detail: d.reason.clone().unwrap_or_else(|| {
                                     "invite redemption rejected in consensus".into()
@@ -219,11 +222,32 @@ impl ValidatorRuntime<'_> {
                     }
                     node::Disposition::Discarded => unreachable!("filtered at the loop top"),
                 };
-                let _ = lobby_tx.send(
-                    Recipients::One(gate.peer),
-                    IoBuf::from(lobby::encode_msg(&reply)),
-                    false,
-                );
+                // on a GRANT, re-track the just-admitted resident onto the
+                // mesh oracle IMMEDIATELY (blessed decision #1): its real key
+                // must complete the discovery handshake to dial statesync,
+                // and the epoch cutover that formally re-tracks it lands a
+                // few views later — a gap the joiner would spend bounced at
+                // the door. every validator resolves this same Applied block
+                // in its own drain, so the widened set converges within a
+                // beat (the same transient the reboot-inside-cutover window
+                // already tolerates).
+                if let lobby::IntroReply::Admitted { .. } = &reply
+                    && let Ok(joiner_pk) = ed25519::PublicKey::decode(gate.joiner.as_slice())
+                {
+                    let mut transport: std::collections::BTreeSet<ed25519::PublicKey> =
+                        orchestrator
+                            .current_members()
+                            .iter()
+                            .chain(orchestrator.current_residents())
+                            .cloned()
+                            .collect();
+                    transport.insert(joiner_pk);
+                    mesh_oracle.track(
+                        orchestrator.epoch(),
+                        super::super::wiring::mesh_at(peers, &transport),
+                    );
+                }
+                super::settle_gate(gate_outcomes, gate.joiner, reply);
                 continue;
             }
             // resolve a relayed hold FIRST: a relayed frame has no
@@ -352,10 +376,11 @@ impl ValidatorRuntime<'_> {
                 }
             }
         }
-        // held join gates that never settled within GATE_SETTLE_TIMEOUT: answer
-        // Busy (NON-terminal, §3.2) so the joiner fails over to another member
-        // rather than exiting. the Redeem may still land later — a re-Request
-        // then hits the V9 idempotent Admitted.
+        // held join gates that never settled within GATE_SETTLE_TIMEOUT: write
+        // Busy (NON-terminal, §3.2) into the outcome map so the joiner's next
+        // retransmit reads it and fails over to another member rather than
+        // exiting. the Redeem may still land later — a re-forward then hits
+        // the V9 idempotent Admitted.
         if !pending_gates.is_empty() {
             let now = std::time::Instant::now();
             let expired: Vec<node::FrameId> = pending_gates
@@ -366,15 +391,15 @@ impl ValidatorRuntime<'_> {
             for k in expired {
                 if let Some(gate) = pending_gates.remove(&k) {
                     gating.remove(&gate.joiner);
-                    let msg = lobby::GateMsg::Rejected {
-                        code: lobby::RejectCode::Busy,
-                        detail: "the gate could not settle in time — trying another member".into(),
-                        terminal: false,
-                    };
-                    let _ = lobby_tx.send(
-                        Recipients::One(gate.peer),
-                        IoBuf::from(lobby::encode_msg(&msg)),
-                        false,
+                    super::settle_gate(
+                        gate_outcomes,
+                        gate.joiner,
+                        lobby::IntroReply::Rejected {
+                            code: lobby::RejectCode::Busy,
+                            detail: "the gate could not settle in time — trying another member"
+                                .into(),
+                            terminal: false,
+                        },
                     );
                 }
             }
