@@ -142,6 +142,10 @@ pub(crate) enum WorkspaceSource {
         /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
         /// surface and an audit/M2 signal.
         branch_born: bool,
+        /// the compose-height verdict from the agent's committed
+        /// `forge_push` cap for this repo. the host may act on this fact but
+        /// cannot widen it.
+        forge_push: bool,
     },
 }
 
@@ -1145,6 +1149,7 @@ mod tests {
                 commit: commit.clone(),
                 branch: "agent/item-7".into(),
                 branch_born: false,
+                forge_push: false,
             },
             skills: Vec::new(),
             sink: WireSink::Pr {
@@ -1186,7 +1191,7 @@ mod tests {
         assert_eq!(v["workspace"]["branch_born"], false);
         assert!(
             payload.contains(&format!(
-                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false}}"#
+                r#""workspace":{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{commit}","branch":"agent/item-7","branch_born":false,"forge_push":false}}"#
             )),
             "the forge workspace field order is part of the committed bytes: {payload}"
         );
@@ -1215,6 +1220,7 @@ mod tests {
                 commit: "cd".repeat(20),
                 branch: "feature/x".into(),
                 branch_born: true,
+                forge_push: false,
             },
             skills: Vec::new(),
             sink: WireSink::Pr {

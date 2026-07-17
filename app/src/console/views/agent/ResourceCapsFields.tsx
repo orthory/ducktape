@@ -106,6 +106,8 @@ export function ResourceCapsFields({
       >
         {listFields.map((field) => {
           const id = `${idPrefix}-${field.key}`;
+          const wildcardPages =
+            field.key === "pagesWrite" && parseCapList(draft.pagesWrite).includes("*");
           return (
             <div key={field.key}>
               <FieldLabel htmlFor={id}>{field.label}</FieldLabel>
@@ -118,6 +120,14 @@ export function ResourceCapsFields({
                 placeholder={field.placeholder}
                 style={monoInputStyle}
               />
+              {wildcardPages && (
+                <div
+                  role="alert"
+                  style={{ marginTop: 5, font: `400 10.5px ${font.sans}`, color: color.danger }}
+                >
+                  Warning: * grants write access to every page.
+                </div>
+              )}
             </div>
           );
         })}

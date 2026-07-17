@@ -37,10 +37,17 @@ protocol builds on.
 
 ## 1. Roles and artifacts
 
-- **Invite token** (targeted-invites cutover): `{ issuer, nonce, target,
-  role, expires_unix_secs, sig }`, sig over `binding ‖ nonce ‖ target ‖
-  role ‖ expires` in the invite-grant namespace. The blob envelope carries
-  descriptor + reach + WG bootstrap + fronts, issuer-signed.
+- **Invite token**: `{ issuer, nonce, target: Option, role,
+  expires_unix_secs, sig }`, sig over `binding ‖ nonce ‖ kind[‖ target] ‖
+  role ‖ expires` in the invite-grant namespace — the signature-covered
+  kind byte says whether a target follows (targeted) or not (bearer), so
+  neither form replays as the other. The blob envelope carries descriptor +
+  reach + WG bootstrap + fronts, issuer-signed.
+  *(2026-07-16, bearer-client-invites: `target` became optional. A bearer
+  token is CLIENT-role-only and never enters this protocol — it redeems
+  over a member's `/v1/submit` via `user-redeem-invite`, granting
+  submit-only client standing. Everything below concerns node joins, which
+  remain targeted-Resident-only.)*
 - **Joiner**: the key equal to `token.target`. Proves possession via the
   join proof (`binding ‖ nonce ‖ joiner`).
 - **Gating member**: any CURRENT VALIDATOR (v1: validators only — a gate
@@ -85,7 +92,7 @@ enum GateMsg {
 | V5 | join proof verifies | `BadProof` (T) |
 | V6 | nonce unspent in committed redemptions | `Spent` (T) |
 | V7 | issuer in committed valset | `IssuerUnknown` (**non-terminal**: a lagging local view cannot distinguish removed from not-yet-seen — PR #538 review finding; the joiner fails over to another member) |
-| V8 | role supported (`Resident` in v1) | `RoleUnsupported` (T) |
+| V8 | role supported (`Resident` — a `Client` token grants submit-only standing and redeems via `user-redeem-invite`/`/v1/submit`, never over this gate) | `RoleUnsupported` (T) |
 | V9 | joiner not already holding standing | short-circuit **success**: reply `Admitted { height: current }` (idempotent — a re-gated joiner is not an error) |
 
 ### 3.2 Settle-then-answer

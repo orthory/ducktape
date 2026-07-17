@@ -328,7 +328,8 @@ mod tests {
                 "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
-                "branch_born": false
+                "branch_born": false,
+                "forge_push": true
             },
             "skills": [],
             "result_contract": {
@@ -615,6 +616,7 @@ mod tests {
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
+                forge_push: true,
             }
         );
         assert_eq!(
@@ -628,6 +630,24 @@ mod tests {
             }
         );
         assert!(workspace.skills.is_empty());
+    }
+
+    #[test]
+    fn an_old_forge_envelope_cannot_gain_push_authority() {
+        let mut envelope: serde_json::Value = serde_json::from_str(&forge_envelope_json()).unwrap();
+        envelope["workspace"]
+            .as_object_mut()
+            .unwrap()
+            .remove("forge_push");
+
+        let prepared = prepare(&envelope.to_string()).unwrap();
+        assert!(matches!(
+            prepared.workspace.source,
+            crate::workspace_source::WorkspaceSource::Forge {
+                forge_push: false,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> 
         "user-sign-remove-member" => cmd_user_sign_remove_member(args, &mut stdin),
         "user-sign-gateway-route" => cmd_user_sign_gateway_route(args, &mut stdin),
         "user-sign-frame" => cmd_user_sign_frame(args, &mut stdin),
+        "user-redeem-invite" => cmd_user_redeem_invite(args, &mut stdin),
         "user-sign-admin" => cmd_user_sign_admin(args, &mut stdin),
         "user-webauthn-challenge" => cmd_user_webauthn_challenge(args),
         "user-p256-payload" => cmd_user_p256_payload(args),
@@ -613,6 +614,106 @@ fn cmd_user_sign_frame(
     Ok(())
 }
 
+/// `user-redeem-invite` core — see [`cmd_user_redeem_invite`].
+///
+/// redeems a CLIENT invite as this user key over a member node's frameless
+/// `/v1/submit`: the token (not the submitter) authorizes the admission —
+/// the serving node stamps its own identity as the frame origin, and
+/// consensus verifies the token signature + this key's join proof inside the
+/// op, granting submit-only client standing to the key on commit. the lane
+/// already settles-then-answers (the receipt carries the committed height;
+/// a deterministic reject comes back as the error body), so the printed
+/// verdict IS the consensus outcome.
+fn user_redeem_invite(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (pos, flags) = parse_flags(args)?;
+    let [blob] = pos.as_slice() else {
+        return Err("user-redeem-invite needs exactly one <invite blob>".into());
+    };
+    let node = flags
+        .get("node")
+        .ok_or("user-redeem-invite needs --node <http-base, e.g. http://host:port>")?
+        .trim_end_matches('/')
+        .to_string();
+    let key_path = PathBuf::from(
+        flags
+            .get("key")
+            .ok_or("user-redeem-invite needs --key <path>")?,
+    );
+
+    // fail-closed expiry + envelope/token verification at decode.
+    let invite = config::decode_invite(blob)?;
+    if invite.token.role != config::InviteRole::Client {
+        return Err("this is a node (resident) invite — use `ducktape-node join`".into());
+    }
+    let user = load_user_signer(&key_path, stdin)?;
+    if let Some(target) = &invite.token.target
+        && *target != user.public_key()
+    {
+        return Err(format!(
+            "this invite is locked to a different key.\n  invite target: {}\n  this key: {}",
+            hex_bytes(target.as_ref()),
+            hex_bytes(user.public_key().as_ref()),
+        )
+        .into());
+    }
+    let binding = invite.descriptor.genesis_namespace();
+    let proof = config::sign_join_proof(&user, binding.as_bytes(), &invite.token);
+
+    let payload = serde_json::json!({ "redeem": {
+        "issuer": invite.token.issuer.as_ref().to_vec(),
+        "nonce": invite.token.nonce.to_vec(),
+        "token_sig": invite.token.sig.encode().as_ref().to_vec(),
+        "joiner": user.public_key().as_ref().to_vec(),
+        "proof": proof.encode().as_ref().to_vec(),
+        // empty target bytes = bearer, the wire-wide rule.
+        "target": invite
+            .token
+            .target
+            .as_ref()
+            .map(|t| t.as_ref().to_vec())
+            .unwrap_or_default(),
+        "role": invite.token.role.as_u8(),
+        "expires_unix_secs": invite.token.expires_unix_secs,
+    }});
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{node}/v1/submit"))
+        .json(&serde_json::json!({ "target": "governance", "payload": payload }))
+        .send()
+        .map_err(|e| format!("POST {node}/v1/submit: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if status.is_success() {
+        let height = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["height"].as_u64())
+            .ok_or_else(|| format!("unexpected submit receipt: {body}"))?;
+        return Ok(format!(
+            "admitted: client standing committed at height {height}"
+        ));
+    }
+    // a re-redeem by the SAME key is not an error worth failing a script over.
+    if body.contains("already holds client standing") {
+        return Ok("already admitted: this key holds client standing".into());
+    }
+    Err(format!("redemption rejected ({status}): {body}").into())
+}
+
+/// `user-redeem-invite <blob> --node <http-base> --key <path>` — stdin:
+/// [password line when the key is v2-encrypted; a fresh path mints a plain
+/// identity]. redeems a CLIENT invite (bearer or targeted) as this user key
+/// and prints the consensus verdict; the key then submits via
+/// `/v1/submit/frame` under its own signature.
+fn cmd_user_redeem_invite(
+    args: &[String],
+    stdin: &mut impl std::io::BufRead,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", user_redeem_invite(args, stdin)?);
+    Ok(())
+}
+
 /// `user-sign-admin` core — see [`cmd_user_sign_admin`].
 ///
 /// signs one owner control-plane request (ADR A5): the per-request PoP the
@@ -1121,6 +1222,73 @@ mod userkey_verb_tests {
                 .public_key()
                 .as_ref(),
         )
+    }
+
+    /// encode a one-validator test network's invite blob for `token_role`,
+    /// targeted at `target` (None = bearer).
+    fn test_blob(
+        issuer: &ed25519::PrivateKey,
+        target: Option<&ed25519::PublicKey>,
+        role: config::InviteRole,
+    ) -> String {
+        let mut d = config::NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: config::SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&issuer.public_key(), "127.0.0.1:52200");
+        let binding = d.genesis_namespace();
+        let token = match (target, role) {
+            (Some(t), role) => {
+                config::mint_invite_token(issuer, binding.as_bytes(), t, role, u64::MAX)
+            }
+            (None, _) => config::mint_bearer_client_token(issuer, binding.as_bytes(), u64::MAX),
+        };
+        config::encode_invite(&d, &token, None, &[], issuer).expect("encode blob")
+    }
+
+    #[test]
+    fn redeem_refuses_a_resident_blob_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let target = ed25519::PrivateKey::from_seed(2);
+        let blob = test_blob(&issuer, Some(&target.public_key()), config::InviteRole::Resident);
+        let key = dir.path().join("user.key");
+        let err = user_redeem_invite(
+            &args_of(&[&blob, "--node", "http://127.0.0.1:1", "--key", &key.to_string_lossy()]),
+            &mut empty_stdin(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("use `ducktape-node join`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn redeem_refuses_a_targeted_client_blob_for_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = ed25519::PrivateKey::from_seed(1);
+        let someone_else = ed25519::PrivateKey::from_seed(3);
+        let blob = test_blob(
+            &issuer,
+            Some(&someone_else.public_key()),
+            config::InviteRole::Client,
+        );
+        // a FRESH key path mints a new identity — necessarily not the target.
+        let key = dir.path().join("user.key");
+        let err = user_redeem_invite(
+            &args_of(&[&blob, "--node", "http://127.0.0.1:1", "--key", &key.to_string_lossy()]),
+            &mut empty_stdin(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("locked to a different key"),
+            "{err}"
+        );
     }
 
     #[test]

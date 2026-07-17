@@ -20,6 +20,7 @@ export const ACTION_LABEL: Record<string, string> = {
   "tasks.update_status": "Update task status",
   "pages.comment": "Comment on pages",
   "pages.set_checked": "Check off page todos",
+  "duckfs.write_text": "Write text files in DuckFS",
 };
 
 // Permission checkboxes read as plain abilities ("what this agent can do"),
@@ -36,6 +37,7 @@ export const ACTION_HINT: Record<string, string> = {
   "tasks.update_status": "Update task status",
   "pages.comment": "Comment on pages",
   "pages.set_checked": "Check off page todos",
+  "duckfs.write_text": "Write text files in DuckFS",
 };
 
 /** Parse a caps list: whitespace/comma-separated ids or prefixes. The node

@@ -44,6 +44,9 @@ pub enum WorkspaceSource {
         /// miss ⇒ zero-oid create), not this flag — kept as a pinned wire
         /// surface and an audit/M2 signal.
         branch_born: bool,
+        /// whether consensus granted `forge_push` for this repo when the run
+        /// was composed. absent on old envelopes means false.
+        forge_push: bool,
     },
 }
 
@@ -75,9 +78,11 @@ impl WorkspaceSource {
 }
 
 /// the wire decode of a v3 envelope's `workspace` block (contract §1). source
-/// coordinates are required; additive metadata defaults for old in-flight
-/// envelopes. [`WireWorkspace::validate`] adds the per-field non-empty checks
-/// and surfaces the plain [`WorkspaceSource`].
+/// coordinates are required at the serde step (a malformed envelope fails to
+/// parse — acceptance IS validation); additive metadata (`item_title`, the
+/// `forge_push` verdict) defaults for old in-flight envelopes.
+/// [`WireWorkspace::validate`] adds the per-field non-empty checks and surfaces
+/// the plain [`WorkspaceSource`].
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WireWorkspace {
@@ -93,6 +98,8 @@ pub(crate) enum WireWorkspace {
         commit: String,
         branch: String,
         branch_born: bool,
+        #[serde(default)]
+        forge_push: bool,
     },
 }
 
@@ -121,6 +128,7 @@ impl WireWorkspace {
                 commit,
                 branch,
                 branch_born,
+                forge_push,
             } => {
                 for (field, value) in [("repo", &repo), ("commit", &commit), ("branch", &branch)] {
                     if value.is_empty() {
@@ -135,6 +143,7 @@ impl WireWorkspace {
                     commit,
                     branch,
                     branch_born,
+                    forge_push,
                 })
             }
         }
@@ -163,8 +172,9 @@ mod tests {
     }
 
     #[test]
-    fn the_tagged_forge_shape_decodes_verbatim() {
-        // the EXACT composer bytes (task-1 report §"Exact final serde shapes").
+    fn an_old_forge_shape_defaults_forge_push_to_false() {
+        // Additive and fail-closed: an in-flight envelope from before the
+        // forge_push field existed cannot gain write authority.
         let ws: WireWorkspace = serde_json::from_str(&format!(
             r#"{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{}","branch":"agent/item-7","branch_born":false}}"#,
             "d0".repeat(20)
@@ -178,6 +188,7 @@ mod tests {
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
+                forge_push: false,
             }
         );
     }
@@ -271,6 +282,7 @@ mod tests {
             commit: "d0".repeat(20),
             branch: "agent/item-7".into(),
             branch_born: true,
+            forge_push: true,
         };
         assert_eq!(
             forge.receipt_coords(),

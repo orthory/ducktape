@@ -564,6 +564,7 @@ mod tests {
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
+                forge_push: true,
             },
             ro_mounts: Vec::new(),
             library_readable: false,

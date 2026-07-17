@@ -2080,7 +2080,8 @@ format = "text"
                 "item_title": "Fix the gate",
                 "commit": "d0".repeat(20),
                 "branch": "agent/item-7",
-                "branch_born": false
+                "branch_born": false,
+                "forge_push": true
             },
             "skills": [],
             "result_contract": {
@@ -2833,6 +2834,7 @@ format = "text"
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
+                forge_push: true,
             }
         );
     }

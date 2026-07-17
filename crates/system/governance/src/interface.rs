@@ -140,21 +140,26 @@ pub enum GovMsg {
     /// proof-of-possession (all raw bytes, mirroring the lobby announce);
     /// the module re-verifies both signatures against the network binding,
     /// requires the issuer to be a CURRENT member, and enforces single-use
-    /// via the redeemed-nonce set in consensus state. success emits
-    /// `ValsetMsg::Grant { key: joiner }` in the same block — the joiner
-    /// becomes a full node (mesh + statesync standing, no quorum seat).
+    /// via the redeemed-nonce set in consensus state. success emits the
+    /// role's grant in the same block: `Resident` → `ValsetMsg::Grant`
+    /// (full node standing — mesh + statesync, no quorum seat), `Client` →
+    /// `ClientsMsg::Grant` (submit authorization only).
     Redeem {
         issuer: Vec<u8>,
         nonce: Vec<u8>,
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        /// the ONE key the token admits — the handler rejects `joiner != target`
-        /// so a blob holder cannot redeem under a key the invite was not minted
-        /// for. raw bytes, mirroring the lobby announce.
+        /// the ONE key the token admits, or EMPTY bytes for a BEARER token.
+        /// targeted: the handler rejects `joiner != target` so a blob holder
+        /// cannot redeem under a key the invite was not minted for. bearer:
+        /// no lock — first valid proof wins the nonce, and bearer is
+        /// Client-role-only (a bearer Resident redeem is rejected). raw
+        /// bytes, mirroring the lobby announce.
         target: Vec<u8>,
-        /// the invite role byte (`Resident = 0`, `Client = 1`); a `Client` token
-        /// is rejected at redeem until the thin-client plane lands.
+        /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
+        /// redeem grants valset resident standing; a `Client` redeem grants
+        /// submit-only client standing in the `clients` module.
         role: u8,
         /// the token's unix-seconds expiry — enforced against block time.
         expires_unix_secs: u64,

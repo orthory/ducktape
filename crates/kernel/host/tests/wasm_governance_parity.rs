@@ -166,12 +166,14 @@ fn execute(id: &str) -> Msg {
 /// proof-of-possession) into the Redeem op — deterministic: the nonce is
 /// caller-chosen and ed25519 signing is deterministic.
 fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &Ed) -> Msg {
-    // target-locked, Resident-role, far-future expiry — the post-client-ACL
-    // grant preimage (binding || nonce || target || role || expires_le).
+    // target-locked, Resident-role, far-future expiry — the current grant
+    // preimage (binding || nonce || kind[|| target] || role || expires_le;
+    // kind 1 = targeted).
     let expires: u64 = 4_102_444_800; // 2100-01-01 — far future, wall-clock-shaped
     let token_msg = [
         binding,
         nonce.as_slice(),
+        &[1u8],
         joiner.public_key().as_ref(),
         &[InviteRole::Resident.as_u8()],
         &expires.to_le_bytes(),
@@ -181,7 +183,7 @@ fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &E
     let token = InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        target: joiner.public_key(),
+        target: Some(joiner.public_key()),
         role: InviteRole::Resident,
         expires_unix_secs: expires,
         sig: token_sig.clone(),
