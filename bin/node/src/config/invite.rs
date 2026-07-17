@@ -18,10 +18,11 @@ use super::{
 /// decode at all.
 const INVITE_PREFIX: &str = "🦆";
 
-/// Joining through coordinated reach needs the local reachability plane even
-/// when the invite does not contain a direct inviter-hosted tunnel bootstrap.
-pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
-    invite.wireguard.is_some() || invite.descriptor.has_coordinated_reach().unwrap_or(false)
+/// Join Protocol v2: the WireGuard/overlay plane is MANDATORY, so an invite
+/// always brings up the joiner's reachability plane. Kept as a named predicate
+/// (call sites read as intent) rather than inlining a bare `true`.
+pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
+    true
 }
 
 // ============================================================================
@@ -35,64 +36,29 @@ pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
 // ============================================================================
 
 pub use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
-    verify_invite_token, verify_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, grant_preimage,
+    sign_join_proof, verify_invite_token, verify_join_proof,
 };
 
-/// mint a token binding an invite to `binding` (the genesis namespace) and to
-/// the single `target` key it admits, with `role` and `expires_unix_secs`:
-/// fresh OS randomness for the nonce, signed by this member's identity. minting
-/// IS the admission decision FOR THAT KEY.
+/// mint a BEARER invite token binding an invite to `binding` (the genesis
+/// namespace), with `role` and `expires_unix_secs`: fresh OS randomness for the
+/// nonce, signed by this member's identity. minting IS the admission decision —
+/// there is no target (기명 dropped in Join Protocol v2); whoever presents a
+/// valid join proof for the nonce first redeems it, single-use.
 pub fn mint_invite_token(
     signer: &ed25519::PrivateKey,
     binding: &[u8],
-    target: &ed25519::PublicKey,
-    role: InviteRole,
-    expires_unix_secs: u64,
-) -> InviteToken {
-    mint_token(signer, binding, Some(target), role, expires_unix_secs)
-}
-
-/// mint a BEARER Client token: no target lock — the first key to present a
-/// valid join proof takes the grant, and the nonce set makes that
-/// exactly-once. Client role BY CONSTRUCTION: this is the only bearer
-/// constructor, so no bearer path onto the resident plane exists.
-pub fn mint_bearer_client_token(
-    signer: &ed25519::PrivateKey,
-    binding: &[u8],
-    expires_unix_secs: u64,
-) -> InviteToken {
-    mint_token(signer, binding, None, InviteRole::Client, expires_unix_secs)
-}
-
-/// the shared mint core — re-states the grant preimage (`binding ‖ nonce ‖
-/// kind[‖ target] ‖ role ‖ expires_le`) because `grant_preimage` is private
-/// to the governance crate; a drift fails the crypto tests loudly.
-fn mint_token(
-    signer: &ed25519::PrivateKey,
-    binding: &[u8],
-    target: Option<&ed25519::PublicKey>,
     role: InviteRole,
     expires_unix_secs: u64,
 ) -> InviteToken {
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let mut msg = Vec::new();
-    msg.extend_from_slice(binding);
-    msg.extend_from_slice(&nonce);
-    match target {
-        Some(t) => {
-            msg.push(1);
-            msg.extend_from_slice(t.as_ref());
-        }
-        None => msg.push(0),
-    }
-    msg.push(role.as_u8());
-    msg.extend_from_slice(&expires_unix_secs.to_le_bytes());
+    // sign the SAME preimage every verifier checks (`grant_preimage` is `pub`
+    // from the governance crate) — no restated shape to drift.
+    let msg = grant_preimage(binding, &nonce, role, expires_unix_secs);
     InviteToken {
         issuer: signer.public_key(),
         nonce,
-        target: target.cloned(),
         role,
         expires_unix_secs,
         sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
@@ -100,23 +66,14 @@ fn mint_token(
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
-/// packed token: `issuer(32) ‖ nonce(16) ‖ kind(1) ‖ [target(32) if
-/// kind==1] ‖ role(1) ‖ expires_le(8) ‖ sig(64)` — 154 bytes targeted, 122
-/// bearer.
-const INVITE_TOKEN_TARGETED_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 32 + 1 + 8 + 64;
-const INVITE_TOKEN_BEARER_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 1 + 8 + 64;
+/// packed token: `issuer(32) ‖ nonce(16) ‖ role(1) ‖ expires_le(8) ‖
+/// sig(64)` — a fixed 121 bytes (every invite is bearer; no kind, no target).
+const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 8 + 64;
 
 fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
-    let mut out = Vec::with_capacity(INVITE_TOKEN_TARGETED_LEN);
+    let mut out = Vec::with_capacity(INVITE_TOKEN_LEN);
     out.extend_from_slice(t.issuer.as_ref());
     out.extend_from_slice(&t.nonce);
-    match &t.target {
-        Some(target) => {
-            out.push(1);
-            out.extend_from_slice(target.as_ref());
-        }
-        None => out.push(0),
-    }
     out.push(t.role.as_u8());
     out.extend_from_slice(&t.expires_unix_secs.to_le_bytes());
     out.extend_from_slice(t.sig.encode().as_ref());
@@ -124,42 +81,17 @@ fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
 }
 
 fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
-    let issuer = ed25519::PublicKey::decode(bytes.get(..32).ok_or("invite token truncated")?)
-        .map_err(|e| format!("invite token issuer: {e}"))?;
-    let mut nonce = [0u8; INVITE_NONCE_LEN];
-    nonce.copy_from_slice(
-        bytes
-            .get(32..32 + INVITE_NONCE_LEN)
-            .ok_or("invite token truncated")?,
-    );
-    let mut pos = 32 + INVITE_NONCE_LEN;
-    let kind = *bytes.get(pos).ok_or("invite token truncated")?;
-    pos += 1;
-    let (target, expect_len) = match kind {
-        1 => {
-            let t = ed25519::PublicKey::decode(
-                bytes.get(pos..pos + 32).ok_or("invite token truncated")?,
-            )
-            .map_err(|e| format!("invite token target: {e}"))?;
-            pos += 32;
-            (Some(t), INVITE_TOKEN_TARGETED_LEN)
-        }
-        0 => (None, INVITE_TOKEN_BEARER_LEN),
-        other => return Err(format!("unknown invite token kind {other}")),
-    };
-    if bytes.len() != expect_len {
+    if bytes.len() != INVITE_TOKEN_LEN {
         return Err(format!(
-            "invite token must be {expect_len} bytes for its kind, got {}",
+            "invite token must be {INVITE_TOKEN_LEN} bytes, got {}",
             bytes.len()
         ));
     }
-    // the semantic rule rides the decoder so EVERY consumer inherits it: a
-    // bearer token is Client-role-only (mint cannot produce the combination;
-    // a self-signed blob can claim it, and consensus would reject it — but
-    // no decoder should hand it onward as a valid token either).
-    if target.is_none() && bytes[pos] != InviteRole::Client.as_u8() {
-        return Err("bearer invite tokens are client-only".into());
-    }
+    let issuer = ed25519::PublicKey::decode(&bytes[..32])
+        .map_err(|e| format!("invite token issuer: {e}"))?;
+    let mut nonce = [0u8; INVITE_NONCE_LEN];
+    nonce.copy_from_slice(&bytes[32..32 + INVITE_NONCE_LEN]);
+    let mut pos = 32 + INVITE_NONCE_LEN;
     let role = InviteRole::from_u8(bytes[pos])?;
     pos += 1;
     let expires_unix_secs = u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
@@ -169,7 +101,6 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
     Ok(InviteToken {
         issuer,
         nonce,
-        target,
         role,
         expires_unix_secs,
         sig,
@@ -461,12 +392,15 @@ pub fn fronts_from_adverts(
 pub struct Invite {
     pub descriptor: NetworkDescriptor,
     pub token: InviteToken,
-    /// `None` when the inviter runs no reachability plane (a TCP-reachable
-    /// network) — the joiner then rides the descriptor's reach hints alone.
-    pub wireguard: Option<InviteWireGuard>,
+    /// The inviter's WireGuard bootstrap — MANDATORY in v2 (the WG/overlay
+    /// plane is required; data planes ride the overlay only). The `endpoint`
+    /// inside stays reachability-dependent (a fully-NAT'd inviter has none and
+    /// is reached by identity via the coordinator), but the key material is
+    /// always present so the joiner can seal its first-contact intro.
+    pub wireguard: InviteWireGuard,
     /// additional first-contact paths the inviter offers (its reachable
-    /// members). Empty on a pre-feature blob or when the inviter has no
-    /// persisted mesh state. Never part of `genesis_namespace`.
+    /// members). Empty when the inviter has no persisted mesh state. Never part
+    /// of `genesis_namespace`.
     pub fronts: Vec<Front>,
     pub expires_unix_secs: u64,
 }
@@ -476,7 +410,7 @@ pub struct Invite {
 pub fn encode_invite(
     descriptor: &NetworkDescriptor,
     token: &InviteToken,
-    wireguard: Option<&InviteWireGuard>,
+    wireguard: &InviteWireGuard,
     fronts: &[Front],
     signer: &ed25519::PrivateKey,
 ) -> Result<String, String> {
@@ -553,7 +487,7 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
 fn pack_invite(
     d: &NetworkDescriptor,
     token: &InviteToken,
-    wireguard: Option<&InviteWireGuard>,
+    wireguard: &InviteWireGuard,
     fronts: &[Front],
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
@@ -589,21 +523,23 @@ fn pack_invite(
         }
     }
 
-    match wireguard {
-        Some(wg) if wg.endpoint.is_some() && wg.intro.is_some() => {
+    // the WireGuard bootstrap is MANDATORY in v2. flag 1 = a direct underlay
+    // endpoint (+ intro), flag 2 = coordinated (key material only, reached by
+    // identity via the coordinator). there is no flag-0 "no wireguard" shape.
+    match (&wireguard.endpoint, &wireguard.intro) {
+        (Some(endpoint), Some(intro)) => {
             out.push(1);
-            out.extend_from_slice(&wg.public_key);
-            put_str_u8(&mut out, wg.endpoint.as_ref().expect("checked"))?;
-            put_str_u8(&mut out, wg.intro.as_ref().expect("checked"))?;
-            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+            out.extend_from_slice(&wireguard.public_key);
+            put_str_u8(&mut out, endpoint)?;
+            put_str_u8(&mut out, intro)?;
+            out.extend_from_slice(&wireguard.mesh_port.to_le_bytes());
         }
-        Some(wg) if wg.endpoint.is_none() && wg.intro.is_none() => {
+        (None, None) => {
             out.push(2);
-            out.extend_from_slice(&wg.public_key);
-            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+            out.extend_from_slice(&wireguard.public_key);
+            out.extend_from_slice(&wireguard.mesh_port.to_le_bytes());
         }
-        Some(_) => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
-        None => out.push(0),
+        _ => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
     }
 
     // the coordination-mode echo: one byte inside the SIGNED envelope,
@@ -690,31 +626,39 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     }
     reach.sort();
 
+    // the WireGuard bootstrap is MANDATORY (v2): flag 0 ("no wireguard") no
+    // longer decodes — an old WG-less blob fails loudly at the reader.
     let wireguard = match r.u8()? {
-        0 => None,
         1 => {
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(r.take(32)?);
             let endpoint = r.take_str_u8()?;
             let intro = r.take_str_u8()?;
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
-            Some(InviteWireGuard {
+            InviteWireGuard {
                 public_key,
                 endpoint: Some(endpoint),
                 intro: Some(intro),
                 mesh_port,
-            })
+            }
         }
         2 => {
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(r.take(32)?);
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
-            Some(InviteWireGuard {
+            InviteWireGuard {
                 public_key,
                 endpoint: None,
                 intro: None,
                 mesh_port,
-            })
+            }
+        }
+        0 => {
+            return Err(
+                "this invite carries no WireGuard bootstrap — v2 requires the reachability \
+                 plane; ask for a fresh invite from a plane-enabled member"
+                    .into(),
+            );
         }
         other => return Err(format!("unknown wireguard flag {other} in invite")),
     };
@@ -872,21 +816,30 @@ mod tests {
         );
     }
 
-    /// mint + encode with the test defaults: issuer-signed, targeting the
-    /// issuer's own key, Resident role, far-future expiry.
+    /// a minimal coordinated (endpoint-less) WireGuard bootstrap — the default a
+    /// test invite carries when it does not specify one (v2: WG is mandatory).
+    fn coordinated_test_wg() -> InviteWireGuard {
+        InviteWireGuard {
+            public_key: [0u8; 32],
+            endpoint: None,
+            intro: None,
+            mesh_port: 52200,
+        }
+    }
+
+    /// mint + encode with the test defaults: issuer-signed, bearer Resident,
+    /// far-future expiry. A caller that passes no WireGuard gets the minimal
+    /// coordinated default, since v2 invites always carry a bootstrap.
     fn encode_test_invite(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
-        let token = mint_invite_token(
-            issuer,
-            d.genesis_namespace().as_bytes(),
-            &issuer.public_key(),
-            InviteRole::Resident,
-            u64::MAX,
-        );
-        encode_invite(d, &token, wireguard, &[], issuer).expect("encode")
+        let token =
+            mint_invite_token(issuer, d.genesis_namespace().as_bytes(), InviteRole::Resident, u64::MAX);
+        let default_wg = coordinated_test_wg();
+        let wg = wireguard.unwrap_or(&default_wg);
+        encode_invite(d, &token, wg, &[], issuer).expect("encode")
     }
 
     #[test]
@@ -911,7 +864,7 @@ mod tests {
             d.reach_hints().expect("source hints"),
             "the dial hints survive as typed reach hints"
         );
-        assert_eq!(invite.wireguard, None);
+        assert_eq!(invite.wireguard, coordinated_test_wg());
         let binding = d.genesis_namespace();
         assert!(verify_invite_token(&invite.token, binding.as_bytes()));
 
@@ -958,14 +911,13 @@ mod tests {
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let binding = d.genesis_namespace();
-        let token = mint_bearer_client_token(&issuer, binding.as_bytes(), u64::MAX);
+        let token = mint_invite_token(&issuer, binding.as_bytes(), InviteRole::Client, u64::MAX);
         assert_eq!(token.role, InviteRole::Client);
-        assert!(token.target.is_none());
         assert!(verify_invite_token(&token, binding.as_bytes()));
 
-        // packed-token codec: bearer width, exact roundtrip.
+        // packed-token codec: fixed width, exact roundtrip.
         let packed = pack_invite_token(&token);
-        assert_eq!(packed.len(), INVITE_TOKEN_BEARER_LEN);
+        assert_eq!(packed.len(), INVITE_TOKEN_LEN);
         assert_eq!(unpack_invite_token(&packed).expect("token roundtrip"), token);
 
         // token FILE roundtrip (the joining side persists it 0600).
@@ -974,7 +926,7 @@ mod tests {
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token.clone()));
 
         // full blob roundtrip: the variable-width token rides length-prefixed.
-        let blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
         let invite = decode_invite(&blob).expect("decode");
         assert_eq!(invite.token, token);
 
@@ -987,36 +939,6 @@ mod tests {
             &invite.token,
             &proof
         ));
-    }
-
-    #[test]
-    fn a_self_signed_bearer_resident_blob_fails_decode_not_panics() {
-        // an attacker CAN self-sign this combination (it is its own issuer);
-        // mint never produces it and consensus rejects it, but the decoder
-        // must refuse to hand it onward as a valid token — every consumer
-        // (join paste, user-redeem-invite) inherits this one guard.
-        let issuer = ed25519::PrivateKey::from_seed(7);
-        let d = NetworkDescriptor {
-            chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
-            validators: vec![hex_bytes(issuer.public_key().as_ref())],
-            bootstrap: vec![format!(
-                "{}@127.0.0.1:52200",
-                hex_bytes(issuer.public_key().as_ref())
-            )],
-            reach: vec![],
-            coordination: None,
-        };
-        let hostile = mint_token(
-            &issuer,
-            d.genesis_namespace().as_bytes(),
-            None,
-            InviteRole::Resident,
-            u64::MAX,
-        );
-        let blob = encode_invite(&d, &hostile, None, &[], &issuer).expect("encode");
-        let err = decode_invite(&blob).expect_err("refused at decode");
-        assert!(err.contains("client-only"), "{err}");
     }
 
     #[test]
@@ -1040,12 +962,13 @@ mod tests {
             mesh_port: 52200,
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
-        assert_eq!(invite.wireguard, Some(wg));
+        assert_eq!(invite.wireguard, wg);
         // a wireguard invite with no fronts decodes to an empty set.
         assert!(invite.fronts.is_empty());
     }
 
-    /// mint + encode with the test defaults, carrying a set of fronts.
+    /// mint + encode with the test defaults, carrying a set of fronts. A caller
+    /// that passes no WireGuard gets the minimal coordinated default (v2).
     fn encode_test_invite_with_fronts(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
@@ -1055,11 +978,12 @@ mod tests {
         let token = mint_invite_token(
             issuer,
             d.genesis_namespace().as_bytes(),
-            &issuer.public_key(),
             InviteRole::Resident,
             u64::MAX,
         );
-        encode_invite(d, &token, wireguard, fronts, issuer).expect("encode")
+        let default_wg = coordinated_test_wg();
+        let wg = wireguard.unwrap_or(&default_wg);
+        encode_invite(d, &token, wg, fronts, issuer).expect("encode")
     }
 
     fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
@@ -1243,13 +1167,12 @@ mod tests {
         let token = mint_invite_token(
             &issuer,
             d.genesis_namespace().as_bytes(),
-            &issuer.public_key(),
             InviteRole::Resident,
             1_000,
         );
 
         // expiry is enforced at decode, deterministically via the injected clock.
-        let blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
         assert!(decode_invite_at(&blob, 999).is_ok());
         let err = decode_invite_at(&blob, 1_000).expect_err("expired");
         assert!(err.contains("expired"), "{err}");
@@ -1269,7 +1192,7 @@ mod tests {
         // an envelope signed by someone other than the token's issuer is
         // refused at encode (and would fail decode's issuer verify anyway).
         let outsider = ed25519::PrivateKey::from_seed(8);
-        assert!(encode_invite(&d, &token, None, &[], &outsider).is_err());
+        assert!(encode_invite(&d, &token, &coordinated_test_wg(), &[], &outsider).is_err());
 
         // the old versioned prefixes are gone: a stale paste fails loudly
         // with re-mint guidance.
@@ -1332,7 +1255,6 @@ mod tests {
         let token = mint_invite_token(
             &issuer,
             d.genesis_namespace().as_bytes(),
-            &issuer.public_key(),
             InviteRole::Resident,
             u64::MAX,
         );
@@ -1350,7 +1272,7 @@ mod tests {
                 endpoint: None,
             },
         ];
-        let blob = encode_invite(&d, &token, None, &fronts, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &fronts, &issuer).expect("encode");
         let invite = decode_invite(&blob).expect("decode");
         assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
     }
@@ -1366,12 +1288,11 @@ mod tests {
         let token = mint_invite_token(
             &issuer,
             d.genesis_namespace().as_bytes(),
-            &issuer.public_key(),
             InviteRole::Resident,
             u64::MAX,
         );
 
-        let empty_blob = encode_invite(&d, &token, None, &[], &issuer).expect("encode");
+        let empty_blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
         let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
         assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
 
@@ -1380,7 +1301,7 @@ mod tests {
         let with_front = encode_invite(
             &d,
             &token,
-            None,
+            &coordinated_test_wg(),
             &[Front {
                 member_key: [1u8; 32],
                 wireguard_public_key: [2u8; 32],
@@ -1404,7 +1325,6 @@ mod tests {
         let token = mint_invite_token(
             &issuer,
             b"net#00000000@feedface",
-            &issuer.public_key(),
             InviteRole::Resident,
             u64::MAX,
         );

@@ -16,10 +16,11 @@ use recovery::Manifest;
 use super::announce::{CapabilityAnnouncer, ReadinessSignaller};
 use crate::constants::{DRAIN_TICK, MAX_PROTOCOL_VERSION};
 use crate::host_reads::read_upgrade_version_fields;
+use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{oracle_pool, relay_runtime, voice_plane};
+use crate::{lobby, oracle_pool, relay_runtime, voice_plane};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -27,18 +28,28 @@ pub(super) type ValidatorNode = node::OrderedNode<
 >;
 
 /// a join gate held open awaiting its `Redeem` frame's consensus fate (ADR
-/// §3.2). the member submitted the redemption and holds the joiner's
-/// `Admitted`/`Rejected` reply keyed by the frame id until `on_drain` resolves
-/// it — the settle-then-answer seam, mirroring `pending_relays`.
+/// §3.2). the member submitted the redemption and holds the joiner's outcome
+/// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
+/// the settle-then-answer seam, mirroring `pending_relays`. no mesh `peer`
+/// rides here any more (Join v2 §4): the answer goes back over the tunnel
+/// doorbell, read from the shared map on the joiner's next retransmit.
 struct GatePending {
-    /// the lobby-channel connection the reply goes back to.
-    peer: ed25519::PublicKey,
-    /// the joiner key, to clear the `gating` in-flight index on resolution.
+    /// the joiner key: clears the `gating` in-flight index and keys the
+    /// outcome write on resolution.
     joiner: Vec<u8>,
     /// the packed coord cap to deliver on `Admitted` (private coordination).
     cap: Option<Vec<u8>>,
     /// answer `Busy` (non-terminal) once past this instant (§3.2 timeout).
     deadline: std::time::Instant,
+}
+
+/// write a resolved gate outcome where the intro doorbell reads it — the
+/// shared map the joiner's next retransmit is answered from (Join v2 §4).
+fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroReply) {
+    outcomes
+        .lock()
+        .expect("gate outcomes lock")
+        .insert(joiner, reply);
 }
 
 /// The long-lived state owned by the validator event loop.
@@ -58,16 +69,23 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    pub(super) lobby_tx: super::MeshSender,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
-    pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
+    /// the join GATE's forward lane from the intro doorbell (Join v2 §4):
+    /// verified gate requests the reachability plane rang through.
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    /// a never-sending clone of the forward lane's sender, held so the select
+    /// arm stays PENDING (instead of None-spinning) when no reachability
+    /// plane was wired to ring the doorbell.
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    /// where the drain writes each settled gate outcome; the doorbell reads
+    /// it on the joiner's next retransmit.
+    pub(super) gate_outcomes: GateOutcomes,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
     pub(super) next_seq: u64,
     pub(super) prev_ckpt: (Option<u64>, u64),
     pub(super) signer: ed25519::PrivateKey,
     pub(super) label: String,
-    pub(super) namespace: Vec<u8>,
     pub(super) peers: Vec<ed25519::PublicKey>,
     pub(super) validators: Vec<ed25519::PublicKey>,
     pub(super) dev_demo: bool,
@@ -100,13 +118,13 @@ struct ValidatorRuntime<'a> {
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    lobby_tx: super::MeshSender,
     relay_tx: super::MeshSender,
+    gate_outcomes: GateOutcomes,
+    _gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
     next_seq: u64,
     prev_ckpt: (Option<u64>, u64),
     signer: ed25519::PrivateKey,
     label: String,
-    namespace: Vec<u8>,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     dev_demo: bool,
@@ -173,16 +191,16 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         blob_peers,
         blob_client,
         reach_cmd,
-        lobby_tx,
         relay_tx,
         mut sync_state_rx,
-        mut lobby_ingress,
+        mut gate_fwd_rx,
+        gate_fwd_keepalive,
+        gate_outcomes,
         mut relay_ingress,
         next_seq,
         prev_ckpt,
         signer,
         label,
-        namespace,
         peers,
         validators,
         dev_demo,
@@ -420,13 +438,13 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         blob_peers,
         blob_client,
         reach_cmd,
-        lobby_tx,
         relay_tx,
+        gate_outcomes,
+        _gate_fwd_keepalive: gate_fwd_keepalive,
         next_seq,
         prev_ckpt,
         signer,
         label,
-        namespace,
         peers,
         validators,
         dev_demo,
@@ -505,9 +523,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                     runtime.on_oracle_result(msg).await;
                 }
             }
-            announce = lobby_ingress.next() => {
-                if let Some((peer, bytes)) = announce {
-                    runtime.on_lobby(peer, bytes).await;
+            fwd = gate_fwd_rx.recv().fuse() => {
+                // the intro doorbell rang the GATE through the tunnel (§4).
+                // `None` cannot spin here: `gate_fwd_keepalive` holds the
+                // channel open even when no plane was wired.
+                if let Some(fwd) = fwd {
+                    runtime.on_gate_forward(fwd).await;
                 }
             }
             relayed = relay_ingress.next() => {

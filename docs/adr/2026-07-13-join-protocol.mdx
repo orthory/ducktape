@@ -1,12 +1,21 @@
 # ADR: Join Protocol v1 — invitation-gated admission
 
-Date: 2026-07-13. Status: **Accepted** (design approved; implementation lands
-as campaign PR4 on top of the targeted-invites cutover). Joining a Ducktape
-network becomes ONE synchronous, invitation-gated handshake: a joiner that
-does not pass the gate gets nothing — no tunnel, no lobby residence, no
-chain state — and a joiner that passes leaves the handshake already holding
-consensus-granted standing. This document is the normative protocol; every
-implementation step cites the section it implements.
+Date: 2026-07-13. Status: **SUPERSEDED** by
+[Join Protocol v2](./2026-07-17-join-protocol-v2.mdx) (2026-07-17). The
+synchronous invitation-gated handshake and settle-then-answer described here
+remain in force, but v2 changes three things: invites are now BEARER (the
+`target` lock is gone), the first-contact intro is SEALED to the member's
+WireGuard key, and the mesh `CHANNEL_LOBBY` + `lobby_identity` are removed (the
+gate rides the doorbell). Everything below about targeted invites, the lobby
+channel, and the lobby transport identity is HISTORICAL — read v2 for the
+current protocol. The short-invite rows in §8 were also never shipped as
+described (the plane was torn down in PR #644).
+
+Joining a Ducktape network becomes ONE synchronous, invitation-gated handshake:
+a joiner that does not pass the gate gets nothing — no tunnel, no lobby
+residence, no chain state — and a joiner that passes leaves the handshake
+already holding consensus-granted standing. This document is the normative
+protocol; every implementation step cites the section it implements.
 
 ## Context
 

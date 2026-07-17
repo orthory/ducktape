@@ -18,78 +18,107 @@ pub(crate) enum IntroPath {
     Coordinated,
 }
 
-/// One inviter-side intro datagram, shared by BOTH doorbells: decode →
+/// One inviter-side intro datagram, shared by BOTH doorbells: OPEN → decode →
 /// verify → install → ack, in that order — the ack is only emitted after the
 /// `InstallInvitePeer` reply settles, so "acked" can never outrun
-/// "installed". `ack` abstracts the reply transport (the direct listener
-/// answers on its own socket, the coordinated receiver via
-/// `SendResolverDatagram`). Returns `false` once the plane's command channel
-/// is gone, telling the caller to exit its receive loop.
-pub(crate) async fn handle_intro<F, Fut>(
-    bytes: &[u8],
+/// "installed". The datagram arrives SEALED to this member's WireGuard X25519
+/// key (Join Protocol v2, item 5): a bearer token never crosses the wire in
+/// the clear, so `open` decrypts it with the member's secret before anything
+/// else. `ack` abstracts the reply transport (the direct listener answers on
+/// its own socket, the coordinated receiver via `SendResolverDatagram`).
+/// Returns `false` once the plane's command channel is gone, telling the
+/// caller to exit its receive loop.
+/// the shared gate-outcome map (joiner key → its resolved [`lobby::IntroReply`]):
+/// the run loop's drain WRITES the settled outcome, the intro doorbell READS it
+/// on the joiner's next retransmit and seals it back down the tunnel.
+pub(crate) type GateOutcomes =
+    std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, lobby::IntroReply>>>;
+
+/// The member side's link from the intro doorbell (reachability-plane thread)
+/// to its validator run loop (§4). The doorbell FORWARDS a verified gate request
+/// to the loop, which submits `Redeem` and settles; the loop's drain writes the
+/// resolved outcome into `outcomes`, which the doorbell reads on the joiner's
+/// next retransmit and seals back. A joiner's own plane carries `None`.
+#[derive(Clone)]
+pub(crate) struct GateHook {
+    pub(crate) forward: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(crate) outcomes: GateOutcomes,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_intro<F, Fut, O>(
+    sealed: &[u8],
     src: std::net::SocketAddr,
     binding: &[u8],
     label: &str,
     path: IntroPath,
     cmds: &tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
+    open: O,
+    gate: Option<&GateHook>,
     ack: F,
 ) -> bool
 where
     F: FnOnce(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = ()>,
+    O: FnOnce(&[u8]) -> Result<Vec<u8>, String>,
 {
-    let Ok(msg) = lobby::decode_intro(bytes) else {
-        return true; // junk on the doorbell — drop.
+    // OPEN the sealed envelope to THIS member's WG key. A datagram that does not
+    // open — an observer's junk, or an intro sealed to a different member — is
+    // dropped silently: no nonce to echo, no answer earned.
+    let Ok(plaintext) = open(sealed) else {
+        return true;
     };
-    let ack_bytes = |installed: bool, detail: String| {
+    let Ok(msg) = lobby::decode_intro(&plaintext) else {
+        return true;
+    };
+    let nonce = msg.nonce.clone();
+    // a pre-verify refusal goes out in the CLEAR (no joiner key trusted yet).
+    let refuse_cleartext = |detail: String| {
         lobby::encode_intro_ack(&lobby::IntroAck {
-            nonce: msg.nonce.clone(),
-            installed,
-            detail,
+            nonce: nonce.clone(),
+            reply: lobby::IntroReply::Refused { detail },
         })
     };
     let verified = match lobby::verify_intro(&msg, binding) {
         Ok(v) => v,
         Err(e) => {
-            // the direct doorbell answers a failed verification; the
-            // coordinated path drops it silently (preserved pre-extraction
-            // behavior — an unverified src has earned no resolver datagram).
             if path == IntroPath::Direct {
-                ack(ack_bytes(false, e)).await;
+                ack(refuse_cleartext(e)).await;
             }
             return true;
         }
     };
-    // expiry, on this member's wall clock: an expired token must not obtain a
-    // tunnel either. `msg.expires_unix_secs` is signature-covered (verify just
-    // proved it), so trusting the wire field here is trusting the token.
+    // past verification we hold the joiner's WG key: every reply from here is
+    // SEALED to it, so an `Admitted`'s coordinator capability never crosses the
+    // wire in the clear.
+    let joiner_wg = verified.wg_public_key;
+    let sealed_reply = |reply: lobby::IntroReply| {
+        let bytes = lobby::encode_intro_ack(&lobby::IntroAck {
+            nonce: nonce.clone(),
+            reply,
+        });
+        reachability::seal(&joiner_wg, &bytes)
+    };
+    // V4 expiry, on this member's wall clock (signature-covered field).
     if nat_traversal::now_secs() >= msg.expires_unix_secs {
         if path == IntroPath::Direct {
-            ack(ack_bytes(
-                false,
-                "invite expired — ask the inviter for a fresh one".into(),
-            ))
+            ack(sealed_reply(lobby::IntroReply::Refused {
+                detail: "invite expired — ask the inviter for a fresh one".into(),
+            }))
             .await;
         }
         return true;
     }
-    // V8 (ADR §3.1): role supported. only `Resident` redeems over the
-    // lobby gate; a `Client` token grants submit-only standing (redeemed via
-    // `user-redeem-invite` over `/v1/submit`) and must not obtain a tunnel
-    // the gate would refuse terminally at Phase B anyway — refuse here so a
-    // doomed join never gets a tunnel at all (R2). the raw role byte is
-    // signature-covered (verify proved it) and any INVALID byte was already
-    // rejected by `verify_intro`, so this only splits Resident from Client.
-    // spent (V6) and issuer-in-valset (V7) need committed state the
-    // transport plane does not hold — those stay enforced at Phase B.
+    // V8 role: only `Resident` gates here; a `Client` token redeems via
+    // `user-redeem-invite` and must not obtain a tunnel (R2). V6/V7 need
+    // committed state — those run at the loop (`on_gate_forward`).
     if msg.role != config::InviteRole::Resident.as_u8() {
         if path == IntroPath::Direct {
-            ack(ack_bytes(
-                false,
-                "a client invite is not redeemable at a node join — it grants submit \
-                 access; redeem it with `ducktape-node user-redeem-invite`"
+            ack(sealed_reply(lobby::IntroReply::Refused {
+                detail: "a client invite is not redeemable at a node join — it grants submit \
+                         access; redeem it with `ducktape-node user-redeem-invite`"
                     .into(),
-            ))
+            }))
             .await;
         }
         return true;
@@ -117,12 +146,66 @@ where
                 "[node {label}] invite intro: {flavor}tunnel peer installed for {}",
                 config::hex_bytes(&verified.joiner.as_ref()[..4])
             );
-            ack(ack_bytes(true, "tunnel installed".into())).await;
+            // THE GATE (§4): the sealed intro IS the gate request. Forward it to
+            // the run loop and ack the CURRENT outcome — `Installed` while it
+            // settles, or the resolved `Admitted`/`Rejected` a later retransmit
+            // picks up from the shared map.
+            let reply = gate_reply(gate, &verified.joiner, &msg).await;
+            ack(sealed_reply(reply)).await;
         }
-        Ok(Err(e)) => ack(ack_bytes(false, e)).await,
-        Err(_) => ack(ack_bytes(false, "plane exited".into())).await,
+        Ok(Err(e)) => ack(sealed_reply(lobby::IntroReply::Refused { detail: e })).await,
+        Err(_) => {
+            ack(sealed_reply(lobby::IntroReply::Refused {
+                detail: "plane exited".into(),
+            }))
+            .await;
+        }
     }
     true
+}
+
+/// Resolve the gate for a just-installed joiner: return the settled outcome if
+/// the run loop already wrote one (a later retransmit), else forward the request
+/// (the loop dedups per joiner) and report `Installed` while it settles. A
+/// `None` gate always reports `Installed`.
+///
+/// outcome consumption is deliberate: `Admitted` STAYS in the map (idempotent
+/// success — a lost ack's retransmit re-reads it for free), everything else is
+/// taken ONE-SHOT — a joiner that retries this member later (a failed-over
+/// `Busy`, a new attempt) must re-run the gate, not eat a stale refusal forever.
+async fn gate_reply(
+    gate: Option<&GateHook>,
+    joiner: &ed25519::PublicKey,
+    msg: &lobby::IntroRequest,
+) -> lobby::IntroReply {
+    let Some(hook) = gate else {
+        return lobby::IntroReply::Installed;
+    };
+    let joiner_key = joiner.as_ref().to_vec();
+    let settled = {
+        let mut outcomes = hook.outcomes.lock().expect("gate outcomes lock");
+        match outcomes.get(&joiner_key) {
+            Some(admitted @ lobby::IntroReply::Admitted { .. }) => Some(admitted.clone()),
+            Some(_) => outcomes.remove(&joiner_key),
+            None => None,
+        }
+    };
+    if let Some(outcome) = settled {
+        return outcome;
+    }
+    let _ = hook
+        .forward
+        .send(lobby::GateForward {
+            issuer: msg.issuer.clone(),
+            nonce: msg.nonce.clone(),
+            token_sig: msg.token_sig.clone(),
+            joiner: joiner_key,
+            proof: msg.proof.clone(),
+            role: msg.role,
+            expires_unix_secs: msg.expires_unix_secs,
+        })
+        .await;
+    lobby::IntroReply::Installed
 }
 
 /// the reachability plane's thread body: derive the plane's endpoints, bind
@@ -162,6 +245,10 @@ pub(crate) fn wire_reachability_plane<S, R>(
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
+    // the member side's gate hook (§4): the intro doorbells forward verified
+    // gate requests to the validator run loop through it and answer settled
+    // outcomes from its shared map. a joiner's own plane passes `None`.
+    gate: Option<GateHook>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -175,6 +262,7 @@ where
     let thread_label = label.to_string();
     let reach_signer = signer.clone();
     let reach_coord_cap = coord_cap;
+    let reach_gate = gate;
     let plane_chain_id = chain_id.to_string();
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
@@ -200,6 +288,7 @@ where
                     coordinators,
                     intro_listen,
                     reach_coord_cap,
+                    reach_gate,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -363,6 +452,9 @@ async fn reachability_plane(
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
+    // the member side's gate hook (§4), cloned into both intro doorbells;
+    // `None` on a joiner's plane.
+    gate: Option<GateHook>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -617,12 +709,22 @@ async fn reachability_plane(
             }
         });
     }
-    // a parked standby's gossip arrives under the network's derived lobby
-    // identity (its own key is untracked until the grant cutover) — admit
-    // that ingress; content signatures still authenticate every message.
-    // the namespace is a TOML-sourced string, so `as_bytes` reproduces the
-    // exact bytes the transport derived the lobby key from.
-    let gossip_ingress = Some(config::lobby_identity(chain_id.as_bytes()).public_key());
+    // this member's WG keypair, shared into the intro doorbells so they can
+    // OPEN a joiner's sealed first-contact intro (item 5). `load_or_generate`
+    // is idempotent — the orchestrator below loads the same file, so a failure
+    // here means the plane is unusable for inbound joins; log and disable the
+    // listeners rather than take the node down (the plane is an overlay).
+    let intro_keypair = match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
+        Ok((keypair, _)) => Some(std::sync::Arc::new(keypair)),
+        Err(e) => {
+            eprintln!(
+                "[node {label}] invite intro: wireguard key {wireguard_key_file:?} unreadable \
+                 ({e}) — inbound joins via this node's invites are disabled (cannot open sealed \
+                 intros)"
+            );
+            None
+        }
+    };
     let config = reachability::ReachabilityConfig {
         chain_id,
         signer,
@@ -633,7 +735,10 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
         persist_file: Some(mesh_state_file),
-        gossip_ingress,
+        // the derived lobby transport identity is RETIRED (Join v2 §4): a
+        // joiner's gossip arrives under its REAL key — the mesh re-track at
+        // its Redeem grant is what admits it.
+        gossip_ingress: None,
     };
     // the invite intro listener: a fresh joiner's first contact. one
     // datagram carries the token, the joiner's identity + proof, and its
@@ -653,9 +758,10 @@ async fn reachability_plane(
              intro endpoint) — intros arrive via the coordinated path"
         );
     }
-    if let Some(intro_addr) = intro_listen {
+    if let (Some(intro_addr), Some(intro_keypair)) = (intro_listen, intro_keypair.clone()) {
         let intro_cmds = nudges.clone().downgrade();
         let intro_label = label.clone();
+        let intro_gate = gate.clone();
         // `chain_id` (the namespace string) moved into the plane config
         // above; the binding tokens sign over is those same bytes.
         let binding = config.chain_id.clone().into_bytes();
@@ -689,6 +795,8 @@ async fn reachability_plane(
                     &intro_label,
                     IntroPath::Direct,
                     &intro_cmds,
+                    |sealed| intro_keypair.open_sealed(sealed),
+                    intro_gate.as_ref(),
                     ack,
                 )
                 .await
@@ -698,9 +806,12 @@ async fn reachability_plane(
             }
         });
     }
-    if let Some(mut invite_intro_rx) = invite_intro_rx.take() {
+    if let (Some(mut invite_intro_rx), Some(intro_keypair)) =
+        (invite_intro_rx.take(), intro_keypair.clone())
+    {
         let intro_cmds = nudges.clone().downgrade();
         let intro_label = label.clone();
+        let intro_gate = gate.clone();
         let binding = config.chain_id.clone().into_bytes();
         tokio::spawn(async move {
             while let Some((src, bytes)) = invite_intro_rx.recv().await {
@@ -724,6 +835,8 @@ async fn reachability_plane(
                     &intro_label,
                     IntroPath::Coordinated,
                     &intro_cmds,
+                    |sealed| intro_keypair.open_sealed(sealed),
+                    intro_gate.as_ref(),
                     ack,
                 )
                 .await

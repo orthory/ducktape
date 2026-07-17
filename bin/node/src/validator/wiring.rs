@@ -21,7 +21,8 @@ use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::read_upgrade_state;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
-use crate::reachability_plane::wire_reachability_plane;
+use crate::lobby;
+use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
 use crate::{voice, voice_plane};
@@ -36,12 +37,16 @@ pub(super) struct PreWiring {
     pub(super) channel_bank: super::ChannelBank,
     pub(super) sync_tx: super::MeshSender,
     pub(super) sync_rx: super::MeshReceiver,
-    pub(super) lobby_tx: super::MeshSender,
-    pub(super) lobby_rx: super::MeshReceiver,
     pub(super) relay_tx: super::MeshSender,
     pub(super) relay_rx: super::MeshReceiver,
     pub(super) media_peers: Option<Arc<voice_plane::MediaPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
+    /// the join GATE's loop end (Join v2 §4): forwarded requests arrive here…
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    /// …kept open by this never-sending clone even when no plane was wired…
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    /// …and settled outcomes go back through this shared map.
+    pub(super) gate_outcomes: GateOutcomes,
 }
 
 pub(super) struct RuntimeWiring {
@@ -57,7 +62,6 @@ pub(super) struct RuntimeWiring {
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
-    pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
 }
 
@@ -90,7 +94,6 @@ pub(super) async fn finish(
     mut channel_bank: super::ChannelBank,
     sync_tx: super::MeshSender,
     sync_rx: super::MeshReceiver,
-    lobby_rx: super::MeshReceiver,
     relay_rx: super::MeshReceiver,
 ) -> RuntimeWiring {
     // the FINAL index heal, at the boot tip every path converged on:
@@ -434,26 +437,6 @@ pub(super) async fn finish(
                 }
             });
     }
-    // the lobby lane rides the same bridge pattern: announces are consumed
-    // by the pump between drains. drop-on-full is doubly safe here — a
-    // parked joiner re-announces every few seconds anyway.
-    let (lobby_bridge_tx, lobby_ingress) =
-        futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-    context.child("lobby_ingress").spawn(move |_ctx| {
-        let mut receiver = lobby_rx;
-        let mut bridge_tx = lobby_bridge_tx;
-        async move {
-            loop {
-                match receiver.recv().await {
-                    Ok((peer, msg)) => {
-                        let bytes: Vec<u8> = msg.into();
-                        let _ = bridge_tx.try_send((peer, bytes));
-                    }
-                    Err(_) => return,
-                }
-            }
-        }
-    });
     // the submit-relay lane rides the same bounded drop-on-full bridge: a
     // dropped relay degrades to the resident client's honest timeout +
     // re-submit, so flood pressure never blocks the pump.
@@ -486,7 +469,6 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
-        lobby_ingress,
         relay_ingress,
     }
 }
@@ -622,10 +604,6 @@ pub(super) async fn wire(
         })
         .collect();
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
-    // the lobby lane: parked joiners announce their keys here (connected
-    // as the derived lobby identity); this member verifies each announce
-    // against the invite token it carries and RECORDS it for approval.
-    let (lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
     // the submit-relay lane: a resident-standing node ships its own
     // signed frame here; this validator takes custody and answers on
     // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
@@ -688,6 +666,14 @@ pub(super) async fn wire(
     // the mesh through the two pump tasks below.
     let (reach_p2p_tx, mut reach_p2p_rx) =
         network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+    // the join GATE's two connectors between the intro doorbell (the plane's
+    // thread) and the validator run loop (Join v2 §4): verified gate requests
+    // forward in over the channel; resolved outcomes ride back through the
+    // shared map. created whether or not the plane runs — the loop's select
+    // arm stays wired either way (the keepalive sender keeps it pending, not
+    // None-spinning, when no doorbell exists to ring it).
+    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<lobby::GateForward>(256);
+    let gate_outcomes = GateOutcomes::default();
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
         match wireguard_listen {
             Some(wg_addr) => {
@@ -729,6 +715,12 @@ pub(super) async fn wire(
                     // coordinated intros ride the plane's shared socket.
                     invite_listen,
                     coord_cap.clone(),
+                    // MEMBER side: the doorbells ring the join gate through
+                    // to this validator's run loop (§4).
+                    Some(GateHook {
+                        forward: gate_fwd_tx.clone(),
+                        outcomes: gate_outcomes.clone(),
+                    }),
                     reach_p2p_tx,
                     reach_p2p_rx,
                 ))
@@ -770,11 +762,12 @@ pub(super) async fn wire(
         channel_bank,
         sync_tx,
         sync_rx,
-        lobby_tx,
-        lobby_rx,
         relay_tx,
         relay_rx,
         media_peers,
         reach_cmd,
+        gate_fwd_rx,
+        gate_fwd_keepalive: gate_fwd_tx,
+        gate_outcomes,
     }
 }

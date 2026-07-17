@@ -1,7 +1,12 @@
 //! invite redemption end-to-end through a REAL host: minting is the admission
 //! decision, so a `GovMsg::Redeem` carrying a member-minted token plus the
-//! joiner's proof-of-possession grants full-node (observer) standing with no
-//! ballot — and the redeemed-nonce set makes every token single-use.
+//! joiner's proof-of-possession grants standing with no ballot — and the
+//! redeemed-nonce set makes every token single-use.
+//!
+//! Join Protocol v2: EVERY invite is bearer (무기명). There is no target lock;
+//! whoever presents a valid join proof for the nonce first wins the grant, and
+//! single-use bounds it. The role (`Resident`/`Client`) selects which standing
+//! plane the grant lands in.
 //!
 //! ops are driven through `Host::submit_at` with `Origin::External(...)`,
 //! exactly the shape the ordered lane hands the host after VERIFYING a frame
@@ -41,61 +46,27 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 }
 
 /// re-state the invite-grant preimage here rather than reach into
-/// `governance::invite` (private): a preimage drift in the crate then FAILS
-/// these tests loudly instead of silently signing a stale shape. a kind
-/// byte (`1` ‖ target for targeted, `0` for bearer) precedes the role.
-fn grant_preimage_for_tests(
-    binding: &[u8],
-    nonce: &[u8],
-    target: Option<&PrivateKey>,
-    role: InviteRole,
-    expires: u64,
-) -> Vec<u8> {
+/// `governance::invite`: a preimage drift in the crate then FAILS these tests
+/// loudly instead of silently signing a stale shape. v2: `binding ‖ nonce ‖
+/// role ‖ expiry` — no kind byte, no target.
+fn grant_preimage_for_tests(binding: &[u8], nonce: &[u8], role: InviteRole, expires: u64) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(binding);
     out.extend_from_slice(nonce);
-    match target {
-        Some(t) => {
-            out.push(1);
-            out.extend_from_slice(t.public_key().as_ref());
-        }
-        None => out.push(0),
-    }
     out.push(role.as_u8());
     out.extend_from_slice(&expires.to_le_bytes());
     out
 }
 
-/// mint as `issuer`, locked to `target`, with explicit role and expiry (fixed
-/// nonce — tests need determinism).
-fn mint_for(
-    issuer: &PrivateKey,
-    nonce_byte: u8,
-    target: &PrivateKey,
-    role: InviteRole,
-    expires: u64,
-) -> InviteToken {
+/// mint a BEARER token as `issuer` with explicit role and expiry (fixed nonce —
+/// tests need determinism). There is no target: any key that presents a valid
+/// proof for this nonce may redeem.
+fn mint(issuer: &PrivateKey, nonce_byte: u8, role: InviteRole, expires: u64) -> InviteToken {
     let nonce = [nonce_byte; INVITE_NONCE_LEN];
-    let msg = grant_preimage_for_tests(BINDING, &nonce, Some(target), role, expires);
+    let msg = grant_preimage_for_tests(BINDING, &nonce, role, expires);
     InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        target: Some(target.public_key()),
-        role,
-        expires_unix_secs: expires,
-        sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
-    }
-}
-
-/// mint a BEARER token as `issuer` — no target lock; role is the caller's so
-/// the client-only rule can be pinned from the outside.
-fn mint_bearer_for(issuer: &PrivateKey, nonce_byte: u8, role: InviteRole, expires: u64) -> InviteToken {
-    let nonce = [nonce_byte; INVITE_NONCE_LEN];
-    let msg = grant_preimage_for_tests(BINDING, &nonce, None, role, expires);
-    InviteToken {
-        issuer: issuer.public_key(),
-        nonce,
-        target: None,
         role,
         expires_unix_secs: expires,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
@@ -110,12 +81,6 @@ fn redeem_msg(token: &InviteToken, joiner: &PrivateKey) -> Vec<u8> {
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: key_bytes(joiner),
         proof: proof.encode().as_ref().to_vec(),
-        // empty target bytes = bearer, mirroring the wire rule.
-        target: token
-            .target
-            .as_ref()
-            .map(|t| t.as_ref().to_vec())
-            .unwrap_or_default(),
         role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
     })
@@ -178,7 +143,7 @@ async fn residents(host: &Host) -> Vec<Vec<u8>> {
         .expect("valset query");
     match valset_decode(&reply).expect("decode") {
         ValsetReply::Residents(v) => v,
-        other => panic!("expected Observers, got {other:?}"),
+        other => panic!("expected Residents, got {other:?}"),
     }
 }
 
@@ -208,7 +173,7 @@ fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
     block_on(async {
         let mut host = gov_host();
         let (member, joiner) = (keypair(1), keypair(9));
-        let token = mint_for(&member, 7, &joiner, InviteRole::Resident, u64::MAX);
+        let token = mint(&member, 7, InviteRole::Resident, u64::MAX);
 
         submit_as(
             &mut host,
@@ -237,7 +202,7 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
     block_on(async {
         let mut host = gov_host();
         let (member, joiner) = (keypair(1), keypair(9));
-        let token = mint_for(&member, 7, &joiner, InviteRole::Resident, u64::MAX);
+        let token = mint(&member, 7, InviteRole::Resident, u64::MAX);
 
         submit_as(
             &mut host,
@@ -248,10 +213,9 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
         .await
         .expect("first redemption");
 
-        // the TARGET replaying its OWN nonce: a deterministic double-admit
-        // reject. (a NON-target replay is refused even earlier by the target
-        // lock; for a same-key replay the resident-standing guard fires before
-        // the nonce guard — both enforce single-use, so accept either.)
+        // the joiner replaying its OWN nonce: a deterministic double-admit
+        // reject. (for a same-key replay the resident-standing guard fires
+        // before the nonce guard — both enforce single-use, so accept either.)
         let err = submit_as(
             &mut host,
             &key_bytes(&member),
@@ -299,7 +263,7 @@ fn forged_or_unauthorized_redemptions_are_refused() {
 
         // a token minted by a NON-member verifies cryptographically but fails
         // the membership check — an outsider cannot admit anyone.
-        let foreign = mint_for(&outsider, 3, &joiner, InviteRole::Resident, u64::MAX);
+        let foreign = mint(&outsider, 3, InviteRole::Resident, u64::MAX);
         let err = submit_as(
             &mut host,
             &key_bytes(&member),
@@ -313,25 +277,25 @@ fn forged_or_unauthorized_redemptions_are_refused() {
             "got {err:?}"
         );
 
-        // a proof that does not match the (target == joiner) key fails the
-        // proof-of-possession: mint FOR keypair(10) so the target lock passes,
-        // but sign the proof with keypair(9) — a mismatched holder.
-        let substituted = keypair(10);
-        let token = mint_for(&member, 4, &substituted, InviteRole::Resident, u64::MAX);
-        let proof = sign_join_proof(&joiner, BINDING, &token); // signed by 9, not target 10
+        // the join proof binds the REDEEMING key: a frame that claims joiner
+        // keypair(10) but carries a proof signed by keypair(9) fails
+        // proof-of-possession — a bearer token is not a blank cheque, the
+        // redeemer must hold the key it names.
+        let claimed = keypair(10);
+        let token = mint(&member, 4, InviteRole::Resident, u64::MAX);
+        let proof = sign_join_proof(&joiner, BINDING, &token); // signed by 9, not 10
         let forged = gov_encode(&GovMsg::Redeem {
             issuer: token.issuer.as_ref().to_vec(),
             nonce: token.nonce.to_vec(),
             token_sig: token.sig.encode().as_ref().to_vec(),
-            joiner: key_bytes(&substituted), // == target, so the lock check passes
+            joiner: key_bytes(&claimed),
             proof: proof.encode().as_ref().to_vec(),
-            target: token.target.as_ref().expect("targeted").as_ref().to_vec(),
             role: token.role.as_u8(),
             expires_unix_secs: token.expires_unix_secs,
         });
         let err = submit_as(&mut host, &key_bytes(&member), 2, forged)
             .await
-            .expect_err("substituted joiner must be refused");
+            .expect_err("mismatched proof must be refused");
         assert!(
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("proof-of-possession")),
             "got {err:?}"
@@ -359,7 +323,7 @@ fn a_network_without_a_binding_refuses_redemption() {
         .expect("genesis");
 
         let (member, joiner) = (keypair(1), keypair(9));
-        let token = mint_for(&member, 5, &joiner, InviteRole::Resident, u64::MAX);
+        let token = mint(&member, 5, InviteRole::Resident, u64::MAX);
         let err = submit_as(
             &mut host,
             &key_bytes(&member),
@@ -376,39 +340,42 @@ fn a_network_without_a_binding_refuses_redemption() {
 }
 
 #[test]
-fn a_targeted_token_admits_only_its_target() {
+fn a_bearer_resident_token_is_first_wins_single_use() {
     block_on(async {
         let mut host = gov_host();
         let issuer = keypair(1);
-        let target = keypair(7);
-        let thief = keypair(8);
+        // ONE bearer Resident token; two different keys race to redeem it.
+        let token = mint(&issuer, 1, InviteRole::Resident, u64::MAX);
 
-        // the thief presents a valid self-proof for the target's token → reject.
-        let token = mint_for(&issuer, 1, &target, InviteRole::Resident, 1_000);
-        let err = submit_as(&mut host, &key_bytes(&thief), 10, redeem_msg(&token, &thief))
+        // key A — any key at all, no target lock — wins resident standing.
+        let a = keypair(50);
+        submit_as(&mut host, &key_bytes(&a), 10, redeem_msg(&token, &a))
             .await
-            .expect_err("locked");
-        assert!(format!("{err:?}").contains("locked to another key"), "{err:?}");
+            .expect("A redeems the bearer resident invite");
+        assert!(residents(&host).await.contains(&key_bytes(&a)), "A holds resident standing");
 
-        // the TARGET redeems → resident standing.
-        submit_as(&mut host, &key_bytes(&target), 10, redeem_msg(&token, &target))
+        // key B presents the SAME token with its OWN valid proof: the nonce is
+        // spent — single-use first-wins is the whole bearer containment story.
+        let b = keypair(51);
+        let err = submit_as(&mut host, &key_bytes(&b), 11, redeem_msg(&token, &b))
             .await
-            .expect("target redeems");
-        assert!(residents(&host).await.contains(&key_bytes(&target)));
+            .expect_err("second redemption of a spent bearer token");
+        assert!(format!("{err:?}").contains("already redeemed"), "{err:?}");
+        assert!(!residents(&host).await.contains(&key_bytes(&b)), "B gained nothing");
 
         // expiry is deliberately NOT consensus-enforced: consensus_time is
         // block height on this chain (no deterministic wall clock exists
         // in-consensus), so a wall-clock-expired token still settles here.
-        // enforcement lives at the joiner's decode and at every gating
-        // member's wall clock before Redeem submission (lobby + intro
-        // doorbells); single-use bounds any residual window. this pins the
-        // ABSENCE of the check so nobody re-adds a vacuous height-vs-seconds
-        // comparison and calls it enforcement.
-        let stale = mint_for(&issuer, 2, &thief, InviteRole::Resident, 1_000);
-        submit_as(&mut host, &key_bytes(&thief), 1_000_000, redeem_msg(&stale, &thief))
+        // enforcement lives at the joiner's decode and at every gating member's
+        // wall clock before Redeem submission (the sealed intro doorbell);
+        // single-use bounds any residual window. this pins the ABSENCE of the
+        // check so nobody re-adds a vacuous height-vs-seconds comparison.
+        let c = keypair(52);
+        let stale = mint(&issuer, 2, InviteRole::Resident, 1_000);
+        submit_as(&mut host, &key_bytes(&c), 1_000_000, redeem_msg(&stale, &c))
             .await
             .expect("an expired token is not rejected in-consensus");
-        assert!(residents(&host).await.contains(&key_bytes(&thief)));
+        assert!(residents(&host).await.contains(&key_bytes(&c)));
     });
 }
 
@@ -417,7 +384,7 @@ fn a_client_role_token_grants_client_standing_not_residency() {
     block_on(async {
         let mut host = gov_host();
         let (member, client) = (keypair(1), keypair(9));
-        let token = mint_for(&member, 3, &client, InviteRole::Client, u64::MAX);
+        let token = mint(&member, 3, InviteRole::Client, u64::MAX);
 
         submit_as(
             &mut host,
@@ -478,7 +445,7 @@ fn legacy_clients_are_invisible_until_protocol_v1() {
 
         let issuer = keypair(1);
         let resident = keypair(8);
-        let resident_token = mint_for(&issuer, 7, &resident, InviteRole::Resident, u64::MAX);
+        let resident_token = mint(&issuer, 7, InviteRole::Resident, u64::MAX);
         submit_as_version(
             &mut host,
             &key_bytes(&resident),
@@ -490,7 +457,7 @@ fn legacy_clients_are_invisible_until_protocol_v1() {
         .expect("resident admission stays available before v1");
 
         let client = keypair(9);
-        let client_token = mint_for(&issuer, 8, &client, InviteRole::Client, u64::MAX);
+        let client_token = mint(&issuer, 8, InviteRole::Client, u64::MAX);
         let error = submit_as_version(
             &mut host,
             &key_bytes(&client),
@@ -530,7 +497,7 @@ fn a_client_token_is_single_use() {
     block_on(async {
         let mut host = gov_host();
         let (member, client) = (keypair(1), keypair(9));
-        let token = mint_for(&member, 4, &client, InviteRole::Client, u64::MAX);
+        let token = mint(&member, 4, InviteRole::Client, u64::MAX);
 
         submit_as(
             &mut host,
@@ -561,89 +528,31 @@ fn a_client_token_is_single_use() {
 }
 
 #[test]
-fn a_client_token_still_enforces_target_lock_and_join_proof() {
+fn the_join_proof_is_enforced_for_a_client_token_too() {
     block_on(async {
         let mut host = gov_host();
         let issuer = keypair(1);
-        let target = keypair(7);
+
+        // claim keypair(10) as the joiner but sign the proof with keypair(8):
+        // proof-of-possession fails for a Client token exactly as for Resident.
+        let claimed = keypair(10);
         let thief = keypair(8);
-
-        // target-lock: a thief redeeming a Client token locked to the target,
-        // under the thief's own key, is refused.
-        let token = mint_for(&issuer, 1, &target, InviteRole::Client, u64::MAX);
-        let err = submit_as(&mut host, &key_bytes(&thief), 10, redeem_msg(&token, &thief))
-            .await
-            .expect_err("locked");
-        assert!(format!("{err:?}").contains("locked to another key"), "{err:?}");
-
-        // join-proof: mint for keypair(10) so the target-lock passes, but sign
-        // the join proof with keypair(9) — a mismatched holder — and present the
-        // frame under the target key. proof-of-possession fails.
-        let real_target = keypair(10);
-        let token = mint_for(&issuer, 2, &real_target, InviteRole::Client, u64::MAX);
-        let proof = sign_join_proof(&thief, BINDING, &token); // signed by 8, not target 10
+        let token = mint(&issuer, 2, InviteRole::Client, u64::MAX);
+        let proof = sign_join_proof(&thief, BINDING, &token); // signed by 8, not 10
         let forged = gov_encode(&GovMsg::Redeem {
             issuer: token.issuer.as_ref().to_vec(),
             nonce: token.nonce.to_vec(),
             token_sig: token.sig.encode().as_ref().to_vec(),
-            joiner: key_bytes(&real_target), // == target, so the lock passes
+            joiner: key_bytes(&claimed),
             proof: proof.encode().as_ref().to_vec(),
-            target: token.target.as_ref().expect("targeted").as_ref().to_vec(),
             role: token.role.as_u8(),
             expires_unix_secs: token.expires_unix_secs,
         });
-        let err = submit_as(&mut host, &key_bytes(&real_target), 11, forged)
+        let err = submit_as(&mut host, &key_bytes(&claimed), 11, forged)
             .await
             .expect_err("bad join proof");
         assert!(format!("{err:?}").contains("proof-of-possession"), "{err:?}");
 
         assert!(clients(&host).await.is_empty(), "nothing was granted");
-    });
-}
-
-#[test]
-fn a_bearer_client_redeem_grants_client_standing_first_wins() {
-    block_on(async {
-        let mut host = gov_host();
-        let issuer = keypair(1);
-        let token = mint_bearer_for(&issuer, 60, InviteRole::Client, u64::MAX);
-
-        // key A — any key at all, no target lock — takes the grant.
-        let a = keypair(61);
-        submit_as(&mut host, &key_bytes(&a), 1, redeem_msg(&token, &a))
-            .await
-            .expect("bearer client redeem");
-        assert!(clients(&host).await.contains(&key_bytes(&a)), "A holds client standing");
-        assert!(residents(&host).await.is_empty(), "bearer grants NO resident standing");
-
-        // key B presents the SAME token with its OWN valid proof: the nonce
-        // is spent — single-use first-wins is the whole bearer containment.
-        let b = keypair(62);
-        let err = submit_as(&mut host, &key_bytes(&b), 2, redeem_msg(&token, &b))
-            .await
-            .expect_err("second redemption of a bearer token");
-        assert!(format!("{err:?}").contains("already redeemed"), "{err:?}");
-        assert!(!clients(&host).await.contains(&key_bytes(&b)), "B gained nothing");
-    });
-}
-
-#[test]
-fn a_bearer_resident_token_is_rejected_as_client_only() {
-    block_on(async {
-        let mut host = gov_host();
-        let issuer = keypair(1);
-        // a WELL-FORMED bearer Resident token (valid sig over the v2
-        // preimage): the rule is semantic, not cryptographic.
-        let token = mint_bearer_for(&issuer, 63, InviteRole::Resident, u64::MAX);
-        let joiner = keypair(64);
-        let err = submit_as(&mut host, &key_bytes(&joiner), 1, redeem_msg(&token, &joiner))
-            .await
-            .expect_err("bearer resident redeem");
-        assert!(
-            format!("{err:?}").contains("bearer invites are client-only"),
-            "{err:?}"
-        );
-        assert!(residents(&host).await.is_empty(), "no resident standing granted");
-        assert!(clients(&host).await.is_empty(), "no client standing granted");
     });
 }

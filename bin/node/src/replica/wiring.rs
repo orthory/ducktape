@@ -1,10 +1,12 @@
 //! phase 6a of the joiner/replica role: everything that must register with
 //! the mesh BEFORE `network.start()` — the per-epoch engine-channel bank
 //! (cert/payload/black-holed lanes), the statesync channel pair, the
-//! reachability plane's STANDBY wiring (+ the tunnel-first join race), and
-//! the relay/lobby lanes, ending with the lobby-reply printer task and the
-//! `network.start()` call itself. `park` (phase 6b–6d) picks up everything
-//! this phase produced via [`ReplicaChannels`].
+//! reachability plane's STANDBY wiring (+ the tunnel-first join race, which
+//! since Join v2 §4 carries the GATE itself: the raced sealed intro is the
+//! gate request and the acked `Admitted` is the authoritative admission),
+//! and the relay lane, ending with the `network.start()` call itself. `park`
+//! (phase 6b–6d) picks up everything this phase produced via
+//! [`ReplicaChannels`].
 
 use commonware_cryptography::ed25519;
 use commonware_p2p::authenticated::discovery::{self, Network};
@@ -41,11 +43,11 @@ pub(super) struct ReplicaChannels {
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
-    pub(super) lobby_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
-    /// the joiner's gate-reply lane: the park loop's gate phase blocks on this
-    /// for the authoritative `GateMsg::Admitted`/`Rejected` (ADR §3.3). NOT a
-    /// side printer any more — the reply IS the admission signal.
-    pub(super) lobby_rx: discovery::Receiver<ed25519::PublicKey>,
+    /// the joiner's admission signal (Join v2 §4): set by the first-contact
+    /// task the moment a member's doorbell answers the gate with the
+    /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
+    /// retired `CHANNEL_LOBBY` gate FSM.
+    pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 }
 
@@ -76,6 +78,10 @@ pub(super) async fn wire(
     invite_token: &Option<config::InviteToken>,
     invite_wireguard: &Option<config::StoredInviteWireGuard>,
     invite_fronts: Vec<config::Front>,
+    // where an admission's delivered coord cap is persisted and the consumed
+    // invite token deleted (the workspace dir — same one `park` gates reads
+    // from).
+    workspace: std::path::PathBuf,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
@@ -198,6 +204,9 @@ pub(super) async fn wire(
                     // redeemable invites.
                     None,
                     coord_cap.clone(),
+                    // JOINER side: no gate hook — this node ANSWERS no gates,
+                    // it rings them (the first-contact race below).
+                    None,
                     reach_tx,
                     reach_rx,
                 ))
@@ -211,26 +220,22 @@ pub(super) async fn wire(
             }
         }
     };
-    // the TUNNEL-FIRST join window: an invite that carried a WireGuard
-    // bootstrap makes the tunnel the join's carrier — before any p2p,
-    // (a) this node's interface gains the INVITER as a peer (endpoint
-    // straight from the blob), and (b) an intro announcer delivers
-    // this node's identity + WireGuard key to the inviter's intro
-    // listener until acked, at which point the inviter's side of the
-    // tunnel exists too. the mesh dialer below then reaches the
-    // inviter's overlay ULA (the join-minted Direct hint) the moment
-    // the tunnel routes, and everything else — lobby announce,
-    // redemption, statesync — rides it.
-    // the TUNNEL-FIRST join window races the invite's UNIFIED path
-    // set: the inviter PLUS every offered front, in one candidate list.
-    // The first candidate to install this joiner's token-signed intro
-    // wins and the rest are cancelled; the mesh dialer below then
-    // reaches that member's overlay ULA (the join-minted Direct hints)
-    // the moment the tunnel routes, and everything else — lobby
-    // announce, redemption, statesync — rides it. If every offered path
-    // is exhausted the race is HONEST-terminal (a distinct exit, never
-    // a silent success). The mechanics live in `first_contact_join`;
-    // this is just the glue.
+    // the TUNNEL-FIRST join window, which since Join v2 §4 IS the join GATE:
+    // an invite that carried a WireGuard bootstrap makes the tunnel the
+    // join's carrier — before any p2p, (a) this node's interface gains the
+    // INVITER as a peer (endpoint straight from the blob), and (b) an intro
+    // announcer delivers this node's sealed identity + WireGuard key + token
+    // to the member's intro doorbell, which installs the tunnel AND forwards
+    // the gate into consensus. the race spans the invite's UNIFIED path set
+    // (the inviter PLUS every offered front, one candidate list); the first
+    // candidate whose doorbell settles the gate wins and the rest are
+    // cancelled. `Admitted` ⇒ standing is COMMITTED — persist the delivered
+    // coord cap, delete the consumed token, and wake the park loop (the
+    // `admitted` flag). a terminal `Rejected` ⇒ exit loudly (R2). If every
+    // offered path is exhausted the race is HONEST-terminal (a distinct
+    // exit, never a silent success). The mechanics live in
+    // `first_contact_join`; this is just the glue.
+    let admitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let (Some(reach), Some(token)) = (&reach_cmd, &invite_token) {
         let inviter = invite_wireguard.as_ref().and_then(|wg| {
             match (wg.issuer_key(), wg.public_key_bytes()) {
@@ -267,7 +272,10 @@ pub(super) async fn wire(
             match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
                 Ok((keypair, _)) => {
                     // this joiner's own token-signed intro, built once
-                    // and reused across every candidate in the race.
+                    // and reused across every candidate in the race. the
+                    // keypair rides along too: post-verify acks (and the
+                    // coord cap inside an `Admitted`) come back SEALED to it.
+                    let keypair = std::sync::Arc::new(keypair);
                     let intro = lobby::encode_intro(&lobby::intro_request(
                         &signer,
                         &namespace,
@@ -277,6 +285,8 @@ pub(super) async fn wire(
                     let token_nonce = token.nonce.to_vec();
                     let reach = reach.clone();
                     let race_label = label.clone();
+                    let race_admitted = admitted.clone();
+                    let cap_dir = workspace.clone();
                     // an exhausted race is honest-terminal ONLY for a fresh
                     // join (no checkpoint): a bad invite must exit loudly,
                     // never spin silently. a RESTART with standing (the
@@ -296,21 +306,70 @@ pub(super) async fn wire(
                                 candidates.clone(),
                                 intro.clone(),
                                 token_nonce.clone(),
+                                keypair.clone(),
                                 race_label.clone(),
                                 std::time::Duration::from_secs(90),
                             )
                             .await;
                             match outcome {
-                                first_contact_join::FirstContactOutcome::Installed {
+                                first_contact_join::FirstContactOutcome::Admitted {
                                     key,
                                     via,
+                                    height,
+                                    cap,
                                 } => {
                                     println!(
-                                        "[node {race_label}] invite: first contact via \
-                                         {via} to {} — join rides the overlay",
+                                        "[node {race_label}] ADMITTED at height {height} \
+                                         via {via} by member {} — standing is committed; \
+                                         the join rides the overlay",
                                         hex_bytes(&key.as_ref()[..4])
                                     );
+                                    if let Some(cap_bytes) = cap {
+                                        match config::unpack_coord_cap(&cap_bytes) {
+                                            Ok(cap) => match config::save_coord_cap(
+                                                &cap_dir, &cap,
+                                            ) {
+                                                Ok(()) => println!(
+                                                    "[node {race_label}] coordinator cap \
+                                                     delivered by member {} — saved \
+                                                     (issuer {}, expires {})",
+                                                    hex_bytes(&key.as_ref()[..4]),
+                                                    hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                    cap.not_after,
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "[node {race_label}] coordinator cap \
+                                                     delivered but could not be saved: {e}"
+                                                ),
+                                            },
+                                            Err(e) => eprintln!(
+                                                "[node {race_label}] member {} sent a \
+                                                 malformed coordinator cap: {e}",
+                                                hex_bytes(&key.as_ref()[..4]),
+                                            ),
+                                        }
+                                    }
+                                    // a CONSUMED credential must not survive to
+                                    // confuse a later boot (ADR §6): the invite
+                                    // did its one job.
+                                    config::delete_invite_token(&cap_dir);
+                                    race_admitted.store(
+                                        true,
+                                        std::sync::atomic::Ordering::Release,
+                                    );
                                     return;
+                                }
+                                first_contact_join::FirstContactOutcome::Rejected {
+                                    code,
+                                    detail,
+                                } => {
+                                    // R2: a terminal refusal means this invite can
+                                    // NEVER redeem — stop loudly instead of
+                                    // spinning candidates toward the same answer.
+                                    fatal!(race_label, "join gate refused \
+                                         ({code:?}): {detail} — this invite cannot be \
+                                         redeemed. ask the inviter for a fresh invite and \
+                                         re-join with the new blob.");
                                 }
                                 first_contact_join::FirstContactOutcome::Terminal {
                                     tried,
@@ -358,11 +417,6 @@ pub(super) async fn wire(
     // same lane. `relay_rx` is bridged into the serve window below (a
     // torn-down select must never drop its `recv()` mid-flight).
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
-    // the lobby lane: the joiner speaks `GateMsg::Request` here and the park
-    // loop's gate phase (ADR §3.3) blocks on the authoritative reply — no side
-    // printer, the reply IS the admission signal, so `lobby_rx` is handed to
-    // `park` verbatim.
-    let (lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
     network.start();
 
     ReplicaChannels {
@@ -375,8 +429,7 @@ pub(super) async fn wire(
         reach_cmd,
         relay_tx,
         relay_rx,
-        lobby_tx,
-        lobby_rx,
+        admitted,
         voice_requests,
     }
 }

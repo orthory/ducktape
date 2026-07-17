@@ -1,20 +1,19 @@
-//! the join-gate wire format (Join Protocol v1, ADR §3) — how a not-yet-
+//! the join-gate wire format (Join Protocol v2, ADR §4) — how a not-yet-
 //! admitted joiner asks to join, and how a gating member answers
 //! AUTHORITATIVELY.
 //!
-//! transport: the joiner connects to the mesh AS the network's derived lobby
-//! identity (see `config::lobby_identity`) — the one key every member tracks
-//! that any invite holder can derive — and speaks on `CHANNEL_LOBBY`. the
-//! lobby identity authenticates nothing; every claim in a [`GateMsg::Request`]
-//! is verified against the INVITE TOKEN it carries (issuer signature over the
-//! genesis namespace) and the joiner's proof-of-possession. UNLIKE the retired
-//! advisory announce, the gate is synchronous: a member runs the V1–V9
-//! checklist, settles `Redeem` through consensus, and its `Admitted` reply IS
-//! the admission — pass the gate and you already hold standing, fail it and you
-//! get nothing (no tunnel, no residence, no chain state).
+//! transport: the joiner's SEALED first-contact intro ([`IntroRequest`]) IS
+//! the gate request — it rides the WireGuard-tunnel doorbell, never the mesh
+//! (the pre-v2 `lobby_identity` + `CHANNEL_LOBBY` lane is gone). every claim
+//! in an intro is verified against the INVITE TOKEN it carries (issuer
+//! signature over the genesis namespace) and the joiner's proof-of-
+//! possession. the gate stays synchronous: a member runs the V1–V9 checklist,
+//! settles `Redeem` through consensus, and its [`IntroReply::Admitted`] IS
+//! the admission — pass the gate and you already hold standing, fail it and
+//! you get nothing (no tunnel, no residence, no chain state).
 //!
 //! json on the wire: matches the module-interface idiom, and this lane is
-//! low-volume (one Request per candidate per attempt).
+//! low-volume (one intro retransmit every couple of seconds per attempt).
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
@@ -34,8 +33,6 @@ pub enum RejectCode {
     BadEncoding,
     /// V2: the token signature does not verify for this network's binding.
     BadToken,
-    /// V3: the announcing key is not the invite's `target`.
-    NotTarget,
     /// V4: the invite expired against the member's wall clock.
     Expired,
     /// V5: the joiner's proof-of-possession does not verify.
@@ -55,57 +52,34 @@ pub enum RejectCode {
     Busy,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
+/// the verified-request carrier [`verify_join_request`] consumes (and
+/// [`verify_intro`] builds internally). NO LONGER A WIRE TYPE: the mesh
+/// `CHANNEL_LOBBY` lane it once rode is retired (Join v2 §4) — the fields now
+/// only ever travel inside a sealed [`IntroRequest`].
+#[derive(Debug, Clone, PartialEq)]
 pub enum GateMsg {
     /// joiner → member. "this key asks to join, invited by `issuer`" — the
     /// token's fields plus the joiner key and its proof-of-possession, all raw
-    /// bytes. `target`, `role`, and `expires_unix_secs` are the token's covered
-    /// fields; verify enforces `target == joiner`, so a blob holder cannot
-    /// announce under a key the invite was not minted for.
+    /// bytes. `role` and `expires_unix_secs` are the token's covered fields.
+    /// Every invite is bearer (기명 dropped in v2): there is no target, the
+    /// proof binds the announcing key and single-use bounds it.
     Request {
         issuer: Vec<u8>,
         nonce: Vec<u8>,
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        target: Vec<u8>,
         role: u8,
         expires_unix_secs: u64,
     },
-    /// member → joiner. the gate refused. `terminal` ⇒ the joiner STOPS
-    /// (exits) instead of failing over to another member (ADR R2/§3.3).
-    Rejected {
-        code: RejectCode,
-        detail: String,
-        terminal: bool,
-    },
-    /// member → joiner. the AUTHORITATIVE admission: the member settled
-    /// `Redeem` through consensus and it COMMITTED at `height` — the joiner now
-    /// holds standing (ADR R3).
-    ///
-    /// `cap` carries an OPAQUE genesis-issued coordinator capability (packed
-    /// `CoordCap` bytes) minted for the joiner when this network coordinates
-    /// PRIVATELY and the answering member is a genesis validator — the joiner
-    /// cannot receive it on the invite (its key does not exist at invite-mint
-    /// time), so this reply is its only delivery channel. lobby.rs stays
-    /// crypto-agnostic: it moves bytes and never depends on the cap types.
-    Admitted {
-        height: u64,
-        cap: Option<Vec<u8>>,
-    },
-}
-
-pub fn encode_msg(m: &GateMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
-}
-
-pub fn decode_msg(b: &[u8]) -> Result<GateMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
 }
 
 /// build the gate request for `token` as `joiner` — the proof binds the
-/// announced key to its secret holder.
+/// announced key to its secret holder. TEST-ONLY since the mesh gate lane
+/// retired (Join v2 §4): production requests only ever travel inside an
+/// [`intro_request`]; the tests keep this to exercise [`verify_join_request`]
+/// without re-deriving the proof signing by hand.
+#[cfg(test)]
 pub fn gate_request(
     joiner: &ed25519::PrivateKey,
     binding: &[u8],
@@ -120,12 +94,6 @@ pub fn gate_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
-        // empty target bytes = bearer, the wire-wide rule.
-        target: token
-            .target
-            .as_ref()
-            .map(|t| t.as_ref().to_vec())
-            .unwrap_or_default(),
         role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
     }
@@ -133,11 +101,15 @@ pub fn gate_request(
 
 /// map a [`verify_join_request`] error to its ADR §3.1 reject code (V1–V3/V5).
 /// every crypto/decode failure is TERMINAL; the caller sets the bit.
+///
+/// no production call site remains this generation — the doorbell's pre-verify
+/// `Refused` carries prose only — but the checklist-code mapping is part of
+/// the reject-code wire contract (ADR §4), test-pinned, and KEPT deliberately
+/// (item-4 blueprint).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn verify_reject_code(err: &str) -> RejectCode {
     if err.contains("does not verify for this network") {
         RejectCode::BadToken // V2
-    } else if err.contains("locked to a different key") {
-        RejectCode::NotTarget // V3
     } else if err.contains("proof-of-possession") {
         RejectCode::BadProof // V5
     } else {
@@ -154,8 +126,6 @@ pub fn redeem_reject_outcome(reason: Option<&str>) -> (RejectCode, bool) {
     let r = reason.unwrap_or("");
     if r.contains("already redeemed") {
         (RejectCode::Spent, true)
-    } else if r.contains("locked to another key") {
-        (RejectCode::NotTarget, true)
     } else if r.contains("proof-of-possession") {
         (RejectCode::BadProof, true)
     } else if r.contains("does not verify for this network") {
@@ -195,27 +165,13 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
         token_sig,
         joiner,
         proof,
-        target,
         role,
         expires_unix_secs,
-    } = msg
-    else {
-        return Err("not a join request".into());
-    };
+    } = msg;
     let issuer = ed25519::PublicKey::decode(issuer.as_slice())
         .map_err(|e| format!("issuer key: {e}"))?;
     let joiner = ed25519::PublicKey::decode(joiner.as_slice())
         .map_err(|e| format!("joiner key: {e}"))?;
-    // empty target bytes = a BEARER token (Client-role-only by mint rule; a
-    // bearer Resident could only be a forgery and dies on the signature).
-    let target = if target.is_empty() {
-        None
-    } else {
-        Some(
-            ed25519::PublicKey::decode(target.as_slice())
-                .map_err(|e| format!("target key: {e}"))?,
-        )
-    };
     let role = InviteRole::from_u8(*role)?;
     if nonce.len() != INVITE_NONCE_LEN {
         return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
@@ -230,26 +186,16 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
     let token = InviteToken {
         issuer: issuer.clone(),
         nonce: nonce_arr,
-        target: target.clone(),
         role,
         expires_unix_secs: *expires_unix_secs,
         sig,
     };
-    // signature first (kills a tampered target/role/expiry), THEN the target
-    // lock (named BEFORE the proof check so the error names the real problem:
-    // a blob holder announcing under its own valid self-proof). a BEARER
-    // token has no lock — any key may claim it; the ROLE gates downstream
-    // (ingress V8, the intro doorbell) are what keep it off the resident
-    // plane.
+    // signature first (kills a tampered role/expiry), then proof-of-possession.
+    // Every invite is bearer — no target lock — so the ROLE gates downstream
+    // (ingress V8, the intro doorbell) are what keep a Client token off the
+    // resident plane, and the sealed intro keeps the token off the wire.
     if !crate::config::verify_invite_token(&token, binding) {
         return Err("invite token signature does not verify for this network".into());
-    }
-    if let Some(t) = &token.target
-        && *t != joiner
-    {
-        return Err(
-            "invite is locked to a different key — this invite was minted for someone else".into(),
-        );
     }
     // NO expiry check here: the lobby fn stays pure crypto (same division as
     // the membership checks) — decode enforces wall-clock expiry, consensus
@@ -267,15 +213,16 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
 }
 
 // ============================================================================
-// the UDP intro — the same trust dance as the lobby announce, one transport
-// earlier: a fresh joiner has NO path to the mesh yet (that is what the
-// tunnel is for), so it announces its keys in a single datagram to the
-// inviter's intro listener. the token authenticates the request (mint was
-// the admission decision), the join proof binds the announced ed25519 key to
-// its holder, and a third signature binds the announced WIREGUARD key to
-// that same identity — the receiving node then installs the tunnel peer and
-// acks. everything after (lobby announce, redemption, statesync) rides the
-// tunnel-borne mesh.
+// the UDP intro — the joiner's first contact AND its gate request (§4): a
+// fresh joiner has NO path to the mesh yet (that is what the tunnel is for),
+// so it announces its keys in a single sealed datagram to the inviter's intro
+// listener. the token authenticates the request (mint was the admission
+// decision), the join proof binds the announced ed25519 key to its holder,
+// and a third signature binds the announced WIREGUARD key to that same
+// identity — the receiving node installs the tunnel peer, forwards the
+// request into consensus, and the acked outcome rides the same doorbell.
+// everything after (redemption settle, statesync) rides the tunnel-borne
+// mesh under the joiner's REAL key.
 // ============================================================================
 
 /// ed25519 signing namespace binding the announced X25519 WireGuard key to
@@ -291,7 +238,6 @@ pub struct IntroRequest {
     pub token_sig: Vec<u8>,
     pub joiner: Vec<u8>,
     pub proof: Vec<u8>,
-    pub target: Vec<u8>,
     pub role: u8,
     pub expires_unix_secs: u64,
     /// the joiner's X25519 WireGuard public key, raw.
@@ -300,14 +246,61 @@ pub struct IntroRequest {
     pub wg_sig: Vec<u8>,
 }
 
-/// the inviter's answer: the nonce echoes so the joiner matches the ack to
-/// its request; `installed` is false with a reason when the tunnel could not
-/// be brought up.
+/// what a member tells a joiner in answer to a first-contact intro (Join
+/// Protocol v2 §4): the sealed intro IS the gate request, so a member installs
+/// the tunnel and forwards the request into consensus. The first ack reports
+/// the tunnel is up while the gate settles (`Installed`); a later ack — once
+/// `Redeem` commits or is refused — carries the AUTHORITATIVE outcome.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntroReply {
+    /// tunnel installed; the gate is settling in consensus — keep waiting.
+    Installed,
+    /// the doorbell refused before installing a tunnel (bad token / expired /
+    /// wrong role). terminal for this candidate; carries no secret.
+    Refused { detail: String },
+    /// the AUTHORITATIVE admission: `Redeem` committed at `height` — the
+    /// joiner now holds standing (ADR R3).
+    ///
+    /// `cap` carries an OPAQUE genesis-issued coordinator capability (packed
+    /// `CoordCap` bytes) minted for the joiner when this network coordinates
+    /// PRIVATELY and the answering member is a genesis validator — the joiner
+    /// cannot receive it on the invite (its key does not exist at invite-mint
+    /// time), so this reply is its only delivery channel; the seal is what
+    /// keeps it off the wire. lobby.rs stays crypto-agnostic: it moves bytes
+    /// and never depends on the cap types.
+    Admitted { height: u64, cap: Option<Vec<u8>> },
+    /// the gate refused (member checklist or consensus). `terminal` ⇒ the joiner
+    /// stops instead of failing over.
+    Rejected {
+        code: RejectCode,
+        detail: String,
+        terminal: bool,
+    },
+}
+
+/// the member's answer, matched to the request by the echoed `nonce`. Post-verify
+/// replies are sealed to the joiner's WG key by the caller before hitting the
+/// wire; this type stays transport-agnostic.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IntroAck {
     pub nonce: Vec<u8>,
-    pub installed: bool,
-    pub detail: String,
+    pub reply: IntroReply,
+}
+
+/// a verified gate request a member's doorbell forwards to its validator run
+/// loop (§4): exactly the fields `governance::Redeem` needs, lifted from the
+/// opened intro. The loop runs the committed-state checks (V6/V7/V9), submits
+/// `Redeem`, settles; the outcome returns via the shared gate-outcome map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GateForward {
+    pub issuer: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub token_sig: Vec<u8>,
+    pub joiner: Vec<u8>,
+    pub proof: Vec<u8>,
+    pub role: u8,
+    pub expires_unix_secs: u64,
 }
 
 pub fn encode_intro(m: &IntroRequest) -> Vec<u8> {
@@ -341,11 +334,6 @@ pub fn intro_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
-        target: token
-            .target
-            .as_ref()
-            .map(|t| t.as_ref().to_vec())
-            .unwrap_or_default(),
         role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
         wg_public_key: wg_public_key.to_vec(),
@@ -376,7 +364,6 @@ pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro,
             token_sig: msg.token_sig.clone(),
             joiner: msg.joiner.clone(),
             proof: msg.proof.clone(),
-            target: msg.target.clone(),
             role: msg.role,
             expires_unix_secs: msg.expires_unix_secs,
         },
@@ -412,25 +399,19 @@ mod tests {
 
     const BINDING: &[u8] = b"net#00000000@feedface";
 
-    /// mint targeting `target` with the far-future Resident defaults the lobby
-    /// tests use.
-    fn mint_for(
-        issuer: &ed25519::PrivateKey,
-        target: &ed25519::PublicKey,
-    ) -> InviteToken {
-        mint_invite_token(issuer, BINDING, target, InviteRole::Resident, u64::MAX)
+    /// mint a far-future bearer Resident token — the lobby tests' default.
+    fn mint_for(issuer: &ed25519::PrivateKey) -> InviteToken {
+        mint_invite_token(issuer, BINDING, InviteRole::Resident, u64::MAX)
     }
 
     #[test]
-    fn a_join_request_roundtrips_and_verifies() {
+    fn a_join_request_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_for(&issuer, &joiner.public_key());
+        let token = mint_for(&issuer);
         let msg = gate_request(&joiner, BINDING, &token);
-        let decoded = decode_msg(&encode_msg(&msg)).expect("roundtrip");
-        assert_eq!(decoded, msg);
 
-        let verified = verify_join_request(&decoded, BINDING).expect("verifies");
+        let verified = verify_join_request(&msg, BINDING).expect("verifies");
         assert_eq!(verified.joiner, joiner.public_key());
         assert_eq!(verified.issuer, issuer.public_key());
         assert_eq!(verified.nonce, token.nonce);
@@ -439,60 +420,42 @@ mod tests {
     }
 
     #[test]
-    fn a_non_target_key_is_refused_by_name() {
+    fn any_key_may_claim_a_bearer_token_but_the_proof_must_hold() {
+        // every invite is bearer: ANY key may present the token (no target
+        // lock), so the containment is single-use + the join proof binding the
+        // ANNOUNCING key. two different keys each verify with their own proof.
         let issuer = ed25519::PrivateKey::from_seed(1);
-        let target = ed25519::PrivateKey::from_seed(2);
-        let thief = ed25519::PrivateKey::from_seed(3);
-        let token = mint_for(&issuer, &target.public_key());
-        // the thief holds the blob and announces under its OWN key with a VALID
-        // self-proof — exactly the bearer hole this feature closes.
-        let msg = gate_request(&thief, BINDING, &token);
-        let err = verify_join_request(&msg, BINDING).expect_err("refused");
-        assert!(err.contains("locked to a different key"), "{err}");
-        // the real target still verifies.
-        let msg = gate_request(&target, BINDING, &token);
-        assert!(verify_join_request(&msg, BINDING).is_ok());
-    }
-
-    #[test]
-    fn a_non_target_key_is_refused_by_name_over_the_intro() {
-        let issuer = ed25519::PrivateKey::from_seed(1);
-        let target = ed25519::PrivateKey::from_seed(2);
-        let thief = ed25519::PrivateKey::from_seed(3);
-        let token = mint_for(&issuer, &target.public_key());
-        let msg = intro_request(&thief, BINDING, &token, [9u8; 32]);
-        let err = verify_intro(&msg, BINDING).expect_err("refused");
-        assert!(err.contains("locked to a different key"), "{err}");
-        let msg = intro_request(&target, BINDING, &token, [9u8; 32]);
-        assert!(verify_intro(&msg, BINDING).is_ok());
+        let token = mint_for(&issuer);
+        for seed in [2u64, 3, 4] {
+            let joiner = ed25519::PrivateKey::from_seed(seed);
+            let msg = gate_request(&joiner, BINDING, &token);
+            let v = verify_join_request(&msg, BINDING).expect("bearer verifies for any key");
+            assert_eq!(v.joiner, joiner.public_key());
+        }
     }
 
     #[test]
     fn a_foreign_binding_or_forged_proof_is_refused() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_for(&issuer, &joiner.public_key());
+        let token = mint_for(&issuer);
         let msg = gate_request(&joiner, BINDING, &token);
 
         // another network refuses the same announce.
         assert!(verify_join_request(&msg, b"other-net").is_err());
 
-        // target == joiner (the lock passes), but a proof signed by a DIFFERENT
-        // key fails the proof-of-possession. (a substituted JOINER key is the
-        // target-lock case, covered by `a_non_target_key_is_refused_by_name`.)
+        // a proof signed by a DIFFERENT key than the announced joiner fails the
+        // proof-of-possession — a bearer token is not a blank cheque, the
+        // announcer must hold the key it names.
         let GateMsg::Request {
             issuer: i,
             nonce,
             token_sig,
             joiner: j,
-            target,
             role,
             expires_unix_secs,
             ..
-        } = msg
-        else {
-            unreachable!()
-        };
+        } = msg;
         let bad_proof = crate::config::sign_join_proof(
             &ed25519::PrivateKey::from_seed(3),
             BINDING,
@@ -505,7 +468,6 @@ mod tests {
             token_sig,
             joiner: j,
             proof: bad_proof.encode().as_ref().to_vec(),
-            target,
             role,
             expires_unix_secs,
         };
@@ -514,22 +476,20 @@ mod tests {
     }
 
     #[test]
-    fn a_bearer_token_at_the_gate_verifies_as_client_and_dies_on_the_role_gates() {
+    fn a_client_token_verifies_and_pins_role_client() {
+        // a Client token verifies at the gate but comes out role=Client, which
+        // ingress V8 and the intro doorbell terminally refuse — no client path
+        // onto the resident plane.
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = crate::config::mint_bearer_client_token(&issuer, BINDING, u64::MAX);
+        let token = mint_invite_token(&issuer, BINDING, InviteRole::Client, u64::MAX);
 
-        // crypto passes — ANY key may claim a bearer token (no target lock) —
         let msg = gate_request(&joiner, BINDING, &token);
-        let verified = verify_join_request(&msg, BINDING).expect("bearer verifies");
-        // — but it comes out role=Client, which ingress V8 and the intro
-        // doorbell terminally refuse: no bearer path onto the resident plane.
+        let verified = verify_join_request(&msg, BINDING).expect("client verifies");
         assert_eq!(verified.role, InviteRole::Client);
-        assert_eq!(verified.joiner, joiner.public_key());
 
-        // the intro half rides the same verify and pins the same role.
         let intro = intro_request(&joiner, BINDING, &token, [9u8; 32]);
-        let verified = verify_intro(&intro, BINDING).expect("bearer intro verifies");
+        let verified = verify_intro(&intro, BINDING).expect("client intro verifies");
         assert_eq!(verified.joiner, joiner.public_key());
         assert!(
             intro.role != InviteRole::Resident.as_u8(),
@@ -538,20 +498,26 @@ mod tests {
     }
 
     #[test]
-    fn an_admitted_reply_roundtrips() {
-        let msg = GateMsg::Admitted {
-            height: 42,
-            cap: None,
+    fn an_admitted_intro_ack_roundtrips() {
+        // the gate outcome rides the intro-ack wire now (Join v2 §4).
+        let ack = IntroAck {
+            nonce: vec![7u8; INVITE_NONCE_LEN],
+            reply: IntroReply::Admitted {
+                height: 42,
+                cap: None,
+            },
         };
-        assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
+        assert_eq!(
+            decode_intro_ack(&encode_intro_ack(&ack)).expect("roundtrip"),
+            ack
+        );
     }
 
     #[test]
-    fn a_rejected_reply_roundtrips_each_variant() {
+    fn a_rejected_intro_ack_roundtrips_each_code() {
         for (code, terminal) in [
             (RejectCode::BadEncoding, true),
             (RejectCode::BadToken, true),
-            (RejectCode::NotTarget, true),
             (RejectCode::Expired, true),
             (RejectCode::BadProof, true),
             (RejectCode::Spent, true),
@@ -559,12 +525,18 @@ mod tests {
             (RejectCode::RoleUnsupported, true),
             (RejectCode::Busy, false),
         ] {
-            let msg = GateMsg::Rejected {
-                code,
-                detail: "prose".into(),
-                terminal,
+            let ack = IntroAck {
+                nonce: vec![7u8; INVITE_NONCE_LEN],
+                reply: IntroReply::Rejected {
+                    code,
+                    detail: "prose".into(),
+                    terminal,
+                },
             };
-            assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
+            assert_eq!(
+                decode_intro_ack(&encode_intro_ack(&ack)).expect("roundtrip"),
+                ack
+            );
         }
     }
 
@@ -575,7 +547,6 @@ mod tests {
         let cases = [
             (RejectCode::BadEncoding, "bad_encoding"),
             (RejectCode::BadToken, "bad_token"),
-            (RejectCode::NotTarget, "not_target"),
             (RejectCode::Expired, "expired"),
             (RejectCode::BadProof, "bad_proof"),
             (RejectCode::Spent, "spent"),
@@ -595,7 +566,7 @@ mod tests {
     fn an_intro_roundtrips_verifies_and_pins_the_wireguard_key() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_for(&issuer, &joiner.public_key());
+        let token = mint_for(&issuer);
         let wg_key = [9u8; 32];
         let msg = intro_request(&joiner, BINDING, &token, wg_key);
         let decoded = decode_intro(&encode_intro(&msg)).expect("roundtrip");
@@ -619,11 +590,17 @@ mod tests {
     #[test]
     fn an_admitted_reply_carrying_a_cap_roundtrips() {
         // the cap is opaque bytes to lobby.rs — any blob roundtrips verbatim.
-        let msg = GateMsg::Admitted {
-            height: 7,
-            cap: Some(vec![1, 2, 3, 4, 5]),
+        let ack = IntroAck {
+            nonce: vec![7u8; INVITE_NONCE_LEN],
+            reply: IntroReply::Admitted {
+                height: 7,
+                cap: Some(vec![1, 2, 3, 4, 5]),
+            },
         };
-        assert_eq!(decode_msg(&encode_msg(&msg)).expect("roundtrip"), msg);
+        assert_eq!(
+            decode_intro_ack(&encode_intro_ack(&ack)).expect("roundtrip"),
+            ack
+        );
     }
 
     #[test]
@@ -631,10 +608,6 @@ mod tests {
         assert_eq!(
             verify_reject_code("invite token signature does not verify for this network"),
             RejectCode::BadToken
-        );
-        assert_eq!(
-            verify_reject_code("invite is locked to a different key — minted for someone else"),
-            RejectCode::NotTarget
         );
         assert_eq!(
             verify_reject_code("joiner proof-of-possession does not verify"),
@@ -664,10 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_announce_wire_no_longer_decodes() {
-        // NO backward compat (ADR §7): the pre-gate `join_reply` announce is a
-        // dead shape — a member/joiner speaking it does not interop.
-        let old_wire = br#"{"join_reply":{"recorded":true,"detail":"awaiting approval"}}"#;
-        assert!(decode_msg(old_wire).is_err());
+    fn the_retired_gate_reply_wire_no_longer_decodes_as_an_ack() {
+        // NO backward compat (ADR §7): the pre-v2 mesh `GateMsg` replies are a
+        // dead shape — a member/joiner speaking them does not interop with the
+        // doorbell's intro-ack lane.
+        let old_wire = br#"{"admitted":{"height":42,"cap":null}}"#;
+        assert!(decode_intro_ack(old_wire).is_err());
     }
 }

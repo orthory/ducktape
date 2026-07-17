@@ -102,11 +102,11 @@ pub(crate) const CHANNEL_SUBMIT_RELAY: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 pub(crate) const CHANNEL_STATE_SYNC: u64 = 4;
-/// the lobby channel: a not-yet-admitted joiner (connected as the derived
-/// lobby identity) announces `{invite token, pubkey, proof}` here; members
-/// verify and RECORD the join request for manual approval, and answer with an
-/// informational reply. see the `lobby` module.
-pub(crate) const CHANNEL_LOBBY: u64 = 5;
+// channel 5 was CHANNEL_LOBBY — the pre-v2 join-gate mesh lane (a joiner
+// connected as the derived lobby identity and spoke `GateMsg` here). Join
+// Protocol v2 rides the gate over the WireGuard-tunnel intro doorbell instead
+// (docs/adr/2026-07-17-join-protocol-v2.mdx §4). the number stays RESERVED:
+// never assign 5 to a new lane.
 /// the reachability channel: members gossip WireGuard endpoint records and
 /// signed advertisements and run the tunnel-upgrade handshake here (the
 /// `reachability` crate's staged node-driven WireGuard plane). registered in
@@ -326,19 +326,12 @@ pub(crate) fn pre_clients_state_schema_fingerprint() -> [u8; 32] {
 /// block events). mirrors the rpc bridge's stuck-node budget.
 pub(crate) const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 
-/// the joiner's per-candidate gate budget (ADR §3.3): how long the joiner
-/// blocks on ONE candidate member's authoritative reply before failing over to
-/// the next. wider than the member's settle budget so a slow-but-working member
-/// is preferred over churning candidates. three rounds over the candidate list,
-/// then the join is a fail-stop.
-pub(crate) const GATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(45);
-
 /// the join gate's settle budget (ADR §3.2): a gating member holds the joiner's
-/// pending `Admitted`/`Rejected` reply against its submitted `Redeem` frame for
-/// this long. if the frame has not drained by then the member answers
-/// `Rejected{ Busy, terminal: false }` and the joiner fails over to another
-/// member. wider than `SUBMIT_HOLD` because a fresh joiner's first block can
-/// wait on mesh warm-up.
+/// pending `Admitted`/`Rejected` outcome against its submitted `Redeem` frame
+/// for this long. if the frame has not drained by then the member writes
+/// `Rejected{ Busy, terminal: false }` into the gate-outcome map and the joiner
+/// fails over to another member. wider than `SUBMIT_HOLD` because a fresh
+/// joiner's first block can wait on mesh warm-up.
 pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// the five channels epoch `e`'s engine uses: vote, certificate, resolver, the
@@ -346,7 +339,7 @@ pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
 /// prefix forever). starts at 9, clear of the fixed discovery channels
-/// (statesync 4, lobby 5, reachability 6).
+/// (statesync 4, retired lobby 5, reachability 6).
 pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)

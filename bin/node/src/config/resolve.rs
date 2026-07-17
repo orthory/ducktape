@@ -14,7 +14,7 @@ use super::node_toml::NodeToml;
 use super::{
     Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
     StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap,
-    load_invite_fronts, load_invite_token, load_invite_wireguard, lobby_identity,
+    load_invite_fronts, load_invite_token, load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -120,7 +120,7 @@ pub struct Resolved {
     /// `wireguard.key` and `coord.cap` live (the network shape's config
     /// directory; the dev shape's `storage_dir`). Threaded so a parked
     /// joiner's gate phase can persist a `coord.cap` delivered over its
-    /// `GateMsg::Admitted` reply via `save_coord_cap`.
+    /// sealed `IntroReply::Admitted` ack via `save_coord_cap`.
     pub workspace: PathBuf,
     /// how provider runs are spawned (`NodeToml::sandbox`). `Direct` (the
     /// default) is the plain host spawn; `Podman` sandboxes every run AND
@@ -254,13 +254,11 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
             ReachDial::Coordinated { coord, coord_key } => coordinated.push((key, coord, coord_key)),
         }
     }
-    // mesh = validators ∪ every reach identity (direct + coordinated) ∪ the
-    // LOBBY identity. A fresh network-shape joiner may be outside this set at
-    // genesis; it parks until governance admits it — but it can always be
-    // HEARD: the lobby key is derivable from the descriptor alone, so every
-    // node folds the same key into the same tracked set (discovery kills peers
-    // whose set at a shared index differs) and an invite-holding joiner can
-    // complete the handshake to announce itself on the lobby channel.
+    // mesh = validators ∪ every reach identity (direct + coordinated). A
+    // fresh network-shape joiner may be outside this set at genesis; it parks
+    // until governance admits it (Join v2 §4: the gate rides the WireGuard-
+    // tunnel doorbell, so a pre-admission joiner needs no mesh door — its
+    // REAL key is re-tracked onto every member's mesh at its Redeem grant).
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
         if !mesh.contains(k) {
@@ -271,10 +269,6 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         if !mesh.contains(k) {
             mesh.push(k.clone());
         }
-    }
-    let lobby = lobby_identity(descriptor.genesis_namespace().as_bytes()).public_key();
-    if !mesh.contains(&lobby) {
-        mesh.push(lobby);
     }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
@@ -714,19 +708,10 @@ mod tests {
     }
 
     #[test]
-    fn lobby_identity_is_deterministic_and_lands_in_the_mesh() {
-        let a = lobby_identity(b"net#11111111@aa");
-        let b = lobby_identity(b"net#11111111@aa");
-        assert_eq!(a.public_key(), b.public_key(), "derivable by every holder");
-        let c = lobby_identity(b"net#22222222@bb");
-        assert_ne!(
-            a.public_key(),
-            c.public_key(),
-            "distinct networks get distinct lobby doors"
-        );
-
-        // resolve() folds the lobby key into the tracked mesh (but never into
-        // the consensus validator set).
+    fn the_mesh_carries_no_derived_lobby_identity() {
+        // Join v2 §4: the derived lobby transport identity is RETIRED — the
+        // tracked mesh is exactly the descriptor's real identities, nothing
+        // derivable from the namespace alone.
         let dir = tmp("lobbymesh");
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
@@ -744,11 +729,10 @@ mod tests {
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        let lobby = lobby_identity(d.genesis_namespace().as_bytes()).public_key();
-        assert!(r.mesh.contains(&lobby), "lobby key is tracked");
-        assert!(
-            !r.validators.contains(&lobby),
-            "lobby key never becomes a participant"
+        assert_eq!(
+            r.mesh,
+            vec![me.public_key()],
+            "mesh = the descriptor's real identities only"
         );
     }
 
@@ -814,8 +798,9 @@ mod tests {
         assert_eq!(r.namespace, d.genesis_namespace().into_bytes());
         assert!(String::from_utf8_lossy(&r.namespace).starts_with("net#11223344@"));
         assert_eq!(r.validators.len(), 2);
-        // validators + the derived lobby identity (the join-request door).
-        assert_eq!(r.mesh.len(), 3);
+        // exactly the validators — no derived lobby identity any more (the
+        // join gate rides the tunnel doorbell, Join v2 §4).
+        assert_eq!(r.mesh.len(), 2);
         // self never appears in bootstrappers; the other member does.
         assert_eq!(r.bootstrappers.len(), 1);
         assert_eq!(r.bootstrappers[0].0, other);
@@ -988,8 +973,9 @@ mod tests {
         assert_eq!(r.signer.public_key(), me.public_key());
         assert!(!r.validators.contains(&me.public_key()));
         assert_eq!(r.validators, vec![other.clone()]);
-        let lobby = lobby_identity(d.genesis_namespace().as_bytes()).public_key();
-        assert_eq!(r.mesh, vec![other, lobby]);
+        // no derived lobby door any more (Join v2 §4): the joiner's own key
+        // enters the mesh at its Redeem grant, not at resolve time.
+        assert_eq!(r.mesh, vec![other]);
     }
 
     #[test]

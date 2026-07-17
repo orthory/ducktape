@@ -1,0 +1,122 @@
+# ADR: Join Protocol v2 — bearer invites, sealed doorbell, no lobby identity
+
+Date: 2026-07-17. Status: **Accepted** (implementation in progress on
+`feat/join-v2`: items §2 and §4 landed; §3 and §5 in flight). Supersedes the
+invite/gate half of [Join Protocol v1](./2026-07-13-join-protocol.mdx) — that
+ADR is now **HISTORICAL** for everything it says about targeted invites, the
+lobby channel, and the lobby transport identity.
+
+Join Protocol v2 makes three changes to how a node joins a Ducktape network,
+each motivated by the same realization: an invite minted at member level never
+authenticated a *person*, only a key the inviter was handed. So the target lock
+bought nothing but blob-in-transit secrecy — which we now buy directly, with a
+seal.
+
+## Decision, in one table
+
+| # | Rule | Enforced at |
+|---|------|-------------|
+| R1 | Every invite is BEARER (무기명). No `target` field exists; whoever presents a valid join proof for the nonce first redeems it, single-use. | §1 |
+| R2 | A bearer resident token IS the admission credential, so it never crosses a link in the clear: the first-contact intro is SEALED to the receiving member's WireGuard X25519 key. | §2 |
+| R3 | The WireGuard/overlay plane is mandatory — the invite blob always carries the inviter's WG key material; the WG-less (TCP-reachable) shape is deleted. | §3 |
+| R4 | The gate rides the doorbell; the lobby dies — one sealed request/response over the tunnel path, no `CHANNEL_LOBBY`, no `lobby_identity`. | §4 |
+| R5 | Pass ⇒ the reply IS the admission (settle-then-answer, unchanged from v1); fail terminal ⇒ the joiner exits; single-use + short expiry bound a leaked blob. | §4 |
+
+## 1. Bearer-only invites (§R1) — *implemented*
+
+The invite token drops `target` and the kind byte entirely:
+
+```rust
+InviteToken { issuer, nonce, role, expires_unix_secs, sig }
+sig = issuer.sign(INVITE_GRANT_NAMESPACE, binding ‖ nonce ‖ role ‖ expiry)
+```
+
+`role` (`Resident`/`Client`) selects the standing plane; there is no target, so
+any key may redeem. The join proof (`binding ‖ nonce ‖ joiner`) still binds the
+REDEEMING key — this is HYGIENE (a grant never lands on a key whose holder never
+asked), not an admission control. Containment is single-use (the nonce is the
+exactly-once key in consensus) plus a short expiry. `GovMsg::Redeem` drops its
+`target` field and lock; the packed token is a fixed 121 bytes.
+
+Rationale: the target key was self-minted by the joiner and handed to the
+inviter seconds before minting, so it authenticated nothing that minting had not
+already decided. What the lock DID buy — a stolen blob being useless without the
+target secret — is re-provided by §2.
+
+## 2. The sealed intro (§R2) — *implemented*
+
+Under bearer the token is the whole credential, and v1 sent it in cleartext UDP
+in the first-contact `IntroRequest`. v2 seals the intro bundle to the receiving
+member's WireGuard X25519 public key (which rides in the invite blob under the
+issuer's envelope signature, so the joiner knows it offline):
+
+- **Seal** (`reachability::seal`): ephemeral X25519 ECDH + ChaCha20-Poly1305,
+  SHA-256 KDF binding both public keys. Layout `ephemeral_pub(32) ‖ nonce(12) ‖
+  ciphertext+tag`. A fresh ephemeral per candidate; only that member can open it.
+- **Joiner**: both first-contact mechanics (direct + coordinated) seal the bundle
+  to each candidate's WG key before sending.
+- **Member**: both doorbells open with the node's WG secret before decode /
+  verify / install; an unopenable datagram (observer junk, or sealed to another
+  member) is dropped silently.
+
+An on-path observer on hostile wifi learns nothing; a captured intro cannot be
+replayed to redeem.
+
+## 3. Mandatory WireGuard (§R3) — *in flight*
+
+Data planes (voice/video/agent/gateway) ride the overlay ONLY — no mesh
+fallback — so a WG-less workspace is a silently degraded tier. v2 deletes the
+WG-less invite shape: the blob ALWAYS carries the inviter's WG key material,
+intro port, and mesh port. The underlay *endpoint* stays reachability-dependent
+(a fully-NAT'd inviter has none and is reached by identity through the
+coordinator). Minting refuses without a configured reachability plane. The
+effect dial (`Tun`/`Socket`/`Fake`) is unchanged — `Socket` (userspace, no
+privileges) is the default; `Fake` remains the test shape.
+
+## 4. The gate rides the doorbell; the lobby dies (§R4, §R5) — *in flight*
+
+v1 verified the invite twice: once at the intro doorbell (before installing the
+tunnel) and again over a mesh `CHANNEL_LOBBY` entered under a shared
+zero-authority `lobby_identity`. With the tunnel guaranteed (§3) and the intro
+sealed (§2), v2 merges them: **the sealed intro IS the gate request.** The
+member opens it, verifies (V1–V2/V4–V5/V8 — V3 target-lock is gone), installs
+the tunnel peer, then runs the SAME settle-then-answer as v1 (submit
+`GovMsg::Redeem`, hold the reply against the frame, resolve on the drain,
+`GATE_SETTLE_TIMEOUT = 30s` → `Busy`) and returns the outcome over the doorbell.
+
+`CHANNEL_LOBBY`, `lobby_identity`, and the joiner's 3-round mesh gate loop are
+deleted; the first-contact race resolves straight to admission. Preserved from
+v1: settle-then-answer, one in-flight gate per joiner key (a duplicate re-arms),
+wire-stable reject codes and terminal bits, and V6 (nonce unspent) / V7 (issuer
+in valset, non-terminal) staying at the member because they need committed
+state.
+
+Two resolved sub-questions (blessed 2026-07-17):
+
+- **Statesync transport identity.** Without `lobby_identity`, a just-admitted
+  resident dials statesync under its REAL key — so members re-track a resident
+  onto the mesh the block `Redeem` COMMITS (not at the epoch cutover), closing
+  the window and pre-warming tunnels. Statesync's real-key PoP (v1 §5.1) is
+  otherwise unchanged.
+- **The 30s-deferred reply on a NAT'd path.** The sealed `Admitted`/`Rejected`
+  rides the tunnel the intro just installed, not a held UDP rendezvous socket.
+
+## 5. Cutover, and what v1 carried forward
+
+In-place hard cutover, no compat decode (the standing posture of this campaign):
+`GovMsg::Redeem`'s wire changed, the intro is sealed, the lobby wire is gone —
+old joiners and members do not interop. The wasm governance guest and its host
+fixture are regenerated with the token change (`make wasm-modules`).
+
+Unchanged from v1 and still in force: minting IS the admission decision; the
+in-consensus redemption re-verifies and enforces single-use + issuer-membership;
+statesync is fail-closed on committed standing (R4 of v1); promotion to a
+validator seat remains a separate `promote` ceremony.
+
+## 6. Open operational note — CoordCap rotation (unresolved)
+
+The coordinator capability minted into the `Admitted` reply still has a 1-year
+TTL and NO rotation flow (`nat-traversal/src/auth.rs`). Its only delivery
+channel is the admission reply, so a short TTL would orphan admitted nodes. A
+private-coordinator deployment needs a rotation/re-issue procedure specified
+here before it is operated at scale. Tracked, not resolved by this ADR.

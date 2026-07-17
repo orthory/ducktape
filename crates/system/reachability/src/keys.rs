@@ -91,6 +91,13 @@ impl WireGuardKeypair {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(self.secret.to_bytes())
     }
+
+    /// Open a [`crate::seal`] envelope sealed to this node's WireGuard X25519
+    /// key. The secret never leaves the keypair — a member opens a joiner's
+    /// sealed first-contact intro through here (Join Protocol v2, item 5).
+    pub fn open_sealed(&self, sealed: &[u8]) -> Result<Vec<u8>, String> {
+        crate::seal::open(&self.secret, sealed)
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
