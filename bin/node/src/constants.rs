@@ -10,9 +10,11 @@ use std::time::Duration;
 /// any named route commitment are implemented by this binary; the boot preflight
 /// refuses a boundary whose `required_min_version` exceeds it. Phase 9 raised
 /// this to 2 when the forge v2 dual path landed; the staged-admission resident
-/// tier raised it to 3 — this binary can execute a scheduled `to_version=3`
-/// (valset/governance resident ops, gated below 3) and truthfully `SignalReady`.
-pub(crate) const MAX_PROTOCOL_VERSION: u32 = 3;
+/// tier raised it to 3; continuation transactions raised it to 4 — this binary
+/// accepts op-frame v3 at the ordered drain and releases inline-lane envelope
+/// continuations once a scheduled `to_version=4` activates
+/// (`node::CONTINUATION_ACTIVATION_VERSION`), so it truthfully `SignalReady`s.
+pub(crate) const MAX_PROTOCOL_VERSION: u32 = 4;
 /// the module-code fetch cap: the largest content-addressed code artifact (a
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a

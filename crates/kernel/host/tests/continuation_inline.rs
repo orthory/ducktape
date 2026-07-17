@@ -355,6 +355,83 @@ fn continuation_lane_is_deterministic() {
     });
 }
 
+// (8) the replay-path trace fold: `into_trace` interleaves each parent's
+// applied continuation right after it (the index order), and a block whose
+// ONLY real work is a released continuation still counts as ran — the seal
+// disposition rule that keeps a rejected-parent/applied-continuation block
+// reproducible on recovery.
+#[test]
+fn into_trace_interleaves_continuations_and_counts_them_as_work() {
+    block_on(async {
+        // parent 0 applies (1 dispatch) + applied continuation (1 dispatch);
+        // parent 1 REJECTS + applied continuation (1 dispatch).
+        let mut h = host();
+        let out = h
+            .submit_block_ops(
+                BlockContext::default(),
+                vec![
+                    BlockOp {
+                        origin: author(),
+                        msg: set("a", "1"),
+                        continuation: Some(Continuation {
+                            target: DIR.into(),
+                            payload: dir_encode(&DirMsg::Set {
+                                key: "b".into(),
+                                value: "2".into(),
+                            }),
+                        }),
+                        frame: [1; 32],
+                    },
+                    BlockOp {
+                        origin: author(),
+                        msg: probe(b"r"),
+                        continuation: Some(echo_cont()),
+                        frame: [2; 32],
+                    },
+                ],
+            )
+            .await
+            .expect("batch applies");
+
+        let (ran, trace) = out.into_trace();
+        assert!(ran, "applied members and continuations are real work");
+        let modules: Vec<&str> = trace.iter().map(|d| d.module.as_str()).collect();
+        assert_eq!(
+            modules,
+            vec![DIR, DIR, PROBE],
+            "parent0, its continuation, then parent1's continuation (the \
+             rejected parent leaves no trace): {modules:?}"
+        );
+        assert_eq!(trace[1].origin, Origin::Module(DIR.into()));
+        assert_eq!(trace[2].origin, Origin::Module(PROBE.into()));
+
+        // a block whose ONLY work is a released continuation still ran.
+        let mut h2 = host();
+        let out2 = h2
+            .submit_block_ops(
+                BlockContext::default(),
+                vec![BlockOp {
+                    origin: author(),
+                    msg: probe(b"r"),
+                    continuation: Some(Continuation {
+                        target: DIR.into(),
+                        payload: dir_encode(&DirMsg::Set {
+                            key: "only".into(),
+                            value: "cont".into(),
+                        }),
+                    }),
+                    frame: [3; 32],
+                }],
+            )
+            .await
+            .expect("batch applies");
+        let (ran2, trace2) = out2.into_trace();
+        assert!(ran2, "a continuation-only block ran real work");
+        assert_eq!(trace2.len(), 1);
+        assert_eq!(trace2[0].module, DIR.to_string());
+    });
+}
+
 // (7) bare pairs are unchanged: no continuation → no derived units.
 #[test]
 fn bare_ops_produce_no_continuations() {

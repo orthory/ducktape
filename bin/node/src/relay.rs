@@ -97,7 +97,9 @@ pub fn decode_msg(b: &[u8]) -> Result<RelayMsg, String> {
 /// still reach the deterministic module rejection path instead of becoming a
 /// relay-specific policy decision.
 pub fn required_blob_digest(frame: &[u8]) -> Option<[u8; 32]> {
-    let (_, msg) = node::decode_frame(frame).ok()?;
+    // either codec: a v3 envelope can carry a forge op too. the door reads
+    // policy fields only — version gating stays at admission and the drain.
+    let (_, msg, _cont) = node::decode_frame_any(frame).ok()?;
     if msg.target != "forge" {
         return None;
     }
@@ -198,7 +200,8 @@ pub fn verify_relay_submit(
     residents: &[Vec<u8>],
     clients: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
-    let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
+    let (origin, _msg, _cont) =
+        node::decode_frame_any(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
@@ -224,7 +227,8 @@ pub fn verify_blob_offer(
     members: &[Vec<u8>],
     residents: &[Vec<u8>],
 ) -> Result<node::FrameId, String> {
-    let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
+    let (origin, _msg, _cont) =
+        node::decode_frame_any(frame).map_err(|e| format!("bad frame: {e}"))?;
     let sdk::Origin::External(origin_bytes) = origin else {
         return Err("blob offers carry an external origin".into());
     };

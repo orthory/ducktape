@@ -51,11 +51,12 @@ pub(crate) fn sealed_frame_block_row(
     blobs: &blobstore::BlobHandle,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
-    // the sealed frame is a BATCH: decode its members and show each as a block
-    // op. per-member dispositions/traces are not carried in the fold (recovery
-    // folds the block-level disposition + aggregate trace), so a replayed op
-    // shows the block disposition and an empty trace — the LIVE drain carries
-    // the full per-op detail.
+    // the sealed frame is a BATCH: decode its members (under the block's own
+    // version gate, so a replayed row never shows an op the live drain refused)
+    // and show each as a block op. per-member dispositions/traces are not
+    // carried in the fold (recovery folds the block-level disposition +
+    // aggregate trace), so a replayed op shows the block disposition and an
+    // empty trace — the LIVE drain carries the full per-op detail.
     let members = node::decode_batch(block.frame).ok()?;
     let disposition = match block.disposition {
         node::Disposition::Applied => noded::BlockDisposition::Applied,
@@ -64,20 +65,32 @@ pub(crate) fn sealed_frame_block_row(
     };
     let mut ops = Vec::new();
     for member in &members {
-        let Ok((origin, msg)) = node::decode_frame(member) else {
+        let Ok(op) = node::decode_member(member, block.protocol_version) else {
             continue;
         };
-        if msg.target == NOP_TARGET {
+        if op.msg.target == NOP_TARGET {
             continue;
         }
         ops.push(explorer_root_op(
             blobs,
-            &origin,
-            &msg.target,
-            &msg.payload,
+            &op.origin,
+            &op.msg.target,
+            &op.msg.payload,
             &[],
             disposition,
         ));
+        // a v3 envelope's released continuation is its own op row, right after
+        // its parent — the live drain's row order (`drain_actions`).
+        if let Some(cont) = op.continuation {
+            ops.push(explorer_root_op(
+                blobs,
+                &sdk::Origin::Module(op.msg.target),
+                &cont.target,
+                &cont.payload,
+                &[],
+                disposition,
+            ));
+        }
     }
     if ops.is_empty() {
         // a pure nop/idle block — the explorer hides it (same rule as live).

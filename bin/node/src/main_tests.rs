@@ -903,6 +903,7 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
             disposition: node::Disposition::Applied,
             app_hash,
             dispatches: &dispatches,
+            protocol_version: 0,
         },
     )
     .expect("an applied non-nop batch rebuilds its row");
@@ -953,6 +954,7 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
                     disposition: node::Disposition::Applied,
                     app_hash: test_root(1),
                     dispatches: &[],
+                    protocol_version: 0,
                 },
             )
             .is_none()
@@ -983,6 +985,7 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
             disposition: node::Disposition::Rejected,
             app_hash: test_root(2),
             dispatches: &[],
+            protocol_version: 0,
         },
     )
     .expect("a decoded non-nop reject still shows in the explorer");

@@ -276,6 +276,39 @@ pub struct BatchOutcome {
     pub system_dispatches: Vec<DispatchRecord>,
 }
 
+impl BatchOutcome {
+    /// flatten this outcome into the block-level facts the replay paths seal
+    /// and fold from: whether the block RAN REAL WORK (any member applied, any
+    /// released continuation applied, or a once-per-block System injection
+    /// dispatched — the live drain's seal-disposition rule), and the aggregate
+    /// dispatch trace in the live index order — each applied member in input
+    /// order with its applied continuation immediately after it, then the
+    /// System injections. recovery replay and suffix catch-up fold THIS exact
+    /// order, so a re-derived per-module op index matches the live one row for
+    /// row.
+    pub fn into_trace(self) -> (bool, Vec<DispatchRecord>) {
+        let mut cont_by_parent: Vec<Option<MemberOutcome>> =
+            self.members.iter().map(|_| None).collect();
+        for (parent, cont) in self.continuations {
+            cont_by_parent[parent] = Some(cont);
+        }
+        let mut dispatches = Vec::new();
+        let mut ran = !self.system_dispatches.is_empty();
+        for (member, cont) in self.members.into_iter().zip(cont_by_parent) {
+            if let MemberOutcome::Applied { dispatches: d } = member {
+                ran = true;
+                dispatches.extend(d);
+            }
+            if let Some(MemberOutcome::Applied { dispatches: d }) = cont {
+                ran = true;
+                dispatches.extend(d);
+            }
+        }
+        dispatches.extend(self.system_dispatches);
+        (ran, dispatches)
+    }
+}
+
 /// the outcome of one member op in a [`BatchOutcome`].
 #[derive(Debug)]
 pub enum MemberOutcome {
@@ -1235,16 +1268,14 @@ impl Host {
     /// but whose in-memory cohort was rolled back to the checkpoint; replay re-runs
     /// the frame and commits ONLY the at-pre cohort, aborting the durable substrate
     /// (re-committing it would move its op-log root and fork). NOT the live path.
+    /// takes full [`BlockOp`]s: a journaled v3 frame's continuation must re-run
+    /// on the heal exactly as it ran live, or the sealed roots cannot reproduce.
     pub async fn submit_block_committing(
         &mut self,
         ctx: BlockContext,
-        ops: Vec<(Origin, Msg)>,
+        ops: Vec<BlockOp>,
         commit_only: &BTreeSet<ModuleId>,
     ) -> Result<BatchOutcome, SubmitError> {
-        let ops = ops
-            .into_iter()
-            .map(|(origin, msg)| BlockOp::bare(origin, msg))
-            .collect();
         self.apply_block(ctx, ops, Some(commit_only)).await
     }
 

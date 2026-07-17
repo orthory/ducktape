@@ -10,7 +10,7 @@ use commonware_cryptography::ed25519;
 use consensus::{
     BoundaryUpgrade, ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchestrator,
 };
-use sdk::StateRoot;
+use sdk::{Origin, StateRoot};
 
 use crate::constants::NOP_TARGET;
 use crate::explorer::explorer_root_op;
@@ -61,6 +61,16 @@ pub(crate) fn block_actions(
                 latency_us = latency_us.saturating_add(op.latency_us);
                 dispatches.extend(op.dispatches.iter().cloned());
             }
+            // the envelope's released continuation: its dispatches join the
+            // block's op stream right after its parent's (the host's event
+            // order), INDEPENDENT of the parent's disposition — a rejected
+            // parent still releases, and an applied continuation is real work.
+            if let Some(cont) = frame.op.as_ref().and_then(|op| op.continuation.as_ref())
+                && cont.disposition == node::Disposition::Applied
+            {
+                applied = true;
+                dispatches.extend(cont.dispatches.iter().cloned());
+            }
             if let Some(op) = &frame.op
                 && op.target != NOP_TARGET
             {
@@ -87,6 +97,29 @@ pub(crate) fn block_actions(
                     &op.dispatches,
                     disposition,
                 ));
+                // the continuation is its own row, right after its parent:
+                // `Origin::Module(parent_target)` is the sending lane, and its
+                // own disposition — not the parent's — is the row's.
+                if let Some(cont) = &op.continuation {
+                    let cont_disposition = match cont.disposition {
+                        node::Disposition::Applied => {
+                            applied_ops += 1;
+                            noded::BlockDisposition::Applied
+                        }
+                        _ => {
+                            rejected_ops += 1;
+                            noded::BlockDisposition::Rejected
+                        }
+                    };
+                    ops.push(explorer_root_op(
+                        blobs,
+                        &Origin::Module(op.target.clone()),
+                        &cont.target,
+                        &cont.payload,
+                        &cont.dispatches,
+                        cont_disposition,
+                    ));
+                }
             }
         }
         if let Some(system) = system_dispatches.remove(&height) {
@@ -246,6 +279,7 @@ mod tests {
                     payload: b"applied".to_vec(),
                     dispatches: vec![member_dispatch.clone()],
                     latency_us: 11,
+                    continuation: None,
                 }),
             ),
             drained(
@@ -259,6 +293,7 @@ mod tests {
                     payload: b"rejected".to_vec(),
                     dispatches: Vec::new(),
                     latency_us: 99,
+                    continuation: None,
                 }),
             ),
             drained(3, 8, node::Disposition::Discarded, 9, None),

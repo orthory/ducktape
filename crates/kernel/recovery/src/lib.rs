@@ -85,8 +85,8 @@ use commonware_storage::metadata;
 use commonware_utils::sequence::U64;
 use futures::{StreamExt as _, pin_mut};
 
-use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
-use node::{BlockSeal, BlockSink, Disposition, decode_batch, decode_frame};
+use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use node::{BlockSeal, BlockSink, Disposition, decode_batch};
 use sdk::{ModuleId, StateRoot, UpgradeCoords};
 
 /// Stable machine-readable marker consumed by the native shell when a node
@@ -1139,6 +1139,12 @@ pub struct FoldedBlock<'a> {
     pub disposition: Disposition,
     pub app_hash: StateRoot,
     pub dispatches: &'a [DispatchRecord],
+    /// the block's effective protocol version — the same value replay stamped
+    /// into its `BlockContext`. the row rebuild decodes the frame's members
+    /// under the SAME codec gate the live drain used (op-frame v3 accepted iff
+    /// this reaches `node::CONTINUATION_ACTIVATION_VERSION`), so a replayed
+    /// explorer row never shows an op the live node refused, or vice versa.
+    pub protocol_version: u32,
 }
 
 /// observer of every sealed block the journal replay walks, in height order —
@@ -1392,6 +1398,7 @@ where
                                     disposition,
                                     app_hash,
                                     dispatches: &[],
+                                    protocol_version,
                                 }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
@@ -1466,6 +1473,7 @@ where
                                     disposition,
                                     app_hash,
                                     dispatches: &dispatches,
+                                    protocol_version,
                                 });
                             }
                             for (id, root) in &changed {
@@ -1566,6 +1574,7 @@ where
                                     disposition,
                                     app_hash,
                                     dispatches: &dispatches,
+                                    protocol_version,
                                 });
                             }
                             // every re-committed and exact-post module must now
@@ -1637,6 +1646,7 @@ where
                         // below; this is that same post-block boundary.
                         app_hash: host.app_hash(),
                         dispatches: &dispatches,
+                        protocol_version,
                     });
                 }
                 disposition
@@ -1709,6 +1719,7 @@ where
                             disposition,
                             app_hash: host.app_hash(),
                             dispatches: &dispatches,
+                            protocol_version,
                         });
                     }
                     disposition
@@ -1848,15 +1859,19 @@ async fn apply_block_committing(
 /// roll-forward's backstop widener: a moved module whose member re-executes
 /// as a duplicate-reject on its own post-state records no dispatch, but the
 /// frame still explains it. undecodable members target nothing
-/// (deterministic no-ops live and on replay alike).
+/// (deterministic no-ops live and on replay alike). decodes UNGATED
+/// ([`node::decode_frame_any`]) and includes a v3 envelope's continuation
+/// target beside its parent's: a released continuation moves ITS module in
+/// the same block, and a widener may only over-explain, never under-explain
+/// (a pre-activation v3 member never applied, so its targets never moved).
 fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     let Ok(members) = decode_batch(frame) else {
         return BTreeSet::new();
     };
     members
         .iter()
-        .filter_map(|m| decode_frame(m).ok())
-        .map(|(_, msg)| msg.target)
+        .filter_map(|m| node::decode_frame_any(m).ok())
+        .flat_map(|(_, msg, cont)| std::iter::once(msg.target).chain(cont.map(|c| c.target)))
         .collect()
 }
 
@@ -1882,10 +1897,14 @@ async fn replay_batch(
     let Ok(members) = decode_batch(frame) else {
         return Ok((Disposition::Rejected, Vec::new()));
     };
+    // decode under the block's version gate exactly as the live drain did
+    // (op-frame v3 accepted iff `protocol_version` reached the continuation
+    // flag day) — a journaled v3 frame replays WITH its continuation, and a
+    // pre-activation v3 member re-rejects identically.
     let mut ops = Vec::new();
     for member in &members {
-        if let Ok(pair) = decode_frame(member) {
-            ops.push(pair);
+        if let Ok(op) = node::decode_member(member, protocol_version) {
+            ops.push(op);
         }
     }
     let ctx = BlockContext {
@@ -1895,7 +1914,7 @@ async fn replay_batch(
         origin: sdk::Origin::System,
     };
     let result = match commit_only {
-        None => host.submit_block(ctx, ops).await,
+        None => host.submit_block_ops(ctx, ops).await,
         Some(set) => host.submit_block_committing(ctx, ops, set).await,
     };
     let outcome = match result {
@@ -1910,23 +1929,14 @@ async fn replay_batch(
         }
     };
     // block-level disposition, DRAIN-based to match the live seal (node's
-    // `drain_delivered`): Applied iff the block ran real work — any member applied
-    // or a once-per-block System injection dispatched. NEVER app-hash-based: a
-    // torn-heal (`commit_only = Some`) commits only the rolled-back cohort and
-    // ABORTS the already-durable mover, so the app-hash cannot move even though the
-    // block WAS applied — app-hash movement would spuriously read Rejected and trip
-    // the disk-cursor backstop.
-    let mut dispatches = Vec::new();
-    let mut any_applied = false;
-    for member in outcome.members {
-        if let MemberOutcome::Applied { dispatches: d } = member {
-            any_applied = true;
-            dispatches.extend(d);
-        }
-    }
-    let has_system = !outcome.system_dispatches.is_empty();
-    dispatches.extend(outcome.system_dispatches);
-    let disposition = if any_applied || has_system {
+    // `drain_delivered`): Applied iff the block ran real work — any member (or
+    // released continuation) applied, or a once-per-block System injection
+    // dispatched. NEVER app-hash-based: a torn-heal (`commit_only = Some`)
+    // commits only the rolled-back cohort and ABORTS the already-durable mover,
+    // so the app-hash cannot move even though the block WAS applied — app-hash
+    // movement would spuriously read Rejected and trip the disk-cursor backstop.
+    let (ran, dispatches) = outcome.into_trace();
+    let disposition = if ran {
         Disposition::Applied
     } else {
         Disposition::Rejected
