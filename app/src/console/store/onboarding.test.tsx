@@ -1,7 +1,7 @@
 // Desktop onboarding contract (epic W1): with no active network the account
 // home is the landing surface (not a full-screen gate); founding connects;
 // joining parks and surfaces the phase. The connect panel is the create/join/
-// remote modal. Drives the provider over a mocked Tauri `invoke` + a stubbed
+// remote modal. Drives the provider over a mocked native `invoke` + a stubbed
 // node surface.
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -15,7 +15,6 @@ import type { Workspace } from "../../domain/workspace-client";
 import { ConnectPanel } from "../views/onboarding/ConnectPanel";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 const status = { version: "0.1.0", appHash: "aa".repeat(32), height: 0, modules: [] };
 
@@ -25,8 +24,8 @@ const jsonResponse = (code: number, body: unknown): Response =>
     headers: { "content-type": "application/json" },
   });
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 const workspace = (over: Partial<Workspace>): Workspace => ({
@@ -59,7 +58,7 @@ function Probe() {
 }
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.unstubAllGlobals();
   invokeMock.mockReset();
   // connectRemote persists the dialed url — clear it so a saved remote from one
@@ -70,7 +69,7 @@ afterEach(() => {
 
 describe("desktop onboarding", () => {
   it("first run with no network lands on the account home (not a gate)", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
     );
@@ -86,7 +85,7 @@ describe("desktop onboarding", () => {
   });
 
   it("createWorkspace founds a network and connects", async () => {
-    markTauri();
+    markNative();
     const team = workspace({});
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
@@ -132,7 +131,7 @@ describe("desktop onboarding", () => {
   it("joinWorkspace parks and surfaces the phase until the node answers", async () => {
     vi.useFakeTimers();
     try {
-      markTauri();
+      markNative();
       const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
       invokeMock.mockImplementation((cmd: string) => {
         switch (cmd) {
@@ -185,7 +184,7 @@ describe("onboarding gate — live join UI", () => {
     expect(LIVE_JOIN_SUPPORTED).toBe(true);
     vi.useFakeTimers();
     try {
-      markTauri();
+      markNative();
       const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
       invokeMock.mockImplementation((cmd: string) => {
         switch (cmd) {
@@ -245,7 +244,7 @@ describe("onboarding gate — live join UI", () => {
   it("strips line breaks and blanks from a pasted invite blob", async () => {
     vi.useFakeTimers();
     try {
-      markTauri();
+      markNative();
       const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
       invokeMock.mockImplementation((cmd: string) => {
         switch (cmd) {
@@ -303,7 +302,7 @@ describe("onboarding gate — live join UI", () => {
 // (managed=false) and the url is remembered for next launch.
 describe("onboarding gate — remote node", () => {
   it("connects to a remote node from the Remote tab", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
     );
@@ -351,7 +350,7 @@ describe("onboarding gate — remote node", () => {
   });
 
   it("keeps the workspace gate up over an unreachable remote", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
     );
@@ -378,7 +377,7 @@ describe("onboarding gate — remote node", () => {
   });
 
   it("boot reconnects a saved remote, superseding the local active workspace", async () => {
-    markTauri();
+    markNative();
     localStorage.setItem("ducktape.remoteUrl", "http://10.0.0.9:8844");
     const team = workspace({});
     // an active LOCAL workspace exists, but the remembered remote was the user's

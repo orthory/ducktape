@@ -129,30 +129,32 @@ Location. `Set-Cookie` is never forwarded.
 ### Browser boundary
 
 The node API can invoke a route programmatically through
-`POST /v1/gateway/proxy`. These gateway API entries accept native clients and
-the exact bundled Tauri origins, but reject arbitrary browser origins even
-though the older general node API retains permissive CORS. A full node enables
-the gateway lane only when that API listener is loopback. Publisher-side IO
-diagnostics are reduced to a typed generic failure before crossing the overlay,
-so local paths and bound ports do not leak. Browsing mints a separate random
-128-bit, route-and-revision-scoped origin:
+`POST /v1/gateway/proxy`. Node control and gateway API entries accept native
+clients with no browser metadata; browser origins are denied by default. The
+static web twin must opt an exact development origin in through
+`DUCKTAPE_ALLOWED_ORIGINS`. Owning an arbitrary loopback port is not a trust
+signal. A full node enables the gateway lane only when its API listener is
+loopback. Publisher-side IO diagnostics are reduced to a typed generic failure
+before crossing the overlay, so local paths and bound ports do not leak.
 
-`http://<token>.localhost:<ephemeral-port>/`
+Executable publisher content never enters a privileged application WebView.
+The Iced desktop embeds CEF only for Browser and renders the route at its stable
+`duck://<label>.<account>.duck` origin. A native scheme handler forwards bounded
+requests to a dedicated ephemeral loopback gateway listener; that listener
+exposes no node API, and the renderer never learns the node-control address.
+CEF's authoritative request initiator must match the Duck origin for every
+subresource. Missing and opaque initiators fail closed. Top-level navigation is
+accepted only through a shell-owned `.duck` action; popups, downloads, direct
+HTTP/HTTPS/file/loopback navigation, and application IPC are unavailable.
 
-The dedicated listener exposes no node API and cannot select another route.
-Sessions expire after ten idle minutes and the store is bounded to 64 entries.
-Cookie, cross-origin `Origin`, and cross-site Fetch Metadata are rejected.
-Every response supplies fixed no-store, nosniff, referrer, opener, resource,
-device-permission, CSP sandbox, and WebRTC restrictions.
-
-Executable publisher content never enters the privileged console WebView.
-The desktop opens an incognito `gateway-*` WebView whose label matches no
-Tauri capability. Navigation is pinned to the exact random origin; popups,
-downloads, developer tools, persistent browsing data, and application IPC are
-disabled. Tauri application commands are registered explicitly and granted
-only to trusted bundled windows. This follows Tauri's iframe capability
-warning on Linux and Android: <https://v2.tauri.app/security/capabilities/>.
-The WebRTC denial follows CSP Level 3:
+Tabs own persistent CEF child surfaces but share one in-memory request context
+only within the current workspace. A workspace change destroys every tab,
+permission grant, cookie/storage context, old gateway generation, and in-flight
+response before the new workspace can browse. The dedicated listener applies
+fixed no-store, nosniff, referrer, opener, resource, device-permission, CSP
+sandbox, and WebRTC restrictions. A same-origin `/.duck/ws` bootstrap mints a
+single-use token for the listener's WebSocket side door; it does not expose a
+general loopback socket. The WebRTC denial follows CSP Level 3:
 <https://www.w3.org/TR/CSP/#directive-webrtc>.
 
 `net.duck` remains a separate, network-owned path under `/shared/.duck/net`.

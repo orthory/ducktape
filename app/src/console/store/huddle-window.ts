@@ -16,11 +16,10 @@
 //                                              media session so the call is never
 //                                              stranded in a dead float
 //
-// The pure pieces (context builder, command mapping) are exported for tests;
-// the Tauri emit/listen wiring lives in DucktapeProvider.
+// The pure pieces remain for the in-page web huddle; native pop-out ownership
+// moved to iced.
 
 import type { Channel, HuddleMember } from "../../domain/chat-client";
-import { isTauri } from "../../domain/node-bootstrap";
 import type { VideoCapability } from "../../domain/video-capability";
 import type { VoiceSlice } from "./state";
 
@@ -28,21 +27,10 @@ export const HUDDLE_CONTEXT_EVENT = "ducktape://huddle-context";
 export const HUDDLE_CMD_EVENT = "ducktape://huddle-cmd";
 export const HUDDLE_CLOSED_EVENT = "ducktape://huddle-closed";
 
-/** Ask Rust to create/show the huddle window. No-op outside Tauri. */
-export const openHuddleWindow = (): void => {
-  if (!isTauri()) return;
-  void import("@tauri-apps/api/core")
-    .then(({ invoke }) => invoke("huddle_pop_out"))
-    .catch(() => {});
-};
+/** Native pop-out is owned by iced; the web twin keeps the in-page huddle. */
+export const openHuddleWindow = (): void => {};
 
-/** Ask Rust to close the huddle window (idempotent). No-op outside Tauri. */
-export const closeHuddleWindow = (): void => {
-  if (!isTauri()) return;
-  void import("@tauri-apps/api/core")
-    .then(({ invoke }) => invoke("huddle_pop_in"))
-    .catch(() => {});
-};
+export const closeHuddleWindow = (): void => {};
 
 /** Everything the popped window needs to RUN its own session + render its roster.
  *  The roster is raw (not pre-projected): the window owns the beacons now, so it

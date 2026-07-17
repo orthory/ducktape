@@ -12,7 +12,6 @@ import type { ConsoleActions } from "./DucktapeProvider";
 import type { Workspace } from "../../domain/workspace-client";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 const status = (publicKey = "ab12") => ({
   version: "0.1.0",
@@ -28,8 +27,8 @@ const jsonResponse = (code: number, body: unknown): Response =>
     headers: { "content-type": "application/json" },
   });
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 /** A stubbed node: status answers with a pubkey, valset queries answer by
@@ -84,7 +83,7 @@ function Probe() {
 }
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   invokeMock.mockReset();
@@ -94,7 +93,7 @@ afterEach(() => {
 });
 
 const bootConnected = async () => {
-  markTauri();
+  markNative();
   const team = workspace();
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {

@@ -1,7 +1,7 @@
 // Desktop-only local git reader for the node's on-disk forge repository.
 // Writes stay on the consensus wire in forge-client.ts; these calls only
 // project committed refs (refs/heads/*, preferring dev and falling back to
-// main on pre-migration repos) through Tauri
+// main on pre-migration repos) through native desktop calls
 // commands — plus forge_build_merge, which builds the client-computed merge
 // commit for MergePr in a throwaway repo without touching the node repo.
 //
@@ -10,9 +10,7 @@
 // that node's `<origin>/forge/<repo>` smart-HTTP remote, kept current by
 // forgeSyncRemote (the view syncs on repo open / head movement).
 
-import { invoke } from "@tauri-apps/api/core";
-
-import { isTauri } from "./node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "./node-bootstrap";
 
 export interface RepoInfo {
   id: string;
@@ -100,10 +98,10 @@ export interface MergeBuildResult {
   conflicts: string[];
 }
 
-export const isForgeGitAvailable = (): boolean => isTauri();
+export const isForgeGitAvailable = (): boolean => hasNativeShell();
 
 const desktopInvoke = <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
-  if (!isTauri()) {
+  if (!hasNativeShell()) {
     return Promise.reject(new Error("local forge browsing is available in the desktop app only"));
   }
   return invoke<T>(command, args);

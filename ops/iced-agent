@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Thin shim over the iced-agent CLI from byeongsu-hong/iced-agent-browser.
+# Cargo consumes the same repo as a git dependency; the shim executes the
+# EXACT rev Cargo.lock pins (single pin authority — bump with `cargo update`),
+# never silently-tracking HEAD. Cache: ~/.cache/iced-agent-browser
+# (override: ICED_AGENT_BROWSER_DIR — set it to a local checkout to develop
+# the tool itself; the pin is not enforced on overrides).
+set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+entry="${ICED_AGENT_ENTRY:-iced-agent.ts}"
+if [ -n "${ICED_AGENT_BROWSER_DIR:-}" ]; then
+  exec bun "$ICED_AGENT_BROWSER_DIR/plugin/bin/$entry" "$@"
+fi
+rev="$(grep -om1 'iced-agent-browser#[0-9a-f]\{40\}' "$repo_root/Cargo.lock" | cut -d'#' -f2)"
+if [ -z "$rev" ]; then
+  echo "iced-agent: no pinned rev in Cargo.lock (run a build so cargo resolves the git dep)" >&2
+  exit 1
+fi
+CACHE="$HOME/.cache/iced-agent-browser"
+# Serialize clone/checkout: parallel fleet instances race on git's index.lock.
+(
+  flock 9
+  if [ ! -d "$CACHE/.git" ]; then
+    git clone -q https://github.com/byeongsu-hong/iced-agent-browser "$CACHE"
+  fi
+  if [ "$(git -C "$CACHE" rev-parse HEAD)" != "$rev" ]; then
+    git -C "$CACHE" fetch -q origin "$rev"
+    git -C "$CACHE" checkout -q "$rev"
+  fi
+) 9>"$CACHE.lock"
+exec bun "$CACHE/plugin/bin/$entry" "$@"

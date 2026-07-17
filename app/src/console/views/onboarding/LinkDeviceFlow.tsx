@@ -10,10 +10,10 @@
 // caller owns the surrounding card.
 
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 
 import { linkFetchChallenge, linkSendResponse } from "../../../domain/link-relay-client";
 import { shortKey } from "../../../domain/names";
+import { nativeCall as invoke } from "../../../domain/node-bootstrap";
 import { identityState } from "../../../domain/user-identity-client";
 import { color, font } from "../../theme/tokens";
 import { decodeLinkChallenge, encodeLinkResponse, isLinkUrl } from "../account/link-device";

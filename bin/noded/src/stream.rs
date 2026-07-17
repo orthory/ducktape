@@ -98,10 +98,11 @@ pub enum ServerFrame {
         op: StreamOpRow,
     },
     /// one raw chunk of interactive-terminal output on a `term:<session>`
-    /// topic: `item` is base64 of the pty bytes. It rides the SAME `type:
-    /// "event"` tag the client keys on, but carries a bare-string `item` and
-    /// NO `op`/`cursor` — the client routes it by the `term:` topic prefix +
-    /// string `item` (its `isTermChunkFrame`), distinct from the op-carrying
+    /// topic: `item` is base64 of the pty bytes and `cursor` is the ring
+    /// sequence used to resume without replaying bytes already rendered. It
+    /// rides the SAME `type: "event"` tag the client keys on, but carries no
+    /// `op` — the client routes it by the `term:` topic prefix + string `item`,
+    /// distinct from the op-carrying
     /// module [`Self::Event`]. `ts(skip)`: the client hand-authors this frame
     /// type (a second `type:"event"` arm would widen the generated `EventFrame`
     /// and is intentionally kept out of `stream.gen.ts`). ServerFrame is
@@ -111,6 +112,7 @@ pub enum ServerFrame {
     #[cfg_attr(test, ts(skip))]
     TermChunk {
         topic: String,
+        cursor: String,
         item: String,
     },
     /// one entry of an interactive session's ordered, attributed command log on
@@ -1370,7 +1372,12 @@ fn catch_up_run_output(
 /// run's: a `Lagged` frame if the reader fell behind an eviction, then every
 /// buffered chunk after the cursor as a `Term` tail item. Emits nothing for an
 /// unknown/evicted session (the ring read returns empty) — never an error.
-fn catch_up_term(topic: &str, session: &str, seq: &mut u64, ring: &crate::term::TermRing) -> CatchUpResult {
+fn catch_up_term(
+    topic: &str,
+    session: &str,
+    seq: &mut u64,
+    ring: &crate::term::TermRing,
+) -> CatchUpResult {
     let mut frames = Vec::new();
     let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
     if *seq < floor {
@@ -1390,6 +1397,7 @@ fn catch_up_term(topic: &str, session: &str, seq: &mut u64, ring: &crate::term::
             *seq = chunk_seq;
             frames.push(ServerFrame::TermChunk {
                 topic: topic.to_string(),
+                cursor: chunk_seq.to_string(),
                 item,
             });
         }
@@ -1841,15 +1849,27 @@ mod tests {
         assert_eq!(result.frames.len(), 2);
         assert_eq!(seq, 2, "the cursor advances past the replayed chunks");
         // the LOAD-BEARING wire shape the app's `isTermChunkFrame` keys on: a
-        // `type:"event"` frame with a bare-string `item` and NO `op`/`cursor`.
+        // `type:"event"` frame with a bare-string `item`, its resume cursor,
+        // and no module op.
         let json = serde_json::to_value(&result.frames[0]).expect("frame json");
         assert_eq!(json["type"], "event");
         assert_eq!(json["topic"], "term:s");
+        assert_eq!(json["cursor"], "1");
         assert_eq!(json["item"], "aGk=");
         assert!(json.get("op").is_none(), "a term chunk carries no op");
-        assert!(json.get("cursor").is_none(), "a term chunk carries no cursor");
+        let mut resumed = 1;
+        let resumed_result = catch_up_term("term:s", "s", &mut resumed, &ring);
+        assert_eq!(resumed_result.frames.len(), 1);
+        assert_eq!(resumed, 2);
+        let json = serde_json::to_value(&resumed_result.frames[0]).expect("resumed frame json");
+        assert_eq!(json["cursor"], "2");
+        assert_eq!(json["item"], "eW8=");
         // a caught-up reader sees nothing new.
-        assert!(catch_up_term("term:s", "s", &mut seq, &ring).frames.is_empty());
+        assert!(
+            catch_up_term("term:s", "s", &mut seq, &ring)
+                .frames
+                .is_empty()
+        );
     }
 
     #[test]

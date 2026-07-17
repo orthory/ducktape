@@ -18,8 +18,8 @@ import type { ConsoleActions } from "../store/actions";
 import { createInitialState } from "../store/state";
 import { NotificationsBell } from "./NotificationsBell";
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = vi.fn(() => Promise.resolve());
 };
 
 const item = (patch: Partial<NotifyItem> = {}): NotifyItem => ({
@@ -46,7 +46,7 @@ const renderBell = () => {
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 
@@ -57,7 +57,7 @@ describe("NotificationsBell", () => {
   });
 
   it("shows the unread badge, marks seen on open, and navigates on item click", async () => {
-    markTauri();
+    markNative();
     notifyMocks.recent.mockResolvedValueOnce({ unread: 0, items: [item()] });
     let pushUnread: (unread: number) => void = () => {};
     notifyMocks.onUnread.mockImplementation(async (cb) => {
@@ -82,7 +82,7 @@ describe("NotificationsBell", () => {
   });
 
   it("falls back to the category screen without a channel, and reroutes forge-item channels", async () => {
-    markTauri();
+    markNative();
     notifyMocks.recent.mockResolvedValueOnce({
       unread: 3,
       items: [
@@ -139,7 +139,7 @@ describe("NotificationsBell", () => {
   });
 
   it("keeps a live item that lands before the boot snapshot resolves", async () => {
-    markTauri();
+    markNative();
     let resolveSnapshot: (value: unknown) => void = () => {};
     notifyMocks.recent.mockImplementationOnce(
       () => new Promise((resolve) => (resolveSnapshot = resolve)),
@@ -170,7 +170,7 @@ describe("NotificationsBell", () => {
   });
 
   it("stacks items sharing a channel and expands them on click", async () => {
-    markTauri();
+    markNative();
     notifyMocks.recent.mockResolvedValueOnce({
       unread: 3,
       items: [
@@ -200,7 +200,7 @@ describe("NotificationsBell", () => {
   });
 
   it("prepends live items and shows the empty state before any arrive", async () => {
-    markTauri();
+    markNative();
     let pushItem: (entry: NotifyItem) => void = () => {};
     notifyMocks.onItem.mockImplementation(async (cb: (entry: NotifyItem) => void) => {
       pushItem = cb;

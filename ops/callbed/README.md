@@ -8,7 +8,7 @@ surface and proved call media flows between them.
 
 ## Why this exists
 
-The huddle call path is: app webview → `/v1/call/ws` → node call hub
+The huddle call path is: app client → `/v1/call/ws` → node call hub
 (`bin/node/src/voice.rs`) → data-plane datagrams over the WireGuard overlay
 (`Service::Voice`/`Service::Video`, one per-use plane each — see
 `docs/adr/2026-07-07-per-use-data-plane.mdx`) → remote hub → playout. The
@@ -17,9 +17,8 @@ exercise the **real mesh**. This bed does, on two separate
 `ducktape-node` processes/containers.
 
 **A single node cannot host a real call**: the hub fans media out by *node key*
-and excludes self, so two webviews on one node produce an empty recipient set.
-You need two peered nodes, one member each. (This is also why Ducktape's
-`tauri-agent-fleet` instance hook, which seeds a *solo* workspace, can't do it.)
+and excludes self, so two clients on one node produce an empty recipient set.
+You need two peered nodes, one member each; a solo workspace cannot prove this.
 
 ## What's verified
 
@@ -121,7 +120,7 @@ pages receive peer audio (RMS ~910, non-silent) **and** peer video (163 frames,
 the real WebCodecs decoder drawing a changing 1280×720 canvas), both directions.
 
 L3 is the elegant unlock: **Chromium supplies fake mic+camera and has WebCodecs**,
-so the real client runs end-to-end headless — no PulseAudio, no VNC, no Tauri
+so the real client runs end-to-end headless — no PulseAudio, no VNC, no native
 shell — and it even exercises VP8 encode/decode that WebKitGTK can't. So the
 heavy "containerized app" profile below is **not needed for verification**; only
 a final native-window smoke remains.
@@ -129,25 +128,22 @@ a final native-window smoke remains.
 ## The app profile (optional — a manual native-window smoke)
 
 The layered tests above already verify the app's call path headless. If you
-additionally want to drive the **real Tauri desktop window** against this
+additionally want to drive the **real Iced desktop window** against this
 network, two things are needed that this bed documents but doesn't ship as a
 service:
 
-1. **A virtual mic.** Headless WebKitGTK has no audio input, so
-   `getUserMedia({audio})` fails. Run `virtual-mic.sh` inside the app container
-   before launching the app (optionally `VMIC_TONE=1` to feed a tone), and point
-   the app process at the same `PULSE_SERVER`.
+1. **A virtual mic.** Run `virtual-mic.sh` inside the app container before
+   launching the app (optionally `VMIC_TONE=1` to feed a tone), and point the
+   app process at the same `PULSE_SERVER`.
 2. **The app owns its own member node.** The desktop app *manages* a local node
    (via `DUCKTAPE_NODE_BIN` + a seeded workspace registry), it does not attach to
    a remote one. So an app container must `join` this network as its **own**
    member node (extend `bootstrap.sh` to emit a member invite), seed a member
-   workspace pointing at that node (see `qa/fleet/prepare-instance.sh`), then
-   launch the app + `x11vnc` (see `skills/tauri-debug`). Two app containers =
+   workspace pointing at that node, then launch the staged Iced package (see
+   `skills/qa` and `skills/tauri-debug`). Two app containers =
    two members who can huddle.
 
 **Caveat — video rendering vs. transport:** the video *transport* is proven here
-(fragment/reassemble over the mesh). What WebKitGTK can't do is *render* it: the
-webview has no WebCodecs VP8, so `supportsVideoCalls()` returns false and the
-in-app call degrades to roster + audio (video tiles need a Chromium-based
-webview). So in the app on this bed, "working call" = **audio + roster +
-presence**, even though the mesh carries video fine.
+(fragment/reassemble over the mesh). Native Iced media verification is a
+separate platform smoke; this callbed's L3 browser harness proves the legacy
+web client's WebCodecs encode/decode path.

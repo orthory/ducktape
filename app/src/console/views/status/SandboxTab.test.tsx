@@ -2,7 +2,6 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import type { Workspace } from "../../../domain/workspace-client";
 import type { ConsoleActions } from "../../store/actions";
@@ -21,13 +20,13 @@ const workspace: Workspace = {
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 
 describe("SandboxTab apply flow", () => {
   it("confirms and applies instead of showing config to copy", async () => {
-    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
     invokeMock.mockImplementation((command: string) => {
       if (command === "sandbox_preflight") {
         return Promise.resolve({

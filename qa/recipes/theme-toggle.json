@@ -1,0 +1,11 @@
+{
+  "name": "theme-toggle",
+  "preset": "ui-demo",
+  "steps": [
+    { "expect": { "state_path": { "path": "mode", "equals": "light" } } },
+    { "intent": "toggle_theme" },
+    { "expect": { "state_path": { "path": "mode", "equals": "dark" } } },
+    { "intent": "toggle_theme" },
+    { "expect": { "state_path": { "path": "mode", "equals": "light" } } }
+  ]
+}

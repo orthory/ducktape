@@ -9,8 +9,8 @@ version.workspace = true
 # (read committed state), GET /v1/status (version + app-hash + module roots),
 # POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a block-finalized event
 # stream). every ducktape app build is a client of this process: the web build
-# dials it directly; the tauri build spawns it as a DETACHED subprocess (an
-# orphan that outlives the window) and talks to it the same way.
+# dials it directly; the native Iced build spawns or adopts its managed
+# workspace process and talks to it over the same HTTP/WebSocket contract.
 [[bin]]
 name = "ducktape-noded"
 path = "src/main.rs"

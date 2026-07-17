@@ -1,0 +1,17 @@
+{
+  "name": "operator-nav-smoke",
+  "preset": "ui-operator",
+  "steps": [
+    { "intent": { "section": { "name": "operator" } } },
+    { "expect": { "state_path": { "path": "screen", "equals": "node" } } },
+    { "expect": { "node": { "role": "tab", "name": "NODE", "exists": true } } },
+    { "click":  { "role": "button", "name": "Gateway" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "gateway" } } },
+    { "click":  { "role": "button", "name": "Modules" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "modules" } } },
+    { "click":  { "role": "button", "name": "Sandbox" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "sandbox" } } },
+    { "click":  { "role": "button", "name": "Metrics" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "metrics" } } }
+  ]
+}

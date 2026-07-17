@@ -1,0 +1,11 @@
+{
+  "name": "search-shortcut",
+  "lane": "fleet",
+  "preset": "ui-demo",
+  "steps": [
+    { "press":  { "key": "k", "mods": ["ctrl"] } },
+    { "wait":   { "cond": { "state_path": { "path": "search_open", "equals": true } }, "timeout_ms": 5000 } },
+    { "press":  { "key": "escape" } },
+    { "wait":   { "cond": { "state_path": { "path": "search_open", "equals": false } }, "timeout_ms": 5000 } }
+  ]
+}

@@ -18,14 +18,13 @@ import type { Workspace } from "../../domain/workspace-client";
 import { WindowFrame } from "./WindowFrame";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.unstubAllGlobals();
   invokeMock.mockReset();
   localStorage.clear();
@@ -36,7 +35,7 @@ afterEach(() => {
 
 describe("window frame search affordance", () => {
   it("is hidden while the onboarding gate is up (no workspace chosen)", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) =>
       cmd === "workspace_list" ? Promise.resolve([]) : Promise.resolve(null),
     );
@@ -55,7 +54,7 @@ describe("window frame search affordance", () => {
   });
 
   it("shows once a node is connected (web build resolves one directly)", async () => {
-    // no tauri marker: the web build dials its configured node — no onboarding.
+    // no native marker: the web build dials its configured node — no onboarding.
     vi.stubGlobal(
       "fetch",
       vi.fn(() =>
@@ -100,7 +99,7 @@ describe("title bar workspace name", () => {
     });
 
   it("shows the active workspace's name once its node is connected", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "workspace_list":

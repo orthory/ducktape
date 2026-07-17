@@ -82,22 +82,31 @@ target/release/coordinator --listen 0.0.0.0:3478
 
 ## Run The App
 
-The app is one React console with two builds, both clients of the node daemon
-(`ducktape-noded`): the web build dials it over http/ws; the desktop build
-spawns it as a detached subprocess (an orphan that keeps running after the
-window closes) and talks to it the same way.
+Ducktape has a native Rust desktop app under `app/src-iced` and a React web
+twin under `app/`. The iced app owns every product screen and the desktop
+lifecycle; pinned CEF is embedded only as the Browser pane. Both surfaces use
+the same node HTTP/WebSocket contracts. The desktop app also owns the workspace
+registry and starts or adopts each workspace's `ducktape-node` process.
 
-Install everything (daemon → `~/.cargo/bin`, `Ducktape.app` → `/Applications`):
+Install the current platform's self-contained desktop package. Every default is
+rootless: macOS uses `~/Applications`, Linux uses `~/.ducktape` plus
+`~/.cargo/bin`, and Windows uses the current user's LocalAppData. Each package
+already carries its exact matching node sidecar. A managed
+Mac can opt into a shared location with `make install APP_DEST=/Applications`.
 
 ```sh
 make install
 ```
 
+Operators who also want the standalone node CLI in `~/.cargo/bin` can run
+`make install-node` explicitly.
+
 Web, for development — start the daemon, then the dev server:
 
 ```sh
-cargo run -p noded                        # http://127.0.0.1:8844, temp storage
-# cargo run -p noded -- --storage <dir>   # persistent module state
+DUCKTAPE_ALLOWED_ORIGINS=http://localhost:1420 \
+  cargo run -p noded                      # http://127.0.0.1:8844, temp storage
+# add -- --storage <dir> for persistent module state
 
 cd app
 bun install
@@ -107,12 +116,10 @@ bun run dev                               # http://localhost:1420
 The web build dials `http://127.0.0.1:8844` by default; point it elsewhere
 with `VITE_DUCKTAPE_NODE_URL`.
 
-Desktop, for development — `tauri dev` stages the daemon sidecar itself:
+Desktop, for development — build the matching node and run the native shell:
 
 ```sh
-cd app
-bun install
-bun run tauri dev
+make dev
 ```
 
 On first launch the desktop app opens the onboarding gate: found a new network
@@ -124,9 +131,34 @@ joiner parks until a member admits it (Settings → Admit a joiner) and then
 promotes itself, with the park→admitted→promoted phase shown live. The web build
 has no registry — it dials a single configured node (`VITE_DUCKTAPE_NODE_URL`).
 
-`make app` builds the distributable desktop bundle (`.app`/`.dmg` under
-`target/release/bundle`); `make web` builds the static web bundle to
-`app/dist`.
+`make app` builds a self-contained native package under
+`target/release/bundle`: an ad-hoc signed local-test `.app` plus zip on macOS, a relocatable
+directory plus tarball on Linux, or a relocatable directory plus zip on
+Windows. Every package includes the node sidecar and the Cargo-pinned CEF
+runtime. `make web` still builds the independent static web twin to `app/dist`.
+The macOS app requires macOS 14 or newer; set `DUCKTAPE_MACOS_SIGN_IDENTITY`
+and `DUCKTAPE_MACOS_NOTARY_PROFILE` for Developer ID signing and notarization.
+
+On macOS, validate the staged native window, close-to-menu-bar behavior, and
+activation reopen before testing product flows (the invoking terminal needs
+Accessibility permission):
+
+```sh
+make macos-smoke
+make macos-cef-smoke
+```
+
+Then exercise the hardware/TCC paths that cannot be validated off-Mac:
+
+- open Browser, navigate and resize it, and confirm CEF content stays below
+  the native chrome;
+- allow, deny, cancel, and retry microphone, camera, and screen sharing in a
+  huddle; switch each available device and stop sharing;
+- pop a huddle out and back in, close/reopen the main window, and activate a
+  native notification;
+- enable and use Touch ID after the normal account unlock; and
+- confirm the app and workspace remain under the current user's directories
+  and never request an administrator password.
 
 ## Documentation
 

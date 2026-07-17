@@ -15,7 +15,6 @@ import { NetworkRail } from "../../console/layout/NetworkRail";
 import type { Workspace } from "../../domain/workspace-client";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 const status = (publicKey?: string) => ({
   version: "0.1.0",
@@ -31,8 +30,8 @@ const jsonResponse = (code: number, body: unknown): Response =>
     headers: { "content-type": "application/json" },
   });
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 const nodeFetch = (pubkey = "ab12") =>
@@ -69,7 +68,7 @@ function Probe() {
 }
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   invokeMock.mockReset();
@@ -83,7 +82,7 @@ const boot = (
   active: Workspace | null,
   handlers: Record<string, (args?: Record<string, unknown>) => unknown> = {},
 ) => {
-  markTauri();
+  markNative();
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd in handlers) return Promise.resolve(handlers[cmd](args));
     switch (cmd) {

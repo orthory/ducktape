@@ -1,6 +1,6 @@
 // Devices & keys — the account's collected member keys (any scheme), with the
 // two halves of the device-link ceremony, the phone QR enrollment (a P-256
-// key minted on a phone over the LAN — see src-tauri/src/enroll.rs), and
+// key minted on a phone over the LAN), and
 // member-key removal. Linked: list keys, mint/approve link codes (shown as a
 // QR + LAN address via link_relay.rs, with the copy/paste blobs as the
 // no-network fallback), enroll a phone, drop keys. Unlinked: offer the

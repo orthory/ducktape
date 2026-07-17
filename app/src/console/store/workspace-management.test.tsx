@@ -1,4 +1,4 @@
-// Workspace management contract, driven over the mocked Tauri `invoke` + a
+// Workspace management contract, driven over the mocked native `invoke` + a
 // stubbed node surface (same harness as onboarding.test.tsx):
 //   - a not-admitted workspace refuses entry from the picker with an error and
 //     stays put — it never repoints the registry or falls through to another
@@ -20,15 +20,14 @@ import type { Workspace } from "../../domain/workspace-client";
 import { ConnectPanel } from "../views/onboarding/ConnectPanel";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-// The Tauri event plane, mocked so a test can play the Rust side and fire
+// The native event plane, mocked so a test can play the Rust side and fire
 // shell events (identity-unlocked) into whatever listeners the provider hung.
-const tauriEvent = vi.hoisted(() => {
+const nativeEvents = vi.hoisted(() => {
   const handlers = new Map<string, Set<(event: { payload: unknown }) => void>>();
   return {
     handlers,
-    /** Fire a Tauri event into every registered listener (the test's Rust). */
+    /** Fire a native event into every registered listener (the test's Rust). */
     emitTo(name: string, payload: unknown) {
       handlers.get(name)?.forEach((handler) => handler({ payload }));
     },
@@ -40,15 +39,6 @@ const tauriEvent = vi.hoisted(() => {
     emit: vi.fn(() => Promise.resolve()),
   };
 });
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: tauriEvent.listen,
-  emit: tauriEvent.emit,
-}));
-// Materialize the mocked module up front: the provider fires several
-// CONCURRENT dynamic imports of the event module on mount, and vitest's lazy
-// mock factory races them — the loser would fall through to the real module.
-import "@tauri-apps/api/event";
-
 const status = (publicKey?: string) => ({
   version: "0.1.0",
   appHash: "aa".repeat(32),
@@ -63,8 +53,9 @@ const jsonResponse = (code: number, body: unknown): Response =>
     headers: { "content-type": "application/json" },
   });
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_EVENTS__ = nativeEvents;
 };
 
 const workspace = (over: Partial<Workspace>): Workspace => ({
@@ -97,11 +88,12 @@ function Probe() {
 }
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_EVENTS__;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
   invokeMock.mockReset();
-  tauriEvent.handlers.clear();
+  nativeEvents.handlers.clear();
   localStorage.clear();
   actions = null;
 });
@@ -137,7 +129,7 @@ const bootGate = async (
   list: Workspace[],
   handlers: Record<string, (args?: Record<string, unknown>) => unknown> = {},
 ) => {
-  markTauri();
+  markNative();
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd in handlers) return Promise.resolve(handlers[cmd](args));
     switch (cmd) {
@@ -200,7 +192,7 @@ describe("selecting a not-admitted workspace from the picker", () => {
     // boot resumes a parked workspace's waiting room; opening the picker and
     // clicking that same workspace must not silently no-op (the old
     // current-id early return) — the user asked for the honest status.
-    markTauri();
+    markNative();
     const guest = workspace({ id: "g", name: "Guest", founder: false, member: false });
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
@@ -462,7 +454,7 @@ describe("deleteWorkspace", () => {
   });
 
   it("deleting the ACTIVE workspace tears down and falls back to the account home", async () => {
-    markTauri();
+    markNative();
     const team = workspace({});
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
@@ -619,7 +611,7 @@ describe("auto-bind retry on identity unlock", () => {
    *  module is empty; `identity.current` plays the machine key's state and
    *  `submits` collects every parsed /v1/submit body, in order. */
   const bootConnected = async (identity: { current: unknown }) => {
-    markTauri();
+    markNative();
     const submits: Array<{ target?: string; payload?: unknown; origin?: string }> = [];
     const team = workspace({});
     invokeMock.mockImplementation((cmd: string) => {
@@ -677,7 +669,7 @@ describe("auto-bind retry on identity unlock", () => {
 
     identity.current = { state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true };
     await act(async () => {
-      tauriEvent.emitTo("ducktape://identity-unlocked", null);
+      nativeEvents.emitTo("ducktape://identity-unlocked", null);
     });
 
     await waitFor(() =>
@@ -703,7 +695,7 @@ describe("auto-bind retry on identity unlock", () => {
 
     identity.current = { state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true };
     await act(async () => {
-      tauriEvent.emitTo("ducktape://identity-unlocked", null);
+      nativeEvents.emitTo("ducktape://identity-unlocked", null);
     });
 
     await waitFor(() =>
@@ -723,7 +715,7 @@ describe("auto-bind retry on identity unlock", () => {
     });
 
     await act(async () => {
-      tauriEvent.emitTo("ducktape://identity-unlocked", null);
+      nativeEvents.emitTo("ducktape://identity-unlocked", null);
     });
 
     expect(invokeMock).not.toHaveBeenCalledWith("user_sign_bind", expect.anything());

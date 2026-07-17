@@ -1,14 +1,12 @@
-// Typed client for the desktop shell's ~/.ducktape workspace registry — the TS
-// mirror of app/src-tauri/src/workspaces.rs. Every call is a Tauri `invoke`,
+// Typed client for the native desktop app's ~/.ducktape workspace registry.
+// Every call crosses the native boundary,
 // so these ONLY work in the desktop build (guard with isDesktop()); the web
 // build has no local registry and dials a single configured node instead.
 //
 // Wire casing is the Rust command's: the registry structs serialize camelCase
 // (chainId, httpUrl), so the TS shapes match verbatim — no remapping.
 
-import { invoke } from "@tauri-apps/api/core";
-
-import { isTauri } from "./node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "./node-bootstrap";
 
 // ── Wire types (verbatim from workspaces.rs) ────────────
 
@@ -97,7 +95,7 @@ export interface JoinRequest {
 // ── Guard ───────────────────────────────────────────────
 
 /** The registry is desktop-only; the web build never calls these. */
-export const isDesktop = (): boolean => isTauri();
+export const isDesktop = (): boolean => hasNativeShell();
 
 // Live join/admit — joining a RUNNING network (post-genesis, network shape) and
 // admitting a joiner into it. The node's live-admission path landed in PR #77:

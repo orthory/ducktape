@@ -1,14 +1,12 @@
-// Typed mirror of the desktop shell's `sandbox_preflight` command
-// (app/src-tauri/src/sandbox.rs). A read-only host probe for the Node view's
+// Typed mirror of the native desktop app's `sandbox_preflight` command. A
+// read-only host probe for the Node view's
 // sandbox onboarding section: it reports the active workspace's serving opt-in
 // (from node.toml) plus the local backend's readiness. Only reachable in the
 // desktop build against a locally managed node — the Sandbox tab is what gates
-// the call; here we just degrade to `null` off Tauri so the view falls back to
+// the call; here we just degrade to `null` on the web so the view falls back to
 // its honest "run preflight on the node host" state.
 
-import { invoke } from "@tauri-apps/api/core";
-
-import { isTauri } from "./node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "./node-bootstrap";
 
 export interface ProbeResult {
   ok: boolean;
@@ -39,7 +37,7 @@ export type SandboxApplyMode = "off" | "direct" | "podman" | "tart";
 /** Probe the local host for one workspace. Resolves `null` off the desktop
  *  build (nothing to probe), so callers render the unknown/guidance state. */
 export const sandboxPreflight = (id: string): Promise<SandboxPreflight | null> =>
-  isTauri() ? invoke<SandboxPreflight>("sandbox_preflight", { id }) : Promise.resolve(null);
+  hasNativeShell() ? invoke<SandboxPreflight>("sandbox_preflight", { id }) : Promise.resolve(null);
 
 /** Persist a sandbox choice and restart the managed workspace node. The Rust
  * command rolls the config back when the new node fails to boot. */

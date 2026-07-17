@@ -3,9 +3,9 @@
 // enroll_start binds an ephemeral, token-gated LAN server and returns the URL to
 // render as a QR; the phone opens it, generates a P-256 key, and posts back a
 // signature. enroll_poll returns [newKeyHex, sigHex] once the phone finishes;
-// enroll_cancel tears the server down. All desktop-only (Tauri invoke).
+// enroll_cancel tears the server down. All desktop-only native calls.
 
-import { invoke } from "@tauri-apps/api/core";
+import { nativeCall as invoke } from "./node-bootstrap";
 
 export interface EnrollStart {
   url: string;

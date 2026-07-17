@@ -295,7 +295,7 @@ export interface ConsoleActions {
    *  huddling — so video tiles can bind their canvas / preview element to it.
    *  Ephemeral and per-client, exactly like the session itself. */
   getCallSession(): CallSession | null;
-  /** Pop the huddle out into its own desktop window (Tauri only). The media
+  /** Pop the huddle out into its own native desktop window. The media
    *  session HANDS OFF to that window: main releases its session (WS/mic/camera)
    *  — consensus membership untouched — and the window runs its own full video
    *  session. No-op when not in a huddle. */

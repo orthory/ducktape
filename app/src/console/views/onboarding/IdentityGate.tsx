@@ -29,7 +29,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 
-import { isTauri } from "../../../domain/node-bootstrap";
+import { hasNativeShell } from "../../../domain/node-bootstrap";
 import { BIP39_ENGLISH_SET } from "../../../domain/bip39-wordlist";
 import {
   confirmMnemonic,
@@ -179,7 +179,6 @@ function CreateFlow({
     </GateCard>
   );
 }
-
 // ── absent: create with Touch ID (macOS) ───────────────────────────────
 
 type TouchIdStep = "intro" | "grid" | "confirm";
@@ -664,7 +663,7 @@ function ResumeScreen({ onDone, onSkip }: { onDone: () => void; onSkip: () => vo
 // ── The gate itself ──────────────────────────────────────────────────────
 
 export function IdentityGate({ children }: { children: ReactNode }) {
-  const desktop = isTauri();
+  const desktop = hasNativeShell();
   const [report, setReport] = useState<IdentityStateReport | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
   const [dismissedPlaintext, setDismissedPlaintext] = useState(false);

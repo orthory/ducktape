@@ -1,7 +1,7 @@
 // The identity gate's state machine: absent → create|restore, plaintext → a
 // dismissable "secure your identity" interstitial, locked → unlock (with
 // skip), unlocked → no gate. Non-desktop never gates. Drives the gate over a
-// mocked `user-identity-client` (not Tauri `invoke` directly — the gate talks
+// mocked `user-identity-client` (not native `invoke` directly — the gate talks
 // to that module's typed surface, never IPC itself).
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -12,7 +12,6 @@ import type { IdentityStateReport } from "../../../domain/user-identity-client";
 import { IdentityGate } from "./IdentityGate";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 const identityStateMock = vi.hoisted(() => vi.fn());
 const createIdentityMock = vi.hoisted(() => vi.fn());
@@ -48,8 +47,8 @@ vi.mock("../../../domain/touchid-client", () => ({
   randomPassphrase: () => "RANDOMPASS",
 }));
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 const TEST_MNEMONIC = BIP39_ENGLISH_WORDLIST.slice(0, 24).join(" ");
@@ -64,7 +63,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   localStorage.removeItem("ducktape.pendingDisplayName");
   localStorage.removeItem("ducktape.accountLinkPending");
   vi.clearAllMocks();
@@ -104,7 +103,7 @@ describe("identity gate — platform gating", () => {
 
 describe("identity gate — state machine", () => {
   it("absent renders the create/restore/link chooser under the first-run step rail", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "absent",
       mnemonicConfirmed: true,
@@ -126,7 +125,7 @@ describe("identity gate — state machine", () => {
   });
 
   it("plaintext renders the dismissable secure-your-identity interstitial", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "plaintext",
       pubkey: "ab12",
@@ -143,7 +142,7 @@ describe("identity gate — state machine", () => {
   });
 
   it("locked (confirmed) renders the unlock form without the first-run rail", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "locked",
       pubkey: "ab12",
@@ -163,7 +162,7 @@ describe("identity gate — state machine", () => {
   });
 
   it("unlocked (confirmed) renders the console with no gate", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "unlocked",
       pubkey: "ab12",
@@ -183,7 +182,7 @@ describe("identity gate — state machine", () => {
 
 describe("identity gate — create flow", () => {
   it("walks password → grid → confirm → done, then re-fetches state", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
@@ -228,7 +227,7 @@ describe("identity gate — create flow", () => {
   });
 
   it("rejects a wrong confirm word and allows retry", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
     createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
     confirmMnemonicMock.mockResolvedValue(undefined);
@@ -268,7 +267,7 @@ describe("identity gate — create flow", () => {
   });
 
   it("surfaces a confirmMnemonic failure inline and allows retry", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
@@ -316,7 +315,7 @@ describe("identity gate — create flow", () => {
   });
 
   it("mismatched create password shows an inline error without calling the client", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
 
     render(
@@ -341,7 +340,7 @@ describe("identity gate — create flow", () => {
 
 describe("identity gate — restore flow", () => {
   it("rejects a word-count mismatch before calling the client", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
 
     render(
@@ -371,7 +370,7 @@ describe("identity gate — restore flow", () => {
   });
 
   it("rejects an unknown word before calling the client", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
 
     render(
@@ -403,7 +402,7 @@ describe("identity gate — restore flow", () => {
   });
 
   it("surfaces the server's checksum rejection inline for well-formed words", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
     restoreIdentityMock.mockRejectedValue(new Error("invalid mnemonic checksum"));
 
@@ -437,7 +436,7 @@ describe("identity gate — restore flow", () => {
   });
 
   it("restoring successfully re-fetches state and renders the console", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", mnemonicConfirmed: true });
@@ -474,7 +473,7 @@ describe("identity gate — restore flow", () => {
 
 describe("identity gate — unlock flow", () => {
   it("shows a wrong-password error inline without leaving the gate", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "locked",
       pubkey: "ab12",
@@ -501,7 +500,7 @@ describe("identity gate — unlock flow", () => {
   });
 
   it("unlocking successfully re-fetches state and renders the console", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", pubkey: "ab12", mnemonicConfirmed: true });
@@ -526,7 +525,7 @@ describe("identity gate — unlock flow", () => {
   });
 
   it("skip for now proceeds straight to the console without unlocking", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "locked",
       pubkey: "ab12",
@@ -549,7 +548,7 @@ describe("identity gate — unlock flow", () => {
 
 describe("identity gate — plaintext (legacy) flow", () => {
   it("dismiss proceeds to the console for this launch", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "plaintext",
       pubkey: "ab12",
@@ -569,7 +568,7 @@ describe("identity gate — plaintext (legacy) flow", () => {
   });
 
   it("secure flow sets a password (encryptLegacy) then offers to reveal the phrase", async () => {
-    markTauri();
+    markNative();
     // mnemonicConfirmed: true post-encrypt is real backend behavior, not just
     // a convenient mock: `user_identity_encrypt` now sets the registry flag
     // itself (mirroring `user_identity_restore`) — a legacy key predates the
@@ -619,7 +618,7 @@ describe("identity gate — plaintext (legacy) flow", () => {
 
 describe("identity gate — create-flow resume", () => {
   it("locked + unconfirmed resumes at password → mnemonic → confirm", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "locked", pubkey: "ab12", mnemonicConfirmed: false })
       .mockResolvedValue({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true });
@@ -661,7 +660,7 @@ describe("identity gate — create-flow resume", () => {
     // a password (possibly forgotten) before the console renders, so it must
     // not be a hard trap — skipping just means the gate re-offers next
     // launch, same as any other unconfirmed mnemonic.
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({
       state: "locked",
       pubkey: "ab12",
@@ -685,7 +684,7 @@ describe("identity gate — create-flow resume", () => {
 
 describe("identity gate — pending display name", () => {
   it("parks the chosen name for the first connect to apply on-chain", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
     createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
 
@@ -713,7 +712,7 @@ describe("identity gate — pending display name", () => {
   });
 
   it("parks nothing when the name is left blank", async () => {
-    markTauri();
+    markNative();
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
     createIdentityMock.mockResolvedValue({ pubkey: "ab12", mnemonic: TEST_MNEMONIC });
 
@@ -749,7 +748,7 @@ describe("identity gate — link-device flow", () => {
   const CHALLENGE = `ducktape-link-challenge-v1:${btoa(JSON.stringify(CHALLENGE_JSON))}`;
 
   it("creates the key, marks link-pending, signs possession, and shows the response code", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       // gate boot: no key yet
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
@@ -850,7 +849,7 @@ describe("identity gate — link-device flow", () => {
   };
 
   it("links over the LAN when the input is the QR address", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
@@ -906,7 +905,7 @@ describe("identity gate — link-device flow", () => {
   });
 
   it("falls back to the response code when the LAN reply can't be delivered", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
@@ -944,7 +943,7 @@ describe("identity gate — link-device flow", () => {
     // new device before fetching the code from their other device continues
     // to the workspace step; the link-pending flag survives so auto-bind
     // keeps deferring and the Account view re-offers the wizard.
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
@@ -981,7 +980,7 @@ describe("identity gate — link-device flow", () => {
   });
 
   it("rejects a malformed challenge inline without signing", async () => {
-    markTauri();
+    markNative();
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
       .mockResolvedValue({ state: "unlocked", pubkey: "cd34", mnemonicConfirmed: true });
@@ -1024,7 +1023,7 @@ describe("identity gate — link-device flow", () => {
 
 describe("identity gate — Touch ID create flow", () => {
   it("hides the Touch ID tab when the shim reports unavailable", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(false);
     identityStateMock.mockResolvedValue({ state: "absent", mnemonicConfirmed: true });
 
@@ -1040,7 +1039,7 @@ describe("identity gate — Touch ID create flow", () => {
   });
 
   it("Touch ID create: no password step, shows the phrase, enrolls after confirm", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(true);
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
@@ -1091,7 +1090,7 @@ describe("identity gate — Touch ID create flow", () => {
   });
 
   it("a failed enroll is non-fatal — the account still lands in the console", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(true);
     identityStateMock
       .mockResolvedValueOnce({ state: "absent", mnemonicConfirmed: true })
@@ -1125,7 +1124,7 @@ describe("identity gate — Touch ID create flow", () => {
 
 describe("identity gate — unlock with Touch ID", () => {
   it("offers Touch ID on the locked screen and unlocks with it", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(true);
     identityStateMock
       .mockResolvedValueOnce({ state: "locked", pubkey: "ab12", mnemonicConfirmed: true })
@@ -1148,7 +1147,7 @@ describe("identity gate — unlock with Touch ID", () => {
   });
 
   it("the touchid-unavailable sentinel points the user at the recovery phrase", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(true);
     identityStateMock.mockResolvedValue({
       state: "locked",
@@ -1173,7 +1172,7 @@ describe("identity gate — unlock with Touch ID", () => {
   });
 
   it("a canceled OS prompt is quiet — no error, the button is re-armed", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(true);
     identityStateMock.mockResolvedValue({
       state: "locked",
@@ -1201,7 +1200,7 @@ describe("identity gate — unlock with Touch ID", () => {
   });
 
   it("no Touch ID button when the shim reports unavailable", async () => {
-    markTauri();
+    markNative();
     touchidAvailableMock.mockResolvedValue(false);
     identityStateMock.mockResolvedValue({
       state: "locked",

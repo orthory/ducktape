@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { openExternal } from "./external-link";
 
-// jsdom has no __TAURI_INTERNALS__, so openExternal takes the web path and
+// jsdom has no __DUCKTAPE_TEST_NATIVE_INVOKE__, so openExternal takes the web path and
 // calls window.open — spy on it to assert which schemes are honored.
 
 afterEach(() => {

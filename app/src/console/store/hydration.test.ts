@@ -275,13 +275,13 @@ describe("receiptFloor", () => {
     ).toBe(9);
   });
 
-  it("ignores pending, failed, and heightless records", () => {
+  it("includes pending receipts while ignoring failed and heightless records", () => {
     expect(
       receiptFloor({
         pending: op("pending", 99),
         failed: op("failed", 42),
         settledWithoutReceipt: op("finalized"),
       }),
-    ).toBe(0);
+    ).toBe(99);
   });
 });

@@ -1,6 +1,6 @@
 // The identity client mirrors identity-interface: IdentityMsg encoding
 // (BindNode/UnbindNode/AddMemberKey/RemoveMemberKey carry a MemberAuth minted
-// by the tauri shell, SetAccountName is origin-gated) + IdentityReply decoding
+// by the native shell, SetAccountName is origin-gated) + IdentityReply decoding
 // for All/Get/OfNode/OfMember over the account registry.
 
 import { describe, expect, it, vi } from "vitest";
@@ -101,7 +101,7 @@ describe("identity queries", () => {
 });
 
 describe("identity msgs", () => {
-  it("submitRawMsg parses the tauri-signed payload and submits it untouched", async () => {
+  it("submitRawMsg parses the native-signed payload and submits it untouched", async () => {
     const transport = stubTransport();
     const raw = JSON.stringify({
       bind_node: {

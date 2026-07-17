@@ -1,153 +1,195 @@
 ---
 name: qa
-description: Use to drive or test isolated real Ducktape CEF desktop instances managed by tauri-agent-fleet. Fleet builds once, launches private instances, exposes loopback VNC on Linux or a native window on macOS, and drives the direct tauri-agent endpoint. For one already-running app outside Fleet, use tauri-debug.
+description: Verify the real native Ducktape Iced desktop, its managed node, and its isolated CEF Browser pane — agent-driven through the iced-agent bridge (tree/find/click/type/state/shot), plus package and lifecycle checks. Use for UI/design QA, lifecycle regressions, package checks, and native smoke testing.
 ---
 
-# QA with tauri-agent-fleet
+# Native Iced QA
 
-Ducktape delegates generic build caching, process ownership, scheduling, runner
-budgets, artifacts, and dashboard serving to `tauri-agent-fleet`. This repository
-owns only `.tauri-agent/` and `qa/fleet/`.
+Use the packaged native app, not the React dev server, for desktop claims. Iced
+owns the interface and node lifecycle; CEF exists only inside Browser. Dev
+builds carry the **iced-agent bridge**: a loopback driver with a semantic tree,
+synthetic input through iced's real event path, screenshots, a log ring, and a
+curated state projection — plus real OS AccessKit fed from the same tree.
 
-## Interactive loop
-
-```bash
-FLEET="${FLEET:-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js}"
-
-"$FLEET" up HEAD
-"$FLEET" status --json
-"$FLEET" dashboard
-
-# Pick the instance's directories.runtime value from status --json.
-export XDG_RUNTIME_DIR=<runtime-directory>
-app/scripts/tauri-agent tree --app com.ducktape.app
-app/scripts/tauri-agent find --role button --name Create --app com.ducktape.app
-
-"$FLEET" down <instance-id>
-```
-
-The opaque instance ID, not the branch, owns HOME, XDG runtime/data, display,
-ports, endpoint, observation capability, and exact process groups. Linux uses a
-private X display and VNC token. macOS launches the native app with
-`display=native`, `vncPort=0`, and no fake VNC route. Never find or stop desktop
-processes with `pkill -f`. Fleet runs Ducktape's cleanup hook after stopping the
-desktop so its recorded detached workspace-node group cannot survive teardown.
-
-## Deterministic suites
+## Baseline gates
 
 ```bash
-export FLEET_MODEL_PROVIDER=claude   # CLAUDE_MODEL defaults to haiku
-"$FLEET" test cef-smoke notification-bell --jobs 1
+cargo test -p ducktape-iced
+cargo test -p iced-agent-plugin
+cd app
+bun install --frozen-lockfile
+bun run typecheck
+bun run test
+bun run build
 ```
 
-Suites let the model choose only typed UI actions. `expect`, state, and IPC pass
-conditions determine the result. Fleet enforces step, wall-time, token, and
-repetition limits and persists actions, usage, semantic frames, console,
-network, IPC, screenshot, and replay artifacts outside the model context.
-
-Ducktape is CEF-only on `dev`; use `runtime: cef`. The plugin endpoint is a
-debug-build seam and is intentionally absent from release builds.
-
-### Action model: local binary execution, not an API key
-
-Fleet ≥ `17b2b40` runs the suite's action-chooser through a LOCAL binary; no
-`OPENAI_API_KEY` is needed (that requirement only exists on older fleet pins
-whose sole provider was the OpenAI Responses API — `app/package.json` pins the
-fleet revision; if `test` demands a key, the pin predates the binary runner).
-
-Two providers, both verified green on the `notification-bell` suite:
-
-- `FLEET_MODEL_PROVIDER=claude` — uses the `claude` CLI and its existing
-  Claude Code login, which every dev in this repo already has. `CLAUDE_MODEL`
-  defaults to `haiku` — the right tier for choosing one typed UI action per
-  step; don't reach for a bigger model unless a suite's objective genuinely
-  needs multi-step reasoning.
-- `FLEET_MODEL_PROVIDER=codex` (fleet's default) — uses the `codex` CLI
-  (`CODEX_MODEL` defaults to `gpt-5.3-codex-spark`). Requires a ChatGPT/Codex
-  subscription, which not every dev has — prefer `claude` in shared docs and
-  CI recipes.
-
-### Writing pass conditions — what each kind can and cannot see
-
-- **`expect` conditions are evaluated from step 0 and THROW on an absent
-  element** (`BRIDGE_UNAVAILABLE` → the whole run dies as
-  `infrastructure_failure` before the model acts). Only use `expect` for
-  elements that exist at app boot. Never gate on something the objective is
-  supposed to create.
-- **`ipc` conditions currently see nothing under CEF** — the captured invoke
-  ledger is empty (`tauri-agent ipc` returns `[]` even after real commands
-  run), so an `ipc: {command, ok}` condition can never pass. Don't use them
-  until IPC capture works in the CEF runtime.
-- **`state` probes are the reliable post-action assertion.** Register a
-  DOM-derived probe in `app/src/main.tsx`'s `WebviewAgentInstrumentation`
-  install (`state: { probeName: () => … }`), then assert it. `state.key`
-  resolves TOP-LEVEL only (`url` | `title` | `values` | `probes`) — a probe is
-  matched by deep-equalling the whole `probes` map:
-
-  ```json
-  { "state": { "key": "probes", "equals": { "notifyDropdownOpen": true } } }
-  ```
-
-  (Deep-equal over the full map means every registered probe appears in
-  `equals` — revisit if the probe set grows.)
-- **Budget for the binary runner is much larger than the old API runner**: the
-  semantic-tree observation rides through the model each step. `tokens: 30000`
-  passes; 1–2k dies at step 0 with `token limit exceeded`. `repetitions` counts
-  identical consecutive actions — a correct click that fails a broken pass
-  condition burns one repetition per retry, so a too-strict budget converts a
-  pass-condition bug into `repeated action limit exceeded`.
-
-Worked example: `.tauri-agent/suites/notification-bell.toon` (boot-safe button
-`expect` + the `notifyDropdownOpen` probe). Diagnose failures from the run
-artifacts under the instance directory: `run.json` (failure + message),
-`actions.jsonl` (what the model actually did), `ipc.jsonl`, `failure.png`.
-
-## Several worktrees or same-artifact instances
+Build or run the matching native app from the repository root:
 
 ```bash
-"$FLEET" up dev agent/my-branch
-"$FLEET" test cef-smoke cef-smoke --jobs 2
+make dev   # interactive debug app (agent bridge on)
+make app   # release package in target/release/bundle (agent bridge compiled out)
 ```
 
-The first form builds each selected revision. The second builds the selected
-revision/CEF runtime once and launches isolated instances from the same cached
-artifact.
+## What's wired
 
-## macOS sandbox hardware gate
+| Piece | Where |
+|---|---|
+| Fork seams (AccessKit adapter, tree push, event injection) | [byeongsu-hong/iced-agent-browser](https://github.com/byeongsu-hong/iced-agent-browser) `iced-winit/` (git dep via `[patch.crates-io]`, rev pinned by Cargo.lock), feature `agent`, marked `// AGENT SEAM` |
+| Semantic layer + bridge + tools | iced-agent-browser `plugin/` (`sem()` tags, Operation collector, loopback JSON-lines server) |
+| App wiring (150 ms snapshot loop, intents, a11y-action routing) | `app/src-iced/src/shell/agent_wire.rs` |
+| CLI | `ops/iced-agent <cmd>` (bun shim over a cached clone in `~/.cache/iced-agent-browser`) |
+| MCP | `.mcp.json` server `iced-agent` via `ops/iced-agent-mcp`, tools `iced_*` |
+| Discovery | `${XDG_RUNTIME_DIR|TMPDIR|/tmp}/iced-agent/com.ducktape.app/endpoint.json` (`cdp` field = Browser-pane CDP URL in dev) |
 
-After touching the Sandbox page, sandbox config transaction, node restart, or
-Podman/Tart provider lifecycle, run this on an Apple Silicon Mac:
+Everything is dev-only: the seams and wiring compile under
+`all(feature = "agent", debug_assertions)`; a release binary registers nothing
+and binds nothing.
+
+## Drive the app
 
 ```bash
-ops/smoke-macos-sandbox.sh
+ops/iced-agent tree                          # semantic tree (default --window main)
+ops/iced-agent find --role button --name Forge
+ops/iced-agent click @3                      # @refs valid until the next tree/find
+ops/iced-agent type "hello"                  # per-key into the focused widget
+ops/iced-agent press --key k --mod ctrl     # chords; named keys: enter/tab/escape/…
+ops/iced-agent state --path section          # curated Shell projection
+ops/iced-agent intent '{"navigate":{"url":"chat"}}'
+ops/iced-agent shot --out /tmp/app.png       # WM-free PNG via window::screenshot
+ops/iced-agent logs                          # in-app tracing ring (4096 lines)
+ops/iced-agent wait --role button --name Settings --timeout 5000
+ops/iced-agent a11y                          # dump the tree actually pushed to the OS
+ops/iced-agent windows                       # main / huddle / tray
 ```
 
-The gate uses real Podman and Tart execution, then launches isolated native CEF
-instances for successful Podman/Tart Apply and an injected failed-start
-rollback. It must finish through Fleet teardown; do not remove its worktree or
-stop its processes manually. The QA identity password is opt-in and confined
-to Fleet's disposable HOME.
+Or the MCP tools (`iced_tree`, `iced_find`, `iced_click`, …) from Claude Code.
+Assertions go over `tree`/`find`/`state` — display-independent; `shot` is for
+evidence, not assertions. Browser-pane content is Chromium: read `cdp` from
+`endpoint.json` and drive it over CDP directly.
 
-The Mac mini is disk-constrained, so live QA is not complete until cleanup is
-also verified:
+Per-instance isolation: the endpoint lives under `XDG_RUNTIME_DIR`, so parallel
+apps isolate by giving each instance its own runtime dir and exporting it
+before calling the CLI.
 
-1. Run `fleet down` for every instance created by the task and confirm
-   `status --json` reports each one as `stopped`.
-2. Confirm no task-owned `ducktape-node`, temporary Tart clone, or Podman
-   container remains. Never use `pkill -f`.
-3. After the PR merges, remove the task worktree and branch. Only then remove
-   stopped instance homes and unreferenced artifacts owned solely by that
-   finished task; never delete a cache shared by an active instance or another
-   worktree.
-4. Report `df -h /` before and after cleanup so the reclaimed space is visible.
+## Screen unit tests — the test.tsx layer
 
-## Linux host prerequisite fallback
+`app/src-iced/src/test/<surface>.rs` (short names, one file per surface —
+the iced twin of `app/src/test/sim/<surface>.test.tsx`). Render a screen's
+`view(&state)` in `iced_test::simulator`, address widgets with `by::role`,
+assert the `Message` values interactions emit (Elm's callback assert — no
+mocks), and drive screen-local `update` transitions. Runs in the standing
+`cargo test -p ducktape-iced` gate. Harness: `src/test/harness.rs`
+(`sim`/`emitted`/`has`). Below this layer sit the recipes:
 
-Linux Fleet expects `Xvfb` and `x11vnc` on PATH. macOS must not install or invoke
-either helper; Fleet launches the native application bundle directly. The
-existing remote-tauri staging can be used during Linux host migration:
+## Recipe QA — two lanes, one recipe
+
+`qa/recipes/*.json` are declarative scenarios that run in BOTH QA lanes
+(format: iced-agent-browser README "Recipes"):
 
 ```bash
-export FLEET_VNC_COMMAND="$HOME/.local/opt/remote-tauri/root/usr/bin/x11vnc"
-export LD_LIBRARY_PATH="$HOME/.local/opt/remote-tauri/root/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+CARGO_INCREMENTAL=0 cargo test -p ducktape-iced qa_recipes  # in-process lane
+ops/iced-fleet up 2 && ops/iced-fleet run qa/recipes/*.json && ops/iced-fleet down
+make ui-qa                                                  # both lanes
 ```
+
+**Lane doctrine — pick the lane by what the test must prove, not by habit:**
+
+| Lane | Use when | Not for |
+|---|---|---|
+| **in-process** (`lane: both`, default) — `iced_test::Simulator` + the shell's `update` loop, plain `cargo test` | Pure UI logic `update()`+`view()` can prove: navigation, state transitions, widget presence/labels | Anything async or process-level |
+| **agent/fleet** (`lane: fleet`) — live headless binaries via the bridge | What only a living process shows: subscription-driven global shortcuts, multi-window lifecycle, real node/CEF effects, screenshots, a11y | Logic already provable in-process (wasting a live boot on it) |
+
+Rule of thumb: *if `update()`+`view()` can prove it, it's in-process; the
+agent lane is for what only a living process can lie about.* Every recipe
+SHOULD stay `lane: both` unless it needs fleet-only machinery.
+
+Live-lane semantics differ on purpose: nothing is synchronous on a live app,
+so the runner treats recipe `expect` as "eventually within 3 s"; in-process
+keeps single-shot asserts. Fleet instances are cattle — `run` re-boots the
+slot with each recipe's `preset`, so recipes never see each other's state.
+
+## Sim lane — transaction round-trips against an embedded node
+
+`app/src-iced/src/shell/sim/` (`cargo test -p ducktape-iced shell::sim`) — the
+iced twin of the TS `app/src/test/sim/` suites, foundry-style. `SimShell::boot()`
+EMBEDS a deterministic node via `simnode::boot`, points the app's real
+`NodeClient` at the in-process listener, and runs a task pump that executes
+`update()` Tasks on a private tokio runtime. Self-contained: no external
+binaries, no env vars. Deterministic: no timers, no subscriptions — timer
+refreshes are injected messages. `make ui-qa` runs it first.
+
+What belongs here: submit → commit → re-render flows, module rejections
+surfacing in UI state. What does NOT: anything needing a real window
+(`lane: fleet`), pure view variants (`src/test/`), recipe-provable navigation
+(`lane: both`).
+
+Harness surface is `boot/click/inject/has/sees_text/shell/node_query` — there is
+no `click_and_type`: simulated typewrite does not reach a `text_editor`, so
+composer text is injected as a `Paste` edit. Message BODIES render as
+`rich_text`, which exposes no operation/text hook, so `sees_text` can never
+match a body — assert the body via the render model
+(`shell().user_screens.chat.data`) and confirm the row materialized with a
+`sees_text` on its plain-text author label.
+
+**Deep reference for writing sim-lane tests** — harness API, Simulator traps,
+chat wire shapes/ordering guarantees, and embedding `simnode::boot` in any
+crate's `#[test]` — lives in `skills/sim-lane`.
+
+## Headless bring-up (Linux)
+
+```bash
+Xvfb :99 -screen 0 1400x900x24 -nolisten tcp &
+export DISPLAY=:99 HOME=<isolated> XDG_RUNTIME_DIR=<short-path, chmod 700>
+export DUCKTAPE_NODE_BIN="$(pwd)/target/debug/ducktape-node"
+dbus-run-session -- bash -c '
+  /usr/libexec/at-spi2-registryd &            # bare sessions cannot dbus-activate it
+  target/debug/ducktape-iced & sleep 15
+  # AccessKit activates only on an IsEnabled *change* signal:
+  gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus \
+    --method org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled "<true>"
+  ...drive with ops/iced-agent...
+'
+```
+
+Gotchas (each cost a debug round — see memory `iced-agent-plugin-campaign`):
+`XDG_RUNTIME_DIR` must be a short path (wayland sockets cap at 108 bytes); the
+a11y switch must *change* after boot for OS-AccessKit checks (the bridge works
+regardless); rustc ICE on this box → `CARGO_INCREMENTAL=0`.
+
+## Native checklist
+
+Use an isolated regular-user profile. Never run the desktop as root or
+Administrator.
+
+1. Launch the staged package and complete or restore onboarding
+   (`find --role button` — onboarding's primary/secondary/link buttons are all
+   tagged; drive with `click @ref` + `type`).
+2. Create/select a workspace; verify its node becomes ready (`state --path
+   has_workspace`, `logs`) and the UI stays responsive while starting.
+3. Close the window, reopen/activate the app, and verify the workspace remains
+   selected and the node was not duplicated.
+4. Quit explicitly; verify the managed node and CEF child processes exit.
+5. Open Browser, navigate to a signed `.duck` route (over CDP), resize/hide/
+   show it, then leave Browser. Browsed content must not overlap native chrome,
+   reach a direct HTTP(S)/loopback/file URL, or access desktop backend actions.
+6. Inspect the workspace's `daemon.log` and `ops/iced-agent logs`; do not
+   expose capability-bearing URL paths, keys, passwords, or recovery phrases in
+   reports.
+
+On macOS, the AppleScript smokes still cover packaged-bundle lifecycle:
+
+```bash
+make macos-smoke
+make macos-cef-smoke
+```
+
+## Process safety
+
+Never use `pkill -f`. Identify a process by executable, process cwd, and the
+workspace's `--config` before signalling it. Use the application's own quit
+path first. For merged-worktree cleanup, dry-run `ops/worktree-clean.sh` and
+then use `--yes`; its retired-workflow reaper is intentionally preserved for
+old external homes.
+
+Report the package path, OS/display backend, CEF result, node lifecycle result,
+commands run, and any skipped platform gate.

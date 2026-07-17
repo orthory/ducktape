@@ -1,13 +1,12 @@
 // The account Home layer: profile + workspace table + custody, with the
 // chain-scope banner when nothing is connected. Store comes in through a
-// ConsoleContext harness; custody's Tauri fetch through a mocked invoke.
+// ConsoleContext harness; custody's native fetch through a mocked invoke.
 
 import { render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import type { ConsoleActions } from "../../store/actions";
 import { ConsoleContext } from "../../store/context";
@@ -27,8 +26,8 @@ const workspace: Workspace = {
   ports: { listen: 7420, http: 8844, rpc: 9020 },
 };
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 const renderHome = (patch: Partial<ConsoleState> = {}) => {
@@ -67,13 +66,13 @@ const renderHome = (patch: Partial<ConsoleState> = {}) => {
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 
 describe("HomeView", () => {
   it("shows the profile, the workspace table, and custody; banner when disconnected", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "user_identity_state")
         return Promise.resolve({ state: "locked", pubkey: DEVICE_KEY, mnemonicConfirmed: true });
@@ -101,7 +100,7 @@ describe("HomeView", () => {
     expect(await screen.findByText("RECOVERY & SECURITY")).toBeInTheDocument();
   });
 
-  it("does not fetch identity on the web build (no tauri shell)", async () => {
+  it("does not fetch identity on the web build (no native shell)", async () => {
     renderHome();
     await Promise.resolve();
     expect(invokeMock).not.toHaveBeenCalled();

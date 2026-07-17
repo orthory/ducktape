@@ -117,14 +117,15 @@ async fn the_guard_covers_every_control_plane_route() {
     }
 }
 
-/// A guard that breaks the console is not a fix.
+/// Native iced does not need a browser origin exception. Loopback origins are
+/// untrusted unless an exact development origin is explicitly configured.
 #[tokio::test]
-async fn the_console_origin_still_reaches_the_control_plane() {
+async fn loopback_browser_origins_are_refused_by_default() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     let _reached = spawn_counting_actor(cmd_rx);
     let app = noded::router(handle);
 
-    for origin in ["tauri://localhost", "http://localhost:1430"] {
+    for origin in ["http://localhost:1420", "http://127.0.0.1:1420"] {
         let response = app
             .clone()
             .oneshot(
@@ -138,10 +139,10 @@ async fn the_console_origin_still_reaches_the_control_plane() {
             .await
             .unwrap();
 
-        assert_ne!(
+        assert_eq!(
             response.status(),
             StatusCode::FORBIDDEN,
-            "the console origin {origin} must still be served"
+            "loopback browser origin {origin} must be opt-in"
         );
     }
 }

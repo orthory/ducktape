@@ -7,7 +7,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.hoisted(() => vi.fn());
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 import {
   randomPassphrase,
@@ -18,12 +17,12 @@ import {
   touchidUnlock,
 } from "./touchid-client";
 
-const markTauri = () => {
-  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+const markNative = () => {
+  (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__ = invokeMock;
 };
 
 afterEach(() => {
-  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  delete (window as unknown as Record<string, unknown>).__DUCKTAPE_TEST_NATIVE_INVOKE__;
   vi.clearAllMocks();
 });
 
@@ -46,7 +45,7 @@ describe("touchidAvailable", () => {
   });
 
   it("invokes touchid_available on desktop", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue(true);
     await expect(touchidAvailable()).resolves.toBe(true);
     expect(invokeMock).toHaveBeenCalledWith("touchid_available");
@@ -60,7 +59,7 @@ describe("touchidEnrolled", () => {
   });
 
   it("invokes touchid_enrolled on desktop", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue(true);
     await expect(touchidEnrolled()).resolves.toBe(true);
     expect(invokeMock).toHaveBeenCalledWith("touchid_enrolled");
@@ -69,7 +68,7 @@ describe("touchidEnrolled", () => {
 
 describe("touchidEnroll", () => {
   it("invokes touchid_enroll with the passphrase", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue(undefined);
     await expect(touchidEnroll("RANDOMPASS")).resolves.toBeUndefined();
     expect(invokeMock).toHaveBeenCalledWith("touchid_enroll", {
@@ -80,7 +79,7 @@ describe("touchidEnroll", () => {
 
 describe("touchidUnlock", () => {
   it("invokes touchid_unlock and returns the pubkey shape", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue({ pubkey: "ab12" });
     await expect(touchidUnlock()).resolves.toEqual({ pubkey: "ab12" });
     expect(invokeMock).toHaveBeenCalledWith("touchid_unlock");
@@ -89,7 +88,7 @@ describe("touchidUnlock", () => {
 
 describe("touchidDisable", () => {
   it("invokes touchid_disable with no args", async () => {
-    markTauri();
+    markNative();
     invokeMock.mockResolvedValue(undefined);
     await expect(touchidDisable()).resolves.toBeUndefined();
     expect(invokeMock).toHaveBeenCalledWith("touchid_disable");

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "tauri-agent": {
-      "command": "app/scripts/tauri-agent-mcp",
+    "iced-agent": {
+      "command": "ops/iced-agent-mcp",
       "args": []
     }
   }

@@ -1,52 +1,75 @@
 # ducktape build + install entry points.
 #
-# `make install` builds the networked node and the desktop app, installs
-# ducktape-node into ~/.cargo/bin, and installs the app — on macOS
-# Ducktape.app into /Applications, on Linux the self-contained app dir
-# (binary + ducktape-node sidecar + pinned CEF runtime, resolved via the
-# binary's DT_RPATH of $ORIGIN) into ~/.ducktape/app with a `ducktape`
-# launcher symlink in ~/.cargo/bin. individual targets below for the pieces.
+# `make install` builds the networked node and native iced desktop app,
+# installs ducktape-node, and installs the platform package: Ducktape.app on
+# macOS, a self-contained app dir on Linux, or a current-user app plus Start
+# menu shortcut on Windows. Every package carries the pinned CEF runtime used
+# only by the Browser pane.
 
 CARGO ?= cargo
 BUN ?= bun
-APP_DEST ?= /Applications
+# Rootless by default on macOS. Operators who deliberately manage a shared
+# machine can still override APP_DEST=/Applications themselves.
+APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 # Linux: the app's payload directory lives inside ducktape's own home so the
 # installed app is self-contained and launcher-spawnable (no LD_LIBRARY_PATH).
 DUCKTAPE_HOME ?= $(HOME)/.ducktape
 
-# The desktop shell runs on the standalone tauri-runtime-cef crate
-# (github.com/byeongsu-hong/tauri-runtime-cef) against published crates.io
-# tauri: plain cargo builds work everywhere. `cef-env` (idempotent) only
-# provisions macOS bundling prerequisites — ninja + the pinned feat/cef CLI
-# checkout, see ops/cef-probe/setup.sh; on Linux it exits immediately.
-# CEF_PATH is where the CEF binary distribution
-# lives (cef-dll-sys downloads into it on first build; the tauri CLI hands
-# it to the macOS bundler for the framework/helper copy).
-CEF_CLONE ?= $(HOME)/.cache/ducktape-cef-probe/tauri-cef
+# The native iced shell embeds the pinned CEF distribution only for its Browser
+# pane. `cef-env` provisions the CEF build prerequisites and distribution.
+# CEF_PATH is where cef-dll-sys downloads the pinned binary distribution. The
+# native staging scripts copy the runtime/framework and helpers from there.
+CEF_TOOLS ?= $(HOME)/.cache/ducktape-cef-tools
 export CEF_PATH ?= $(HOME)/.local/share/cef
 # setup.sh drops a ninja binary here on Macs that lack one (cef-dll-sys
 # hardcodes the Ninja CMake generator); make sure child builds can see it.
-export PATH := $(dir $(CEF_CLONE))bin:$(PATH)
+export PATH := $(CEF_TOOLS)/bin:$(PATH)
 
-UNAME_S := $(shell uname -s)
+ifeq ($(OS),Windows_NT)
+HOST_OS := Windows
+else
+HOST_OS := $(shell uname -s)
+endif
 
-.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
+# The native screen-sharing picker requires macOS 14. Keep the Rust, Swift,
+# and C/C++ deployment targets aligned with the bundle's honest minimum.
+ifeq ($(HOST_OS),Darwin)
+export MACOSX_DEPLOYMENT_TARGET ?= 14.0
+endif
 
-all: node web
+.PHONY: all dev ui-qa demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
 
-## provision macOS bundling prerequisites (ninja + the pinned upstream
-## feat/cef tauri CLI checkout); no-op on Linux. idempotent; every
+all: app
+
+## provision macOS CEF build prerequisites (ninja); no-op on Linux. idempotent; every
 ## cargo-touching target depends on it.
 cef-env:
-	@bash ops/cef-probe/setup.sh "$(CEF_CLONE)"
+	@bash ops/cef-probe/setup.sh "$(CEF_TOOLS)"
 
-## dev loop: the desktop app + a HOT-RELOADING node. runs `tauri dev` (frontend
-## hot-reload) and watches the Rust tree — on any node/kernel change it rebuilds
-## ducktape-node and restarts the running node in place, which the app re-adopts.
-## see ops/dev.sh. (stop any already-running `tauri dev` first — it owns :1430.)
-dev: cef-env app/node_modules
-	@bash ops/dev.sh
+## Native iced development app with the matching local node binary. macOS
+## runs from a staged .app. Windows runs only through CEF's sandbox-owning
+## bootstrap + Rust client DLL pair. Linux can run the flat debug executable.
+## Keep incremental builds for the node, but disable them for the async-heavy
+## iced crate: rustc 1.96 can otherwise ICE on stale obligation fingerprints.
+ifeq ($(HOST_OS),Darwin)
+dev: cef-env
+	$(CARGO) build -p node-bin
+	CARGO_INCREMENTAL=0 $(CARGO) build -p ducktape-iced
+	bash ops/stage-macos-iced-app.sh debug
+	bash ops/check-macos-cef-bundle.sh target/debug/bundle/macos/Ducktape.app
+	target/debug/bundle/macos/Ducktape.app/Contents/MacOS/ducktape
+else ifeq ($(HOST_OS),Windows)
+dev: cef-env
+	$(CARGO) build -p node-bin
+	CARGO_INCREMENTAL=0 $(CARGO) build -p ducktape-iced --lib
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops/stage-windows-app.ps1 -Configuration debug -NoArchive
+	target/debug/bundle/windows/Ducktape/Ducktape.exe
+else
+dev: cef-env
+	$(CARGO) build -p node-bin
+	CARGO_INCREMENTAL=0 DUCKTAPE_NODE_BIN="$(abspath target/debug/ducktape-node)" $(CARGO) run -p ducktape-iced
+endif
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
 ## messages, a tasks board, pages, a registered agent (with a live @mention run),
@@ -89,39 +112,55 @@ coordinator: cef-env
 coordinator-smoke: cef-env
 	$(CARGO) test -p coordinator-bin
 
-## stage the daemon as the desktop app's sidecar (app/src-tauri/binaries)
-sidecar: cef-env app/node_modules
-	cd app && $(BUN) run sidecar
+## build the daemon that is staged beside the desktop executable.
+sidecar: cef-env
+	$(CARGO) build -p node-bin
 
 ## static web bundle -> app/dist
 web: app/node_modules
 	cd app && $(BUN) run build
 
-## desktop build — stages the sidecar itself via beforeBuildCommand. on macOS
-## a bundle (.app + .dmg under target/release/bundle); on Linux a relocatable
-## self-contained dir + release tarball under target/release/bundle/linux
-## (ops/stage-linux-app.sh; --no-bundle because tauri's deb/rpm/appimage
-## packagers know nothing about the CEF payload — the staging script is the
-## Linux bundler). the dmg post-fix hides .VolumeIcon.icns, which macOS 26
-## Finder would otherwise show overlapping the app icon — see ops/fix-dmg.sh.
-## on macOS the bundle MUST be built with the feat/cef tauri CLI: it copies
-## "Chromium Embedded Framework.framework" and the CEF helper apps into the
-## .app — the released npm @tauri-apps/cli knows nothing about CEF and
-## produces a bundle that panics in cef::library_loader at launch.
-## --ignore-version-mismatches: the CLI compares the tauri crate version to
-## @tauri-apps/api, and the pinned feat/cef checkout's CLI carries an
-## unreleased dev version — the mismatch is a false positive, the real base
-## is 2.11.x on both sides.
-ifeq ($(UNAME_S),Darwin)
-app: cef-env app/node_modules
-	cd app && $(CARGO) run --manifest-path "$(CEF_CLONE)/crates/tauri-cli/Cargo.toml" --bin cargo-tauri -- build --ignore-version-mismatches
+## Desktop build — stages the node beside the iced executable. macOS gets an
+## app bundle + zip, Windows a relocatable directory + zip, and Linux a
+## relocatable directory + tarball. Native staging keeps CEF framework/runtime
+## registration coupled to the executable without an external bundler.
+ifeq ($(HOST_OS),Darwin)
+app: cef-env
+	$(CARGO) build --release -p ducktape-iced -p node-bin
+	bash ops/stage-macos-iced-app.sh
 	bash ops/check-macos-cef-bundle.sh target/release/bundle/macos/Ducktape.app
-	bash ops/smoke-macos-app.sh target/release/bundle/macos/Ducktape.app
-	bash ops/fix-dmg.sh
+else ifeq ($(HOST_OS),Windows)
+app: cef-env
+	$(CARGO) build --release -p node-bin
+	$(CARGO) build --release -p ducktape-iced --lib
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops/stage-windows-app.ps1
 else
-app: cef-env app/node_modules
-	cd app && $(BUN) run tauri build --no-bundle
+app: cef-env
+	$(CARGO) build --release -p ducktape-iced -p node-bin
 	bash ops/stage-linux-app.sh
+endif
+
+## Build and exercise the real staged macOS window, including close-to-menu-bar
+## and Dock/Finder activation reopen. Requires Accessibility permission for the
+## invoking terminal because it inspects and presses native AppKit controls.
+ifeq ($(HOST_OS),Darwin)
+macos-smoke: app
+	bash ops/smoke-macos-iced-app.sh target/release/bundle/macos/Ducktape.app
+
+macos-cef-smoke: cef-env
+	$(CARGO) build -p ducktape-iced --bin cef-probe
+	$(CARGO) build -p node-bin
+	DUCKTAPE_MACOS_BINARY=cef-probe bash ops/stage-macos-iced-app.sh debug
+	bash ops/check-macos-cef-bundle.sh target/debug/bundle/macos/Ducktape.app
+	bash ops/smoke-macos-cef-probe.sh target/debug/bundle/macos/Ducktape.app
+else
+macos-smoke:
+	@echo "macos-smoke must run on macOS" >&2
+	@exit 2
+
+macos-cef-smoke:
+	@echo "macos-cef-smoke must run on macOS" >&2
+	@exit 2
 endif
 
 # re-run bun install whenever the manifest or lockfile changes, not just when
@@ -131,9 +170,10 @@ app/node_modules: app/package.json app/bun.lock
 	cd app && $(BUN) install --frozen-lockfile
 	touch app/node_modules
 
-install: install-node install-app
+install: install-app
 
-## ducktape-node -> ~/.cargo/bin
+## Optional operator CLI install. The desktop bundle already carries the exact
+## matching node sidecar and does not depend on this PATH copy.
 install-node: cef-env
 	$(CARGO) install --path bin/node --locked
 
@@ -143,24 +183,32 @@ install-coordinator: cef-env
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
-## macOS: Ducktape.app -> $(APP_DEST); Linux: the staged self-contained dir
-## -> $(DUCKTAPE_HOME)/app (binary + ducktape-node sidecar + pinned CEF
+## macOS: Ducktape.app -> $(APP_DEST); Windows: current-user LocalAppData plus
+## a Start-menu shortcut; Linux: the staged self-contained dir ->
+## $(DUCKTAPE_HOME)/app (binary + ducktape-node sidecar + pinned CEF
 ## runtime in ONE directory, so sidecar sibling-resolution and the DT_RPATH
 ## $ORIGIN lookup both land beside the executable), plus a launcher symlink
 ## in $(BIN_DEST) — a symlink, NOT a copy: ld.so resolves $ORIGIN through
 ## symlinks to the real file's directory, while a copied binary would sit
 ## beside no runtime and fall back to LD_LIBRARY_PATH, which is how a system
 ## CEF of the wrong major version silently breaks IME.
-ifeq ($(UNAME_S),Darwin)
+ifeq ($(HOST_OS),Darwin)
 install-app: app
 	mkdir -p "$(APP_DEST)"
+	@if [ -L "$(DUCKTAPE_HOME)" ]; then echo "refusing symbolic-link state root: $(DUCKTAPE_HOME)" >&2; exit 1; fi
+	@if [ -d "$(DUCKTAPE_HOME)" ]; then chmod 700 "$(DUCKTAPE_HOME)"; fi
 	rm -rf "$(APP_DEST)/Ducktape.app"
 	cp -R target/release/bundle/macos/Ducktape.app "$(APP_DEST)/"
 	bash ops/check-macos-cef-bundle.sh "$(APP_DEST)/Ducktape.app"
 	@echo "installed $(APP_DEST)/Ducktape.app"
+else ifeq ($(HOST_OS),Windows)
+install-app: app
+	powershell.exe -NoProfile -ExecutionPolicy Bypass -File ops/stage-windows-app.ps1 -Install
 else
 install-app: app
+	@if [ -L "$(DUCKTAPE_HOME)" ]; then echo "refusing symbolic-link state root: $(DUCKTAPE_HOME)" >&2; exit 1; fi
 	mkdir -p "$(DUCKTAPE_HOME)"
+	chmod 700 "$(DUCKTAPE_HOME)"
 	rm -rf "$(DUCKTAPE_HOME)/app"
 	cp -a target/release/bundle/linux/ducktape "$(DUCKTAPE_HOME)/app"
 	mkdir -p "$(BIN_DEST)"
@@ -378,4 +426,13 @@ wasm-modules-check:
 
 clean:
 	$(CARGO) clean
-	rm -rf app/dist app/node_modules app/src-tauri/binaries
+	rm -rf app/dist app/node_modules
+
+## Recipe-backed UI QA: the in-process lane (cargo test, no display), then the
+## fleet lane (2 live headless instances run every recipe over the bridge).
+ui-qa:
+	CARGO_INCREMENTAL=0 $(CARGO) test -p ducktape-iced shell::sim
+	CARGO_INCREMENTAL=0 $(CARGO) test -p ducktape-iced qa_recipes
+	$(CARGO) build -p ducktape-iced --bin ducktape-iced
+	ops/iced-fleet up 2 --preset ui-demo
+	ops/iced-fleet run qa/recipes/*.json; status=$$?; ops/iced-fleet down; exit $$status

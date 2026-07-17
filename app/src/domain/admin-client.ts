@@ -12,8 +12,6 @@
 // This module is deliberately self-contained (no store imports) so it composes
 // cleanly with whatever shape the console store settles into.
 
-import { isTauri } from "./node-bootstrap";
-
 /** The `x-ducktape-admin-*` header material for one owner request. */
 export interface AdminAuth {
   key: string;
@@ -21,28 +19,12 @@ export interface AdminAuth {
   sig: string;
 }
 
-/** Signs one admin request: (method, path) -> the PoP the node verifies.
- *  Undefined outside Tauri (web build: no user-key custody). */
+/** Signs one admin request: (method, path) -> the PoP the node verifies. */
 export type AdminSigner = (method: string, path: string) => Promise<AdminAuth>;
 
-/** The desktop shell's admin signer for ONE target node, or undefined on the
- *  web build. `nodeKeyHex` (the node's consensus key, from /v1/status) is
- *  folded into every signature so a PoP minted for this node can never be
- *  replayed against another node the same owner controls. Rejects with
- *  `identity-locked` when the account key is encrypted and uncached — the
- *  caller should treat that as "not reachable", never mis-attribute. */
-export const adminSigner = (nodeKeyHex: string): AdminSigner | undefined =>
-  isTauri() && nodeKeyHex
-    ? async (method: string, path: string) => {
-        const { invoke } = await import("@tauri-apps/api/core");
-        const raw = await invoke<string>("user_sign_admin", {
-          method,
-          path,
-          nodeKey: nodeKeyHex,
-        });
-        return JSON.parse(raw) as AdminAuth;
-      }
-    : undefined;
+/** The static web twin never holds a desktop account key. Native admin
+ *  signing belongs to the Iced application. */
+export const adminSigner = (_nodeKeyHex: string): AdminSigner | undefined => undefined;
 
 const base = (url: string): string => url.replace(/\/$/, "");
 

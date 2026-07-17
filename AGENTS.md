@@ -4,7 +4,7 @@
 
 ## Internal Skills
 
-- Keep repo-specific operational runbooks in `skills/` (`qa`, `tauri-debug`, `upgrade`).
+- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`, `upgrade`).
 - `.claude/skills` and `.codex/skills` both point to the shared `skills/` directory.
 - Keep assistant-facing repository guidance in this file; `CLAUDE.md` links here so both assistants read the same instructions.
 - Workflow helpers are user-global, not repo-tracked; the branching and
@@ -33,24 +33,21 @@
 - **A worktree's life ends when its PR merges.** Once merged, remove the
   worktree and delete its branch. Leaving it costs ~20 GB of Cargo target each
   and nothing else; twelve of them once ate 250 GB and had to be swept by hand.
-- **Stop the QA fleet BEFORE removing the worktree — this order is not optional.**
-  `.tauri-agent/fleet.json` points `cleanupInstance` at
-  `qa/fleet/cleanup-instance.ts`, a path *inside the worktree*, while the
-  instance's workspace, pidfile and detached `ducktape-node` live *outside* it
-  under `FLEET_HOME`. Delete the worktree first and you delete the only thing
-  that could ever stop its node: it then runs forever, unreachable by
-  `fleet down`. That is not hypothetical — a node was found still up 40 hours
-  after its worktree was gone, beside 9.2 GB of instance homes whose worktrees
-  no longer existed. So: `"$FLEET" down <instance-id>`, *then* remove the tree.
+- **Reap retired QA state BEFORE removing the worktree — this order is not
+  optional.** The current Iced workflow has no Fleet instance manager, but old
+  external instance homes can still contain a pidfile and detached
+  `ducktape-node`. Deleting their worktree first used to delete the teardown
+  hook and leave the node running forever. `ops/worktree-clean.sh` retains a
+  self-contained, identity-verified reaper for that historical state.
 - **`ops/worktree-clean.sh` does the whole sequence safely.** Dry-run by
-  default; `--yes` to act. It reaps orphaned fleet instances (killing only a pid
+  default; `--yes` to act. It reaps orphaned retired-QA instances (killing only a pid
   it has verified is that workspace's own `ducktape-node`, by exe and
   `--config` — never `pkill -f`), then removes worktrees whose branch is fully
   merged into `origin/dev`. It REFUSES a worktree that is dirty or carries a
   commit not in `dev`; unmerged work is never its to throw away.
 - Never stop desktop/QA processes with `pkill -f` — a pattern match will
-  cheerfully kill an editor, a grep, or this script. Find them by process cwd or
-  let Fleet's own teardown do it.
+  cheerfully kill an editor, a grep, or this script. Find them by process cwd,
+  executable, and workspace config or let the native app shut them down.
 - Review the PR from a clean context before merging: re-read the diff against
   `dev`, check for scope creep and missing verification, and address actionable
   feedback before deciding mergeability.
@@ -89,7 +86,7 @@
   field. An unconditional `warn!` in one is a log bomb that evicts the very
   evidence you need — and the counter IS the diagnosis.
 - Never log a URI path or query string (`/.duck/ws/{token}` carries a capability
-  token in the path, and the ring is streamed to the webview) or any key
+  token in the path, and the ring is visible in the app) or any key
   material. A `reason` is a stable snake_case token, not prose — greppable and
   countable.
 - Turn one plane up on a LIVE node rather than restarting it — a restart destroys

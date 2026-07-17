@@ -30,16 +30,6 @@ vi.mock("../../domain/notify-client", () => ({
   markSeen: vi.fn(() => Promise.resolve()),
   onUnread: vi.fn(() => Promise.resolve(() => {})),
 }));
-vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(() => Promise.resolve(() => {})),
-  emit: vi.fn(() => Promise.resolve()),
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
-// Materialize the mocked modules up front: the provider fires several
-// CONCURRENT dynamic imports on mount and vitest's lazy factory races them.
-import "@tauri-apps/api/event";
-import "@tauri-apps/api/core";
-
 const message = (seq: number, text: string): MessageView => ({
   channel_id: "general",
   seq,

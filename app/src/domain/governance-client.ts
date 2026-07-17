@@ -12,7 +12,7 @@
 // with the user's account key (local AND remote). The governance module's own
 // standing ACL resolves that signer, via its committed `BindNode`, to a member
 // node and authorizes accordingly. There is no node-local re-signing lane
-// anymore; the app's bespoke `workspace_*` Tauri commands are gone. (The
+// anymore; the old web-shell `workspace_*` commands are gone. (The
 // standalone `ducktape-node` operator CLI still works, as a node-principal
 // `Actor::Node` under the same module ACL.)
 

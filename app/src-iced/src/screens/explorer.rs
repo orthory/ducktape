@@ -1,0 +1,787 @@
+//! Native block explorer. Presentation state is transport-free: the host
+//! loads the finalized block ring and returns it through [`ServiceEvent`].
+
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::{Alignment, Background, Border, Color, Element, Length};
+
+use crate::icons::{self, Icon};
+use crate::theme::{self, MONO, Palette, RADIUS_MD, RADIUS_SM, SANS, SANS_SEMIBOLD};
+use crate::ui;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resource<T> {
+    Loading,
+    Empty,
+    Error(String),
+    Ready(T),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchInfo {
+    pub module: String,
+    pub origin: String,
+    pub emitted_messages: u64,
+    pub emitted_events: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    Applied,
+    Rejected,
+}
+
+impl Disposition {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootOp {
+    pub proposer: String,
+    pub proposer_name: Option<String>,
+    pub disposition: Disposition,
+    pub target: String,
+    pub operations: Vec<DispatchInfo>,
+    pub payload: String,
+    pub op_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockRecord {
+    pub height: u64,
+    pub hash: String,
+    pub commit_hash: String,
+    pub ops: Vec<RootOp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct State {
+    pub blocks: Resource<Vec<BlockRecord>>,
+    /// Holds the immutable record, not merely its height, so a detail remains
+    /// stable when the bounded ring evicts it during inspection.
+    pub open: Option<BlockRecord>,
+    pub pending_focus: Option<u64>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            blocks: Resource::Loading,
+            open: None,
+            pending_focus: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Load,
+    Refresh,
+    Open(u64),
+    Back,
+    /// Deep-link entry point: open the explorer already scrolled to block #N,
+    /// waiting for the ring to load if needed (see [`consume_focus`]). The
+    /// consume side is complete and mirrors `members::Message::FocusAccount`,
+    /// but there is no producer yet. Wiring one is a cross-module change that
+    /// must end in `shell.rs`, which a parallel agent owns, so it is deferred:
+    //  TODO(EX-2.2): wire a block-ref producer for `Focus`. The chain is
+    //  `duck://block/{height}` → `classify_chat_ref` (`screen_service/chat.rs`,
+    //  add `ChatLink::Block { height }`) → `chat_intent` (`module_host.rs`) →
+    //  `Route::Block { height }` (`view_api.rs`) → the `AppIntent::Navigate`
+    //  arm in `shell.rs` (navigate to `Screen::Explorer` then
+    //  `explorer::update(&mut state.explorer, Message::Focus(height))`, exactly
+    //  as `Route::Member` does with `FocusAccount`). Only that last hop can emit
+    //  `Focus`; `shell.rs` is off-limits to this agent, so it is left for a
+    //  follow-up once the shell agent lands.
+    #[allow(dead_code)]
+    Focus(u64),
+    Service(ServiceEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Load,
+    ClearFocus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceEvent {
+    Loaded(Result<Option<Vec<BlockRecord>>, String>),
+}
+
+pub fn update(state: &mut State, message: Message) -> Option<Command> {
+    match message {
+        Message::Load => {
+            state.blocks = Resource::Loading;
+            Some(Command::Load)
+        }
+        Message::Refresh => Some(Command::Load),
+        Message::Open(height) => {
+            let Resource::Ready(blocks) = &state.blocks else {
+                return None;
+            };
+            state.open = blocks.iter().find(|block| block.height == height).cloned();
+            None
+        }
+        Message::Back => {
+            state.open = None;
+            None
+        }
+        Message::Focus(height) => {
+            state.pending_focus = Some(height);
+            consume_focus(state)
+        }
+        Message::Service(ServiceEvent::Loaded(result)) => {
+            state.blocks = match result {
+                Ok(Some(blocks)) if blocks.is_empty() => Resource::Empty,
+                Ok(Some(blocks)) => Resource::Ready(blocks),
+                Ok(None) => Resource::Empty,
+                Err(error) => Resource::Error(error),
+            };
+            consume_focus(state)
+        }
+    }
+}
+
+fn consume_focus(state: &mut State) -> Option<Command> {
+    let height = state.pending_focus?;
+    let Resource::Ready(blocks) = &state.blocks else {
+        return None;
+    };
+    state.open = blocks.iter().find(|block| block.height == height).cloned();
+    state.pending_focus = None;
+    Some(Command::ClearFocus)
+}
+
+pub fn view(state: &State, mode: theme::Mode) -> Element<'_, Message> {
+    let p = *theme::palette(mode);
+    let count = match &state.blocks {
+        Resource::Ready(blocks) => format!("{} blocks", blocks.len()),
+        _ => "—".into(),
+    };
+    // Unified node-section header idiom (§4.1): 56px paper bar, TITLE title in
+    // semibold, mono CAPTION count beside it, bottom rule. Matches Modules/
+    // Gateway's `screen_header` so the whole rail reads as one system.
+    let header = container(
+        row![
+            text("Explorer")
+                .font(SANS_SEMIBOLD)
+                .size(theme::TITLE)
+                .color(p.ink),
+            text(count).font(MONO).size(theme::CAPTION).color(p.muted_2),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .height(56)
+    .padding([0, 22])
+    .align_y(Alignment::Center)
+    .style(move |_| bottom_rule(p.paper, p.border_soft));
+
+    let body = if let Some(block) = &state.open {
+        block_detail(block, p)
+    } else {
+        blocks_view(&state.blocks, p)
+    };
+    container(column![header, body].height(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| surface(p.canvas))
+        .into()
+}
+
+fn blocks_view(resource: &Resource<Vec<BlockRecord>>, p: Palette) -> Element<'_, Message> {
+    match resource {
+        Resource::Loading => state_view(
+            "Loading blocks…",
+            "Reading the finalized block ring.",
+            p,
+        ),
+        Resource::Empty => state_view(
+            "No blocks yet",
+            "Empty heartbeat blocks are skipped, so rows appear once real ops commit.",
+            p,
+        ),
+        Resource::Error(error) => {
+            let body = column![
+                text("Block explorer unavailable")
+                    .font(SANS_SEMIBOLD)
+                    .size(theme::BODY_LG)
+                    .color(p.ink),
+                selectable_text("error", error, SANS, theme::BODY, p.danger, p),
+                outline_button("Retry", Message::Load, p),
+            ]
+            .spacing(8);
+            container(body).padding(17).width(Length::Fill).into()
+        }
+        Resource::Ready(blocks) => {
+            let headers = row![
+                header_cell("HEIGHT", 72.0, p),
+                fill_header("HASH", p),
+                fill_header("COMMIT", p),
+                fill_header("PROPOSER", p),
+                header_cell("OPS", 52.0, p),
+            ]
+            .spacing(12)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 13.0,
+                bottom: 5.0,
+                left: 13.0,
+            });
+            let mut rows = column![headers].spacing(7);
+            for block in blocks.iter().rev() {
+                rows = rows.push(block_row(block, p));
+            }
+            scrollable(container(rows).padding(17).width(Length::Fill))
+                .height(Length::Fill)
+                .into()
+        }
+    }
+}
+
+fn block_row(block: &BlockRecord, p: Palette) -> Element<'static, Message> {
+    let proposers: Vec<&str> =
+        block
+            .ops
+            .iter()
+            .map(|op| op.proposer.as_str())
+            .fold(Vec::new(), |mut values, proposer| {
+                if !values.contains(&proposer) {
+                    values.push(proposer);
+                }
+                values
+            });
+    let primary = block.ops.first();
+    let proposer = primary
+        .map(|op| {
+            let label = op
+                .proposer_name
+                .clone()
+                .unwrap_or_else(|| short_hex(&op.proposer));
+            if proposers.len() > 1 {
+                format!("{label} +{}", proposers.len() - 1)
+            } else {
+                label
+            }
+        })
+        .unwrap_or_else(|| "—".into());
+    let rejected = block
+        .ops
+        .iter()
+        .any(|op| op.disposition == Disposition::Rejected);
+    let op_count = if block.ops.is_empty() {
+        "nop".into()
+    } else {
+        block.ops.len().to_string()
+    };
+
+    let btn = button(
+        row![
+            fixed_cell(format!("#{}", block.height), 72.0, p.ink, true),
+            fill_cell(short_hex(&block.hash), p.ink_softer, true),
+            fill_cell(short_hex(&block.commit_hash), p.muted_3, true),
+            fill_cell(proposer, p.muted_3, false),
+            fixed_cell(
+                op_count,
+                52.0,
+                if block.ops.is_empty() {
+                    p.muted_2
+                } else if rejected {
+                    p.red
+                } else {
+                    theme::ACCENTS[0]
+                },
+                true,
+            ),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([9, 13])
+    .style(move |_, status| iced::widget::button::Style {
+        background: Some(Background::Color(
+            if matches!(status, iced::widget::button::Status::Hovered) {
+                p.sidebar
+            } else {
+                p.paper
+            },
+        )),
+        text_color: p.ink,
+        border: Border {
+            color: p.border,
+            width: 1.0,
+            radius: RADIUS_MD.into(),
+        },
+        ..Default::default()
+    })
+    .on_press(Message::Open(block.height));
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(
+        iced_agent_plugin::Role::ListItem,
+        format!("#{}", block.height),
+        btn,
+    );
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn block_detail<'a>(block: &'a BlockRecord, p: Palette) -> Element<'a, Message> {
+    let empty = block.ops.is_empty();
+    let rejected = block
+        .ops
+        .iter()
+        .filter(|op| op.disposition == Disposition::Rejected)
+        .count();
+    let status = if empty {
+        "idle".into()
+    } else {
+        format!(
+            "{} op{}{}",
+            block.ops.len(),
+            if block.ops.len() == 1 { "" } else { "s" },
+            if rejected == 0 {
+                String::new()
+            } else {
+                format!(" · {rejected} rejected")
+            }
+        )
+    };
+    let top = row![
+        bare_button("← Blocks", Message::Back, p),
+        text(format!("#{}", block.height))
+            .font(MONO)
+            .size(theme::BODY_LG)
+            .color(p.ink),
+        Space::new().width(Length::Fill),
+        text(status)
+            .font(SANS)
+            .size(theme::CAPTION)
+            .color(if rejected > 0 { p.red } else { p.green }),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+    let digests = card(
+        column![
+            selectable_value("HASH", &block.hash, p),
+            selectable_value("COMMIT", &block.commit_hash, p),
+        ]
+        .spacing(7),
+        p,
+    );
+    let mut content = column![top, digests].spacing(13);
+    if empty {
+        content = content.push(
+            text("Idle block — no ops committed in this window (a heartbeat nop).")
+                .font(SANS)
+                .size(theme::BODY)
+                .color(p.muted_2),
+        );
+    } else {
+        content = content.push(
+            text(format!("OPS ({})", block.ops.len()))
+                .font(SANS_SEMIBOLD)
+                .size(theme::LABEL)
+                .color(p.muted),
+        );
+        for (index, op) in block.ops.iter().enumerate() {
+            content = content.push(op_section(op, index, p));
+        }
+    }
+    scrollable(container(content).padding(17).width(Length::Fill))
+        .height(Length::Fill)
+        .into()
+}
+
+fn op_section<'a>(op: &'a RootOp, index: usize, p: Palette) -> Element<'a, Message> {
+    let header = row![
+        text(format!("OP {index}"))
+            .font(MONO)
+            .size(theme::CAPTION)
+            .color(p.muted_2),
+        text(op.target.clone())
+            .font(SANS)
+            .size(theme::BODY)
+            .color(p.ink),
+        text(op.disposition.label())
+            .font(SANS)
+            .size(theme::CAPTION)
+            .color(if op.disposition == Disposition::Rejected {
+                p.red
+            } else {
+                p.green
+            }),
+        Space::new().width(Length::Fill),
+        text(
+            op.proposer_name
+                .clone()
+                .unwrap_or_else(|| short_hex(&op.proposer)),
+        )
+        .font(SANS)
+        .size(theme::CAPTION)
+        .color(p.muted_3),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let mut body = column![
+        header,
+        selectable_value("PROPOSER", &op.proposer, p),
+        selectable_value("OP HASH", &op.op_hash, p),
+        text(format!("TRANSACTIONS ({})", op.operations.len()))
+            .font(SANS_SEMIBOLD)
+            .size(theme::LABEL)
+            .color(p.muted),
+    ]
+    .spacing(8);
+    if op.operations.is_empty() {
+        body = body.push(
+            text(if op.disposition == Disposition::Rejected {
+                "The op finalized but was rejected — a deterministic no-op, so no dispatches ran."
+            } else {
+                "No dispatches recorded."
+            })
+            .font(SANS)
+            .size(theme::BODY)
+            .color(p.muted_2),
+        );
+    } else {
+        for (dispatch_index, dispatch) in op.operations.iter().enumerate() {
+            body = body.push(dispatch_row(dispatch, dispatch_index, p));
+        }
+    }
+    if !op.payload.is_empty() {
+        body = body
+            .push(
+                text("PAYLOAD")
+                    .font(SANS_SEMIBOLD)
+                    .size(theme::LABEL)
+                    .color(p.muted),
+            )
+            .push(
+                container(selectable_text(
+                    "PAYLOAD",
+                    &op.payload,
+                    MONO,
+                    theme::BODY,
+                    p.ink_softer,
+                    p,
+                ))
+                .width(Length::Fill)
+                .padding([9, 11])
+                .style(move |_| rounded_surface(p.sunken, p.border, RADIUS_MD)),
+            );
+    }
+    card(body, p)
+}
+
+fn dispatch_row(dispatch: &DispatchInfo, index: usize, p: Palette) -> Element<'static, Message> {
+    let mut fanout = Vec::new();
+    if dispatch.emitted_messages > 0 {
+        fanout.push(format!("▸{} msgs", dispatch.emitted_messages));
+    }
+    if dispatch.emitted_events > 0 {
+        fanout.push(format!("◆{} events", dispatch.emitted_events));
+    }
+    container(
+        row![
+            text(index).font(MONO).size(theme::CAPTION).color(p.muted_2),
+            text(dispatch.module.clone())
+                .font(SANS)
+                .size(theme::BODY)
+                .color(p.ink),
+            text(dispatch.origin.clone())
+                .font(MONO)
+                .size(theme::CAPTION)
+                .color(p.muted_2),
+            Space::new().width(Length::Fill),
+            text(fanout.join("  "))
+                .font(MONO)
+                .size(theme::CAPTION)
+                .color(p.muted_3),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([8, 11])
+    .style(move |_| rounded_surface(p.paper, p.border, RADIUS_SM))
+    .into()
+}
+
+/// A labeled digest row whose full value is a copy target: the value renders in
+/// a borderless read-only text input, so the user can select and copy the whole
+/// hash/key even though the table rows above truncate it. Mirrors the
+/// `selectable_error` idiom (`screens/workspace.rs`).
+fn selectable_value<'a>(label: &'static str, value: &'a str, p: Palette) -> Element<'a, Message> {
+    row![
+        text(label)
+            .font(SANS_SEMIBOLD)
+            .size(theme::LABEL)
+            .color(p.muted)
+            .width(72),
+        selectable_text(label, value, MONO, theme::BODY, p.ink_softer, p),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A read-only, transparent, borderless text input: reads as plain text but the
+/// user can select and copy the full value. `name` tags it for the agent's
+/// semantic layer so a screen test can address it as a copy target.
+fn selectable_text<'a>(
+    name: &'static str,
+    value: &'a str,
+    font: iced::Font,
+    size: f32,
+    color: Color,
+    p: Palette,
+) -> Element<'a, Message> {
+    let display: &str = if value.is_empty() { "—" } else { value };
+    let input = text_input("", display)
+        .font(font)
+        .size(size)
+        .padding(0)
+        .width(Length::Fill)
+        .style(move |_, _| iced::widget::text_input::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            border: Border::default(),
+            icon: color,
+            placeholder: p.muted_2,
+            value: color,
+            selection: theme::ACCENTS[0],
+        });
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::Sem::new(iced_agent_plugin::Role::TextInput, name, input)
+        .value(display.to_string())
+        .into();
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    {
+        let _ = name;
+        input.into()
+    }
+}
+
+fn state_view(title: &'static str, detail: &'static str, p: Palette) -> Element<'static, Message> {
+    let t = theme::ui_for(&p);
+    let badge = container(icons::view(Icon::Explorer, 23.0, p.ink_soft))
+        .width(42)
+        .height(42)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .style(move |_| rounded_surface(p.hover, p.border_soft, RADIUS_SM));
+    ui::empty_state::empty_state(Some(badge.into()), title, detail, &t)
+        .height(Length::Fill)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+fn header_cell(label: &'static str, width: f32, p: Palette) -> Element<'static, Message> {
+    text(label)
+        .font(SANS_SEMIBOLD)
+        .size(theme::LABEL)
+        .color(p.muted)
+        .width(width)
+        .into()
+}
+
+fn fill_header(label: &'static str, p: Palette) -> Element<'static, Message> {
+    text(label)
+        .font(SANS_SEMIBOLD)
+        .size(theme::LABEL)
+        .color(p.muted)
+        .width(Length::Fill)
+        .into()
+}
+
+fn fixed_cell(
+    value: String,
+    width: f32,
+    color: iced::Color,
+    mono: bool,
+) -> Element<'static, Message> {
+    text(value)
+        .font(if mono { MONO } else { SANS })
+        .size(theme::BODY)
+        .color(color)
+        .width(width)
+        .into()
+}
+
+fn fill_cell(value: String, color: iced::Color, mono: bool) -> Element<'static, Message> {
+    text(value)
+        .font(if mono { MONO } else { SANS })
+        .size(theme::BODY)
+        .color(color)
+        .width(Length::Fill)
+        .into()
+}
+
+fn card<'a>(body: impl Into<Element<'a, Message>>, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
+    ui::surface::surface(body, ui::surface::SurfaceVariant::Card, &t)
+        .width(Length::Fill)
+        .padding([11, 13])
+        .into()
+}
+
+fn bare_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Ghost)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(message)
+        .into_widget();
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn outline_button<'a>(label: &'a str, message: Message, p: Palette) -> Element<'a, Message> {
+    let t = theme::ui_for(&p);
+    let btn = ui::button::button(label, &t)
+        .variant(ui::button::ButtonVariant::Outline)
+        .size(ui::button::ButtonSize::Small)
+        .on_press(message)
+        .into_widget();
+    #[cfg(all(feature = "agent", debug_assertions))]
+    return iced_agent_plugin::sem(iced_agent_plugin::Role::Button, label, btn);
+    #[cfg(not(all(feature = "agent", debug_assertions)))]
+    btn.into()
+}
+
+fn short_hex(value: &str) -> String {
+    if value.is_empty() {
+        "—".into()
+    } else if value.len() > 10 {
+        format!("{}…", &value[..10])
+    } else {
+        value.into()
+    }
+}
+
+fn surface(color: iced::Color) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(color)),
+        ..Default::default()
+    }
+}
+
+fn bottom_rule(color: iced::Color, border: iced::Color) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(color)),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+fn rounded_surface(
+    color: iced::Color,
+    border: iced::Color,
+    radius: f32,
+) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(color)),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: radius.into(),
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(height: u64, ops: Vec<RootOp>) -> BlockRecord {
+        BlockRecord {
+            height,
+            hash: "aa".repeat(32),
+            commit_hash: "bb".repeat(32),
+            ops,
+        }
+    }
+
+    fn op(disposition: Disposition) -> RootOp {
+        RootOp {
+            proposer: "cc".repeat(32),
+            proposer_name: Some("Founder Rae".into()),
+            disposition,
+            target: "chat".into(),
+            operations: Vec::new(),
+            payload: "{\"Post\":{}}".into(),
+            op_hash: "dd".repeat(32),
+        }
+    }
+
+    #[test]
+    fn explorer_preserves_loading_empty_error_and_populated_states() {
+        let mut state = State::default();
+        update(&mut state, Message::Service(ServiceEvent::Loaded(Ok(None))));
+        assert_eq!(state.blocks, Resource::Empty);
+        update(
+            &mut state,
+            Message::Service(ServiceEvent::Loaded(Err("offline".into()))),
+        );
+        assert_eq!(state.blocks, Resource::Error("offline".into()));
+        update(
+            &mut state,
+            Message::Service(ServiceEvent::Loaded(Ok(Some(vec![block(
+                7,
+                vec![op(Disposition::Applied)],
+            )])))),
+        );
+        assert!(matches!(state.blocks, Resource::Ready(_)));
+    }
+
+    #[test]
+    fn detail_holds_an_immutable_block_snapshot() {
+        let original = block(7, vec![op(Disposition::Applied)]);
+        let mut state = State {
+            blocks: Resource::Ready(vec![original.clone()]),
+            ..State::default()
+        };
+        update(&mut state, Message::Open(7));
+        assert_eq!(state.open, Some(original));
+        state.blocks = Resource::Ready(vec![]);
+        assert_eq!(state.open.as_ref().map(|block| block.height), Some(7));
+    }
+
+    #[test]
+    fn focus_waits_for_data_then_clears_even_when_evicted() {
+        let mut state = State::default();
+        assert_eq!(update(&mut state, Message::Focus(9)), None);
+        assert_eq!(state.pending_focus, Some(9));
+        assert_eq!(
+            update(
+                &mut state,
+                Message::Service(ServiceEvent::Loaded(Ok(Some(vec![block(7, vec![])]))))
+            ),
+            Some(Command::ClearFocus)
+        );
+        assert_eq!(state.pending_focus, None);
+        assert_eq!(state.open, None);
+    }
+
+    #[test]
+    fn idle_and_rejected_blocks_remain_distinct() {
+        assert!(block(1, vec![]).ops.is_empty());
+        assert_eq!(
+            block(2, vec![op(Disposition::Rejected)]).ops[0].disposition,
+            Disposition::Rejected
+        );
+    }
+}

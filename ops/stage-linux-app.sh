@@ -2,13 +2,13 @@
 # Stage the self-contained Linux desktop app and pack the release tarball.
 # CEF ships libcef.so only as a shared library (no static build exists), so a
 # self-contained Linux app is the binary plus the CEF payload in ONE directory,
-# with the $ORIGIN rpath the binary carries (app/src-tauri/build.rs) resolving
+# with the $ORIGIN rpath the binary carries (app/src-iced/build.rs) resolving
 # the libraries beside it — no LD_LIBRARY_PATH, so desktop launchers can spawn
 # it with a clean environment. `make app` runs this after the release build:
 #   target/release/bundle/linux/ducktape/            the relocatable app dir
 #   target/release/bundle/linux/ducktape-linux-<arch>.tar.gz   release artifact
-# The whitelist below is the CEF runtime set the build linked against (the
-# same set qa/fleet/build-cef.sh stages for QA instances); everything else in
+# The whitelist below is the CEF runtime set the build linked against;
+# everything else in
 # target/release is build debris and must not ship.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -17,17 +17,17 @@ release_dir="target/release"
 stage_root="$release_dir/bundle/linux"
 stage="$stage_root/ducktape"
 
-[ -x "$release_dir/ducktape-desktop" ] \
-  || { echo "[linux-app] $release_dir/ducktape-desktop missing — run the release build first" >&2; exit 1; }
+[ -x "$release_dir/ducktape-iced" ] \
+  || { echo "[linux-app] $release_dir/ducktape-iced missing — run the release build first" >&2; exit 1; }
 [ -x "$release_dir/ducktape-node" ] \
-  || { echo "[linux-app] $release_dir/ducktape-node missing — beforeBuildCommand stages the sidecar" >&2; exit 1; }
+  || { echo "[linux-app] $release_dir/ducktape-node missing — run the release node build first" >&2; exit 1; }
 
 rm -rf "$stage"
 mkdir -p "$stage"
 
 # The installed binary is named ducktape: the wayland app_id / x11 WM_CLASS is
 # the binary name, and the desktop entry's StartupWMClass must match it.
-install -m 755 "$release_dir/ducktape-desktop" "$stage/ducktape"
+install -m 755 "$release_dir/ducktape-iced" "$stage/ducktape"
 install -m 755 "$release_dir/ducktape-node" "$stage/ducktape-node"
 
 cef_libs=(

@@ -13,7 +13,7 @@ import type { CSSProperties, ReactNode } from "react";
 import { MAX_VIDEO_PARTICIPANTS } from "../../../domain/call-session";
 import { keyHex } from "../../../domain/chat-client";
 import type { Channel } from "../../../domain/chat-client";
-import { isTauri } from "../../../domain/node-bootstrap";
+import { hasNativeShell } from "../../../domain/node-bootstrap";
 import { buildParticipants } from "../../store/huddle-roster";
 import { useDucktape } from "../../store/use-ducktape";
 import { accentVar, color, font, radius } from "../../theme/tokens";
@@ -35,7 +35,6 @@ function HeadphonesGlyph({ size = 14 }: { size?: number }) {
     </svg>
   );
 }
-
 function ExpandGlyph({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
@@ -271,7 +270,7 @@ function HuddleDockCard() {
           </HeaderIconButton>
           {/* Pop-out hands the MEDIA session to the window — there is nothing to
               hand off from an errored session, so the control hides with it. */}
-          {isTauri() && voice.status !== "error" && (
+          {hasNativeShell() && voice.status !== "error" && (
             <HeaderIconButton title="Open in window" onClick={() => actions.popOutHuddle()}>
               <PopGlyph size={13} />
             </HeaderIconButton>

@@ -1,0 +1,25 @@
+{
+  "name": "nav-smoke",
+  "preset": "ui-demo",
+  "steps": [
+    { "click":  { "role": "button", "name": "Pages" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "pages" } } },
+    { "click":  { "role": "button", "name": "Files" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "files" } } },
+    { "click":  { "role": "button", "name": "Browser" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "browser" } } },
+    { "click":  { "role": "button", "name": "Forge" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "forge" } } },
+    { "click":  { "role": "button", "name": "Agents" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "agents" } } },
+    { "click":  { "role": "button", "name": "Members" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "members" } } },
+    { "click":  { "role": "button", "name": "Governance" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "governance" } } },
+    { "click":  { "role": "button", "name": "Explorer" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "explorer" } } },
+    { "click":  { "role": "button", "name": "Chat" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "chat" } } },
+    { "expect": { "node": { "role": "tab", "name": "USER", "exists": true } } }
+  ]
+}

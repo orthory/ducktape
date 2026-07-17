@@ -9,9 +9,9 @@
 //! reason — the trusted console was the only web page that ever ran in this
 //! process.
 //!
-//! That premise dies the moment a webview renders content we did not write:
-//! gateway content today, arbitrary `https://` pages once the browser opens to
-//! the internet. A page cannot be stopped from ATTEMPTING
+//! That premise dies the moment an embedded browser renders content we did not
+//! write: signed gateway content today, or any other untrusted content in the
+//! future. A page cannot be stopped from ATTEMPTING
 //! `fetch("http://127.0.0.1:<port>/v1/submit")` — `on_navigation` gates
 //! navigation, not `fetch`, and CORS never prevents a request from ARRIVING,
 //! only from being read. Permissive CORS additionally handed the response back,
@@ -28,10 +28,11 @@
 //!
 //! ## the allowlist
 //!
-//! - `tauri://localhost` — the console under CEF.
-//! - `http://localhost:<port>` / `http://127.0.0.1:<port>` — the dev server and
-//!   the fleet's per-worktree vite tiles. Any loopback ORIGIN implies a local
-//!   server we already trust; hostile content never gets one.
+//! - no browser origin by default. Native iced talks to the node as a
+//!   non-browser client, so it needs no CORS exception.
+//! - exact origins in `DUCKTAPE_ALLOWED_ORIGINS` are an explicit development
+//!   opt-in for the static web twin. Merely owning a loopback port is not a
+//!   trust signal: another user or browsed local service may own it.
 //!
 //! Everything else is refused, and two exclusions are the point of the whole
 //! file: `null` (a sandboxed/`data:` document) and `<token>.localhost` (gateway
@@ -46,7 +47,7 @@ use axum::{
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// Extra origins, comma-separated. For an embedder that serves the console from
-/// somewhere unusual; not needed for the desktop app or the fleet.
+/// somewhere unusual; not needed for the native app or local web twin.
 const EXTRA_ORIGINS_ENV: &str = "DUCKTAPE_ALLOWED_ORIGINS";
 
 fn extra_origins() -> Vec<String> {
@@ -67,19 +68,14 @@ fn extra_origins() -> Vec<String> {
 /// refused explicitly: it is what a sandboxed iframe or a `data:` document
 /// sends, and treating it as "absent" would hand those the control plane.
 pub fn origin_allowed(origin: &str) -> bool {
-    if origin == "tauri://localhost" {
-        return true;
-    }
-    if let Some(rest) = origin
-        .strip_prefix("http://localhost")
-        .or_else(|| origin.strip_prefix("http://127.0.0.1"))
-    {
-        // "" (default port) or ":<port>" — and nothing else, so that
-        // "http://localhost.evil.com" cannot pass by prefix.
-        return rest.is_empty()
-            || (rest.starts_with(':') && rest[1..].chars().all(|c| c.is_ascii_digit()));
-    }
-    extra_origins().iter().any(|allowed| allowed == origin)
+    origin_allowed_with(origin, &extra_origins())
+}
+
+fn origin_allowed_with(origin: &str, allowed: &[String]) -> bool {
+    origin != "null"
+        && !origin.is_empty()
+        && !origin.chars().any(char::is_whitespace)
+        && allowed.iter().any(|candidate| candidate == origin)
 }
 
 /// Refuse any request that arrives with an `Origin` this node does not trust.
@@ -119,13 +115,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_console_and_loopback_dev_servers_are_allowed() {
-        assert!(origin_allowed("tauri://localhost"));
-        assert!(origin_allowed("http://localhost:1430"));
-        assert!(origin_allowed("http://127.0.0.1:1430"));
-        assert!(origin_allowed("http://localhost"));
-        // the fleet's per-worktree vite tiles land on arbitrary loopback ports
-        assert!(origin_allowed("http://localhost:1437"));
+    fn loopback_dev_servers_are_refused_without_an_exact_opt_in() {
+        assert!(!origin_allowed_with("http://localhost:1420", &[]));
+        assert!(!origin_allowed_with("http://127.0.0.1:1420", &[]));
+        assert!(origin_allowed_with(
+            "http://localhost:1420",
+            &["http://localhost:1420".into()]
+        ));
+        assert!(!origin_allowed_with(
+            "http://localhost:1421",
+            &["http://localhost:1420".into()]
+        ));
     }
 
     /// The two exclusions this file exists for.
@@ -133,27 +133,22 @@ mod tests {
     fn gateway_content_and_null_are_refused() {
         // gateway sessions run at `<32hex>.localhost` — a DIFFERENT host than
         // `localhost`, and the reason the check is not a substring match.
-        assert!(!origin_allowed(
-            "http://0123456789abcdef0123456789abcdef.localhost:49152"
+        assert!(!origin_allowed_with(
+            "http://0123456789abcdef0123456789abcdef.localhost:49152",
+            &[]
         ));
         // a sandboxed iframe / data: document
-        assert!(!origin_allowed("null"));
+        assert!(!origin_allowed_with("null", &["null".into()]));
     }
 
     #[test]
     fn the_public_web_is_refused() {
-        assert!(!origin_allowed("https://evil.com"));
-        assert!(!origin_allowed("http://evil.com"));
+        assert!(!origin_allowed_with("https://evil.com", &[]));
+        assert!(!origin_allowed_with("http://evil.com", &[]));
         // the prefix trap: a hostile host that merely STARTS with our allowlist
-        assert!(!origin_allowed("http://localhost.evil.com"));
-        assert!(!origin_allowed("http://127.0.0.1.evil.com"));
+        assert!(!origin_allowed_with("http://localhost.evil.com", &[]));
+        assert!(!origin_allowed_with("http://127.0.0.1.evil.com", &[]));
         // and a duck:// page, once the browser renders those
-        assert!(!origin_allowed("duck://site.alice.duck"));
-    }
-
-    #[test]
-    fn a_port_must_be_numeric() {
-        assert!(!origin_allowed("http://localhost:abc"));
-        assert!(!origin_allowed("http://localhost:1430x"));
+        assert!(!origin_allowed_with("duck://site.alice.duck", &[]));
     }
 }

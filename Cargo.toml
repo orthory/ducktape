@@ -80,8 +80,8 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
     "bin/mcp",
-    # app — the desktop shell of the react client (web twin ships from app/)
-    "app/src-tauri",
+    # app — native desktop shell (the React client remains the web twin)
+    "app/src-iced",
 ]
 
 [workspace.package]
@@ -232,8 +232,16 @@ overlay-net = { path = "crates/system/overlay-net" }
 governor = "0.10.2"
 rand_core = "0.6.4"
 
-# The desktop shell runs on the standalone tauri-runtime-cef crate
-# (github.com/byeongsu-hong/tauri-runtime-cef) against PUBLISHED tauri
-# crates — no tauri fork, no [patch.crates-io]. The dep lives in
-# app/src-tauri/Cargo.toml; the shell aliases the runtime generics itself
-# (app/src-tauri/src/rt.rs) since registry tauri only defaults them to wry.
+# The agent fork of iced_winit: crates.io 0.14.0 + `// AGENT SEAM` blocks
+# (AccessKit adapter, tree push, synthetic event injection), dev-only via the
+# `agent` feature. Lives in the
+# byeongsu-hong/iced-agent-browser repo (git dep; AGENT-FORK.md inside).
+# Supply-chain pin: Cargo.lock records the exact rev (bump via `cargo update`)
+# and ops/iced-agent executes that same lock-pinned rev — one pin authority,
+# no silent HEAD tracking anywhere.
+[patch.crates-io]
+# `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
+# its uninhabited extern-static type is future-incompatible with Rust. Keep the
+# API/ABI identical and patch only that declaration locally.
+block = { path = "patches/block" }
+iced_winit = { git = "https://github.com/byeongsu-hong/iced-agent-browser" }

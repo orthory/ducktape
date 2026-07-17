@@ -104,8 +104,8 @@ pub struct GatewayProxyReply {
 /// The node surface predates gateway and intentionally has permissive CORS for
 /// the web console. Gateway is a network pivot, so its two API entries add a
 /// narrower browser boundary: native clients omit Origin, while only the
-/// bundled Tauri console origins may call from a WebView. Publisher sessions
-/// and arbitrary websites fail before route resolution or overlay work.
+/// trusted static-web origins may call from a browser. Publisher sessions and
+/// arbitrary websites fail before route resolution or overlay work.
 fn gateway_api_origin_allowed(headers: &HeaderMap) -> bool {
     let mut origins = headers.get_all(header::ORIGIN).iter();
     let first = origins.next();
@@ -117,10 +117,7 @@ fn gateway_api_origin_allowed(headers: &HeaderMap) -> bool {
             let Ok(origin) = value.to_str() else {
                 return false;
             };
-            matches!(
-                origin,
-                "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
-            ) || (cfg!(debug_assertions) && origin == "http://localhost:1430")
+            crate::origin_guard::origin_allowed(origin)
         }
         // A real native client has neither header. Browser requests without an
         // Origin still carry Fetch Metadata, so do not let that omission turn

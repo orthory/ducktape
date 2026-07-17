@@ -18,6 +18,7 @@ import type {
   HeartbeatFrame,
   TailFrame,
   TermClientMsg,
+  TermChunkFrame,
 } from "./stream";
 import {
   isErrorFrame,
@@ -406,10 +407,9 @@ export interface TermSession {
 export interface TopicHandlers {
   onEvent?(frame: EventFrame): void;
   onTail?(frame: TailFrame): void;
-  /** A terminal output chunk on a `term:` topic — `item` is base64 of raw
-   *  terminal bytes (see stream.ts TermChunkFrame). The ring replays on
-   *  (re)subscribe, so these also carry catch-up. */
-  onTermChunk?(item: string): void;
+  /** A terminal output chunk on a `term:` topic. Its cursor is retained for
+   *  reconnect resume before the frame is delivered. */
+  onTermChunk?(frame: TermChunkFrame): void;
   /** One row of a shared session's ordered command log, on a `term-cmd:` topic
    *  (see stream.ts TermCommandLogFrame): the total-order `seq`, the author
    *  `origin`, and the command `text`. The ring replays on (re)subscribe, so
@@ -773,12 +773,12 @@ export const remoteTransport = (
       } catch {
         return; // a malformed / non-json frame is a no-op, not an uncaught throw
       }
-      // A term chunk is an event frame carrying `item` on a `term:` topic; it
-      // has no `op`/`cursor`, so it fails the strict isServerFrame guard —
-      // route it here before that gate. No cursor tracking: the node replays
-      // the whole ring on resubscribe and xterm reconstructs from raw bytes.
+      // A term chunk is an event frame carrying `item` on a `term:` topic. It
+      // has no module `op`, so it fails the strict isServerFrame guard; route
+      // it here first and retain its ring cursor for reconnect resume.
       if (isTermChunkFrame(frame)) {
-        topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onTermChunk?.(frame.item));
+        cursors.set(frame.topic, frame.cursor);
+        topicSubs.get(frame.topic)?.forEach((handlers) => handlers.onTermChunk?.(frame));
         return;
       }
       if (isServerFrame(frame)) dispatchFrame(frame);
@@ -955,7 +955,7 @@ export const remoteTransport = (
         } catch (err) {
           // a locked identity falls back to the unsigned lane — the commit
           // still lands, with the daemon's status-quo authorship. anything
-          // else (a real signer or node failure) propagates. tauri invoke
+          // else (a real signer or node failure) propagates. Native calls
           // rejects with the raw string, not an Error — accept both shapes.
           const detail = err instanceof Error ? err.message : String(err);
           if (detail !== "identity-locked") throw err;

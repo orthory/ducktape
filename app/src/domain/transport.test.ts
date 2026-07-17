@@ -379,6 +379,48 @@ describe("remoteTransport", () => {
     }
   });
 
+  it("resumes terminal chunks without replaying rendered bytes", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = remoteTransport("http://node.example:8844");
+      const onTermChunk = vi.fn();
+      const off = transport.subscribe(["term:s1"], { onTermChunk });
+      const ws = FakeWebSocket.instances[0];
+      ws.open();
+      ws.onmessage?.({
+        data: JSON.stringify({
+          type: "event",
+          topic: "term:s1",
+          cursor: "7",
+          item: btoa("redraw"),
+        }),
+      });
+
+      expect(onTermChunk).toHaveBeenCalledWith({
+        type: "event",
+        topic: "term:s1",
+        cursor: "7",
+        item: btoa("redraw"),
+      });
+
+      ws.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      const next = FakeWebSocket.instances[1];
+      next.open();
+      expect(next.sent.map((msg) => JSON.parse(msg))).toEqual([
+        {
+          op: "subscribe",
+          topics: ["term:s1"],
+          resume: { "term:s1": "7" },
+        },
+      ]);
+      off();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("adopts lagged cursors and notifies handlers", () => {
     const transport = remoteTransport("http://node.example:8844");
     const lagged: Array<[string, string]> = [];

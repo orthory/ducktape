@@ -4,7 +4,7 @@
 // it collects many MEMBER KEYS of different schemes (an ed25519 seed key, a
 // WebAuthn passkey, a native P-256 key), shares one display name, and owns many
 // NODES. Every state op is authorized by a member key; BindNode/UnbindNode and
-// the AddMemberKey/RemoveMemberKey ops carry a MemberAuth minted by the tauri
+// the AddMemberKey/RemoveMemberKey ops carry a MemberAuth minted by the native
 // shell over a chain-and-nonce-scoped preimage — this client never signs, it
 // only forwards the ready-to-submit msg JSON via `submitRawMsg`. SetAccountName
 // is origin-gated (a bound node is user-trusted hardware). Pure functions over
@@ -63,7 +63,7 @@ export { hexToBytes };
 
 // ── Msgs (writes) ────────────────────────────────────────
 
-/** Forward a tauri-signed IdentityMsg (BindNode/UnbindNode/AddMemberKey/
+/** Forward a native-signed IdentityMsg (BindNode/UnbindNode/AddMemberKey/
  *  RemoveMemberKey) untouched: the shell mints the MemberAuth over the signed
  *  preimage, this client only parses and submits the resulting one-line JSON. */
 export const submitRawMsg = (

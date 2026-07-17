@@ -4,10 +4,8 @@
 
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { invoke } from "@tauri-apps/api/core";
-
 import type { AccountView } from "./identity-client";
-import { isTauri } from "./node-bootstrap";
+import { hasNativeShell, nativeCall as invoke } from "./node-bootstrap";
 import type { BlockEvent, NodeTransport } from "./transport";
 import { replyVariant } from "./wire";
 
@@ -489,7 +487,7 @@ export const probeRouteHealth = async (
 
 export const signStatement = async (statement: RouteStatement): Promise<SetRouteMessage> => {
   validateStatement(statement);
-  if (!isTauri()) throw new Error("gateway publishing requires the desktop app");
+  if (!hasNativeShell()) throw new Error("gateway publishing requires the desktop app");
   const messageJson = await invoke<string>("user_sign_gateway_route", {
     statement: JSON.stringify(statement),
   });
@@ -520,9 +518,9 @@ export interface InlineRect {
 
 // `title` is the .duck route the user navigated to. The shell needs it because
 // the session origin is a random loopback token: it is the only honest name a
-// permission prompt can put in front of the user (see src-tauri/permissions.rs).
+// permission prompt can put in front of the user.
 export const openInline = async (url: string, title: string, tabId: string, rect: InlineRect): Promise<void> => {
-  if (!isTauri()) throw new Error("executable gateway routes require the desktop app");
+  if (!hasNativeShell()) throw new Error("executable gateway routes require the desktop app");
   await invoke<void>("gateway_open_inline", { url, title, tabId, rect });
 };
 

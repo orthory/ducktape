@@ -4,11 +4,8 @@
 // dev default); there is nothing to manage, we only connect. No onboarding —
 // the web user's node is provisioned out of band.
 //
-// Desktop build: the node is one of the user's ~/.ducktape WORKSPACES. Which
-// workspace (and thus which http url) is the registry's call — see
-// workspace-client.ts; the Rust `workspace_select` command spawns/adopts that
-// workspace's node detached and hands back its url. This module only turns a
-// url into a transport and polls it up; workspace selection lives in the store.
+// The native iced app owns workspace lifecycle independently. This static web
+// twin never manages a local process; it only dials its configured node.
 // Stopping rides the owner-gated control surface — POST /v1/admin/shutdown
 // (ADR A2, see admin-client.ts) — because the node's port is its identity; no
 // pid crosses this boundary.
@@ -33,43 +30,23 @@ const DEFAULT_LISTEN = "127.0.0.1:8844";
 const POLL_ATTEMPTS = 40;
 const POLL_DELAY_MS = 250;
 
-export const isTauri = (): boolean =>
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export const hasNativeShell = (): boolean => false;
 
-/** True only on the macOS desktop build, where `titleBarStyle: "Overlay"`
- *  (tauri.conf.json) floats the native traffic-light controls over the
- *  top-left of the web content. That overlay is macOS-only — Linux/Windows keep
- *  native decorations and the web build has no window chrome — so UI that insets
- *  to clear the traffic lights must gate on this predicate. Detected via the
- *  WKWebView user-agent (`Macintosh`): synchronous, no extra plugin/capability.
- *
- *  Coupled to the window's user-agent: the default WKWebView UA carries
- *  `Macintosh` on macOS, so this holds today. If a custom `userAgent` is ever set
- *  in tauri.conf.json (or the target set grows to iOS, whose UA also matches
- *  `/Mac/i`), revisit this — a false negative would let the traffic lights
- *  occlude the brand, a false positive would inset where there are none. */
-export const isMacDesktop = (): boolean =>
-  isTauri() &&
-  typeof navigator !== "undefined" &&
-  /Mac/i.test(navigator.userAgent);
+/** Explicit fallback for actions whose implementation lives only in iced. */
+export const nativeCall = <T>(feature: string, _args?: unknown): Promise<T> =>
+  Promise.reject(new Error(`${feature} is available only in the native desktop app`));
+
+/** The static web twin never overlays native macOS window controls. */
+export const isMacDesktop = (): boolean => false;
 
 const webUrl = (): string =>
   import.meta.env.VITE_DUCKTAPE_NODE_URL || `http://${DEFAULT_LISTEN}`;
 
-/** The desktop shell's files-frame signer, or undefined outside Tauri (web
- *  build: no user-key custody, writes ride the unsigned convenience lane).
- *  The shell command pins the target module to `files` and rejects with the
- *  exact string `identity-locked` on an encrypted, uncached key — which the
- *  transport maps to its unsigned-lane fallback. */
-const filesFrameSigner = (): ((payloadHex: string) => Promise<string>) | undefined =>
-  isTauri()
-    ? async (payloadHex: string) => {
-        const { invoke } = await import("@tauri-apps/api/core");
-        return invoke<string>("user_sign_files_frame", { payloadHex });
-      }
-    : undefined;
+/** The static web twin has no local user-key custody. */
+const filesFrameSigner = (): ((_payloadHex: string) => Promise<string>) | undefined =>
+  undefined;
 
-/** The desktop shell's generic content-op signer, or undefined outside Tauri.
+/** The desktop shell's generic content-op signer, or undefined on the web.
  *  Used for REMOTE connections so every op is authored as the connecting
  *  user's key (`ext:<user-pubkey>`) — authorized by the remote node's
  *  client-standing door — instead of the remote node re-signing with its own
@@ -77,14 +54,8 @@ const filesFrameSigner = (): ((payloadHex: string) => Promise<string>) | undefin
  *  locked key with `identity-locked` (the transport surfaces it, no silent
  *  fallback). */
 const contentFrameSigner = ():
-  | ((target: string, payloadHex: string) => Promise<string>)
-  | undefined =>
-  isTauri()
-    ? async (target: string, payloadHex: string) => {
-        const { invoke } = await import("@tauri-apps/api/core");
-        return invoke<string>("user_sign_frame", { target, payloadHex });
-      }
-    : undefined;
+  | ((_target: string, _payloadHex: string) => Promise<string>)
+  | undefined => undefined;
 
 /** Web build: dial the configured node url. Nothing to manage. */
 export const resolveNode = (): NodeResolution => {

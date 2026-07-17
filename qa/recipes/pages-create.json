@@ -1,0 +1,15 @@
+{
+  "name": "pages-create",
+  "preset": "ui-live",
+  "lane": "fleet",
+  "steps": [
+    { "wait": { "cond": { "node": { "role": "link", "name": "Not now", "exists": true } }, "timeout_ms": 20000 } },
+    { "click": { "role": "link", "name": "Not now" } },
+    { "wait": { "cond": { "node": { "role": "list_item", "name": "General", "exists": true } }, "timeout_ms": 120000 } },
+    { "click": { "role": "button", "name": "Pages" } },
+    { "expect": { "state_path": { "path": "screen", "equals": "pages" } } },
+    { "wait": { "cond": { "node": { "role": "list_item", "name": "Team Runbook", "exists": true } }, "timeout_ms": 30000 } },
+    { "click": { "role": "button", "name": "New page" } },
+    { "wait": { "cond": { "node": { "role": "list_item", "name": "Untitled", "exists": true } }, "timeout_ms": 30000 } }
+  ]
+}

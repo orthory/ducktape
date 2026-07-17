@@ -119,8 +119,8 @@ export function TerminalView() {
           ? [session.topic, commandTopic(session.sessionId)]
           : [session.topic];
         unsubscribe = subscribe(topics, {
-          onTermChunk: (item) => {
-            t.write(decodeTermChunk(item));
+          onTermChunk: (frame) => {
+            t.write(decodeTermChunk(frame.item));
             if (!sized) {
               sized = true;
               fit.fit();
@@ -136,6 +136,22 @@ export function TerminalView() {
                 ? prev
                 : [...prev, { seq, origin, text }],
             ),
+          onLagged: () => {
+            // A VT is stateful: once the byte-ring prefix is gone, replaying
+            // only its tail cannot reconstruct colors, cursor, or alt-screen
+            // state. Stop this session honestly instead of showing a subtly
+            // corrupted terminal.
+            observer?.disconnect();
+            observer = null;
+            unsubscribe?.();
+            unsubscribe = null;
+            t.dispose();
+            term = null;
+            close?.(session.sessionId);
+            sessionId = null;
+            setReady(false);
+            setError("Terminal output history expired. Reopen Terminal to start a fresh session.");
+          },
         });
         // A shared session REFUSES raw keystrokes (raw_input_on_shared) — the
         // only way in is termCommand, so leave onData unwired. Resize applies to
