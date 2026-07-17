@@ -5,6 +5,7 @@
 //! `docs/superpowers/specs/2026-07-18-trustless-credential-gateway-poc-design.md`.
 
 pub mod attest;
+pub mod handshake;
 pub mod seal;
 pub mod token;
 pub mod wire;

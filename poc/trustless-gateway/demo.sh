@@ -32,8 +32,8 @@ done
 echo "== seal (Credential Provider) =="
 "$CLIENT_BIN" seal --host "$HOST" --attest mock --measurement "$MEAS" --refresh-token ref-seed
 
-echo "== run (Computation Provider) =="
-OUT=$("$CLIENT_BIN" run --host "$HOST" --sub demo --prompt "hi")
+echo "== run (Computation Provider: attested handshake -> scoped token -> proxied call) =="
+OUT=$("$CLIENT_BIN" run --host "$HOST" --attest mock --measurement "$MEAS" --sub demo --prompt "hi")
 echo "$OUT"
 
 if echo "$OUT" | grep -q "TRUSTLESS-GATEWAY-OK"; then

@@ -49,8 +49,8 @@ else
     "$C" seal --host "$HOST" --attest mock --measurement "$MEAS" --refresh-token "$REFRESH"
 fi
 
-echo "== mint a temporary session token =="
-TOKEN=$("$C" token --host "$HOST" --sub claude-code)
+echo "== mint a temporary session token (attested handshake) =="
+TOKEN=$("$C" token --host "$HOST" --attest mock --measurement "$MEAS" --sub claude-code)
 echo "token: ${TOKEN:0:24}…"
 
 echo "== run Claude Code through the enclave with ONLY that token =="

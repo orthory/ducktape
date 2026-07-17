@@ -30,6 +30,14 @@ impl SealKeypair {
     pub fn public_bytes(&self) -> [u8; 32] {
         self.public.to_bytes()
     }
+
+    /// ECDH against a peer's X25519 public key, so this same static keypair also
+    /// anchors the session-key handshake (see `handshake`). The client derives
+    /// the matching secret from the `seal_pk` it read out of the attested
+    /// REPORTDATA, so the session binds to the attested enclave.
+    pub fn ecdh(&self, peer_pk: &[u8; 32]) -> [u8; 32] {
+        self.secret.diffie_hellman(&PublicKey::from(*peer_pk)).to_bytes()
+    }
 }
 
 fn derive_key(shared: &[u8; 32]) -> [u8; 32] {

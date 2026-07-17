@@ -59,11 +59,11 @@ else
     "$C" seal --host "$HOST" --attest tdx --measurement "$MRTD" --refresh-token "$REFRESH"
 fi
 
-echo "== run: proxied call with a scoped session token =="
-OUT=$("$C" run --host "$HOST" --sub demo --prompt "hi")
+echo "== run: attested handshake -> scoped session token -> proxied call =="
+OUT=$("$C" run --host "$HOST" --attest tdx --measurement "$MRTD" --sub demo --prompt "hi")
 echo "$OUT"
 
-if echo "$OUT" | grep -q MOCK-REPLY-OK; then
+if echo "$OUT" | grep -q TRUSTLESS-GATEWAY-OK; then
     echo "PASS ✅  real TDX attestation + mock upstream"
 elif [ "$UPSTREAM_BASE" != "http://127.0.0.1:9101" ] && echo "$OUT" | grep -qi '"type"'; then
     echo "PASS ✅  real TDX attestation + REAL Anthropic upstream (OAuth constants valid)"

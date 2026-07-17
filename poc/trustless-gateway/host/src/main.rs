@@ -28,6 +28,7 @@ use rand_core::OsRng;
 use tokio::net::TcpListener;
 
 use tcg_core::attest::{self, AttestMode, Measurement};
+use tcg_core::handshake;
 use tcg_core::seal::{self, SealKeypair};
 use tcg_core::token::{self, Claims};
 use tcg_core::wire::{
@@ -51,10 +52,12 @@ enum Cmd {
 struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:9100")]
     listen: String,
-    /// mock | tdx
+    /// mock | tdx | snp | auto. `auto` probes configfs-tsm's `provider` to pick
+    /// the vendor (tdx_guest -> tdx, sev_guest -> snp).
     #[arg(long, default_value = "mock")]
     attest: String,
-    /// Expected/embedded measurement (48-byte hex). Required for --attest mock.
+    /// Embedded measurement (48-byte hex). Required for --attest mock; for the
+    /// real vendors the measurement comes from the hardware quote.
     #[arg(long)]
     measurement: Option<String>,
     #[arg(long, default_value = "http://127.0.0.1:9101")]
@@ -94,6 +97,8 @@ struct AppState {
     sess_sk: SigningKey,
     sess_pk: VerifyingKey,
     quote: Vec<u8>,
+    /// "mock" | "tdx" | "snp" — advertised so the client picks the right verifier.
+    vendor: String,
     http: reqwest::Client,
     cfg: Config,
     oauth: Mutex<Option<Oauth>>,
@@ -114,8 +119,6 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let mode: AttestMode = args.attest.parse()?;
-
     // Enclave-bound keys, memory only.
     let seal_kp = SealKeypair::generate();
     let sess_sk = SigningKey::generate(&mut OsRng);
@@ -124,19 +127,25 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let seal_pk = seal_kp.public_bytes();
     let report_data = attest::make_report_data(&seal_pk, &sess_pk.to_bytes());
 
-    let quote = match mode {
-        AttestMode::Mock => {
-            let m = args
-                .measurement
-                .as_deref()
-                .context("--measurement is required for --attest mock")?;
-            attest::mock_quote(&report_data, &Measurement::from_hex(m)?)
+    // `auto` picks the vendor from the hardware; explicit mock|tdx|snp are as named.
+    let (mode, quote) = if args.attest == "auto" {
+        tsm_gen_quote(None, &report_data)?
+    } else {
+        let mode: AttestMode = args.attest.parse()?;
+        match mode {
+            AttestMode::Mock => {
+                let m = args
+                    .measurement
+                    .as_deref()
+                    .context("--measurement is required for --attest mock")?;
+                (mode, attest::mock_quote(&report_data, &Measurement::from_hex(m)?))
+            }
+            AttestMode::Tdx | AttestMode::Snp => tsm_gen_quote(Some(mode), &report_data)?,
         }
-        AttestMode::Tdx => tdx_gen_quote(&report_data)?,
     };
     eprintln!(
-        "[host] attest={:?} quote={} bytes; seal_pk+sess_pk bound in REPORTDATA",
-        mode,
+        "[host] attest={} quote={} bytes; seal_pk+sess_pk bound in REPORTDATA",
+        mode.as_str(),
         quote.len()
     );
 
@@ -145,6 +154,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         sess_sk,
         sess_pk,
         quote,
+        vendor: mode.as_str().to_string(),
         http: reqwest::Client::new(),
         cfg: Config {
             anthropic_base: args.anthropic_base,
@@ -172,19 +182,44 @@ async fn serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Generate a real TDX quote via configfs-tsm (kernel >= 6.7, only inside a TD).
-/// Untested off-hardware; validate on the TDX box.
-fn tdx_gen_quote(report_data: &[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> {
+/// Generate a real confidential-VM quote via `configfs-tsm` (kernel >= 6.7,
+/// only inside a CVM guest). The path is vendor-generic: Intel TDX and AMD
+/// SEV-SNP both write REPORTDATA to `inblob` and read the raw report/quote from
+/// `outblob`; the `provider` attribute names the vendor (`tdx_guest` /
+/// `sev_guest`). `expected` is the vendor the operator asked for (`None` = auto,
+/// trust the hardware); a mismatch is an error. Returns the detected vendor.
+/// Untested off-hardware; validate on the CVM box.
+fn tsm_gen_quote(
+    expected: Option<AttestMode>,
+    report_data: &[u8; attest::REPORT_DATA_LEN],
+) -> Result<(AttestMode, Vec<u8>)> {
     use std::fs;
     let dir = format!("/sys/kernel/config/tsm/report/tcg-{}", std::process::id());
     fs::create_dir(&dir)
-        .with_context(|| format!("create {dir} (are we inside a TDX guest?)"))?;
-    let write_res = (|| -> Result<Vec<u8>> {
+        .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
+    let result = (|| -> Result<(AttestMode, Vec<u8>)> {
+        let provider = fs::read_to_string(format!("{dir}/provider"))
+            .context("read configfs-tsm provider")?;
+        let detected = match provider.trim() {
+            "tdx_guest" => AttestMode::Tdx,
+            "sev_guest" => AttestMode::Snp,
+            other => bail!("unsupported configfs-tsm provider {other:?} (want tdx_guest/sev_guest)"),
+        };
+        if let Some(want) = expected {
+            if want != detected {
+                bail!(
+                    "--attest {} but the guest reports {} ({provider:?})",
+                    want.as_str(),
+                    detected.as_str()
+                );
+            }
+        }
         fs::write(format!("{dir}/inblob"), report_data).context("write inblob")?;
-        fs::read(format!("{dir}/outblob")).context("read outblob")
+        let quote = fs::read(format!("{dir}/outblob")).context("read outblob")?;
+        Ok((detected, quote))
     })();
     let _ = fs::remove_dir(&dir);
-    write_res
+    result
 }
 
 // -------- handlers --------
@@ -197,7 +232,10 @@ impl IntoResponse for AppErr {
 }
 
 async fn attestation(State(st): State<Arc<AppState>>) -> Json<AttestationResponse> {
-    Json(AttestationResponse { quote_b64: BASE64.encode(&st.quote) })
+    Json(AttestationResponse {
+        quote_b64: BASE64.encode(&st.quote),
+        vendor: st.vendor.clone(),
+    })
 }
 
 async fn credential(
@@ -229,7 +267,18 @@ async fn credential(
 async fn session(
     State(st): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
-) -> Json<SessionResponse> {
+) -> Result<Json<SessionResponse>, AppErr> {
+    // Enclave side of the handshake: derive the shared key from the client's
+    // ephemeral key and our static seal secret. The token is then sealed under
+    // it, so only the client that ECDH'd against the *attested* seal_pk can open
+    // it (see handshake / design §Session-key handshake).
+    let eph = BASE64
+        .decode(&req.client_eph_pk_b64)
+        .ok()
+        .and_then(|v| <[u8; 32]>::try_from(v).ok())
+        .ok_or_else(|| AppErr(StatusCode::BAD_REQUEST, "bad client_eph_pk".into()))?;
+    let session_key = handshake::enclave_session_key(&st.seal_kp, &eph);
+
     let now = now_secs();
     let claims = Claims {
         sub: req.sub.clone(),
@@ -238,7 +287,9 @@ async fn session(
         max_requests: st.cfg.max_requests,
     };
     st.budgets.lock().unwrap().insert(req.sub, st.cfg.max_requests);
-    Json(SessionResponse { token: token::issue(&st.sess_sk, &claims) })
+    let token = token::issue(&st.sess_sk, &claims);
+    let sealed = handshake::seal_token(&session_key, token.as_bytes());
+    Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
 }
 
 async fn proxy(

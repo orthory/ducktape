@@ -3,10 +3,11 @@
 //! credential.
 //!
 //! Mock mode lives here (runs anywhere — the dev box is a Ryzen 5950X with no
-//! SEV/TDX). Real TDX quote generation (`configfs-tsm`, in `tcg-host`) and
-//! verification (`dcap-qvl`, in `tcg-client` behind `--features tdx`) live in
-//! the binaries, since neither is shared and the real verifier needs async +
-//! network.
+//! SEV/TDX). Real quote generation is vendor-generic via `configfs-tsm` (in
+//! `tcg-host`): Intel TDX (`tdx_guest`) and AMD SEV-SNP (`sev_guest`) share the
+//! sysfs report path. Verification is vendor-SPECIFIC and lives in `tcg-client`
+//! behind feature flags (`dcap-qvl` for TDX; the AMD VCEK/KDS chain for SNP),
+//! since it needs async + network + heavy deps that the mock path must not pull.
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey};
@@ -39,10 +40,33 @@ impl Measurement {
     }
 }
 
+/// The attestation vendor. `Mock` runs anywhere; `Tdx`/`Snp` need the matching
+/// confidential-VM silicon. `auto` (a CLI-only value) resolves to `Tdx`/`Snp`
+/// by probing `configfs-tsm`'s `provider`, so it is not a variant here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AttestMode {
     Mock,
     Tdx,
+    Snp,
+}
+
+impl AttestMode {
+    /// The `configfs-tsm` `provider` string for this vendor, or `None` for mock.
+    pub fn tsm_provider(self) -> Option<&'static str> {
+        match self {
+            Self::Mock => None,
+            Self::Tdx => Some("tdx_guest"),
+            Self::Snp => Some("sev_guest"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Tdx => "tdx",
+            Self::Snp => "snp",
+        }
+    }
 }
 
 impl std::str::FromStr for AttestMode {
@@ -51,7 +75,8 @@ impl std::str::FromStr for AttestMode {
         match s {
             "mock" => Ok(Self::Mock),
             "tdx" => Ok(Self::Tdx),
-            other => bail!("unknown attest mode {other:?} (want 'mock' or 'tdx')"),
+            "snp" => Ok(Self::Snp),
+            other => bail!("unknown attest mode {other:?} (want 'mock', 'tdx', or 'snp')"),
         }
     }
 }
