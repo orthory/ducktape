@@ -26,7 +26,9 @@ mod screens;
 mod search;
 mod shell;
 mod terminal_contract;
-#[cfg(test)]
+// The screen-test toolkit drives widgets through the agent plugin's semantic
+// selector layer, so it only exists when the `agent` feature is on.
+#[cfg(all(test, feature = "agent"))]
 mod test;
 mod terminal_service;
 mod theme;

@@ -823,7 +823,9 @@ pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
 
 /// POST /v1/log-filter — retune the log level of a RUNNING node.
 ///
-///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'
+/// ```text
+/// curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'
+/// ```
 ///
 /// RUST_LOG is read once at boot, so without this route every `debug!` in the
 /// tree is unreachable without a restart — and restarting a wedged node destroys
