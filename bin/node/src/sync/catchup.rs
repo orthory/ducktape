@@ -15,7 +15,7 @@ pub(crate) async fn apply_verified_suffix_frame(
     host: &mut Host,
     served: &statesync::FinalizedFrame,
     code_source: &dyn host::CodeSource,
-) -> Result<(Vec<host::DispatchRecord>, u32), String> {
+) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
     let protocol_version = host.effective_version(served.height).await;
     host.set_active_version(protocol_version);
@@ -26,17 +26,17 @@ pub(crate) async fn apply_verified_suffix_frame(
     host.realize_module_swaps(served.height, code_source)
         .await
         .map_err(|e| format!("code-swap realization at height {}: {e}", served.height))?;
-    // the served frame is a BATCH: decode its members (under the block's
-    // version gate — a v3 envelope re-applies WITH its continuation) and apply
-    // as ONE block, exactly like the live drain and recovery replay, so the
-    // disposition, roots, and app-hash reproduce what the peer served.
-    // disposition is DRAIN-based (any member or released continuation applied,
-    // or a System injection ran), never app-hash-based.
+    // the served frame is a BATCH: decode its members (a v3 envelope
+    // re-applies WITH its continuation) and apply as ONE block, exactly like
+    // the live drain and recovery replay, so the disposition, roots, and
+    // app-hash reproduce what the peer served. disposition is DRAIN-based
+    // (any member or released continuation applied, or a System injection
+    // ran), never app-hash-based.
     let (outcome, dispatches) = match node::decode_batch(&served.frame) {
         Ok(members) => {
             let mut ops = Vec::new();
             for member in &members {
-                if let Ok(op) = node::decode_member(member, protocol_version) {
+                if let Ok(op) = node::decode_member(member) {
                     ops.push(op);
                 }
             }
@@ -87,7 +87,7 @@ pub(crate) async fn apply_verified_suffix_frame(
             hex(&served.app_hash)
         ));
     }
-    Ok((dispatches, protocol_version))
+    Ok(dispatches)
 }
 
 pub(crate) async fn apply_and_journal_verified_frame<E>(
@@ -105,8 +105,7 @@ where
     // realize swaps through the SAME source replay uses (wired on Recovery), so
     // every path reconciles code identically.
     let code_source = recovery.code_source();
-    let (dispatches, protocol_version) =
-        apply_verified_suffix_frame(host, frame, code_source.as_ref()).await?;
+    let dispatches = apply_verified_suffix_frame(host, frame, code_source.as_ref()).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),
@@ -124,7 +123,6 @@ where
             disposition: seal.disposition,
             app_hash: seal.app_hash,
             dispatches: &dispatches,
-            protocol_version,
         });
     }
     Ok(())

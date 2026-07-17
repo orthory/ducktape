@@ -51,12 +51,12 @@ pub(crate) fn sealed_frame_block_row(
     blobs: &blobstore::BlobHandle,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
-    // the sealed frame is a BATCH: decode its members (under the block's own
-    // version gate, so a replayed row never shows an op the live drain refused)
-    // and show each as a block op. per-member dispositions/traces are not
-    // carried in the fold (recovery folds the block-level disposition +
-    // aggregate trace), so a replayed op shows the block disposition and an
-    // empty trace — the LIVE drain carries the full per-op detail.
+    // the sealed frame is a BATCH: decode its members (either codec, exactly
+    // like the live drain) and show each as a block op. per-member
+    // dispositions/traces are not carried in the fold (recovery folds the
+    // block-level disposition + aggregate trace), so a replayed op shows the
+    // block disposition and an empty trace — the LIVE drain carries the full
+    // per-op detail.
     let members = node::decode_batch(block.frame).ok()?;
     let disposition = match block.disposition {
         node::Disposition::Applied => noded::BlockDisposition::Applied,
@@ -65,7 +65,7 @@ pub(crate) fn sealed_frame_block_row(
     };
     let mut ops = Vec::new();
     for member in &members {
-        let Ok(op) = node::decode_member(member, block.protocol_version) else {
+        let Ok(op) = node::decode_member(member) else {
             continue;
         };
         if op.msg.target == NOP_TARGET {

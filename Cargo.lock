@@ -7098,7 +7098,6 @@ dependencies = [
  "statesync",
  "thiserror 2.0.18",
  "tracing",
- "upgrade",
 ]
 
 [[package]]

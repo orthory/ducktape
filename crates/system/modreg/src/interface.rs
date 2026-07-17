@@ -29,12 +29,8 @@ pub const CODE_HASH_LEN: usize = 32;
 /// that turns admissions on, and it must not happen before the recovery /
 /// state-sync composition can restore an admitted module's accumulated state
 /// (today's composers enumerate a fixed module set — the restore half of
-/// admissions is follow-up work). this ceiling FLOATS above whatever feature
-/// claims the next slot: continuation transactions took v4
-/// (`node::CONTINUATION_ACTIVATION_VERSION`), which pushed admission to 5 —
-/// pinning admission at 4 would have made the continuation flag day cross the
-/// still-blocked admission boundary as a side effect.
-pub const ADMISSION_ACTIVATION_VERSION: u32 = 5;
+/// admissions is follow-up work).
+pub const ADMISSION_ACTIVATION_VERSION: u32 = 4;
 
 /// coordinates of a scheduled code swap for one module. **at most one** is ever
 /// pending per module.

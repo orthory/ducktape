@@ -1139,12 +1139,6 @@ pub struct FoldedBlock<'a> {
     pub disposition: Disposition,
     pub app_hash: StateRoot,
     pub dispatches: &'a [DispatchRecord],
-    /// the block's effective protocol version — the same value replay stamped
-    /// into its `BlockContext`. the row rebuild decodes the frame's members
-    /// under the SAME codec gate the live drain used (op-frame v3 accepted iff
-    /// this reaches `node::CONTINUATION_ACTIVATION_VERSION`), so a replayed
-    /// explorer row never shows an op the live node refused, or vice versa.
-    pub protocol_version: u32,
 }
 
 /// observer of every sealed block the journal replay walks, in height order —
@@ -1398,8 +1392,7 @@ where
                                     disposition,
                                     app_hash,
                                     dispatches: &[],
-                                    protocol_version,
-                                }),
+                                                                    }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
                                 // re-executed here — unreproducible.
@@ -1473,8 +1466,7 @@ where
                                     disposition,
                                     app_hash,
                                     dispatches: &dispatches,
-                                    protocol_version,
-                                });
+                                                                    });
                             }
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
@@ -1574,8 +1566,7 @@ where
                                     disposition,
                                     app_hash,
                                     dispatches: &dispatches,
-                                    protocol_version,
-                                });
+                                                                    });
                             }
                             // every re-committed and exact-post module must now
                             // stand at its sealed post-root. a disk substrate that
@@ -1646,8 +1637,7 @@ where
                         // below; this is that same post-block boundary.
                         app_hash: host.app_hash(),
                         dispatches: &dispatches,
-                        protocol_version,
-                    });
+                                            });
                 }
                 disposition
             } else {
@@ -1719,8 +1709,7 @@ where
                             disposition,
                             app_hash: host.app_hash(),
                             dispatches: &dispatches,
-                            protocol_version,
-                        });
+                                                    });
                     }
                     disposition
                 }
@@ -1859,11 +1848,10 @@ async fn apply_block_committing(
 /// roll-forward's backstop widener: a moved module whose member re-executes
 /// as a duplicate-reject on its own post-state records no dispatch, but the
 /// frame still explains it. undecodable members target nothing
-/// (deterministic no-ops live and on replay alike). decodes UNGATED
+/// (deterministic no-ops live and on replay alike). decodes either codec
 /// ([`node::decode_frame_any`]) and includes a v3 envelope's continuation
 /// target beside its parent's: a released continuation moves ITS module in
-/// the same block, and a widener may only over-explain, never under-explain
-/// (a pre-activation v3 member never applied, so its targets never moved).
+/// the same block, and a widener may only over-explain, never under-explain.
 fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     let Ok(members) = decode_batch(frame) else {
         return BTreeSet::new();
@@ -1897,13 +1885,11 @@ async fn replay_batch(
     let Ok(members) = decode_batch(frame) else {
         return Ok((Disposition::Rejected, Vec::new()));
     };
-    // decode under the block's version gate exactly as the live drain did
-    // (op-frame v3 accepted iff `protocol_version` reached the continuation
-    // flag day) — a journaled v3 frame replays WITH its continuation, and a
-    // pre-activation v3 member re-rejects identically.
+    // decode exactly as the live drain does — a journaled v3 frame replays
+    // WITH its continuation (dropping it would fork the replayed app-hash).
     let mut ops = Vec::new();
     for member in &members {
-        if let Ok(op) = node::decode_member(member, protocol_version) {
+        if let Ok(op) = node::decode_member(member) {
             ops.push(op);
         }
     }

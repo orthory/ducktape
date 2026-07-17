@@ -1,5 +1,5 @@
-//! op-frame v3 — the continuation-capable envelope codec and its
-//! protocol-version gate at the ordered lane. properties:
+//! op-frame v3 — the continuation-capable envelope codec at the ordered
+//! lane. properties:
 //!
 //! 1. round-trip: with and without a continuation, decode returns exactly
 //!    what encode framed, under the v3 signing domain;
@@ -8,16 +8,13 @@
 //!    continuation onto (or stripping one off) someone else's op;
 //! 3. `cont_flag` outside {0,1} is not a canonical frame;
 //! 4. cross-codec: the v2 decoder deterministically rejects a v3 frame and
-//!    the v3 decoder rejects a v2 frame — the pre-activation fence is
+//!    the v3 decoder rejects a v2 frame — the fence between the codecs is
 //!    structural, not a config check;
 //! 5. the continuation payload cap rejects at decode;
-//! 6. `decode_member` accepts v2 at any version and v3 only at/after
-//!    [`node::CONTINUATION_ACTIVATION_VERSION`], with a versioned reason
-//!    below it; `decode_frame_any` reads both codecs ungated;
-//! 7. the flag day end-to-end: below the boundary a v3 frame is refused at
-//!    admission AND deterministically rejected by the drain (a byzantine
-//!    proposal); at/after it the same frame admits, applies its parent, and
-//!    releases the continuation in the same block — surfaced on
+//! 6. `decode_member` / `decode_frame_any` read both codecs, a v3 envelope
+//!    carrying its continuation (and the member frame id) onto the op;
+//! 7. end-to-end: a v3 envelope admits at the ordered lane, applies its
+//!    parent, and releases the continuation in the same block — surfaced on
 //!    [`node::DrainedOp::continuation`];
 //! 8. determinism: two nodes fed the identical v3-carrying batch drain
 //!    identical app-hashes, dispositions, and continuation traces.
@@ -30,10 +27,8 @@ use directory::{
 };
 use futures::executor::block_on;
 use host::Host;
-use node::{
-    CONTINUATION_ACTIVATION_VERSION, Disposition, OrderedNode, Orderer as _, RoundOrderer,
-};
-use sdk::{Continuation, Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use node::{Disposition, OrderedNode, Orderer as _, RoundOrderer};
+use sdk::{Continuation, Msg, Origin};
 
 fn sk(seed: u64) -> PrivateKey {
     PrivateKey::from_seed(seed)
@@ -135,37 +130,22 @@ fn v3_rejects_over_cap_continuation_payload() {
     );
 }
 
-// (6) the member decode gate: v2 at ANY version, v3 only at/after the flag day.
+// (6) the member decode: both codecs, a v3 envelope carrying its continuation.
 #[test]
-fn decode_member_gates_v3_on_the_protocol_version() {
+fn decode_member_reads_both_codecs() {
     let signer = sk(6);
     let v2 = node::encode_frame(&signer, 0, &msg());
+    let op = node::decode_member(&v2).expect("v2 decodes");
+    assert!(op.continuation.is_none());
+    assert_eq!(op.frame, node::frame_id(&v2), "member frame id stamped");
+
     let v3 = node::encode_frame_v3(&signer, 0, &msg(), Some(&cont()));
-
-    for version in [0, CONTINUATION_ACTIVATION_VERSION] {
-        let op = node::decode_member(&v2, version).expect("v2 decodes at any version");
-        assert!(op.continuation.is_none());
-        assert_eq!(op.frame, node::frame_id(&v2), "member frame id stamped");
-    }
-
-    let err = node::decode_member(&v3, CONTINUATION_ACTIVATION_VERSION - 1)
-        .expect_err("v3 below the gate must reject");
-    assert!(
-        err.to_string()
-            .contains(&format!("activates at protocol v{CONTINUATION_ACTIVATION_VERSION}")),
-        "the reason names the flag day: {err}"
-    );
-
-    let op = node::decode_member(&v3, CONTINUATION_ACTIVATION_VERSION)
-        .expect("v3 decodes at the gate");
+    let op = node::decode_member(&v3).expect("v3 decodes");
     assert_eq!(op.continuation, Some(cont()), "the envelope continuation rides the BlockOp");
     assert_eq!(op.frame, node::frame_id(&v3), "member frame id stamped");
     assert_eq!(op.msg, msg());
 
-    assert!(
-        node::decode_member(b"junk", CONTINUATION_ACTIVATION_VERSION).is_err(),
-        "junk is junk at any version"
-    );
+    assert!(node::decode_member(b"junk").is_err(), "junk is junk");
 }
 
 // (6b) the policy-door decode: both codecs, no gate.
@@ -183,62 +163,12 @@ fn decode_frame_any_reads_both_codecs() {
     assert!(node::decode_frame_any(b"junk").is_err());
 }
 
-// ---- the ordered-lane gate, end to end --------------------------------------
+// ---- the ordered lane, end to end -------------------------------------------
 
 const DIR: &str = "directory";
 
-/// a mock `upgrade` module reporting a STATIC armed schedule to
-/// `CONTINUATION_ACTIVATION_VERSION` at `activation_height` — so
-/// `Host::effective_version(h)` crosses the flag day at exactly that height
-/// with none of the valset/readiness choreography (the gate under test is the
-/// DRAIN's, not the upgrade module's). the host's boundary `Advance` injection
-/// is accepted as a no-op: the mock arms purely by height, which is all the
-/// version derivation reads.
-struct GateAt {
-    activation_height: u64,
-}
-
-#[async_trait::async_trait(?Send)]
-impl Module for GateAt {
-    fn id(&self) -> ModuleId {
-        "upgrade".into()
-    }
-    fn root(&self) -> StateRoot {
-        StateRoot([0x47; 32])
-    }
-    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match upgrade::decode_msg(&msg.payload).map_err(Error::Module)? {
-            upgrade::UpgradeMsg::Advance => Ok(()),
-            other => Err(Error::Module(format!("gate mock got {other:?}"))),
-        }
-    }
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let upgrade::UpgradeQuery::Status = upgrade::decode_query(req).map_err(Error::Module)?;
-        let member = vec![0xEE; 32];
-        Ok(upgrade::encode_reply(&upgrade::UpgradeReply::Status(
-            upgrade::UpgradeStatus {
-                current_version: 0,
-                pending: Some(upgrade::ScheduledUpgrade {
-                    name: "continuation-tx".into(),
-                    activation_height: self.activation_height,
-                    to_version: CONTINUATION_ACTIVATION_VERSION,
-                }),
-                members: vec![member.clone()],
-                ready: vec![member],
-                member_count: 1,
-                ready_count: 1,
-                armed: true,
-            },
-        )))
-    }
-}
-
-fn gated_host(activation_height: u64) -> Host {
-    Host::genesis(vec![
-        Box::new(Directory::new(DIR)),
-        Box::new(GateAt { activation_height }),
-    ])
-    .expect("genesis")
+fn dir_host() -> Host {
+    Host::genesis(vec![Box::new(Directory::new(DIR))]).expect("genesis")
 }
 
 fn dir_set(key: &str, value: &str) -> Msg {
@@ -277,65 +207,22 @@ fn v3_envelope(signer: &PrivateKey, seq: u64) -> Vec<u8> {
     )
 }
 
-// (7) the flag day: refused at admission and rejected by the drain below the
-// boundary; admitted, applied, and released at/after it.
+// (7) end to end: a v3 envelope admits at the ordered lane, applies its
+// parent, and releases the continuation in the same block.
 #[test]
-fn drain_gates_v3_on_the_upgrade_flag_day() {
+fn drain_applies_v3_and_releases_the_continuation() {
     block_on(async {
-        // activation at height 2: heights 0,1 run v0; heights >= 2 run v4.
-        let mut node = OrderedNode::new(gated_host(2), RoundOrderer::new());
+        let mut node = OrderedNode::new(dir_host(), RoundOrderer::new());
         let signer = sk(10);
-        let v3 = v3_envelope(&signer, 0);
 
-        // ADMISSION, pre-activation: refused with the versioned reason.
-        let err = node
-            .submit_frame(v3.clone())
+        node.submit_frame(v3_envelope(&signer, 0))
             .await
-            .expect_err("v3 must not admit below the flag day");
-        assert!(
-            err.to_string().contains(&format!(
-                "activates at protocol v{CONTINUATION_ACTIVATION_VERSION}"
-            )),
-            "admission names the flag day: {err}"
-        );
-
-        // the DRAIN, pre-activation: a byzantine proposer forces the identical
-        // bytes into the order anyway — every honest node rejects them
-        // deterministically, with the versioned reason, moving no state.
-        let before = node.app_hash();
-        node.orderer_mut()
-            .submit(node::encode_batch(std::slice::from_ref(&v3)))
-            .await
-            .expect("byzantine propose");
-        while node.drain_delivered().await.expect("drain") != 0 {}
-        let drained = node.take_drained();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].disposition, Disposition::Rejected);
-        assert!(drained[0].op.is_none(), "nothing decodes below the gate");
-        assert!(
-            drained[0].reason.as_deref().unwrap_or_default().contains(&format!(
-                "activates at protocol v{CONTINUATION_ACTIVATION_VERSION}"
-            )),
-            "the drained reason names the flag day: {:?}",
-            drained[0].reason
-        );
-        assert_eq!(node.app_hash(), before, "a rejected v3 frame moves nothing");
-        assert_eq!(dir_get(node.host(), "a").await, None);
-
-        // a filler block below the boundary (height 1) advances the chain.
-        node.submit(&signer, 1, dir_set("x", "9")).await.expect("filler");
+            .expect("v3 admits");
         node.flush_batch().await.expect("flush");
         while node.drain_delivered().await.expect("drain") != 0 {}
-        node.take_drained();
 
-        // ADMISSION at the boundary (next height = 2): the SAME frame admits,
-        // applies its parent, and releases the continuation in the same block.
-        node.submit_frame(v3.clone()).await.expect("v3 admits at the flag day");
-        node.flush_batch().await.expect("flush");
-        while node.drain_delivered().await.expect("drain") != 0 {}
         let drained = node.take_drained();
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].height, 2, "the flag-day block");
         assert_eq!(drained[0].disposition, Disposition::Applied);
         let op = drained[0].op.as_ref().expect("decoded op");
         assert_eq!(op.target, DIR);
@@ -353,12 +240,6 @@ fn drain_gates_v3_on_the_upgrade_flag_day() {
         // both writes committed: parent then continuation, one block.
         assert_eq!(dir_get(node.host(), "a").await.as_deref(), Some("1"));
         assert_eq!(dir_get(node.host(), "b").await.as_deref(), Some("2"));
-        // the boundary block also carried the System Advance injection.
-        let system = node.take_system_dispatches();
-        assert!(
-            system.iter().any(|(h, d)| *h == 2 && !d.is_empty()),
-            "the flag-day block injects the boundary Advance: {system:?}"
-        );
     });
 }
 
@@ -367,9 +248,8 @@ fn drain_gates_v3_on_the_upgrade_flag_day() {
 #[test]
 fn identical_v3_batches_drain_identically_on_two_nodes() {
     block_on(async {
-        // active from genesis: every height runs v4.
-        let mut n1 = OrderedNode::new(gated_host(0), RoundOrderer::new());
-        let mut n2 = OrderedNode::new(gated_host(0), RoundOrderer::new());
+        let mut n1 = OrderedNode::new(dir_host(), RoundOrderer::new());
+        let mut n2 = OrderedNode::new(dir_host(), RoundOrderer::new());
 
         let batch = node::encode_batch(&[
             node::encode_frame(&sk(11), 0, &dir_set("x", "9")),

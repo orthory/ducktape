@@ -39,7 +39,3 @@ saga = { workspace = true }
 # a probe module (impl sdk::Module) in the env-from-view test needs async-trait.
 async-trait = { workspace = true }
 commonware-runtime = { workspace = true }
-# the frame-v3 flag-day tests stand a mock armed `upgrade` module so
-# `effective_version(height)` crosses CONTINUATION_ACTIVATION_VERSION at a
-# chosen boundary (the status wire types live in the upgrade crate).
-upgrade = { workspace = true }

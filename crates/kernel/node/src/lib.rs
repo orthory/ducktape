@@ -255,21 +255,11 @@ pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
 /// nobody can graft one onto (or strip one off) someone else's transaction.
 /// domain-separated from v2 so neither codec's signature can ever verify
 /// under the other's parse — a v2-era signature is structurally dead under
-/// v3 and vice versa. acceptance is protocol-version-gated at the drain (the
-/// upgrade-module flag-day); until then the live v2 decoder deterministically
-/// rejects any v3 frame (its flag/continuation bytes fail the v2 signature
-/// split).
+/// v3 and vice versa. the ordered lane accepts BOTH codecs side by side
+/// ([`decode_member`]): there is no live network yet, so everything still runs
+/// protocol v0 and v3 needs no activation gate — the spec's upgrade-module
+/// flag-day gating (rollout section) arrives together with a real network.
 pub const FRAME_NS_V3: &[u8] = b"ducktape:op-frame:v3";
-
-/// the protocol version at which the ordered lane ACCEPTS op-frame v3 (and so
-/// releases envelope continuations): the height-gated flag day scheduled
-/// through the upgrade module. below it, admission and the drain reject any
-/// v3-domain frame deterministically — every honest node runs the identical
-/// `effective_version(height)` gate, so a byzantine proposer cannot split the
-/// network with an early v3 member. v4 is claimed HERE, which is why modreg's
-/// `ADMISSION_ACTIVATION_VERSION` sits at 5: activating continuations must not
-/// drag the (still-blocked) module-admission boundary across with it.
-pub const CONTINUATION_ACTIVATION_VERSION: u32 = 4;
 
 /// read one byte off the front of `buf`.
 fn take_byte(buf: &mut &[u8]) -> Option<u8> {
@@ -377,14 +367,11 @@ pub fn decode_frame_v3(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation
 }
 
 /// decode a frame under WHICHEVER codec its signature verifies against — v2
-/// first (the dominant lane), then v3. NO version gate: this is the policy-door
-/// read (the relay's standing checks, blob-digest extraction), which needs the
-/// verified `(origin, msg)` regardless of activation state — the authoritative
-/// version gates live at admission ([`OrderedNode::submit_frame`]) and the
-/// drain ([`decode_member`]), and a pre-activation v3 frame passing a policy
-/// door still rejects there. the codecs are mutually exclusive by construction
-/// (domain-separated signatures, incompatible trailing shapes), so at most one
-/// arm can succeed. both failing returns the v2 error.
+/// first (the dominant lane), then v3. the codecs are mutually exclusive by
+/// construction (domain-separated signatures, incompatible trailing shapes),
+/// so at most one arm can succeed. both failing returns the v2 error. serves
+/// the policy doors (the relay's standing checks, blob-digest extraction),
+/// which need only the verified `(origin, msg)`.
 pub fn decode_frame_any(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
     match decode_frame(bytes) {
         Ok((origin, msg)) => Ok((origin, msg, None)),
@@ -392,44 +379,21 @@ pub fn decode_frame_any(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuatio
     }
 }
 
-/// decode ONE batch member into the [`host::BlockOp`] the block applies, under
-/// the block's effective protocol version: the v2 codec always; the v3
-/// (continuation-capable) codec iff `protocol_version >=`
-/// [`CONTINUATION_ACTIVATION_VERSION`]. a structurally-valid v3 frame below the
-/// gate rejects with a versioned reason (node-local observability — the reason
-/// never enters consensus; the REJECTION is deterministic on every node
-/// because the gate reads the agreed `effective_version(height)`).
+/// decode ONE batch member into the [`host::BlockOp`] the block applies —
+/// either codec, a v3 envelope carrying its continuation onto the op.
 ///
 /// stamps `frame` with the member's content id HERE — the relay slot's
 /// `parent_frame` is consensus input a module may commit to state, so live
 /// drain, recovery replay, and suffix catch-up must all derive it from the ONE
 /// definition rather than each stamping (or forgetting) it at the call site.
-pub fn decode_member(bytes: &[u8], protocol_version: u32) -> Result<host::BlockOp, Error> {
-    match decode_frame(bytes) {
-        Ok((origin, msg)) => Ok(host::BlockOp {
-            origin,
-            msg,
-            continuation: None,
-            frame: frame_id(bytes),
-        }),
-        Err(v2_err) => {
-            let Ok((origin, msg, continuation)) = decode_frame_v3(bytes) else {
-                return Err(v2_err);
-            };
-            if protocol_version < CONTINUATION_ACTIVATION_VERSION {
-                return Err(Error::Host(sdk::Error::Module(format!(
-                    "op-frame v3 activates at protocol \
-                     v{CONTINUATION_ACTIVATION_VERSION} (block runs v{protocol_version})"
-                ))));
-            }
-            Ok(host::BlockOp {
-                origin,
-                msg,
-                continuation,
-                frame: frame_id(bytes),
-            })
-        }
-    }
+pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
+    let (origin, msg, continuation) = decode_frame_any(bytes)?;
+    Ok(host::BlockOp {
+        origin,
+        msg,
+        continuation,
+        frame: frame_id(bytes),
+    })
 }
 
 // ============================================================================
@@ -1246,16 +1210,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 frame.len()
             ))));
         }
-        // ADMISSION: verify under whichever codec the version gate allows. the
-        // hint is the NEXT app height's effective version — the earliest block
-        // this frame could land in — so v3 acceptance opens exactly at the
-        // upgrade module's flag day. admission is node-local (a frame admitted
-        // just before the boundary that drains just after still resolves under
-        // the DRAIN's agreed gate); pre-activation v3 frames are refused here
-        // with the versioned reason instead of entering custody only to reject.
-        let next_height = self.finalized.map_or(self.view_base, |f| f.height + 1);
-        let admission_version = self.host.effective_version(next_height).await;
-        decode_member(&frame, admission_version)?;
+        decode_member(&frame)?;
         let id = frame_id(&frame);
         // ENQUEUE, don't propose: the frame joins `pending_batch` (FIFO) and
         // enters custody. it is not pinned or proposed until [`flush_batch`]
@@ -1471,8 +1426,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // stamp the block's dispatch version as the PURE derivation
             // effective_version(height) — never the raw stored current_version —
             // so dispatch and hashing agree on the version for block `height`.
-            // computed BEFORE member decode: the same value is the op-frame v3
-            // acceptance gate, agreed on every validator.
             let protocol_version = self.host.effective_version(height).await;
             // decode each member into the ops the block applies. no per-member
             // dedup here on purpose: in honest operation a signed frame lives in
@@ -1481,17 +1434,16 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // a finalized batch never repeats a member; a byzantine duplicate is
             // caught deterministically by the module's own (origin, seq) dedup —
             // identically live and on recovery replay. a member that fails to
-            // decode (or carries a v3 envelope below the activation gate) is a
-            // deterministic no-op: EXCLUDED from the ops and recorded Rejected
-            // after the block settles (it shares the block app-hash). the rest
-            // carry their identity parallel to `ops`, in member (= applied, =
-            // enqueue/FIFO) order, for building the drained records.
+            // decode is a deterministic no-op: EXCLUDED from the ops and recorded
+            // Rejected after the block settles (it shares the block app-hash).
+            // the rest carry their identity parallel to `ops`, in member (=
+            // applied, = enqueue/FIFO) order, for building the drained records.
             let mut ops: Vec<host::BlockOp> = Vec::new();
             let mut op_meta: Vec<MemberMeta> = Vec::new();
             let mut decode_fail: Vec<(FrameId, String)> = Vec::new();
             for member in &members {
                 let mid = frame_id(member);
-                match decode_member(member, protocol_version) {
+                match decode_member(member) {
                     Ok(op) => {
                         op_meta.push(MemberMeta {
                             id: mid,
@@ -1502,8 +1454,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         });
                         ops.push(op);
                     }
-                    // keep the codec's verbatim reason (a submitter's held
-                    // reply surfaces it — notably the versioned v3 gate reason).
+                    // keep the codec's verbatim reason — a submitter's held
+                    // reply surfaces it. node-local observability only.
                     Err(Error::Host(sdk::Error::Module(reason))) => {
                         decode_fail.push((mid, reason));
                     }
