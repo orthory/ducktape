@@ -99,9 +99,10 @@ pub fn mock_quote(report_data: &[u8; REPORT_DATA_LEN], m: &Measurement) -> Vec<u
     q
 }
 
-/// Verify a mock quote: issuer signature valid AND measurement matches the
-/// expected audited image. Returns the bound REPORTDATA.
-pub fn mock_verify(quote: &[u8], expected: &Measurement) -> Result<[u8; REPORT_DATA_LEN]> {
+/// Parse + authenticate a mock quote WITHOUT comparing the measurement. Used by
+/// `inspect` to read the embedded MRTD out of a quote. Still checks the issuer
+/// signature so a garbage blob is rejected.
+pub fn mock_peek(quote: &[u8]) -> Result<(Measurement, [u8; REPORT_DATA_LEN])> {
     let need = 4 + MRTD_LEN + REPORT_DATA_LEN + 64;
     if quote.len() != need {
         bail!("mock quote wrong length: {} != {need}", quote.len());
@@ -121,17 +122,25 @@ pub fn mock_verify(quote: &[u8], expected: &Measurement) -> Result<[u8; REPORT_D
         .verify_strict(&signed, &Signature::from_bytes(&sig_bytes))
         .context("mock quote signature invalid")?;
 
-    if mrtd != expected.0 {
+    let mut m = [0u8; MRTD_LEN];
+    m.copy_from_slice(mrtd);
+    let mut out = [0u8; REPORT_DATA_LEN];
+    out.copy_from_slice(rd);
+    Ok((Measurement(m), out))
+}
+
+/// Verify a mock quote: issuer signature valid AND measurement matches the
+/// expected audited image. Returns the bound REPORTDATA.
+pub fn mock_verify(quote: &[u8], expected: &Measurement) -> Result<[u8; REPORT_DATA_LEN]> {
+    let (m, rd) = mock_peek(quote)?;
+    if m.0 != expected.0 {
         bail!(
             "measurement mismatch: quote {} != expected {} (not the audited image)",
-            hex::encode(mrtd),
+            m.to_hex(),
             expected.to_hex()
         );
     }
-
-    let mut out = [0u8; REPORT_DATA_LEN];
-    out.copy_from_slice(rd);
-    Ok(out)
+    Ok(rd)
 }
 
 #[cfg(test)]

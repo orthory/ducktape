@@ -25,8 +25,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read the enclave measurement (MRTD) out of the quote, so you can pin it
+    /// as --measurement. Prints the MRTD hex to stdout, details to stderr.
+    Inspect(InspectArgs),
     Seal(SealArgs),
     Run(RunArgs),
+}
+
+#[derive(Args)]
+struct InspectArgs {
+    #[arg(long, default_value = "http://127.0.0.1:9100")]
+    host: String,
+    /// mock | tdx
+    #[arg(long, default_value = "mock")]
+    attest: String,
 }
 
 #[derive(Args)]
@@ -64,9 +76,41 @@ struct RunArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Inspect(a) => inspect_cmd(a).await,
         Cmd::Seal(a) => seal_cmd(a).await,
         Cmd::Run(a) => run_cmd(a).await,
     }
+}
+
+async fn inspect_cmd(args: InspectArgs) -> Result<()> {
+    let mode: AttestMode = args.attest.parse()?;
+    let att: AttestationResponse = reqwest::Client::new()
+        .get(format!("{}/attestation", args.host))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let quote = BASE64.decode(att.quote_b64).context("quote base64")?;
+
+    let (mrtd_hex, report_data, extra) = match mode {
+        AttestMode::Mock => {
+            let (m, rd) = attest::mock_peek(&quote)?;
+            (m.to_hex(), rd, Vec::new())
+        }
+        AttestMode::Tdx => tdx_inspect(&quote)?,
+    };
+    let (seal_pk, sess_pk) = attest::split_report_data(&report_data);
+
+    eprintln!("attest={mode:?}  quote={} bytes", quote.len());
+    for line in &extra {
+        eprintln!("{line}");
+    }
+    eprintln!("REPORTDATA seal_pk = {}", hex::encode(seal_pk));
+    eprintln!("REPORTDATA sess_pk = {}", hex::encode(sess_pk));
+    eprintln!("--- pin the line below as --measurement (TOFU; in prod pin from the audited build): ---");
+    println!("{mrtd_hex}");
+    Ok(())
 }
 
 async fn seal_cmd(args: SealArgs) -> Result<()> {
@@ -171,6 +215,30 @@ async fn verify_quote(
     }
 }
 
+/// Offline: parse the TDX quote and read MRTD/RTMRs/report_data. No collateral
+/// / network — structural parse only.
+#[cfg(feature = "tdx")]
+fn tdx_inspect(quote: &[u8]) -> Result<(String, [u8; attest::REPORT_DATA_LEN], Vec<String>)> {
+    use dcap_qvl::quote::Quote;
+    let q = Quote::parse(quote).map_err(|e| anyhow::anyhow!("parse quote: {e:?}"))?;
+    let td = q.report.as_td10().context("quote is not a TDX TD10 report")?;
+    let mut rd = [0u8; attest::REPORT_DATA_LEN];
+    rd.copy_from_slice(&td.report_data[..attest::REPORT_DATA_LEN]);
+    let extra = vec![
+        format!("MRTD  {}", hex::encode(td.mr_td)),
+        format!("RTMR0 {}", hex::encode(td.rt_mr0)),
+        format!("RTMR1 {}", hex::encode(td.rt_mr1)),
+        format!("RTMR2 {}", hex::encode(td.rt_mr2)),
+        format!("RTMR3 {}", hex::encode(td.rt_mr3)),
+    ];
+    Ok((hex::encode(td.mr_td), rd, extra))
+}
+
+#[cfg(not(feature = "tdx"))]
+fn tdx_inspect(_quote: &[u8]) -> Result<(String, [u8; attest::REPORT_DATA_LEN], Vec<String>)> {
+    bail!("tcg-client was built without the `tdx` feature (rebuild with --features tdx)")
+}
+
 #[cfg(feature = "tdx")]
 async fn tdx_verify(
     quote: &[u8],
@@ -184,7 +252,7 @@ async fn tdx_verify(
 
     let pccs = std::env::var("PCCS_URL")
         .unwrap_or_else(|_| "https://api.trustedservices.intel.com/tdx/certification/v4/".into());
-    let coll = get_collateral(&pccs, quote, std::time::Duration::from_secs(15))
+    let coll = get_collateral(&pccs, quote)
         .await
         .map_err(|e| anyhow::anyhow!("fetch collateral: {e:?}"))?;
     let now = std::time::SystemTime::now()

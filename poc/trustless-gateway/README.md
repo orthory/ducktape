@@ -28,15 +28,44 @@ Standalone PoC — not wired into the main ducktape workspace. Design:
 Best trust demo: `--attest tdx` + mock upstream (real enclave, zero ToS
 exposure). Hermetic dev demo: both mock.
 
-## Run
+## Run (hermetic, any box)
 
 ```sh
-./demo.sh        # hermetic: mock attest + mock upstream, asserts a reply
+./demo.sh        # mock attest + mock upstream, asserts a reply through the enclave
 ```
 
-On the TDX box, run `tcg-host serve --attest tdx …` inside the guest and
-`tcg-client seal --attest tdx --measurement <real MRTD>` with
-`tcg-client` built `--features tdx`.
+## Run (full scenario on an Intel TDX box)
+
+Run **inside the TD guest**:
+
+```sh
+./demo-tdx.sh    # real configfs-tsm quote + dcap-qvl verify, mock upstream
+```
+
+Prereqs in the guest: kernel ≥ 6.7 with `configfs-tsm`
+(`/sys/kernel/config/tsm/report` present); a working quote-generation path (QGS
+over vsock — a bare TDX guest without it returns a *report*, not a verifiable
+*quote*); network egress to Intel PCS (or set `PCCS_URL`); root (configfs report
+dirs). Build the client with `--features tdx`.
+
+The measurement bootstrap is a chicken-and-egg: `seal` needs the MRTD to pin.
+`tcg-client inspect --attest tdx` reads it out of the quote (MRTD → stdout,
+RTMRs + REPORTDATA → stderr). `demo-tdx.sh` does this as TOFU; **in production
+pin the MRTD from the audited build**, not by reading it back from the quote you
+are verifying.
+
+To also validate the real OAuth constants against Anthropic (spends real
+subscription; account-sharing exposure):
+
+```sh
+UPSTREAM_BASE=https://api.anthropic.com \
+OAUTH_URL=https://console.anthropic.com/v1/oauth/token \
+CREDS=$HOME/.claude/.credentials.json ./demo-tdx.sh
+```
+
+Note: `tdx_verify` is best-effort against `dcap-qvl` 0.3 (compiles clean with
+`--features tdx`); the report-vs-quote / QGS path is the most likely thing to
+need adjusting per platform.
 
 ## Out of scope (later specs)
 
