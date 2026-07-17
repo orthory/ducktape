@@ -1,0 +1,78 @@
+# Proves the "buildable on mac" half of the guest wasm toolchain claim on real
+# Apple hardware: a blst-carrying guest builds to wasm32-unknown-unknown and
+# componentizes on stock rustup, with NO wasm-capable clang involved. The
+# mechanism under test is patches/blst (build.rs early-returns on wasm32, so no
+# C is compiled at all — see patches/blst/PATCH.md) plus the getrandom stubs in
+# the guest workspace. CC for the wasm target is pinned to /usr/bin/false so
+# any attempt to compile C for wasm32 fails loudly rather than silently
+# succeeding via a toolchain the runner happens to carry.
+name: guest-wasm-mac-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/guest-wasm-mac-smoke.yml"
+      - "patches/blst/**"
+      - "crates/examples/identity-wasm/**"
+      - "crates/examples/guest-adapter/**"
+
+concurrency:
+  group: guest-wasm-mac-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CC_wasm32_unknown_unknown: /usr/bin/false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: record toolchain evidence
+        run: |
+          sw_vers
+          uname -m
+          xcode-select -p
+          clang --version | head -1
+          brew list --versions llvm 2>/dev/null || echo "no brew llvm installed"
+
+      - name: stock rustup + wasm32 target
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+          rustc -vV
+
+      - name: build identity-wasm (no C toolchain)
+        working-directory: crates/examples/identity-wasm
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: install wasm-tools
+        run: cargo install wasm-tools --locked
+
+      - name: componentize
+        working-directory: crates/examples/identity-wasm
+        run: |
+          wasm-tools component new \
+            target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+            -o "$RUNNER_TEMP/identity.component.wasm"
+          ls -l target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+            "$RUNNER_TEMP/identity.component.wasm"
+
+      - name: assert blst dead-stripped
+        working-directory: crates/examples/identity-wasm
+        run: |
+          wasm-tools print \
+            target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+            > "$RUNNER_TEMP/identity_wasm.wat"
+          count=$(grep -c blst "$RUNNER_TEMP/identity_wasm.wat" || true)
+          echo "blst symbol refs in module: $count"
+          test "$count" -eq 0
