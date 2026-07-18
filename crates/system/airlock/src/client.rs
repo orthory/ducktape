@@ -92,16 +92,14 @@ impl Gateway {
         String::from_utf8(token).context("session token was not utf-8")
     }
 
-    /// Seal `refresh_token` to the ALREADY-VERIFIED `seal_pk` and upload it. The
-    /// gateway never sees it in the clear.
+    /// Seal `payload` (a refresh token or a static bearer) to the ALREADY-VERIFIED
+    /// `seal_pk` and upload it. The gateway never sees it in the clear.
     pub async fn upload_sealed_credential(
         &self,
         seal_pk: &[u8; 32],
-        refresh_token: &str,
+        payload: &CredentialPayload,
     ) -> Result<()> {
-        let payload = serde_json::to_vec(&CredentialPayload {
-            refresh_token: refresh_token.to_string(),
-        })?;
+        let payload = serde_json::to_vec(payload)?;
         let sealed = seal::seal(seal_pk, &payload);
         let status = self
             .route(self.http.post(self.url("/credential")))

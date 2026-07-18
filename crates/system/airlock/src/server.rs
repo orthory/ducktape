@@ -208,16 +208,31 @@ async fn credential(
     let payload: CredentialPayload = serde_json::from_slice(&pt)
         .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("bad payload: {e}")))?;
 
-    *st.oauth.lock().unwrap() = Some(Oauth {
-        access_token: String::new(),
-        refresh_token: payload.refresh_token,
-        expires_at: 0,
-    });
-    // Prove the credential works now, so a later /v1/messages isn't the first
-    // time we learn it's broken.
-    refresh_now(&st)
-        .await
-        .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("initial refresh failed: {e}")))?;
+    match payload {
+        CredentialPayload::Refresh { refresh_token } => {
+            *st.oauth.lock().unwrap() = Some(Oauth {
+                access_token: String::new(),
+                refresh_token,
+                expires_at: 0,
+            });
+            // Prove the credential works now, so a later /v1/messages isn't the
+            // first time we learn it's broken.
+            refresh_now(&st).await.map_err(|e| {
+                AppErr(StatusCode::BAD_GATEWAY, format!("initial refresh failed: {e}"))
+            })?;
+        }
+        CredentialPayload::Bearer { access_token } => {
+            // Static access token: used as-is. `expires_at = u64::MAX` so `proxy`
+            // never treats it as stale (there is no refresh token to rotate); a
+            // token that has actually expired surfaces as an upstream 401. Nothing
+            // the owner is still using gets invalidated.
+            *st.oauth.lock().unwrap() = Some(Oauth {
+                access_token,
+                refresh_token: String::new(),
+                expires_at: u64::MAX,
+            });
+        }
+    }
     Ok(StatusCode::OK)
 }
 

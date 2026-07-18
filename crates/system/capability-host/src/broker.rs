@@ -2249,7 +2249,12 @@ mod tests {
         let (quote, _vendor) = gw.fetch_quote().await.unwrap();
         let expected = Measurement::from_hex(&meas).unwrap();
         let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
-        gw.upload_sealed_credential(&seal_pk, "ref-seed").await.unwrap();
+        gw.upload_sealed_credential(
+            &seal_pk,
+            &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+        )
+        .await
+        .unwrap();
 
         // Computation Provider: build the Anthropic broker in AIRLOCK mode —
         // NO host credential, just a verified gateway + session token.

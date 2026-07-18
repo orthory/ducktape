@@ -99,7 +99,11 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
 
     // Credential Provider: verify the quote, then seal + upload the refresh token.
     let seal_pk = attested_seal_pk(&gw).await;
-    gw.upload_sealed_credential(&seal_pk, "ref-seed").await.unwrap();
+    gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
+        refresh_token: "ref-seed".into(),
+    })
+    .await
+    .unwrap();
 
     // Computation Provider: handshake for a scoped token, then a proxied call.
     let token = gw.open_session(&seal_pk, "test-sub").await.unwrap();
@@ -144,4 +148,64 @@ async fn a_forged_gateway_cannot_mint_a_token_the_client_opens() {
     let wrong_seal_pk = [0x42u8; 32]; // not the gateway's attested key
     let err = gw.open_session(&wrong_seal_pk, "test-sub").await;
     assert!(err.is_err(), "a token derived against the wrong seal_pk must not open");
+}
+
+#[tokio::test]
+async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // An upstream that FAILS if /oauth/token is ever hit, and accepts only the
+    // exact static bearer on /v1/messages — proving a sealed Bearer is used as-is,
+    // never refreshed (so a live subscription's token chain is not rotated).
+    let oauth_hits = Arc::new(AtomicU64::new(0));
+    let oh = oauth_hits.clone();
+    let app = Router::new()
+        .route(
+            "/oauth/token",
+            post(move || {
+                let oh = oh.clone();
+                async move {
+                    oh.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "oauth must not be called for a static bearer")
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(|headers: HeaderMap| async move {
+                let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+                if got != "Bearer static-access-xyz" {
+                    return (StatusCode::UNAUTHORIZED, format!("got {got:?}")).into_response();
+                }
+                ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+            }),
+        );
+    let upstream = spawn(app).await;
+    let gateway_url = boot_gateway(&upstream).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seal_pk = attested_seal_pk(&gw).await;
+    gw.upload_sealed_credential(
+        &seal_pk,
+        &airlock::wire::CredentialPayload::Bearer { access_token: "static-access-xyz".into() },
+    )
+    .await
+    .unwrap();
+
+    let token = gw.open_session(&seal_pk, "test-sub").await.unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("AIRLOCK-OK"), "static bearer should reach upstream: {body}");
+    assert_eq!(
+        oauth_hits.load(Ordering::SeqCst),
+        0,
+        "a static bearer must NOT trigger an OAuth refresh (no rotation)"
+    );
 }
