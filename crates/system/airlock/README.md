@@ -63,10 +63,24 @@ the full custody path — attest → seal → handshake → proxied call → cre
 swap → reply — asserting the session token never reaches the upstream.
 
 
+## Grafted into the product
+
+`capability-host`'s Anthropic broker can now use a verified airlock gateway as
+its credential SOURCE instead of a host-held credential: set
+`DUCKTAPE_AIRLOCK_GATEWAY=<url>` (local) or `DUCKTAPE_AIRLOCK_REMOTE=<handle>.duck`
++ `DUCKTAPE_AIRLOCK_VIA=<browser-gw>` (remote) plus `DUCKTAPE_AIRLOCK_MEASUREMENT`
+(the pinned audited-image hex), and the run's `claude` traffic is verified,
+handshaked, and forwarded to the gateway with a scoped session token (re-minted
+on a gateway 401). The local path is exercised end-to-end by an in-process test
+(`cargo test -p capability-host airlock_broker`). See the design spec §graft.
+
 ## Deferred
 
-Body-level AEAD of proxied traffic, SSE-over-overlay streaming, wiring
-`airlock-broker`'s Remote mode as the default credential source inside
-`capability-host` (the seam is mapped in the design spec §graft). Subscription
-OAuth proxied by a third party remains an accepted, named ToS risk — attested
-custody is mitigation, not a solution.
+Body-level AEAD of proxied traffic, and **SSE-over-overlay streaming** — the
+remote topology routes through the node's gateway proxy, which today BUFFERS
+responses (4 MiB cap; only the WS-upgrade lane streams), so live `claude`
+streaming over the overlay waits on that slice. Remote mode also needs the node
+to publish the gateway's `LoopbackHttp` route with `allow_authorization` so the
+session-token bearer reaches the enclave. Subscription OAuth proxied by a third
+party remains an accepted, named ToS risk — attested custody is mitigation, not
+a solution.

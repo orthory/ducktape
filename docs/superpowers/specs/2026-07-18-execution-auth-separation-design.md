@@ -124,25 +124,40 @@ Client (`airlock-cli`):
 - `seal` / `run` / `token` do: attest → verify (per vendor) → handshake → open
   token → use.
 
-## Graft onto production `broker.rs` (integration slice, not this PR)
+## Graft onto production `broker.rs`
 
-The seams are already there; this PoC is shaped to drop onto them:
-- `AnthropicAuth::from_host()` is the **Local** credential source. Add a
-  **Remote** arm that, instead of reading local creds, forwards each proxied
-  request to a `RemoteGateway` (duckdns handle) carrying the session token.
-- `Reachability {Loopback, HostGateway}` already picks the child's dial address;
-  a third dimension (credential *locality*: local vs remote-TEE) is orthogonal
-  and composes with it.
-- `apply_auth_env` already hands the child `ANTHROPIC_BASE_URL` + an opaque
-  bearer — unchanged. The broker gains a `CredentialGateway` it dispatches to.
-- The overlay hop reuses the gateway `RouteTarget::LoopbackHttp` +
-  `/v1/gateway/proxy` path (`bin/noded/src/gateway_http.rs`). Note: that proxy
-  **buffers** responses today; SSE streaming needs the WS-upgrade lane or a
-  streaming extension to `read_proxy_response` — the deferred transport slice.
+**Landed (broker side).** `capability-host`'s Anthropic broker gained an
+`AnthropicAuth::Airlock` arm alongside `ApiKey`/`Oauth`. When
+`DUCKTAPE_AIRLOCK_GATEWAY` (local) or `DUCKTAPE_AIRLOCK_REMOTE` + `_VIA` (remote)
+is set — with `DUCKTAPE_AIRLOCK_MEASUREMENT` pinning the audited image — the
+broker verifies the gateway quote, handshakes for a scoped session token, and
+forwards `/v1/messages` to the gateway (which swaps the token for the real
+credential in-enclave) instead of holding a local credential. It re-handshakes
+once on a gateway 401. `authorize()` stamps the session token (and
+`x-duck-authority` on the remote path); the existing `Reachability
+{Loopback, HostGateway}` (child→broker dial) is orthogonal and unchanged, as is
+`apply_auth_env` (the child still gets `ANTHROPIC_BASE_URL` + the opaque run
+bearer). Covered by an in-process test: sandbox → broker → gateway → mock
+upstream, asserting the credential swap. Vendor verify (tdx/snp) in the host
+broker is refused for now (mock only), matching `airlock-broker`.
+
+**Remaining (overlay transport slice).** The remote topology dials the gateway
+through the node's `RouteTarget::LoopbackHttp` route over `POST
+/v1/gateway/proxy` (`bin/noded/src/gateway_http.rs` → `bin/node/src/gateway_plane.rs`).
+Two pieces are unbuilt: (1) the node must **publish** the airlock gateway's
+`LoopbackHttp` route with `allow_authorization = true` so the session-token
+bearer reaches the enclave; (2) that proxy **buffers** responses (4 MiB cap;
+only the WS-upgrade lane streams), so live `claude` SSE streaming over the
+overlay needs the WS-upgrade lane or a streaming `read_proxy_response`. Note:
+`simnode` cannot exercise this path — it carries the gateway/duckdns *consensus
+modules* but no WireGuard/`data_plane` transport (`handle.gateway == None`), so
+the node-to-node overlay proxy requires two real `bin/node` instances, not the
+deterministic `/v1` twin.
 
 ## Out of scope (later specs)
 
-Body-level AEAD of proxied traffic, SSE-over-overlay streaming, the actual
-`broker.rs` graft, revocation, multi-tenant budgets, sealed-to-disk credential
-persistence. Subscription-OAuth proxied by a third party remains an accepted,
-named ToS risk — TEE custody is mitigation, not a solution.
+Body-level AEAD of proxied traffic, SSE-over-overlay streaming, the node-side
+route publish for remote mode (see §graft "Remaining"), revocation, multi-tenant
+budgets, sealed-to-disk credential persistence. Subscription-OAuth proxied by a
+third party remains an accepted, named ToS risk — TEE custody is mitigation, not
+a solution.
