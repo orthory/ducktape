@@ -1,6 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["core", "host", "client"]
-
-# Standalone PoC workspace — deliberately NOT a member of the main ducktape
-# workspace, so it carries none of the repo gates or build weight.

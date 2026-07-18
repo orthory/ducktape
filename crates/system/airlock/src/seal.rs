@@ -12,7 +12,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::aead;
 
-const SEAL_LABEL: &[u8] = b"tcg-seal-v1";
+const SEAL_LABEL: &[u8] = b"airlock-seal-v1";
 
 /// The recipient (enclave) keypair. The secret never leaves the enclave.
 pub struct SealKeypair {

@@ -86,7 +86,7 @@ async fn messages(State(st): State<Arc<MockState>>, headers: HeaderMap, body: ax
         .ok()
         .and_then(|j| j["model"].as_str().map(str::to_string))
         .unwrap_or_else(|| "claude-sonnet-5".into());
-    let reply = "TRUSTLESS-GATEWAY-OK";
+    let reply = "AIRLOCK-OK";
 
     let start = json!({"type":"message_start","message":{"id":"msg_mock01","type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1}}});
     let block_start = json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
