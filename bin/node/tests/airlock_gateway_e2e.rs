@@ -235,6 +235,12 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
     (format!("http://127.0.0.1:{port}"), port)
 }
 
+// TODO(full-spec, needs hardware): this proves the node-to-node overlay hop with
+// MOCK attestation and a MOCK upstream. The full 2-node + TEE run — real
+// `--attest tdx`/`snp` on a confidential VM (+ the matching vendor verify wired
+// into the compute path, which capability-host currently refuses) and the real
+// Anthropic API via the static bearer (PR #681) — is deferred to real hardware.
+// See the design spec "TODO — full 2-node + TEE validation".
 #[test]
 fn airlock_over_gateway_two_wireguard_nodes() {
     let _serial = serial();

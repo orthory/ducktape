@@ -174,3 +174,33 @@ Body-level AEAD of proxied traffic, SSE-over-overlay streaming (see §graft
 persistence. Subscription-OAuth proxied by a third party remains an accepted,
 named ToS risk — TEE custody is mitigation, not
 a solution.
+
+## TODO — full 2-node + TEE validation
+
+Everything below the protocol is proven with mock attestation and a mock
+upstream; the single-node self-serve test (`airlock_gateway_e2e.rs`) is green and
+the 2-node overlay test is written. The **full-spec** end-to-end run — two real
+nodes AND real hardware attestation AND the real Anthropic API — is deferred
+because it needs hardware this dev box does not have. To close it:
+
+1. **Two real nodes where WireGuard peers.** This dev box's inline userspace
+   WireGuard does not peer reliably (`gateway_e2e` times out on `"1 peer(s)"`);
+   run `airlock_over_gateway_two_wireguard_nodes` on a box where it does, or two
+   real machines per the README runbook.
+2. **Real TEE attestation on the credential node.** Run `airlock-gateway serve
+   --attest tdx` (or `snp`) inside an Intel TDX / AMD SEV-SNP confidential VM
+   (real `configfs-tsm` quote gen; a bare TDX guest also needs QGS/vsock
+   quote-gen wired — Azure/GCP CVMs provide it). The compute node must run the
+   matching **vendor verifier** — `dcap-qvl` (TDX) / AMD KDS/VCEK (SNP). NOTE:
+   the capability-host broker currently **refuses** `tdx`/`snp` (mock only,
+   `verify_gateway` in `broker.rs`); full-spec first wires the vendor verify into
+   that host path (the airlock-cli client already has it, behind features).
+3. **Real Anthropic API + the static bearer** (PR #681): seal the current
+   subscription access token (`--cred-kind bearer`, no rotation) and point
+   `--anthropic-base` at `https://api.anthropic.com`. Note a *short* turn fits the
+   buffered proxy; a live interactive streaming session additionally needs the
+   SSE-over-overlay slice above.
+
+The end state: `podman(claude, temp bearer) → compute node → overlay → credential
+node (real TEE) → real api.anthropic.com`, with the compute side verifying a
+*hardware* quote before the handshake.
