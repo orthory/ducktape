@@ -4586,9 +4586,11 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "airlock",
  "argon2",
  "async-trait",
  "automations",
+ "axum",
  "base64 0.22.1",
  "bip39",
  "blobstore",
