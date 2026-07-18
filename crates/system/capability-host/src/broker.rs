@@ -1042,7 +1042,9 @@ struct AirlockConfig {
 impl AirlockConfig {
     /// `DUCKTAPE_AIRLOCK_GATEWAY=<url>` (local), or `DUCKTAPE_AIRLOCK_REMOTE=<handle>.duck`
     /// with `DUCKTAPE_AIRLOCK_VIA=<url>` (remote), turns airlock on;
-    /// `DUCKTAPE_AIRLOCK_MEASUREMENT` (hex) is then required. `Some(Err)` = airlock
+    /// `DUCKTAPE_AIRLOCK_MEASUREMENT` (hex) and `DUCKTAPE_AIRLOCK_ATTEST` are then
+    /// required — the latter has NO default, so nobody silently gets forgeable
+    /// mock attestation while believing they pinned a TEE. `Some(Err)` = airlock
     /// is enabled but misconfigured (fail the run, don't silently fall back to a
     /// host credential); `None` = airlock is off.
     fn from_env() -> Option<Result<Self, String>> {
@@ -1066,10 +1068,16 @@ impl AirlockConfig {
                              (the audited-image measurement hex) is not set"
                 .into()));
         };
+        let Some(attest) = env_nonempty("DUCKTAPE_AIRLOCK_ATTEST") else {
+            return Some(Err("airlock is enabled but DUCKTAPE_AIRLOCK_ATTEST is not set — choose \
+                             'mock' (DEV ONLY: the mock quote is signed by a public seed and is \
+                             forgeable) or a real TEE vendor ('tdx'/'snp')"
+                .into()));
+        };
         Some(Ok(Self {
             gateway,
             measurement,
-            attest: env_nonempty("DUCKTAPE_AIRLOCK_ATTEST").unwrap_or_else(|| "mock".into()),
+            attest,
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
         }))
     }
@@ -1165,7 +1173,10 @@ impl AnthropicBrokerState {
                 true
             }
             Err(_) => {
-                tracing::warn!(
+                // per-request (fires once per forwarded request under a wedged
+                // gateway) → debug, not a warn log-bomb. The 401 itself flows to
+                // the client, which re-auths.
+                tracing::debug!(
                     target: "ducktape::agent",
                     event = "airlock_reauth",
                     reason = "handshake_failed",
@@ -1362,6 +1373,14 @@ async fn send_upstream(
                 | "content-length"
                 | "connection"
                 | "transfer-encoding"
+                // SECURITY: the overlay routing headers are OURS to set, never
+                // the child's. reqwest `.header()` APPENDS, and the browser-gateway
+                // reads the FIRST `x-duck-authority` (+ derives its Origin check
+                // from it); leaving a child value in would let the sandbox redirect
+                // this request — carrying the scoped session token — to an
+                // attacker-chosen overlay node. `route()` re-adds our own authority.
+                | "x-duck-authority"
+                | "origin"
                 // Drop accept-encoding so upstream replies UNCOMPRESSED: our
                 // reqwest is built without the gzip/brotli features, so it does
                 // NOT auto-decompress, and we forward only content-type (not
@@ -2286,5 +2305,72 @@ mod tests {
             refused.is_err(),
             "a gateway whose measurement != the pinned audited image must be refused"
         );
+    }
+
+    /// A recording upstream that captures the headers of one request.
+    async fn recording_gateway() -> (String, Arc<Mutex<Option<HeaderMap>>>) {
+        let seen = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap| {
+                let sink = sink.clone();
+                async move {
+                    *sink.lock().unwrap() = Some(headers);
+                    (StatusCode::OK, "ok")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn airlock_remote_strips_child_injected_routing_authority() {
+        // SECURITY REGRESSION: in remote topology a sandbox child must not be
+        // able to inject `x-duck-authority` and redirect the session-token-bearing
+        // request to an attacker-chosen overlay node.
+        let (via, seen) = recording_gateway().await;
+        let auth = AnthropicAuth::Airlock(AirlockSession {
+            gateway: Gateway::remote("broker.duck".into(), via.clone()),
+            seal_pk: [0u8; 32],
+            sub: "s".into(),
+            token: "sess-tok".into(),
+        });
+        let broker =
+            RunBroker::start_anthropic_with(auth, Reachability::Loopback, format!("{via}/v1/messages"))
+                .await
+                .unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", broker.endpoint.base_url))
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .header("x-duck-authority", "attacker.duck")
+            .header("origin", "https://attacker.duck")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let headers = seen.lock().unwrap().take().unwrap();
+        let authorities: Vec<&str> = headers
+            .get_all("x-duck-authority")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            authorities,
+            vec!["broker.duck"],
+            "only the broker's OWN routing authority may reach the gateway"
+        );
+        // the session token rode the request (we replaced auth, not dropped it).
+        assert_eq!(headers["authorization"], "Bearer sess-tok");
     }
 }

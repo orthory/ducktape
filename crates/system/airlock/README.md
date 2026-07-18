@@ -68,11 +68,14 @@ swap → reply — asserting the session token never reaches the upstream.
 `capability-host`'s Anthropic broker can now use a verified airlock gateway as
 its credential SOURCE instead of a host-held credential: set
 `DUCKTAPE_AIRLOCK_GATEWAY=<url>` (local) or `DUCKTAPE_AIRLOCK_REMOTE=<handle>.duck`
-+ `DUCKTAPE_AIRLOCK_VIA=<browser-gw>` (remote) plus `DUCKTAPE_AIRLOCK_MEASUREMENT`
-(the pinned audited-image hex), and the run's `claude` traffic is verified,
-handshaked, and forwarded to the gateway with a scoped session token (re-minted
-on a gateway 401). The local path is exercised end-to-end by an in-process test
-(`cargo test -p capability-host airlock_broker`). See the design spec §graft.
++ `DUCKTAPE_AIRLOCK_VIA=<browser-gw>` (remote), plus `DUCKTAPE_AIRLOCK_MEASUREMENT`
+(the pinned audited-image hex) and `DUCKTAPE_AIRLOCK_ATTEST` (`mock` — dev only,
+forgeable — or `tdx`/`snp`; no default, so nobody silently gets mock). The run's
+`claude` traffic is then verified, handshaked, and forwarded to the gateway with
+a scoped session token (re-minted on a gateway 401). The local path is exercised
+end-to-end by in-process tests (`cargo test -p capability-host airlock`),
+including a check that a sandbox child cannot inject the overlay routing header.
+See the design spec §graft.
 
 ## Deferred
 
