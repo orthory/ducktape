@@ -36,6 +36,55 @@ Promoted from a PoC into real workspace crates. Design:
 Remote adds an `x-duck-authority` header; the local node's browser-gateway routes
 it to the remote node's published `LoopbackHttp` route over the overlay.
 
+## Remote overlay (cred ≠ compute) — how to run
+
+The remote topology needs **no airlock or node code** beyond what ships here: the
+compute side already speaks it, and the credential node exposes the gateway with
+the stock gateway-route CLIs. `bin/node/tests/airlock_gateway_e2e.rs` is the
+canonical, executable recipe (two real WireGuard nodes, in-process gateway + mock
+upstream); run it where inline 2-node WireGuard works:
+
+```sh
+cargo test -p node-bin --test airlock_gateway_e2e -- --nocapture
+```
+
+For a real cross-machine deployment:
+
+**Credential node** (runs the enclave gateway; `<handle>` is its duckdns name):
+
+```sh
+MEAS=<48-byte audited-image hex>            # mock: any 48-byte hex, pinned everywhere
+airlock-gateway serve --attest mock --measurement $MEAS \
+    --listen 127.0.0.1:9100 --anthropic-base https://api.anthropic.com
+# seal the credential (static bearer = no rotation; see "Credential" above)
+airlock-cli seal --attest mock --measurement $MEAS --host http://127.0.0.1:9100 \
+    --credentials ~/.claude/.credentials.json --cred-kind bearer
+# register the loopback port node-locally
+ducktape-node gateway-route-bind --workspace <node-workspace> --label airlock --port 9100
+# publish the signed LoopbackHttp route (allow_authorization:true, max_response_bytes ≤ 4 MiB
+# — the buffered proxy enforces this cap literally; 0/"unbounded" awaits SSE-over-overlay);
+# construct the RouteStatement exactly as signed_airlock_route() does in the test,
+# then: user-sign-gateway-route --key <user.key> --statement <json>  → submit to the
+# node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle> on duckdns.
+```
+
+**Compute node** (runs the sandbox): point the broker at the remote gateway — no
+credential is held locally:
+
+```sh
+export DUCKTAPE_AIRLOCK_REMOTE=airlock.<handle>.duck
+export DUCKTAPE_AIRLOCK_VIA=$(curl -s http://<this-node-rpc>/v1/gateway/browser | jq -r .base)
+export DUCKTAPE_AIRLOCK_MEASUREMENT=$MEAS
+export DUCKTAPE_AIRLOCK_ATTEST=mock
+# then run a claude agent through capability-host (podman) as usual — the run's
+# /v1/messages flow crosses the overlay to the enclave.
+```
+
+The quote is fetched + verified **over the overlay** before any token is derived,
+so a relaying node cannot substitute its key or read the session token. Note the
+overlay proxy currently **buffers** responses (4 MiB); live SSE streaming for long
+interactive turns is the remaining transport slice (spec §graft "Remaining").
+
 ## Session-key handshake
 
 The client reads the gateway's `seal_pk` out of the **verified** quote REPORTDATA,

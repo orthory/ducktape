@@ -141,23 +141,36 @@ bearer). Covered by an in-process test: sandbox → broker → gateway → mock
 upstream, asserting the credential swap. Vendor verify (tdx/snp) in the host
 broker is refused for now (mock only), matching `airlock-broker`.
 
-**Remaining (overlay transport slice).** The remote topology dials the gateway
-through the node's `RouteTarget::LoopbackHttp` route over `POST
-/v1/gateway/proxy` (`bin/noded/src/gateway_http.rs` → `bin/node/src/gateway_plane.rs`).
-Two pieces are unbuilt: (1) the node must **publish** the airlock gateway's
-`LoopbackHttp` route with `allow_authorization = true` so the session-token
-bearer reaches the enclave; (2) that proxy **buffers** responses (4 MiB cap;
-only the WS-upgrade lane streams), so live `claude` SSE streaming over the
-overlay needs the WS-upgrade lane or a streaming `read_proxy_response`. Note:
-`simnode` cannot exercise this path — it carries the gateway/duckdns *consensus
-modules* but no WireGuard/`data_plane` transport (`handle.gateway == None`), so
-the node-to-node overlay proxy requires two real `bin/node` instances, not the
-deterministic `/v1` twin.
+**Wired (route-publish + reachability).** The remote topology needs no airlock or
+node code beyond what ships. The compute side reaches the gateway through the
+node's browser-gateway origin (`via` = `http://127.0.0.1:<gateway_listen>`), which
+resolves `x-duck-authority` and proxies over the overlay to the publisher's
+`LoopbackHttp` route; a host process sends no `Origin` header so it passes the
+only guard. The credential node exposes the gateway with the **stock gateway-route
+CLIs** — `gateway-route-bind` (registers the loopback port node-locally) +
+`user-sign-gateway-route` (signs a `RouteStatement` with `LoopbackHttp`,
+`allow_authorization: true`, and a real `max_response_bytes` cap ≤ 4 MiB — the
+buffered proxy enforces the cap literally, so `0`/"unbounded" 502s until the SSE
+slice) submitted to the `gateway` module, plus duckdns `SetHandle`.
+`bin/node/tests/airlock_gateway_e2e.rs` is the executable recipe: a single-node
+self-serve test that runtime-proves the whole airlock-over-gateway path (route
+publish → browser door → `allow_authorization` bearer forward → `proxy_loopback`
+→ attest+handshake+swap → reply), **verified green**, plus a two-node WireGuard
+test for the node-to-node overlay hop (runs where inline 2-node WireGuard peers
+reliably). The README's "Remote overlay" section is the operator runbook.
+
+**Remaining (SSE streaming only).** The overlay proxy **buffers** responses (4 MiB
+cap; only the WS-upgrade lane streams), so live `claude` SSE for long interactive
+turns needs the WS-upgrade lane or a streaming `read_proxy_response`. A short turn
+fits the buffered path. Note: `simnode` cannot exercise the overlay — it carries
+the gateway/duckdns *consensus modules* but no WireGuard/`data_plane` transport
+(`handle.gateway == None`); the node-to-node overlay proxy requires two real
+`bin/node` instances, not the deterministic `/v1` twin.
 
 ## Out of scope (later specs)
 
-Body-level AEAD of proxied traffic, SSE-over-overlay streaming, the node-side
-route publish for remote mode (see §graft "Remaining"), revocation, multi-tenant
-budgets, sealed-to-disk credential persistence. Subscription-OAuth proxied by a
-third party remains an accepted, named ToS risk — TEE custody is mitigation, not
+Body-level AEAD of proxied traffic, SSE-over-overlay streaming (see §graft
+"Remaining"), revocation, multi-tenant budgets, sealed-to-disk credential
+persistence. Subscription-OAuth proxied by a third party remains an accepted,
+named ToS risk — TEE custody is mitigation, not
 a solution.
