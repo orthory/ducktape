@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 
 use airlock::attest::{self, AttestMode, Measurement};
 use airlock::client::Gateway;
+use airlock::wire::CredentialPayload;
 
 /// `--flag value` / `--flag=value` lookup over argv (no clap — house rule).
 fn arg(name: &str) -> Option<String> {
@@ -82,9 +83,13 @@ async fn seal_cmd() -> Result<()> {
         &expected.to_hex()[..12]
     );
 
-    let refresh = resolve_refresh_token()?;
-    gw.upload_sealed_credential(&seal_pk, &refresh).await?;
-    println!("✓ refresh token sealed to enclave key and uploaded (gateway never sees it in clear)");
+    let credential = resolve_credential()?;
+    let kind = match &credential {
+        CredentialPayload::Bearer { .. } => "static access token (no rotation)",
+        CredentialPayload::Refresh { .. } => "refresh token (OAuth, rotates)",
+    };
+    gw.upload_sealed_credential(&seal_pk, &credential).await?;
+    println!("✓ {kind} sealed to enclave key and uploaded (gateway never sees it in clear)");
     Ok(())
 }
 
@@ -108,6 +113,9 @@ async fn run_cmd() -> Result<()> {
         .route(gw.http().post(gw.url("/v1/messages")))
         .bearer_auth(token)
         .header("anthropic-version", "2023-06-01")
+        // a subscription (OAuth) access token is only accepted with the oauth beta
+        // capability header — the same one Claude Code sends. Harmless with an API key.
+        .header("anthropic-beta", "oauth-2025-04-20")
         .header("content-type", "application/json")
         .body(serde_json::to_vec(&body)?)
         .send()
@@ -148,19 +156,39 @@ async fn inspect_cmd() -> Result<()> {
     Ok(())
 }
 
-fn resolve_refresh_token() -> Result<String> {
-    if let Some(t) = arg("--refresh-token") {
-        return Ok(t);
+/// Resolve which credential to seal. Direct: `--access-token` (static Bearer, no
+/// rotation) or `--refresh-token` (OAuth, rotates). From a Claude credentials
+/// file: `--credentials <path>` reads `claudeAiOauth.refreshToken` by default, or
+/// its current `accessToken` with `--cred-kind bearer` — the latter seals a live
+/// subscription WITHOUT rotating the refresh chain the owner is still using.
+fn resolve_credential() -> Result<CredentialPayload> {
+    if let Some(access_token) = arg("--access-token") {
+        return Ok(CredentialPayload::Bearer { access_token });
+    }
+    if let Some(refresh_token) = arg("--refresh-token") {
+        return Ok(CredentialPayload::Refresh { refresh_token });
     }
     let Some(path) = arg("--credentials") else {
-        bail!("provide --refresh-token or --credentials");
+        bail!("provide --access-token, --refresh-token, or --credentials");
     };
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
     let j: serde_json::Value = serde_json::from_str(&raw).context("credentials json")?;
-    j["claudeAiOauth"]["refreshToken"]
-        .as_str()
-        .map(|s| s.to_string())
-        .context("claudeAiOauth.refreshToken not found")
+    let oauth = &j["claudeAiOauth"];
+    match arg_or("--cred-kind", "refresh").as_str() {
+        "bearer" => Ok(CredentialPayload::Bearer {
+            access_token: oauth["accessToken"]
+                .as_str()
+                .context("claudeAiOauth.accessToken not found")?
+                .to_string(),
+        }),
+        "refresh" => Ok(CredentialPayload::Refresh {
+            refresh_token: oauth["refreshToken"]
+                .as_str()
+                .context("claudeAiOauth.refreshToken not found")?
+                .to_string(),
+        }),
+        other => bail!("--cred-kind must be 'bearer' or 'refresh', got {other:?}"),
+    }
 }
 
 async fn verify_quote(

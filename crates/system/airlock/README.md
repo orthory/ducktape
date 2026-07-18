@@ -44,6 +44,17 @@ ECDHs against it, and derives a session key. `/session` returns the token
 enclave can open it — a relaying node operator cannot substitute its key or read
 the token.
 
+## Credential the gateway holds
+
+`airlock-cli seal` uploads one of two sealed credentials (`CredentialPayload`):
+
+- **`Refresh`** — an OAuth refresh token; the gateway exchanges it for an access
+  token and **rotates** on each refresh (subscription path).
+- **`Bearer`** — a **static** access token, used as-is: no refresh, no rotation.
+  `seal --credentials <file> --cred-kind bearer` seals a live subscription's
+  *current* access token without invalidating the token chain its owner is still
+  using — the safe way to point a run at a real credential.
+
 ## Per-vendor attestation (`--attest mock|tdx|snp|auto`)
 
 Quote generation is vendor-generic via `configfs-tsm` (`tdx_guest`/`sev_guest`;
@@ -60,7 +71,24 @@ cargo test -p airlock --features server,client
 Unit tests cover the crypto (seal/handshake/token/attest); the in-process e2e
 test (`tests/e2e.rs`) boots the gateway server against a mock upstream and drives
 the full custody path — attest → seal → handshake → proxied call → credential
-swap → reply — asserting the session token never reaches the upstream.
+swap → reply — asserting the session token never reaches the upstream (and that a
+static `Bearer` credential is used without any OAuth refresh).
+
+### Verified end-to-end against the real API
+
+The whole chain has run live (mock attest, real `api.anthropic.com`):
+
+1. `airlock-gateway serve --anthropic-base https://api.anthropic.com` (loopback).
+2. `airlock-cli seal --credentials ~/.claude/.credentials.json --cred-kind bearer`
+   — seals the current subscription access token (no rotation).
+3. A `claude` CLI inside a **podman** sandbox holding only the opaque run bearer,
+   driven through `capability-host` in airlock mode
+   (`DUCKTAPE_AIRLOCK_GATEWAY`/`_MEASUREMENT`/`_ATTEST`) — the ignored live test
+   `claude_model_turn_through_the_broker`.
+
+`podman(claude) → capability-host broker → airlock gateway → real api.anthropic.com`
+returned a real completion; the sandbox never held the credential, only the
+temp bearer.
 
 
 ## Grafted into the product

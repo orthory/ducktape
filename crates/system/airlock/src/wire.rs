@@ -14,17 +14,23 @@ pub struct AttestationResponse {
     pub vendor: String,
 }
 
-/// `POST /credential` — the sealed refresh token, encrypted to the enclave's
-/// seal key. Only the enclave (inside the TD) can open it.
+/// `POST /credential` — the sealed credential, encrypted to the enclave's seal
+/// key. Only the enclave (inside the TD) can open it.
 #[derive(Serialize, Deserialize)]
 pub struct CredentialUpload {
     pub sealed_b64: String,
 }
 
-/// Plaintext inside the sealed blob.
+/// Plaintext inside the sealed blob: the upstream credential the enclave holds.
+/// `Refresh` is exchanged via OAuth for an access token and ROTATES on each
+/// refresh (subscription path). `Bearer` is a STATIC access token used as-is —
+/// no refresh, no rotation — so sealing a live subscription's current access
+/// token does not invalidate the token chain the owner is still using.
 #[derive(Serialize, Deserialize)]
-pub struct CredentialPayload {
-    pub refresh_token: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialPayload {
+    Refresh { refresh_token: String },
+    Bearer { access_token: String },
 }
 
 /// `POST /session` — the Computation Provider asks for a scoped session token.
