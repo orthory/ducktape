@@ -1,14 +1,27 @@
-# Execution / Auth Separation — Trustless Credential Gateway v2
+# Execution / Auth Separation — airlock
 
-Promotes the `poc/trustless-gateway` PoC into the target architecture: separate
-*who runs the agent* (Computation Provider) from *who holds the credential*
-(Credential Provider ≡ Gateway/TEE). Same package, real crypto, so it can later
-graft onto the production broker seams in
-`crates/system/capability-host/src/broker.rs`.
+Separate *who runs the agent* (Computation Provider) from *who holds the
+credential* (Credential Provider ≡ Gateway/TEE). Nothing crosses the airlock
+without an attested, session-scoped handshake.
 
-Supersedes the role sketch in
-`2026-07-18-trustless-credential-gateway-poc-design.md` (which this refines, not
-replaces — the sealing/token/attestation core stands).
+## Implementation (promoted feature)
+
+Shipped as real workspace crates (was a `poc/trustless-gateway` prototype):
+
+- **`crates/system/airlock`** — pure attest + seal + handshake + token + wire +
+  aead core; `client::Gateway` behind the `client` feature; the gateway HTTP
+  service `server` behind the `server` feature. Off-consensus, RustCrypto
+  primitives directly (like `reachability`). Unit tests + an in-process e2e test
+  (`cargo test -p airlock --features server,client`).
+- **`bin/airlock-gateway`** — the TEE credential side (thin wrapper over
+  `airlock::server`).
+- **`bin/airlock-broker`** — the Computation Provider's local api-snatch: a
+  loopback `ANTHROPIC_BASE_URL` for an unmodified sandbox, forwarding to the
+  gateway with a handshake-minted session token.
+- **`bin/airlock-cli`** — `seal` (Credential Provider), `inspect`, `run`.
+
+The role names below map to these crates. Sealing/token/attestation design is
+unchanged from `2026-07-18-trustless-credential-gateway-poc-design.md`.
 
 ## Roles
 
@@ -31,7 +44,7 @@ changes is where the broker routes behind it:
 | **Remote gateway** | Credential Provider != Computation Provider | duckdns handle → gateway `LoopbackHttp` route over the overlay |
 
 In the PoC this is the client-side `Gateway` trait: `LocalGateway` (a same-host
-`tcg-host` on loopback) and `RemoteGateway` (a remote node reached via the local
+`airlock-gateway` on loopback) and `RemoteGateway` (a remote node reached via the local
 node's browser-gateway with `x-duck-authority: <handle>.duck`). Remote runs over
 plain HTTP now; the overlay hop is the integration slice below.
 
@@ -48,7 +61,7 @@ as its static ECDH key — no new key, no extra REPORTDATA field.
 1. Client `GET /attestation` → quote. Verify it (per vendor). Read
    `seal_pk ‖ sess_pk` out of the **verified** REPORTDATA — never a JSON field.
 2. Client generates an ephemeral X25519 keypair, computes
-   `shared = ECDH(eph_sk, seal_pk)`, `session_key = HKDF(shared, "tcg-session-v1")`.
+   `shared = ECDH(eph_sk, seal_pk)`, `session_key = HKDF(shared, "airlock-session-v1")`.
 3. `POST /session { sub, client_eph_pk }`. Enclave computes the same
    `session_key = HKDF(ECDH(seal_sk, client_eph_pk), …)`, issues the scoped token,
    and returns it **AEAD-sealed under `session_key`**.
@@ -89,7 +102,7 @@ belt-and-suspenders; for remote it is the load-bearing attestation binding.
 
 ## Components
 
-Core (`tcg-core`, pure, no IO/async):
+Core (`airlock`, pure, no IO/async):
 - `attest` — `AttestMode` (+ Snp), `Measurement`, REPORTDATA pack/split, mock
   quote gen+verify. Real TDX/SNP verify stays in the client behind features
   (needs async + network + heavy deps).
@@ -101,11 +114,11 @@ Core (`tcg-core`, pure, no IO/async):
 - `token`, `wire` — `SessionRequest{ sub, client_eph_pk_b64 }`,
   `SessionResponse{ sealed_token_b64 }`, `AttestationResponse{ quote_b64, vendor }`.
 
-Host (`tcg-host serve`):
+Host (`airlock-gateway serve`):
 - `--attest mock|tdx|snp|auto`; generic `tsm_gen_quote` for tdx/snp.
 - `/session` runs the enclave side of the handshake and returns the sealed token.
 
-Client (`tcg-client`):
+Client (`airlock-cli`):
 - `Gateway` abstraction: `--host <url>` (local) or `--remote <handle>.duck --via
   <browser-gw-url>` (remote). Adds the `x-duck-authority` header for remote.
 - `seal` / `run` / `token` do: attest → verify (per vendor) → handshake → open

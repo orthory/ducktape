@@ -4,8 +4,8 @@
 //!
 //! Mock mode lives here (runs anywhere — the dev box is a Ryzen 5950X with no
 //! SEV/TDX). Real quote generation is vendor-generic via `configfs-tsm` (in
-//! `tcg-host`): Intel TDX (`tdx_guest`) and AMD SEV-SNP (`sev_guest`) share the
-//! sysfs report path. Verification is vendor-SPECIFIC and lives in `tcg-client`
+//! `airlock-gateway`): Intel TDX (`tdx_guest`) and AMD SEV-SNP (`sev_guest`) share
+//! the sysfs report path. Verification is vendor-SPECIFIC and lives in `airlock-cli`
 //! behind feature flags (`dcap-qvl` for TDX; the AMD VCEK/KDS chain for SNP),
 //! since it needs async + network + heavy deps that the mock path must not pull.
 

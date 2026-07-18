@@ -1,13 +1,7 @@
-//! `tcg-host` — the Trustless Gateway. Runs (canonically) inside an Intel TDX
-//! confidential VM. Holds a sealed OAuth refresh token in enclave memory,
-//! proxies the Claude messages API, and issues scoped session tokens. The host
-//! operator cannot read the credential.
-//!
-//! Subcommands:
-//!   serve          the gateway itself
-//!   mock-upstream  a fake OAuth + messages server, for the hermetic demo
-
-mod mock_upstream;
+//! The gateway (credential-side) HTTP service, behind the `server` feature. The
+//! `airlock-gateway` binary is a thin wrapper over [`build`]/[`serve`]; tests
+//! drive the same router in-process. Enclave keys are minted per process and
+//! never leave memory; the operator cannot read the sealed credential back out.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,61 +15,29 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
-use clap::{Args, Parser, Subcommand};
+use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
-use tokio::net::TcpListener;
 
-use tcg_core::attest::{self, AttestMode, Measurement};
-use tcg_core::handshake;
-use tcg_core::seal::{self, SealKeypair};
-use tcg_core::token::{self, Claims};
-use tcg_core::wire::{
+use crate::attest::{self, AttestMode, Measurement};
+use crate::handshake;
+use crate::seal::{self, SealKeypair};
+use crate::token::{self, Claims};
+use crate::wire::{
     AttestationResponse, CredentialPayload, CredentialUpload, SessionRequest, SessionResponse,
 };
 
-#[derive(Parser)]
-#[command(name = "tcg-host", about = "Trustless credential gateway (TEE exit node)")]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    Serve(ServeArgs),
-    MockUpstream(MockArgs),
-}
-
-#[derive(Args)]
-struct ServeArgs {
-    #[arg(long, default_value = "127.0.0.1:9100")]
-    listen: String,
-    /// mock | tdx | snp | auto. `auto` probes configfs-tsm's `provider` to pick
-    /// the vendor (tdx_guest -> tdx, sev_guest -> snp).
-    #[arg(long, default_value = "mock")]
-    attest: String,
-    /// Embedded measurement (48-byte hex). Required for --attest mock; for the
-    /// real vendors the measurement comes from the hardware quote.
-    #[arg(long)]
-    measurement: Option<String>,
-    #[arg(long, default_value = "http://127.0.0.1:9101")]
-    anthropic_base: String,
-    #[arg(long, default_value = "http://127.0.0.1:9101/oauth/token")]
-    oauth_token_url: String,
-    #[arg(long, default_value = "9d1c250a-e61b-44d9-88ed-5944d1962f5e")]
-    oauth_client_id: String,
-    #[arg(long, default_value_t = 3600)]
-    session_ttl_secs: u64,
-    #[arg(long, default_value_t = 1000)]
-    max_requests: u32,
-}
-
-#[derive(Args)]
-struct MockArgs {
-    #[arg(long, default_value = "127.0.0.1:9101")]
-    listen: String,
+/// Everything the gateway needs to serve. Keys are minted inside [`build`].
+pub struct GatewayConfig {
+    /// mock | tdx | snp | auto.
+    pub attest: String,
+    /// 48-byte hex; required for `--attest mock`.
+    pub measurement: Option<String>,
+    pub anthropic_base: String,
+    pub oauth_token_url: String,
+    pub oauth_client_id: String,
+    pub session_ttl_secs: u64,
+    pub max_requests: u32,
 }
 
 struct Config {
@@ -105,9 +67,8 @@ struct AppState {
     /// Single-flight gate around the OAuth refresh: held across the token POST so
     /// two concurrent callers cannot both spend the same rotating refresh token.
     refresh_gate: tokio::sync::Mutex<()>,
-    /// Remaining request budget per session `sub`. ponytail: refillable by asking
-    /// for a new /session and unbounded in `sub` — fine for the PoC (the overlay
-    /// ACL gates who may reach it); a real deployment caps/evicts it.
+    /// Remaining request budget per session `sub`. Refillable by asking for a new
+    /// /session and unbounded in `sub`; the overlay ACL gates who may reach it.
     budgets: Mutex<HashMap<String, u32>>,
 }
 
@@ -115,15 +76,9 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    match Cli::parse().cmd {
-        Cmd::Serve(a) => serve(a).await,
-        Cmd::MockUpstream(a) => mock_upstream::run(&a.listen).await,
-    }
-}
-
-async fn serve(args: ServeArgs) -> Result<()> {
+/// Build the gateway router and report the detected vendor ("mock"/"tdx"/"snp").
+/// Mints the enclave keys and generates the attestation quote.
+pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
     // Enclave-bound keys, memory only.
     let seal_kp = SealKeypair::generate();
     let sess_sk = SigningKey::generate(&mut OsRng);
@@ -133,40 +88,36 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let report_data = attest::make_report_data(&seal_pk, &sess_pk.to_bytes());
 
     // `auto` picks the vendor from the hardware; explicit mock|tdx|snp are as named.
-    let (mode, quote) = if args.attest == "auto" {
+    let (mode, quote) = if cfg.attest == "auto" {
         tsm_gen_quote(None, &report_data)?
     } else {
-        let mode: AttestMode = args.attest.parse()?;
+        let mode: AttestMode = cfg.attest.parse()?;
         match mode {
             AttestMode::Mock => {
-                let m = args
+                let m = cfg
                     .measurement
                     .as_deref()
-                    .context("--measurement is required for --attest mock")?;
+                    .context("measurement is required for attest=mock")?;
                 (mode, attest::mock_quote(&report_data, &Measurement::from_hex(m)?))
             }
             AttestMode::Tdx | AttestMode::Snp => tsm_gen_quote(Some(mode), &report_data)?,
         }
     };
-    eprintln!(
-        "[host] attest={} quote={} bytes; seal_pk+sess_pk bound in REPORTDATA",
-        mode.as_str(),
-        quote.len()
-    );
+    let vendor = mode.as_str().to_string();
 
     let state = Arc::new(AppState {
         seal_kp,
         sess_sk,
         sess_pk,
         quote,
-        vendor: mode.as_str().to_string(),
+        vendor: vendor.clone(),
         http: reqwest::Client::new(),
         cfg: Config {
-            anthropic_base: args.anthropic_base,
-            oauth_token_url: args.oauth_token_url,
-            oauth_client_id: args.oauth_client_id,
-            session_ttl_secs: args.session_ttl_secs,
-            max_requests: args.max_requests,
+            anthropic_base: cfg.anthropic_base,
+            oauth_token_url: cfg.oauth_token_url,
+            oauth_client_id: cfg.oauth_client_id,
+            session_ttl_secs: cfg.session_ttl_secs,
+            max_requests: cfg.max_requests,
         },
         oauth: Mutex::new(None),
         refresh_gate: tokio::sync::Mutex::new(()),
@@ -179,46 +130,47 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .route("/session", post(session))
         // Proxy the whole Anthropic /v1/* surface (Claude Code calls
         // /v1/messages and /v1/messages/count_tokens, not just messages).
-        .route("/v1/*rest", any(proxy))
+        .route("/v1/{*rest}", any(proxy))
         .with_state(state);
+    Ok((app, vendor))
+}
 
-    let listener = TcpListener::bind(&args.listen).await?;
-    eprintln!("[host] listening on {}", args.listen);
+/// Bind-and-serve helper for the binary.
+pub async fn serve(listener: tokio::net::TcpListener, cfg: GatewayConfig) -> Result<()> {
+    let (app, _vendor) = build(cfg)?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 /// Generate a real confidential-VM quote via `configfs-tsm` (kernel >= 6.7,
-/// only inside a CVM guest). The path is vendor-generic: Intel TDX and AMD
-/// SEV-SNP both write REPORTDATA to `inblob` and read the raw report/quote from
-/// `outblob`; the `provider` attribute names the vendor (`tdx_guest` /
-/// `sev_guest`). `expected` is the vendor the operator asked for (`None` = auto,
-/// trust the hardware); a mismatch is an error. Returns the detected vendor.
-/// Untested off-hardware; validate on the CVM box.
+/// only inside a CVM guest). Vendor-generic: Intel TDX and AMD SEV-SNP both write
+/// REPORTDATA to `inblob` and read the raw report/quote from `outblob`; the
+/// `provider` attribute names the vendor. `expected` is the operator's requested
+/// vendor (`None` = auto); a mismatch errors. Untested off-hardware.
 fn tsm_gen_quote(
     expected: Option<AttestMode>,
     report_data: &[u8; attest::REPORT_DATA_LEN],
 ) -> Result<(AttestMode, Vec<u8>)> {
     use std::fs;
-    let dir = format!("/sys/kernel/config/tsm/report/tcg-{}", std::process::id());
+    let dir = format!("/sys/kernel/config/tsm/report/airlock-{}", std::process::id());
     fs::create_dir(&dir)
         .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
     let result = (|| -> Result<(AttestMode, Vec<u8>)> {
-        let provider = fs::read_to_string(format!("{dir}/provider"))
-            .context("read configfs-tsm provider")?;
+        let provider =
+            fs::read_to_string(format!("{dir}/provider")).context("read configfs-tsm provider")?;
         let detected = match provider.trim() {
             "tdx_guest" => AttestMode::Tdx,
             "sev_guest" => AttestMode::Snp,
             other => bail!("unsupported configfs-tsm provider {other:?} (want tdx_guest/sev_guest)"),
         };
-        if let Some(want) = expected {
-            if want != detected {
-                bail!(
-                    "--attest {} but the guest reports {} ({provider:?})",
-                    want.as_str(),
-                    detected.as_str()
-                );
-            }
+        if let Some(want) = expected
+            && want != detected
+        {
+            bail!(
+                "attest={} but the guest reports {} ({provider:?})",
+                want.as_str(),
+                detected.as_str()
+            );
         }
         fs::write(format!("{dir}/inblob"), report_data).context("write inblob")?;
         let quote = fs::read(format!("{dir}/outblob")).context("read outblob")?;
@@ -266,7 +218,6 @@ async fn credential(
     refresh_now(&st)
         .await
         .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("initial refresh failed: {e}")))?;
-    eprintln!("[host] credential sealed-in and refreshed; access token ready");
     Ok(StatusCode::OK)
 }
 
@@ -275,9 +226,8 @@ async fn session(
     Json(req): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, AppErr> {
     // Enclave side of the handshake: derive the shared key from the client's
-    // ephemeral key and our static seal secret. The token is then sealed under
-    // it, so only the client that ECDH'd against the *attested* seal_pk can open
-    // it (see handshake / design §Session-key handshake).
+    // ephemeral key and our static seal secret, then seal the token under it — so
+    // only the client that ECDH'd against the *attested* seal_pk can open it.
     let eph = BASE64
         .decode(&req.client_eph_pk_b64)
         .ok()
@@ -319,7 +269,6 @@ async fn proxy_inner(
     body: Bytes,
 ) -> Result<Response, AppErr> {
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(uri.path());
-    eprintln!("[host] proxy {method} {path_and_query}");
 
     let bearer = headers
         .get(AUTHORIZATION)
@@ -392,16 +341,14 @@ async fn proxy_inner(
     if let Some(v) = ct {
         builder = builder.header("content-type", v);
     }
-    Ok(builder
+    builder
         .body(Body::from_stream(resp.bytes_stream()))
-        .expect("valid response"))
+        .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
 }
 
 /// Exchange the refresh token for a fresh access token (and rotated refresh
-/// token). Mirrors the current broker's OAuth refresh.
+/// token), single-flighted so concurrent callers never double-spend it.
 async fn refresh_now(st: &AppState) -> Result<()> {
-    // Single-flight: only one refresh runs at a time. Concurrent callers queue
-    // here rather than each POSTing the same refresh token.
     let _gate = st.refresh_gate.lock().await;
     // Re-check under the gate — a caller we queued behind may have just done it.
     let refresh = {
@@ -438,7 +385,7 @@ async fn refresh_now(st: &AppState) -> Result<()> {
     if let Some(o) = g.as_mut() {
         o.access_token = access;
         if let Some(r) = new_refresh {
-            o.refresh_token = r; // ponytail: memory-only; lost on TD restart, re-seal to recover
+            o.refresh_token = r; // memory-only; lost on restart, re-seal to recover
         }
         o.expires_at = now + expires_in.saturating_sub(60);
     }

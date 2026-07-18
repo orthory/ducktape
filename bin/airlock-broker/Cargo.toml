@@ -1,0 +1,18 @@
+[package]
+name = "airlock-broker"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[[bin]]
+name = "airlock-broker"
+path = "src/main.rs"
+
+[dependencies]
+airlock = { path = "../../crates/system/airlock", features = ["client"] }
+anyhow = "1"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros"] }
+axum = "0.8"
+reqwest = { workspace = true }
+rand = { workspace = true }
+hex = "0.4"

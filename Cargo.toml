@@ -55,6 +55,7 @@ members = [
     "crates/system/modreg",
     "crates/system/duckdns",
     "crates/system/gateway",
+    "crates/system/airlock",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -80,6 +81,7 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
     "bin/mcp",
+    "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
 ]
 
 [workspace.package]

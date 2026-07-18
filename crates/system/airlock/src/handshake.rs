@@ -16,7 +16,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::aead;
 use crate::seal::SealKeypair;
 
-const SESSION_LABEL: &[u8] = b"tcg-session-v1";
+const SESSION_LABEL: &[u8] = b"airlock-session-v1";
 
 /// Client side: given the enclave's attested `seal_pk`, produce this session's
 /// ephemeral public key (sent to the enclave) and the shared session key.
