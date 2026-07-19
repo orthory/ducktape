@@ -171,6 +171,26 @@ fn bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Register or update a node-local loopback route `name -> port` at boot — the
+/// programmatic equivalent of the `gateway-route-bind` CLI, for services the node
+/// runs itself (e.g. an embedded airlock gateway on an ephemeral port).
+pub fn register(
+    workspace: &Path,
+    name: gateway::RouteName,
+    port: u16,
+) -> Result<(), String> {
+    if port == 0 {
+        return Err("gateway route port must be non-zero".into());
+    }
+    name.validate()?;
+    let mut routes = load(workspace)?;
+    match routes.routes.binary_search_by(|route| route.name.cmp(&name)) {
+        Ok(index) => routes.routes[index].port = port,
+        Err(index) => routes.routes.insert(index, LocalRoute { name, port }),
+    }
+    save(workspace, &routes)
+}
+
 fn unbind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (positional, flags) = parse_flags(args)?;
     if !positional.is_empty() {

@@ -84,21 +84,39 @@ pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> 
 /// Resolves `cfg.attest` to a configfs-tsm quoter; `auto` probes the hardware
 /// for the vendor.
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
+    build_seeded(cfg, None)
+}
+
+/// Like [`build`], but seed the enclave with an initial credential directly
+/// instead of waiting for a sealed `/credential` upload. Used when the credential
+/// provider IS the gateway process (the node embed): there is no host-vs-enclave
+/// boundary to seal across, so the credential is handed in-process. A `Bearer` is
+/// static (no rotation); a `Refresh` is refreshed lazily on first proxied call.
+pub fn build_seeded(
+    cfg: GatewayConfig,
+    initial_credential: Option<CredentialPayload>,
+) -> Result<(Router, String)> {
     let mode = if cfg.attest == "auto" {
         tsm_probe_provider()?
     } else {
         cfg.attest.parse::<AttestMode>()?
     };
-    build_with_quoter(cfg, mode.as_str(), tsm_quoter(mode))
+    build_with_quoter(cfg, mode.as_str(), tsm_quoter(mode), initial_credential)
 }
 
 fn tsm_quoter(expected: AttestMode) -> Quoter {
     Box::new(move |rd| tsm_gen_quote(Some(expected), rd).map(|(_, quote)| quote))
 }
 
-/// Build the gateway with an injected quote generator. Mints the enclave keys
+/// Build the gateway with an injected quote generator, optionally seeding an
+/// initial in-process credential (see [`build_seeded`]). Mints the enclave keys
 /// and calls `quoter` once on the freshly bound REPORTDATA.
-pub fn build_with_quoter(cfg: GatewayConfig, vendor: &str, quoter: Quoter) -> Result<(Router, String)> {
+pub fn build_with_quoter(
+    cfg: GatewayConfig,
+    vendor: &str,
+    quoter: Quoter,
+    initial_credential: Option<CredentialPayload>,
+) -> Result<(Router, String)> {
     // Enclave-bound keys, memory only.
     let seal_kp = SealKeypair::generate();
     let sess_sk = SigningKey::generate(&mut OsRng);
@@ -123,7 +141,20 @@ pub fn build_with_quoter(cfg: GatewayConfig, vendor: &str, quoter: Quoter) -> Re
             session_ttl_secs: cfg.session_ttl_secs,
             max_requests: cfg.max_requests,
         },
-        oauth: Mutex::new(None),
+        oauth: Mutex::new(initial_credential.map(|credential| match credential {
+            // static bearer: used as-is, never refreshed (expires_at = MAX).
+            CredentialPayload::Bearer { access_token } => Oauth {
+                access_token,
+                refresh_token: String::new(),
+                expires_at: u64::MAX,
+            },
+            // refresh token: exchanged lazily on the first proxied call (expires_at = 0).
+            CredentialPayload::Refresh { refresh_token } => Oauth {
+                access_token: String::new(),
+                refresh_token,
+                expires_at: 0,
+            },
+        })),
         refresh_gate: tokio::sync::Mutex::new(()),
         budgets: Mutex::new(HashMap::new()),
     });
@@ -142,6 +173,18 @@ pub fn build_with_quoter(cfg: GatewayConfig, vendor: &str, quoter: Quoter) -> Re
 /// Bind-and-serve helper for the binary.
 pub async fn serve(listener: tokio::net::TcpListener, cfg: GatewayConfig) -> Result<()> {
     let (app, _vendor) = build(cfg)?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Bind-and-serve, seeding an initial in-process credential (see [`build_seeded`]).
+/// Used by the node embed, where the credential provider is the gateway process.
+pub async fn serve_seeded(
+    listener: tokio::net::TcpListener,
+    cfg: GatewayConfig,
+    initial_credential: Option<CredentialPayload>,
+) -> Result<()> {
+    let (app, _vendor) = build_seeded(cfg, initial_credential)?;
     axum::serve(listener, app).await?;
     Ok(())
 }

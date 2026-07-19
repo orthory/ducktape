@@ -50,7 +50,34 @@ cargo test -p node-bin --test airlock_gateway_e2e -- --nocapture
 
 For a real cross-machine deployment:
 
-**Credential node** (runs the enclave gateway; `<handle>` is its duckdns name):
+**Credential node** (runs the enclave gateway; `<handle>` is its duckdns name).
+The node **embeds** the gateway: set `DUCKTAPE_AIRLOCK_SERVE` and it runs the
+gateway in-process, registers its loopback port as the `airlock` route, and seeds
+the credential — no separate serve / bind / seal steps. The credential provider IS
+the node process, so the credential is seeded directly (not sealed-uploaded).
+
+```sh
+# in the node's environment (systemd unit / launchd / shell). The node must run
+# INSIDE a TDX/SNP confidential VM — there is no mock, a box that cannot attest
+# cannot serve credentials:
+export DUCKTAPE_AIRLOCK_SERVE=1
+export DUCKTAPE_AIRLOCK_SERVE_ATTEST=auto           # or tdx|snp; REQUIRED, no default
+export DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE=https://api.anthropic.com
+export DUCKTAPE_AIRLOCK_SERVE_CREDENTIALS=~/.claude/.credentials.json
+export DUCKTAPE_AIRLOCK_SERVE_CRED_KIND=bearer     # static access token, no rotation
+ducktape-node --config node.toml                  # gateway comes up + route registers at boot
+# clients pin the audited image's measurement on THEIR side (--measurement /
+# DUCKTAPE_AIRLOCK_MEASUREMENT + --snp-product); the serving node takes none.
+# then the ONE manual, signed ownership act — publish the LoopbackHttp route
+# (allow_authorization:true, max_response_bytes ≤ 4 MiB — the buffered proxy enforces
+# the cap literally; 0/"unbounded" awaits SSE-over-overlay). Build the RouteStatement
+# exactly as signed_airlock_route() in the test, then:
+#   ducktape-node user-sign-gateway-route --key <user.key> --statement <json>
+#   → submit to the node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle>.
+```
+
+The manual route (for a gateway NOT run by the node) still works and is what
+the standalone binaries are for:
 
 ```sh
 MEAS=<48-byte audited-image hex>            # pinned from the audited CVM image
@@ -62,11 +89,6 @@ airlock-cli seal --attest snp --snp-product milan --measurement $MEAS \
     --credentials ~/.claude/.credentials.json --cred-kind bearer
 # register the loopback port node-locally
 ducktape-node gateway-route-bind --workspace <node-workspace> --label airlock --port 9100
-# publish the signed LoopbackHttp route (allow_authorization:true, max_response_bytes ≤ 4 MiB
-# — the buffered proxy enforces this cap literally; 0/"unbounded" awaits SSE-over-overlay);
-# construct the RouteStatement exactly as signed_airlock_route() does in the test,
-# then: user-sign-gateway-route --key <user.key> --statement <json>  → submit to the
-# node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle> on duckdns.
 ```
 
 **Compute node** (runs the sandbox): point the broker at the remote gateway — no

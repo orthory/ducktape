@@ -79,6 +79,7 @@ async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
         },
         "snp",
         enclave.quoter(),
+        None,
     )
     .unwrap();
     assert_eq!(vendor, "snp");
@@ -162,6 +163,70 @@ async fn a_forged_gateway_cannot_mint_a_token_the_client_opens() {
     let wrong_seal_pk = [0x42u8; 32]; // not the gateway's attested key
     let err = gw.open_session(&wrong_seal_pk, "test-sub").await;
     assert!(err.is_err(), "a token derived against the wrong seal_pk must not open");
+}
+
+#[tokio::test]
+async fn build_seeded_uses_the_initial_credential_without_upload() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // The credential is seeded at build (the node-embed path) — no /credential
+    // upload, and a static bearer must never trigger an OAuth refresh.
+    let oauth_hits = Arc::new(AtomicU64::new(0));
+    let oh = oauth_hits.clone();
+    let app = Router::new()
+        .route(
+            "/oauth/token",
+            post(move || {
+                let oh = oh.clone();
+                async move {
+                    oh.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "no oauth for a seeded bearer").into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/messages",
+            post(|headers: HeaderMap| async move {
+                let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+                if got != "Bearer seeded-tok" {
+                    return (StatusCode::UNAUTHORIZED, format!("got {got:?}")).into_response();
+                }
+                ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+            }),
+        );
+    let upstream = spawn(app).await;
+
+    let enclave = enclave();
+    let (router, vendor) = server::build_with_quoter(
+        GatewayConfig {
+            attest: "snp".into(),
+            anthropic_base: upstream.clone(),
+            oauth_token_url: format!("{upstream}/oauth/token"),
+            oauth_client_id: "test-client".into(),
+            session_ttl_secs: 3600,
+            max_requests: 100,
+        },
+        "snp",
+        enclave.quoter(),
+        Some(airlock::wire::CredentialPayload::Bearer { access_token: "seeded-tok".into() }),
+    )
+    .unwrap();
+    assert_eq!(vendor, "snp");
+    let gateway_url = spawn(router).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    // NO upload_sealed_credential — the credential was seeded at build.
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    let token = gw.open_session(&seal_pk, "sub").await.unwrap();
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert!(resp.text().await.unwrap().contains("AIRLOCK-OK"));
+    assert_eq!(oauth_hits.load(Ordering::SeqCst), 0, "a seeded bearer must not OAuth-refresh");
 }
 
 #[tokio::test]

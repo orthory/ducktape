@@ -64,6 +64,7 @@ mod drain_actions;
 mod explorer;
 mod first_contact_join;
 mod gateway_plane;
+mod airlock_serve;
 mod gateway_routes;
 mod host_reads;
 mod host_resources;
@@ -320,6 +321,9 @@ fn run_node(
         joiner,
         label: &label,
         storage: &storage,
+        // the config dir where gateway-routes.json lives (= storage in the dev
+        // shape); an embedded airlock gateway registers its port here.
+        workspace: &workspace,
         rpc_listen,
         http_listen,
         gateway_listen,
