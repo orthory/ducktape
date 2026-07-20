@@ -117,7 +117,6 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use duckdns::DuckDns;
 use files::Files;
 use forge::Forge;
 use gateway::Gateway;
@@ -155,7 +154,7 @@ use valset::Valset;
 /// exact set, so status/roots and query targets match what the app expects of a
 /// daemon. the sim-parity conformance lane pins this list against noded; do not
 /// change it without also changing the daemon.
-const BASE_MODULE_IDS: [&str; 16] = [
+const BASE_MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -170,12 +169,12 @@ const BASE_MODULE_IDS: [&str; 16] = [
     "forge",
     "files",
     "identity",
-    "duckdns",
+    // the MERGED gateway owns both the `.duck` handle plane and the route plane.
     "gateway",
 ];
 
 /// the four system modules the opt-in `--with-valset` genesis appends AFTER the
-/// default 16, in registry order: the KV store, the membership registry seeded
+/// default 15, in registry order: the KV store, the membership registry seeded
 /// with the genesis validators, governance (the sole authorized author of
 /// valset change), and the upgrade coordinator — whose mere registration makes
 /// the host-injected once-per-block boundary `Advance` ride every sim block.
@@ -818,7 +817,6 @@ fn run_sim(
         // (the simulator has neither), matching noded's daemon wiring. It is
         // also the canonical account display-name registry.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
         let gateway = Gateway::new("gateway", "identity", None, "local");
         let mut modules: Vec<Box<dyn Module>> = vec![
             Box::new(chat),
@@ -835,7 +833,6 @@ fn run_sim(
             Box::new(forge),
             Box::new(files),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
         ];
         // opt-in governance genesis, AFTER the default 16 in registry order:

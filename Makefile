@@ -308,13 +308,6 @@ wasm-modules:
 	cp crates/guests/capability-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/capability.component.wasm
 
-	cd crates/guests/duckdns-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
-	wasm-tools component new \
-	  crates/guests/duckdns-wasm/target/wasm32-unknown-unknown/release/duckdns_wasm.wasm \
-	  -o crates/guests/duckdns-wasm/component.wasm
-	cp crates/guests/duckdns-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
-
 	cd crates/guests/identity-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/identity-wasm/target/wasm32-unknown-unknown/release/identity_wasm.wasm \
@@ -399,8 +392,6 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/tagging.component.wasm
 	cmp crates/guests/capability-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/capability.component.wasm
-	cmp crates/guests/duckdns-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
 	cmp crates/guests/identity-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/identity.component.wasm
 	cmp crates/guests/gateway-wasm/component.wasm \

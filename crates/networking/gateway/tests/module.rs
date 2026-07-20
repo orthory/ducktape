@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::executor::block_on;
 use gateway::{
-    GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
-    RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
-    RouteTarget, decode_reply, encode_msg, encode_query, route_signing_preimage,
+    DuckDnsName, GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply,
+    MemberAuthorization, ResolvedAccount, RouteAudience, RouteDefinition, RouteMethod, RouteName,
+    RoutePolicy, RouteStatement, RouteTarget, decode_reply, encode_msg, encode_query,
+    route_signing_preimage,
 };
 use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView};
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
@@ -191,7 +192,9 @@ fn route_requires_standing_bound_origin_current_member_and_valid_signature() {
 
     context.env.origin = Origin::External(node);
     let mut forged = publish;
-    let GatewayMsg::SetRoute { authorization, .. } = &mut forged;
+    let GatewayMsg::SetRoute { authorization, .. } = &mut forged else {
+        unreachable!("publish is a SetRoute");
+    };
     authorization.signature[0] ^= 1;
     assert!(
         execute(&mut module, &mut context, forged)
@@ -240,6 +243,67 @@ fn apex_and_named_routes_share_one_authority_model_but_independent_revisions() {
     assert_eq!(routes[0].name, RouteName::apex());
     assert_eq!(routes[1].name, RouteName::named("api"));
     assert_eq!(routes[0].revision, 1);
+}
+
+#[test]
+fn handle_plane_resolves_to_the_bound_account_and_shares_the_route_gates() {
+    // the merged module owns the `.duck` handle plane too: a bound, standing
+    // node registers a name that resolves to its stable AccountId, and an
+    // outsider is refused by the SAME valset gate the route plane uses.
+    let (node, signer, account, mut context, mut module) = fixture(21);
+    execute(
+        &mut module,
+        &mut context,
+        GatewayMsg::SetHandle {
+            handle: Some("orthory".into()),
+        },
+    )
+    .unwrap();
+    block_on(module.commit_block()).unwrap();
+
+    let reply = block_on(module.query(&encode_query(&GatewayQuery::Resolve {
+        name: DuckDnsName {
+            handle: "orthory".into(),
+        },
+    })))
+    .unwrap();
+    assert_eq!(
+        decode_reply(&reply).unwrap(),
+        GatewayReply::Resolved(Some(ResolvedAccount {
+            account_id: account.account_id.clone(),
+        }))
+    );
+
+    // a reserved root label is refused at admission.
+    assert!(
+        execute(
+            &mut module,
+            &mut context,
+            GatewayMsg::SetHandle {
+                handle: Some("net".into()),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("reserved")
+    );
+
+    // the standing gate is shared: an outsider node cannot set a handle.
+    let _ = signer;
+    context.env.origin = Origin::External(vec![2; 32]);
+    assert!(
+        execute(
+            &mut module,
+            &mut context,
+            GatewayMsg::SetHandle {
+                handle: Some("intruder".into()),
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("validator or admitted resident")
+    );
+    let _ = node;
 }
 
 #[test]

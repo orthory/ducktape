@@ -1,3 +1,4 @@
+use duckdns::{DuckDnsName, HandleRegistration, ResolvedAccount};
 use sdk::codec::{push_bytes, push_opt_str};
 use serde::{Deserialize, Serialize};
 
@@ -180,9 +181,19 @@ pub struct RouteSummary {
     pub target: String,
 }
 
+/// The single message surface of the merged gateway module: the `.duck` handle
+/// plane (`SetHandle`, the human-name → AccountId facet absorbed from duckdns)
+/// and the route plane (`SetRoute`) are ops on ONE consensus module.
+// the route variant dwarfs the handle one, but this enum is decoded once per op
+// (never held in bulk), so boxing every SetRoute allocation to even the sizes
+// out would only add indirection on a cold path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayMsg {
+    /// Declaratively replace the authenticated account's optional `.duck`
+    /// handle. `None` unregisters it without changing Identity.
+    SetHandle { handle: Option<String> },
     SetRoute {
         statement: RouteStatement,
         authorization: MemberAuthorization,
@@ -192,6 +203,11 @@ pub enum GatewayMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayQuery {
+    /// Resolve one `.duck` name to the stable AccountId it aliases. Node
+    /// selection is deliberately absent — resolution stops at the AccountId.
+    Resolve { name: DuckDnsName },
+    /// The optional-handle registration listing, paginated.
+    Registrations { from: u64, limit: u64 },
     Get {
         account_id: Vec<u8>,
         name: RouteName,
@@ -206,6 +222,9 @@ pub enum GatewayQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayReply {
+    /// The stable AccountId a `.duck` name resolves to, or `None`.
+    Resolved(Option<ResolvedAccount>),
+    Registrations(Vec<HandleRegistration>),
     /// Boxed only to keep the Rust reply enum bounded after adding the compact
     /// list variant; `Box` is transparent in the JSON wire representation.
     Route(Box<Option<RouteRecord>>),

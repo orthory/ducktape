@@ -412,8 +412,12 @@ async fn resolve_route(
                 "gateway route is not published".into(),
             )),
         },
-        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
-            "gateway returned an unexpected route-list reply".into(),
+        // a route `Get` must answer with a `Route`; the list and handle-plane
+        // replies (`Resolved`/`Registrations`) are all wrong shapes here.
+        Ok(gateway::GatewayReply::Routes(_))
+        | Ok(gateway::GatewayReply::Resolved(_))
+        | Ok(gateway::GatewayReply::Registrations(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected reply to a route query".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }

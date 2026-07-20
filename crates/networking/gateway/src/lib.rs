@@ -1,13 +1,17 @@
-//! Global `.duck` gateway routes.
+//! The `.duck` gateway: the whole **name → AccountId → route** pipeline as one
+//! consensus module.
 //!
-//! The consensus surface is deliberately small: an Identity account signs one
-//! monotonic route from its apex or a single service label to a typed upstream
-//! target plus an invocation policy. DuckDNS remains the optional
-//! human-name-to-AccountId layer. This module stores no node address, local
-//! port, browser session, content bytes, or transport state.
+//! An Identity account signs one monotonic route from its apex or a single
+//! service label to a typed upstream target plus an invocation policy, AND —
+//! as the handle plane absorbed from duckdns — an optional human `.duck` name
+//! aliasing its stable AccountId. Resolution stops at the AccountId; this
+//! module stores no node address, local port, browser session, content bytes,
+//! or transport state. `.duck` is Ducktape presentation syntax, never installed
+//! into the host DNS stack.
 
 mod frames;
 mod interface;
+mod legacy;
 mod manifest;
 mod module;
 mod proxy;
@@ -15,7 +19,18 @@ mod registry;
 
 pub use frames::*;
 pub use interface::*;
+pub use legacy::LegacyGateway;
 pub use manifest::*;
 pub use module::Gateway;
 pub use proxy::*;
 pub use registry::Registry;
+
+// the `.duck` handle-plane surface, absorbed as gateway's internal facet: the
+// grammar and wire TYPES for human names are re-exported here so callers speak
+// one crate. duckdns's own module/query/reply enums are superseded by the
+// unified [`GatewayMsg`]/[`GatewayQuery`]/[`GatewayReply`]; only the shared
+// value types and the admission grammar cross over.
+pub use duckdns::{
+    DUCKDNS_ZONE, DuckDnsName, HandleRegistration, MAX_LABEL_LEN, MAX_QUERY_LIMIT,
+    RESERVED_ROOT_LABELS, ResolvedAccount, parse_hostname, validate_handle, validate_handle_shape,
+};

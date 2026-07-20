@@ -713,25 +713,27 @@ fn gateway_route() -> gateway::RouteRecord {
     }
 }
 
-/// Answer the duck:// browser proxy's queries: DuckDNS resolves the handle to
-/// the route's account, gateway returns the signed route. `queries` is the
-/// total count (one proxy request = one duckdns + two gateway queries).
+/// Answer the duck:// browser proxy's queries against the MERGED gateway
+/// module: a handle `Resolve` returns the route's account, a `Get` returns the
+/// signed route — both now target the one "gateway" module, dispatched by
+/// query variant. `queries` is the total count.
 fn spawn_duck_actor(mut cmds: mpsc::Receiver<NodeCommand>, queries: usize) {
     tokio::spawn(async move {
         for _ in 0..queries {
-            let NodeCommand::Query { target, reply, .. } = cmds.next().await.unwrap() else {
+            let NodeCommand::Query { target, req, reply } = cmds.next().await.unwrap() else {
                 panic!("gateway only issues queries");
             };
-            let bytes = match target.as_str() {
-                "duckdns" => duckdns::encode_reply(&duckdns::DuckDnsReply::Resolved(Some(
-                    duckdns::ResolvedAccount {
+            assert_eq!(target, "gateway");
+            let bytes = match gateway::decode_query(&req).unwrap() {
+                gateway::GatewayQuery::Resolve { .. } => gateway::encode_reply(
+                    &gateway::GatewayReply::Resolved(Some(gateway::ResolvedAccount {
                         account_id: vec![1],
-                    },
-                ))),
-                "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(
-                    gateway_route(),
-                )))),
-                other => panic!("unexpected query target {other}"),
+                    })),
+                ),
+                gateway::GatewayQuery::Get { .. } => gateway::encode_reply(
+                    &gateway::GatewayReply::Route(Box::new(Some(gateway_route()))),
+                ),
+                other => panic!("unexpected query {other:?}"),
             };
             let _ = reply.send(Ok(bytes));
         }

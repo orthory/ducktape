@@ -24,7 +24,7 @@
 //! tenants. the whole-state dispatch model (load `__state`/`__root` through
 //! the host's staged overlay, run the native `execute`, commit the INNER
 //! module, save the canonical snapshot back as OUTER staged writes) is
-//! `vaults-wasm` / `duckdns-wasm` verbatim; see those crates for the
+//! `vaults-wasm` verbatim; see that crate for the
 //! equivalence argument. the persisted encoding is the native canonical
 //! snapshot as ONE host-KV value: a STATE-SCHEMA BREAK versus the native root
 //! (revision 2; beta networks re-genesis, no back-compat shim).

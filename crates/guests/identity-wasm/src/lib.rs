@@ -18,7 +18,7 @@
 //! staged-overlay reads, run the native `execute` (its valset member gate
 //! resolves through the runtime's memoized replay), commit the INNER module,
 //! save the canonical snapshot back as OUTER staged writes — is `vaults-wasm`
-//! / `duckdns-wasm` verbatim; see those crates for the equivalence argument
+//! verbatim; see that crate for the equivalence argument
 //! spelled out. the persisted encoding is the native canonical snapshot as ONE
 //! host-KV value: a STATE-SCHEMA BREAK versus the native root (revision 2;
 //! beta networks re-genesis, no back-compat shim). the WebAuthn / P-256 member

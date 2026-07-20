@@ -130,9 +130,18 @@ impl Registry {
         encode_state(&self.committed)
     }
 
+    /// Decode a canonical snapshot and adopt it as committed WITHOUT a root
+    /// check. The merged gateway module (which absorbs this handle plane)
+    /// verifies the COMBINED root once, over both planes.
+    pub fn adopt(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.committed = decode_state(bytes)?;
+        self.pending = None;
+        Ok(())
+    }
+
     pub fn install(&mut self, bytes: &[u8], expected: [u8; 32]) -> Result<(), String> {
-        let decoded = decode_state(bytes)?;
-        let actual = root_of(&decoded);
+        self.adopt(bytes)?;
+        let actual = root_of(&self.committed);
         if actual != expected {
             return Err(format!(
                 "duckdns: registry snapshot root mismatch: decoded {}, expected {}",
@@ -140,8 +149,6 @@ impl Registry {
                 hex(&expected)
             ));
         }
-        self.committed = decoded;
-        self.pending = None;
         Ok(())
     }
 }
