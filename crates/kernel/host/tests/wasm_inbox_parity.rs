@@ -20,7 +20,7 @@ use inbox::{
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/inbox-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/inbox-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const INBOX_WASM: &[u8] = include_bytes!("fixtures/inbox.component.wasm");
 

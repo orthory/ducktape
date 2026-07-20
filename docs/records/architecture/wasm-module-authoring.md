@@ -3,10 +3,10 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/examples/hello-wasm` (v1),
-`crates/examples/hello-wasm-v2` (its live-update target), and
-`crates/examples/sibling-wasm` (the cross-module-read reference). The first
-REAL production tenant is `crates/examples/directory-wasm` — the wasm port of
+the reference modules are `crates/guests/hello-wasm` (v1),
+`crates/guests/hello-wasm-v2` (its live-update target), and
+`crates/guests/sibling-wasm` (the cross-module-read reference). The first
+REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
 the `directory` module, bytes-compatible with the native implementation it
 replaced (same root, same snapshot encoding: the cutover left the app-hash
 untouched).
@@ -99,7 +99,7 @@ make wasm-modules-check  # the drift gate: every committed copy is byte-identica
 One-off equivalent, per crate:
 
 ```
-cd crates/examples/hello-wasm
+cd crates/guests/hello-wasm
 cargo build --target wasm32-unknown-unknown --release
 wasm-tools component new target/wasm32-unknown-unknown/release/hello_wasm.wasm -o component.wasm
 ```

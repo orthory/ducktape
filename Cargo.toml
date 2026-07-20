@@ -22,9 +22,12 @@
 #                      inbox, files, jobs)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
+#   crates/guests/   — the wasm ports: one standalone guest workspace per
+#                      module (X-wasm compiles the native crate to a
+#                      component the node embeds) + guest-adapter (the
+#                      ducktape:module world binding they all share)
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
-#                      canary), greeter (the types-only composition example),
-#                      evm (experimental; genesis-registered in the daemons)
+#                      canary), greeter (the types-only composition example)
 #   bin/             — demo (in-process walkthrough), node (validator),
 #                      noded (the app-facing daemon), simnode (deterministic
 #                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)

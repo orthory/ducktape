@@ -4,7 +4,7 @@
 //! an aborted round's staged writes never leak into the next (no double-apply),
 //! and the sibling-read budget rejects deterministically.
 //!
-//! The fixture is a GENERATED artifact (built from `crates/examples/sibling-wasm`
+//! The fixture is a GENERATED artifact (built from `crates/guests/sibling-wasm`
 //! by the module build target); it is committed so this proof is self-contained.
 
 use std::cell::RefCell;

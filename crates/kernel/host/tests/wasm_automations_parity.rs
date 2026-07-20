@@ -36,7 +36,7 @@ use tasks::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/automations-wasm` by the
+/// GENERATED artifact — built from `crates/guests/automations-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.wasm");
 

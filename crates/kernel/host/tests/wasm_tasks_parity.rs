@@ -15,7 +15,7 @@ use tasks::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/tasks-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/tasks-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const TASKS_WASM: &[u8] = include_bytes!("fixtures/tasks.component.wasm");
 

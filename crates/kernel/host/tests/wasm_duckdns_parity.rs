@@ -30,7 +30,7 @@ use sdk::{Error, Msg, Origin, StateRoot};
 use valset::{Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/duckdns-wasm` (see that
+/// GENERATED artifact — built from `crates/guests/duckdns-wasm` (see that
 /// crate's Cargo.toml for the componentize recipe); committed so this proof is
 /// self-contained.
 const DUCKDNS_WASM: &[u8] = include_bytes!("fixtures/duckdns.component.wasm");

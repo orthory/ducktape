@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 use valset::Valset;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/saga-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/saga-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const SAGA_WASM: &[u8] = include_bytes!("fixtures/saga.component.wasm");
 

@@ -81,7 +81,7 @@ use tasks::{
 use valset::Valset;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/runs-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/runs-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 

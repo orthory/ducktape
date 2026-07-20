@@ -13,7 +13,7 @@ use host::Host;
 use sdk::{Module, Msg, StateSyncHandle};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/directory-wasm` by the
+/// GENERATED artifact — built from `crates/guests/directory-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const DIRECTORY_WASM: &[u8] = include_bytes!("fixtures/directory.component.wasm");
 

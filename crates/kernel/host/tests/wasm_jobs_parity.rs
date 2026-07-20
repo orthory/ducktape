@@ -15,7 +15,7 @@ use jobs::{
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/jobs-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/jobs-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const JOBS_WASM: &[u8] = include_bytes!("fixtures/jobs.component.wasm");
 

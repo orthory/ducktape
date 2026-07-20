@@ -29,8 +29,10 @@ crates/
                   dispatch-oracle, tagging, modreg    (from crates/system/)
     apps/       ← chat, pages, forge, agent, runs, tasks, vaults,
                   automations, inbox, files, jobs     (from crates/apps/)
+  guests/       ← the wasm ports: every *-wasm wrapper + guest-adapter
+                  (from crates/examples/ — production packaging, not examples)
   duckfs/       ← unchanged
-  examples/     ← unchanged
+  examples/     ← directory, greeter only (the true reference modules)
   labs/         ← unchanged
   module-view-host/ ← unchanged
 ```
