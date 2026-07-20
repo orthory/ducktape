@@ -24,10 +24,9 @@ use std::time::Duration;
 
 use common::{Cluster, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
-use duckdns::{DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply};
 use gateway::{
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience, RouteDefinition,
-    RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
+    DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
+    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
 };
 use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 
@@ -96,15 +95,15 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
 fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<u8>> {
     let bytes = cluster.query(
         reader,
-        "duckdns",
-        &duckdns::encode_query(&DuckDnsQuery::Resolve {
+        "gateway",
+        &gateway::encode_query(&GatewayQuery::Resolve {
             name: DuckDnsName {
                 handle: handle.into(),
             },
         }),
     )?;
-    match duckdns::decode_reply(&bytes).ok()? {
-        DuckDnsReply::Resolved(Some(account)) => Some(account.account_id),
+    match gateway::decode_reply(&bytes).ok()? {
+        GatewayReply::Resolved(Some(account)) => Some(account.account_id),
         _ => None,
     }
 }
@@ -174,7 +173,7 @@ fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> O
             .as_ref()
             .as_ref()
             .map(|record| record.statement.revision),
-        GatewayReply::Routes(_) => None,
+        _ => None,
     }
 }
 
@@ -325,8 +324,8 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     // Alice maps `alice.duck`, so `airlock.alice.duck` resolves to her account.
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );
@@ -466,8 +465,8 @@ fn airlock_single_node_self_serves_its_own_route() {
 
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );

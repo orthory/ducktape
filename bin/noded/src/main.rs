@@ -30,7 +30,6 @@ use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use duckdns::DuckDns;
 use gateway::Gateway;
 use tagging::TaggingModule;
 use files::Files;
@@ -56,7 +55,7 @@ use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 15] = [
     "chat",
     "saga",
     "dispatch",
@@ -71,7 +70,6 @@ const MODULE_IDS: [&str; 16] = [
     "forge",
     "files",
     "identity",
-    "duckdns",
     "gateway",
 ];
 
@@ -304,7 +302,9 @@ fn run_node(
         // chain-unscoped certs are an acceptable surface here). It also owns
         // the canonical account display name.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
+        // the MERGED gateway owns both the `.duck` handle plane and the route
+        // plane; the single-node daemon carries no valset (ungated) and a
+        // dev-only chain id.
         let gateway = Gateway::new("gateway", "identity", None, "local");
         let mut host = Host::genesis(vec![
             Box::new(chat),
@@ -321,7 +321,6 @@ fn run_node(
             Box::new(forge),
             Box::new(files),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
         ])
         .expect("genesis");

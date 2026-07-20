@@ -1,8 +1,14 @@
-//! `gateway-wasm` — the wasm port of the `gateway` module, built the ADAPTER
-//! way: the NATIVE `gateway` crate is compiled to wasm32 unmodified and
+//! `gateway-wasm` — the wasm port of the merged `gateway` module, built the
+//! ADAPTER way: the NATIVE `gateway` crate is compiled to wasm32 unmodified and
 //! adapted to the `ducktape:module` world through `guest-adapter`, so the
 //! module's logic is single-sourced (a behavior change in the native crate IS
 //! the wasm change).
+//!
+//! `gateway` now owns the WHOLE `.duck` name → AccountId → route pipeline: the
+//! route plane AND the `.duck` handle plane absorbed from the retired
+//! `duckdns` module. So this single guest replaces the old `gateway-wasm` +
+//! `duckdns-wasm` pair; its persisted snapshot is the merged canonical state
+//! (both planes under one root — a STATE-SCHEMA BREAK, revision 3).
 //!
 //! like `identity-wasm`, the constructor takes a PER-NETWORK parameter — the
 //! chain id every route statement is scoped to — which arrives as GENESIS
@@ -16,11 +22,12 @@
 //! current-member check — which resolve through the runtime's memoized replay.
 //! the whole-state dispatch model (load `__state`/`__root` through the host's
 //! staged overlay, run the native `execute`, commit the INNER module, save the
-//! canonical snapshot back as OUTER staged writes) is `vaults-wasm` /
-//! `duckdns-wasm` verbatim; see those crates for the equivalence argument.
+//! canonical snapshot back as OUTER staged writes) is `vaults-wasm` verbatim;
+//! see that crate for the equivalence argument.
 //! the persisted encoding is the native canonical snapshot as ONE host-KV
-//! value: a STATE-SCHEMA BREAK versus the native root (revision 2; beta
-//! networks re-genesis, no back-compat shim).
+//! value: a STATE-SCHEMA BREAK versus the native root (revision 3 — the merge
+//! of the handle plane into the route plane's snapshot; beta networks
+//! re-genesis, no back-compat shim).
 
 use gateway::Gateway;
 use guest_adapter::{block_on, host, load_config, load_state, save_state, Guest, WitCtx};

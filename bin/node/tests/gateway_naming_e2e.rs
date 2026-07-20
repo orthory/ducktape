@@ -1,6 +1,6 @@
-//! DuckDNS naming over two real node processes. The module maps one optional
-//! `.duck` account name to AccountId and deliberately exposes no NodeId, route,
-//! endpoint, or service discovery state.
+//! `.duck` naming over two real node processes, on the MERGED gateway module's
+//! handle plane. It maps one optional `.duck` account name to AccountId and
+//! deliberately exposes no NodeId, route, endpoint, or service discovery state.
 
 mod common;
 
@@ -8,10 +8,9 @@ use std::time::Duration;
 
 use common::{Cluster, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
-use duckdns::{
-    DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, ResolvedAccount,
-    decode_reply as duckdns_decode_reply, encode_msg as duckdns_encode_msg,
-    encode_query as duckdns_encode_query,
+use gateway::{
+    DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, ResolvedAccount,
+    decode_reply as gw_decode_reply, encode_msg as gw_encode_msg, encode_query as gw_encode_query,
 };
 use identity::{
     AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth,
@@ -56,16 +55,16 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
 fn resolve(cluster: &Cluster, reader: usize) -> Option<Option<ResolvedAccount>> {
     let bytes = cluster.query(
         reader,
-        "duckdns",
-        &duckdns_encode_query(&DuckDnsQuery::Resolve {
+        "gateway",
+        &gw_encode_query(&GatewayQuery::Resolve {
             name: DuckDnsName {
                 handle: "alice".into(),
             },
         }),
     )?;
-    match duckdns_decode_reply(&bytes).ok()? {
-        DuckDnsReply::Resolved(account) => Some(account),
-        DuckDnsReply::Registrations(_) => None,
+    match gw_decode_reply(&bytes).ok()? {
+        GatewayReply::Resolved(account) => Some(account),
+        _ => None,
     }
 }
 
@@ -97,8 +96,8 @@ fn account_name_converges_without_node_discovery() {
 
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns_encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gw_encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );
@@ -118,8 +117,8 @@ fn account_name_converges_without_node_discovery() {
 
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns_encode_msg(&DuckDnsMsg::SetHandle { handle: None }),
+        "gateway",
+        &gw_encode_msg(&GatewayMsg::SetHandle { handle: None }),
     );
     for reader in 0..2 {
         poll_until(

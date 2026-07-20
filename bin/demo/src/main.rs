@@ -29,7 +29,6 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
-use duckdns::DuckDns;
 use gateway::Gateway;
 use files::Files;
 use forge::Forge;
@@ -87,7 +86,6 @@ fn main() {
         // the deterministic user->nodes binding registry: no valset gating and
         // a fixed demo chain id (the demo has no real network descriptor).
         let identity = Identity::new("identity", None, "demo".into());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
         let gateway = Gateway::new("gateway", "identity", None, "demo");
         let inbox = Inbox::new("inbox");
         let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
@@ -119,7 +117,6 @@ fn main() {
             Box::new(tagging),
             Box::new(tasks),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
             Box::new(inbox),
             Box::new(files),

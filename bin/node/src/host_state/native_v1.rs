@@ -13,7 +13,11 @@ use duckdns::DuckDns;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
-use gateway::Gateway;
+// the FROZEN routes-only gateway module: on the v1 network the `.duck` handle
+// plane rode a SEPARATE `duckdns` module, so this registry reconstructs the
+// routes-only `gateway` snapshot AND the separate `duckdns` snapshot. The live
+// path uses the MERGED `gateway::Gateway`.
+use gateway::LegacyGateway;
 use governance::Governance;
 use host::Host;
 use identity::Identity;
@@ -59,7 +63,7 @@ struct NativeV1Modules {
     tasks: Tasks,
     identity: Identity,
     duckdns: DuckDns,
-    gateway: Gateway,
+    gateway: LegacyGateway,
     inbox: Inbox,
     files: Files,
     jobs: Jobs,
@@ -275,7 +279,7 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|error| format!("duckdns install: {error}"))?;
 
-    let mut gateway = Gateway::new(
+    let mut gateway = LegacyGateway::new(
         "gateway",
         "identity",
         Some("valset".into()),
@@ -583,7 +587,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|error| format!("duckdns install: {error}"))?;
 
     let (bytes, root) = snapshot_of("gateway").await?;
-    let mut gateway = Gateway::new(
+    let mut gateway = LegacyGateway::new(
         "gateway",
         "identity",
         Some("valset".into()),

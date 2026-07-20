@@ -278,12 +278,12 @@ fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {
         |handle: serde_json::Value| serde_json::json!({ "set_handle": { "handle": handle } });
 
     // a short origin is not a node key, and an unbound node has no account.
-    let error = sim.submit_rejected("duckdns", set_handle("eddy".into()), Some("noded"));
+    let error = sim.submit_rejected("gateway", set_handle("eddy".into()), Some("noded"));
     assert!(
         error.contains("origin must be a 32-byte node key"),
         "{error}"
     );
-    let error = sim.submit_rejected("duckdns", set_handle("eddy".into()), Some(&node_a));
+    let error = sim.submit_rejected("gateway", set_handle("eddy".into()), Some(&node_a));
     assert!(
         error.contains("not bound to an identity account"),
         "{error}"
@@ -308,9 +308,9 @@ fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {
     );
 
     // the bound node registers the handle, and resolution serves account A.
-    sim.submit_ok("duckdns", set_handle("eddy".into()), Some(&node_a));
+    sim.submit_ok("gateway", set_handle("eddy".into()), Some(&node_a));
     let resolved = sim.query(
-        "duckdns",
+        "gateway",
         serde_json::json!({ "resolve": { "name": { "handle": "eddy" } } }),
     );
     assert_eq!(
@@ -327,7 +327,7 @@ fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {
         serde_json::json!({ "bind_node": { "authorizer": ed_bind_auth(&key_b, &preimage_b) } }),
         Some(&node_b),
     );
-    let error = sim.submit_rejected("duckdns", set_handle("eddy".into()), Some(&node_b));
+    let error = sim.submit_rejected("gateway", set_handle("eddy".into()), Some(&node_b));
     assert!(
         error.contains("already claimed by another account"),
         "label exclusivity: {error}"
@@ -335,13 +335,13 @@ fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {
 
     // …until the holder releases it; then the label re-registers cleanly.
     sim.submit_ok(
-        "duckdns",
+        "gateway",
         set_handle(serde_json::Value::Null),
         Some(&node_a),
     );
-    sim.submit_ok("duckdns", set_handle("eddy".into()), Some(&node_b));
+    sim.submit_ok("gateway", set_handle("eddy".into()), Some(&node_b));
     let resolved = sim.query(
-        "duckdns",
+        "gateway",
         serde_json::json!({ "resolve": { "name": { "handle": "eddy" } } }),
     );
     assert_eq!(

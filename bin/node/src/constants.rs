@@ -142,7 +142,7 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 24] = [
+pub(crate) const MODULE_IDS: [&str; 23] = [
     "pages",
     "chat",
     "forge",
@@ -158,7 +158,9 @@ pub(crate) const MODULE_IDS: [&str; 24] = [
     "tagging",
     "tasks",
     "identity",
-    "duckdns",
+    // the MERGED gateway owns the whole `.duck` name → AccountId → route
+    // pipeline: the route plane PLUS the human-name handle plane that the
+    // retired `duckdns` module used to own separately.
     "gateway",
     "inbox",
     "directory",
@@ -174,7 +176,7 @@ pub(crate) const MODULE_IDS: [&str; 24] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 23] = [
     // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
     // tail inside the native snapshot persisted as one host-KV value.
     ("agent", 3),
@@ -193,14 +195,14 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
     // COMMITTED-ONLY state by design (runs' mid-block lease_holder read
     // depends on it), a view the wasm adapter's staged-fold cannot represent.
     ("dispatch", 1),
-    ("duckdns", 2),
     ("files", 1),
     ("forge", 1),
-    // 2: wasm adapter ports — the native canonical snapshot persisted as one
-    // host-KV value, plus the GENESIS-CONFIG `__config` store entry carrying
-    // the per-network parameters (gateway/identity: chain id; governance: the
-    // invite binding), so root()/snapshot bytes changed shape at cutover.
-    ("gateway", 2),
+    // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
+    // revision 3 folds the `.duck` handle registry (the retired `duckdns`
+    // module's plane) into the same host-KV snapshot under one root — a
+    // state-schema break (beta re-genesis, no shim). identity/governance stay
+    // at 2. The per-network chain id still rides the GENESIS-CONFIG `__config`.
+    ("gateway", 3),
     ("governance", 2),
     ("hello", 1),
     ("identity", 2),
@@ -261,17 +263,17 @@ pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
 /// including genuinely historical pre-wasm-cutover workspaces, whose module
 /// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
 /// re-genesis, no shim).
-pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 23] = [
+pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 22] = [
     ("agent", 3),
     ("automations", 2),
     ("capability", 2),
     ("chat", 1),
     ("directory", 1),
     ("dispatch", 1),
-    ("duckdns", 2),
     ("files", 1),
     ("forge", 1),
-    ("gateway", 2),
+    // merged gateway, revision 3 (see MODULE_STATE_SCHEMAS).
+    ("gateway", 3),
     ("governance", 2),
     ("hello", 1),
     ("identity", 2),
@@ -293,10 +295,16 @@ pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
 /// binaries already advertise support through v3. This exact logical artifact
 /// binds readiness to the only accepted source schema, destination schema, and
 /// dormant-registry route.
+///
+/// Both fingerprints moved with the duckdns→gateway merge flag day: the source
+/// (`pre_clients`) and destination (current `MODULE_STATE_SCHEMAS`) schemas
+/// dropped `duckdns` and bumped `gateway` to revision 3. Recomputed for this
+/// merge alone — the campaign integrator MUST re-pin both after combining every
+/// module-plane trim (each trim moves the whole-set fingerprint).
 pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
     "commit:clients-v1:",
-    "53e5b47824b4221907a9936ffacbf34a92619cd482d48471211421220ba6ed7b:",
-    "e7874af2854f92987f4613962da89286ad938c3f33836c5e429a112273857228:",
+    "dd152ef8d6c71bd6b4a771b2afa65239c1cb61a118a7cbe0f9c30d631cae1096:",
+    "1fb3d5c0ec9c7b7401ad9744eb46e9769609c26de70288f978f743629b8faa0c:",
     "dormant-registry-v1"
 );
 

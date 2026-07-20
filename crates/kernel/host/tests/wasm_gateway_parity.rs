@@ -1,11 +1,17 @@
-//! the adapter-port equivalence proof for the gateway cutover: the
+//! the adapter-port equivalence proof for the MERGED gateway module: the
 //! `gateway-wasm` component (the NATIVE `gateway` crate compiled to wasm
 //! behind `guest-adapter`) and the native `Gateway` module answer the SAME op
 //! sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
 //! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 2) — and this proof pins that
+//! declared state-schema break (revision 3) — and this proof pins that
 //! difference so it can never be mistaken for accidental compatibility.
+//!
+//! gateway now owns the WHOLE `.duck` name → AccountId → route pipeline: BOTH
+//! the route plane AND the `.duck` handle plane absorbed from the retired
+//! `duckdns` module (which had its own `duckdns-wasm` guest + parity proof —
+//! both merged here). the route-plane tests below cover SetRoute; the
+//! handle-plane test covers SetHandle / Resolve on the SAME merged tenant.
 //!
 //! like identity, gateway's constructor takes the PER-NETWORK chain id, which
 //! travels as GENESIS CONFIG (a host-installed `__config` store entry —
@@ -24,9 +30,10 @@
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_cryptography::Signer as _;
 use gateway::{
-    encode_msg, encode_query, route_signing_preimage, Gateway, GatewayMsg, GatewayQuery,
-    MemberAuthorization, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
-    RouteStatement, RouteTarget, GATEWAY_ROUTE_NS,
+    decode_reply, encode_msg, encode_query, route_signing_preimage, DuckDnsName, Gateway,
+    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, ResolvedAccount, RouteAudience,
+    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
+    GATEWAY_ROUTE_NS, MAX_QUERY_LIMIT,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{bind_preimage, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof,
@@ -50,9 +57,9 @@ const CHAIN_ID: &str = "test-chain";
 fn wasm_gateway_with_chain(chain_id: &str) -> WasmModule {
     let mut module = WasmModule::from_bytes("gateway", GATEWAY_WASM)
         .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the gateway
-        // canonical state.
-        .with_state_schema_revision(2);
+        // the adapter port's host-KV snapshot is revision 3 of the merged
+        // gateway canonical state (route plane + absorbed handle plane).
+        .with_state_schema_revision(3);
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
     module.install(&bytes, root).expect("install genesis config");
@@ -944,4 +951,146 @@ async fn genesis_config_inner() {
         reason.contains("belongs to another chain"),
         "the chain scope is what refuses: {reason}"
     );
+}
+
+// ---- handle plane (absorbed from duckdns) -----------------------------------
+
+/// a SetHandle msg on the MERGED gateway module — the `.duck` human-name facet.
+fn set_handle(handle: Option<&str>) -> Msg {
+    Msg {
+        target: "gateway".into(),
+        payload: encode_msg(&GatewayMsg::SetHandle {
+            handle: handle.map(Into::into),
+        }),
+    }
+}
+
+fn resolve_query(handle: &str) -> Vec<u8> {
+    encode_query(&GatewayQuery::Resolve {
+        name: DuckDnsName {
+            handle: handle.into(),
+        },
+    })
+}
+
+/// the handle-plane read matrix: present/renamed/freed/absent resolves plus the
+/// full registration listing — the whole surface duckdns's own parity pinned.
+async fn handle_replies(h: &Host) -> Vec<Vec<u8>> {
+    let queries = [
+        resolve_query("orthory"),
+        resolve_query("renamed"),
+        resolve_query("quack-2"),
+        resolve_query("absent"),
+        encode_query(&GatewayQuery::Registrations {
+            from: 0,
+            limit: MAX_QUERY_LIMIT,
+        }),
+        encode_query(&GatewayQuery::Registrations { from: 1, limit: 1 }),
+    ];
+    let mut out = Vec::new();
+    for q in &queries {
+        out.push(h.query("gateway", q).await.expect("query"));
+    }
+    out
+}
+
+async fn resolved(h: &Host, handle: &str) -> Option<ResolvedAccount> {
+    let reply = h.query("gateway", &resolve_query(handle)).await.expect("resolve");
+    match decode_reply(&reply).expect("decode") {
+        GatewayReply::Resolved(r) => r,
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+}
+
+#[test]
+fn handle_plane_ops_stay_in_lockstep_on_the_merged_tenant() {
+    futures::executor::block_on(handle_plane_inner());
+}
+
+async fn handle_plane_inner() {
+    let w = World::new();
+    let validators = vec![w.node_a.clone()];
+    let mut native = native_host(&validators);
+    let mut wasm = wasm_host_(&validators);
+
+    // the schema break is visible from genesis (native ZERO sentinel vs the
+    // wasm host-KV root that already commits to `__config`).
+    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
+    assert_ne!(root_of(&native), root_of(&wasm), "genesis roots differ (schema break)");
+
+    // sibling-only seed blocks leave the gateway root untouched on both sides.
+    w.seed(&mut native).await;
+    w.seed(&mut wasm).await;
+    assert_eq!(root_of(&native), StateRoot::ZERO, "seed holds the native root");
+
+    // every handle op family in one deterministic sequence; `moves` says
+    // whether committed state changes — root movement must agree on both sides.
+    // node A is a validator bound to account A; node B a resident bound to B.
+    let ops: Vec<(Vec<u8>, Option<&str>, bool)> = vec![
+        (w.node_a.clone(), Some("orthory"), true),   // validator registers
+        (w.node_b.clone(), Some("quack-2"), true),   // resident registers
+        (w.node_a.clone(), Some("orthory"), false),  // idempotent no-op
+        (w.node_a.clone(), Some("renamed"), true),   // atomic rename frees "orthory"
+        (w.node_b.clone(), None, true),              // unregister "quack-2"
+        (w.node_b.clone(), Some("orthory"), true),   // claim the freed name
+    ];
+
+    for (i, (who, handle, moves)) in ops.into_iter().enumerate() {
+        let height = i as u64 + 5;
+        let (n_before, w_before) = (root_of(&native), root_of(&wasm));
+        native
+            .submit_at(block(height, Origin::External(who.clone())), set_handle(handle))
+            .await
+            .expect("native submit");
+        wasm.submit_at(block(height, Origin::External(who)), set_handle(handle))
+            .await
+            .expect("wasm submit");
+
+        assert_eq!(
+            handle_replies(&native).await,
+            handle_replies(&wasm).await,
+            "handle replies diverge after block {height}"
+        );
+        if moves {
+            assert_ne!(root_of(&native), n_before, "native stuck at {height}");
+            assert_ne!(root_of(&wasm), w_before, "wasm stuck at {height}");
+        } else {
+            assert_eq!(root_of(&native), n_before, "native moved at {height}");
+            assert_eq!(root_of(&wasm), w_before, "wasm moved at {height}");
+        }
+        assert_ne!(root_of(&native), root_of(&wasm), "the pinned schema break");
+    }
+
+    // resolution stops at the stable AccountId (the founding key), never a node.
+    assert_eq!(
+        resolved(&wasm, "renamed").await,
+        Some(ResolvedAccount { account_id: w.a_id() }),
+        "A's rename resolves to A's account id"
+    );
+    assert_eq!(
+        resolved(&wasm, "orthory").await,
+        Some(ResolvedAccount { account_id: w.b_id() }),
+        "the freed handle now belongs to B's account"
+    );
+    assert_eq!(resolved(&wasm, "quack-2").await, None, "B's old name is gone");
+
+    // a reserved root label is refused identically on both runtimes, and the
+    // reject leaves BOTH roots byte-identical to pre-block (abort, no trace).
+    let (n_before, w_before) = (root_of(&native), root_of(&wasm));
+    let n_err = native
+        .submit_at(block(20, Origin::External(w.node_a.clone())), set_handle(Some("net")))
+        .await
+        .expect_err("native rejects reserved");
+    let w_err = wasm
+        .submit_at(block(20, Origin::External(w.node_a.clone())), set_handle(Some("net")))
+        .await
+        .expect_err("wasm rejects reserved");
+    for err in [n_err, w_err] {
+        let SubmitError::Rejected(Error::Module(reason)) = err else {
+            panic!("rejection shape: {err:?}");
+        };
+        assert!(reason.contains("reserved"), "reason: {reason}");
+    }
+    assert_eq!(root_of(&native), n_before, "native moved on reject");
+    assert_eq!(root_of(&wasm), w_before, "wasm moved on reject");
 }

@@ -10,6 +10,11 @@ version.workspace = true
 sdk = { workspace = true }
 identity = { workspace = true }
 valset = { workspace = true }
+# the `.duck` human-name → AccountId handle plane, absorbed as gateway's
+# internal facet: gateway owns the whole name → AccountId → route pipeline as
+# ONE consensus module. `duckdns` remains a standalone crate only for the
+# frozen native-v1 compatibility registry (`bin/node/src/host_state/native_v1.rs`).
+duckdns = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

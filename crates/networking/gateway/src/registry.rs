@@ -140,16 +140,24 @@ impl Registry {
         encode_state(&self.committed)
     }
 
-    pub fn install(&mut self, bytes: &[u8], expected: [u8; 32]) -> Result<(), String> {
+    /// Decode a canonical snapshot and adopt it as committed WITHOUT a root
+    /// check. The merged gateway module verifies the COMBINED root once, over
+    /// both planes, so the per-plane check is the merged module's job.
+    pub fn adopt(&mut self, bytes: &[u8]) -> Result<(), String> {
         let decoded = decode_state(bytes)?;
         if encode_state(&decoded) != bytes {
             return Err("gateway: snapshot is not canonical".into());
         }
-        if root_of(&decoded) != expected {
-            return Err("gateway: snapshot root mismatch".into());
-        }
         self.committed = decoded;
         self.pending = None;
+        Ok(())
+    }
+
+    pub fn install(&mut self, bytes: &[u8], expected: [u8; 32]) -> Result<(), String> {
+        self.adopt(bytes)?;
+        if root_of(&self.committed) != expected {
+            return Err("gateway: snapshot root mismatch".into());
+        }
         Ok(())
     }
 }

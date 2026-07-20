@@ -167,8 +167,12 @@ async fn current_route(
                 "gateway route is not published".into(),
             )),
         },
-        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
-            "gateway returned an unexpected route-list reply".into(),
+        // a route `Get` must answer with a `Route`; the list and handle-plane
+        // replies (`Resolved`/`Registrations`) are all wrong shapes here.
+        Ok(gateway::GatewayReply::Routes(_))
+        | Ok(gateway::GatewayReply::Resolved(_))
+        | Ok(gateway::GatewayReply::Registrations(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected reply to a route query".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
@@ -292,9 +296,9 @@ pub(crate) async fn gateway_browser_base(
 
 /// Resolve a `duck://` authority (`<label>.<handle>.duck` or `<handle>.duck`)
 /// to the account it names and the route label beneath it. Node-local: one
-/// DuckDNS resolve, no session state and no round-trip to the publisher.
-/// A reserved root label (`duckdns::RESERVED_ROOT_LABELS`: `net.duck`,
-/// `agents.duck`, and any `<x>.<reserved>.duck`) carries no gateway route.
+/// merged-gateway handle resolve, no session state and no round-trip to the
+/// publisher. A reserved root label (`gateway::RESERVED_ROOT_LABELS`:
+/// `net.duck`, `agents.duck`, and any `<x>.<reserved>.duck`) carries no route.
 async fn resolve_duck_authority(
     handle: &NodeHandle,
     authority: &str,
@@ -316,12 +320,12 @@ async fn resolve_duck_authority(
     } else {
         (None, labels[0])
     };
-    if duckdns::RESERVED_ROOT_LABELS.contains(&alias) {
+    if gateway::RESERVED_ROOT_LABELS.contains(&alias) {
         return Err(GatewayFailure::NotFound(format!(
             "{alias}.duck is reserved and has no gateway route"
         )));
     }
-    duckdns::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
+    gateway::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
     let name = match label {
         Some(label) => gateway::RouteName::named(label),
         None => gateway::RouteName::apex(),
@@ -332,9 +336,9 @@ async fn resolve_duck_authority(
     let mut commands = handle.cmds.clone();
     commands
         .send(NodeCommand::Query {
-            target: "duckdns".into(),
-            req: duckdns::encode_query(&duckdns::DuckDnsQuery::Resolve {
-                name: duckdns::DuckDnsName {
+            target: "gateway".into(),
+            req: gateway::encode_query(&gateway::GatewayQuery::Resolve {
+                name: gateway::DuckDnsName {
                     handle: alias.to_string(),
                 },
             }),
@@ -344,16 +348,16 @@ async fn resolve_duck_authority(
         .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
     let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
         .await
-        .map_err(|_| GatewayFailure::Unavailable("duckdns resolve timed out".into()))?
+        .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
         .map_err(GatewayFailure::Unavailable)?;
-    match duckdns::decode_reply(&bytes) {
-        Ok(duckdns::DuckDnsReply::Resolved(Some(account))) => Ok((account.account_id, name)),
-        Ok(duckdns::DuckDnsReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
+    match gateway::decode_reply(&bytes) {
+        Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
+        Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
             "{alias}.duck is not registered"
         ))),
         Ok(_) => Err(GatewayFailure::Unavailable(
-            "duckdns returned an unexpected reply".into(),
+            "gateway returned an unexpected reply".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }

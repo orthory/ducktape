@@ -155,7 +155,7 @@ const TASKS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/tasks-wasm/component.wasm");
 const TASKS_MODULE_ID: &str = "tasks";
 
-/// tagging / capability / duckdns — adapter-ported tenants whose ops resolve
+/// tagging / capability — adapter-ported tenants whose ops resolve
 /// SIBLING READS (valset standing, identity bindings, content-module roots)
 /// through the runtime's memoized replay. upgrade deliberately stays NATIVE:
 /// its Advance decides over frozen end-of-block committed state, a surface the
@@ -167,9 +167,6 @@ const TAGGING_MODULE_ID: &str = "tagging";
 const CAPABILITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/capability-wasm/component.wasm");
 const CAPABILITY_MODULE_ID: &str = "capability";
-const DUCKDNS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/duckdns-wasm/component.wasm");
-const DUCKDNS_MODULE_ID: &str = "duckdns";
 
 /// identity / gateway / governance — adapter-ported tenants whose native
 /// constructors take PER-NETWORK parameters (the identity chain id, the invite
@@ -281,10 +278,6 @@ fn seeded_modreg() -> Modreg {
         sha2::Sha256::digest(CAPABILITY_WASM_COMPONENT).to_vec(),
     );
     modreg.seed(
-        DUCKDNS_MODULE_ID,
-        sha2::Sha256::digest(DUCKDNS_WASM_COMPONENT).to_vec(),
-    );
-    modreg.seed(
         IDENTITY_MODULE_ID,
         sha2::Sha256::digest(IDENTITY_WASM_COMPONENT).to_vec(),
     );
@@ -338,7 +331,6 @@ pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(TAGGING_WASM_COMPONENT.to_vec());
     blobs.put_chunk(CAPABILITY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(DUCKDNS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(IDENTITY_WASM_COMPONENT.to_vec());
     blobs.put_chunk(GATEWAY_WASM_COMPONENT.to_vec());
     blobs.put_chunk(GOVERNANCE_WASM_COMPONENT.to_vec());
@@ -389,7 +381,7 @@ fn genesis_tasks_wasm() -> WasmModule {
         .with_state_schema_revision(2)
 }
 
-/// tagging / capability / duckdns at their GENESIS code (adapter-ported,
+/// tagging / capability at their GENESIS code (adapter-ported,
 /// revision 2 — see [`genesis_jobs_wasm`]).
 fn genesis_tagging_wasm() -> WasmModule {
     WasmModule::from_bytes(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT)
@@ -400,12 +392,6 @@ fn genesis_tagging_wasm() -> WasmModule {
 fn genesis_capability_wasm() -> WasmModule {
     WasmModule::from_bytes(CAPABILITY_MODULE_ID, CAPABILITY_WASM_COMPONENT)
         .expect("embedded capability component loads")
-        .with_state_schema_revision(2)
-}
-
-fn genesis_duckdns_wasm() -> WasmModule {
-    WasmModule::from_bytes(DUCKDNS_MODULE_ID, DUCKDNS_WASM_COMPONENT)
-        .expect("embedded duckdns component loads")
         .with_state_schema_revision(2)
 }
 
@@ -476,10 +462,11 @@ fn genesis_config_wasm(
     component: &[u8],
     params: &[(&str, &[u8])],
     what: &str,
+    revision: u32,
 ) -> WasmModule {
     let mut module = WasmModule::from_bytes(module_id, component)
         .unwrap_or_else(|e| panic!("embedded {what} component loads: {e}"))
-        .with_state_schema_revision(2);
+        .with_state_schema_revision(revision);
     let config = sdk::genesis_config::encode_config(params);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
     module
@@ -496,17 +483,24 @@ fn genesis_identity_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
         IDENTITY_WASM_COMPONENT,
         &[("chain_id", bindings.identity_chain_id.as_bytes())],
         "identity",
+        2,
     )
 }
 
-/// gateway at its GENESIS code + config: routes are chain-scoped, so the same
-/// per-network chain id rides `__config`.
+/// the MERGED gateway at its GENESIS code + config: it owns the whole `.duck`
+/// name → AccountId → route pipeline (the route plane plus the `.duck` handle
+/// plane absorbed from the retired `duckdns` module). Both planes are chain-
+/// scoped, so the per-network chain id rides `__config`. Revision 3: the
+/// merged snapshot folds the handle registry into the route snapshot — a
+/// state-schema break from the routes-only revision 2 (beta re-genesis, no
+/// shim).
 fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     genesis_config_wasm(
         GATEWAY_MODULE_ID,
         GATEWAY_WASM_COMPONENT,
         &[("chain_id", bindings.identity_chain_id.as_bytes())],
         "gateway",
+        3,
     )
 }
 
@@ -520,6 +514,7 @@ fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
         GOVERNANCE_WASM_COMPONENT,
         &[("invite", bindings.invite)],
         "governance",
+        2,
     )
 }
 
@@ -544,7 +539,6 @@ struct ProductionModules {
     tagging: WasmModule,
     tasks: WasmModule,
     identity: WasmModule,
-    duckdns: WasmModule,
     gateway: WasmModule,
     inbox: WasmModule,
     files: Files,
@@ -576,7 +570,6 @@ impl ProductionModules {
             Box::new(self.tagging),
             Box::new(self.tasks),
             Box::new(self.identity),
-            Box::new(self.duckdns),
             Box::new(self.gateway),
             Box::new(self.inbox),
             Box::new(self.files),
@@ -680,10 +673,11 @@ pub(super) async fn genesis_host(
         // member-gated binds via valset, and account display names have this
         // single canonical owner.
         identity: genesis_identity_wasm(bindings),
-        duckdns: genesis_duckdns_wasm(),
-        // Identity-signed, monotonic gateway routes. DuckDNS owns optional
-        // human names, Files owns DuckFS bytes, and loopback ports stay local.
-        // adapter-ported; the chain id rides its GENESIS CONFIG.
+        // the MERGED gateway: the whole `.duck` name → AccountId → route
+        // pipeline in ONE module — the route plane PLUS the optional human-name
+        // handle plane absorbed from the retired `duckdns` module. Files owns
+        // DuckFS bytes, loopback ports stay local. adapter-ported; the chain id
+        // rides its GENESIS CONFIG.
         gateway: genesis_gateway_wasm(bindings),
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
@@ -844,12 +838,6 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
 
-    let mut duckdns = genesis_duckdns_wasm();
-    let (bytes, root) = snapshot_of(DUCKDNS_MODULE_ID)?;
-    duckdns
-        .install(bytes, root)
-        .map_err(|e| format!("duckdns install: {e}"))?;
-
     let mut gateway = genesis_gateway_wasm(bindings);
     let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID)?;
     gateway
@@ -917,7 +905,6 @@ pub(super) async fn restore_host(
         tagging,
         tasks,
         identity,
-        duckdns,
         gateway,
         inbox,
         files,
@@ -1180,12 +1167,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("identity install: {e}"))?;
 
-    let (bytes, root) = snapshot_of(DUCKDNS_MODULE_ID).await?;
-    let mut duckdns = genesis_duckdns_wasm();
-    duckdns
-        .install(&bytes, root)
-        .map_err(|e| format!("duckdns install: {e}"))?;
-
     let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID).await?;
     let mut gateway = genesis_gateway_wasm(bindings);
     gateway
@@ -1275,7 +1256,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         tagging,
         tasks,
         identity,
-        duckdns,
         gateway,
         inbox,
         files,
@@ -1349,7 +1329,7 @@ mod tests {
         // fail-closed like every other historical schema).
         assert_eq!(
             crate::config::hex_bytes(&pre_clients_state_schema_fingerprint()),
-            "53e5b47824b4221907a9936ffacbf34a92619cd482d48471211421220ba6ed7b"
+            "dd152ef8d6c71bd6b4a771b2afa65239c1cb61a118a7cbe0f9c30d631cae1096"
         );
         assert_eq!(
             classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 0),

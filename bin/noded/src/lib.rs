@@ -1018,7 +1018,6 @@ mod tests {
             "files",
             "saga",
             "identity",
-            "duckdns",
             "gateway",
             "kv",
             "valset",
