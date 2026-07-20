@@ -586,10 +586,6 @@ fn proposal_progress(proposal: &governance::ProposalView, members: &[Vec<u8>]) -
     }
     let total: u64 = powers.values().sum();
     match proposal.voting_rule {
-        governance::VotingRule::DynamicValidatorMajority => {
-            let required = total / 2 + 1;
-            (yes, required, yes >= required)
-        }
         governance::VotingRule::Threshold { required_yes } => {
             (yes, required_yes, yes >= required_yes)
         }

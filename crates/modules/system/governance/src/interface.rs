@@ -107,10 +107,6 @@ pub enum VoterKind {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VotingRule {
-    /// Inert: reachable only for a proposal restored from a pre-share snapshot
-    /// (no current network emits it). Uses the validator set current at
-    /// execution. Pending removal with the `electorate: None` path.
-    DynamicValidatorMajority,
     /// Pass once `yes_power >= required_yes`; this covers validator-set
     /// snapshots and structural proposals requiring two thirds of all shares.
     Threshold { required_yes: u64 },
@@ -184,8 +180,8 @@ pub struct ProposalView {
     /// ballots by validator-node key or account id, per `voter_kind`.
     pub votes: Vec<(Vec<u8>, bool)>,
     pub voter_kind: VoterKind,
-    /// the proposal-time power snapshot. empty only for a proposal restored
-    /// from a pre-share snapshot (inert; no current network emits it).
+    /// the proposal-time power snapshot — every proposal freezes its electorate
+    /// when it is opened.
     pub electorate: Vec<(Vec<u8>, u64)>,
     pub voting_rule: VotingRule,
 }
