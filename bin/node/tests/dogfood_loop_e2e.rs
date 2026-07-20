@@ -583,9 +583,20 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
         "run 1 replies in the issue channel"
     );
 
-    let run1_oid = poll_until("branch agent/item-1 to be born", FINALIZE, || {
-        branch_tip(&cluster, 0, WORK_BRANCH)
-    });
+    let run1_oid = {
+        let deadline = std::time::Instant::now() + FINALIZE;
+        loop {
+            if let Some(oid) = branch_tip(&cluster, 0, WORK_BRANCH) {
+                break oid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "branch {WORK_BRANCH} never born;\n{}",
+                cluster.all_log_tails(80)
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
     assert_ne!(run1_oid, dev_tip, "the run pushed a NEW commit");
 
     // the provider ran in a REAL worktree: DETACHED at the pinned dev tip

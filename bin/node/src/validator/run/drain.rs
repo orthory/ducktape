@@ -45,6 +45,7 @@ impl ValidatorRuntime<'_> {
             label,
             peers,
             checkpoint_blocks,
+            sync_lease,
             stream_hub,
             index,
             blobs,
@@ -485,7 +486,19 @@ impl ValidatorRuntime<'_> {
                             Ok(Some(fc))
                                 if prev_ckpt.0.is_none_or(|h| fc.height >= h)
                         );
-                        if floor_passed
+                        let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
+                        if floor_passed && lease_active {
+                            // a syncer is actively pulling from this node:
+                            // pruning now would yank its boundary away and put
+                            // it on the rebootstrap treadmill. defer — the
+                            // next checkpoint prunes once the lease lapses.
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                node = %label,
+                                reason = "sync_lease_active",
+                                "oplog prune deferred"
+                            );
+                        } else if floor_passed
                             && let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await
                         {
                             eprintln!("[node {label}] oplog prune failed: {e}");
