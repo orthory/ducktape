@@ -54,7 +54,7 @@ use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 15] = [
+const MODULE_IDS: [&str; 14] = [
     "chat",
     "saga",
     "dispatch",
