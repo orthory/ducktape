@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, oneshot, watch};
 
 use airlock::attest::{self, AttestMode, Measurement};
+use airlock::verify::{SnpProduct, SnpRoots, TdxRoots, TrustRoots, VcekSource};
 use airlock::client::Gateway;
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -998,11 +999,13 @@ impl AnthropicAuth {
             Measurement::from_hex(&cfg.measurement).map_err(|e| format!("airlock measurement: {e}"))?;
         // `base` is the host the broker POSTs to: the gateway itself (local) or
         // the browser-gateway that routes the overlay hop (remote).
-        let (gateway, base) = match cfg.gateway {
-            AirlockGateway::Local { url } => (Gateway::local(url.clone()), url),
-            AirlockGateway::Remote { handle, via } => (Gateway::remote(handle, via.clone()), via),
+        let (gateway, base) = match &cfg.gateway {
+            AirlockGateway::Local { url } => (Gateway::local(url.clone()), url.clone()),
+            AirlockGateway::Remote { handle, via } => {
+                (Gateway::remote(handle.clone(), via.clone()), via.clone())
+            }
         };
-        let seal_pk = verify_gateway(&gateway, mode, &expected).await?;
+        let seal_pk = verify_gateway(&gateway, &cfg, mode, &expected).await?;
         let token = gateway
             .open_session(&seal_pk, &cfg.sub)
             .await
@@ -1037,6 +1040,12 @@ struct AirlockConfig {
     measurement: String,
     attest: String,
     sub: String,
+    /// attest=snp: the pinned AMD platform generation (parsed at config time).
+    snp_product: Option<SnpProduct>,
+    /// attest=snp: an out-of-band VCEK (file READ at config time); KDS otherwise.
+    snp_vcek: Option<VcekSource>,
+    /// attest=tdx: collateral endpoint override; Intel PCS otherwise.
+    pccs_url: Option<String>,
 }
 
 impl AirlockConfig {
@@ -1074,21 +1083,39 @@ impl AirlockConfig {
                              forgeable) or a real TEE vendor ('tdx'/'snp')"
                 .into()));
         };
+        // Typed at the boundary: THIS is the one place `DUCKTAPE_AIRLOCK_*`
+        // env is read, so misconfig fails here, not mid-verify.
+        let snp_product = match env_nonempty("DUCKTAPE_AIRLOCK_SNP_PRODUCT") {
+            Some(p) => match p.parse::<SnpProduct>() {
+                Ok(p) => Some(p),
+                Err(e) => return Some(Err(format!("airlock SNP product: {e}"))),
+            },
+            None => None,
+        };
+        let snp_vcek = match env_nonempty("DUCKTAPE_AIRLOCK_SNP_VCEK") {
+            Some(path) => match std::fs::read(&path) {
+                Ok(der) => Some(VcekSource::Der(der)),
+                Err(e) => return Some(Err(format!("airlock read DUCKTAPE_AIRLOCK_SNP_VCEK: {e}"))),
+            },
+            None => None,
+        };
         Some(Ok(Self {
             gateway,
             measurement,
             attest,
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
+            snp_product,
+            snp_vcek,
+            pccs_url: env_nonempty("DUCKTAPE_AIRLOCK_PCCS_URL"),
         }))
     }
 }
 
-/// Fetch + verify the gateway quote and return the attested seal key. Mock is
-/// wired here; tdx/snp verification needs the node's vendor verifier (dcap-qvl /
-/// AMD KDS chain) and is not pulled into the host broker, so those modes are
-/// refused rather than trusted unverified (mirrors `airlock-broker`).
+/// Fetch + verify the gateway quote and return the attested seal key, via the
+/// real vendor verifier (`airlock::verify`) against pinned Intel/AMD roots.
 async fn verify_gateway(
     gateway: &Gateway,
+    cfg: &AirlockConfig,
     mode: AttestMode,
     expected: &Measurement,
 ) -> Result<[u8; 32], String> {
@@ -1101,14 +1128,46 @@ async fn verify_gateway(
             attest::mock_verify(&quote, expected).map_err(|e| format!("airlock verify: {e}"))?
         }
         AttestMode::Tdx | AttestMode::Snp => {
-            return Err(format!(
-                "airlock --attest {} verification is not wired into the host broker yet; use \
-                 mock or run the vendor verifier at the node integration",
-                mode.as_str()
-            ));
+            let roots = trust_roots(cfg, mode)?;
+            airlock::verify::verify_quote(&quote, expected, &roots)
+                .await
+                .map_err(|e| format!("airlock verify: {e}"))?
         }
     };
     Ok(attest::split_report_data(&report_data).0)
+}
+
+/// Production: pinned roots assembled from the ALREADY-PARSED typed config
+/// (the Intel root lives inside dcap-qvl, the AMD ARK/ASK inside the sev
+/// builtins — nothing here can swap a trust anchor). Tests: an injected
+/// override, compiled OUT of non-test builds, so an in-process test enclave
+/// is verified through the real verify path.
+fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<TrustRoots, String> {
+    #[cfg(test)]
+    if let Some(roots) = test_trust_roots().lock().unwrap().clone() {
+        return Ok(roots);
+    }
+    match mode {
+        AttestMode::Tdx => Ok(TrustRoots::Tdx(TdxRoots { pccs_url: cfg.pccs_url.clone() })),
+        AttestMode::Snp => {
+            let product = cfg.snp_product.ok_or_else(|| {
+                "airlock attest=snp requires DUCKTAPE_AIRLOCK_SNP_PRODUCT (milan|genoa|turin)"
+                    .to_string()
+            })?;
+            let vcek = cfg.snp_vcek.clone().unwrap_or(VcekSource::Kds);
+            SnpRoots::amd(product, vcek)
+                .map(|r| TrustRoots::Snp(Box::new(r)))
+                .map_err(|e| format!("airlock SNP roots: {e}"))
+        }
+        AttestMode::Mock => Err("mock has no trust roots".into()),
+    }
+}
+
+#[cfg(test)]
+fn test_trust_roots() -> &'static std::sync::Mutex<Option<TrustRoots>> {
+    static ROOTS: std::sync::OnceLock<std::sync::Mutex<Option<TrustRoots>>> =
+        std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// Resolve the Anthropic upstream: a verified airlock gateway when configured
@@ -2213,20 +2272,41 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// ONE test enclave (measures `0x11`×48) shared by every airlock test in
+    /// this file, so the parallel tests all agree on the injected trust roots.
+    /// Its minted chain verifies through the REAL SNP verifier — only under
+    /// its own roots, never under the AMD builtins.
+    fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
+        static ENCLAVE: std::sync::OnceLock<Arc<airlock::testkit::SnpTestEnclave>> =
+            std::sync::OnceLock::new();
+        ENCLAVE.get_or_init(|| {
+            let m = Measurement([0x11; attest::MRTD_LEN]);
+            let enclave = Arc::new(airlock::testkit::SnpTestEnclave::new(&m).unwrap());
+            // Route the broker's verify path at the enclave's roots. Set once,
+            // same value from every test — no cross-test races.
+            *test_trust_roots().lock().unwrap() = Some(enclave.roots());
+            enclave
+        })
+    }
+
     /// Boot an in-process airlock gateway (measures `0x11`×48) pointed at
     /// `upstream`, and return its base URL.
     async fn boot_airlock_gateway(upstream: &str) -> String {
-        let (app, vendor) = airlock::server::build(airlock::server::GatewayConfig {
-            attest: "mock".into(),
-            measurement: Some("11".repeat(attest::MRTD_LEN)),
-            anthropic_base: upstream.into(),
-            oauth_token_url: format!("{upstream}/oauth/token"),
-            oauth_client_id: "test-client".into(),
-            session_ttl_secs: 3600,
-            max_requests: 100,
-        })
+        let (app, vendor) = airlock::server::build_with_quoter(
+            airlock::server::GatewayConfig {
+                attest: "snp".into(),
+                measurement: None,
+                anthropic_base: upstream.into(),
+                oauth_token_url: format!("{upstream}/oauth/token"),
+                oauth_client_id: "test-client".into(),
+                session_ttl_secs: 3600,
+                max_requests: 100,
+            },
+            "snp",
+            test_enclave().quoter(),
+        )
         .unwrap();
-        assert_eq!(vendor, "mock");
+        assert_eq!(vendor, "snp");
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -2243,12 +2323,16 @@ mod tests {
         let upstream = airlock_mock_anthropic().await;
         let gateway_url = boot_airlock_gateway(&upstream).await;
 
-        // Credential Provider: verify the gateway quote, then seal + upload the
+        // Credential Provider: verify the gateway quote through the REAL SNP
+        // verifier (under the test enclave's roots), then seal + upload the
         // refresh token (the broker never holds it — the gateway does, sealed).
         let gw = Gateway::local(gateway_url.clone());
         let (quote, _vendor) = gw.fetch_quote().await.unwrap();
         let expected = Measurement::from_hex(&meas).unwrap();
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
             &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
@@ -2261,8 +2345,11 @@ mod tests {
         let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig {
             gateway: AirlockGateway::Local { url: gateway_url },
             measurement: meas,
-            attest: "mock".into(),
+            attest: "snp".into(),
             sub: "test-sub".into(),
+            snp_product: None, // the test roots override supplies the chain
+            snp_vcek: None,
+            pccs_url: None,
         })
         .await
         .unwrap();
@@ -2302,8 +2389,11 @@ mod tests {
         let refused = AnthropicAuth::airlock(AirlockConfig {
             gateway: AirlockGateway::Local { url: gateway_url },
             measurement: "22".repeat(attest::MRTD_LEN),
-            attest: "mock".into(),
+            attest: "snp".into(),
             sub: "test-sub".into(),
+            snp_product: None,
+            snp_vcek: None,
+            pccs_url: None,
         })
         .await;
         assert!(
