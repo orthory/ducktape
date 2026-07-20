@@ -29,6 +29,10 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 const BIND_RETRY: Duration = Duration::from_secs(3);
 const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle ceiling between BODY reads from a loopback upstream. A live SSE feed
+/// emits events/keepalives well inside this; a silent-forever upstream would
+/// otherwise pin its accept permit (16 total) and its serve task for good.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ERROR_BYTES: usize = 512;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
@@ -582,12 +586,15 @@ async fn proxy_loopback(
     let port = routes.port(&head.name).ok_or_else(|| {
         GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
     })?;
-    // Connect-scoped deadline only: a TOTAL timeout would kill long streamed
-    // (SSE) bodies. The head is still deadline-bound by serve_proxy_stream.
+    // Connect + per-read deadlines only: a TOTAL timeout would kill long
+    // streamed (SSE) bodies, but a silent-forever upstream must not pin its
+    // accept permit — the idle read timeout reclaims it. The head is still
+    // deadline-bound by serve_proxy_stream.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(PROXY_IO_TIMEOUT)
+        .read_timeout(BODY_IDLE_TIMEOUT)
         .build()
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
     let method = reqwest::Method::from_bytes(head.method.as_http_str().as_bytes())

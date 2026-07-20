@@ -64,10 +64,18 @@ pub struct GatewayResponse {
 
 /// Collect a streamed body to completion — the buffered-by-contract consumers
 /// (the JSON proxy lane) and tests use this; the streaming door does not.
+/// Hard-bounded at the buffered ceiling: an unbounded (cap-0 SSE) route
+/// collected here must not become a single-request node OOM.
 pub async fn collect_body(body: &mut GatewayBody) -> Result<Vec<u8>, GatewayFailure> {
     let mut out = Vec::new();
     while let Some(item) = body.recv().await {
-        out.extend_from_slice(&item?);
+        let chunk = item?;
+        if out.len().saturating_add(chunk.len()) as u64 > gateway::MAX_RESPONSE_BODY_BYTES {
+            return Err(GatewayFailure::Unavailable(
+                "response exceeds the buffered-lane ceiling (use the streaming door)".into(),
+            ));
+        }
+        out.extend_from_slice(&chunk);
     }
     Ok(out)
 }
