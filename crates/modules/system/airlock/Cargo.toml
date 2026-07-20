@@ -19,7 +19,7 @@ path = "src/lib.rs"
 client = ["dep:reqwest"]
 # The gateway HTTP service (airlock::server), used by airlock-gateway and the
 # in-process e2e test. Off by default so the pure core stays IO/async-free.
-server = ["dep:reqwest", "dep:axum", "dep:tokio"]
+server = ["dep:reqwest", "dep:axum", "dep:tokio", "dep:tokio-stream", "dep:futures-util"]
 # Real quote verification: TDX via dcap-qvl (Intel root pinned in-crate), SNP
 # via the AMD VCEK chain (sev crate, crypto_nossl). reqwest for PCS/KDS fetch.
 verify = ["dep:dcap-qvl", "dep:sev", "dep:reqwest"]
@@ -48,6 +48,8 @@ p384 = { version = "0.13", optional = true }
 rsa = { version = "0.9", features = ["sha2"], optional = true }
 x509-cert = { version = "0.2", features = ["builder"], optional = true }
 rand = { version = "0.8", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
 
 [dev-dependencies]
 # The fixture test names dcap-qvl types (QuoteCollateralV3, Quote) directly.

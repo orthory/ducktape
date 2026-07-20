@@ -166,6 +166,123 @@ async fn a_forged_gateway_cannot_mint_a_token_the_client_opens() {
 }
 
 #[tokio::test]
+async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
+    use airlock::bodyseal::{self, OpenedItem};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Upstream asserts it receives the EXACT plaintext body — proving the
+    // enclave (and nowhere else) unsealed the request.
+    let saw_plaintext = Arc::new(AtomicBool::new(false));
+    let seen = saw_plaintext.clone();
+    let app = Router::new()
+        .route("/oauth/token", post(oauth))
+        .route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+                    if !got.starts_with("Bearer acc-") {
+                        return (StatusCode::UNAUTHORIZED, format!("got {got:?}")).into_response();
+                    }
+                    if body.as_ref() != br#"{"secret":"prompt"}"# {
+                        return (StatusCode::BAD_REQUEST, "upstream saw non-plaintext body")
+                            .into_response();
+                    }
+                    seen.store(true, Ordering::SeqCst);
+                    ([("content-type", "text/event-stream")], "data: SEALED-OK\n\n")
+                        .into_response()
+                }
+            }),
+        )
+        .with_state(Arc::new(MockUpstream::default()));
+    // The state is unused by these closures but keeps Router typing uniform.
+    let upstream = spawn(app).await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
+        refresh_token: "ref-seed".into(),
+    })
+    .await
+    .unwrap();
+
+    let (token, keys) = gw.open_session_sealed(&seal_pk, "test-sub").await.unwrap();
+    let sealed_body = bodyseal::seal_request(&keys, br#"{"secret":"prompt"}"#);
+    assert!(
+        !sealed_body.windows(6).any(|w| w == b"prompt"),
+        "the wire body must not contain the plaintext"
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1)
+        .header("content-type", "application/json")
+        .body(sealed_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/octet-stream",
+        "the outer response is opaque ciphertext"
+    );
+    let wire = resp.bytes().await.unwrap();
+    assert!(
+        !wire.windows(9).any(|w| w == b"SEALED-OK"),
+        "the wire response must not contain the plaintext"
+    );
+    let mut opener = bodyseal::StreamOpener::new(&keys);
+    let items = opener.feed(&wire).unwrap();
+    assert!(opener.finished(), "the sealed stream must end with the Final marker");
+    let plaintext: Vec<u8> = items
+        .iter()
+        .filter_map(|item| match item {
+            OpenedItem::Data(data) => Some(data.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(String::from_utf8(plaintext).unwrap().contains("SEALED-OK"));
+    assert!(matches!(&items[0], OpenedItem::Head(ct) if ct == "text/event-stream"));
+    assert!(saw_plaintext.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_sealed_session_refuses_a_plaintext_body() {
+    let upstream = boot_upstream().await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
+    gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
+        refresh_token: "ref-seed".into(),
+    })
+    .await
+    .unwrap();
+    let (token, _keys) = gw.open_session_sealed(&seal_pk, "test-sub").await.unwrap();
+
+    // A plaintext body on a sealed session = what a bearer thief can produce.
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body(r#"{"stolen":"bearer"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a stolen bearer without the body key must be useless"
+    );
+}
+
+#[tokio::test]
 async fn build_seeded_uses_the_initial_credential_without_upload() {
     use std::sync::atomic::{AtomicU64, Ordering};
     // The credential is seeded at build (the node-embed path) — no /credential

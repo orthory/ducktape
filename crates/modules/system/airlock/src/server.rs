@@ -21,6 +21,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
 use crate::attest::{self, AttestMode};
+use crate::bodyseal;
 use crate::handshake;
 use crate::seal::{self, SealKeypair};
 use crate::token::{self, Claims};
@@ -364,6 +365,45 @@ async fn proxy_inner(
         *rem -= 1;
     }
 
+    // Sealed-body session: re-derive the handshake keys statelessly from the
+    // claims' ephemeral pk, unseal the request, and REFUSE plaintext — a
+    // stolen bearer alone (visible to path hosts) cannot produce a sealable
+    // body. A plaintext session must not send the seal header.
+    let seal_keys = if claims.seal {
+        let eph = BASE64
+            .decode(&claims.eph)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            .ok_or_else(|| AppErr(StatusCode::UNAUTHORIZED, "bad eph in claims".into()))?;
+        Some(handshake::enclave_session_keys(&st.seal_kp, &eph))
+    } else {
+        None
+    };
+    let sealed_request = headers
+        .get(bodyseal::SEAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(bodyseal::SEAL_V1);
+    let body = match (&seal_keys, sealed_request) {
+        (Some(keys), true) => Bytes::from(
+            bodyseal::open_request(keys, &body)
+                .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
+        ),
+        (Some(_), false) if !body.is_empty() => {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: sealed session requires a sealed body".into(),
+            ));
+        }
+        (Some(_), false) => body,
+        (None, true) => {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: session was not opened for sealed bodies".into(),
+            ));
+        }
+        (None, false) => body,
+    };
+
     // Ensure a fresh access token, then swap session token -> real credential.
     let stale = st
         .oauth
@@ -393,7 +433,7 @@ async fn proxy_inner(
     for (name, value) in headers.iter() {
         if matches!(
             name.as_str(),
-            "authorization" | "host" | "content-length" | "accept-encoding"
+            "authorization" | "host" | "content-length" | "accept-encoding" | "x-airlock-body-seal"
         ) {
             continue;
         }
@@ -407,12 +447,53 @@ async fn proxy_inner(
 
     let status = resp.status();
     let ct = resp.headers().get("content-type").cloned();
-    let mut builder = Response::builder().status(status.as_u16());
-    if let Some(v) = ct {
-        builder = builder.header("content-type", v);
-    }
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
+    let Some(keys) = seal_keys else {
+        // Plaintext session: passthrough, streamed.
+        let mut builder = Response::builder().status(status.as_u16());
+        if let Some(v) = ct {
+            builder = builder.header("content-type", v);
+        }
+        return builder
+            .body(Body::from_stream(resp.bytes_stream()))
+            .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")));
+    };
+
+    // Sealed session: re-seal the upstream stream chunk by chunk. The inner
+    // content-type rides the sealed head chunk; the outer body is opaque. An
+    // upstream error mid-stream ends WITHOUT the final marker — the broker
+    // sees authenticated truncation, never a silent clean EOF.
+    let inner_ct = ct
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys);
+    let head_chunk = sealer.seal_head(&inner_ct);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        use futures_util::StreamExt as _;
+        let mut opening = salt;
+        opening.extend(head_chunk);
+        if tx.send(Ok(Bytes::from(opening))).await.is_err() {
+            return;
+        }
+        let mut upstream = resp.bytes_stream();
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if tx.send(Ok(Bytes::from(sealer.seal_chunk(&chunk)))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return, // no Final marker -> authenticated truncation
+            }
+        }
+        let _ = tx.send(Ok(Bytes::from(sealer.seal_final()))).await;
+    });
+    Response::builder()
+        .status(status.as_u16())
+        .header("content-type", "application/octet-stream")
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
         .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
 }
 
