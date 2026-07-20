@@ -339,9 +339,9 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         message["message"].is_null(),
         "the aborted post left no message: {message}"
     );
-    let tasks = sim.query("tasks", serde_json::json!("list"));
+    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
     assert_eq!(
-        tasks["tasks"].as_array().map(Vec::len),
+        tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
         "no task survived the abort: {tasks}"
     );
@@ -510,7 +510,7 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
     // `main` gets a real head oid.
     sim.submit_ok(
         "forge",
-        serde_json::json!({ "commit": { "path": "README.md", "content": "hi", "message": "init" } }),
+        serde_json::json!({ "commit": { "repo": "default", "path": "README.md", "content": "hi", "message": "init" } }),
         None,
     );
     let head = sim.query("forge", serde_json::json!("head"))["head"]
@@ -524,6 +524,7 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
     let error = sim.submit_rejected(
         "forge",
         serde_json::json!({ "push_refs": {
+            "repo": "default",
             "updates": [{ "ref_name": "main", "prev_oid": vec![0u8; 20], "new_oid": head_bytes }],
             "pack_digest": vec![0u8; 32],
         }}),
@@ -539,6 +540,7 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
     sim.submit_ok(
         "forge",
         serde_json::json!({ "push_refs": {
+            "repo": "default",
             "updates": [{ "ref_name": "feature/x", "prev_oid": null, "new_oid": head_bytes }],
             "pack_digest": vec![0u8; 32],
         }}),
@@ -563,12 +565,12 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
     // from the born branch, review it against `head`, and read the pin back.
     sim.submit_ok(
         "forge",
-        serde_json::json!({ "open_pr": { "title": "ship it", "source_branch": "feature/x", "target_branch": "main" } }),
+        serde_json::json!({ "open_pr": { "repo": "default", "title": "ship it", "source_branch": "feature/x", "target_branch": "main" } }),
         Some("author"),
     );
     sim.submit_ok(
         "forge",
-        serde_json::json!({ "submit_review": { "number": 1, "verdict": "comment", "body": "lgtm", "commit_oid": head, "comments": [] } }),
+        serde_json::json!({ "submit_review": { "repo": "default", "number": 1, "verdict": "comment", "body": "lgtm", "commit_oid": head, "comments": [] } }),
         Some("reviewer"),
     );
     let item = sim.query(

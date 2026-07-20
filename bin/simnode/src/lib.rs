@@ -152,7 +152,7 @@ use valset::Valset;
 /// exact set, so status/roots and query targets match what the app expects of a
 /// daemon. the sim-parity conformance lane pins this list against noded; do not
 /// change it without also changing the daemon.
-const BASE_MODULE_IDS: [&str; 15] = [
+const BASE_MODULE_IDS: [&str; 14] = [
     "chat",
     "saga",
     "dispatch",
