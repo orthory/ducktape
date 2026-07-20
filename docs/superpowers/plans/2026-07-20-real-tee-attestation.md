@@ -6,7 +6,7 @@
 
 **Architecture:** One shared verifier module `airlock::verify` (feature `verify`) holds both vendor verifiers behind a `TrustRoots` value whose production constructors hard-pin the Intel/AMD roots. The gateway server gains a `Quoter` injection seam so in-process tests on non-TEE hardware mint an SNP-format quote signed by a test chain (`airlock::testkit`, feature `testkit`) and verify it through the REAL verify path with test roots — a caller injecting fake roots only fools itself. Mock is deleted last, compiler-guided.
 
-**Tech Stack:** `sev = 8.0` (`snp` + `crypto_nossl`: pure-RustCrypto AMD chain verify, builtin ARK/ASK), `dcap-qvl = 0.3` (`rustcrypto` backend, Intel root pinned in-crate, ships TDX quote+collateral sample fixtures), `p384`/`rsa`/`x509-cert` 0.2 (testkit chain minting), reqwest (KDS/PCCS fetch).
+**Tech Stack:** `sev = 8.0` (`snp` + `crypto_nossl`: pure-RustCrypto AMD chain verify, builtin ARK/ASK), `dcap-qvl = 0.5` (latest — USER DIRECTIVE mid-execution: latest versions for security deps; `rustcrypto` backend, Intel root pinned in-crate, `CollateralClient::with_default_http(INTEL_PCS_URL)` replaces 0.3's `get_collateral_from_pcs`), `p384 0.13`/`rsa 0.9`/`x509-cert 0.2` (pinned to sev 8's own graph so cert types stay identical — bump when sev bumps), reqwest (KDS fetch).
 
 **Spec:** `docs/superpowers/specs/2026-07-20-real-tee-attestation-design.md`
 
@@ -35,7 +35,7 @@
 - Create: `crates/system/airlock/tests/verify_snp.rs`
 
 **Interfaces (produced, relied on by every later task):**
-- `airlock::verify::{TrustRoots, TdxRoots, SnpRoots, SnpProduct, VcekSource}` — all `Clone`.
+- `airlock::verify::{TrustRoots, TdxRoots, SnpRoots, SnpProduct, VcekSource}` — all `Clone`, **plain data**. USER FEEDBACK (mid-execution): the airlock lib NEVER reads env — each binary parses its config ONCE at its boundary into these typed values (capability-host's `AirlockConfig::from_env` stays the single env reader; the bins parse flags) and hands them in. No `TrustRoots::from_env` in the lib.
 - `airlock::verify::verify_quote(quote: &[u8], expected: &Measurement, roots: &TrustRoots) -> anyhow::Result<[u8; REPORT_DATA_LEN]>` (async).
 - `airlock::testkit::SnpTestEnclave` with `new(&Measurement) -> Result<Self>`, `quote(&self, &[u8; 64]) -> Result<Vec<u8>>`, `roots(&self) -> TrustRoots`.
 
@@ -673,7 +673,7 @@ Note: `Measurement` needs its tuple field public for the test's `Measurement(...
 
 Run: `CARGO_INCREMENTAL=0 cargo test -p airlock --features verify --test verify_tdx 2>&1 | tail -5` → 4 passed. (If `real_tdx_quote_verifies…` fails on a CRL time bound, nudge `NOW` toward 1750329147+1 day and update the fixtures README.)
 
-Add to `verify.rs` a `#[cfg(test)] mod tests` covering `SnpProduct::from_str` (milan/genoa/turin/garbage) and that `TrustRoots::from_env(AttestMode::Snp)` without `DUCKTAPE_AIRLOCK_SNP_PRODUCT` errors mentioning the var name (set/remove env inside one test; do not parallel-race other env tests — mark `#[test]` single like existing env-dependent tests in the crate, or assert via a child fn taking `Option<String>` instead of env: prefer refactoring `from_env` into `from_env_values(mode, product: Option<String>, vcek_path: Option<String>, pccs: Option<String>)` with `from_env` as a thin env-reading wrapper, then test the value-taking fn — no env races).
+`verify.rs` already carries a `#[cfg(test)] mod tests` covering `SnpProduct::from_str` (milan/genoa/turin/garbage). Env-shape tests belong to capability-host's `AirlockConfig` (Task 4), the single env boundary — the lib has no env surface to test.
 
 Run: `CARGO_INCREMENTAL=0 cargo test -p airlock --features testkit 2>&1 | tail -3` → all green.
 
@@ -853,7 +853,7 @@ async fn verify_gateway(
             attest::mock_verify(&quote, expected).map_err(|e| format!("airlock verify: {e}"))?
         }
         AttestMode::Tdx | AttestMode::Snp => {
-            let roots = trust_roots(mode).map_err(|e| format!("airlock trust roots: {e}"))?;
+            let roots = trust_roots(cfg, mode)?;
             airlock::verify::verify_quote(&quote, expected, &roots)
                 .await
                 .map_err(|e| format!("airlock verify: {e}"))?
@@ -861,16 +861,43 @@ async fn verify_gateway(
     };
     Ok(attest::split_report_data(&report_data).0)
 }
+```
 
-/// Production: pinned roots selected by the vendor env. Tests: an injected
-/// override (compiled OUT of non-test builds) so an in-process test enclave is
-/// verified through the real verify path.
-fn trust_roots(mode: AttestMode) -> anyhow::Result<airlock::verify::TrustRoots> {
+(`verify_gateway` gains a `cfg: &AirlockConfig` parameter; its one call site in the
+`AnthropicAuth` setup already holds the parsed config.)
+
+```rust
+
+/// Production: pinned roots assembled from the ALREADY-PARSED typed config.
+/// Tests: an injected override (compiled OUT of non-test builds) so an
+/// in-process test enclave is verified through the real verify path.
+///
+/// Config-boundary rule (user feedback): `AirlockConfig::from_env` is the ONE
+/// place that reads `DUCKTAPE_AIRLOCK_*` env — it grows typed fields
+/// `snp_product: Option<SnpProduct>` (parsed at config time),
+/// `snp_vcek: Option<VcekSource>` (file READ at config time -> `VcekSource::Der`),
+/// `pccs_url: Option<String>` — so misconfig fails at config time and
+/// everything downstream is plain typed data.
+fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<airlock::verify::TrustRoots, String> {
+    use airlock::verify::{SnpRoots, TdxRoots, TrustRoots, VcekSource};
     #[cfg(test)]
     if let Some(roots) = test_trust_roots().lock().unwrap().clone() {
         return Ok(roots);
     }
-    airlock::verify::TrustRoots::from_env(mode)
+    match mode {
+        AttestMode::Tdx => Ok(TrustRoots::Tdx(TdxRoots { pccs_url: cfg.pccs_url.clone() })),
+        AttestMode::Snp => {
+            let product = cfg.snp_product.ok_or_else(|| {
+                "airlock attest=snp requires DUCKTAPE_AIRLOCK_SNP_PRODUCT (milan|genoa|turin)"
+                    .to_string()
+            })?;
+            let vcek = cfg.snp_vcek.clone().unwrap_or(VcekSource::Kds);
+            SnpRoots::amd(product, vcek)
+                .map(TrustRoots::Snp)
+                .map_err(|e| format!("airlock SNP roots: {e}"))
+        }
+        AttestMode::Mock => Err("mock has no trust roots".into()),
+    }
 }
 
 #[cfg(test)]

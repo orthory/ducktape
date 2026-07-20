@@ -115,11 +115,57 @@ pub async fn verify_quote(
 // ===== Intel TDX ============================================================
 
 async fn verify_tdx(
-    _quote: &[u8],
-    _expected: &Measurement,
-    _roots: &TdxRoots,
+    quote: &[u8],
+    expected: &Measurement,
+    roots: &TdxRoots,
 ) -> Result<[u8; REPORT_DATA_LEN]> {
-    bail!("tdx verify lands in task 2")
+    use dcap_qvl::collateral::{CollateralClient, INTEL_PCS_URL};
+    let pccs = roots.pccs_url.as_deref().unwrap_or(INTEL_PCS_URL);
+    let collateral = CollateralClient::with_default_http(pccs)
+        .map_err(|e| anyhow!("collateral client: {e:?}"))?
+        .fetch(quote)
+        .await
+        .map_err(|e| anyhow!("fetch TDX collateral: {e:?}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    verify_tdx_at(quote, &collateral, now, expected)
+}
+
+/// TCB statuses accepted as "trustworthy enough to release a credential to".
+/// Anything else (OutOfDate, ConfigurationNeeded, Revoked, …) fails closed
+/// with the status named.
+const TDX_OK_STATUSES: &[&str] = &["UpToDate", "SWHardeningNeeded"];
+
+/// Pure verification against provided collateral at a given time — the
+/// fixture-testable core. Full dcap chain: PCK -> Intel root (pinned inside
+/// dcap-qvl), TCB info, QE identity, quote signature.
+pub fn verify_tdx_at(
+    quote: &[u8],
+    collateral: &dcap_qvl::QuoteCollateralV3,
+    now_secs: u64,
+    expected: &Measurement,
+) -> Result<[u8; REPORT_DATA_LEN]> {
+    let verified = dcap_qvl::verify::rustcrypto::verify(quote, collateral, now_secs)
+        .map_err(|e| anyhow!("dcap verify: {e:?}"))?;
+    if !TDX_OK_STATUSES.contains(&verified.status.as_str()) {
+        bail!(
+            "TDX TCB status {:?} not accepted (advisories: {:?})",
+            verified.status,
+            verified.advisory_ids
+        );
+    }
+    let td = verified.report.as_td10().context("quote is not a TDX TD10 report")?;
+    if td.mr_td != expected.0 {
+        bail!(
+            "MRTD mismatch: {} != expected {} (not the audited image)",
+            hex::encode(td.mr_td),
+            expected.to_hex()
+        );
+    }
+    let mut rd = [0u8; REPORT_DATA_LEN];
+    rd.copy_from_slice(&td.report_data[..REPORT_DATA_LEN]);
+    Ok(rd)
 }
 
 // ===== AMD SEV-SNP ==========================================================

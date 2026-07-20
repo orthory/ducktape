@@ -49,3 +49,52 @@ async fn garbage_quote_is_rejected() {
     let enclave = SnpTestEnclave::new(&meas(0x11)).unwrap();
     assert!(verify_quote(&[0u8; 32], &meas(0x11), &enclave.roots()).await.is_err());
 }
+
+// ===== real AMD-signed fixture (vendored from virtee/sev test data) =========
+
+use airlock::verify::{SnpProduct, SnpRoots, TrustRoots, VcekSource};
+
+const MILAN_REPORT: &[u8] = include_bytes!("fixtures/snp_report_milan.bin");
+const MILAN_VCEK: &[u8] = include_bytes!("fixtures/snp_vcek_milan.der");
+/// MEASUREMENT offset in the SNP report (AMD SEV-SNP ABI, Table 22).
+const MEASUREMENT_OFF: usize = 0x90;
+
+fn milan_measurement() -> Measurement {
+    let mut m = [0u8; MRTD_LEN];
+    m.copy_from_slice(&MILAN_REPORT[MEASUREMENT_OFF..MEASUREMENT_OFF + MRTD_LEN]);
+    Measurement(m)
+}
+
+fn milan_roots(product: SnpProduct) -> TrustRoots {
+    TrustRoots::Snp(Box::new(
+        SnpRoots::amd(product, VcekSource::Der(MILAN_VCEK.to_vec())).unwrap(),
+    ))
+}
+
+#[tokio::test]
+async fn real_amd_signed_milan_report_verifies_against_builtin_roots() {
+    let rd = verify_quote(MILAN_REPORT, &milan_measurement(), &milan_roots(SnpProduct::Milan))
+        .await
+        .unwrap();
+    assert_eq!(rd.len(), 64);
+}
+
+#[tokio::test]
+async fn milan_report_is_rejected_under_genoa_roots() {
+    // The right product generation is part of the pinned trust: Genoa's
+    // ARK/ASK must refuse the Milan VCEK.
+    let err = verify_quote(MILAN_REPORT, &milan_measurement(), &milan_roots(SnpProduct::Genoa)).await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn tampered_real_report_is_rejected() {
+    let mut quote = MILAN_REPORT.to_vec();
+    quote[MEASUREMENT_OFF] ^= 1;
+    // Measurement check aside, the signature over [0, 0x2a0) must break: use
+    // the tampered measurement as the EXPECTED one so only the signature gates.
+    let mut m = milan_measurement().0;
+    m[0] ^= 1;
+    let err = verify_quote(&quote, &Measurement(m), &milan_roots(SnpProduct::Milan)).await;
+    assert!(err.is_err());
+}
