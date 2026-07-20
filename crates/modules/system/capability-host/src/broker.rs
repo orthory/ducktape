@@ -874,6 +874,10 @@ struct AirlockSession {
     seal_pk: [u8; 32],
     sub: String,
     token: String,
+    /// Handshake keys for the body AEAD (`bodyseal`): requests are sealed,
+    /// responses unsealed, so path hosts (incl. the publisher node outside the
+    /// enclave) see only ciphertext and a stolen bearer alone is useless.
+    keys: airlock::handshake::SessionKeys,
 }
 
 struct OauthTokens {
@@ -1006,8 +1010,8 @@ impl AnthropicAuth {
             }
         };
         let seal_pk = verify_gateway(&gateway, &cfg, mode, &expected).await?;
-        let token = gateway
-            .open_session(&seal_pk, &cfg.sub)
+        let (token, keys) = gateway
+            .open_session_sealed(&seal_pk, &cfg.sub)
             .await
             .map_err(|e| format!("airlock handshake: {e}"))?;
         let messages_url = format!("{}/v1/messages", base.trim_end_matches('/'));
@@ -1017,6 +1021,7 @@ impl AnthropicAuth {
                 seal_pk,
                 sub: cfg.sub,
                 token,
+                keys,
             }),
             messages_url,
         ))
@@ -1217,9 +1222,10 @@ impl AnthropicBrokerState {
         let AnthropicAuth::Airlock(session) = &mut *auth else {
             return false;
         };
-        match session.gateway.open_session(&session.seal_pk, &session.sub).await {
-            Ok(fresh) => {
-                session.token = fresh;
+        match session.gateway.open_session_sealed(&session.seal_pk, &session.sub).await {
+            Ok((token, keys)) => {
+                session.token = token;
+                session.keys = keys;
                 true
             }
             Err(_) => {
@@ -1450,6 +1456,17 @@ async fn send_upstream(
     }
     let request = {
         let auth = state.auth.lock().await;
+        // Airlock sessions are sealed-body: encrypt the child's plaintext under
+        // the handshake body key (fresh nonce per attempt, so the 401-retry
+        // path re-seals safely) and mark the request. The enclave refuses
+        // plaintext on this token, so the bearer alone grants nothing.
+        let request = if let AnthropicAuth::Airlock(session) = &*auth {
+            request
+                .body(airlock::bodyseal::seal_request(&session.keys, body))
+                .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
+        } else {
+            request
+        };
         auth.authorize(request)
     };
     request.send().await
@@ -1517,6 +1534,34 @@ async fn forward_messages(
             }
         };
     }
+    // Airlock sealed session: the enclave's proxied response is an opaque
+    // sealed stream — unseal to plain SSE for the unmodified sandbox. Gateway
+    // error bodies (minted before the proxy path) are plaintext and relay as
+    // errors below; a plaintext SUCCESS on a sealed session can only be a
+    // forgery by a path host, so it is refused.
+    let seal_keys = {
+        let auth = state.auth.lock().await;
+        match &*auth {
+            AnthropicAuth::Airlock(session) => Some(session.keys.clone()),
+            _ => None,
+        }
+    };
+    if let Some(keys) = seal_keys {
+        let sealed_outer = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/octet-stream"));
+        if sealed_outer {
+            return relay_sealed(upstream, keys, permit).await;
+        }
+        if upstream.status().is_success() {
+            return response(
+                StatusCode::BAD_GATEWAY,
+                "airlock: sealed session received a plaintext success body",
+            );
+        }
+    }
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // Pass the upstream content-type through (text/event-stream for SSE). The
@@ -1555,6 +1600,113 @@ async fn forward_messages(
             .insert(axum::http::header::CONTENT_TYPE, content_type);
     }
     response
+}
+
+/// Unseal an enclave-sealed response stream: open chunks incrementally, take
+/// the inner content-type from the sealed head, forward Data payloads as they
+/// open, and turn a stream that ends WITHOUT the authenticated Final marker
+/// into an ABORT (never a clean EOF the sandbox would trust).
+async fn relay_sealed(
+    mut upstream: reqwest::Response,
+    keys: airlock::handshake::SessionKeys,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response<Body> {
+    use airlock::bodyseal::OpenedItem;
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut opener = airlock::bodyseal::StreamOpener::new(&keys);
+    let mut pending: Vec<Bytes> = Vec::new();
+    let mut inner_ct: Option<String> = None;
+    // The response head can only be built once the sealed head chunk opens.
+    while inner_ct.is_none() {
+        match upstream.chunk().await {
+            Ok(Some(chunk)) => {
+                let items = match opener.feed(&chunk) {
+                    Ok(items) => items,
+                    Err(e) => return response(StatusCode::BAD_GATEWAY, &format!("airlock: {e}")),
+                };
+                for item in items {
+                    match item {
+                        OpenedItem::Head(ct) => inner_ct = Some(ct),
+                        OpenedItem::Data(data) => pending.push(Bytes::from(data)),
+                        OpenedItem::Final => {}
+                    }
+                }
+            }
+            Ok(None) => {
+                return response(
+                    StatusCode::BAD_GATEWAY,
+                    "airlock: sealed response ended before its head",
+                );
+            }
+            Err(e) => return response(StatusCode::BAD_GATEWAY, &format!("airlock: {e}")),
+        }
+    }
+    let finished_at_head = opener.finished();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let _keep = permit; // concurrency slot held for the stream's life
+        let mut seen = 0usize;
+        for data in pending {
+            seen = seen.saturating_add(data.len());
+            if tx.send(Ok(data)).await.is_err() {
+                return;
+            }
+        }
+        if finished_at_head {
+            return;
+        }
+        loop {
+            match upstream.chunk().await {
+                Ok(Some(chunk)) => {
+                    let items = match opener.feed(&chunk) {
+                        Ok(items) => items,
+                        Err(e) => {
+                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                            return;
+                        }
+                    };
+                    for item in items {
+                        if let OpenedItem::Data(data) = item {
+                            seen = seen.saturating_add(data.len());
+                            if seen > MAX_RESPONSE_BYTES {
+                                let _ = tx
+                                    .send(Err(std::io::Error::other(
+                                        "run broker response byte budget exhausted",
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            if tx.send(Ok(Bytes::from(data))).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if opener.finished() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::other("airlock: sealed response truncated")))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                    return;
+                }
+            }
+        }
+    });
+    let mut resp = Response::new(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ));
+    *resp.status_mut() = status;
+    if let Some(value) = inner_ct.and_then(|ct| HeaderValue::from_str(&ct).ok()) {
+        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    resp
 }
 
 fn json_response(status: StatusCode, reply: &IdleControlReply) -> Response<Body> {
@@ -2394,16 +2546,19 @@ mod tests {
     }
 
     /// A recording upstream that captures the headers of one request.
-    async fn recording_gateway() -> (String, Arc<Mutex<Option<HeaderMap>>>) {
+    async fn recording_gateway() -> (String, Arc<Mutex<Option<(HeaderMap, Vec<u8>)>>>) {
         let seen = Arc::new(Mutex::new(None));
         let sink = seen.clone();
         let app = Router::new().route(
             "/v1/messages",
-            post(move |headers: HeaderMap| {
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
                 let sink = sink.clone();
                 async move {
-                    *sink.lock().unwrap() = Some(headers);
-                    (StatusCode::OK, "ok")
+                    *sink.lock().unwrap() = Some((headers, body.to_vec()));
+                    // A recording tap has no enclave to seal a success body;
+                    // return a non-success so the sealed session relays it as
+                    // a plaintext ERROR (a plaintext SUCCESS would be refused).
+                    (StatusCode::BAD_GATEWAY, "tap")
                 }
             }),
         );
@@ -2423,11 +2578,14 @@ mod tests {
         // able to inject `x-duck-authority` and redirect the session-token-bearing
         // request to an attacker-chosen overlay node.
         let (via, seen) = recording_gateway().await;
+        let enclave = airlock::seal::SealKeypair::generate();
+        let (_eph, keys) = airlock::handshake::client_handshake(&enclave.public_bytes());
         let auth = AnthropicAuth::Airlock(AirlockSession {
             gateway: Gateway::remote("broker.duck".into(), via.clone()),
             seal_pk: [0u8; 32],
             sub: "s".into(),
             token: "sess-tok".into(),
+            keys,
         });
         let broker =
             RunBroker::start_anthropic_with(auth, Reachability::Loopback, format!("{via}/v1/messages"))
@@ -2439,13 +2597,15 @@ mod tests {
             .bearer_auth(&broker.endpoint.run_bearer)
             .header("x-duck-authority", "attacker.duck")
             .header("origin", "https://attacker.duck")
-            .body("{}")
+            .body(r#"{"secret":"prompt"}"#)
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        // The tap answers a plaintext non-success; the sealed session relays
+        // it as the error it is (a plaintext SUCCESS would be refused).
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
 
-        let headers = seen.lock().unwrap().take().unwrap();
+        let (headers, body) = seen.lock().unwrap().take().unwrap();
         let authorities: Vec<&str> = headers
             .get_all("x-duck-authority")
             .iter()
@@ -2458,5 +2618,12 @@ mod tests {
         );
         // the session token rode the request (we replaced auth, not dropped it).
         assert_eq!(headers["authorization"], "Bearer sess-tok");
+        // The path host sees CIPHERTEXT: the sealed body carries the marker
+        // header and none of the child's plaintext.
+        assert_eq!(headers[airlock::bodyseal::SEAL_HEADER], airlock::bodyseal::SEAL_V1);
+        assert!(
+            !body.windows(6).any(|w| w == b"prompt"),
+            "the child's plaintext must never reach a path host"
+        );
     }
 }

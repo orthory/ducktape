@@ -768,6 +768,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
  "tracing",
 ]
