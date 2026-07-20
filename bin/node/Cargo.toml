@@ -150,7 +150,7 @@ tempfile = "3"
 # the airlock client through the overlay — proving the cred!=compute remote
 # topology (LoopbackHttp route + allow_authorization). axum serves the in-process
 # mock upstream the gateway swaps into.
-airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server"] }
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server", "verify", "testkit"] }
 axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
