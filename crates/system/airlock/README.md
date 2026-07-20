@@ -124,7 +124,9 @@ is real and fails closed — there is NO mock:
   file) must chain to the **builtin AMD ARK/ASK for the operator-pinned product
   generation** (`--snp-product milan|genoa|turin`), and the report signature
   must verify under it. VLEK-signed reports are refused. The measurement is then
-  compared to the pinned value.
+  compared to the pinned value. Known gap (deliberate, tracked with the
+  hardware TODO): no TCB-freshness gate — AMD issues VCEKs for older TCBs, so
+  firmware rollback is not detected; TDX gets freshness from its TCB status.
 
 `--attest` has **no default** anywhere. Trust roots are plain typed data in the
 lib (`TrustRoots`); each binary parses its flags/env ONCE at its boundary — the

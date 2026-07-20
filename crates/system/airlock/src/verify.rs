@@ -195,6 +195,12 @@ pub fn verify_tdx_at(
 
 // ===== AMD SEV-SNP ==========================================================
 
+/// NOTE (deliberate asymmetry with TDX): there is no TCB-freshness gate here.
+/// AMD keeps issuing VCEKs for older TCBs, so a chain-valid report can attest
+/// firmware at a rolled-back patch level; pinning a minimum `reported_tcb` per
+/// product is the follow-up hardening, tracked with the real-hardware
+/// validation TODO. TDX gets its freshness gate for free from the collateral's
+/// TCB status.
 async fn verify_snp(
     quote: &[u8],
     expected: &Measurement,
@@ -263,11 +269,18 @@ async fn fetch_vcek_kds(report: &AttestationReport, product: SnpProduct) -> Resu
         return Ok(hit);
     }
 
-    let resp = reqwest::get(&url).await.context("fetch VCEK from AMD KDS")?;
+    // Drop the reqwest source: its Display can carry the URL (= chip id),
+    // which must reach neither the log ring nor a CLI's stderr backtrace.
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|_| anyhow!("fetch VCEK from AMD KDS: transport error (URL withheld)"))?;
     if !resp.status().is_success() {
         bail!("AMD KDS refused the VCEK request: HTTP {}", resp.status());
     }
     let der = resp.bytes().await.context("read VCEK body")?.to_vec();
+    // Only cache a body that actually parses as a certificate — a transient
+    // 200-with-garbage must not wedge every later verify until restart.
+    Certificate::from_der(&der).map_err(|e| anyhow!("KDS returned a non-certificate body: {e}"))?;
     cache.lock().unwrap().insert(url, der.clone());
     Ok(der)
 }
