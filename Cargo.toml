@@ -85,8 +85,6 @@ members = [
     "crates/examples/directory", "crates/examples/greeter",
     # labs — consensus modules deliberately absent from every genesis set
     "crates/labs",
-    # view — shell-side runtime for packaged module views (.quack)
-    "crates/module-view-host",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
