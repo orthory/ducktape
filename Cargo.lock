@@ -4607,13 +4607,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "module-view-host"
-version = "0.1.0"
-dependencies = [
- "sha2",
-]
-
-[[package]]
 name = "moka"
 version = "0.12.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
