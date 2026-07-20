@@ -53,11 +53,12 @@ For a real cross-machine deployment:
 **Credential node** (runs the enclave gateway; `<handle>` is its duckdns name):
 
 ```sh
-MEAS=<48-byte audited-image hex>            # mock: any 48-byte hex, pinned everywhere
-airlock-gateway serve --attest mock --measurement $MEAS \
-    --listen 127.0.0.1:9100 --anthropic-base https://api.anthropic.com
+MEAS=<48-byte audited-image hex>            # pinned from the audited CVM image
+airlock-gateway serve --attest snp --listen 127.0.0.1:9100 \
+    --anthropic-base https://api.anthropic.com     # must run IN a TDX/SNP guest
 # seal the credential (static bearer = no rotation; see "Credential" above)
-airlock-cli seal --attest mock --measurement $MEAS --host http://127.0.0.1:9100 \
+airlock-cli seal --attest snp --snp-product milan --measurement $MEAS \
+    --host http://127.0.0.1:9100 \
     --credentials ~/.claude/.credentials.json --cred-kind bearer
 # register the loopback port node-locally
 ducktape-node gateway-route-bind --workspace <node-workspace> --label airlock --port 9100
@@ -75,7 +76,10 @@ credential is held locally:
 export DUCKTAPE_AIRLOCK_REMOTE=airlock.<handle>.duck
 export DUCKTAPE_AIRLOCK_VIA=$(curl -s http://<this-node-rpc>/v1/gateway/browser | jq -r .base)
 export DUCKTAPE_AIRLOCK_MEASUREMENT=$MEAS
-export DUCKTAPE_AIRLOCK_ATTEST=mock
+export DUCKTAPE_AIRLOCK_ATTEST=snp                  # or tdx
+export DUCKTAPE_AIRLOCK_SNP_PRODUCT=milan           # snp: pin the platform generation
+# optional transport overrides: DUCKTAPE_AIRLOCK_SNP_VCEK=<der file> (air-gapped),
+# DUCKTAPE_AIRLOCK_PCCS_URL=<pccs> (tdx)
 # then run a claude agent through capability-host (podman) as usual — the run's
 # /v1/messages flow crosses the overlay to the enclave.
 ```
@@ -104,17 +108,43 @@ the token.
   *current* access token without invalidating the token chain its owner is still
   using — the safe way to point a run at a real credential.
 
-## Per-vendor attestation (`--attest mock|tdx|snp|auto`)
+## Per-vendor attestation (`--attest tdx|snp`, gateway also `auto`)
 
 Quote generation is vendor-generic via `configfs-tsm` (`tdx_guest`/`sev_guest`;
-`auto` probes the provider). Verification is vendor-specific: `mock` (always),
-`tdx` (`dcap-qvl`, `airlock-cli --features tdx`), `snp` (structural; AMD KDS/VCEK
-verify is the follow-up, `--features snp`, fails closed).
+`auto` probes the provider). Verification (`airlock::verify`, feature `verify`)
+is real and fails closed — there is NO mock:
+
+- **`tdx`** — full DCAP verification via `dcap-qvl` (PCK chain anchored to the
+  Intel root pinned inside the crate, TCB info, QE identity, quote signature).
+  Collateral comes from Intel PCS (`--pccs-url`/`DUCKTAPE_AIRLOCK_PCCS_URL`
+  overrides the endpoint, never the root). TCB status must be `UpToDate` or
+  `SWHardeningNeeded`; anything else is refused by name.
+- **`snp`** — full AMD chain via the `sev` crate (`crypto_nossl`): the VCEK
+  (fetched from AMD KDS by chip id + reported TCB, cached; or supplied as a DER
+  file) must chain to the **builtin AMD ARK/ASK for the operator-pinned product
+  generation** (`--snp-product milan|genoa|turin`), and the report signature
+  must verify under it. VLEK-signed reports are refused. The measurement is then
+  compared to the pinned value. Known gap (deliberate, tracked with the
+  hardware TODO): no TCB-freshness gate — AMD issues VCEKs for older TCBs, so
+  firmware rollback is not detected; TDX gets freshness from its TCB status.
+
+`--attest` has **no default** anywhere. Trust roots are plain typed data in the
+lib (`TrustRoots`); each binary parses its flags/env ONCE at its boundary — the
+airlock crate itself never reads the environment.
+
+**Dev boxes without TEE silicon** use `airlock::testkit` (feature `testkit`):
+`SnpTestEnclave` mints a real-format SNP report signed by a freshly generated
+test chain, the server takes it via the `build_with_quoter` seam, and clients
+verify it through the REAL verifier under `enclave.roots()`. A minted quote
+never verifies under the AMD builtins, so nothing here weakens production —
+injecting fake roots only fools the injector. Real vendored fixtures
+(`tests/fixtures/`: an Intel-signed TDX quote + collateral, an AMD-signed Milan
+report + VCEK) prove the production chains offline.
 
 ## Test
 
 ```sh
-cargo test -p airlock --features server,client
+cargo test -p airlock --features server,client,verify,testkit
 ```
 
 Unit tests cover the crypto (seal/handshake/token/attest); the in-process e2e
@@ -125,7 +155,9 @@ static `Bearer` credential is used without any OAuth refresh).
 
 ### Verified end-to-end against the real API
 
-The whole chain has run live (mock attest, real `api.anthropic.com`):
+The whole chain has run live (2026-07-19, real `api.anthropic.com`, with the
+since-deleted mock attest standing in for the quote — the custody path is
+unchanged; a TEE-silicon rerun is the standing hardware TODO):
 
 1. `airlock-gateway serve --anthropic-base https://api.anthropic.com` (loopback).
 2. `airlock-cli seal --credentials ~/.claude/.credentials.json --cred-kind bearer`
@@ -146,8 +178,10 @@ temp bearer.
 its credential SOURCE instead of a host-held credential: set
 `DUCKTAPE_AIRLOCK_GATEWAY=<url>` (local) or `DUCKTAPE_AIRLOCK_REMOTE=<handle>.duck`
 + `DUCKTAPE_AIRLOCK_VIA=<browser-gw>` (remote), plus `DUCKTAPE_AIRLOCK_MEASUREMENT`
-(the pinned audited-image hex) and `DUCKTAPE_AIRLOCK_ATTEST` (`mock` — dev only,
-forgeable — or `tdx`/`snp`; no default, so nobody silently gets mock). The run's
+(the pinned audited-image hex) and `DUCKTAPE_AIRLOCK_ATTEST` (`tdx`/`snp`; no
+default). For snp, `DUCKTAPE_AIRLOCK_SNP_PRODUCT` pins the platform generation
+(optional `DUCKTAPE_AIRLOCK_SNP_VCEK` file, `DUCKTAPE_AIRLOCK_PCCS_URL` for
+tdx) — all parsed once at the config boundary. The run's
 `claude` traffic is then verified, handshaked, and forwarded to the gateway with
 a scoped session token (re-minted on a gateway 401). The local path is exercised
 end-to-end by in-process tests (`cargo test -p capability-host airlock`),

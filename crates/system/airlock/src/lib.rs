@@ -12,6 +12,10 @@ mod aead;
 pub mod attest;
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "testkit")]
+pub mod testkit;
+#[cfg(feature = "verify")]
+pub mod verify;
 pub mod handshake;
 pub mod seal;
 #[cfg(feature = "server")]

@@ -75,26 +75,29 @@ to protect the token handoff; body-level AEAD / SSE-over-overlay streaming is th
 transport slice (deferred, see Out of scope). For loopback the key is
 belt-and-suspenders; for remote it is the load-bearing attestation binding.
 
-## Per-vendor TEE, feature-flagged
+## Per-vendor TEE — real verification only
 
-`attest::AttestMode { Mock, Tdx, Snp }`, selected by `--attest`
-(`mock|tdx|snp|auto`); `auto` probes the platform.
+**Superseded (2026-07-20) by
+`docs/superpowers/specs/2026-07-20-real-tee-attestation-design.md`: mock
+attestation is DELETED.** `attest::AttestMode { Tdx, Snp }`, selected by
+`--attest` (`tdx|snp`, gateway also `auto`); no default anywhere.
 
 - **Quote generation (host) is vendor-generic** via Linux `configfs-tsm`
   (`/sys/kernel/config/tsm/report/*`): write `inblob` = REPORTDATA(64), read
   `outblob` = raw report/quote. The kernel `provider` attribute is `tdx_guest`
   on Intel TDX and `sev_guest` on AMD SEV-SNP. `auto` reads `provider` to pick
-  the vendor. No feature flag needed to *generate* — the sysfs path is the same.
-- **Verification (client) is vendor-specific**, behind feature flags so the
-  default build stays dependency-light:
-  - `mock` — always, well-known issuer key, runs anywhere.
-  - `tdx` (`--features tdx`, `dcap-qvl`) — verify against Intel PCS collateral,
-    read MRTD from the TD10 report.
-  - `snp` (`--features snp`) — verify the SEV-SNP attestation report against the
-    AMD VCEK/KDS chain, read the launch measurement. PoC ships the structural
-    parse + measurement compare with the cert-chain verify stubbed and clearly
-    marked (mirrors how the TDX arm started), because this box has neither TDX
-    nor SEV-SNP silicon (Ryzen 5950X: only `sme`).
+  the vendor. Tests inject a quoter (`server::build_with_quoter` +
+  `testkit::SnpTestEnclave`) instead of faking a vendor.
+- **Verification (client) is real and shared** — `airlock::verify` (feature
+  `verify`), used by capability-host, airlock-broker, and airlock-cli alike:
+  - `tdx` — full DCAP verify via `dcap-qvl` (Intel root pinned in-crate; PCS
+    collateral; TCB status must be UpToDate/SWHardeningNeeded).
+  - `snp` — full AMD chain via the `sev` crate (`crypto_nossl`): KDS/file VCEK
+    chained to the builtin ARK/ASK of the pinned `--snp-product`
+    (milan|genoa|turin), report signature under the VCEK, VLEK refused.
+  Trust roots are plain typed data; each binary parses flags/env once at its
+  boundary. Both chains are proven offline by real vendor-signed fixtures
+  (`crates/system/airlock/tests/fixtures/`).
 - Measurement sizes coincide: TDX MRTD and SNP launch measurement are both
   SHA-384 (48 bytes), REPORTDATA is 64 bytes — the wire is vendor-agnostic on
   sizes. `AttestationResponse` carries `vendor` so the client selects the
@@ -139,7 +142,7 @@ once on a gateway 401. `authorize()` stamps the session token (and
 `apply_auth_env` (the child still gets `ANTHROPIC_BASE_URL` + the opaque run
 bearer). Covered by an in-process test: sandbox → broker → gateway → mock
 upstream, asserting the credential swap. Vendor verify (tdx/snp) in the host
-broker is refused for now (mock only), matching `airlock-broker`.
+broker is REAL (`airlock::verify` — 2026-07-20), matching `airlock-broker`.
 
 **Wired (route-publish + reachability).** The remote topology needs no airlock or
 node code beyond what ships. The compute side reaches the gateway through the
@@ -177,8 +180,9 @@ a solution.
 
 ## TODO — full 2-node + TEE validation
 
-Everything below the protocol is proven with mock attestation and a mock
-upstream; the single-node self-serve test (`airlock_gateway_e2e.rs`) is green and
+Everything below the protocol is proven with testkit-minted quotes checked by
+the REAL chain verifier (plus real vendor-signed fixtures) and a mock upstream;
+the single-node self-serve test (`airlock_gateway_e2e.rs`) is green and
 the 2-node overlay test is written. The **full-spec** end-to-end run — two real
 nodes AND real hardware attestation AND the real Anthropic API — is deferred
 because it needs hardware this dev box does not have. To close it:
@@ -190,11 +194,10 @@ because it needs hardware this dev box does not have. To close it:
 2. **Real TEE attestation on the credential node.** Run `airlock-gateway serve
    --attest tdx` (or `snp`) inside an Intel TDX / AMD SEV-SNP confidential VM
    (real `configfs-tsm` quote gen; a bare TDX guest also needs QGS/vsock
-   quote-gen wired — Azure/GCP CVMs provide it). The compute node must run the
-   matching **vendor verifier** — `dcap-qvl` (TDX) / AMD KDS/VCEK (SNP). NOTE:
-   the capability-host broker currently **refuses** `tdx`/`snp` (mock only,
-   `verify_gateway` in `broker.rs`); full-spec first wires the vendor verify into
-   that host path (the airlock-cli client already has it, behind features).
+   quote-gen wired — Azure/GCP CVMs provide it). The compute node's vendor
+   verifier is ALREADY WIRED (2026-07-20: `airlock::verify` in capability-host /
+   airlock-broker / airlock-cli, real TDX DCAP + SNP VCEK chains, fail-closed);
+   what remains hardware-bound is silicon-backed quote GENERATION.
 3. **Real Anthropic API + the static bearer** (PR #681): seal the current
    subscription access token (`--cred-kind bearer`, no rotation) and point
    `--anthropic-base` at `https://api.anthropic.com`. Note a *short* turn fits the

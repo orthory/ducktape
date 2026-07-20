@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
@@ -57,7 +57,7 @@ struct ServeArgs {
     /// The local node's browser-gateway base URL that routes duck:// authorities
     /// onto the overlay. Required with --remote.
     via: Option<String>,
-    /// mock | tdx | snp — how to verify the gateway quote.
+    /// tdx | snp — how to verify the gateway quote. No default.
     attest: String,
     /// Expected audited-image measurement (48-byte hex).
     measurement: String,
@@ -71,10 +71,32 @@ fn parse_args() -> Result<ServeArgs> {
         gateway_host: arg_or("--gateway-host", "http://127.0.0.1:9100"),
         remote: arg("--remote"),
         via: arg("--via"),
-        attest: arg_or("--attest", "mock"),
+        attest: arg("--attest").context("--attest is required (tdx|snp)")?,
         measurement: arg("--measurement").context("--measurement is required")?,
         sub: arg_or("--sub", "compute-provider"),
     })
+}
+
+/// Flags -> typed trust roots (tdx/snp only). The roots themselves are pinned
+/// (Intel inside dcap-qvl, AMD ARK/ASK from the sev builtins); flags select the
+/// product and transport (PCCS URL, VCEK file).
+fn resolve_roots(mode: AttestMode) -> Result<airlock::verify::TrustRoots> {
+    use airlock::verify::{SnpProduct, SnpRoots, TdxRoots, TrustRoots, VcekSource};
+    match mode {
+        AttestMode::Tdx => Ok(TrustRoots::Tdx(TdxRoots { pccs_url: arg("--pccs-url") })),
+        AttestMode::Snp => {
+            let product: SnpProduct = arg("--snp-product")
+                .context("--attest snp requires --snp-product milan|genoa|turin")?
+                .parse()?;
+            let vcek = match arg("--snp-vcek") {
+                Some(path) => VcekSource::Der(
+                    std::fs::read(&path).with_context(|| format!("read {path}"))?,
+                ),
+                None => VcekSource::Kds,
+            };
+            Ok(TrustRoots::Snp(Box::new(SnpRoots::amd(product, vcek)?)))
+        }
+    }
 }
 
 struct BrokerState {
@@ -139,23 +161,18 @@ fn random_bearer() -> String {
     hex::encode(secret)
 }
 
-/// Fetch + verify the gateway quote and return the attested seal_pk. Vendor
-/// verification: mock is wired here; tdx/snp verify runs in the full node
-/// integration (the broker on a real compute node reuses the node's verifier),
-/// so this standalone broker refuses them rather than trusting an unverified quote.
+/// Fetch + verify the gateway quote and return the attested seal_pk, via the
+/// real vendor verifier (`airlock::verify`) against pinned Intel/AMD roots.
 async fn attested_seal_pk(
     gateway: &Gateway,
     mode: AttestMode,
     expected: &Measurement,
 ) -> Result<[u8; 32]> {
+    // Roots come from flags alone — resolve BEFORE any network so a bad
+    // --snp-product/--snp-vcek fails fast.
+    let roots = resolve_roots(mode)?;
     let (quote, _vendor) = gateway.fetch_quote().await?;
-    let report_data = match mode {
-        AttestMode::Mock => attest::mock_verify(&quote, expected)?,
-        AttestMode::Tdx | AttestMode::Snp => bail!(
-            "airlock-broker verifies only --attest mock; tdx/snp verification belongs to the node \
-             integration, not this standalone broker"
-        ),
-    };
+    let report_data = airlock::verify::verify_quote(&quote, expected, &roots).await?;
     Ok(attest::split_report_data(&report_data).0)
 }
 
