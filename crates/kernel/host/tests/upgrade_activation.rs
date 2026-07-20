@@ -1,7 +1,7 @@
 //! Phase 6, Task 6.3 — the deterministic, in-block System-origin `Advance`
 //! injection at a finalized activation boundary.
 //!
-//! The host's drain injects EXACTLY ONE `Origin::System` `UpgradeMsg::Advance`
+//! The host's drain injects EXACTLY ONE `Origin::System` lifecycle `Advance`
 //! whenever the committed `upgrade` module holds a pending upgrade that has
 //! reached its `activation_height`. Because it rides the SAME `submit_at` drain
 //! that recovery-replay and state-sync-install also run, the reconciliation
@@ -13,11 +13,11 @@ use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use futures::executor::block_on;
 
-use host::{BASELINE_VERSION, BlockContext, Host, SubmitError};
+use host::{BASELINE_VERSION, BlockContext, Host, LIFECYCLE_MODULE_ID, SubmitError};
 use sdk::{Msg, Origin};
-use upgrade::Upgrade;
-use upgrade::{
-    UpgradeMsg, UpgradeQuery, UpgradeReply, UpgradeStatus, encode_msg, encode_query,
+use lifecycle::{
+    Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply, UpgradeStatus, encode_msg,
+    encode_query,
 };
 use valset::Valset;
 
@@ -33,7 +33,7 @@ fn host_with(members: &[Vec<u8>]) -> Host {
     }
     let mut host = Host::new();
     host.register(Box::new(valset));
-    host.register(Box::new(Upgrade::new("upgrade", "valset")));
+    host.register(Box::new(Lifecycle::new(LIFECYCLE_MODULE_ID, "valset")));
     host
 }
 
@@ -49,8 +49,8 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
 
 fn schedule_msg(name: &str, activation_height: u64, to_version: u32) -> Msg {
     Msg {
-        target: "upgrade".into(),
-        payload: encode_msg(&UpgradeMsg::Schedule {
+        target: LIFECYCLE_MODULE_ID.into(),
+        payload: encode_msg(&LifecycleMsg::ScheduleUpgrade {
             name: name.into(),
             activation_height,
             to_version,
@@ -60,8 +60,8 @@ fn schedule_msg(name: &str, activation_height: u64, to_version: u32) -> Msg {
 
 fn signal_msg(name: &str, to_version: u32) -> Msg {
     Msg {
-        target: "upgrade".into(),
-        payload: encode_msg(&UpgradeMsg::SignalReady {
+        target: LIFECYCLE_MODULE_ID.into(),
+        payload: encode_msg(&LifecycleMsg::UpgradeReady {
             name: name.into(),
             to_version,
             commitment: None,
@@ -70,10 +70,11 @@ fn signal_msg(name: &str, to_version: u32) -> Msg {
 }
 
 fn status(host: &Host) -> UpgradeStatus {
-    let reply = block_on(host.query("upgrade", &encode_query(&UpgradeQuery::Status)))
+    let reply = block_on(host.query(LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus)))
         .expect("status query");
-    match upgrade::decode_reply(&reply).expect("decode status") {
-        UpgradeReply::Status(s) => s,
+    match lifecycle::decode_reply(&reply).expect("decode status") {
+        LifecycleReply::UpgradeStatus(s) => s,
+        other => panic!("expected UpgradeStatus, got {other:?}"),
     }
 }
 
@@ -144,14 +145,14 @@ fn no_injection_below_activation_height() {
 
     submit(&mut host, 0, Origin::System, schedule_msg("n", 10, 2));
     submit(&mut host, 1, Origin::External(m0.clone()), signal_msg("n", 2));
-    let root_before = host.module_root("upgrade");
+    let root_before = host.module_root(LIFECYCLE_MODULE_ID);
 
     // a block at height 9 (< 10): no Advance, no flip, root unmoved.
     submit(&mut host, 9, Origin::External(m0.clone()), signal_msg("n", 2));
     let after = status(&host);
     assert_eq!(after.current_version, 0);
     assert!(after.pending.is_some());
-    assert_eq!(host.module_root("upgrade"), root_before, "root unmoved below H");
+    assert_eq!(host.module_root(LIFECYCLE_MODULE_ID), root_before, "root unmoved below H");
 }
 
 /// INERT before the retrofit: a host WITHOUT the upgrade module registered runs

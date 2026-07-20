@@ -29,9 +29,11 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 const BIND_RETRY: Duration = Duration::from_secs(3);
 const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Idle ceiling between BODY reads from a loopback upstream. A live SSE feed
+/// emits events/keepalives well inside this; a silent-forever upstream would
+/// otherwise pin its accept permit (16 total) and its serve task for good.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_ERROR_BYTES: usize = 512;
-const MAX_PROXY_FRAME_BYTES: usize =
-    gateway::MAX_RESPONSE_BODY_BYTES as usize + gateway::MAX_RESPONSE_HEAD_BYTES + 2;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
 
@@ -105,12 +107,31 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             body,
                             reply,
                         } => {
+                            // The deadline covers everything up to the response
+                            // HEAD; the body streams beyond it (WS precedent).
                             let result = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
                                 if publisher_node == own_node {
-                                    serve_current(
-                                        &commands, &workspace, &own_node, &own_node, &head, &body,
-                                    )
-                                    .await
+                                    // Self-serve rides the SAME frame protocol as
+                                    // the overlay path over a local duplex, so a
+                                    // single-node e2e exercises the real wire.
+                                    let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
+                                    let serve_commands = commands.clone();
+                                    let serve_workspace = workspace.clone();
+                                    let head_for_server = head.clone();
+                                    let body_for_server = body.clone();
+                                    tokio::spawn(async move {
+                                        serve_proxy_stream(
+                                            &serve_commands,
+                                            &serve_workspace,
+                                            &own_node,
+                                            &own_node,
+                                            head_for_server,
+                                            Some(body_for_server),
+                                            server_end,
+                                        )
+                                        .await;
+                                    });
+                                    read_streamed_response(caller_end, max_response_bytes).await
                                 } else {
                                     proxy_remote(
                                         &slot,
@@ -232,29 +253,8 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                     serve_ws(&commands, &workspace, &own_node, &requester.0, &head, stream).await;
                     return;
                 }
-                let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
-                    let body_len = usize::try_from(head.body_len).map_err(|_| {
-                        GatewayFailure::Invalid("gateway proxy: body length overflows usize".into())
-                    })?;
-                    let mut body = vec![0u8; body_len];
-                    stream
-                        .read_exact(&mut body)
-                        .await
-                        .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-                    serve_current(&commands, &workspace, &own_node, &requester.0, &head, &body)
-                        .await
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    Err(GatewayFailure::Unavailable(
-                        "gateway proxy request timed out".into(),
-                    ))
-                });
-                let _ = tokio::time::timeout(
-                    PROXY_IO_TIMEOUT,
-                    write_proxy_response(&mut stream, outcome),
-                )
-                .await;
+                serve_proxy_stream(&commands, &workspace, &own_node, &requester.0, head, None, stream)
+                    .await;
             });
         }
     });
@@ -280,6 +280,8 @@ async fn proxy_remote(
         .open(PeerId(publisher), proxy_flow(), gateway::PROXY_INTENT, meta)
         .await
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+    // The deadline covers the request write + response HEAD; the body pump
+    // streams beyond it.
     tokio::time::timeout(PROXY_IO_TIMEOUT, async {
         stream
             .write_all(body)
@@ -289,10 +291,64 @@ async fn proxy_remote(
             .flush()
             .await
             .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-        read_proxy_response(&mut stream, max_response_bytes).await
+        read_streamed_response(stream, max_response_bytes).await
     })
     .await
     .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
+}
+
+/// One proxied HTTP exchange over a frame-capable stream (the overlay socket
+/// or the self-serve duplex). `body`: `Some` when the caller already holds the
+/// request body (self-serve); `None` reads `head.body_len` bytes off the
+/// stream (overlay). The deadline covers the body read + serve up to the
+/// response HEAD; the body drain streams beyond it.
+async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    commands: &mpsc::Sender<NodeCommand>,
+    workspace: &Path,
+    own_node: &[u8; 32],
+    caller_node: &[u8; 32],
+    head: gateway::ProxyRequestHead,
+    body: Option<Vec<u8>>,
+    mut stream: S,
+) {
+    let outcome = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
+        let body = match body {
+            Some(body) => body,
+            None => {
+                let body_len = usize::try_from(head.body_len).map_err(|_| {
+                    GatewayFailure::Invalid("gateway proxy: body length overflows usize".into())
+                })?;
+                let mut body = vec![0u8; body_len];
+                stream
+                    .read_exact(&mut body)
+                    .await
+                    .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
+                body
+            }
+        };
+        serve_current(commands, workspace, own_node, caller_node, &head, &body).await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(GatewayFailure::Unavailable(
+            "gateway proxy request timed out".into(),
+        ))
+    });
+    let _ = write_proxy_response(&mut stream, outcome).await;
+}
+
+/// Read the response head, then hand the stream to the body pump. Returns AT
+/// the head — the returned `GatewayResponse.body` streams.
+async fn read_streamed_response<S: AsyncRead + Unpin + Send + 'static>(
+    mut stream: S,
+    max_response_bytes: u64,
+) -> Result<GatewayResponse, GatewayFailure> {
+    let mut buf = Vec::new();
+    let head = read_proxy_head(&mut stream, &mut buf).await?;
+    Ok(GatewayResponse {
+        head,
+        body: spawn_body_pump(stream, buf, max_response_bytes),
+    })
 }
 
 /// Caller side of a remote WebSocket upgrade: open the mesh stream to the
@@ -412,8 +468,12 @@ async fn resolve_route(
                 "gateway route is not published".into(),
             )),
         },
-        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
-            "gateway returned an unexpected route-list reply".into(),
+        // a route `Get` must answer with a `Route`; the list and handle-plane
+        // replies (`Resolved`/`Registrations`) are all wrong shapes here.
+        Ok(gateway::GatewayReply::Routes(_))
+        | Ok(gateway::GatewayReply::Resolved(_))
+        | Ok(gateway::GatewayReply::Registrations(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected reply to a route query".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
@@ -526,10 +586,15 @@ async fn proxy_loopback(
     let port = routes.port(&head.name).ok_or_else(|| {
         GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
     })?;
+    // Connect + per-read deadlines only: a TOTAL timeout would kill long
+    // streamed (SSE) bodies, but a silent-forever upstream must not pin its
+    // accept permit — the idle read timeout reclaims it. The head is still
+    // deadline-bound by serve_proxy_stream.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .timeout(PROXY_IO_TIMEOUT)
+        .connect_timeout(PROXY_IO_TIMEOUT)
+        .read_timeout(BODY_IDLE_TIMEOUT)
         .build()
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
     let method = reqwest::Method::from_bytes(head.method.as_http_str().as_bytes())
@@ -575,9 +640,11 @@ async fn proxy_loopback(
         .send()
         .await
         .map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > route.policy.max_response_bytes)
+    let capped = route.policy.max_response_bytes != 0; // 0 = unbounded stream
+    if capped
+        && response
+            .content_length()
+            .is_some_and(|length| length > route.policy.max_response_bytes)
     {
         return Err(GatewayFailure::Unavailable(
             "loopback response exceeds the signed route cap".into(),
@@ -638,24 +705,47 @@ async fn proxy_loopback(
         headers,
     };
     gateway::validate_response_head(&response_head).map_err(GatewayFailure::Unavailable)?;
-    let mut response_body = Vec::new();
-    let mut chunks = response.bytes_stream();
-    while let Some(chunk) = chunks.next().await {
-        let chunk = chunk.map_err(|error| GatewayFailure::Unavailable(error.to_string()))?;
-        if response_body.len().saturating_add(chunk.len()) as u64 > route.policy.max_response_bytes
-        {
-            return Err(GatewayFailure::Unavailable(
-                "loopback response exceeds the signed route cap".into(),
-            ));
+    // Stream the upstream body through a bounded channel with a RUNNING cap
+    // (0 = unbounded, the declared-SSE case). The head returns immediately.
+    let cap = route.policy.max_response_bytes;
+    let is_head_method = head.method == gateway::RouteMethod::Head;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(16);
+    tokio::spawn(async move {
+        if is_head_method {
+            return; // headers only; drop the upstream body
         }
-        response_body.extend_from_slice(&chunk);
-    }
-    if head.method == gateway::RouteMethod::Head {
-        response_body.clear();
-    }
+        let mut chunks = response.bytes_stream();
+        let mut total: u64 = 0;
+        while let Some(chunk) = chunks.next().await {
+            let item = match chunk {
+                Ok(chunk) => {
+                    total = total.saturating_add(chunk.len() as u64);
+                    let over_cap = cap != 0 && total > cap;
+                    if over_cap {
+                        let _ = tx
+                            .send(Err(GatewayFailure::Unavailable(
+                                "loopback response exceeds the signed route cap".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    Ok(chunk)
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(GatewayFailure::Unavailable(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            if tx.send(item).await.is_err() {
+                return; // caller went away; drop the upstream stream
+            }
+        }
+    });
     Ok(GatewayResponse {
         head: response_head,
-        body: response_body,
+        body: rx,
     })
 }
 
@@ -760,9 +850,15 @@ async fn serve_duckfs(
         ],
     };
     gateway::validate_response_head(&response_head).map_err(GatewayFailure::Unavailable)?;
+    // Content responses stay buffered internally; wrap the one blob as a
+    // single-chunk stream (the frame writer re-splits at MAX_CHUNK_BYTES).
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
+    if !bytes.is_empty() {
+        let _ = tx.try_send(Ok(bytes::Bytes::from(bytes)));
+    }
     Ok(GatewayResponse {
         head: response_head,
-        body: bytes,
+        body: rx,
     })
 }
 
@@ -1225,21 +1321,37 @@ async fn read_frame<S: AsyncRead + Unpin>(
     }
 }
 
-/// Publisher → caller: a `ResponseHead`, the body split into `MAX_CHUNK_BYTES`
-/// `BodyChunk`s, then `End`; a failure is a single `Failure` frame instead.
+/// Publisher → caller: a `ResponseHead`, then the body DRAINED from its
+/// channel as `MAX_CHUNK_BYTES` `BodyChunk` frames (flushed per chunk — SSE
+/// latency), then `End`. A pre-head failure is a single `Failure` frame; a
+/// mid-stream failure emits `Failure` after the chunks already sent (the
+/// caller aborts — truncation). The drain deliberately has NO deadline.
 async fn write_proxy_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     outcome: Result<GatewayResponse, GatewayFailure>,
 ) -> std::io::Result<()> {
     match outcome {
-        Ok(response) => {
+        Ok(mut response) => {
             if let Err(error) = gateway::validate_response_head(&response.head) {
                 write_frame(stream, &failure_frame(&GatewayFailure::Unavailable(error))).await?;
                 return stream.flush().await;
             }
             write_frame(stream, &gateway::ProxyFrame::ResponseHead(response.head)).await?;
-            for chunk in response.body.chunks(gateway::MAX_CHUNK_BYTES) {
-                write_frame(stream, &gateway::ProxyFrame::BodyChunk(chunk.to_vec())).await?;
+            stream.flush().await?;
+            while let Some(item) = response.body.recv().await {
+                match item {
+                    Ok(chunk) => {
+                        for piece in chunk.chunks(gateway::MAX_CHUNK_BYTES) {
+                            write_frame(stream, &gateway::ProxyFrame::BodyChunk(piece.to_vec()))
+                                .await?;
+                        }
+                        stream.flush().await?;
+                    }
+                    Err(failure) => {
+                        write_frame(stream, &failure_frame(&failure)).await?;
+                        return stream.flush().await;
+                    }
+                }
             }
             write_frame(stream, &gateway::ProxyFrame::End).await?;
         }
@@ -1248,16 +1360,13 @@ async fn write_proxy_response<S: AsyncWrite + Unpin>(
     stream.flush().await
 }
 
-/// Caller side (buffered): collect body chunks into one `GatewayResponse`,
-/// enforcing the response cap. `max_response_bytes == 0` (unbounded/SSE) is
-/// capped at the buffer ceiling on this buffered path — true streaming lands
-/// with the duck:// viewer.
-async fn read_proxy_response<S: AsyncRead + Unpin>(
+/// Caller side, head only: `ResponseHead` (validated) or the failure that
+/// replaced it. Leftover stream bytes stay in `buf` for the body pump.
+async fn read_proxy_head<S: AsyncRead + Unpin>(
     stream: &mut S,
-    max_response_bytes: u64,
-) -> Result<GatewayResponse, GatewayFailure> {
-    let mut buf = Vec::new();
-    let head = match read_frame(stream, &mut buf).await? {
+    buf: &mut Vec<u8>,
+) -> Result<gateway::ProxyResponseHead, GatewayFailure> {
+    let head = match read_frame(stream, buf).await? {
         gateway::ProxyFrame::ResponseHead(head) => head,
         gateway::ProxyFrame::Failure(failure) => return Err(failure_from(failure)),
         _ => {
@@ -1267,32 +1376,61 @@ async fn read_proxy_response<S: AsyncRead + Unpin>(
         }
     };
     gateway::validate_response_head(&head).map_err(GatewayFailure::Unavailable)?;
-    let cap = if max_response_bytes == 0 {
-        MAX_PROXY_FRAME_BYTES as u64
-    } else {
-        max_response_bytes.min(MAX_PROXY_FRAME_BYTES as u64)
-    };
-    let mut body = Vec::new();
-    loop {
-        match read_frame(stream, &mut buf).await? {
-            gateway::ProxyFrame::BodyChunk(chunk) => {
-                if body.len() as u64 + chunk.len() as u64 > cap {
-                    return Err(GatewayFailure::Unavailable(
-                        "publisher exceeded the response cap".into(),
-                    ));
+    Ok(head)
+}
+
+/// Frame → chunk pump for a streamed response body. Runs until `End`,
+/// `Failure`, overflow of the RUNNING cap (`0` = unbounded — the old buffered
+/// clamp is gone; per-frame size stays codec-bounded), or receiver hangup.
+fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
+    mut stream: S,
+    mut buf: Vec<u8>,
+    max_response_bytes: u64,
+) -> noded::GatewayBody {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(16);
+    tokio::spawn(async move {
+        let mut total: u64 = 0;
+        loop {
+            let frame = match read_frame(&mut stream, &mut buf).await {
+                Ok(frame) => frame,
+                Err(failure) => {
+                    let _ = tx.send(Err(failure)).await;
+                    return;
                 }
-                body.extend_from_slice(&chunk);
-            }
-            gateway::ProxyFrame::End => break,
-            gateway::ProxyFrame::Failure(failure) => return Err(failure_from(failure)),
-            _ => {
-                return Err(GatewayFailure::Unavailable(
-                    "unexpected frame in gateway response body".into(),
-                ));
+            };
+            match frame {
+                gateway::ProxyFrame::BodyChunk(chunk) => {
+                    total = total.saturating_add(chunk.len() as u64);
+                    let over_cap = max_response_bytes != 0 && total > max_response_bytes;
+                    if over_cap {
+                        let _ = tx
+                            .send(Err(GatewayFailure::Unavailable(
+                                "publisher exceeded the response cap".into(),
+                            )))
+                            .await;
+                        return;
+                    }
+                    if tx.send(Ok(bytes::Bytes::from(chunk))).await.is_err() {
+                        return; // caller went away; drop the stream
+                    }
+                }
+                gateway::ProxyFrame::End => return,
+                gateway::ProxyFrame::Failure(failure) => {
+                    let _ = tx.send(Err(failure_from(failure))).await;
+                    return;
+                }
+                _ => {
+                    let _ = tx
+                        .send(Err(GatewayFailure::Unavailable(
+                            "unexpected frame in gateway response body".into(),
+                        )))
+                        .await;
+                    return;
+                }
             }
         }
-    }
-    Ok(GatewayResponse { head, body })
+    });
+    rx
 }
 
 use duckfs_core::to_hex as hex_bytes;
@@ -1300,6 +1438,66 @@ use duckfs_core::to_hex as hex_bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn streamed_response_arrives_and_zero_cap_is_unbounded() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let big = vec![0xABu8; 5 * 1024 * 1024]; // > the old 4 MiB buffered clamp
+        let mut frames =
+            gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+        for chunk in big.chunks(gateway::MAX_CHUNK_BYTES) {
+            frames.extend(
+                gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(chunk.to_vec())).unwrap(),
+            );
+        }
+        frames.extend(gateway::encode_frame(&gateway::ProxyFrame::End).unwrap());
+        tokio::spawn(async move { writer.write_all(&frames).await.unwrap() });
+
+        let mut buf = Vec::new();
+        let got_head = read_proxy_head(&mut reader, &mut buf).await.unwrap();
+        assert_eq!(got_head.status, 200);
+        let mut body = spawn_body_pump(reader, buf, 0);
+        let mut total = Vec::new();
+        while let Some(chunk) = body.recv().await {
+            total.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(total, big, "a 5 MiB body must stream through with cap 0");
+    }
+
+    #[tokio::test]
+    async fn running_cap_aborts_mid_stream() {
+        use tokio::io::AsyncWriteExt as _;
+        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let mut frames =
+            gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+        for _ in 0..4 {
+            frames.extend(
+                gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(vec![0u8; 1024])).unwrap(),
+            );
+        }
+        frames.extend(gateway::encode_frame(&gateway::ProxyFrame::End).unwrap());
+        tokio::spawn(async move { writer.write_all(&frames).await.unwrap() });
+
+        let mut buf = Vec::new();
+        read_proxy_head(&mut reader, &mut buf).await.unwrap();
+        let mut body = spawn_body_pump(reader, buf, 2048);
+        let mut seen = 0usize;
+        let mut aborted = false;
+        while let Some(item) = body.recv().await {
+            match item {
+                Ok(chunk) => seen += chunk.len(),
+                Err(_) => {
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+        assert!(aborted, "exceeding the running cap must surface an error item");
+        assert!(seen <= 2048);
+    }
 
     #[test]
     fn set_cookie_domain_is_scrubbed_to_host_only() {
@@ -1329,26 +1527,44 @@ mod tests {
         );
     }
 
+    /// Round-trip one streamed response over the frame codec and collect it.
+    async fn round_trip(
+        head: gateway::ProxyResponseHead,
+        body: Vec<u8>,
+        cap: u64,
+    ) -> Result<(gateway::ProxyResponseHead, Vec<u8>), GatewayFailure> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(Ok(bytes::Bytes::from(body))).unwrap();
+        drop(tx);
+        let response = GatewayResponse { head, body: rx };
+        let (mut writer, reader) = tokio::io::duplex(1 << 20);
+        let pump = tokio::spawn(async move {
+            let _ = write_proxy_response(&mut writer, Ok(response)).await;
+        });
+        let result = async {
+            let mut streamed = read_streamed_response(reader, cap).await?;
+            let body = noded::collect_body(&mut streamed.body).await?;
+            Ok((streamed.head, body))
+        }
+        .await;
+        let _ = pump.await;
+        result
+    }
+
     #[tokio::test]
     async fn response_codec_is_bounded_and_preserves_safe_metadata() {
-        let response = GatewayResponse {
-            head: gateway::ProxyResponseHead {
-                status: 201,
-                headers: vec![gateway::ProxyHeader {
-                    name: "content-type".into(),
-                    value: "application/json".into(),
-                }],
-            },
-            body: br#"{"ok":true}"#.to_vec(),
+        let head = gateway::ProxyResponseHead {
+            status: 201,
+            headers: vec![gateway::ProxyHeader {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            }],
         };
-        let (mut writer, mut reader) = tokio::io::duplex(4096);
-        write_proxy_response(&mut writer, Ok(response.clone()))
+        let (got_head, got_body) = round_trip(head.clone(), br#"{"ok":true}"#.to_vec(), 1024)
             .await
             .unwrap();
-        assert_eq!(
-            read_proxy_response(&mut reader, 1024).await.unwrap(),
-            response
-        );
+        assert_eq!(got_head, head);
+        assert_eq!(got_body, br#"{"ok":true}"#);
 
         let (mut writer, mut reader) = tokio::io::duplex(2048);
         write_proxy_response(
@@ -1357,8 +1573,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut buf = Vec::new();
         assert!(matches!(
-            read_proxy_response(&mut reader, 0).await,
+            read_proxy_head(&mut reader, &mut buf).await,
             Err(GatewayFailure::Forbidden(detail)) if detail == "audience denied"
         ));
 
@@ -1371,8 +1588,9 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut buf = Vec::new();
         assert!(matches!(
-            read_proxy_response(&mut reader, 0).await,
+            read_proxy_head(&mut reader, &mut buf).await,
             Err(GatewayFailure::Unavailable(detail))
                 if detail == "gateway publisher is unavailable"
         ));
@@ -1383,38 +1601,16 @@ mod tests {
         // A body larger than one chunk is split into multiple BodyChunk frames
         // and reassembled exactly.
         let big = vec![7u8; gateway::MAX_CHUNK_BYTES * 2 + 100];
-        let response = GatewayResponse {
-            head: gateway::ProxyResponseHead {
-                status: 200,
-                headers: vec![],
-            },
-            body: big.clone(),
-        };
-        let (mut writer, mut reader) = tokio::io::duplex(1 << 20);
-        // The writer can outrun the bounded duplex, so drive it concurrently.
-        let pump = tokio::spawn(async move {
-            write_proxy_response(&mut writer, Ok(response)).await.unwrap();
-        });
-        let got = read_proxy_response(&mut reader, (gateway::MAX_CHUNK_BYTES * 3) as u64)
+        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let (_, got_body) = round_trip(head, big.clone(), (gateway::MAX_CHUNK_BYTES * 3) as u64)
             .await
             .unwrap();
-        pump.await.unwrap();
-        assert_eq!(got.body, big);
+        assert_eq!(got_body, big);
 
-        // A body past the caller's cap is rejected mid-stream.
-        let over = GatewayResponse {
-            head: gateway::ProxyResponseHead {
-                status: 200,
-                headers: vec![],
-            },
-            body: vec![1u8; 5000],
-        };
-        let (mut writer, mut reader) = tokio::io::duplex(1 << 20);
-        let pump = tokio::spawn(async move {
-            let _ = write_proxy_response(&mut writer, Ok(over)).await;
-        });
-        let capped = read_proxy_response(&mut reader, 1000).await;
-        let _ = pump.await;
+        // A body past the caller's RUNNING cap is rejected mid-stream (the
+        // head has already arrived; the failure surfaces from the body pump).
+        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let capped = round_trip(head, vec![1u8; 5000], 1000).await;
         assert!(matches!(capped, Err(GatewayFailure::Unavailable(_))));
     }
 
@@ -1829,8 +2025,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let mut response = response;
         assert_eq!(response.head.status, 201);
-        assert_eq!(response.body, br#"{"ok":true}"#);
+        assert_eq!(
+            noded::collect_body(&mut response.body).await.unwrap(),
+            br#"{"ok":true}"#
+        );
         // Set-Cookie now flows back (v1 stripped it).
         let set_cookie = response
             .head
@@ -2019,12 +2219,12 @@ mod tests {
 
     #[tokio::test]
     async fn duckfs_head_verifies_signed_bytes_before_returning_no_body() {
-        let response = serve_content_head(b"safe", b"safe").await.unwrap();
-        assert!(response.body.is_empty());
+        let mut response = serve_content_head(b"safe", b"safe").await.unwrap();
+        assert!(noded::collect_body(&mut response.body).await.unwrap().is_empty());
         assert_eq!(response.head.status, 200);
 
-        let empty = serve_content_head(b"", b"").await.unwrap();
-        assert!(empty.body.is_empty());
+        let mut empty = serve_content_head(b"", b"").await.unwrap();
+        assert!(noded::collect_body(&mut empty.body).await.unwrap().is_empty());
 
         let error = serve_content_head(b"safe", b"evil").await.unwrap_err();
         assert!(matches!(error, GatewayFailure::Forbidden(_)));

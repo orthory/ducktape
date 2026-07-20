@@ -1597,7 +1597,10 @@ mod userkey_verb_tests {
         let gateway::GatewayMsg::SetRoute {
             statement: decoded,
             authorization,
-        } = gateway::decode_msg(json.as_bytes()).unwrap();
+        } = gateway::decode_msg(json.as_bytes()).unwrap()
+        else {
+            panic!("userkey mints a SetRoute");
+        };
         assert_eq!(decoded, statement);
         assert_eq!(authorization.signer, signer.public_key().as_ref());
         assert!(identity::verify_authority(

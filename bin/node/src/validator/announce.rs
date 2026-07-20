@@ -37,7 +37,7 @@ impl ReadinessSignaller {
     /// named route), member-gated, and idempotent.
     pub(crate) fn decide(
         &mut self,
-        status: &upgrade::UpgradeStatus,
+        status: &lifecycle::UpgradeStatus,
     ) -> Option<(String, u32, Option<Vec<u8>>)> {
         let pending = status.pending.as_ref()?;
         // never lie: a binary that cannot execute the target version stays silent so
@@ -45,13 +45,13 @@ impl ReadinessSignaller {
         if pending.to_version > self.max_version {
             return None;
         }
-        let commitment = match upgrade::required_readiness_commitment(&pending.name) {
-            Some(expected) if pending.name == crate::constants::CLIENTS_MODULE_UPGRADE_NAME => {
-                Some(expected.to_vec())
-            }
-            Some(_) => return None,
-            None => None,
-        };
+        // a named-route upgrade demanding a specific readiness commitment: this
+        // binary recognizes no such route (the clients dormant-registry route is
+        // retired), so stay silent and let the boundary cleanly abort. plain
+        // numeric upgrades carry no commitment.
+        if lifecycle::required_readiness_commitment(&pending.name).is_some() {
+            return None;
+        }
         // only a CURRENT boundary member is in the readiness denominator (R = n).
         if !status.members.iter().any(|m| m == &self.me) {
             return None;
@@ -66,25 +66,27 @@ impl ReadinessSignaller {
             return None;
         }
         self.signaled = Some((pending.name.clone(), pending.to_version));
-        Some((pending.name.clone(), pending.to_version, commitment))
+        Some((pending.name.clone(), pending.to_version, None))
     }
 
     /// query committed upgrade state and, when a signal is due, build the
     /// validator-origin `SignalReady` op. gracefully `None` when the module is
     /// absent (pre-retrofit) or the reply is unreadable — no panic on a baseline net.
     pub(crate) async fn maybe_signal(&mut self, host: &Host) -> Option<(Msg, String, u32)> {
-        use upgrade::{
-            UpgradeMsg, UpgradeQuery, UpgradeReply, decode_reply, encode_msg, encode_query,
+        use lifecycle::{
+            LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply, encode_msg, encode_query,
         };
         let reply = host
-            .query("upgrade", &encode_query(&UpgradeQuery::Status))
+            .query(host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus))
             .await
             .ok()?;
-        let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
+        let LifecycleReply::UpgradeStatus(status) = decode_reply(&reply).ok()? else {
+            return None;
+        };
         let (name, to_version, commitment) = self.decide(&status)?;
         let msg = Msg {
-            target: "upgrade".into(),
-            payload: encode_msg(&UpgradeMsg::SignalReady {
+            target: host::LIFECYCLE_MODULE_ID.into(),
+            payload: encode_msg(&LifecycleMsg::UpgradeReady {
                 name: name.clone(),
                 to_version,
                 commitment,

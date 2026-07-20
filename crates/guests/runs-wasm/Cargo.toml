@@ -1,0 +1,48 @@
+# The wasm port of the `runs` module: compiles the NATIVE runs crate to
+# wasm32 and adapts it to the ducktape:module world through guest-adapter —
+# the module's logic stays single-sourced in `crates/modules/apps/runs`. Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are
+# componentized by the module build target, never by the host workspace.
+# runs reaches its ten collaborators through their consensus wire types only
+# (chat/tasks/pages/saga pinned default-features = false in the runs crate
+# itself, dispatch's saga edge likewise, agent's already was; forge is a
+# dev-only dep of runs — the sink emits conformance-pinned local mirrors), so
+# no native-only submodule (indexer/voice/tokio/libgit2) ever drags into this
+# graph.
+[package]
+name = "runs-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+runs = { path = "../../modules/apps/runs" }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]
+
+# runs -> saga/dispatch/agent -> valset -> commonware-cryptography enables
+# getrandom's "js" backend on wasm32, which bakes unstrippable wasm-bindgen
+# imports into the cdylib and breaks componentization. no consensus path ever
+# calls getrandom (modules are deterministic by contract; the guest only
+# reaches saga's pure wire types), so the guest links a vendored stub whose
+# only backend is a deterministic refusal — see getrandom-stub/Cargo.toml.
+[patch.crates-io]
+getrandom = { path = "getrandom-stub" }
+# one stub per major the graph pulls — the commonware 2026.7 bump brought
+# getrandom 0.3 and 0.4 alongside 0.2 (same ruling for all three; see
+# getrandom-stub-03/Cargo.toml).
+getrandom-03 = { package = "getrandom", path = "getrandom-stub-03" }
+getrandom-04 = { package = "getrandom", path = "getrandom-stub-04" }
+
+# blst reaches every commonware-cryptography guest unconditionally, but no
+# module calls bls12381 — wasm-ld dead-strips every blst symbol from the
+# shipped module. Compiling its C for wasm32 would still demand a
+# wasm-capable clang (apple clang has no wasm backend at all), so the guest
+# links a vendored blst whose build.rs skips the C on wasm32. A guest that
+# ever really calls blst fails the link loudly — see patches/blst/PATCH.md.
+blst = { path = "../../../patches/blst" }

@@ -398,7 +398,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         ),
         // duckdns — claim a handle on the just-bound account (32-byte origin).
         (
-            "duckdns",
+            "gateway",
             json!({ "set_handle": { "handle": "eddy" } }),
             Some(node.clone()),
         ),

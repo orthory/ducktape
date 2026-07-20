@@ -32,7 +32,8 @@ use crate::{NodeCommand, NodeHandle, error_response};
 /// because it has no authenticated network transport. `publisher_node` and the
 /// caps are derived from the locally finalized RouteRecord, never client input.
 pub enum GatewayJob {
-    /// A bounded HTTP exchange: one request, one buffered response.
+    /// One HTTP exchange: one request, a streamed response (head at reply
+    /// time, body chunks over the bounded channel).
     Http {
         publisher_node: [u8; 32],
         max_response_bytes: u64,
@@ -50,10 +51,33 @@ pub enum GatewayJob {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A streamed response body: `Ok` chunks until the sender closes (end of
+/// body) or an `Err` item (mid-stream failure -> the relay aborts). Bounded,
+/// so the paced overlay stream backpressures the upstream.
+pub type GatewayBody = tokio::sync::mpsc::Receiver<Result<bytes::Bytes, GatewayFailure>>;
+
+#[derive(Debug)]
 pub struct GatewayResponse {
     pub head: gateway::ProxyResponseHead,
-    pub body: Vec<u8>,
+    pub body: GatewayBody,
+}
+
+/// Collect a streamed body to completion — the buffered-by-contract consumers
+/// (the JSON proxy lane) and tests use this; the streaming door does not.
+/// Hard-bounded at the buffered ceiling: an unbounded (cap-0 SSE) route
+/// collected here must not become a single-request node OOM.
+pub async fn collect_body(body: &mut GatewayBody) -> Result<Vec<u8>, GatewayFailure> {
+    let mut out = Vec::new();
+    while let Some(item) = body.recv().await {
+        let chunk = item?;
+        if out.len().saturating_add(chunk.len()) as u64 > gateway::MAX_RESPONSE_BODY_BYTES {
+            return Err(GatewayFailure::Unavailable(
+                "response exceeds the buffered-lane ceiling (use the streaming door)".into(),
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// One WebSocket message crossing the browser↔mesh boundary on the caller
@@ -167,8 +191,12 @@ async fn current_route(
                 "gateway route is not published".into(),
             )),
         },
-        Ok(gateway::GatewayReply::Routes(_)) => Err(GatewayFailure::Unavailable(
-            "gateway returned an unexpected route-list reply".into(),
+        // a route `Get` must answer with a `Route`; the list and handle-plane
+        // replies (`Resolved`/`Registrations`) are all wrong shapes here.
+        Ok(gateway::GatewayReply::Routes(_))
+        | Ok(gateway::GatewayReply::Resolved(_))
+        | Ok(gateway::GatewayReply::Registrations(_)) => Err(GatewayFailure::Unavailable(
+            "gateway returned an unexpected reply to a route query".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
@@ -229,11 +257,6 @@ async fn proxy_current(
         .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("gateway plane dropped the request".into()))??;
     gateway::validate_response_head(&response.head).map_err(GatewayFailure::Unavailable)?;
-    if response.body.len() as u64 > max_response_bytes {
-        return Err(GatewayFailure::Unavailable(
-            "publisher exceeded the route response cap".into(),
-        ));
-    }
     Ok(response)
 }
 
@@ -253,11 +276,15 @@ pub(crate) async fn gateway_proxy(
         }
     };
     match proxy_current(&handle, request.head, body).await {
-        Ok(response) => Json(GatewayProxyReply {
-            head: response.head,
-            body_b64: base64::engine::general_purpose::STANDARD.encode(response.body),
-        })
-        .into_response(),
+        // The JSON lane is buffered BY CONTRACT (body_b64); collect the stream.
+        Ok(mut response) => match collect_body(&mut response.body).await {
+            Ok(body) => Json(GatewayProxyReply {
+                head: response.head,
+                body_b64: base64::engine::general_purpose::STANDARD.encode(body),
+            })
+            .into_response(),
+            Err(failure) => gateway_failure_response(failure),
+        },
         Err(failure) => gateway_failure_response(failure),
     }
 }
@@ -292,9 +319,9 @@ pub(crate) async fn gateway_browser_base(
 
 /// Resolve a `duck://` authority (`<label>.<handle>.duck` or `<handle>.duck`)
 /// to the account it names and the route label beneath it. Node-local: one
-/// DuckDNS resolve, no session state and no round-trip to the publisher.
-/// A reserved root label (`duckdns::RESERVED_ROOT_LABELS`: `net.duck`,
-/// `agents.duck`, and any `<x>.<reserved>.duck`) carries no gateway route.
+/// merged-gateway handle resolve, no session state and no round-trip to the
+/// publisher. A reserved root label (`gateway::RESERVED_ROOT_LABELS`:
+/// `net.duck`, `agents.duck`, and any `<x>.<reserved>.duck`) carries no route.
 async fn resolve_duck_authority(
     handle: &NodeHandle,
     authority: &str,
@@ -316,12 +343,12 @@ async fn resolve_duck_authority(
     } else {
         (None, labels[0])
     };
-    if duckdns::RESERVED_ROOT_LABELS.contains(&alias) {
+    if gateway::RESERVED_ROOT_LABELS.contains(&alias) {
         return Err(GatewayFailure::NotFound(format!(
             "{alias}.duck is reserved and has no gateway route"
         )));
     }
-    duckdns::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
+    gateway::validate_handle(alias).map_err(GatewayFailure::Invalid)?;
     let name = match label {
         Some(label) => gateway::RouteName::named(label),
         None => gateway::RouteName::apex(),
@@ -332,9 +359,9 @@ async fn resolve_duck_authority(
     let mut commands = handle.cmds.clone();
     commands
         .send(NodeCommand::Query {
-            target: "duckdns".into(),
-            req: duckdns::encode_query(&duckdns::DuckDnsQuery::Resolve {
-                name: duckdns::DuckDnsName {
+            target: "gateway".into(),
+            req: gateway::encode_query(&gateway::GatewayQuery::Resolve {
+                name: gateway::DuckDnsName {
                     handle: alias.to_string(),
                 },
             }),
@@ -344,16 +371,16 @@ async fn resolve_duck_authority(
         .map_err(|_| GatewayFailure::Unavailable("node actor is gone".into()))?;
     let bytes = tokio::time::timeout(Duration::from_secs(5), rx)
         .await
-        .map_err(|_| GatewayFailure::Unavailable("duckdns resolve timed out".into()))?
+        .map_err(|_| GatewayFailure::Unavailable("gateway resolve timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("node actor dropped the query".into()))?
         .map_err(GatewayFailure::Unavailable)?;
-    match duckdns::decode_reply(&bytes) {
-        Ok(duckdns::DuckDnsReply::Resolved(Some(account))) => Ok((account.account_id, name)),
-        Ok(duckdns::DuckDnsReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
+    match gateway::decode_reply(&bytes) {
+        Ok(gateway::GatewayReply::Resolved(Some(account))) => Ok((account.account_id, name)),
+        Ok(gateway::GatewayReply::Resolved(None)) => Err(GatewayFailure::NotFound(format!(
             "{alias}.duck is not registered"
         ))),
         Ok(_) => Err(GatewayFailure::Unavailable(
-            "duckdns returned an unexpected reply".into(),
+            "gateway returned an unexpected reply".into(),
         )),
         Err(error) => Err(GatewayFailure::Unavailable(error)),
     }
@@ -535,7 +562,14 @@ async fn gateway_browser_proxy(
     {
         Body::empty()
     } else {
-        Body::from(response.body)
+        // Streamed relay: chunks flow to the browser as the publisher sends
+        // them; a mid-stream failure aborts the response body (truncation),
+        // which is the standard proxy contract once the head is committed.
+        use futures::StreamExt as _;
+        Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(response.body)
+                .map(|item| item.map_err(|failure| std::io::Error::other(format!("{failure:?}")))),
+        )
     };
     builder
         .body(body)

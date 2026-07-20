@@ -520,11 +520,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
                 let pending = cluster
                     .query(
                         0,
-                        "upgrade",
-                        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
+                        "lifecycle",
+                        &lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus),
                     )
-                    .and_then(|raw| upgrade::decode_reply(&raw).ok())
-                    .map(|upgrade::UpgradeReply::Status(st)| st.pending.is_some())
+                    .and_then(|raw| lifecycle::decode_reply(&raw).ok())
+                    .and_then(|reply| match reply {
+                        lifecycle::LifecycleReply::UpgradeStatus(st) => Some(st.pending.is_some()),
+                        _ => None,
+                    })
                     .unwrap_or(false);
                 if pending {
                     break true;

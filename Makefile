@@ -38,7 +38,7 @@ ifeq ($(HOST_OS),Darwin)
 export MACOSX_DEPLOYMENT_TARGET ?= 14.0
 endif
 
-.PHONY: all dev ui-qa demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
+.PHONY: all dev ui-qa demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check labs-gate
 
 all: app
 
@@ -99,6 +99,12 @@ demo-clear:
 ## `make dev`). see ops/dogfood-forge.sh.
 dogfood-forge:
 	@bash ops/dogfood-forge.sh
+
+## build-check the quarantined labs crate. It is EXCLUDED from the workspace
+## (its own Cargo.lock) so its revm/alloy dep tree never taxes workspace gates;
+## this target is how CI/devs still keep it compiling.
+labs-gate:
+	$(CARGO) check --manifest-path crates/labs/Cargo.toml
 
 ## release build of the networked node (serves the app surface)
 node: cef-env
@@ -245,138 +251,117 @@ test: cef-env app/node_modules wasm-modules-check
 ## guards mutual consistency, not reproducibility. standalone guest workspaces:
 ## no cef-env needed.
 wasm-modules:
-	cd crates/examples/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
-	  -o crates/examples/hello-wasm/component.wasm
-	cp crates/examples/hello-wasm/component.wasm \
+	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
+	  -o crates/guests/hello-wasm/component.wasm
+	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
-	cp crates/examples/hello-wasm/component.wasm \
+	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	cd crates/examples/hello-wasm-v2 && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/hello-wasm-v2 && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/hello-wasm-v2/target/wasm32-unknown-unknown/release/hello_wasm_v2.wasm \
+	  crates/guests/hello-wasm-v2/target/wasm32-unknown-unknown/release/hello_wasm_v2.wasm \
 	  -o crates/kernel/host/tests/fixtures/hello-v2.component.wasm
-	cd crates/examples/directory-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/directory-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/directory-wasm/target/wasm32-unknown-unknown/release/directory_wasm.wasm \
-	  -o crates/examples/directory-wasm/component.wasm
-	cp crates/examples/directory-wasm/component.wasm \
+	  crates/guests/directory-wasm/target/wasm32-unknown-unknown/release/directory_wasm.wasm \
+	  -o crates/guests/directory-wasm/component.wasm
+	cp crates/guests/directory-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/directory.component.wasm
-	cd crates/examples/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
+	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
-	cd crates/examples/vaults-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/inbox-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/vaults-wasm/target/wasm32-unknown-unknown/release/vaults_wasm.wasm \
-	  -o crates/examples/vaults-wasm/component.wasm
-	cp crates/examples/vaults-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/vaults.component.wasm
-
-	cd crates/examples/jobs-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
-	wasm-tools component new \
-	  crates/examples/jobs-wasm/target/wasm32-unknown-unknown/release/jobs_wasm.wasm \
-	  -o crates/examples/jobs-wasm/component.wasm
-	cp crates/examples/jobs-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/jobs.component.wasm
-
-	cd crates/examples/inbox-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
-	wasm-tools component new \
-	  crates/examples/inbox-wasm/target/wasm32-unknown-unknown/release/inbox_wasm.wasm \
-	  -o crates/examples/inbox-wasm/component.wasm
-	cp crates/examples/inbox-wasm/component.wasm \
+	  crates/guests/inbox-wasm/target/wasm32-unknown-unknown/release/inbox_wasm.wasm \
+	  -o crates/guests/inbox-wasm/component.wasm
+	cp crates/guests/inbox-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/inbox.component.wasm
 
-	cd crates/examples/tasks-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/tasks-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/tasks-wasm/target/wasm32-unknown-unknown/release/tasks_wasm.wasm \
-	  -o crates/examples/tasks-wasm/component.wasm
-	cp crates/examples/tasks-wasm/component.wasm \
+	  crates/guests/tasks-wasm/target/wasm32-unknown-unknown/release/tasks_wasm.wasm \
+	  -o crates/guests/tasks-wasm/component.wasm
+	cp crates/guests/tasks-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tasks.component.wasm
 
-	cd crates/examples/tagging-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/tagging-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/tagging-wasm/target/wasm32-unknown-unknown/release/tagging_wasm.wasm \
-	  -o crates/examples/tagging-wasm/component.wasm
-	cp crates/examples/tagging-wasm/component.wasm \
+	  crates/guests/tagging-wasm/target/wasm32-unknown-unknown/release/tagging_wasm.wasm \
+	  -o crates/guests/tagging-wasm/component.wasm
+	cp crates/guests/tagging-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tagging.component.wasm
 
-	cd crates/examples/capability-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/capability-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/capability-wasm/target/wasm32-unknown-unknown/release/capability_wasm.wasm \
-	  -o crates/examples/capability-wasm/component.wasm
-	cp crates/examples/capability-wasm/component.wasm \
+	  crates/guests/capability-wasm/target/wasm32-unknown-unknown/release/capability_wasm.wasm \
+	  -o crates/guests/capability-wasm/component.wasm
+	cp crates/guests/capability-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/capability.component.wasm
 
-	cd crates/examples/duckdns-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/identity-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/duckdns-wasm/target/wasm32-unknown-unknown/release/duckdns_wasm.wasm \
-	  -o crates/examples/duckdns-wasm/component.wasm
-	cp crates/examples/duckdns-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
-
-	cd crates/examples/identity-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
-	wasm-tools component new \
-	  crates/examples/identity-wasm/target/wasm32-unknown-unknown/release/identity_wasm.wasm \
-	  -o crates/examples/identity-wasm/component.wasm
-	cp crates/examples/identity-wasm/component.wasm \
+	  crates/guests/identity-wasm/target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+	  -o crates/guests/identity-wasm/component.wasm
+	cp crates/guests/identity-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/identity.component.wasm
 
-	cd crates/examples/gateway-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/gateway-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/gateway-wasm/target/wasm32-unknown-unknown/release/gateway_wasm.wasm \
-	  -o crates/examples/gateway-wasm/component.wasm
-	cp crates/examples/gateway-wasm/component.wasm \
+	  crates/guests/gateway-wasm/target/wasm32-unknown-unknown/release/gateway_wasm.wasm \
+	  -o crates/guests/gateway-wasm/component.wasm
+	cp crates/guests/gateway-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/gateway.component.wasm
 
-	cd crates/examples/governance-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/governance-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/governance-wasm/target/wasm32-unknown-unknown/release/governance_wasm.wasm \
-	  -o crates/examples/governance-wasm/component.wasm
-	cp crates/examples/governance-wasm/component.wasm \
+	  crates/guests/governance-wasm/target/wasm32-unknown-unknown/release/governance_wasm.wasm \
+	  -o crates/guests/governance-wasm/component.wasm
+	cp crates/guests/governance-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/governance.component.wasm
 
-	cd crates/examples/pages-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/pages-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/pages-wasm/target/wasm32-unknown-unknown/release/pages_wasm.wasm \
-	  -o crates/examples/pages-wasm/component.wasm
-	cp crates/examples/pages-wasm/component.wasm \
+	  crates/guests/pages-wasm/target/wasm32-unknown-unknown/release/pages_wasm.wasm \
+	  -o crates/guests/pages-wasm/component.wasm
+	cp crates/guests/pages-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/pages.component.wasm
 
-	cd crates/examples/chat-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/chat-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/chat-wasm/target/wasm32-unknown-unknown/release/chat_wasm.wasm \
-	  -o crates/examples/chat-wasm/component.wasm
-	cp crates/examples/chat-wasm/component.wasm \
+	  crates/guests/chat-wasm/target/wasm32-unknown-unknown/release/chat_wasm.wasm \
+	  -o crates/guests/chat-wasm/component.wasm
+	cp crates/guests/chat-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/chat.component.wasm
 
-	cd crates/examples/saga-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/saga-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/saga-wasm/target/wasm32-unknown-unknown/release/saga_wasm.wasm \
-	  -o crates/examples/saga-wasm/component.wasm
-	cp crates/examples/saga-wasm/component.wasm \
+	  crates/guests/saga-wasm/target/wasm32-unknown-unknown/release/saga_wasm.wasm \
+	  -o crates/guests/saga-wasm/component.wasm
+	cp crates/guests/saga-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/saga.component.wasm
 
-	cd crates/examples/agent-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/agent-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/agent-wasm/target/wasm32-unknown-unknown/release/agent_wasm.wasm \
-	  -o crates/examples/agent-wasm/component.wasm
-	cp crates/examples/agent-wasm/component.wasm \
+	  crates/guests/agent-wasm/target/wasm32-unknown-unknown/release/agent_wasm.wasm \
+	  -o crates/guests/agent-wasm/component.wasm
+	cp crates/guests/agent-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/agent.component.wasm
 
-	cd crates/examples/automations-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/automations-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/automations-wasm/target/wasm32-unknown-unknown/release/automations_wasm.wasm \
-	  -o crates/examples/automations-wasm/component.wasm
-	cp crates/examples/automations-wasm/component.wasm \
+	  crates/guests/automations-wasm/target/wasm32-unknown-unknown/release/automations_wasm.wasm \
+	  -o crates/guests/automations-wasm/component.wasm
+	cp crates/guests/automations-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/automations.component.wasm
 
-	cd crates/examples/runs-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/runs-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/examples/runs-wasm/target/wasm32-unknown-unknown/release/runs_wasm.wasm \
-	  -o crates/examples/runs-wasm/component.wasm
-	cp crates/examples/runs-wasm/component.wasm \
+	  crates/guests/runs-wasm/target/wasm32-unknown-unknown/release/runs_wasm.wasm \
+	  -o crates/guests/runs-wasm/component.wasm
+	cp crates/guests/runs-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/runs.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
@@ -384,43 +369,37 @@ wasm-modules:
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
 ## the pre-push `test` gate; run `make wasm-modules` to refresh the set.
 wasm-modules-check:
-	cmp crates/examples/hello-wasm/component.wasm \
+	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
-	cmp crates/examples/hello-wasm/component.wasm \
+	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	cmp crates/examples/directory-wasm/component.wasm \
+	cmp crates/guests/directory-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/directory.component.wasm
-	cmp crates/examples/vaults-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/vaults.component.wasm
-	cmp crates/examples/jobs-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/jobs.component.wasm
-	cmp crates/examples/inbox-wasm/component.wasm \
+	cmp crates/guests/inbox-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/inbox.component.wasm
-	cmp crates/examples/tasks-wasm/component.wasm \
+	cmp crates/guests/tasks-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tasks.component.wasm
-	cmp crates/examples/tagging-wasm/component.wasm \
+	cmp crates/guests/tagging-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tagging.component.wasm
-	cmp crates/examples/capability-wasm/component.wasm \
+	cmp crates/guests/capability-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/capability.component.wasm
-	cmp crates/examples/duckdns-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/duckdns.component.wasm
-	cmp crates/examples/identity-wasm/component.wasm \
+	cmp crates/guests/identity-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/identity.component.wasm
-	cmp crates/examples/gateway-wasm/component.wasm \
+	cmp crates/guests/gateway-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/gateway.component.wasm
-	cmp crates/examples/governance-wasm/component.wasm \
+	cmp crates/guests/governance-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/governance.component.wasm
-	cmp crates/examples/pages-wasm/component.wasm \
+	cmp crates/guests/pages-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/pages.component.wasm
-	cmp crates/examples/chat-wasm/component.wasm \
+	cmp crates/guests/chat-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/chat.component.wasm
-	cmp crates/examples/saga-wasm/component.wasm \
+	cmp crates/guests/saga-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/saga.component.wasm
-	cmp crates/examples/agent-wasm/component.wasm \
+	cmp crates/guests/agent-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/agent.component.wasm
-	cmp crates/examples/automations-wasm/component.wasm \
+	cmp crates/guests/automations-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/automations.component.wasm
-	cmp crates/examples/runs-wasm/component.wasm \
+	cmp crates/guests/runs-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/runs.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 

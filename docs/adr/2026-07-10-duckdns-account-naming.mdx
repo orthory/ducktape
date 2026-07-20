@@ -1,6 +1,15 @@
 # ADR: DuckDNS Is Account Naming Only
 
-Date: 2026-07-10. Status: **Accepted**.
+Date: 2026-07-10. Status: **Accepted** — **merged into `gateway` 2026-07-20**.
+
+> **Update (2026-07-20, module-plane trim):** the DuckDNS naming plane is no
+> longer a standalone consensus module. It was merged into `gateway` (same
+> deps — identity, valset — one concern: the whole `.duck` name → AccountId →
+> route pipeline). Everything below still describes the naming plane's
+> behaviour exactly; only its host changed. `.duck` names now resolve via
+> `GatewayQuery::Resolve` on the `gateway` module, register via
+> `GatewayMsg::SetHandle`, and the 32-byte-origin admission rule is preserved.
+> See `docs/adr/2026-07-10-gateway-routes.mdx` for the merged surface.
 
 ## Context
 

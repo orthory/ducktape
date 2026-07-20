@@ -73,7 +73,7 @@ test seems to need a wait, the flow is broken, not slow.
 
 - Replies are externally tagged: `{"channels":[..]}`, `{"messages":[..]}`.
 - `messages_latest` returns messages **ascending by `seq`**
-  (`crates/apps/chat/src/lib.rs`), and the app maps the reply 1:1 with no
+  (`crates/modules/apps/chat/src/lib.rs`), and the app maps the reply 1:1 with no
   reversal (`screen_service/chat.rs`) — order assertions are sound.
 - The composer clears on Submit (`chat_composer::update`), so consecutive
   posts don't concatenate.

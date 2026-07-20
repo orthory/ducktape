@@ -1074,11 +1074,12 @@ impl ValidatorRuntime<'_> {
         {
             return;
         }
-        let req = modreg::encode_query(&modreg::ModregQuery::Status);
-        let Ok(bytes) = node.host().query(host::MODREG_MODULE_ID, &req).await else {
+        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
+        let Ok(bytes) = node.host().query(host::LIFECYCLE_MODULE_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(modreg::ModregReply::Status { modules }) = modreg::decode_reply(&bytes) else {
+        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) = lifecycle::decode_reply(&bytes)
+        else {
             return;
         };
         // residency is a VERIFYING read (content re-hashed on the disk path):

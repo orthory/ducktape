@@ -491,9 +491,9 @@ fn strip(array: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
 ///     their commonware sequential-merkle op log, so ONE block ≠ N blocks even for
 ///     the identical writes — their roots DIFFER. this is the finding, generalized
 ///     past kv to a second qmdb module.
-///   - a plain, content-only module with no embedded block coordinate (duckdns)
-///     commits to the key→value map alone — its root is BYTE-IDENTICAL across the
-///     two block shapes.
+///   - a plain, content-only module with no embedded block coordinate (the
+///     merged gateway's `.duck` handle plane) commits to the key→value map
+///     alone — its root is BYTE-IDENTICAL across the two block shapes.
 ///   - the plain modules that stamp the block's `consensus_time` into their records
 ///     (tasks, inbox) also DIFFER, but for a reason ORTHOGONAL to qmdb: the batch's
 ///     one block carries one timestamp, the N singles carry N. their LOGICAL
@@ -513,9 +513,9 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     let sim_a = Sim::spawn(dir_a.path(), &["--with-valset", &valset]);
     let sim_b = Sim::spawn(dir_b.path(), &["--with-valset", &valset]);
 
-    // the duckdns account: identity bind seats the node, and set_handle then reads
-    // it (across members in the batch, across blocks in the singles). both runs
-    // bind the identical account deterministically.
+    // the gateway handle account: identity bind seats the node, and set_handle
+    // then reads it (across members in the batch, across blocks in the singles).
+    // both runs bind the identical account deterministically.
     let key = Ed::from_seed(9);
     let node = "n".repeat(32);
     let preimage = bind_preimage("", node.as_bytes(), 0);
@@ -529,7 +529,7 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
             node.clone(),
         ),
         (
-            "duckdns",
+            "gateway",
             serde_json::json!({ "set_handle": { "handle": "eddy" } }),
             node.clone(),
         ),
@@ -589,8 +589,8 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     // (a future duckdns that went qmdb-backed or stamped a block coordinate fails
     // HERE — the standing insurance.)
     assert_eq!(
-        module_root(&a, "duckdns"),
-        module_root(&b, "duckdns"),
+        module_root(&a, "gateway"),
+        module_root(&b, "gateway"),
         "duckdns commits to content alone — its root is batch-invariant"
     );
 

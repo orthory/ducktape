@@ -22,7 +22,7 @@ use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
 use tagging::TaggingModule;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/chat-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/chat-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const CHAT_WASM: &[u8] = include_bytes!("fixtures/chat.component.wasm");
 

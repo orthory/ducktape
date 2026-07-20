@@ -30,7 +30,7 @@ use sdk::{Error, Msg, Origin, StateRoot};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/capability-wasm` by the
+/// GENERATED artifact — built from `crates/guests/capability-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const CAPABILITY_WASM: &[u8] = include_bytes!("fixtures/capability.component.wasm");
 

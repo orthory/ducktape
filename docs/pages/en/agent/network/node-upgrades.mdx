@@ -96,7 +96,7 @@ Drive these steps in order. Do not skip the readiness confirmation before `H`.
    the upgrade-module follow-up records `pending`. Confirm exactly one pending
    upgrade exists and that its `name`/`H`/`to_version` are the intended values.
 4. **Collect readiness.** Each validator running the new binary emits
-   `SignalReady { name, to_version }` (validator-origin, machine-generated from
+   `UpgradeReady { name, to_version }` (validator-origin, machine-generated from
    the running binary's `MAX_PROTOCOL_VERSION`, idempotent per member pubkey).
    Confirm each accepted signal matches the pending upgrade identity; stale
    signals for another `name`/`to_version` do not count.
@@ -130,7 +130,7 @@ Drive these steps in order. Do not skip the readiness confirmation before `H`.
    frozen readiness set and boundary valset. Armed → at the finalized cutover view
    every ready node sets the stamped `BlockContext.protocol_version` and each
    changed module's `active_version` to `effective_version(H) = to_version`
-   (reconciling the upgrade module's stored `current_version` in the same
+   (reconciling the lifecycle module's stored `current_version` in the same
    transition); the migration runs as a deterministic in-block transition. One
    respawn carries both a coincident membership change and the version flip.
 7. **Verify app-hash continuity across `H`.** Confirm block `H` finalized with a
@@ -154,7 +154,7 @@ Drive these steps in order. Do not skip the readiness confirmation before `H`.
   dual-path binary, restart, let recovery replay through `H` under the new
   branch, rejoin.
 - **Pre-`upgrade`-module binary in the set.** It diverges earlier — at the block
-  where a `ScheduleUpgrade` follow-up first mutates the in-hash `upgrade` module,
+  where a `ScheduleUpgrade` follow-up first mutates the in-hash `lifecycle` module,
   not at `H`. This is why the rollout gate is "upgrade-module-aware dual-path
   binary on every node BEFORE `ScheduleUpgrade` commits."
 - **Mis-scheduled but validly-armed upgrade.** `CancelUpgrade { name }`
@@ -202,7 +202,7 @@ Before `H`:
   rejected (it can halt at `H`). Any `R = n - s` is a discouraged downgrade,
   allowed only with out-of-band attestation and a documented conditional
   guarantee.
-- Every accepted `SignalReady` matches the pending identity.
+- Every accepted `UpgradeReady` matches the pending identity.
 
 After `H`:
 

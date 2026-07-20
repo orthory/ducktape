@@ -31,12 +31,12 @@ use inbox::{Inbox, InboxQuery, encode_query as inbox_encode_query};
 use sdk::{Error, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tasks::{
-    TaskMsg, TaskQuery, TaskReply, Tasks, decode_reply as tasks_decode_reply,
-    encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
+    TaskMsg, TaskQuery, TaskReply, Tasks, decode_task_reply as tasks_decode_reply,
+    encode_task_msg as tasks_encode_msg, encode_task_query as tasks_encode_query,
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/automations-wasm` by the
+/// GENERATED artifact — built from `crates/guests/automations-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.wasm");
 

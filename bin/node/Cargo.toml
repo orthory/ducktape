@@ -25,15 +25,13 @@ kv = { workspace = true }
 directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
 valset = { workspace = true }
-clients = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
-# the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
-# committed boundary snapshot; the module itself is genesis-wired post-retrofit).
-upgrade = { workspace = true }
-# the module code registry + the wasm runtime it governs: genesis-wired, with
-# height-gated live code swaps realized through the blobstore-backed CodeSource.
-modreg = { workspace = true }
+# the network lifecycle module: the no-downtime protocol-version coordinator AND
+# the module code registry, one genesis-wired module. read_upgrade_state reads
+# its committed boundary snapshot; height-gated live code swaps are realized
+# through the blobstore-backed CodeSource.
+lifecycle = { workspace = true }
 wasm-host = { workspace = true }
 saga = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side
@@ -48,10 +46,13 @@ forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
-vaults = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 gateway = { workspace = true }
+# a credential-provider node embeds an airlock gateway in-process (server) and
+# seeds its credential; the compute-side broker path also uses the client. See
+# src/airlock_serve.rs.
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server"] }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
@@ -63,7 +64,6 @@ duckfs-client = { workspace = true }
 duckfs-disk = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
-jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability orchestrator runs
@@ -84,6 +84,7 @@ data-plane = { workspace = true }
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }
 futures = "0.3"
+bytes = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
@@ -148,15 +149,16 @@ async-trait = { workspace = true }
 # in milliseconds of wall time instead of minutes.
 tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
-# airlock_gateway_e2e runs a real airlock gateway (server) on loopback and drives
-# the airlock client through the overlay — proving the cred!=compute remote
-# topology (LoopbackHttp route + allow_authorization). axum serves the in-process
-# mock upstream the gateway swaps into.
-airlock = { path = "../../crates/system/airlock", features = ["client", "server"] }
+# the streaming e2e feeds an SSE upstream through a channel-backed Body.
+tokio-stream = "0.1"
+# airlock is also a runtime dependency (see [dependencies] — src/airlock_serve.rs);
+# tests additionally need the real verifier + the minted-chain testkit. axum
+# serves the in-process mock upstream airlock_gateway_e2e swaps into.
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server", "verify", "testkit"] }
 axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
-# loopback (the crates/system/overlay-net/tests/loopback_pair harness shape) to
+# loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
 # prove huddle media crosses the REAL overlay headless — this supplies the WG
 # interface config types; the boringtun crypto rides overlay-net (a dep above).
 defguard_wireguard_rs = { workspace = true }

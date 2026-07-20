@@ -8,18 +8,10 @@ publish = false
 name = "airlock-cli"
 path = "src/main.rs"
 
-[features]
-# Real TDX quote verification via dcap-qvl; off by default so the mock path
-# builds light. Build with --features tdx on the TDX box.
-tdx = ["dep:dcap-qvl"]
-# AMD SEV-SNP report parsing (structural; KDS/VCEK verify is the follow-up).
-snp = []
-
 [dependencies]
-airlock = { path = "../../crates/system/airlock", features = ["client"] }
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "verify"] }
 anyhow = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 hex = "0.4"
-dcap-qvl = { version = "0.3", optional = true }

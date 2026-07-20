@@ -91,22 +91,18 @@ pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, 
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
-/// the genesis-constant module id the `upgrade` module registers under. read by
-/// [`Host::effective_version`] to derive the block's protocol version; absent
-/// before the coordinated retrofit, in which case the derivation falls back to
-/// [`BASELINE_VERSION`].
-pub const UPGRADE_MODULE_ID: &str = "upgrade";
+/// the genesis-constant module id the `lifecycle` module registers under. read
+/// by [`Host::effective_version`] to derive the block's protocol version, by the
+/// boundary code-swap realization ([`Host::realize_module_swaps`]), and by the
+/// drain's [`Host::pending_lifecycle_advance`] injection; absent before the
+/// coordinated retrofit, in which case the version derivation falls back to
+/// [`BASELINE_VERSION`] and no swap is ever realized or injected.
+pub const LIFECYCLE_MODULE_ID: &str = lifecycle::DEFAULT_LIFECYCLE_ID;
 
 /// the genesis-constant module id the `dispatch` module registers under. read
 /// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
 /// a net without the module, in which case nothing is ever injected.
 const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
-
-/// the genesis-constant module id the `modreg` code registry registers under.
-/// read by the boundary code-swap realization ([`Host::realize_module_swaps`])
-/// and the drain's [`Host::pending_modreg_advance`] injection; absent on a net
-/// without the module, in which case no swap is ever realized or injected.
-pub const MODREG_MODULE_ID: &str = modreg::DEFAULT_MODREG_ID;
 
 /// the out-of-band source of component BYTES for a code swap.
 ///
@@ -177,7 +173,7 @@ pub struct BlockContext {
     /// the root op's real submitter. follow-ups override with `Origin::Module`.
     pub origin: Origin,
     /// the effective protocol version for this block — `effective_version(height)`
-    /// derived from committed upgrade-module state and stamped by the node layer
+    /// derived from committed lifecycle-module upgrade state and stamped by the node layer
     /// (see [`Host::effective_version`]). copied verbatim into every dispatch's
     /// [`Env::protocol_version`]. a read-only dispatch input: it is NEVER folded
     /// into any module `root()` preimage, op/wire encoding, or the app-hash
@@ -186,8 +182,8 @@ pub struct BlockContext {
 }
 
 /// the baseline protocol version — the version every node runs before any upgrade
-/// activates, and the graceful fallback when the `upgrade` module is not yet
-/// registered (a host without the module, e.g. a test registry). Matches the `upgrade` module's uninitialized
+/// activates, and the graceful fallback when the `lifecycle` module is not yet
+/// registered (a host without the module, e.g. a test registry). Matches the `lifecycle` module's uninitialized
 /// `current_version == 0`, so a fresh module and a module-absent host agree.
 pub const BASELINE_VERSION: u32 = 0;
 
@@ -271,7 +267,7 @@ pub struct BatchOutcome {
     /// the once-per-block injections.
     pub events: Vec<Event>,
     /// the dispatch trace from the once-per-block System injections
-    /// (`pending_advance` / `pending_modreg_advance` / `pending_deliveries`),
+    /// (`pending_lifecycle_advance` / `pending_deliveries`),
     /// drained once after the members.
     pub system_dispatches: Vec<DispatchRecord>,
 }
@@ -713,22 +709,22 @@ impl Host {
     /// `height` runs one version.
     ///
     /// this is a read-only, out-of-block committed read (routed like any external
-    /// [`Host::query`]). the `upgrade` module is a genesis constant on an upgraded
+    /// [`Host::query`]). the `lifecycle` module is a genesis constant on an upgraded
     /// net, but is ABSENT before the coordinated retrofit — so a missing module,
     /// an undecodable reply, or any query error gracefully falls back to
     /// [`BASELINE_VERSION`] rather than panicking or erroring. behavior is
     /// therefore unchanged until the module is registered and a pending upgrade
     /// arms at its activation height.
     pub async fn effective_version(&self, height: u64) -> u32 {
-        let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
-        match self.query(UPGRADE_MODULE_ID, &req).await {
-            Ok(bytes) => match upgrade::decode_reply(&bytes) {
-                Ok(upgrade::UpgradeReply::Status(s)) => {
+        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus);
+        match self.query(LIFECYCLE_MODULE_ID, &req).await {
+            Ok(bytes) => match lifecycle::decode_reply(&bytes) {
+                Ok(lifecycle::LifecycleReply::UpgradeStatus(s)) => {
                     // the ONE shared predicate — the host stamps EXACTLY what the
                     // module's Advance arm check computes (both route through
-                    // upgrade::effective_version), so dispatch and hashing
+                    // lifecycle::effective_version), so dispatch and hashing
                     // can never diverge at the boundary (risk R4).
-                    upgrade::effective_version(
+                    lifecycle::effective_version(
                         height,
                         s.current_version,
                         s.pending.as_ref(),
@@ -741,7 +737,7 @@ impl Host {
                     )
                 }
                 // module present but reply unreadable — never fork on a decode slip.
-                Err(_) => BASELINE_VERSION,
+                _ => BASELINE_VERSION,
             },
             // module absent or unreadable — baseline, never error.
             Err(_) => BASELINE_VERSION,
@@ -794,33 +790,52 @@ impl Host {
         self.active_version = version;
     }
 
-    /// the SYSTEM-ORIGIN `Advance` the drain injects in-block at a finalized
-    /// activation boundary, or `None` when there is nothing to reconcile.
+    /// the SYSTEM-ORIGIN lifecycle `Advance` the drain injects in-block at a
+    /// finalized activation boundary, or `None` when there is nothing to
+    /// reconcile on EITHER lifecycle half.
     ///
     /// this is the replay-safe realization of the design's "arm/abort is a
     /// deterministic self-transition evaluated exactly once at `H`": because it
     /// rides the SAME [`Host::submit_at`] drain that recovery-replay and
-    /// state-sync-install also run, the `current_version` flip + pending clear
-    /// reconstruct byte-for-byte on every node (never a respawn side-effect,
-    /// invisible to replay). keyed purely on committed upgrade state + `height`:
-    /// injected iff the committed `upgrade` module holds a pending upgrade whose
-    /// `activation_height` has been reached. idempotent — the first block at/after
-    /// `H` clears the pending, so later blocks inject nothing. ABSENT until the
-    /// module is registered (the `Status` query errors → `None`), so the drain is
+    /// state-sync-install also run, the `current_version` flip + pending-upgrade
+    /// clear AND the committed active-hash flip + pending-swap clear reconstruct
+    /// byte-for-byte on every node (never a respawn side-effect, invisible to
+    /// replay). keyed purely on committed lifecycle state + `height`: injected
+    /// iff the committed module holds a pending upgrade whose `activation_height`
+    /// has been reached OR an armed swap (ready + height reached). the single
+    /// `Advance` reconciles BOTH halves. idempotent — the first block at/after
+    /// `H` clears both, so later blocks inject nothing. ABSENT until the module
+    /// is registered (both queries error → `None`), so the drain is
     /// byte-identical on a net without the module.
-    async fn pending_advance(&self, height: u64) -> Option<Msg> {
-        let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
-        let bytes = self.query(UPGRADE_MODULE_ID, &req).await.ok()?;
-        let upgrade::UpgradeReply::Status(status) =
-            upgrade::decode_reply(&bytes).ok()?;
-        let pending = status.pending?;
-        if height >= pending.activation_height {
-            Some(Msg {
-                target: UPGRADE_MODULE_ID.into(),
-                payload: upgrade::encode_msg(&upgrade::UpgradeMsg::Advance),
+    async fn pending_lifecycle_advance(&self, height: u64) -> Option<Msg> {
+        let upgrade_reached = self
+            .lifecycle_upgrade_status()
+            .await
+            .and_then(|s| s.pending)
+            .is_some_and(|pending| height >= pending.activation_height);
+        let swap_armed = self.lifecycle_module_status().await.is_some_and(|modules| {
+            modules.iter().any(|m| {
+                m.pending
+                    .as_ref()
+                    .is_some_and(|p| p.ready && height >= p.activation_height)
             })
-        } else {
-            None
+        });
+        (upgrade_reached || swap_armed).then(|| Msg {
+            target: LIFECYCLE_MODULE_ID.into(),
+            payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::Advance),
+        })
+    }
+
+    /// the lifecycle module's committed upgrade-status projection, or `None` when
+    /// the module is absent / its reply is unreadable — the shared out-of-block
+    /// committed read behind [`Host::pending_lifecycle_advance`] (mirrors
+    /// [`Host::effective_version`]'s graceful fallback).
+    async fn lifecycle_upgrade_status(&self) -> Option<lifecycle::UpgradeStatus> {
+        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus);
+        let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
+        match lifecycle::decode_reply(&bytes).ok()? {
+            lifecycle::LifecycleReply::UpgradeStatus(s) => Some(s),
+            _ => None,
         }
     }
 
@@ -862,40 +877,16 @@ impl Host {
         self.pending_deliveries().await.is_some()
     }
 
-    /// the SYSTEM-ORIGIN modreg `Advance` the drain injects in-block, or `None`
-    /// when the committed code registry has no armed swap to activate. mirrors
-    /// [`Host::pending_advance`]: it rides the SAME drain that recovery-replay and
-    /// state-sync-install also run, so the committed active-hash flip + pending
-    /// clear reconstruct byte-for-byte on every node (folded into the app-hash —
-    /// the consensus commitment to WHICH code is active). keyed purely on
-    /// committed registry state + `height`: injected iff the committed registry
-    /// holds a pending swap whose `activation_height` has been reached. idempotent
-    /// — the first block at/after `H` clears the pending, so later blocks inject
-    /// nothing. ABSENT until the module is registered (`Status` errors → `None`),
-    /// so the drain is byte-identical on a net without the code registry.
-    async fn pending_modreg_advance(&self, height: u64) -> Option<Msg> {
-        let modules = self.modreg_status().await?;
-        let any_armed = modules.iter().any(|m| {
-            m.pending
-                .as_ref()
-                .is_some_and(|p| p.ready && height >= p.activation_height)
-        });
-        any_armed.then(|| Msg {
-            target: MODREG_MODULE_ID.into(),
-            payload: modreg::encode_msg(&modreg::ModregMsg::Advance),
-        })
-    }
-
-    /// the code registry's committed per-module code state, or `None` when the
+    /// the lifecycle module's committed per-module code state, or `None` when the
     /// module is absent / its reply is unreadable — the shared out-of-block
-    /// committed read behind [`Host::pending_modreg_advance`] and
+    /// committed read behind [`Host::pending_lifecycle_advance`] and
     /// [`Host::realize_module_swaps`] (mirrors [`Host::effective_version`]'s
     /// graceful fallback: a missing registry is never an error, just nothing to do).
-    async fn modreg_status(&self) -> Option<Vec<modreg::ModuleCode>> {
-        let req = modreg::encode_query(&modreg::ModregQuery::Status);
-        let bytes = self.query(MODREG_MODULE_ID, &req).await.ok()?;
-        match modreg::decode_reply(&bytes).ok()? {
-            modreg::ModregReply::Status { modules } => Some(modules),
+    async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
+        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
+        let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
+        match lifecycle::decode_reply(&bytes).ok()? {
+            lifecycle::LifecycleReply::ModuleStatus { modules } => Some(modules),
             _ => None,
         }
     }
@@ -916,7 +907,7 @@ impl Host {
     /// reconcile every hot-swappable module's RUNNING code against the code
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;
-    /// the consensus half is the in-block [`Host::pending_modreg_advance`] tick
+    /// the consensus half is the in-block [`Host::pending_lifecycle_advance`] tick
     /// that flips the committed active hash into the app-hash. code is invisible
     /// to `root()`, so a swap keeps the module's state and the app-hash is
     /// byte-continuous across it.
@@ -930,7 +921,7 @@ impl Host {
     ///
     /// the target hash for a module at `height` is a pending hash that has reached
     /// activation (`activation_height <= height`), else its committed ACTIVE hash
-    /// — the SAME predicate modreg's `Advance` arm-check applies, so this
+    /// — the SAME predicate lifecycle's `Advance` arm-check applies, so this
     /// out-of-block realization and the in-block commit never disagree on the arm
     /// set. reading ACTIVE (not only the armed pending) is what lets a state-sync
     /// joiner — which installs post-activation state with no pending left to arm —
@@ -945,14 +936,14 @@ impl Host {
         height: u64,
         src: &dyn CodeSource,
     ) -> Result<(), Error> {
-        let Some(modules) = self.modreg_status().await else {
+        let Some(modules) = self.lifecycle_module_status().await else {
             return Ok(());
         };
         for m in modules {
-            // the SAME arm predicate as modreg::handle_advance (height >=
+            // the SAME arm predicate as lifecycle::handle_advance (height >=
             // activation_height): pending-if-armed, else the committed active hash.
             let target = match m.pending {
-                // the SAME arm predicate as modreg: ready (full byte receipt,
+                // the SAME arm predicate as lifecycle: ready (full byte receipt,
                 // latched in committed state) AND the height floor reached.
                 Some(p) if p.ready && height >= p.activation_height => p.code_hash,
                 _ => m.active_code_hash,
@@ -1298,16 +1289,11 @@ impl Host {
         // 1. the once-per-block System injections, computed ONCE against PRE-batch
         // committed state — the "results staged by this very block are invisible
         // here" invariant, evaluated BEFORE any member stages. same order as the
-        // single-op drain: upgrade `Advance`, then modreg `Advance`, then
+        // single-op drain: the lifecycle `Advance` (one tick reconciling BOTH the
+        // protocol-version arm/abort AND every armed code swap), then
         // `DeliverPending`. drained once, after every member, below (step 4).
         let mut injections: VecDeque<(Origin, Msg)> = VecDeque::new();
-        if let Some(advance) = self.pending_advance(height).await {
-            injections.push_back((Origin::System, advance));
-        }
-        // the code-registry boundary tick: flip every armed swap's committed
-        // active hash so the app-hash commits to the new code (the per-node
-        // realization of the actual swap is out-of-block, in realize_module_swaps).
-        if let Some(advance) = self.pending_modreg_advance(height).await {
+        if let Some(advance) = self.pending_lifecycle_advance(height).await {
             injections.push_back((Origin::System, advance));
         }
         if let Some(deliver) = self.pending_deliveries().await {
@@ -1663,26 +1649,20 @@ impl Host {
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
 
         // DETERMINISTIC ACTIVATION INJECTION (design §4 / plan Task 6.3). at a
-        // finalized boundary where the committed `upgrade` module holds a pending
-        // upgrade that has reached its activation height, append EXACTLY ONE
-        // System-origin `Advance` so the module reconciles its own app-hashed state
-        // in-block (ARM: `current_version = to_version` + clear pending/readiness;
-        // ABORT: clear only) at the SAME finalized view on every node. it rides this
-        // drain (not the respawn side-path), so live, recovery-replay, and
-        // state-sync nodes all reconstruct it byte-for-byte. this is what frees the
-        // at-most-one-pending slot after activation. INERT until the module is
-        // registered — `pending_advance` returns `None` when the module is absent.
-        if let Some(advance) = self.pending_advance(height).await {
-            queue.push_back((Origin::System, advance));
-        }
-        // DETERMINISTIC CODE-SWAP ACTIVATION INJECTION: when the committed code
-        // registry holds a pending swap that has reached its activation height,
-        // append EXACTLY ONE System-origin modreg `Advance` so the registry flips
-        // the armed active hash in-block (folded into the app-hash) at the SAME
-        // finalized view on every node — the consensus commitment to the new code.
-        // the actual component swap is realized out-of-block by
-        // `realize_module_swaps`. INERT until the module is registered.
-        if let Some(advance) = self.pending_modreg_advance(height).await {
+        // finalized boundary where the committed `lifecycle` module holds a
+        // pending upgrade that has reached its activation height OR an armed code
+        // swap, append EXACTLY ONE System-origin `Advance` so the module
+        // reconciles its own app-hashed state in-block: the upgrade half (ARM:
+        // `current_version = to_version` + clear pending/readiness; ABORT: clear
+        // only) AND the code-swap half (flip every armed active hash — the
+        // consensus commitment to the new code; the actual component swap is
+        // realized out-of-block by `realize_module_swaps`). one tick reconciles
+        // BOTH at the SAME finalized view on every node. it rides this drain (not
+        // the respawn side-path), so live, recovery-replay, and state-sync nodes
+        // all reconstruct it byte-for-byte, and it frees the at-most-one-pending
+        // slots after activation. INERT until the module is registered —
+        // `pending_lifecycle_advance` returns `None` when the module is absent.
+        if let Some(advance) = self.pending_lifecycle_advance(height).await {
             queue.push_back((Origin::System, advance));
         }
         // DETERMINISTIC DELIVERY INJECTION: when the committed dispatch

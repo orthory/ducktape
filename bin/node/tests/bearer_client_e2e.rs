@@ -17,14 +17,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// does the founder's committed clients set contain `key_hex`?
+/// does the founder's committed client set (identity's submit-door ACL facet)
+/// contain `key_hex`?
 fn clients_contains(cluster: &NetworkShapeCluster, key_hex: &str) -> bool {
-    use clients::{ClientsQuery, ClientsReply};
-    let req = clients::encode_query(&ClientsQuery::Clients);
-    let Some(raw) = cluster.query(0, "clients", &req) else {
+    use identity::{IdentityQuery, IdentityReply};
+    let req = identity::encode_query(&IdentityQuery::Clients);
+    let Some(raw) = cluster.query(0, "identity", &req) else {
         return false;
     };
-    let Ok(ClientsReply::Clients(list)) = clients::decode_reply(&raw) else {
+    let Ok(IdentityReply::Clients(list)) = identity::decode_reply(&raw) else {
         return false;
     };
     list.iter().any(|c| hex(c) == key_hex)

@@ -61,7 +61,8 @@ pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
     GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayResponse, GatewayWsMsg, gateway_browser_router, serve_browser_gateway,
+    GatewayBody, GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router,
+    serve_browser_gateway,
 };
 // git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
 mod git_http;
@@ -434,13 +435,13 @@ pub enum ModuleCategory {
 impl ModuleCategory {
     /// The category a module id belongs to. Ids not listed here —
     /// infrastructure and internal modules (files, saga, identity, kv,
-    /// valset, governance, vaults, directory, …) — fall to `System`, so a new
+    /// valset, governance, directory, …) — fall to `System`, so a new
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
         match id {
             "chat" | "tasks" | "inbox" | "pages" => Self::Workspace,
             "forge" | "agent" => Self::Developer,
-            "automations" | "jobs" => Self::Automation,
+            "automations" => Self::Automation,
             _ => Self::System,
         }
     }
@@ -1008,22 +1009,20 @@ mod tests {
         for id in ["forge", "agent"] {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
-        for id in ["automations", "jobs"] {
+        for id in ["automations"] {
             assert_eq!(ModuleCategory::of(id), Automation, "{id}");
         }
         // infra + internals fall to the System bucket — including ids only the
-        // full `node` binary registers (kv/valset/governance/vaults/directory)
+        // full `node` binary registers (kv/valset/governance/directory)
         // and anything unknown, so the view never breaks on a new module.
         for id in [
             "files",
             "saga",
             "identity",
-            "duckdns",
             "gateway",
             "kv",
             "valset",
             "governance",
-            "vaults",
             "directory",
             "totally-unknown",
         ] {

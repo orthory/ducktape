@@ -30,7 +30,6 @@ use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use duckdns::DuckDns;
 use gateway::Gateway;
 use tagging::TaggingModule;
 use files::Files;
@@ -41,7 +40,6 @@ use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
-use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
@@ -56,7 +54,7 @@ use statesync::qmdb::QmdbStore;
 
 /// every module registered at genesis, in registry order. status reports use
 /// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 16] = [
+const MODULE_IDS: [&str; 14] = [
     "chat",
     "saga",
     "dispatch",
@@ -64,14 +62,12 @@ const MODULE_IDS: [&str; 16] = [
     "tasks",
     "inbox",
     "automations",
-    "jobs",
     "agent",
     "runs",
     "pages",
     "forge",
     "files",
     "identity",
-    "duckdns",
     "gateway",
 ];
 
@@ -261,7 +257,6 @@ fn run_node(
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
             "runs",
@@ -271,7 +266,7 @@ fn run_node(
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2). its presence is what selects the v3 composer; unwired,
@@ -304,7 +299,9 @@ fn run_node(
         // chain-unscoped certs are an acceptable surface here). It also owns
         // the canonical account display name.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
+        // the MERGED gateway owns both the `.duck` handle plane and the route
+        // plane; the single-node daemon carries no valset (ungated) and a
+        // dev-only chain id.
         let gateway = Gateway::new("gateway", "identity", None, "local");
         let mut host = Host::genesis(vec![
             Box::new(chat),
@@ -314,14 +311,12 @@ fn run_node(
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
-            Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
         ])
         .expect("genesis");

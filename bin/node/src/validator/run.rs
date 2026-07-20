@@ -353,14 +353,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
     // this binary can execute. survives restart/late-join (state-driven, not a
     // one-shot effect). inert before the module is registered.
-    let native_v1_compat = node.host().state_schema_fingerprint()
-        == crate::constants::native_v1_state_schema_fingerprint();
     let signaller = ReadinessSignaller::new(
-        if native_v1_compat {
-            1
-        } else {
-            MAX_PROTOCOL_VERSION
-        },
+        MAX_PROTOCOL_VERSION,
         signer.public_key().as_ref().to_vec(),
     );
     // the CODE readiness self-signaller: the byte-receipt twin of the
@@ -368,11 +362,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // component bytes and emits one truthful `SignalReady` per swap.
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
-    let code_signaller = if native_v1_compat {
-        code_signaller.fetch_only()
-    } else {
-        code_signaller
-    };
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
     // the capability self-announcer: publishes this node's discovered
     // provider set into the capability registry once (state-driven,

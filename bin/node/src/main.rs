@@ -65,6 +65,7 @@ mod explorer;
 mod first_contact_join;
 mod fs_cli;
 mod gateway_plane;
+mod airlock_serve;
 mod gateway_routes;
 mod host_reads;
 mod host_resources;
@@ -216,7 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "unexpected arg {other:?} (want a node verb — \
                      keygen|init|invite|admit|invite-accept|promote|resident-remove|\
                      join-requests|join-state|member-remove|member-leave|member-status|join|\
-                     preflight-state|upgrade-status — or the run path: \
+                     upgrade-status — or the run path: \
                      ducktape node --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());
@@ -349,6 +350,9 @@ fn run_node(
         joiner,
         label: &label,
         storage: &storage,
+        // the config dir where gateway-routes.json lives (= storage in the dev
+        // shape); an embedded airlock gateway registers its port here.
+        workspace: &workspace,
         rpc_listen,
         http_listen,
         gateway_listen,

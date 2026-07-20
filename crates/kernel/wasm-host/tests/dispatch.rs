@@ -2,7 +2,7 @@
 //! like a native one — staged writes, block-boundary commit, deterministic root,
 //! and a hot-swap that keeps the host-owned state.
 //!
-//! The fixture is a GENERATED artifact (built from `crates/examples/hello-wasm`
+//! The fixture is a GENERATED artifact (built from `crates/guests/hello-wasm`
 //! by the module build target); it is committed so this proof is self-contained.
 
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};

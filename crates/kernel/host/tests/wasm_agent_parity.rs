@@ -33,7 +33,7 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::Digest as _;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/agent-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/agent-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const AGENT_WASM: &[u8] = include_bytes!("fixtures/agent.component.wasm");
 

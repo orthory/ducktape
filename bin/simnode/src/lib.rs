@@ -65,8 +65,8 @@
 //! 32 bytes of hex fails loud at startup.
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
-//! separated, and repeatable) appends the kv/valset/governance/upgrade system
-//! modules AFTER the default 16, seeding the validator set with the given
+//! separated, and repeatable) appends the kv/valset/governance/lifecycle system
+//! modules AFTER the default 14, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
 //! binding governance verifies invite tokens against. registering the upgrade
@@ -117,7 +117,6 @@ use axum::{Json, Router};
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use duckdns::DuckDns;
 use files::Files;
 use forge::Forge;
 use gateway::Gateway;
@@ -134,7 +133,6 @@ use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
-use jobs::Jobs;
 use kv::Kv;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
@@ -147,15 +145,14 @@ use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
-use upgrade::Upgrade;
-use clients::Clients;
+use lifecycle::Lifecycle;
 use valset::Valset;
 
 /// the DEFAULT module set registered at genesis, in registry order — noded's
 /// exact set, so status/roots and query targets match what the app expects of a
 /// daemon. the sim-parity conformance lane pins this list against noded; do not
 /// change it without also changing the daemon.
-const BASE_MODULE_IDS: [&str; 16] = [
+const BASE_MODULE_IDS: [&str; 14] = [
     "chat",
     "saga",
     "dispatch",
@@ -163,23 +160,22 @@ const BASE_MODULE_IDS: [&str; 16] = [
     "tasks",
     "inbox",
     "automations",
-    "jobs",
     "agent",
     "runs",
     "pages",
     "forge",
     "files",
     "identity",
-    "duckdns",
+    // the MERGED gateway owns both the `.duck` handle plane and the route plane.
     "gateway",
 ];
 
 /// the four system modules the opt-in `--with-valset` genesis appends AFTER the
-/// default 16, in registry order: the KV store, the membership registry seeded
+/// default 14, in registry order: the KV store, the membership registry seeded
 /// with the genesis validators, governance (the sole authorized author of
-/// valset change), and the upgrade coordinator — whose mere registration makes
+/// valset change), and the lifecycle coordinator — whose mere registration makes
 /// the host-injected once-per-block boundary `Advance` ride every sim block.
-const VALSET_MODULE_IDS: [&str; 5] = ["kv", "valset", "clients", "governance", "upgrade"];
+const VALSET_MODULE_IDS: [&str; 4] = ["kv", "valset", "governance", "lifecycle"];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
 
@@ -348,7 +344,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 16-module set, byte-identical.
+    /// => the default 14-module set, byte-identical.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -397,7 +393,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     } = opts;
 
     // the status module list and the index tier both extend only under valset
-    // keys; the default path stays the exact 16-module set the parity lane pins.
+    // keys; the default path stays the exact 14-module set the parity lane pins.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
         BASE_MODULE_IDS.to_vec()
     } else {
@@ -741,7 +737,7 @@ struct Sim {
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
     /// the registered module ids, in registry order — the exact set `status`
-    /// reports (the default 16, or those plus VALSET_MODULE_IDS under the flag).
+    /// reports (the default 14, or those plus VALSET_MODULE_IDS under the flag).
     module_ids: Vec<&'static str>,
     /// the fabricated mesh identity `status` reports (`--node-key`), or empty
     /// for the default "no peer-routed features here". no mesh sits behind it.
@@ -790,7 +786,6 @@ fn run_sim(
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
             "runs",
@@ -800,7 +795,7 @@ fn run_sim(
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2) — mandatory for envelope composition.
@@ -818,7 +813,6 @@ fn run_sim(
         // (the simulator has neither), matching noded's daemon wiring. It is
         // also the canonical account display-name registry.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
         let gateway = Gateway::new("gateway", "identity", None, "local");
         let mut modules: Vec<Box<dyn Module>> = vec![
             Box::new(chat),
@@ -828,42 +822,39 @@ fn run_sim(
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
-            Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
         ];
-        // opt-in governance genesis, AFTER the default 16 in registry order:
+        // opt-in governance genesis, AFTER the default 14 in registry order:
         // kv, valset (seeded with the given genesis validators exactly like
         // bin/node), governance (the sole authorized author of valset change,
-        // bound to the invite namespace), and the upgrade coordinator — whose
+        // bound to the invite namespace), and the lifecycle coordinator — whose
         // registration alone makes the host's once-per-block boundary `Advance`
-        // ride every sim block. modreg/capability are deliberately left out
-        // (UpdateModule proposals stay unwired), and saga's construction is
-        // untouched. empty valset_keys => the default set, byte-identical.
+        // ride every sim block. governance's code-registry path stays unwired
+        // (no `with_code_registry`, so UpdateModule proposals are gated off) and
+        // capability is left out; saga's construction is untouched. empty
+        // valset_keys => the default set, byte-identical.
         if !valset_keys.is_empty() {
             let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
             let mut valset = Valset::new("valset");
             for key in &valset_keys {
                 valset.insert(key.clone());
             }
-            // the client ACL, seeded empty — a redeemed role=Client invite
-            // records a key here (governance emits ClientsMsg::Grant).
-            let clients = Clients::new("clients");
-            let governance = Governance::new("governance", "valset", "upgrade", "identity")
-                .with_invite_binding(invite_binding)
-                .with_clients("clients");
-            let upgrade = Upgrade::new("upgrade", "valset");
+            // a redeemed role=Client invite records a key in identity's client
+            // ACL (governance emits an `IdentityMsg::GrantClient` follow-up);
+            // identity is already in the default module set above.
+            let governance = Governance::new("governance", "valset", "lifecycle", "identity")
+                .with_invite_binding(invite_binding);
+            let lifecycle = Lifecycle::new("lifecycle", "valset");
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));
-            modules.push(Box::new(clients));
             modules.push(Box::new(governance));
-            modules.push(Box::new(upgrade));
+            modules.push(Box::new(lifecycle));
         }
         let host = Host::genesis(modules).expect("genesis");
 
