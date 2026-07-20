@@ -142,7 +142,7 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 25] = [
+pub(crate) const MODULE_IDS: [&str; 24] = [
     "pages",
     "chat",
     "forge",
@@ -157,7 +157,6 @@ pub(crate) const MODULE_IDS: [&str; 25] = [
     "dispatch",
     "tagging",
     "tasks",
-    "vaults",
     "identity",
     "duckdns",
     "gateway",
@@ -175,7 +174,7 @@ pub(crate) const MODULE_IDS: [&str; 25] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
     // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
     // tail inside the native snapshot persisted as one host-KV value.
     ("agent", 3),
@@ -221,9 +220,6 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("tasks", 2),
     ("upgrade", 1),
     ("valset", 1),
-    // 2: the wasm adapter port — the native canonical snapshot persisted as
-    // one host-KV value, so root()/snapshot bytes changed shape at cutover.
-    ("vaults", 2),
 ];
 
 /// The exact pre-wasm production registry still running on the dogfood v1
@@ -231,7 +227,7 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
 /// it must not reinterpret any module as wasm or advertise this as a fresh
 /// genesis/state-sync target. The route is deliberately exact: every other
 /// historical schema remains fail-closed.
-pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
+pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("agent", 1),
     ("automations", 1),
     ("capability", 1),
@@ -257,7 +253,6 @@ pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     ("tasks", 1),
     ("upgrade", 1),
     ("valset", 1),
-    ("vaults", 1),
 ];
 
 /// The only registry this binary can migrate in place: the CURRENT schema
@@ -266,7 +261,7 @@ pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
 /// including genuinely historical pre-wasm-cutover workspaces, whose module
 /// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
 /// re-genesis, no shim).
-pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
+pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 23] = [
     ("agent", 3),
     ("automations", 2),
     ("capability", 2),
@@ -290,7 +285,6 @@ pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
     ("tasks", 2),
     ("upgrade", 1),
     ("valset", 1),
-    ("vaults", 2),
 ];
 
 pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
@@ -301,8 +295,8 @@ pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
 /// dormant-registry route.
 pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
     "commit:clients-v1:",
-    "14f1d63c54bf56f602f75cefa658b7f7843438a87a6b52e3d872b6a7f4d3c31b:",
-    "27e67fbf3113ca99d67999230f84fadccbe0b522290bdea2904881c2ee3fd560:",
+    "53e5b47824b4221907a9936ffacbf34a92619cd482d48471211421220ba6ed7b:",
+    "e7874af2854f92987f4613962da89286ad938c3f33836c5e429a112273857228:",
     "dormant-registry-v1"
 );
 

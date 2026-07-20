@@ -142,20 +142,9 @@ const DIRECTORY_WASM_COMPONENT: &[u8] =
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
 
-/// the vaults module's GENESIS component — the first ADAPTER-ported tenant:
-/// the guest compiles the NATIVE `vaults` crate to wasm and persists its
-/// canonical snapshot as one host-KV value per dispatch, so the module's
-/// logic is single-sourced while the state schema breaks (revision 2 in
-/// `MODULE_STATE_SCHEMAS`; beta networks re-genesis, no back-compat shim).
-const VAULTS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/vaults-wasm/component.wasm");
-
-/// the genesis-constant id the vaults module registers under.
-const VAULTS_MODULE_ID: &str = "vaults";
-
-/// jobs / inbox / tasks GENESIS components — adapter-ported tenants like
-/// vaults (native crate compiled into the guest; canonical snapshot persisted
-/// through the host-KV store; revision 2 in `MODULE_STATE_SCHEMAS`).
+/// jobs / inbox / tasks GENESIS components — adapter-ported tenants (the
+/// native crate compiled into the guest; canonical snapshot persisted through
+/// the host-KV store; revision 2 in `MODULE_STATE_SCHEMAS`).
 const JOBS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/jobs-wasm/component.wasm");
 const JOBS_MODULE_ID: &str = "jobs";
@@ -272,10 +261,6 @@ fn seeded_modreg() -> Modreg {
         sha2::Sha256::digest(DIRECTORY_WASM_COMPONENT).to_vec(),
     );
     modreg.seed(
-        VAULTS_MODULE_ID,
-        sha2::Sha256::digest(VAULTS_WASM_COMPONENT).to_vec(),
-    );
-    modreg.seed(
         JOBS_MODULE_ID,
         sha2::Sha256::digest(JOBS_WASM_COMPONENT).to_vec(),
     );
@@ -348,7 +333,6 @@ fn seeded_modreg() -> Modreg {
 pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(VAULTS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(JOBS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(INBOX_WASM_COMPONENT.to_vec());
     blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
@@ -382,18 +366,11 @@ fn genesis_directory_wasm() -> WasmModule {
         .expect("embedded directory component loads")
 }
 
-/// the vaults module at its GENESIS code (same reconciliation story as
-/// [`genesis_hello_wasm`]). revision 2: the adapter port persists the native
-/// canonical snapshot under the host-KV encoding — a state-schema break from
-/// the native module's root, fenced by the recovery/state-sync preflight.
-fn genesis_vaults_wasm() -> WasmModule {
-    WasmModule::from_bytes(VAULTS_MODULE_ID, VAULTS_WASM_COMPONENT)
-        .expect("embedded vaults component loads")
-        .with_state_schema_revision(2)
-}
-
-/// jobs / inbox / tasks at their GENESIS code (adapter-ported, revision 2 —
-/// see [`genesis_vaults_wasm`]).
+/// jobs / inbox / tasks at their GENESIS code. adapter-ported, revision 2: the
+/// adapter port persists the native canonical snapshot under the host-KV
+/// encoding — a state-schema break from the native module's root, fenced by
+/// the recovery/state-sync preflight. same boot-time code reconciliation story
+/// as [`genesis_hello_wasm`].
 fn genesis_jobs_wasm() -> WasmModule {
     WasmModule::from_bytes(JOBS_MODULE_ID, JOBS_WASM_COMPONENT)
         .expect("embedded jobs component loads")
@@ -413,7 +390,7 @@ fn genesis_tasks_wasm() -> WasmModule {
 }
 
 /// tagging / capability / duckdns at their GENESIS code (adapter-ported,
-/// revision 2 — see [`genesis_vaults_wasm`]).
+/// revision 2 — see [`genesis_jobs_wasm`]).
 fn genesis_tagging_wasm() -> WasmModule {
     WasmModule::from_bytes(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT)
         .expect("embedded tagging component loads")
@@ -512,7 +489,7 @@ fn genesis_config_wasm(
 }
 
 /// identity at its GENESIS code + config (adapter-ported, revision 2 — see
-/// [`genesis_vaults_wasm`]): the per-network chain id rides `__config`.
+/// [`genesis_jobs_wasm`]): the per-network chain id rides `__config`.
 fn genesis_identity_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     genesis_config_wasm(
         IDENTITY_MODULE_ID,
@@ -566,7 +543,6 @@ struct ProductionModules {
     dispatch: DispatchModule,
     tagging: WasmModule,
     tasks: WasmModule,
-    vaults: WasmModule,
     identity: WasmModule,
     duckdns: WasmModule,
     gateway: WasmModule,
@@ -599,7 +575,6 @@ impl ProductionModules {
             Box::new(self.dispatch),
             Box::new(self.tagging),
             Box::new(self.tasks),
-            Box::new(self.vaults),
             Box::new(self.identity),
             Box::new(self.duckdns),
             Box::new(self.gateway),
@@ -700,10 +675,6 @@ pub(super) async fn genesis_host(
         // modules receive engagement events — router only, module-agnostic.
         tagging: genesis_tagging_wasm(),
         tasks: genesis_tasks_wasm(),
-        // the first ADAPTER-ported wasm tenant: the native vaults logic
-        // compiled to wasm, whole-state persisted per dispatch (see
-        // `genesis_vaults_wasm`).
-        vaults: genesis_vaults_wasm(),
         // the deterministic user->nodes binding registry: certificates are
         // chain-scoped (this network's chain id, riding its GENESIS CONFIG),
         // member-gated binds via valset, and account display names have this
@@ -867,16 +838,6 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
 
-    // the checkpoint bytes are the WasmModule host-KV snapshot (the adapter
-    // port's own canonical encoding), so a wasm-era checkpoint reinstalls
-    // self-consistently; pre-cutover checkpoints are fenced off by the
-    // state-schema preflight above (revision 2).
-    let mut vaults = genesis_vaults_wasm();
-    let (bytes, root) = snapshot_of(VAULTS_MODULE_ID)?;
-    vaults
-        .install(bytes, root)
-        .map_err(|e| format!("vaults install: {e}"))?;
-
     let mut identity = genesis_identity_wasm(bindings);
     let (bytes, root) = snapshot_of(IDENTITY_MODULE_ID)?;
     identity
@@ -955,7 +916,6 @@ pub(super) async fn restore_host(
         dispatch,
         tagging,
         tasks,
-        vaults,
         identity,
         duckdns,
         gateway,
@@ -1214,12 +1174,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
 
-    let (bytes, root) = snapshot_of(VAULTS_MODULE_ID).await?;
-    let mut vaults = genesis_vaults_wasm();
-    vaults
-        .install(&bytes, root)
-        .map_err(|e| format!("vaults install: {e}"))?;
-
     let (bytes, root) = snapshot_of(IDENTITY_MODULE_ID).await?;
     let mut identity = genesis_identity_wasm(bindings);
     identity
@@ -1320,7 +1274,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         dispatch,
         tagging,
         tasks,
-        vaults,
         identity,
         duckdns,
         gateway,
@@ -1396,7 +1349,7 @@ mod tests {
         // fail-closed like every other historical schema).
         assert_eq!(
             crate::config::hex_bytes(&pre_clients_state_schema_fingerprint()),
-            "14f1d63c54bf56f602f75cefa658b7f7843438a87a6b52e3d872b6a7f4d3c31b"
+            "53e5b47824b4221907a9936ffacbf34a92619cd482d48471211421220ba6ed7b"
         );
         assert_eq!(
             classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 0),
@@ -1416,7 +1369,7 @@ mod tests {
     fn native_v1_schema_has_one_exact_compatibility_route() {
         assert_eq!(
             crate::config::hex_bytes(&native_v1_state_schema_fingerprint()),
-            "363608db2d6271c5fba5b2dd55b1de6043aeeb101fb3e0db43d60550c7aca1af"
+            "7fdd19b359398d9035ee8eb59cb3afd0707728fad16236c10a5f7b7d13e6ff53"
         );
         assert_eq!(
             classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 1),

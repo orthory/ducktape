@@ -42,10 +42,6 @@ directory = { workspace = true }
 # (root-continuous cutover — revision stays 1).
 pages = { workspace = true }
 chat = { workspace = true }
-# the adapter-port parity proof drives the SAME op matrix through the native
-# vaults module and its wasm port, asserting identical replies + the declared
-# state-schema break.
-vaults = { workspace = true }
 jobs = { workspace = true }
 inbox = { workspace = true }
 tasks = { workspace = true }

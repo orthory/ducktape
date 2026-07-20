@@ -34,7 +34,6 @@ use tagging::TaggingModule;
 use tasks::Tasks;
 use upgrade::Upgrade;
 use valset::Valset;
-use vaults::Vaults;
 use wasm_host::WasmModule;
 
 use super::{
@@ -58,7 +57,6 @@ struct NativeV1Modules {
     dispatch: DispatchModule,
     tagging: TaggingModule,
     tasks: Tasks,
-    vaults: Vaults,
     identity: Identity,
     duckdns: DuckDns,
     gateway: Gateway,
@@ -89,7 +87,6 @@ impl NativeV1Modules {
             Box::new(self.dispatch),
             Box::new(self.tagging),
             Box::new(self.tasks),
-            Box::new(self.vaults),
             Box::new(self.identity),
             Box::new(self.duckdns),
             Box::new(self.gateway),
@@ -262,12 +259,6 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|error| format!("tasks install: {error}"))?;
 
-    let mut vaults = Vaults::new("vaults");
-    let (bytes, root) = snapshot_of("vaults")?;
-    vaults
-        .install(bytes, root)
-        .map_err(|error| format!("vaults install: {error}"))?;
-
     let mut identity = Identity::new(
         "identity",
         Some("valset".into()),
@@ -361,7 +352,6 @@ pub(super) async fn restore_host(
         dispatch,
         tagging,
         tasks,
-        vaults,
         identity,
         duckdns,
         gateway,
@@ -576,12 +566,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|error| format!("tasks install: {error}"))?;
 
-    let (bytes, root) = snapshot_of("vaults").await?;
-    let mut vaults = Vaults::new("vaults");
-    vaults
-        .install(&bytes, root)
-        .map_err(|error| format!("vaults install: {error}"))?;
-
     let (bytes, root) = snapshot_of("identity").await?;
     let mut identity = Identity::new(
         "identity",
@@ -691,7 +675,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         dispatch,
         tagging,
         tasks,
-        vaults,
         identity,
         duckdns,
         gateway,
