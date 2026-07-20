@@ -28,9 +28,10 @@ pub enum WorkspaceSource {
     /// a forge repo pinned at a commit, worked on `branch`.
     Forge {
         repo: String,
-        /// authoritative Forge tracker title when the composing node supplied
-        /// it; absent on older in-flight v3 envelopes.
-        item_title: Option<String>,
+        /// the authoritative Forge tracker title the composing node supplied —
+        /// required; it owns the primary capture commit (an empty title simply
+        /// falls back to model prose at commit time).
+        item_title: String,
         /// the pinned base commit (40-hex sha1) — COMMITTED refs at compose
         /// height, the checkout/fork point.
         commit: String,
@@ -75,12 +76,11 @@ impl WorkspaceSource {
     }
 }
 
-/// the wire decode of a v3 envelope's `workspace` block (contract §1). source
-/// coordinates and the `forge_push` verdict are required at the serde step (a
-/// malformed envelope fails to parse — acceptance IS validation); the
-/// `item_title` metadata still defaults for old in-flight envelopes.
-/// [`WireWorkspace::validate`] adds the per-field non-empty checks and surfaces
-/// the plain [`WorkspaceSource`].
+/// the wire decode of a v3 envelope's `workspace` block (contract §1). every
+/// field — source coordinates, the `forge_push` verdict, and the `item_title`
+/// — is required at the serde step (a malformed envelope fails to parse —
+/// acceptance IS validation). [`WireWorkspace::validate`] adds the per-field
+/// non-empty checks and surfaces the plain [`WorkspaceSource`].
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum WireWorkspace {
@@ -90,9 +90,8 @@ pub(crate) enum WireWorkspace {
     },
     Forge {
         repo: String,
-        /// additive in v3: old in-flight envelopes carry no fallback title.
-        #[serde(default)]
-        item_title: Option<String>,
+        /// required in v3: the composer always states the tracker title.
+        item_title: String,
         commit: String,
         branch: String,
         branch_born: bool,
@@ -169,18 +168,16 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_title_forge_envelope_keeps_running_without_a_fallback() {
-        let ws: WireWorkspace = serde_json::from_str(
-            r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false,"forge_push":false}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            ws.validate().unwrap(),
-            WorkspaceSource::Forge {
-                item_title: None,
-                ..
-            }
-        ));
+    fn a_forge_envelope_without_a_title_fails_the_decode() {
+        // FLAG DAY: item_title is REQUIRED — the composer always states the
+        // tracker title, so an omitting envelope is a mixed-binary signal that
+        // fails the serde step, never a run with a silently-missing title.
+        assert!(
+            serde_json::from_str::<WireWorkspace>(
+                r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false,"forge_push":false}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -196,11 +193,12 @@ mod tests {
     #[test]
     fn a_forge_workspace_missing_a_field_fails_to_decode() {
         for broken in [
-            r#"{"kind":"forge","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, // no repo
-            r#"{"kind":"forge","repo":"app","branch":"b","branch_born":true,"forge_push":true}"#, // no commit
-            r#"{"kind":"forge","repo":"app","commit":"c","branch_born":true,"forge_push":true}"#, // no branch
-            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","forge_push":true}"#,       // no branch_born
-            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","branch_born":true}"#, // no forge_push
+            r#"{"kind":"forge","item_title":"t","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, // no repo
+            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, // no item_title
+            r#"{"kind":"forge","repo":"app","item_title":"t","branch":"b","branch_born":true,"forge_push":true}"#, // no commit
+            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch_born":true,"forge_push":true}"#, // no branch
+            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"b","forge_push":true}"#,       // no branch_born
+            r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"b","branch_born":true}"#, // no forge_push
         ] {
             assert!(
                 serde_json::from_str::<WireWorkspace>(broken).is_err(),
@@ -212,9 +210,9 @@ mod tests {
     #[test]
     fn validation_rejects_empty_forge_coordinates_per_field() {
         let cases = [
-            (r#"{"kind":"forge","repo":"","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, "repo"),
-            (r#"{"kind":"forge","repo":"app","commit":"","branch":"b","branch_born":true,"forge_push":true}"#, "commit"),
-            (r#"{"kind":"forge","repo":"app","commit":"c","branch":"","branch_born":true,"forge_push":true}"#, "branch"),
+            (r#"{"kind":"forge","repo":"","item_title":"t","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, "repo"),
+            (r#"{"kind":"forge","repo":"app","item_title":"t","commit":"","branch":"b","branch_born":true,"forge_push":true}"#, "commit"),
+            (r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"","branch_born":true,"forge_push":true}"#, "branch"),
         ];
         for (json, field) in cases {
             let err = serde_json::from_str::<WireWorkspace>(json)
@@ -254,7 +252,7 @@ mod tests {
         // per-kind receipt shape.
         let forge = WorkspaceSource::Forge {
             repo: "app".into(),
-            item_title: Some("Fix the gate".into()),
+            item_title: "Fix the gate".into(),
             commit: "d0".repeat(20),
             branch: "agent/item-7".into(),
             branch_born: true,

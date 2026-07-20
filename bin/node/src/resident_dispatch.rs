@@ -619,6 +619,8 @@ format = "text"
                 payload: serde_json::json!({
                     "ducktape_run": 3,
                     "agent_id": "bot",
+                    "run_id": "chat\u{1f}general\u{1f}1\u{1f}bot",
+                    "agent_display_name": "BOT",
                     "thread_key": null,
                     "instructions": "GENERIC",
                     "contract": "CONTRACT",
@@ -629,6 +631,7 @@ format = "text"
                         "source_snapshot": null
                     },
                     "skills": [],
+                    "library_readable": false,
                     "result_contract": {"ducktape_runner_result": 1}
                 })
                 .to_string()

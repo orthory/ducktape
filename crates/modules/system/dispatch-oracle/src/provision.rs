@@ -30,10 +30,10 @@ use crate::workspace_source::WorkspaceSource;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePlan {
     pub source: WorkspaceSource,
-    /// the run's CONSENSUS id, verbatim from the envelope — see
-    /// [`WorkspaceSpec::consensus_run_id`]. `None` on an envelope composed
-    /// before the field existed.
-    pub consensus_run_id: Option<String>,
+    /// the run's CONSENSUS id, verbatim from the (required) envelope field —
+    /// see [`WorkspaceSpec::consensus_run_id`]. always present: a run the
+    /// session lane cannot name is a run whose mid-run writes silently vanish.
+    pub consensus_run_id: String,
     pub sink: Sink,
     pub skills: Vec<RoMount>,
     /// committed registry name, carried to the Forge commit boundary.
@@ -58,12 +58,15 @@ pub struct WorkspaceSpec {
     pub run_id: String,
     /// the id `runs` resolves the run by — the key of its pending map, and the
     /// run the agent session lane binds to. carried from the composer through
-    /// the envelope because the host cannot derive it (see [`Self::run_id`]).
-    /// `None` = a pre-field envelope, or an embedder that composes its own: the
-    /// run then opens NO agent session and executes on the read-only tool plane
-    /// — the pre-session behaviour, never an error.
+    /// the envelope (a REQUIRED field) because the host cannot derive it (see
+    /// [`Self::run_id`]). `None` ONLY on a RECEIPT-ONLY spec, which carries
+    /// source coords alone and names no run; every EXECUTION spec the pool
+    /// builds has it, and `session::open` degrades to the read-only plane if it
+    /// somehow does not.
     pub consensus_run_id: Option<String>,
     pub agent_id: Option<String>,
+    /// the committed registry display name (Forge authorship / attribution).
+    /// `None` ONLY on a receipt-only spec; every execution spec carries it.
     pub agent_display_name: Option<String>,
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
@@ -560,7 +563,7 @@ mod tests {
             agent_display_name: Some("Bot".into()),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
-                item_title: Some("Fix the gate".into()),
+                item_title: "Fix the gate".into(),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,

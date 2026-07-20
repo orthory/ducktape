@@ -49,14 +49,13 @@ struct WireEnvelope {
     /// pending map is keyed on, and the one its agent session lane binds). the
     /// host has no way to derive it: the pool's own `WorkspaceSpec.run_id` is
     /// `{saga_id}:{attempt}`, a host-local workspace-dir key that names no run
-    /// in consensus. `Option` because it is an ADDITIVE field — an envelope
-    /// composed before it existed carries no key, and such a run must still
-    /// execute (it simply opens no session: the read-only tool plane).
-    run_id: Option<String>,
-    /// additive for v3: old in-flight envelopes fall back to `agent_id`, while
-    /// newly composed runs carry the committed registry display name.
-    #[serde(default)]
-    agent_display_name: Option<String>,
+    /// in consensus. REQUIRED: the composer always states it, so an envelope
+    /// that omits it is a mixed-binary signal and fails the decode.
+    run_id: String,
+    /// the committed registry display name. REQUIRED: the composer always
+    /// states it (defaulting to `agent_id` at compose time when a registry has
+    /// no distinct name), so an omitting envelope fails the decode.
+    agent_display_name: String,
     thread_key: Option<String>,
     instructions: String,
     contract: String,
@@ -145,9 +144,7 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
     let envelope: WireEnvelope =
         serde_json::from_value(claimed).map_err(|e| format!("run envelope is malformed: {e}"))?;
 
-    let agent_display_name = envelope
-        .agent_display_name
-        .unwrap_or_else(|| envelope.agent_id.clone());
+    let agent_display_name = envelope.agent_display_name;
     let mut ctx = RunContext {
         agent_id: Some(envelope.agent_id),
         thread_key: envelope.thread_key,
@@ -206,7 +203,7 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
 /// in the pool through its required execution-time provisioner.
 fn accept_portable_envelope(
     ctx: &mut RunContext,
-    consensus_run_id: Option<String>,
+    consensus_run_id: String,
     workspace: Option<WireWorkspace>,
     skills: Option<Vec<WireSkill>>,
     result_contract: Option<WireResultContract>,
@@ -247,7 +244,7 @@ fn accept_portable_envelope(
         library_readable,
         // the id CONSENSUS knows this run by — carried through to the
         // provisioner, which is the only thing that can name the run back to
-        // `runs`. absent on a pre-field envelope: no session, never a failure.
+        // `runs`.
         consensus_run_id,
         agent_display_name,
         // the requested sink rides the plan so the pool can echo it on the
@@ -420,11 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn an_in_flight_envelope_without_a_display_name_uses_the_agent_id() {
+    fn an_envelope_without_a_display_name_fails_the_decode() {
+        // FLAG DAY: agent_display_name is REQUIRED — the composer always states
+        // it, so an omitting envelope is a mixed-binary signal, never a run that
+        // silently falls back to the agent id.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v.as_object_mut().unwrap().remove("agent_display_name");
-        let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
-        assert_eq!(workspace.agent_display_name, "bot");
+        let err = prepare(&v.to_string()).unwrap_err();
+        assert!(err.contains("malformed"), "got {err:?}");
     }
 
     #[test]
@@ -539,28 +539,24 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_carries_the_consensus_run_id_and_tolerates_its_absence() {
+    fn the_plan_carries_the_consensus_run_id_and_an_absent_one_fails_the_decode() {
         // the id `runs` resolves the run by. it MUST survive the decode: the
         // pool has no other way to name the run — its own spec id is
         // `{saga_id}:{attempt}`, which resolves nothing in consensus — so a
         // dropped id here silently kills every mid-run write the run makes.
         let Prepared { workspace, .. } = prepare(&envelope_json()).unwrap();
         assert_eq!(
-            workspace.consensus_run_id.as_deref(),
-            Some(CONSENSUS_RUN_ID),
+            workspace.consensus_run_id, CONSENSUS_RUN_ID,
             "the run id crosses the envelope verbatim, separators and all"
         );
 
-        // ADDITIVE: an envelope composed before the field existed still runs —
-        // it simply names no run, so the provisioner opens no session (the
-        // read-only tool plane) rather than binding to a run that isn't there.
+        // FLAG DAY: run_id is REQUIRED — an envelope that omits it is a
+        // mixed-binary signal that fails the decode loudly, never a run that
+        // silently executes without a name.
         let mut legacy: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         legacy.as_object_mut().unwrap().remove("run_id");
-        let Prepared {
-            input, workspace, ..
-        } = prepare(&legacy.to_string()).unwrap();
-        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
-        assert_eq!(workspace.consensus_run_id, None);
+        let err = prepare(&legacy.to_string()).unwrap_err();
+        assert!(err.contains("malformed"), "got {err:?}");
     }
 
     #[test]
@@ -610,7 +606,7 @@ mod tests {
             workspace.source,
             crate::workspace_source::WorkspaceSource::Forge {
                 repo: "app".into(),
-                item_title: Some("Fix the gate".into()),
+                item_title: "Fix the gate".into(),
                 commit: "d0".repeat(20),
                 branch: "agent/item-7".into(),
                 branch_born: false,
