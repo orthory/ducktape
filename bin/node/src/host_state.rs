@@ -101,7 +101,7 @@ pub(super) struct SyncSubstrates<'a> {
 /// out-of-band as governance-committed hashes + blob-plane bytes; this is only
 /// where the story starts.
 const HELLO_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/hello-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/hello-wasm/component.wasm");
 
 /// the genesis-constant id the reference wasm module registers under.
 const HELLO_WASM_MODULE_ID: &str = "hello";
@@ -138,7 +138,7 @@ impl host::ModuleFactory for WasmModuleFactory {
 /// canonical encoding), so root(), snapshots, and pre-cutover workspace
 /// restores are all continuous across the cutover.
 const DIRECTORY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/directory-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/directory-wasm/component.wasm");
 
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
@@ -149,7 +149,7 @@ const DIRECTORY_MODULE_ID: &str = "directory";
 /// logic is single-sourced while the state schema breaks (revision 2 in
 /// `MODULE_STATE_SCHEMAS`; beta networks re-genesis, no back-compat shim).
 const VAULTS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/vaults-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/vaults-wasm/component.wasm");
 
 /// the genesis-constant id the vaults module registers under.
 const VAULTS_MODULE_ID: &str = "vaults";
@@ -158,13 +158,13 @@ const VAULTS_MODULE_ID: &str = "vaults";
 /// vaults (native crate compiled into the guest; canonical snapshot persisted
 /// through the host-KV store; revision 2 in `MODULE_STATE_SCHEMAS`).
 const JOBS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/jobs-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/jobs-wasm/component.wasm");
 const JOBS_MODULE_ID: &str = "jobs";
 const INBOX_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/inbox-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/inbox-wasm/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
 const TASKS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/tasks-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/tasks-wasm/component.wasm");
 const TASKS_MODULE_ID: &str = "tasks";
 
 /// tagging / capability / duckdns — adapter-ported tenants whose ops resolve
@@ -174,13 +174,13 @@ const TASKS_MODULE_ID: &str = "tasks";
 /// wit world's staged-over-committed reads cannot represent (kernel
 /// coordinators — valset, modreg, upgrade — gate the machinery itself).
 const TAGGING_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/tagging-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/tagging-wasm/component.wasm");
 const TAGGING_MODULE_ID: &str = "tagging";
 const CAPABILITY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/capability-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/capability-wasm/component.wasm");
 const CAPABILITY_MODULE_ID: &str = "capability";
 const DUCKDNS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/duckdns-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/duckdns-wasm/component.wasm");
 const DUCKDNS_MODULE_ID: &str = "duckdns";
 
 /// identity / gateway / governance — adapter-ported tenants whose native
@@ -192,13 +192,13 @@ const DUCKDNS_MODULE_ID: &str = "duckdns";
 /// every node, in the module root (hence the app-hash) from genesis, and
 /// carried by checkpoint snapshots like any other store key.
 const IDENTITY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/identity-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/identity-wasm/component.wasm");
 const IDENTITY_MODULE_ID: &str = "identity";
 const GATEWAY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/gateway-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/gateway-wasm/component.wasm");
 const GATEWAY_MODULE_ID: &str = "gateway";
 const GOVERNANCE_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/governance-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/governance-wasm/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
 
 /// saga / agent / automations — adapter-ported tenants of the async engine's
@@ -213,13 +213,13 @@ const GOVERNANCE_MODULE_ID: &str = "governance";
 /// committed-only view (the same class of frozen-committed read that keeps
 /// upgrade native).
 const SAGA_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/saga-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/saga-wasm/component.wasm");
 const SAGA_MODULE_ID: &str = "saga";
 const AGENT_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/agent-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/agent-wasm/component.wasm");
 const AGENT_MODULE_ID: &str = "agent";
 const AUTOMATIONS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/automations-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/automations-wasm/component.wasm");
 const AUTOMATIONS_MODULE_ID: &str = "automations";
 
 /// runs — the FINAL adapter-ported tenant: the collaboration loop's actor.
@@ -239,7 +239,7 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 /// (the app's runs client and the dogfood receipt lane read it), so it rides
 /// the wasm root and snapshots like everything else the guest keeps.
 const RUNS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/runs-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/runs-wasm/component.wasm");
 const RUNS_MODULE_ID: &str = "runs";
 
 /// pages / chat — the first STORE-BACKED wasm tenants: the native crates are
@@ -252,10 +252,10 @@ const RUNS_MODULE_ID: &str = "runs";
 /// workspaces reopen unchanged. NOTE the `.with_tagging("tagging")` wiring
 /// moved INTO the guests — the host builder chain drops it.
 const PAGES_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/pages-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/pages-wasm/component.wasm");
 const PAGES_MODULE_ID: &str = "pages";
 const CHAT_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/examples/chat-wasm/component.wasm");
+    include_bytes!("../../../crates/guests/chat-wasm/component.wasm");
 const CHAT_MODULE_ID: &str = "chat";
 
 /// genesis-seed the code registry: every wasm tenant's initial active code

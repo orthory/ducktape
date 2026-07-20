@@ -11,7 +11,7 @@
 //! host-KV store ONE — different preimages).
 //!
 //! runs is the collaboration loop's actor, so this proof drives the REAL
-//! loop (the `crates/apps/runs/tests/collaboration_loop.rs` shape) through
+//! loop (the `crates/modules/apps/runs/tests/collaboration_loop.rs` shape) through
 //! both runtimes side by side: both hosts carry the REAL native siblings
 //! under the production ids (`bin/node/src/host_state.rs`) — chat and pages
 //! over their own qmdb stores, tagging, saga, DISPATCH (native in production
@@ -81,7 +81,7 @@ use tasks::{
 use valset::Valset;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/runs-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/runs-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 

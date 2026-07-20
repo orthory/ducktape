@@ -150,11 +150,11 @@ tempfile = "3"
 # the airlock client through the overlay — proving the cred!=compute remote
 # topology (LoopbackHttp route + allow_authorization). axum serves the in-process
 # mock upstream the gateway swaps into.
-airlock = { path = "../../crates/system/airlock", features = ["client", "server", "verify", "testkit"] }
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server", "verify", "testkit"] }
 axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
-# loopback (the crates/system/overlay-net/tests/loopback_pair harness shape) to
+# loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
 # prove huddle media crosses the REAL overlay headless — this supplies the WG
 # interface config types; the boringtun crypto rides overlay-net (a dep above).
 defguard_wireguard_rs = { workspace = true }

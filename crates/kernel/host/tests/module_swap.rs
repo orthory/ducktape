@@ -17,7 +17,7 @@
 //!     left to arm — still reconciles its genesis code to the committed ACTIVE
 //!     hash instead of forking on stale code.
 //!
-//! Fixtures are GENERATED artifacts (see `crates/examples/hello-wasm{,-v2}`),
+//! Fixtures are GENERATED artifacts (see `crates/guests/hello-wasm{,-v2}`),
 //! committed so the proof is self-contained.
 
 use std::collections::BTreeMap;

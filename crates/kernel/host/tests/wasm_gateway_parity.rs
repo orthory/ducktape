@@ -35,7 +35,7 @@ use sdk::{Error, Module as _, Msg, Origin, StateRoot};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/gateway-wasm` by the
+/// GENERATED artifact — built from `crates/guests/gateway-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const GATEWAY_WASM: &[u8] = include_bytes!("fixtures/gateway.component.wasm");
 

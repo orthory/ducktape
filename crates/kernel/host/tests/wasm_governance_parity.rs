@@ -44,7 +44,7 @@ use valset::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/governance-wasm` by the
+/// GENERATED artifact — built from `crates/guests/governance-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const GOVERNANCE_WASM: &[u8] = include_bytes!("fixtures/governance.component.wasm");
 

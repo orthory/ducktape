@@ -3,10 +3,10 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/examples/hello-wasm` (v1),
-`crates/examples/hello-wasm-v2` (its live-update target), and
-`crates/examples/sibling-wasm` (the cross-module-read reference). The first
-REAL production tenant is `crates/examples/directory-wasm` — the wasm port of
+the reference modules are `crates/guests/hello-wasm` (v1),
+`crates/guests/hello-wasm-v2` (its live-update target), and
+`crates/guests/sibling-wasm` (the cross-module-read reference). The first
+REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
 the `directory` module, bytes-compatible with the native implementation it
 replaced (same root, same snapshot encoding: the cutover left the app-hash
 untouched).
@@ -99,7 +99,7 @@ make wasm-modules-check  # the drift gate: every committed copy is byte-identica
 One-off equivalent, per crate:
 
 ```
-cd crates/examples/hello-wasm
+cd crates/guests/hello-wasm
 cargo build --target wasm32-unknown-unknown --release
 wasm-tools component new target/wasm32-unknown-unknown/release/hello_wasm.wasm -o component.wasm
 ```
@@ -114,7 +114,7 @@ commit it as one change. The check rides the pre-push `make test` gate.
 ## Live update: how new code ships
 
 The consensus commitment to WHICH code a module runs is the code registry
-(`crates/system/modreg`): per module, the active 32-byte sha256 of its component
+(`crates/modules/system/modreg`): per module, the active 32-byte sha256 of its component
 bytes plus at most one pending height-gated swap. The BYTES travel out-of-band,
 content-addressed on the node blob plane. The flow:
 
@@ -150,7 +150,7 @@ block.
   `crates/kernel/host/tests/cross_module.rs` (a native peer composing with a
   wasm module) and `crates/kernel/host/tests/wasm_cutover_parity.rs` (the
   native↔wasm byte-compatibility proof for the directory cutover).
-- Authorization-level: `crates/system/governance/tests/
+- Authorization-level: `crates/modules/system/governance/tests/
   governance_schedules_module_update.rs` — ballot → registry acceptance.
 
 ## Porting a native module (the cutover pattern)

@@ -37,7 +37,7 @@ use sha2::{Digest as _, Sha256};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/identity-wasm` by the
+/// GENERATED artifact — built from `crates/guests/identity-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/identity.component.wasm");
 

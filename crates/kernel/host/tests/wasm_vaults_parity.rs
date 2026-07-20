@@ -14,7 +14,7 @@ use vaults::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/vaults-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/vaults-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const VAULTS_WASM: &[u8] = include_bytes!("fixtures/vaults.component.wasm");
 

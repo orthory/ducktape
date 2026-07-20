@@ -21,7 +21,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 [dev-dependencies]
 # the mock NodeApi stands a REAL native `files::Files` on a tempdir, so the tests
 # pull in the module glue (native feature) plus the block_on drivers.
-files = { path = "../../apps/files" }
+files = { path = "../../modules/apps/files" }
 sdk = { workspace = true }
 tempfile = { workspace = true }
 futures = "0.3"

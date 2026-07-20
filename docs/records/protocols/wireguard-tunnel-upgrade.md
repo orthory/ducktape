@@ -1,7 +1,7 @@
 # WireGuard Tunnel Upgrade Protocol
 
 Status: implemented protocol boundary for the validator-mesh epic. The
-`crates/system/wireguard` crate owns it (the former `wireguard-upgrade` and
+`crates/networking/wireguard` crate owns it (the former `wireguard-upgrade` and
 `wireguard-effect` crates, merged): the crate root verifies endpoint
 advertisements, mesh versions, port policy, signed upgrade
 request/response/ack messages, replay nonces, allowed IPs, and ACK freshness.

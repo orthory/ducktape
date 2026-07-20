@@ -30,13 +30,13 @@ use sdk::{Error, Msg, Origin, StateRoot};
 use valset::{Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/duckdns-wasm` (see that
+/// GENERATED artifact — built from `crates/guests/duckdns-wasm` (see that
 /// crate's Cargo.toml for the componentize recipe); committed so this proof is
 /// self-contained.
 const DUCKDNS_WASM: &[u8] = include_bytes!("fixtures/duckdns.component.wasm");
 
 /// the chain id the identity sibling is constructed with — the same string the
-/// identity module's own tests bind under (`crates/system/identity/src/tests.rs`).
+/// identity module's own tests bind under (`crates/modules/system/identity/src/tests.rs`).
 const CHAIN_ID: &str = "test-chain";
 
 fn wasm_duckdns() -> WasmModule {

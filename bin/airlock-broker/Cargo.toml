@@ -9,7 +9,7 @@ name = "airlock-broker"
 path = "src/main.rs"
 
 [dependencies]
-airlock = { path = "../../crates/system/airlock", features = ["client", "verify"] }
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "verify"] }
 anyhow = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros"] }
 axum = "0.8"

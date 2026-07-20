@@ -25,7 +25,7 @@ use tagging::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/tagging-wasm` by the module
+/// GENERATED artifact — built from `crates/guests/tagging-wasm` by the module
 /// build target; committed so this proof is self-contained.
 const TAGGING_WASM: &[u8] = include_bytes!("fixtures/tagging.component.wasm");
 
