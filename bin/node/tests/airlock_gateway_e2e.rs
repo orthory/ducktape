@@ -276,7 +276,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     for index in 0..2 {
         cluster.wait_marker(index, "rpc listening on", READY);
         cluster.wait_marker(index, "converged app_hash=", READY);
-        cluster.wait_marker(index, "1 peer(s); userspace socket backend", READY);
+        cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
 
@@ -414,7 +414,7 @@ fn airlock_single_node_self_serves_its_own_route() {
         .unwrap();
     });
 
-    // One validator node; no peer, so "1 peer(s)" never prints — but the gateway
+    // One validator node; no peer, so no handshake ever completes — but the gateway
     // plane still binds and serves the node's own routes locally.
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;

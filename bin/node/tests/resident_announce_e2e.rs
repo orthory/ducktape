@@ -208,7 +208,7 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     opt_in_serving(&cluster, 1);
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
-    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     // (1) THE ANNOUNCE: without promotion, the resident's discovered tag set

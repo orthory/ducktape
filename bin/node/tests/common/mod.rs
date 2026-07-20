@@ -154,6 +154,10 @@ impl NetworkShapeCluster {
     }
 
     pub fn init_founder(&self, name: &str) -> String {
+        // Join v2 refuses to mint an invite from a member with no reachability
+        // plane, and this harness is deliberately coordinator-free — so every
+        // founder carries a distinct-port WireGuard listen.
+        let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
             .args([
                 "init",
@@ -178,6 +182,8 @@ impl NetworkShapeCluster {
                 "--rpc",
                 &format!("127.0.0.1:{}", self.rpc_ports[0]),
             ])
+            .args(["--wireguard-listen", &wg_listen])
+            .args(["--wireguard-effect", "socket"])
             .output()
             .expect("run init");
         assert!(
@@ -205,16 +211,15 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// mint an invite LOCKED to the friend's key. Every invite is targeted now,
-    /// so this pre-generates the friend identity (which `join_friend` reuses)
-    /// and passes `--target`.
+    /// mint a bearer invite (Join v2: single-use, sealed to whoever redeems it
+    /// at first contact). Still pre-generates the friend identity so
+    /// `join_friend` reuses one stable key across the ceremony.
     pub fn invite(&self) -> String {
-        let target = self.keygen_friend(1);
+        self.keygen_friend(1);
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
             .args(["invite", "--config"])
             .arg(cfg)
-            .args(["--target", &target])
             .output()
             .expect("run invite");
         assert!(
@@ -274,6 +279,14 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.http_ports[1]),
                 "--rpc",
                 &format!("127.0.0.1:{}", self.rpc_ports[1]),
+                "--wireguard-listen",
+                &format!("127.0.0.1:{}", alloc_ports(1)[0]),
+                "--wireguard-effect",
+                "socket",
+                // hermetic: without this the joined node registers with the
+                // LIVE public coordinator from inside the test.
+                "--primary-coordinator",
+                "none",
             ])
             .output()
             .expect("run join")
@@ -337,31 +350,57 @@ impl NetworkShapeCluster {
     /// mirror of [`Cluster::rpc`] (same wire, same ports array).
     pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
         let port = self.rpc_ports[idx];
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let stream = loop {
-            match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(s) => break s,
-                Err(e) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "rpc connect to node idx {idx} (port {port}) failed: {e}"
-                    );
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        };
-        let mut stream = stream;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("rpc read timeout");
         let mut line = serde_json::to_string(&req).expect("rpc request serializes");
         line.push('\n');
-        stream.write_all(line.as_bytes()).expect("rpc write");
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .expect("rpc read");
-        serde_json::from_str(reply.trim()).expect("rpc reply is json")
+        let retryable = req["cmd"] == "query";
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            // the listener is up before the pump — connecting retries for
+            // every cmd (nothing has been sent yet, so retrying is safe).
+            let connect_deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        assert!(
+                            Instant::now() < connect_deadline,
+                            "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                            self.all_log_tails(40)
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            };
+            let mut stream = stream;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(if retryable { 15 } else { 60 })))
+                .expect("rpc read timeout");
+            stream.write_all(line.as_bytes()).expect("rpc write");
+            let mut reply = String::new();
+            match BufReader::new(stream).read_line(&mut reply) {
+                Ok(n) if n > 0 => {
+                    return serde_json::from_str(reply.trim()).expect("rpc reply is json");
+                }
+                res => {
+                    // a query is idempotent: reconnect and resend across the
+                    // windows where the listener answers connects but the node
+                    // cannot reply yet (a promotion reboot, an epoch-cutover
+                    // engine restart). a submit is NEVER resent — a duplicate
+                    // could double-apply — it gets one long read window above.
+                    let why = match res {
+                        Ok(_) => "connection closed before a reply line".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    if !retryable || Instant::now() >= deadline {
+                        panic!(
+                            "rpc to node idx {idx} (port {port}) failed: {why}; request: {req};\n{}",
+                            self.all_log_tails(60)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
     }
 
     pub fn query(&self, idx: usize, target: &str, req: &[u8]) -> Option<Vec<u8>> {
@@ -438,6 +477,33 @@ impl NetworkShapeCluster {
                 let verb = if exited { "exited" } else { "timed out" };
                 panic!(
                     "network-shape node idx {idx} {verb} without printing {marker:?};\n{}",
+                    self.all_log_tails(60),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// wait until node `idx` has COMMITTED STANDING as a member. Join v2 has
+    /// two legitimate admission paths and which one lands first is a race:
+    /// direct first contact prints "standing is committed" (replica/wiring),
+    /// the announce-redeem park path prints "resident: standing granted".
+    /// Waiting on either is the semantic event the resident tests gate on.
+    pub fn wait_admitted(&mut self, idx: usize, timeout: Duration) {
+        let markers = ["standing is committed", "resident: standing granted"];
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
+            if markers.iter().any(|m| find_marker(&text, m).is_some()) {
+                return;
+            }
+            let exited = node.child.try_wait().expect("poll node").is_some();
+            if exited || Instant::now() >= deadline {
+                let verb = if exited { "exited" } else { "timed out" };
+                panic!(
+                    "network-shape node idx {idx} {verb} without printing any of \
+                     {markers:?};\n{}",
                     self.all_log_tails(60),
                 );
             }
@@ -809,32 +875,57 @@ impl Cluster {
     /// process start).
     pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
         let port = self.rpc_ports[idx];
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let stream = loop {
-            match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(s) => break s,
-                Err(e) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
-                        self.all_log_tails(40)
-                    );
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        };
-        let mut stream = stream;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("rpc read timeout");
         let mut line = serde_json::to_string(&req).expect("rpc request serializes");
         line.push('\n');
-        stream.write_all(line.as_bytes()).expect("rpc write");
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .expect("rpc read");
-        serde_json::from_str(reply.trim()).expect("rpc reply is json")
+        let retryable = req["cmd"] == "query";
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            // the listener is up before the pump — connecting retries for
+            // every cmd (nothing has been sent yet, so retrying is safe).
+            let connect_deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        assert!(
+                            Instant::now() < connect_deadline,
+                            "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                            self.all_log_tails(40)
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            };
+            let mut stream = stream;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(if retryable { 15 } else { 60 })))
+                .expect("rpc read timeout");
+            stream.write_all(line.as_bytes()).expect("rpc write");
+            let mut reply = String::new();
+            match BufReader::new(stream).read_line(&mut reply) {
+                Ok(n) if n > 0 => {
+                    return serde_json::from_str(reply.trim()).expect("rpc reply is json");
+                }
+                res => {
+                    // a query is idempotent: reconnect and resend across the
+                    // windows where the listener answers connects but the node
+                    // cannot reply yet (a promotion reboot, an epoch-cutover
+                    // engine restart). a submit is NEVER resent — a duplicate
+                    // could double-apply — it gets one long read window above.
+                    let why = match res {
+                        Ok(_) => "connection closed before a reply line".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    if !retryable || Instant::now() >= deadline {
+                        panic!(
+                            "rpc to node idx {idx} (port {port}) failed: {why}; request: {req};\n{}",
+                            self.all_log_tails(60)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
     }
 
     /// submit an op via node `idx`'s rpc and assert the lane accepted it

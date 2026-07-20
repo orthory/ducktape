@@ -83,7 +83,7 @@ fn a_suspended_resident_resumes_following_within_the_deadline_budget() {
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
     let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
     assert!(ok, "invite-accept failed:\n{out}");
-    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     // prove the follow loop is live before the freeze.

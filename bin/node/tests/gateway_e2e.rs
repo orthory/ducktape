@@ -279,7 +279,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     for index in 0..2 {
         cluster.wait_marker(index, "rpc listening on", READY);
         cluster.wait_marker(index, "converged app_hash=", READY);
-        cluster.wait_marker(index, "1 peer(s); userspace socket backend", READY);
+        cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
 
