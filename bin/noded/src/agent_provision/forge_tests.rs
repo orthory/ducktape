@@ -182,7 +182,7 @@ impl Bed {
             agent_display_name: Some(AGENT_DISPLAY_NAME.into()),
             source: WorkspaceSource::Forge {
                 repo: REPO.into(),
-                item_title: Some("Fix the flaky gate".into()),
+                item_title: "Fix the flaky gate".into(),
                 commit: commit.into(),
                 branch: BRANCH.into(),
                 branch_born,
@@ -556,7 +556,7 @@ async fn a_repo_missing_on_this_node_fails_provision_loudly() {
     let mut spec = bed.spec("s1:0", &bed.head, false);
     spec.source = WorkspaceSource::Forge {
         repo: "ghost".into(),
-        item_title: Some("Fix the flaky gate".into()),
+        item_title: "Fix the flaky gate".into(),
         commit: bed.head.clone(),
         branch: BRANCH.into(),
         branch_born: false,
@@ -645,7 +645,7 @@ fn commit_message_selection_rejects_identity_spoofing_without_rewriting_the_fall
              Acked-by: Fake Acker <ack@example.com>\r\n\
              Tested-by: Fake Tester <test@example.com>",
         ),
-        Some("Unused Forge title"),
+        "Unused Forge title",
     )
     .expect("the Forge title is authoritative");
     assert_eq!(message, "Unused Forge title");
@@ -769,7 +769,7 @@ fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
         let safe_name = sanitize_display_name(&long_name);
         assert!(safe_name.len() <= MAX_DISPLAY_NAME_BYTES);
         assert!(safe_name.is_char_boundary(safe_name.len()));
-        let message = select_commit_message(proposal, Some("Fix the flaky gate"))
+        let message = select_commit_message(proposal, "Fix the flaky gate")
             .expect("the Forge title recovers an invalid agent proposal");
         assert_eq!(message, "Fix the flaky gate");
         assert!(!message.contains("dispatch") && message.len() <= MAX_COMMIT_MESSAGE_BYTES);
@@ -778,7 +778,7 @@ fn missing_unsafe_and_oversized_proposals_fall_back_to_the_forge_title() {
 
     let err = select_commit_message(
         Some("Fix it\n\nCo-Authored-By: Human <human@example.com>"),
-        Some("invalid\u{1f}Forge title"),
+        "invalid\u{1f}Forge title",
     )
     .unwrap_err();
     assert!(
@@ -792,7 +792,7 @@ fn the_forge_title_owns_the_primary_capture_and_response_is_only_fallback() {
     assert_eq!(
         select_commit_message(
             Some("Final response subject\n\nFinal response body"),
-            Some("Forge title"),
+            "Forge title",
         )
         .unwrap(),
         "Forge title"
@@ -800,29 +800,29 @@ fn the_forge_title_owns_the_primary_capture_and_response_is_only_fallback() {
     assert_eq!(
         select_commit_message(
             Some("Unsafe claim\n\nReviewed-by: Human <human@example.com>"),
-            Some("Forge title"),
+            "Forge title",
         )
         .unwrap(),
         "Forge title"
     );
     assert_eq!(
-        select_commit_message(Some("invalid\u{1f}message"), Some("Forge title")).unwrap(),
+        select_commit_message(Some("invalid\u{1f}message"), "Forge title").unwrap(),
         "Forge title"
     );
     assert_eq!(
         select_commit_message(
             Some("ship it 🦆\n\nThe agent chooses its own style."),
-            Some("Forge title"),
+            "Forge title",
         )
         .unwrap(),
         "Forge title"
     );
     assert_eq!(
-        select_commit_message(Some("Response fallback\n\nUseful detail"), None).unwrap(),
+        select_commit_message(Some("Response fallback\n\nUseful detail"), "").unwrap(),
         "Response fallback\n\nUseful detail"
     );
     assert_eq!(
-        select_commit_message(Some("Apply agent changes"), Some("Exact issue title")).unwrap(),
+        select_commit_message(Some("Apply agent changes"), "Exact issue title").unwrap(),
         "Exact issue title",
         "generic response prose must never replace bound item metadata"
     );
@@ -1110,7 +1110,9 @@ async fn no_agent_message_or_forge_title_never_pushes_synthetic_history() {
     let WorkspaceSource::Forge { item_title, .. } = &mut spec.source else {
         unreachable!()
     };
-    *item_title = None;
+    // an EMPTY title is the "no usable forge title" case now that the field is
+    // required: it fails the commit-message candidate and falls to the prose.
+    *item_title = String::new();
     let ws = bed.provisioner().provision(&spec).await.expect("provision");
     std::fs::write(ws.workdir().join("answer.md"), "real work\n").unwrap();
 

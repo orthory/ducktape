@@ -525,7 +525,7 @@ impl ForgeWorkspace {
 
     /// the source's pinned base commit / work branch (forge variant by
     /// construction — provision refused anything else).
-    fn coords(&self) -> (String, String, Option<String>) {
+    fn coords(&self) -> (String, String, String) {
         match &self.source {
             WorkspaceSource::Forge {
                 commit,
@@ -533,7 +533,7 @@ impl ForgeWorkspace {
                 item_title,
                 ..
             } => (commit.clone(), branch.clone(), item_title.clone()),
-            WorkspaceSource::Duckfs { .. } => (String::new(), String::new(), None),
+            WorkspaceSource::Duckfs { .. } => (String::new(), String::new(), String::new()),
         }
     }
 }
@@ -558,13 +558,12 @@ const PUSH_ATTEMPTS: u32 = 3;
 
 /// Use the committed Forge item title for the primary capture commit. Model
 /// prose is publication-body material, not identity metadata; it is only a
-/// fallback when the item title is unavailable or structurally unsafe.
+/// fallback when the item title is unavailable (empty) or structurally unsafe.
 fn select_commit_message(
     response_proposal: Option<&str>,
-    item_title: Option<&str>,
+    item_title: &str,
 ) -> Result<String, String> {
-    item_title
-        .into_iter()
+    std::iter::once(item_title)
         .chain(response_proposal)
         .find_map(commit_message_candidate)
         .ok_or_else(|| {
@@ -879,7 +878,7 @@ fn commit_blocking(
     push_url: &str,
     forge_push: bool,
     response_proposal: Option<&str>,
-    item_title: Option<&str>,
+    item_title: &str,
     identity: &CommitIdentity,
 ) -> Result<CommitOutcome, String> {
     // The provider's isolated HOME/auth/temp/target tree lives inside the
@@ -1046,7 +1045,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &push_url,
                 forge_push,
                 proposal.as_deref(),
-                item_title.as_deref(),
+                &item_title,
                 &identity,
             )
         })
