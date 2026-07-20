@@ -8,8 +8,10 @@
 //! proxied `/v1/messages` — through BOB's browser-gateway door and over the
 //! authenticated WireGuard overlay to Alice's enclave, and gets the swapped
 //! credential's reply back. This proves the remote topology the design's §graft
-//! calls out, minus real hardware attestation and the real Anthropic upstream
-//! (a mock upstream stands in, so the test is deterministic and spends no quota).
+//! calls out, minus silicon-backed quote GENERATION and the real Anthropic
+//! upstream (a testkit-minted SNP quote — checked by the REAL chain verifier
+//! under the test enclave's roots — and a mock upstream stand in, so the test
+//! is deterministic and spends no quota).
 //!
 //! The session-key handshake is load-bearing HERE: the quote is fetched and
 //! verified OVER the untrusted overlay before any token is derived, so a relaying
@@ -45,6 +47,18 @@ const FINALIZE: Duration = Duration::from_secs(60);
 
 fn measurement_hex() -> String {
     "11".repeat(attest::MRTD_LEN)
+}
+
+/// ONE test enclave (measures `0x11`x48) shared by the tests in this file. Its
+/// minted SNP chain is verified through the REAL `airlock::verify` path — but
+/// only under its own roots, never under the AMD builtins.
+fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
+    static ENCLAVE: std::sync::OnceLock<Arc<airlock::testkit::SnpTestEnclave>> =
+        std::sync::OnceLock::new();
+    ENCLAVE.get_or_init(|| {
+        let m = Measurement::from_hex(&measurement_hex()).unwrap();
+        Arc::new(airlock::testkit::SnpTestEnclave::new(&m).unwrap())
+    })
 }
 
 // ----- identity + duckdns helpers (mirrors gateway_e2e) ---------------------
@@ -205,7 +219,8 @@ async fn bind_and_serve(app: Router) -> String {
     format!("http://{addr}")
 }
 
-/// Boot the mock upstream and the airlock gateway (mock attest) pointed at it.
+/// Boot the mock upstream and the airlock gateway (testkit quoter, verified by
+/// the real SNP verifier) pointed at it.
 /// Returns `(gateway_base_url, gateway_loopback_port)`.
 async fn boot_gateway_and_upstream() -> (String, u16) {
     let upstream = bind_and_serve(
@@ -216,17 +231,21 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
     )
     .await;
 
-    let (app, vendor) = server::build(GatewayConfig {
-        attest: "mock".into(),
-        measurement: Some(measurement_hex()),
-        anthropic_base: upstream.clone(),
-        oauth_token_url: format!("{upstream}/oauth/token"),
-        oauth_client_id: "test-client".into(),
-        session_ttl_secs: 3600,
-        max_requests: 100,
-    })
+    let (app, vendor) = server::build_with_quoter(
+        GatewayConfig {
+            attest: "snp".into(),
+            measurement: None,
+            anthropic_base: upstream.clone(),
+            oauth_token_url: format!("{upstream}/oauth/token"),
+            oauth_client_id: "test-client".into(),
+            session_ttl_secs: 3600,
+            max_requests: 100,
+        },
+        "snp",
+        test_enclave().quoter(),
+    )
     .unwrap();
-    assert_eq!(vendor, "mock");
+    assert_eq!(vendor, "snp");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -236,11 +255,10 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
 }
 
 // TODO(full-spec, needs hardware): this proves the node-to-node overlay hop with
-// MOCK attestation and a MOCK upstream. The full 2-node + TEE run — real
-// `--attest tdx`/`snp` on a confidential VM (+ the matching vendor verify wired
-// into the compute path, which capability-host currently refuses) and the real
-// Anthropic API via the static bearer (PR #681) — is deferred to real hardware.
-// See the design spec "TODO — full 2-node + TEE validation".
+// a minted SNP chain (real verifier, test roots) and a mock upstream. The full
+// 2-node + TEE run — silicon-backed quote GENERATION on a confidential VM and
+// the real Anthropic API via the static bearer (PR #681) — is deferred to real
+// hardware. See the design spec "TODO — full 2-node + TEE validation".
 #[test]
 fn airlock_over_gateway_two_wireguard_nodes() {
     let _serial = serial();
@@ -257,7 +275,10 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         let gw = AirlockClient::local(gw_base.clone());
         let (quote, _vendor) = gw.fetch_quote().await.unwrap();
         let expected = Measurement::from_hex(&measurement_hex()).unwrap();
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
             &CredentialPayload::Refresh { refresh_token: "seed".into() },
@@ -353,7 +374,10 @@ fn airlock_over_gateway_two_wireguard_nodes() {
 
         // 1) attest OVER the overlay, verify the quote, read the attested seal_pk.
         let (quote, _vendor) = gw.fetch_quote().await.expect("fetch quote over overlay");
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
 
         // 2) session-key handshake OVER the overlay → scoped token.
         let token = gw
@@ -404,7 +428,10 @@ fn airlock_single_node_self_serves_its_own_route() {
         let gw = AirlockClient::local(gw_base.clone());
         let (quote, _vendor) = gw.fetch_quote().await.unwrap();
         let expected = Measurement::from_hex(&measurement_hex()).unwrap();
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
             &CredentialPayload::Refresh { refresh_token: "seed".into() },
@@ -477,7 +504,10 @@ fn airlock_single_node_self_serves_its_own_route() {
         let gw = AirlockClient::remote("airlock.alice.duck".into(), via);
         let expected = Measurement::from_hex(&measurement_hex()).unwrap();
         let (quote, _vendor) = gw.fetch_quote().await.expect("fetch quote through the gateway");
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
         let token = gw
             .open_session(&seal_pk, "self")
             .await
