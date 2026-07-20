@@ -540,6 +540,31 @@ fn airlock_single_node_self_serves_its_own_route() {
 /// file — no separate `airlock-gateway serve` / `gateway-route-bind` / seal steps.
 /// The client then self-serves through it exactly as above. Proves the node embed.
 ///
+/// The non-CVM half of the embed contract, runnable on any box WITHOUT
+/// TDX/SNP silicon: a credential node whose embedded gateway cannot attest
+/// must FAIL BOOT loudly — no "listening" claim, no route registration, no
+/// half-alive node with a route pointing at a dead gateway.
+#[test]
+fn airlock_embed_without_tee_fails_boot_loudly() {
+    let _serial = serial();
+    let mut cluster = Cluster::new(&[0], &[0]);
+    cluster.wireguard = true;
+    cluster.wireguard_socket = true;
+    cluster.env[0] = vec![
+        ("DUCKTAPE_AIRLOCK_SERVE".into(), "1".into()),
+        ("DUCKTAPE_AIRLOCK_SERVE_ATTEST".into(), "auto".into()),
+    ];
+    cluster.spawn(0);
+    // The attest probe names the reason (configfs-tsm absent on a non-CVM box)…
+    let output = cluster.wait_marker(0, "are we inside a TDX/SEV-SNP guest", READY);
+    // …and the node must not have claimed the gateway is up before dying.
+    assert!(
+        !output.contains("airlock gateway listening"),
+        "a node that cannot attest must not claim its gateway listens: {output}"
+    );
+    cluster.wait_exit(0, READY);
+}
+
 /// HARDWARE-ONLY since mock attestation was deleted: the embedded gateway
 /// attests via configfs-tsm, so the node must run inside a TDX/SNP guest
 /// (task #26). On SNP hardware set AIRLOCK_E2E_SNP_PRODUCT=milan|genoa|turin.

@@ -110,12 +110,17 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             ))?;
             listener.set_nonblocking(true)?;
             let port = listener.local_addr()?.port();
+            // Build — and thus ATTEST — BEFORE registering the route or claiming
+            // to listen: a node that cannot attest must fail boot loudly here,
+            // never register a route to a gateway that will not come up.
+            let (router, vendor) = airlock::server::build_seeded(serve.cfg, serve.credential)
+                .map_err(|error| format!("airlock gateway: {error}"))?;
             crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
                 .map_err(|error| format!("register airlock gateway route: {error}"))?;
             println!(
-                "[node {label}] airlock gateway listening on http://127.0.0.1:{port} (route \"airlock\")"
+                "[node {label}] airlock gateway listening on http://127.0.0.1:{port} (route \"airlock\", attest={vendor})"
             );
-            Some((listener, serve.cfg, serve.credential))
+            Some((listener, router))
         }
         Some(Ok(_)) => {
             eprintln!(
@@ -288,16 +293,14 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                     }
                                 });
                             }
-                            if let Some((airlock_listener, airlock_cfg, airlock_cred)) = airlock_bits
-                            {
+                            if let Some((airlock_listener, airlock_router)) = airlock_bits {
                                 let airlock_listener =
                                     tokio::net::TcpListener::from_std(airlock_listener)
                                         .expect("adopt airlock gateway listener");
                                 tokio::spawn(async move {
-                                    if let Err(error) = airlock::server::serve_seeded(
+                                    if let Err(error) = airlock::server::serve_router(
                                         airlock_listener,
-                                        airlock_cfg,
-                                        airlock_cred,
+                                        airlock_router,
                                     )
                                     .await
                                     {
