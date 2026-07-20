@@ -131,14 +131,19 @@ fn name(flags: &std::collections::BTreeMap<String, String>) -> Result<gateway::R
     Ok(name)
 }
 
-pub fn dispatch(command: &str, args: &[String]) -> Option<Result<(), Box<dyn std::error::Error>>> {
-    let result = match command {
-        "gateway-route-bind" => bind(args),
-        "gateway-route-unbind" => unbind(args),
-        "gateway-route-list" => list(args),
-        _ => return None,
+const USAGE: &str = "usage: ducktape gateway <verb> — bind | unbind | list";
+
+/// Run one verb of the `ducktape gateway` family.
+pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let Some((verb, args)) = argv.split_first() else {
+        return Err(USAGE.into());
     };
-    Some(result)
+    match verb.as_str() {
+        "bind" => bind(args),
+        "unbind" => unbind(args),
+        "list" => list(args),
+        other => Err(format!("unknown gateway verb {other:?}\n{USAGE}").into()),
+    }
 }
 
 fn bind(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {

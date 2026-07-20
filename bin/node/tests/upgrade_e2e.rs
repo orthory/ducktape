@@ -22,7 +22,7 @@
 //! - (f) a fresh state-sync joiner across `H` rebuilds the IDENTICAL app-hash
 //!   (version-aware install).
 //!
-//! plus a live `ducktape upgrade-status` CLI read against a scheduled net.
+//! plus a live `ducktape node upgrade-status` CLI read against a scheduled net.
 //!
 //! NOTE on the mixed-old/new-binary leg: a single `cargo test` links ONE node
 //! binary (`CARGO_BIN_EXE_ducktape`, `MAX_PROTOCOL_VERSION = 3`), so a true
@@ -438,7 +438,7 @@ fn cluster_upgrade() {
     // pending upgrade, readiness count, and armed verdict.
     let cfg0 = cluster.config_file(0);
     let cfg0s = cfg0.to_str().expect("utf-8 config path");
-    let (ok, out) = cluster.run_verb(&["upgrade-status", "--config", cfg0s]);
+    let (ok, out) = cluster.run_verb(&["node", "upgrade-status", "--config", cfg0s]);
     assert!(ok, "upgrade-status CLI failed:\n{out}");
     assert!(
         out.contains("pending: name=proto-v2") && out.contains("to_version=2"),

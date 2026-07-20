@@ -320,7 +320,8 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     // LoopbackHttp route on consensus.
     let workspace = cluster.workspace(0);
     let (ok, output) = cluster.run_verb(&[
-        "gateway-route-bind",
+        "gateway",
+        "bind",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",
@@ -450,7 +451,8 @@ fn airlock_single_node_self_serves_its_own_route() {
 
     let workspace = cluster.workspace(0);
     let (ok, output) = cluster.run_verb(&[
-        "gateway-route-bind",
+        "gateway",
+        "bind",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",

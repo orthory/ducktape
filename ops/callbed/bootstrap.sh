@@ -3,7 +3,7 @@
 # (init -> invite -> join -> admit -> invite -> join, same as
 # bin/node/examples/demo-invite.sh) ONCE, writing each node's config dir into
 # the shared volume (/shared/node0, /shared/node1). Each node container then
-# runs `ducktape --config /shared/nodeK/node.toml`; they peer at runtime.
+# runs `ducktape node --config /shared/nodeK/node.toml`; they peer at runtime.
 #
 # Nodes BIND 0.0.0.0 but ADVERTISE their compose service name (node0/node1) so
 # peers dial each other by DNS on the compose network. The whole ceremony is
@@ -36,21 +36,21 @@ WG="--wireguard-effect socket"
 COORD="--primary-coordinator coordinator:3478"
 
 echo "[bootstrap] node0 (founder): init"
-"$BIN" init --name callbed --dir "$A" $WG $COORD --wireguard-advertised node0:51820 \
+"$BIN" node init --name callbed --dir "$A" $WG $COORD --wireguard-advertised node0:51820 \
   --listen 0.0.0.0:$P2P --advertised node0:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC >/dev/null
-inv=$("$BIN" invite --config "$A/node.toml")
+inv=$("$BIN" node invite --config "$A/node.toml")
 
 echo "[bootstrap] node1 (friend): join (identity pass)"
-fk=$("$BIN" join "$inv" --dir "$B" $WG $COORD --wireguard-advertised node1:51820 \
+fk=$("$BIN" node join "$inv" --dir "$B" $WG $COORD --wireguard-advertised node1:51820 \
   --listen 0.0.0.0:$P2P --advertised node1:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC)
 echo "[bootstrap]   node1 key: $fk"
 
 echo "[bootstrap] node0 admits node1 + refreshes invite"
-"$BIN" admit "$fk" --config "$A/node.toml" >/dev/null
-inv2=$("$BIN" invite --config "$A/node.toml")
+"$BIN" node admit "$fk" --config "$A/node.toml" >/dev/null
+inv2=$("$BIN" node invite --config "$A/node.toml")
 
 echo "[bootstrap] node1: join (member pass)"
-"$BIN" join "$inv2" --dir "$B" $WG $COORD --wireguard-advertised node1:51820 \
+"$BIN" node join "$inv2" --dir "$B" $WG $COORD --wireguard-advertised node1:51820 \
   --listen 0.0.0.0:$P2P --advertised node1:$P2P --http 0.0.0.0:$HTTP --rpc 0.0.0.0:$RPC >/dev/null
 
 echo "[bootstrap] done — configs at $A and $B"

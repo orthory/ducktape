@@ -33,8 +33,8 @@ fn clients_contains(cluster: &NetworkShapeCluster, key_hex: &str) -> bool {
 /// run `user-redeem-invite <blob>` as the key at `key_path` (fresh path =
 /// auto-minted plain identity) against the founder's http surface.
 fn redeem(blob: &str, http: &str, key_path: &std::path::Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ducktape"))
-        .args(["user-redeem-invite", blob, "--node", http, "--key"])
+    Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("user")
+        .args(["redeem-invite", blob, "--node", http, "--key"])
         .arg(key_path)
         .output()
         .expect("run user-redeem-invite")
@@ -57,7 +57,7 @@ fn a_bearer_client_invite_redeems_over_http_exactly_once() {
     });
 
     // mint a bearer client blob — no --target, no invitee key exchange.
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
         .args(["invite", "--role", "client", "--config"])
         .arg(cluster.config_file(0))
         .output()
@@ -88,7 +88,7 @@ fn a_bearer_client_invite_redeems_over_http_exactly_once() {
 
     // the standing is committed consensus state, queryable from the node.
     let pub_a = {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
             .args(["keygen", "--out"])
             .arg(&key_a)
             .output()

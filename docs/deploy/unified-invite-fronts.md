@@ -1,6 +1,6 @@
 # Unified invite: member fronts
 
-`ducktape invite` now bundles **fronts** — the inviter's reachable
+`ducktape node invite` now bundles **fronts** — the inviter's reachable
 members — alongside the inviter's own WireGuard bootstrap. A joiner races
 first contact across the whole union (`{inviter} ∪ {fronts}`), so a fully
 NAT'd inviter is no longer a single point of failure: the tunnel can come up

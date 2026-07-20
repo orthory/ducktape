@@ -10,7 +10,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _};
 
 use crate::{
-    MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config, gateway_routes, host_state, userkey_cli,
+    MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config, host_state,
 };
 use config::{hex_bytes, unhex};
 
@@ -22,15 +22,9 @@ enum PreflightPhase {
     Roll,
 }
 
-/// Run an operator command, or return `None` when the arguments select the
-/// long-running node path instead.
+/// Run an operator command of the `ducktape node` family, or return `None`
+/// when the arguments select the long-running node path instead.
 pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> {
-    if let Some(result) = userkey_cli::dispatch(command, args) {
-        return Some(result);
-    }
-    if let Some(result) = gateway_routes::dispatch(command, args) {
-        return Some(result);
-    }
     let result = match command {
         "keygen" => cmd_keygen(args),
         "init" => cmd_init(args),
@@ -521,9 +515,9 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         hex_bytes(me.as_ref())
     );
     eprintln!("network {chain_id} initialized in {}", dir.display());
-    eprintln!("start:  ducktape --config {}/node.toml", dir.display());
+    eprintln!("start:  ducktape node --config {}/node.toml", dir.display());
     eprintln!(
-        "invite: ducktape invite --config {}/node.toml",
+        "invite: ducktape node invite --config {}/node.toml",
         dir.display()
     );
     println!("{chain_id}");
@@ -760,7 +754,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if role == config::InviteRole::Client {
         eprintln!(
             "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
-             redeem with: ducktape user-redeem-invite <blob> --node <member-http-url> \
+             redeem with: ducktape user redeem-invite <blob> --node <member-http-url> \
              --key <user.key>",
         );
     }
@@ -798,7 +792,7 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     descriptor.save(&descriptor_path)?;
     eprintln!("admitted {pubkey_hex} into {}", descriptor.chain_id);
     eprintln!(
-        "re-run `ducktape invite` and share the REFRESHED invite — genesis must be \
+        "re-run `ducktape node invite` and share the REFRESHED invite — genesis must be \
          identical on every member"
     );
     Ok(())
@@ -1261,7 +1255,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if read_residents(&rpc_addr)?.contains(&key_bytes) {
         eprintln!(
             "{pubkey_hex} already holds resident standing — promote with \
-             `ducktape promote {pubkey_hex}` once it is synced"
+             `ducktape node promote {pubkey_hex}` once it is synced"
         );
         return Ok(());
     }
@@ -1277,7 +1271,7 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
             eprintln!(
                 "granted resident standing to {pubkey_hex}: the mesh admits it at the next \
                  epoch cutover and its parked node pre-syncs state. promote it into the \
-                 quorum once warm:\n    ducktape promote {pubkey_hex}"
+                 quorum once warm:\n    ducktape node promote {pubkey_hex}"
             );
             Ok(())
         }
@@ -1366,7 +1360,7 @@ fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     if members.contains(&key_bytes) {
         eprintln!(
             "{pubkey_hex} is a seated validator, not a resident — remove it with \
-             `ducktape member-remove {pubkey_hex}`"
+             `ducktape node member-remove {pubkey_hex}`"
         );
         return Ok(());
     }
@@ -1386,7 +1380,7 @@ fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             eprintln!(
                 "revoked resident standing from {pubkey_hex}: the mesh drops it at the next \
                  epoch cutover and its node parks again. a member re-grants with:\n    \
-                 ducktape invite-accept {pubkey_hex}"
+                 ducktape node invite-accept {pubkey_hex}"
             );
             Ok(())
         }
@@ -1486,7 +1480,7 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     if after_vote.status == ProposalStatus::Open && !ready {
         eprintln!(
             "{yes} of {required} required voting power — waiting on other voters. each runs:\n    \
-             ducktape member-remove {pubkey_hex} --config <their node.toml>"
+             ducktape node member-remove {pubkey_hex} --config <their node.toml>"
         );
         return Ok(());
     }
@@ -1601,7 +1595,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // also filters every bearer blob.)
     if invite.token.role == config::InviteRole::Client {
         return Err("this is a CLIENT invite — it grants submit access, not a node. \
-                    redeem it with `ducktape user-redeem-invite <blob> --node \
+                    redeem it with `ducktape user redeem-invite <blob> --node \
                     <member-http-url> --key <user.key>`"
             .into());
     }
@@ -1718,12 +1712,12 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     );
     if descriptor.validators.contains(&me_hex) {
         eprintln!(
-            "this identity is a member — start: ducktape --config {}/node.toml",
+            "this identity is a member — start: ducktape node --config {}/node.toml",
             dir.display()
         );
     } else {
         eprintln!(
-            "NOT yet a member. start now — `ducktape --config {}/node.toml` redeems \
+            "NOT yet a member. start now — `ducktape node --config {}/node.toml` redeems \
              this invite automatically: the node joins the network's VPN, syncs state, and \
              comes up as a full node. no approval step follows (minting the invite WAS the \
              approval); a member can later promote it into the quorum with `promote {me_hex}`.",

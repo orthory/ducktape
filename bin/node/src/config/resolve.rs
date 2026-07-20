@@ -237,7 +237,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     }
     let key_path = base.join(raw.key_file.as_deref().unwrap_or("identity.key"));
     let signer = load_identity(&key_path).map_err(|e| {
-        format!("{e} — run `ducktape init` or `ducktape join <invite>` first")
+        format!("{e} — run `ducktape node init` or `ducktape node join <invite>` first")
     })?;
     let me = signer.public_key();
 

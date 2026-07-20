@@ -73,6 +73,7 @@ fn solo_founder_invites_a_friend() {
     let friend_hex = hex(&Cluster::identity(1));
     let cfg = cluster.config_file(0);
     let (ok, out) = cluster.run_verb(&[
+        "node",
         "promote",
         &friend_hex,
         "--config",
@@ -143,7 +144,8 @@ fn live_quorum_admits_a_fourth_validator() {
     for member in [0usize, 1] {
         let cfg = cluster.config_file(member);
         let (ok, out) = cluster.run_verb(&[
-            "promote",
+            "node",
+        "promote",
             &friend_hex,
             "--config",
             cfg.to_str().expect("utf-8 config path"),

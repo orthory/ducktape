@@ -110,7 +110,7 @@ ENTRY='
     iptables -A INPUT -s "$PEER" -p tcp -j REJECT;
   fi &&
   mkdir -p /run/wireguard &&
-  exec ducktape --config /data/node.toml'
+  exec ducktape node --config /data/node.toml'
 
 # node0: the TUN backend — privileged, device-backed.
 podman run -d --name dtwg-node0 --network $NET --ip "$IP0" \
