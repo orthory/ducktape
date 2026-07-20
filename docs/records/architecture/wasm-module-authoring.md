@@ -114,7 +114,7 @@ commit it as one change. The check rides the pre-push `make test` gate.
 ## Live update: how new code ships
 
 The consensus commitment to WHICH code a module runs is the code registry
-(`crates/system/modreg`): per module, the active 32-byte sha256 of its component
+(`crates/modules/system/modreg`): per module, the active 32-byte sha256 of its component
 bytes plus at most one pending height-gated swap. The BYTES travel out-of-band,
 content-addressed on the node blob plane. The flow:
 
@@ -150,7 +150,7 @@ block.
   `crates/kernel/host/tests/cross_module.rs` (a native peer composing with a
   wasm module) and `crates/kernel/host/tests/wasm_cutover_parity.rs` (the
   native↔wasm byte-compatibility proof for the directory cutover).
-- Authorization-level: `crates/system/governance/tests/
+- Authorization-level: `crates/modules/system/governance/tests/
   governance_schedules_module_update.rs` — ballot → registry acceptance.
 
 ## Porting a native module (the cutover pattern)

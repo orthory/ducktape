@@ -2,7 +2,7 @@
 //!
 //! a pure state-machine module (in the app-hash) holding channel watches and
 //! the correlation entries for still-pending dispatches. the agents it runs
-//! are NOT its state: the agent registry (`crates/apps/agent`) is the record
+//! are NOT its state: the agent registry (`crates/modules/apps/agent`) is the record
 //! book, and this module reads it by query — staged same-block registrations
 //! included, through the host's live query routing. run LIFECYCLE is not here
 //! either: a run is a dispatched task, and its status, outcome, and history

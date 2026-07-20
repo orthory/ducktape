@@ -111,7 +111,7 @@ The load-bearing facts:
   sync + a bounded invite shelf. It holds no key material, never carries peer
   traffic, and its `InviteStore` is integrity-protected by the blob's own
   envelope signature, not by the server
-  (`crates/system/nat-traversal/src/coordinator.rs:107-110`,
+  (`crates/networking/nat-traversal/src/coordinator.rs:107-110`,
   `invite_store.rs:1-8`).
 
 **Genesis sets differ by binary.** The production node composes **26 modules**
@@ -136,12 +136,12 @@ The workspace `Cargo.toml:1-27` header is the canonical tier map:
 ```
 crates/kernel/    the platform: sdk, host, node, consensus, statesync,
                   recovery, indexer, wasm-host (+ module-guest WIT)
-crates/system/    consensus modules (kv, valset, clients, governance, identity,
+crates/modules/system/    consensus modules (kv, valset, clients, governance, identity,
                   upgrade, saga, capability, dispatch, tagging, modreg,
                   duckdns, gateway) and off-consensus infra (blobstore,
                   dispatch-oracle, capability-host, wireguard, nat-traversal,
                   reachability, data-plane, overlay-net)
-crates/apps/      product modules: forge, chat, pages, agent, runs, tasks,
+crates/modules/apps/      product modules: forge, chat, pages, agent, runs, tasks,
                   vaults, automations, inbox, files, jobs
 crates/duckfs/    the versioned-filesystem engine: core (pure, wasm-ready),
                   disk, client (OS-side)
@@ -372,7 +372,7 @@ the doc, so per-loop refs are exact.
 Two corrections to folklore worth pinning: the "100ms drain tick" is a
 **validator** construct only — `noded` has no periodic tick at all; and
 `automations` is *not* a scheduler — it is a fully in-consensus hook reactor
-with no loop (`crates/apps/automations/src/lib.rs:1-13`). The only module-tier
+with no loop (`crates/modules/apps/automations/src/lib.rs:1-13`). The only module-tier
 background machinery is chat's voice engine and the dispatch-oracle provider
 pool.
 
@@ -385,7 +385,7 @@ pool.
 
 ## 6. The network/transport stack
 
-Two orthogonal planes ride one underlay (`crates/system/reachability/src/lib.rs:9-12`):
+Two orthogonal planes ride one underlay (`crates/networking/reachability/src/lib.rs:9-12`):
 the **control mesh** (commonware-p2p `authenticated::discovery`, encrypted
 TCP) is untouched by all the WireGuard machinery, which drives only the
 **data tunnel**. Bottom-up:
@@ -517,7 +517,7 @@ Step detail, with the actor / transport / evidence for each:
 0. **Mint** (inviter, local CLI). `cmd_invite` (`bin/node/src/cli.rs:541`)
    requires `--target` — no bearer invites. Token
    `{issuer, nonce[16], target, role, expires_unix_secs, sig}` signed in
-   `INVITE_GRANT_NAMESPACE` (`crates/system/governance/src/invite.rs:58-94`);
+   `INVITE_GRANT_NAMESPACE` (`crates/modules/system/governance/src/invite.rs:58-94`);
    default TTL 7 days. The issuer-signed blob envelope adds the network
    descriptor, the inviter's WireGuard bootstrap, and **fronts** — reachable
    members harvested from `mesh-state.json` — so a NAT'd inviter is not a
@@ -662,7 +662,7 @@ results** that re-enter as ordinary ordered ops:
   records pending work and emits a worker request as an `Event`. Idempotency
   (`(saga_id, attempt)`), same-block terminal callbacks, and deterministic
   deadlines via a permissionless `Crank` are its contract
-  (`crates/system/saga/src/lib.rs:10-31`).
+  (`crates/modules/system/saga/src/lib.rs:10-31`).
 - **dispatch** (consensus) is the task plane: a `Recipe` names a required
   capability tag, routing mode, and output contract; it stages the saga
   trigger, validates the agreed result against the contract, and delivers a
@@ -703,7 +703,7 @@ in *that* block.
 One line each; state substrate in parentheses. Genesis: **P** = production
 node (26), **D** = noded daemon (16).
 
-**Consensus infrastructure** (`crates/system/`):
+**Consensus infrastructure** (`crates/modules/system/`):
 
 | Module | Genesis | Role |
 |---|---|---|
@@ -726,7 +726,7 @@ content-addressed receipts/blob lane), `dispatch-oracle` + `capability-host`
 (§8.2), `wireguard` / `nat-traversal` / `reachability` / `overlay-net` /
 `data-plane` (§6).
 
-**Product modules** (`crates/apps/`), all P+D except `vaults` (P only):
+**Product modules** (`crates/modules/apps/`), all P+D except `vaults` (P only):
 
 | Module | Role |
 |---|---|
@@ -835,7 +835,7 @@ Doc-vs-code drift found while writing this (each verified in code):
    top search hits for "invitation."
 4. **Observers→Residents naming drift**: a leftover
    `ValsetReply::Residents` match arm still panics with `"expected Observers"`
-   (`crates/system/governance/tests/invite_redemption.rs:155`).
+   (`crates/modules/system/governance/tests/invite_redemption.rs:155`).
 5. **`user-node-identity-split` plan predates the implemented v2 account
    format** (multi-scheme `MemberAuth`, WebAuthn-P256) — the plan reads as an
    earlier design point.

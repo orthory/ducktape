@@ -1,6 +1,6 @@
 # The wasm port of the `jobs` module: compiles the NATIVE jobs crate to
 # wasm32 and adapts it to the ducktape:module world through guest-adapter —
-# the module's logic stays single-sourced in `crates/apps/jobs`. Standalone
+# the module's logic stays single-sourced in `crates/modules/apps/jobs`. Standalone
 # workspace: guest crates build to `wasm32-unknown-unknown` and are
 # componentized by the module build target, never by the host workspace.
 [package]
@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 guest-adapter = { path = "../guest-adapter" }
-jobs = { path = "../../apps/jobs" }
+jobs = { path = "../../modules/apps/jobs" }
 sdk = { path = "../../kernel/sdk" }
 
 [workspace]

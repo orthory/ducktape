@@ -1,5 +1,5 @@
 //! a module-backed `NodeApi`: a real native `files::Files` on a tempdir, driven
-//! exactly like `crates/apps/files/tests/commit.rs` — `execute` + `commit_block`
+//! exactly like `crates/modules/apps/files/tests/commit.rs` — `execute` + `commit_block`
 //! per op, `block_on` at the top level, one block per write. it stands in for a
 //! live node so the engine's logic (checkout, planning, staging, conflict) is
 //! tested against real module semantics without a daemon. `stage_chunk`/`commit`

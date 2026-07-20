@@ -1,7 +1,7 @@
 # The wasm port of the `governance` module: compiles the NATIVE governance
 # crate to wasm32 and adapts it to the ducktape:module world through
 # guest-adapter — the module's logic stays single-sourced in
-# `crates/system/governance`. The per-network invite binding is NOT compiled
+# `crates/modules/system/governance`. The per-network invite binding is NOT compiled
 # in: it arrives via the GENESIS-CONFIG store entry the host installs (see
 # `sdk::genesis_config`). Standalone workspace: guest crates build to
 # `wasm32-unknown-unknown` and are componentized by the module build target,
@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 guest-adapter = { path = "../guest-adapter" }
-governance = { path = "../../system/governance" }
+governance = { path = "../../modules/system/governance" }
 sdk = { path = "../../kernel/sdk" }
 
 [workspace]

@@ -1,7 +1,7 @@
 # The wasm port of the `capability` module: compiles the NATIVE capability
 # crate to wasm32 and adapts it to the ducktape:module world through
 # guest-adapter — the module's logic stays single-sourced in
-# `crates/system/capability`. Standalone workspace: guest crates build to
+# `crates/modules/system/capability`. Standalone workspace: guest crates build to
 # `wasm32-unknown-unknown` and are componentized by the module build target,
 # never by the host workspace.
 [package]
@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 guest-adapter = { path = "../guest-adapter" }
-capability = { path = "../../system/capability" }
+capability = { path = "../../modules/system/capability" }
 sdk = { path = "../../kernel/sdk" }
 
 [workspace]

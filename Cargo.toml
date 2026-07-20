@@ -1,19 +1,25 @@
 # super-app workspace — a consensus platform of isolated modules. each module
 # publishes its wire surface (types-only payload/query/reply shapes + codecs)
 # at its crate root; cross-module product interaction goes through those wire
-# types and host-mediated queries, never another module's internals. layout:
+# types and host-mediated queries, never another module's internals.
+# three layers: module / kernel / networking — the tree groups by function,
+# not mechanism ("system" always means system *modules*). layout:
 #   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
 #                      host (submit/execute loop, app-hash composition, the
 #                      host::worker seam), node (ordered replication), consensus
 #                      (BFT orderer), statesync, recovery, indexer
-#   crates/system/   — system modules and their host-side counterparts:
-#                      consensus modules (kv, valset, governance, identity,
-#                      upgrade, saga, capability, dispatch, tagging, duckdns,
-#                      gateway) and off-consensus infra (blobstore,
-#                      dispatch-oracle, capability-host, wireguard,
+#   crates/networking/ — the netstack: host-side transport infra (wireguard,
 #                      nat-traversal, reachability, data-plane, overlay-net)
-#   crates/apps/     — product feature modules (forge, chat, pages, agent,
-#                      runs, tasks, vaults, automations, inbox, files, jobs)
+#                      plus the consensus modules that govern it (duckdns,
+#                      gateway)
+#   crates/modules/system/ — system modules: consensus infrastructure (kv,
+#                      valset, clients, governance, identity, upgrade, saga,
+#                      capability, dispatch, tagging, modreg) and their
+#                      host-side counterparts (blobstore, dispatch-oracle,
+#                      capability-host)
+#   crates/modules/apps/   — application modules, the product features (forge,
+#                      chat, pages, agent, runs, tasks, vaults, automations,
+#                      inbox, files, jobs)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
@@ -34,42 +40,42 @@ members = [
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/wasm-host",
     # system — consensus infrastructure modules
-    "crates/system/kv",
-    "crates/system/valset",
-    "crates/system/clients",
-    "crates/system/governance",
-    "crates/system/identity",
-    "crates/system/upgrade", 
-    "crates/system/wireguard",
-    "crates/system/nat-traversal",
-    "crates/system/reachability",
-    "crates/system/data-plane",
-    "crates/system/overlay-net",
-    "crates/system/saga",
-    "crates/system/capability",
-    "crates/system/capability-host",
-    "crates/system/blobstore",
-    "crates/system/dispatch",
-    "crates/system/dispatch-oracle",
-    "crates/system/tagging",
-    "crates/system/modreg",
-    "crates/system/duckdns",
-    "crates/system/gateway",
+    "crates/modules/system/kv",
+    "crates/modules/system/valset",
+    "crates/modules/system/clients",
+    "crates/modules/system/governance",
+    "crates/modules/system/identity",
+    "crates/modules/system/upgrade", 
+    "crates/networking/wireguard",
+    "crates/networking/nat-traversal",
+    "crates/networking/reachability",
+    "crates/networking/data-plane",
+    "crates/networking/overlay-net",
+    "crates/modules/system/saga",
+    "crates/modules/system/capability",
+    "crates/modules/system/capability-host",
+    "crates/modules/system/blobstore",
+    "crates/modules/system/dispatch",
+    "crates/modules/system/dispatch-oracle",
+    "crates/modules/system/tagging",
+    "crates/modules/system/modreg",
+    "crates/networking/duckdns",
+    "crates/networking/gateway",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
     # apps — product feature modules
-    "crates/apps/forge",
-    "crates/apps/pages",
-    "crates/apps/chat",
-    "crates/apps/agent",
-    "crates/apps/runs", 
-    "crates/apps/tasks", 
-    "crates/apps/vaults", 
-    "crates/apps/automations", 
-    "crates/apps/inbox", 
-    "crates/apps/files",
-    "crates/apps/jobs",
+    "crates/modules/apps/forge",
+    "crates/modules/apps/pages",
+    "crates/modules/apps/chat",
+    "crates/modules/apps/agent",
+    "crates/modules/apps/runs", 
+    "crates/modules/apps/tasks", 
+    "crates/modules/apps/vaults", 
+    "crates/modules/apps/automations", 
+    "crates/modules/apps/inbox", 
+    "crates/modules/apps/files",
+    "crates/modules/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # labs — consensus modules deliberately absent from every genesis set
@@ -108,7 +114,7 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
 # decoder (empty input errors), so the voice engine renders lost frames as
-# silence; see crates/apps/chat/src/voice.
+# silence; see crates/modules/apps/chat/src/voice.
 opus-rs = "0.1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
@@ -179,49 +185,49 @@ consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
-capability-host = { path = "crates/system/capability-host" }
+capability-host = { path = "crates/modules/system/capability-host" }
 wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
-kv = { path = "crates/system/kv" }
-valset = { path = "crates/system/valset" }
-clients = { path = "crates/system/clients" }
-governance = { path = "crates/system/governance" }
-identity = { path = "crates/system/identity" }
-upgrade = { path = "crates/system/upgrade" }
-saga = { path = "crates/system/saga" }
-capability = { path = "crates/system/capability" }
-blobstore = { path = "crates/system/blobstore" }
-dispatch = { path = "crates/system/dispatch" }
-dispatch-oracle = { path = "crates/system/dispatch-oracle" }
-tagging = { path = "crates/system/tagging" }
-modreg = { path = "crates/system/modreg" }
-duckdns = { path = "crates/system/duckdns" }
-gateway = { path = "crates/system/gateway" }
-forge = { path = "crates/apps/forge" }
-pages = { path = "crates/apps/pages" }
-chat = { path = "crates/apps/chat" }
-agent = { path = "crates/apps/agent" }
-runs = { path = "crates/apps/runs" }
-tasks = { path = "crates/apps/tasks" }
-vaults = { path = "crates/apps/vaults" }
+kv = { path = "crates/modules/system/kv" }
+valset = { path = "crates/modules/system/valset" }
+clients = { path = "crates/modules/system/clients" }
+governance = { path = "crates/modules/system/governance" }
+identity = { path = "crates/modules/system/identity" }
+upgrade = { path = "crates/modules/system/upgrade" }
+saga = { path = "crates/modules/system/saga" }
+capability = { path = "crates/modules/system/capability" }
+blobstore = { path = "crates/modules/system/blobstore" }
+dispatch = { path = "crates/modules/system/dispatch" }
+dispatch-oracle = { path = "crates/modules/system/dispatch-oracle" }
+tagging = { path = "crates/modules/system/tagging" }
+modreg = { path = "crates/modules/system/modreg" }
+duckdns = { path = "crates/networking/duckdns" }
+gateway = { path = "crates/networking/gateway" }
+forge = { path = "crates/modules/apps/forge" }
+pages = { path = "crates/modules/apps/pages" }
+chat = { path = "crates/modules/apps/chat" }
+agent = { path = "crates/modules/apps/agent" }
+runs = { path = "crates/modules/apps/runs" }
+tasks = { path = "crates/modules/apps/tasks" }
+vaults = { path = "crates/modules/apps/vaults" }
 labs = { path = "crates/labs" }
-automations = { path = "crates/apps/automations" }
-inbox = { path = "crates/apps/inbox" }
-files = { path = "crates/apps/files" }
+automations = { path = "crates/modules/apps/automations" }
+inbox = { path = "crates/modules/apps/inbox" }
+files = { path = "crates/modules/apps/files" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
-jobs = { path = "crates/apps/jobs" }
+jobs = { path = "crates/modules/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
-wireguard = { path = "crates/system/wireguard" }
-nat-traversal = { path = "crates/system/nat-traversal" }
-reachability = { path = "crates/system/reachability" }
-data-plane = { path = "crates/system/data-plane" }
-overlay-net = { path = "crates/system/overlay-net" }
+wireguard = { path = "crates/networking/wireguard" }
+nat-traversal = { path = "crates/networking/nat-traversal" }
+reachability = { path = "crates/networking/reachability" }
+data-plane = { path = "crates/networking/data-plane" }
+overlay-net = { path = "crates/networking/overlay-net" }
 
 # overlay-net's wrapper context implements commonware-runtime's `Clock` and
 # rng bounds, whose supertraits live in these crates — pinned to the exact

@@ -16,7 +16,7 @@
 //! already an ordered, origin-signed, durable per-channel append log: a shared
 //! session's command lane IS a dedicated chat channel, a submitted command IS a
 //! chat message. This mirrors forge's hidden `forge:<repo>:<n>` discussion
-//! channels (`crates/apps/forge/src/tracker_iface.rs`).
+//! channels (`crates/modules/apps/forge/src/tracker_iface.rs`).
 //!
 //! ## Channel scheme (see the resolution note on [`session_channel`])
 //!
@@ -54,7 +54,7 @@
 //! The obvious shape — a worker that decodes a committed `ChatEvent::MessagePosted`
 //! event — does not work: chat emits `MessagePosted` via `ctx.emit_msg` to
 //! registered HOOK MODULES (a within-block dispatch), never as an `sdk::Event`
-//! on the worker seam (`crates/apps/chat/src/lib.rs` has NO `emit_event`). A
+//! on the worker seam (`crates/modules/apps/chat/src/lib.rs` has NO `emit_event`). A
 //! channel with no hooks emits nothing to observe, and a hook target must be a
 //! real registered module — which PR2 must not add. So the worker seam never
 //! sees a chat post. Instead we do what `bin/node`'s dispatch reactor already

@@ -1,6 +1,6 @@
 # The wasm port of the `vaults` module: compiles the NATIVE vaults crate to
 # wasm32 and adapts it to the ducktape:module world through guest-adapter —
-# the module's logic stays single-sourced in `crates/apps/vaults`. Standalone
+# the module's logic stays single-sourced in `crates/modules/apps/vaults`. Standalone
 # workspace: guest crates build to `wasm32-unknown-unknown` and are
 # componentized by the module build target, never by the host workspace.
 [package]
@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 guest-adapter = { path = "../guest-adapter" }
-vaults = { path = "../../apps/vaults" }
+vaults = { path = "../../modules/apps/vaults" }
 sdk = { path = "../../kernel/sdk" }
 
 [workspace]

@@ -148,7 +148,7 @@ tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
-# loopback (the crates/system/overlay-net/tests/loopback_pair harness shape) to
+# loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
 # prove huddle media crosses the REAL overlay headless — this supplies the WG
 # interface config types; the boringtun crypto rides overlay-net (a dep above).
 defguard_wireguard_rs = { workspace = true }

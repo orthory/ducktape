@@ -36,7 +36,7 @@ use wasm_host::WasmModule;
 const DUCKDNS_WASM: &[u8] = include_bytes!("fixtures/duckdns.component.wasm");
 
 /// the chain id the identity sibling is constructed with — the same string the
-/// identity module's own tests bind under (`crates/system/identity/src/tests.rs`).
+/// identity module's own tests bind under (`crates/modules/system/identity/src/tests.rs`).
 const CHAIN_ID: &str = "test-chain";
 
 fn wasm_duckdns() -> WasmModule {
