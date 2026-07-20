@@ -47,8 +47,7 @@ use sdk::codec::{Cursor, push_bytes};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use clients::{ClientsMsg, encode_msg as clients_encode_msg};
-use modreg::{ModregMsg, encode_msg as modreg_encode_msg};
-use upgrade::{UpgradeMsg, encode_msg as upgrade_encode_msg};
+use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
@@ -136,14 +135,15 @@ pub struct Governance {
     /// the id of the valset module this governance instance gates. genesis
     /// wiring — identical on every node.
     valset_id: ModuleId,
-    /// the id of the upgrade module a passing `ScheduleUpgrade`/`CancelUpgrade`
-    /// authorizes. genesis wiring — identical on every node.
-    upgrade_id: ModuleId,
-    /// the id of the code registry a passing `UpdateModule`/`CancelModuleUpdate`
-    /// authorizes. genesis wiring — identical on every node; `None` (a net
-    /// without the registry) rejects those proposals at the door,
-    /// deterministically.
-    modreg_id: Option<ModuleId>,
+    /// the id of the lifecycle module a passing `ScheduleUpgrade`/`CancelUpgrade`
+    /// authorizes (the protocol-version path). genesis wiring — identical on
+    /// every node.
+    lifecycle_id: ModuleId,
+    /// the id of the lifecycle module a passing `UpdateModule`/`CancelModuleUpdate`
+    /// authorizes (the code-registry path — the same module, gated separately).
+    /// genesis wiring — identical on every node; `None` (a net without the code
+    /// registry wired) rejects those proposals at the door, deterministically.
+    code_registry_id: Option<ModuleId>,
     /// the Identity account registry used in account-share mode.
     identity_id: ModuleId,
     /// the id of the client-ACL module a redeemed `role=Client` invite grants
@@ -187,14 +187,14 @@ impl Governance {
     pub fn new(
         id: impl Into<ModuleId>,
         valset_id: impl Into<ModuleId>,
-        upgrade_id: impl Into<ModuleId>,
+        lifecycle_id: impl Into<ModuleId>,
         identity_id: impl Into<ModuleId>,
     ) -> Self {
         Self {
             id: id.into(),
             valset_id: valset_id.into(),
-            upgrade_id: upgrade_id.into(),
-            modreg_id: None,
+            lifecycle_id: lifecycle_id.into(),
+            code_registry_id: None,
             identity_id: identity_id.into(),
             clients_id: None,
             clients_min_version: 0,
@@ -211,11 +211,13 @@ impl Governance {
         }
     }
 
-    /// wire the code registry a passing `UpdateModule`/`CancelModuleUpdate`
-    /// authorizes. genesis wiring — every node of a network must wire the same
-    /// id (or none), or nodes diverge on whether those proposals are accepted.
-    pub fn with_modreg(mut self, modreg_id: impl Into<ModuleId>) -> Self {
-        self.modreg_id = Some(modreg_id.into());
+    /// enable the code-registry path (`UpdateModule`/`CancelModuleUpdate`) on the
+    /// lifecycle module. genesis wiring — every node of a network must wire the
+    /// same id (or none), or nodes diverge on whether those proposals are
+    /// accepted. `id` is the lifecycle module id (the same module the version
+    /// path targets).
+    pub fn with_code_registry(mut self, id: impl Into<ModuleId>) -> Self {
+        self.code_registry_id = Some(id.into());
         self
     }
 
@@ -875,14 +877,14 @@ impl Governance {
         // module-update authorizations: shape-checked at the door (a proposal
         // that can never execute is rejected here, not at tally time); the code
         // registry's min-lead / at-most-one / no-op gates are NOT duplicated —
-        // modreg is their sole authority at ingest. a net without a wired code
-        // registry deterministically rejects these (genesis wiring is identical
-        // on every node).
+        // the lifecycle module is their sole authority at ingest. a net without a
+        // wired code registry deterministically rejects these (genesis wiring is
+        // identical on every node).
         if let GovAction::UpdateModule { name, module_id, .. }
         | GovAction::RegisterModule { name, module_id, .. }
         | GovAction::CancelModuleUpdate { name, module_id } = &action
         {
-            if self.modreg_id.is_none() {
+            if self.code_registry_id.is_none() {
                 return Err(Error::Module(
                     "no code registry wired: module updates are not available on this network"
                         .into(),
@@ -897,22 +899,22 @@ impl Governance {
         }
         if let GovAction::UpdateModule { code_hash, .. }
         | GovAction::RegisterModule { code_hash, .. } = &action
-            && code_hash.len() != modreg::CODE_HASH_LEN
+            && code_hash.len() != lifecycle::CODE_HASH_LEN
         {
             return Err(Error::Module(format!(
                 "code_hash must be {} bytes (sha256 of the component)",
-                modreg::CODE_HASH_LEN
+                lifecycle::CODE_HASH_LEN
             )));
         }
         // admission is protocol-version gated (the registry enforces the same
         // constant at execution; this door-check fails the proposal early,
         // before an electorate wastes a ballot on it).
         if matches!(&action, GovAction::RegisterModule { .. })
-            && self.active_version < modreg::ADMISSION_ACTIVATION_VERSION
+            && self.active_version < lifecycle::ADMISSION_ACTIVATION_VERSION
         {
             return Err(Error::Module(format!(
                 "module admission activates at protocol v{} (network is at v{})",
-                modreg::ADMISSION_ACTIVATION_VERSION,
+                lifecycle::ADMISSION_ACTIVATION_VERSION,
                 self.active_version
             )));
         }
@@ -1131,16 +1133,16 @@ impl Governance {
                     activation_height,
                     to_version,
                 } => ctx.emit_msg(Msg {
-                    target: self.upgrade_id.clone(),
-                    payload: upgrade_encode_msg(&UpgradeMsg::Schedule {
+                    target: self.lifecycle_id.clone(),
+                    payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleUpgrade {
                         name: name.clone(),
                         activation_height: *activation_height,
                         to_version: *to_version,
                     }),
                 }),
                 GovAction::CancelUpgrade { name } => ctx.emit_msg(Msg {
-                    target: self.upgrade_id.clone(),
-                    payload: upgrade_encode_msg(&UpgradeMsg::Cancel { name: name.clone() }),
+                    target: self.lifecycle_id.clone(),
+                    payload: lifecycle_encode_msg(&LifecycleMsg::CancelUpgrade { name: name.clone() }),
                 }),
                 // a passing module-update authorization is PERFORMED the same
                 // way: emit the modreg op as a follow-up, accepted because the
@@ -1155,10 +1157,10 @@ impl Governance {
                     module_id,
                     activation_height,
                     code_hash,
-                } => match &self.modreg_id {
-                    Some(modreg) => ctx.emit_msg(Msg {
-                        target: modreg.clone(),
-                        payload: modreg_encode_msg(&ModregMsg::Schedule {
+                } => match &self.code_registry_id {
+                    Some(lifecycle) => ctx.emit_msg(Msg {
+                        target: lifecycle.clone(),
+                        payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleSwap {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -1175,10 +1177,10 @@ impl Governance {
                     module_id,
                     activation_height,
                     code_hash,
-                } => match &self.modreg_id {
-                    Some(modreg) => ctx.emit_msg(Msg {
-                        target: modreg.clone(),
-                        payload: modreg_encode_msg(&ModregMsg::ScheduleRegister {
+                } => match &self.code_registry_id {
+                    Some(lifecycle) => ctx.emit_msg(Msg {
+                        target: lifecycle.clone(),
+                        payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleRegister {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -1187,10 +1189,10 @@ impl Governance {
                     }),
                     None => proposal.status = ProposalStatus::Rejected,
                 },
-                GovAction::CancelModuleUpdate { name, module_id } => match &self.modreg_id {
-                    Some(modreg) => ctx.emit_msg(Msg {
-                        target: modreg.clone(),
-                        payload: modreg_encode_msg(&ModregMsg::Cancel {
+                GovAction::CancelModuleUpdate { name, module_id } => match &self.code_registry_id {
+                    Some(lifecycle) => ctx.emit_msg(Msg {
+                        target: lifecycle.clone(),
+                        payload: lifecycle_encode_msg(&LifecycleMsg::CancelSwap {
                             name: name.clone(),
                             module_id: module_id.clone(),
                         }),

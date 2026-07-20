@@ -22,7 +22,7 @@ use governance::{
 };
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use upgrade::{UpgradeMsg, decode_msg as upgrade_decode};
+use lifecycle::{LifecycleMsg, decode_msg as lifecycle_decode};
 use valset::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
@@ -37,7 +37,7 @@ fn member_key(seed: u8) -> Vec<u8> {
 /// what an in-test `upgrade` stub observed: the decoded op and the origin the
 /// host stamped it with. shared with the test via `Rc<RefCell<..>>` (everything
 /// here is single-threaded `block_on`).
-type Spy = Rc<RefCell<Vec<(UpgradeMsg, Origin)>>>;
+type Spy = Rc<RefCell<Vec<(LifecycleMsg, Origin)>>>;
 
 /// a minimal stand-in for the real upgrade module (not registered until a later
 /// phase): it records every op it is dispatched, and can be told to REJECT a
@@ -60,11 +60,11 @@ impl Module for UpgradeStub {
         Ok(StateSyncHandle::Stateless)
     }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let op = upgrade_decode(&msg.payload).map_err(Error::Module)?;
+        let op = lifecycle_decode(&msg.payload).map_err(Error::Module)?;
         self.seen
             .borrow_mut()
             .push((op.clone(), ctx.env().origin.clone()));
-        if self.reject_schedule && matches!(op, UpgradeMsg::Schedule { .. }) {
+        if self.reject_schedule && matches!(op, LifecycleMsg::ScheduleUpgrade { .. }) {
             return Err(Error::Module("stub rejects schedule".into()));
         }
         Ok(())
@@ -212,7 +212,7 @@ fn a_passing_schedule_upgrade_emits_the_upgrade_followup() {
         assert_eq!(seen.len(), 1, "exactly one follow-up drained");
         assert_eq!(
             seen[0].0,
-            UpgradeMsg::Schedule {
+            LifecycleMsg::ScheduleUpgrade {
                 name: "forge-multi-repo".into(),
                 activation_height: 500,
                 to_version: 2,
@@ -247,7 +247,7 @@ fn cancel_upgrade_emits_cancel_followup() {
         assert_eq!(seen.len(), 1);
         assert_eq!(
             seen[0].0,
-            UpgradeMsg::Cancel {
+            LifecycleMsg::CancelUpgrade {
                 name: "forge-multi-repo".into(),
             }
         );

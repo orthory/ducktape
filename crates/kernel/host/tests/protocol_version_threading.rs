@@ -14,9 +14,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use commonware_runtime::{Runner as _, deterministic};
-use host::{BASELINE_VERSION, BlockContext, Host, UPGRADE_MODULE_ID};
+use host::{BASELINE_VERSION, BlockContext, Host, LIFECYCLE_MODULE_ID};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use upgrade::{ScheduledUpgrade, UpgradeReply, UpgradeStatus, encode_reply};
+use lifecycle::{LifecycleReply, ScheduledUpgrade, UpgradeStatus, encode_reply};
 
 /// a probe module that records the `protocol_version` it observed on EVERY
 /// dispatch, and whose `root()` deliberately IGNORES the version — it commits
@@ -85,7 +85,7 @@ impl Module for ProbeModule {
 }
 
 /// a stub standing in for the real `upgrade` module: it answers
-/// `UpgradeQuery::Status` with a fixed, configurable status so
+/// `LifecycleQuery::UpgradeStatus` with a fixed, configurable status so
 /// `Host::effective_version` can be exercised on its own derivation +
 /// fallback, decoupled from valset/governance mechanics.
 struct StatusModule {
@@ -95,7 +95,7 @@ struct StatusModule {
 #[async_trait::async_trait(?Send)]
 impl Module for StatusModule {
     fn id(&self) -> ModuleId {
-        UPGRADE_MODULE_ID.into()
+        LIFECYCLE_MODULE_ID.into()
     }
 
     fn root(&self) -> StateRoot {
@@ -107,7 +107,7 @@ impl Module for StatusModule {
     }
 
     async fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(encode_reply(&UpgradeReply::Status(self.status.clone())))
+        Ok(encode_reply(&LifecycleReply::UpgradeStatus(self.status.clone())))
     }
 }
 

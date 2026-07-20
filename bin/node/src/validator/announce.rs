@@ -37,7 +37,7 @@ impl ReadinessSignaller {
     /// named route), member-gated, and idempotent.
     pub(crate) fn decide(
         &mut self,
-        status: &upgrade::UpgradeStatus,
+        status: &lifecycle::UpgradeStatus,
     ) -> Option<(String, u32, Option<Vec<u8>>)> {
         let pending = status.pending.as_ref()?;
         // never lie: a binary that cannot execute the target version stays silent so
@@ -45,7 +45,7 @@ impl ReadinessSignaller {
         if pending.to_version > self.max_version {
             return None;
         }
-        let commitment = match upgrade::required_readiness_commitment(&pending.name) {
+        let commitment = match lifecycle::required_readiness_commitment(&pending.name) {
             Some(expected) if pending.name == crate::constants::CLIENTS_MODULE_UPGRADE_NAME => {
                 Some(expected.to_vec())
             }
@@ -73,18 +73,20 @@ impl ReadinessSignaller {
     /// validator-origin `SignalReady` op. gracefully `None` when the module is
     /// absent (pre-retrofit) or the reply is unreadable — no panic on a baseline net.
     pub(crate) async fn maybe_signal(&mut self, host: &Host) -> Option<(Msg, String, u32)> {
-        use upgrade::{
-            UpgradeMsg, UpgradeQuery, UpgradeReply, decode_reply, encode_msg, encode_query,
+        use lifecycle::{
+            LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply, encode_msg, encode_query,
         };
         let reply = host
-            .query("upgrade", &encode_query(&UpgradeQuery::Status))
+            .query(host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus))
             .await
             .ok()?;
-        let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
+        let LifecycleReply::UpgradeStatus(status) = decode_reply(&reply).ok()? else {
+            return None;
+        };
         let (name, to_version, commitment) = self.decide(&status)?;
         let msg = Msg {
-            target: "upgrade".into(),
-            payload: encode_msg(&UpgradeMsg::SignalReady {
+            target: host::LIFECYCLE_MODULE_ID.into(),
+            payload: encode_msg(&LifecycleMsg::UpgradeReady {
                 name: name.clone(),
                 to_version,
                 commitment,

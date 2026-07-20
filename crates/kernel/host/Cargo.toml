@@ -13,18 +13,16 @@ tracing = { workspace = true }
 sdk = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
-# WIRE-TYPES-ONLY dep: `Host::effective_version` decodes the upgrade module's
-# `Status` reply and applies the shared version derivation. host uses only
-# the crate-root wire types — it never constructs or registers the module impl
-# (same shape as governance reading valset's wire types).
-upgrade = { workspace = true }
+# WIRE-TYPES-ONLY dep: `Host::effective_version` decodes the lifecycle module's
+# `UpgradeStatus` reply and applies the shared version derivation, and the
+# boundary code-swap realization reads its committed active/pending hashes and
+# injects the shared `Advance` tick. host uses only the crate-root wire types —
+# it never constructs or registers the module impl (same shape as governance
+# reading valset's wire types).
+lifecycle = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
 dispatch = { workspace = true }
-# WIRE-TYPES-ONLY dep, same shape: the boundary code-swap realization reads the
-# code registry's committed active/pending hashes and injects its Advance tick.
-# host never constructs or registers the modreg impl — only its crate-root types.
-modreg = { workspace = true }
 
 [dev-dependencies]
 # the host-side qmdb store handle injected into disk-backed modules.

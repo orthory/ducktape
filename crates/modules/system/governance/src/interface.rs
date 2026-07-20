@@ -24,10 +24,10 @@ pub enum GovAction {
     RemoveValidator { key: Vec<u8> },
     /// a binding signal with no on-chain effect beyond its recorded outcome.
     Signal { text: String },
-    /// AUTHORIZE a pending node upgrade: emits `UpgradeMsg::Schedule { name,
-    /// activation_height, to_version }` on execution. governance only SCHEDULES
+    /// AUTHORIZE a pending node upgrade: emits `LifecycleMsg::ScheduleUpgrade {
+    /// name, activation_height, to_version }` on execution. governance only SCHEDULES
     /// (authorizes) — it never ARMS: arming additionally requires the `R = n`
-    /// readiness quorum evaluated by the upgrade module, and the upgrade module
+    /// readiness quorum evaluated by the lifecycle module, and the lifecycle module
     /// is the sole authority for the monotonicity / min-lead / at-most-one gates.
     ScheduleUpgrade {
         name: String,
@@ -35,7 +35,7 @@ pub enum GovAction {
         to_version: u32,
     },
     /// AUTHORIZE clearing a pending upgrade before its boundary: emits
-    /// `UpgradeMsg::Cancel { name }` on execution.
+    /// `LifecycleMsg::CancelUpgrade { name }` on execution.
     CancelUpgrade { name: String },
     /// grant RESIDENT standing (mesh + statesync, no quorum seat — the
     /// staged-admission tier): emits `ValsetMsg::Grant { key }` on execution.
@@ -56,8 +56,8 @@ pub enum GovAction {
     /// account shares; `false` restores one ballot per validator node. this
     /// proposal itself is always decided by the mode frozen when it was opened.
     SetShareMode { enabled: bool },
-    /// AUTHORIZE a height-gated wasm module code swap: emits `ModregMsg::
-    /// Schedule { name, module_id, activation_height, code_hash }` on execution.
+    /// AUTHORIZE a height-gated wasm module code swap: emits `LifecycleMsg::
+    /// ScheduleSwap { name, module_id, activation_height, code_hash }` on execution.
     /// governance only authorizes — the code registry is the sole authority for
     /// the min-lead / at-most-one / no-op-swap gates, and the swap arms purely
     /// on height (the bytes travel out-of-band, content-addressed by the hash).
@@ -69,7 +69,7 @@ pub enum GovAction {
         code_hash: Vec<u8>,
     },
     /// AUTHORIZE the post-genesis ADMISSION of a brand-new wasm module: emits
-    /// `ModregMsg::ScheduleRegister { name, module_id, activation_height,
+    /// `LifecycleMsg::ScheduleRegister { name, module_id, activation_height,
     /// code_hash }` on execution. governance only authorizes — the code
     /// registry owns the not-already-registered / min-lead gates, the R = n
     /// readiness quorum arms it, and the host instantiates the module from the
@@ -84,7 +84,7 @@ pub enum GovAction {
         code_hash: Vec<u8>,
     },
     /// AUTHORIZE clearing a pending module code swap before its boundary: emits
-    /// `ModregMsg::Cancel { name, module_id }` on execution.
+    /// `LifecycleMsg::CancelSwap { name, module_id }` on execution.
     CancelModuleUpdate { name: String, module_id: String },
 }
 

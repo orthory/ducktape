@@ -841,7 +841,7 @@ impl DispatchModule {
     }
 
     /// the saga's current lease holder, read through the host-routed sibling
-    /// lane — the filtered-facade pattern (cf. `upgrade::members`). read-only:
+    /// lane — the filtered-facade pattern (cf. `lifecycle::members`). read-only:
     /// this never stages, so it is safe inside `query_with`.
     async fn saga_view(
         &self,

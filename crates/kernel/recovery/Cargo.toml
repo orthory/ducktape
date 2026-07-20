@@ -17,6 +17,6 @@ futures = "0.3"
 [dev-dependencies]
 directory = { workspace = true }
 commonware-cryptography = { workspace = true }
-upgrade = { workspace = true }
+lifecycle = { workspace = true }
 async-trait = { workspace = true }
 sha2 = { workspace = true }

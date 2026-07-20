@@ -11,14 +11,14 @@
 //! module's consensus store at genesis construction, and every dispatch
 //! decodes it and constructs the native module with it. the config is
 //! consensus state and rides checkpoint snapshots like any other store key.
-//! the valset / upgrade / identity / modreg sibling ids are genesis-constant
+//! the valset / lifecycle / identity sibling ids are genesis-constant
 //! wiring (identical on every network), so they stay compiled in like every
 //! other port's sibling ids.
 //!
 //! governance exercises every seam the runtime offers at once: sibling reads
 //! (valset membership, identity account resolution) resolve through the
 //! memoized replay, and a passing proposal EMITS follow-up msgs (valset
-//! membership ops, upgrade schedules, modreg code swaps) that the runtime
+//! membership ops, lifecycle upgrade schedules + code swaps) that the runtime
 //! republishes through the host ctx only after a clean run — so a wasm
 //! governance still drives the code registry that live-updates the other wasm
 //! tenants. the whole-state dispatch model (load `__state`/`__root` through
@@ -38,13 +38,12 @@ use sdk::{genesis_config, Error, Module as _, Msg, StateRoot};
 const MODULE_ID: &str = "governance";
 /// the sibling ids this instance reads/authorizes through — EXACTLY the
 /// production wiring (`bin/node/src/host_state.rs`): valset for membership
-/// (reads + emitted membership ops), upgrade for scheduled node upgrades,
-/// identity for account-share resolution, and the code registry for
-/// wasm-module swaps ("modreg" == `host::MODREG_MODULE_ID`).
+/// (reads + emitted membership ops), the lifecycle module for scheduled node
+/// upgrades AND wasm-module code swaps ("lifecycle" == `host::LIFECYCLE_MODULE_ID`),
+/// and identity for account-share resolution.
 const VALSET_ID: &str = "valset";
-const UPGRADE_ID: &str = "upgrade";
+const LIFECYCLE_ID: &str = "lifecycle";
 const IDENTITY_ID: &str = "identity";
-const MODREG_ID: &str = "modreg";
 const CLIENTS_ID: &str = "clients";
 /// the genesis-config key carrying this network's invite binding.
 const INVITE_PARAM: &str = "invite";
@@ -74,12 +73,12 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 /// install failure is host-store corruption surfaced as a deterministic
 /// rejection, never a silent re-genesis.
 fn loaded_module() -> Result<Governance, host::Error> {
-    let mut module = Governance::new(MODULE_ID, VALSET_ID, UPGRADE_ID, IDENTITY_ID)
+    let mut module = Governance::new(MODULE_ID, VALSET_ID, LIFECYCLE_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
         // the client-ACL registry: redeem-time client grants ride a follow-up
         // into it. genesis-constant sibling wiring, compiled in like the rest.
         .with_clients(CLIENTS_ID)
-        .with_modreg(MODREG_ID);
+        .with_code_registry(LIFECYCLE_ID);
     if let Some((bytes, root)) = load_state() {
         module
             .install(&bytes, StateRoot(root))

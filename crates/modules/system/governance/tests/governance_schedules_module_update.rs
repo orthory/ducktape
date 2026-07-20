@@ -16,9 +16,9 @@ use governance::{
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use modreg::{
-    ModregMsg, ModregQuery, ModregReply, Modreg, decode_reply as modreg_decode,
-    encode_msg as modreg_encode, encode_query as modreg_query,
+use lifecycle::{
+    Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode,
+    encode_msg as lifecycle_encode, encode_query as lifecycle_query,
 };
 use sdk::{Error, Module as _, Msg, Origin};
 use valset::Valset;
@@ -33,7 +33,7 @@ fn member_key(seed: u8) -> Vec<u8> {
 }
 
 fn hash(seed: u8) -> Vec<u8> {
-    vec![seed; modreg::CODE_HASH_LEN]
+    vec![seed; lifecycle::CODE_HASH_LEN]
 }
 
 /// a host with valset (members 1,2) + governance wired to the REAL code
@@ -44,8 +44,8 @@ async fn gov_host_with_modreg() -> Host {
     valset.insert(member_key(2));
     let mut host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "upgrade", "identity").with_modreg("modreg")),
-        Box::new(Modreg::new("modreg", "valset")),
+        Box::new(Governance::new("governance", "valset", "lifecycle", "identity").with_code_registry("lifecycle")),
+        Box::new(Lifecycle::new("lifecycle", "valset")),
     ])
     .expect("genesis");
     // genesis-bootstrap the swappable module's initial code (System origin).
@@ -57,8 +57,8 @@ async fn gov_host_with_modreg() -> Host {
             origin: Origin::System,
         },
         Msg {
-            target: "modreg".into(),
-            payload: modreg_encode(&ModregMsg::Register {
+            target: "lifecycle".into(),
+            payload: lifecycle_encode(&LifecycleMsg::RegisterModule {
                 module_id: "hello".into(),
                 code_hash: hash(1),
             }),
@@ -80,7 +80,7 @@ async fn submit_as(
             // the admission version: UpdateModule/Cancel are ungated, and the
             // admission flavors below need both the block env and the module
             // branch selector past the boundary.
-            protocol_version: modreg::ADMISSION_ACTIVATION_VERSION,
+            protocol_version: lifecycle::ADMISSION_ACTIVATION_VERSION,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -110,13 +110,13 @@ async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
     }
 }
 
-async fn hello_code(host: &Host) -> modreg::ModuleCode {
+async fn hello_code(host: &Host) -> lifecycle::ModuleCode {
     let reply = host
-        .query("modreg", &modreg_query(&ModregQuery::Status))
+        .query("lifecycle", &lifecycle_query(&LifecycleQuery::ModuleStatus))
         .await
         .expect("modreg status");
-    match modreg_decode(&reply).expect("decode") {
-        ModregReply::Status { modules } => modules
+    match lifecycle_decode(&reply).expect("decode") {
+        LifecycleReply::ModuleStatus { modules } => modules
             .into_iter()
             .find(|m| m.module_id == "hello")
             .expect("hello entry"),
@@ -319,12 +319,12 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         );
         assert_eq!(proposal_status(&host, "mod-short").await, None);
 
-        // an UNWIRED registry (Governance::new without with_modreg).
+        // an UNWIRED registry (Governance::new without with_code_registry).
         let mut valset = Valset::new("valset");
         valset.insert(member_key(1));
         let mut unwired = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "upgrade", "identity")),
+            Box::new(Governance::new("governance", "valset", "lifecycle", "identity")),
         ])
         .expect("genesis");
         let err = submit_as(
@@ -407,7 +407,7 @@ fn snapshot_install_round_trips_module_update_proposals() {
         };
 
         let mut rebuilt =
-            Governance::new("governance", "valset", "upgrade", "identity").with_modreg("modreg");
+            Governance::new("governance", "valset", "lifecycle", "identity").with_code_registry("lifecycle");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(rebuilt.root(), root, "installed root equals the source root");
 
@@ -444,13 +444,13 @@ fn snapshot_install_round_trips_module_update_proposals() {
 }
 
 /// the module lookup, admission flavor: any id, absent allowed.
-async fn module_code(host: &Host, id: &str) -> Option<modreg::ModuleCode> {
+async fn module_code(host: &Host, id: &str) -> Option<lifecycle::ModuleCode> {
     let reply = host
-        .query("modreg", &modreg_query(&ModregQuery::Status))
+        .query("lifecycle", &lifecycle_query(&LifecycleQuery::ModuleStatus))
         .await
         .expect("modreg status");
-    match modreg_decode(&reply).expect("decode") {
-        ModregReply::Status { modules } => modules.into_iter().find(|m| m.module_id == id),
+    match lifecycle_decode(&reply).expect("decode") {
+        LifecycleReply::ModuleStatus { modules } => modules.into_iter().find(|m| m.module_id == id),
         other => panic!("expected Status, got {other:?}"),
     }
 }
@@ -599,7 +599,7 @@ fn register_module_is_door_refused_below_the_activation_version() {
         let refused = host
             .submit_at(
                 BlockContext {
-                    protocol_version: modreg::ADMISSION_ACTIVATION_VERSION - 1,
+                    protocol_version: lifecycle::ADMISSION_ACTIVATION_VERSION - 1,
                     height: 1,
                     consensus_time: 1,
                     origin: Origin::External(member_key(1)),

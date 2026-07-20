@@ -146,7 +146,7 @@ use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
-use upgrade::Upgrade;
+use lifecycle::Lifecycle;
 use clients::Clients;
 use valset::Valset;
 
@@ -178,7 +178,7 @@ const BASE_MODULE_IDS: [&str; 15] = [
 /// with the genesis validators, governance (the sole authorized author of
 /// valset change), and the upgrade coordinator — whose mere registration makes
 /// the host-injected once-per-block boundary `Advance` ride every sim block.
-const VALSET_MODULE_IDS: [&str; 5] = ["kv", "valset", "clients", "governance", "upgrade"];
+const VALSET_MODULE_IDS: [&str; 5] = ["kv", "valset", "clients", "governance", "lifecycle"];
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
 
@@ -838,11 +838,12 @@ fn run_sim(
         // opt-in governance genesis, AFTER the default 16 in registry order:
         // kv, valset (seeded with the given genesis validators exactly like
         // bin/node), governance (the sole authorized author of valset change,
-        // bound to the invite namespace), and the upgrade coordinator — whose
+        // bound to the invite namespace), and the lifecycle coordinator — whose
         // registration alone makes the host's once-per-block boundary `Advance`
-        // ride every sim block. modreg/capability are deliberately left out
-        // (UpdateModule proposals stay unwired), and saga's construction is
-        // untouched. empty valset_keys => the default set, byte-identical.
+        // ride every sim block. governance's code-registry path stays unwired
+        // (no `with_code_registry`, so UpdateModule proposals are gated off) and
+        // capability is left out; saga's construction is untouched. empty
+        // valset_keys => the default set, byte-identical.
         if !valset_keys.is_empty() {
             let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
             let mut valset = Valset::new("valset");
@@ -852,15 +853,15 @@ fn run_sim(
             // the client ACL, seeded empty — a redeemed role=Client invite
             // records a key here (governance emits ClientsMsg::Grant).
             let clients = Clients::new("clients");
-            let governance = Governance::new("governance", "valset", "upgrade", "identity")
+            let governance = Governance::new("governance", "valset", "lifecycle", "identity")
                 .with_invite_binding(invite_binding)
                 .with_clients("clients");
-            let upgrade = Upgrade::new("upgrade", "valset");
+            let lifecycle = Lifecycle::new("lifecycle", "valset");
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));
             modules.push(Box::new(clients));
             modules.push(Box::new(governance));
-            modules.push(Box::new(upgrade));
+            modules.push(Box::new(lifecycle));
         }
         let host = Host::genesis(modules).expect("genesis");
 

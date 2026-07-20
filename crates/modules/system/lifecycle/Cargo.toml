@@ -1,0 +1,25 @@
+# lifecycle — the network lifecycle module. ONE app-hashed commitment covering
+# both height-gated coordination classes that used to live in the mirror-image
+# `upgrade` and `modreg` crates:
+#   * the agreed node protocol version + at most one pending, readiness-gated
+#     ScheduledUpgrade (the R=n binary roll), and
+#   * per hot-swappable module, the ACTIVE code hash + at most one pending,
+#     readiness-gated ScheduledSwap (the height-gated wasm code swap).
+# One root, one wire surface, one system-injected `Advance` boundary tick that
+# arms both. Native module (no wasm guest). The code BYTES stay out-of-band
+# (content-addressed by hash); this module commits only to WHICH code is active.
+[package]
+name = "lifecycle"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sdk = { workspace = true }
+valset = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }

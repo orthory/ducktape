@@ -61,7 +61,7 @@ members = [
     "crates/modules/system/clients",
     "crates/modules/system/governance",
     "crates/modules/system/identity",
-    "crates/modules/system/upgrade",
+    "crates/modules/system/lifecycle",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
     "crates/modules/system/capability-host",
@@ -69,7 +69,6 @@ members = [
     "crates/modules/system/dispatch",
     "crates/modules/system/dispatch-oracle",
     "crates/modules/system/tagging",
-    "crates/modules/system/modreg",
     "crates/modules/system/airlock",
     "crates/duckfs/core",
     "crates/duckfs/disk",
@@ -207,14 +206,13 @@ valset = { path = "crates/modules/system/valset" }
 clients = { path = "crates/modules/system/clients" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }
-upgrade = { path = "crates/modules/system/upgrade" }
+lifecycle = { path = "crates/modules/system/lifecycle" }
 saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 blobstore = { path = "crates/modules/system/blobstore" }
 dispatch = { path = "crates/modules/system/dispatch" }
 dispatch-oracle = { path = "crates/modules/system/dispatch-oracle" }
 tagging = { path = "crates/modules/system/tagging" }
-modreg = { path = "crates/modules/system/modreg" }
 duckdns = { path = "crates/networking/duckdns" }
 gateway = { path = "crates/networking/gateway" }
 forge = { path = "crates/modules/apps/forge" }

@@ -2841,12 +2841,11 @@ dependencies = [
  "futures",
  "host",
  "identity",
- "modreg",
+ "lifecycle",
  "sdk",
  "serde",
  "serde_json",
  "sha2",
- "upgrade",
  "valset",
 ]
 
@@ -3102,7 +3101,7 @@ dependencies = [
  "inbox",
  "jobs",
  "kv",
- "modreg",
+ "lifecycle",
  "p256",
  "pages",
  "runs",
@@ -3115,7 +3114,6 @@ dependencies = [
  "tasks",
  "tempfile",
  "tracing",
- "upgrade",
  "valset",
  "wasm-host",
 ]
@@ -3698,6 +3696,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lifecycle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "valset",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3844,19 +3855,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "modreg"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
- "valset",
 ]
 
 [[package]]
@@ -4040,7 +4038,7 @@ dependencies = [
  "jobs",
  "kv",
  "libc",
- "modreg",
+ "lifecycle",
  "nat-traversal",
  "node",
  "noded",
@@ -4067,7 +4065,6 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber 0.3.23",
- "upgrade",
  "valset",
  "wasm-host",
  "wireguard",
@@ -5097,11 +5094,11 @@ dependencies = [
  "directory",
  "futures",
  "host",
+ "lifecycle",
  "node",
  "sdk",
  "sha2",
  "thiserror 2.0.18",
- "upgrade",
 ]
 
 [[package]]
@@ -5834,6 +5831,7 @@ dependencies = [
  "indexer",
  "jobs",
  "kv",
+ "lifecycle",
  "node",
  "noded",
  "pages",
@@ -5848,7 +5846,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "upgrade",
  "valset",
 ]
 
@@ -6868,21 +6865,6 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
-
-[[package]]
-name = "upgrade"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "futures",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
- "valset",
-]
 
 [[package]]
 name = "url"

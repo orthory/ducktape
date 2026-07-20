@@ -12,7 +12,7 @@ use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
 use host::Host;
-use modreg::Modreg;
+use lifecycle::Lifecycle;
 use recovery::Manifest;
 use sdk::StateRoot;
 use sha2::Digest as _;
@@ -20,7 +20,6 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbResolver},
 };
-use upgrade::Upgrade;
 use valset::Valset;
 use wasm_host::WasmModule;
 
@@ -120,7 +119,7 @@ impl host::CodeSource for BlobCodeSource {
 }
 
 /// the wasm-runtime [`host::ModuleFactory`]: a post-genesis ADMISSION
-/// (governance `RegisterModule` → modreg `ScheduleRegister`) instantiates its
+/// (governance `RegisterModule` → lifecycle `ScheduleRegister`) instantiates its
 /// module from the verified component bytes at the activation boundary — the
 /// constructor twin of [`BlobCodeSource`].
 pub(super) struct WasmModuleFactory;
@@ -157,10 +156,10 @@ const TASKS_MODULE_ID: &str = "tasks";
 
 /// tagging / capability — adapter-ported tenants whose ops resolve
 /// SIBLING READS (valset standing, identity bindings, content-module roots)
-/// through the runtime's memoized replay. upgrade deliberately stays NATIVE:
+/// through the runtime's memoized replay. the lifecycle module deliberately stays NATIVE:
 /// its Advance decides over frozen end-of-block committed state, a surface the
 /// wit world's staged-over-committed reads cannot represent (kernel
-/// coordinators — valset, modreg, upgrade — gate the machinery itself).
+/// coordinators — valset, lifecycle — gate the machinery itself).
 const TAGGING_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/tagging-wasm/component.wasm");
 const TAGGING_MODULE_ID: &str = "tagging";
@@ -196,7 +195,7 @@ const GOVERNANCE_MODULE_ID: &str = "governance";
 /// COMMITTED-ONLY state by design — runs' mid-block `lease_holder` read
 /// depends on it — and the adapter's staged-fold cannot represent a
 /// committed-only view (the same class of frozen-committed read that keeps
-/// upgrade native).
+/// lifecycle native).
 const SAGA_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/saga-wasm/component.wasm");
 const SAGA_MODULE_ID: &str = "saga";
@@ -247,73 +246,73 @@ const CHAT_MODULE_ID: &str = "chat";
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
 /// all three compose the same registry shape.
-fn seeded_modreg() -> Modreg {
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset");
-    modreg.seed(
+fn seeded_lifecycle() -> Lifecycle {
+    let mut reg = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+    reg.seed(
         HELLO_WASM_MODULE_ID,
         sha2::Sha256::digest(HELLO_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         DIRECTORY_MODULE_ID,
         sha2::Sha256::digest(DIRECTORY_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         JOBS_MODULE_ID,
         sha2::Sha256::digest(JOBS_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         INBOX_MODULE_ID,
         sha2::Sha256::digest(INBOX_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         TASKS_MODULE_ID,
         sha2::Sha256::digest(TASKS_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         TAGGING_MODULE_ID,
         sha2::Sha256::digest(TAGGING_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         CAPABILITY_MODULE_ID,
         sha2::Sha256::digest(CAPABILITY_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         IDENTITY_MODULE_ID,
         sha2::Sha256::digest(IDENTITY_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         GATEWAY_MODULE_ID,
         sha2::Sha256::digest(GATEWAY_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         GOVERNANCE_MODULE_ID,
         sha2::Sha256::digest(GOVERNANCE_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         PAGES_MODULE_ID,
         sha2::Sha256::digest(PAGES_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         CHAT_MODULE_ID,
         sha2::Sha256::digest(CHAT_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         SAGA_MODULE_ID,
         sha2::Sha256::digest(SAGA_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         AGENT_MODULE_ID,
         sha2::Sha256::digest(AGENT_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         AUTOMATIONS_MODULE_ID,
         sha2::Sha256::digest(AUTOMATIONS_WASM_COMPONENT).to_vec(),
     );
-    modreg.seed(
+    reg.seed(
         RUNS_MODULE_ID,
         sha2::Sha256::digest(RUNS_WASM_COMPONENT).to_vec(),
     );
-    modreg
+    reg
 }
 
 /// seed the blob plane with the genesis components, so this node can serve
@@ -506,7 +505,7 @@ fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
 
 /// governance at its GENESIS code + config: the invite binding every token
 /// and join proof verify against rides `__config` (the sibling wiring —
-/// valset/upgrade/identity/modreg — is genesis-constant and compiled into the
+/// valset/lifecycle/identity — is genesis-constant and compiled into the
 /// guest like every other port's sibling ids).
 fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     genesis_config_wasm(
@@ -530,8 +529,7 @@ struct ProductionModules {
     valset: Valset,
     clients: Clients,
     governance: WasmModule,
-    upgrade: Upgrade,
-    modreg: Modreg,
+    lifecycle: Lifecycle,
     hello_wasm: WasmModule,
     saga: WasmModule,
     capability: WasmModule,
@@ -561,8 +559,7 @@ impl ProductionModules {
             Box::new(self.valset),
             Box::new(self.clients),
             Box::new(self.governance),
-            Box::new(self.upgrade),
-            Box::new(self.modreg),
+            Box::new(self.lifecycle),
             Box::new(self.hello_wasm),
             Box::new(self.saga),
             Box::new(self.capability),
@@ -637,15 +634,14 @@ pub(super) async fn genesis_host(
         // the invite binding rides its GENESIS CONFIG, the clients sibling id
         // is compiled into the guest like the rest.
         governance: genesis_governance_wasm(bindings),
-        // the no-downtime upgrade coordinator: holds the at-most-one pending
-        // upgrade + per-validator readiness set (valset-gated). its mere
-        // presence in the registry is its genesis app-hash contribution.
-        upgrade: Upgrade::new("upgrade", "valset"),
-        // the module code registry: the consensus commitment to WHICH component
-        // each hot-swappable wasm module runs, seeded with the genesis hashes.
-        // governance schedules height-gated swaps into it; the host realizes
-        // them at the boundary through the blobstore-backed CodeSource.
-        modreg: seeded_modreg(),
+        // the network lifecycle module (merged upgrade + modreg): the
+        // no-downtime protocol-version coordinator (at-most-one pending upgrade +
+        // per-validator readiness, valset-gated) AND the module code registry
+        // (the consensus commitment to WHICH component each hot-swappable wasm
+        // module runs, seeded with the genesis hashes). governance schedules
+        // height-gated upgrades and swaps into it; the host realizes swaps at the
+        // boundary through the blobstore-backed CodeSource.
+        lifecycle: seeded_lifecycle(),
         // the reference wasm module — the live-update machinery's first tenant.
         hello_wasm: genesis_hello_wasm(),
         // capability-aware strict leases: a saga whose trigger names a
@@ -780,22 +776,18 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
 
-    let mut upgrade = Upgrade::new("upgrade", "valset");
-    let (bytes, root) = snapshot_of("upgrade")?;
-    upgrade
+    // the lifecycle module (protocol-version coordinator + code registry)
+    // restores like any in-memory module: construct at genesis shape, adopt the
+    // checkpoint snapshot. its seeded code hashes carry the genesis registry; the
+    // wasm tenants are rebuilt on their EMBEDDED genesis components here, and
+    // recovery's boot-time code reconciliation swaps them to the checkpoint's
+    // committed active code (state installs independently of code, so the roots
+    // check out either way).
+    let mut lifecycle = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+    let (bytes, root) = snapshot_of(host::LIFECYCLE_MODULE_ID)?;
+    lifecycle
         .install(bytes, root)
-        .map_err(|e| format!("upgrade install: {e}"))?;
-
-    // the code registry + the wasm module restore like any in-memory module:
-    // construct at genesis shape, adopt the checkpoint snapshot. the wasm module
-    // is rebuilt on its EMBEDDED genesis component here — recovery's boot-time
-    // code reconciliation swaps it to the checkpoint's committed active code
-    // (state installs independently of code, so the roots check out either way).
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset");
-    let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID)?;
-    modreg
-        .install(bytes, root)
-        .map_err(|e| format!("modreg install: {e}"))?;
+        .map_err(|e| format!("lifecycle install: {e}"))?;
 
     let mut hello_wasm = genesis_hello_wasm();
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID)?;
@@ -896,8 +888,7 @@ pub(super) async fn restore_host(
         valset,
         clients,
         governance,
-        upgrade,
-        modreg,
+        lifecycle,
         hello_wasm,
         saga,
         capability,
@@ -1132,22 +1123,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("upgrade").await?;
-    let mut upgrade = Upgrade::new("upgrade", "valset");
-    upgrade
+    // the lifecycle module (protocol-version coordinator + code registry) joins
+    // like any in-memory module: adopt the served snapshot, root-checked. the
+    // wasm tenants join on their EMBEDDED genesis components — a post-swap
+    // network's committed active hash differs, and the joiner's first code
+    // reconciliation (before it applies any block) swaps them to the committed
+    // components, fetched off the blob plane.
+    let (bytes, root) = snapshot_of(host::LIFECYCLE_MODULE_ID).await?;
+    let mut lifecycle = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+    lifecycle
         .install(&bytes, root)
-        .map_err(|e| format!("upgrade install: {e}"))?;
-
-    // the code registry + the wasm module join like any in-memory module: adopt
-    // the served snapshot, root-checked. the wasm module joins on its EMBEDDED
-    // genesis component — a post-swap network's committed active hash differs,
-    // and the joiner's first code reconciliation (before it applies any block)
-    // swaps it to the committed component, fetched off the blob plane.
-    let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID).await?;
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset");
-    modreg
-        .install(&bytes, root)
-        .map_err(|e| format!("modreg install: {e}"))?;
+        .map_err(|e| format!("lifecycle install: {e}"))?;
 
     let (bytes, root) = snapshot_of(HELLO_WASM_MODULE_ID).await?;
     let mut hello_wasm = genesis_hello_wasm();
@@ -1247,8 +1233,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         valset,
         clients,
         governance,
-        upgrade,
-        modreg,
+        lifecycle,
         hello_wasm,
         saga,
         capability,
@@ -1329,7 +1314,7 @@ mod tests {
         // fail-closed like every other historical schema).
         assert_eq!(
             crate::config::hex_bytes(&pre_clients_state_schema_fingerprint()),
-            "dd152ef8d6c71bd6b4a771b2afa65239c1cb61a118a7cbe0f9c30d631cae1096"
+            "68759333723c4b38428fffc6718f7ee78e90f799fb6c253e63f243a273793eb1"
         );
         assert_eq!(
             classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 0),
@@ -1349,7 +1334,7 @@ mod tests {
     fn native_v1_schema_has_one_exact_compatibility_route() {
         assert_eq!(
             crate::config::hex_bytes(&native_v1_state_schema_fingerprint()),
-            "7fdd19b359398d9035ee8eb59cb3afd0707728fad16236c10a5f7b7d13e6ff53"
+            "3c22f767f741d3d4d78d8f8005cbc0aea1427afee88a75fc586a7d1729ddb63c"
         );
         assert_eq!(
             classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 1),
