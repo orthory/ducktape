@@ -113,10 +113,6 @@ pub struct CapabilityRegistry {
     /// `class_claims` (read-your-writes: a rival claim in the same block sees
     /// the earlier stage), merged on `commit_block`, dropped on `abort_block`.
     pending_class_claims: BTreeMap<String, ModuleId>,
-    /// Recovery-only execution mode for the protocol-v1 native registry. Its
-    /// root preimage predates capability classes, so the class section must be
-    /// omitted exactly and class mutations must remain unavailable.
-    legacy_v1: bool,
 }
 
 impl CapabilityRegistry {
@@ -128,15 +124,7 @@ impl CapabilityRegistry {
             pending: BTreeMap::new(),
             class_claims: BTreeMap::new(),
             pending_class_claims: BTreeMap::new(),
-            legacy_v1: false,
         }
-    }
-
-    /// Preserve the exact protocol-v1 snapshot/root contract while rolling a
-    /// newer node binary over an existing native workspace.
-    pub fn with_legacy_v1_state(mut self) -> Self {
-        self.legacy_v1 = true;
-        self
     }
 
     /// validate and canonicalize an announced tag list. duplicates collapse
@@ -250,11 +238,7 @@ impl CapabilityRegistry {
     /// unhashed). pending is deliberately excluded — a snapshot ships what
     /// consensus committed to.
     pub fn snapshot(&self) -> Vec<u8> {
-        if self.legacy_v1 {
-            Self::snapshot_announcements(&self.announced)
-        } else {
-            Self::snapshot_of(&self.announced, &self.class_claims)
-        }
+        Self::snapshot_of(&self.announced, &self.class_claims)
     }
 
     fn snapshot_announcements(map: &BTreeMap<Vec<u8>, NodeEntry>) -> Vec<u8> {
@@ -295,12 +279,8 @@ impl CapabilityRegistry {
     /// before the call. success clears pending — staged changes belong to the
     /// state being replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (announced, class_claims) = Self::decode_snapshot(bytes, self.legacy_v1)?;
-        let root = if self.legacy_v1 {
-            Self::legacy_root_of(&announced)
-        } else {
-            Self::root_of(&announced, &class_claims)
-        };
+        let (announced, class_claims) = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&announced, &class_claims);
         if root != expected {
             return Err(Error::Module(format!(
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
@@ -326,7 +306,6 @@ impl CapabilityRegistry {
     #[allow(clippy::type_complexity)]
     fn decode_snapshot(
         bytes: &[u8],
-        legacy_v1: bool,
     ) -> Result<(BTreeMap<Vec<u8>, NodeEntry>, BTreeMap<String, ModuleId>), Error> {
         let mut cur = codec::Cursor::new(bytes);
         let count = cur.u64("snapshot node count")?;
@@ -397,11 +376,6 @@ impl CapabilityRegistry {
             map.insert(key.to_vec(), NodeEntry { tags, resources });
         }
 
-        if legacy_v1 {
-            cur.finish("snapshot")?;
-            return Ok((map, BTreeMap::new()));
-        }
-
         let class_count = cur.u64("snapshot class count")?;
         // each class entry costs at least its two 8-byte length prefixes.
         cur.bound(class_count, 16, "snapshot class")?;
@@ -437,13 +411,6 @@ impl CapabilityRegistry {
         }
         StateRoot(Sha256::digest(Self::snapshot_of(map, classes)).into())
     }
-
-    fn legacy_root_of(map: &BTreeMap<Vec<u8>, NodeEntry>) -> StateRoot {
-        if map.is_empty() {
-            return StateRoot::ZERO;
-        }
-        StateRoot(Sha256::digest(Self::snapshot_announcements(map)).into())
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -457,11 +424,7 @@ impl Module for CapabilityRegistry {
     /// map. order-independent (BTreeMap / BTreeSet) and idempotent. an empty
     /// registry reports `ZERO`.
     fn root(&self) -> StateRoot {
-        if self.legacy_v1 {
-            Self::legacy_root_of(&self.announced)
-        } else {
-            Self::root_of(&self.announced, &self.class_claims)
-        }
+        Self::root_of(&self.announced, &self.class_claims)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -515,11 +478,6 @@ impl Module for CapabilityRegistry {
                 self.pending.insert(node, NodeEntry { tags, resources });
             }
             CapabilityMsg::ClaimClass { class } => {
-                if self.legacy_v1 {
-                    return Err(Error::Module(
-                        "capability classes are unavailable in native v1 compatibility mode".into(),
-                    ));
-                }
                 // a class is claimed by the module that serves it: the
                 // claimant is the verified MODULE origin, never payload data.
                 // external submitters and the system have no module to route
@@ -606,16 +564,10 @@ impl Module for CapabilityRegistry {
                 encode_reply(&CapabilityReply::All(all))
             }
             CapabilityQuery::ResolveClass { class } => {
-                if self.legacy_v1 {
-                    return Err(Error::QueryUnsupported);
-                }
                 let owner = self.effective_class_owner(&class).cloned();
                 encode_reply(&CapabilityReply::ClassOwner(owner))
             }
             CapabilityQuery::Classes => {
-                if self.legacy_v1 {
-                    return Err(Error::QueryUnsupported);
-                }
                 let classes = self.effective_classes().into_iter().collect();
                 encode_reply(&CapabilityReply::Classes(classes))
             }
@@ -769,33 +721,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_mode_round_trips_old_snapshot_and_rejects_classes() {
-        let node = vec![42; 32];
-        let mut src = ungated().with_legacy_v1_state();
-        futures::executor::block_on(src.execute(
-            &mut TestCtx::external(&node),
-            &announce_with(&["codex"], &[("cpu", 2)]),
-        ))
+    fn a_pre_class_v1_snapshot_no_longer_decodes() {
+        // FLAG DAY: the v2 wire appends a class-count section (see the snapshot
+        // doc). a pre-class v1 stream is the node section with no trailing
+        // class count; the modern decoder must REFUSE it, never silently adopt
+        // it — the alternate-root recovery mode that once read it is gone.
+        let mut src = ungated();
+        let node = vec![42u8; 32];
+        futures::executor::block_on(
+            src.execute(&mut TestCtx::external(&node), &announce(&["codex"])),
+        )
         .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
 
-        let bytes = src.snapshot();
-        let root = src.root();
-        let mut dst = ungated().with_legacy_v1_state();
-        dst.install(&bytes, root).expect("legacy snapshot installs");
-        assert_eq!(dst.root(), root);
-        assert_eq!(node_tags(&dst, &node), vec!["codex"]);
-
+        // strip the trailing zero class count -> exactly the v1 encoding.
+        let v2 = src.snapshot();
+        let v1 = &v2[..v2.len() - 8];
         assert!(
-            ungated().install(&bytes, root).is_err(),
-            "modern mode requires the class-count section"
+            ungated().install(v1, src.root()).is_err(),
+            "a class-less v1 snapshot no longer decodes"
         );
-        let err = futures::executor::block_on(dst.execute(
-            &mut TestCtx::with_origin(sdk::Origin::Module("dispatch".into())),
-            &claim("agent"),
-        ))
-        .expect_err("legacy registry has no class lane");
-        assert!(matches!(err, Error::Module(message) if message.contains("unavailable")));
     }
 
     #[test]
