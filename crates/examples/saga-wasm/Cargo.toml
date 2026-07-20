@@ -29,3 +29,16 @@ sdk = { path = "../../kernel/sdk" }
 # backend is a deterministic refusal — see getrandom-stub/Cargo.toml.
 [patch.crates-io]
 getrandom = { path = "getrandom-stub" }
+# one stub per major the graph pulls — the commonware 2026.7 bump brought
+# getrandom 0.3 and 0.4 alongside 0.2 (same ruling for all three; see
+# getrandom-stub-03/Cargo.toml).
+getrandom-03 = { package = "getrandom", path = "getrandom-stub-03" }
+getrandom-04 = { package = "getrandom", path = "getrandom-stub-04" }
+
+# blst reaches every commonware-cryptography guest unconditionally, but no
+# module calls bls12381 — wasm-ld dead-strips every blst symbol from the
+# shipped module. Compiling its C for wasm32 would still demand a
+# wasm-capable clang (apple clang has no wasm backend at all), so the guest
+# links a vendored blst whose build.rs skips the C on wasm32. A guest that
+# ever really calls blst fails the link loudly — see patches/blst/PATCH.md.
+blst = { path = "../../../patches/blst" }

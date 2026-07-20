@@ -80,14 +80,6 @@ pub(crate) async fn run(
             .child("blackhole_submit_relay")
             .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
     }
-    // the lobby lane: a sync-only resident never announces or answers,
-    // but an unregistered channel is a protocol violation — black-hole.
-    {
-        let (_tx, mut rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
-        context.child("blackhole_lobby").spawn(move |_ctx| async move {
-            while rx.recv().await.is_ok() {}
-        });
-    }
     // the reachability lane: a sync-only resident runs no WireGuard
     // plane, but the channel must exist — black-hole.
     {

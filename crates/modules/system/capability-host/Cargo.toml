@@ -17,6 +17,11 @@ futures = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
+# airlock: use a verified TEE gateway as the run's Anthropic credential SOURCE
+# instead of a host-held credential — verify its attestation, handshake for a
+# scoped session token, forward the run's traffic to it (the gateway swaps the
+# token for the real credential in-enclave). `client` = the async Gateway.
+airlock = { path = "../airlock", features = ["client"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
@@ -34,3 +39,8 @@ tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# the in-process airlock custody test boots the gateway HTTP service itself
+# (server feature) to drive sandbox → broker → gateway → upstream end to end.
+airlock = { path = "../airlock", features = ["client", "server"] }

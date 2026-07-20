@@ -508,26 +508,6 @@ pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
     unpack_coord_cap(&bytes).ok()
 }
 
-// ============================================================================
-// the lobby identity — a keypair every holder of this network's descriptor can
-// DERIVE (seeded from the genesis namespace, which is public to members and
-// invitees alike). it authenticates NOTHING: it exists so a not-yet-admitted
-// joiner can complete the discovery handshake and be heard on the lobby
-// channel at all — authorization is the invite token it then presents. every
-// member folds this key into its tracked mesh, so the set stays identical
-// across nodes (discovery kills peers whose set at a shared index differs).
-// ============================================================================
-
-pub fn lobby_identity(binding: &[u8]) -> ed25519::PrivateKey {
-    use commonware_cryptography::{Hasher as _, Sha256};
-    let mut hasher = Sha256::default();
-    hasher.update(b"ducktape-lobby-v1:");
-    hasher.update(binding);
-    let digest = hasher.finalize();
-    // every 32-byte string is a valid ed25519 seed (the scheme clamps).
-    ed25519::PrivateKey::decode(digest.as_ref()).expect("32 digest bytes decode")
-}
-
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
 /// workspace dir only ever holds one chain-id. a refreshed invite for the
 /// SAME chain-id (the documented re-join after a pre-genesis admit) may
@@ -899,7 +879,8 @@ mod tests {
     /// joiner unpacks it (`unpack_coord_cap`) and presents it on an
     /// authenticated request — and the coordinator's private `verify_request`
     /// admits the joiner off that delivered cap. Proves the cap the member
-    /// hands over its `GateMsg::Admitted` reply actually authorizes the holder.
+    /// hands over its sealed `IntroReply::Admitted` ack actually authorizes the
+    /// holder.
     #[test]
     fn delivered_cap_admits_the_joiner_under_private_policy() {
         use commonware_cryptography::Signer as _;

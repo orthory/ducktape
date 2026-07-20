@@ -615,6 +615,18 @@ saga/dispatch/oracle async engine. §5 lists the loops this rides.
    sending peer (a node relays only its own ops), and committed resident
    standing — the relay grants **no authority**, a member-gated op from a
    non-member still finalizes Rejected (`bin/node/src/relay.rs`).
+
+   > **Update (2026-07-18):** an op-frame **v3** codec landed with the
+   > continuation-envelope work (phases 0+1 of
+   > `docs/superpowers/specs/2026-07-17-continuation-transactions-design.md`).
+   > The signed preimage gains an optional `continue` section under a new
+   > signing domain (`FRAME_NS_V3 = "ducktape:op-frame:v3"`) — the signature
+   > binds the continuation to its parent op — alongside
+   > `sdk::{Continuation, Relay}` + `Ctx::{relay, set_output, author_origin}`
+   > and the host's inline release lane (`Host::submit_block_ops`). The live
+   > wire still speaks v2 (the v2/v3 decoders structurally reject each other);
+   > nothing activates until drain wiring + protocol-version gating land.
+
 2. **Order.** There is **no mempool**: custody is two in-memory structures on
    `OrderedNode` — `outstanding: HashMap<FrameId, (seq, frame)>` and the
    `pending_batch` FIFO (`node/src/lib.rs:804,812`). `submit_frame`

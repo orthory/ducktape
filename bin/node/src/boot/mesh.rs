@@ -9,9 +9,9 @@ use crate::constants::MAX_MESSAGE_SIZE;
 
 /// `run_node`'s shared runtime head (phase P3): the head of the async
 /// closure `executor.start(|context| async move { … })` runs on — metrics
-/// registration, the tracked mesh set, the statesync source pick, the lobby
-/// transport identity, discovery's config, the overlay-net seam, and the
-/// real `Network`/`Oracle` pair. Ends before the `if sync_only {` branch,
+/// registration, the tracked mesh set, the statesync source pick,
+/// discovery's config, the overlay-net seam, and the real
+/// `Network`/`Oracle` pair. Ends before the `if sync_only {` branch,
 /// which stays in `run_node` (that's the sync-only-vs-validator fork).
 pub(crate) struct MeshHead {
     /// the closure's own root context, round-tripped: `commonware_runtime`'s
@@ -52,7 +52,6 @@ pub(crate) fn build(
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     sync_candidates: Vec<(ed25519::PublicKey, Ingress)>,
-    joiner: bool,
     listen: std::net::SocketAddr,
     advertised: Ingress,
     bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
@@ -107,24 +106,13 @@ pub(crate) fn build(
     // forwarded connection from a private source IP — use a public-IP sentry
     // or a reverse tunnel then.
     //
-    // TRANSPORT IDENTITY: a parked joiner's own key is usually untracked
-    // on every member (that is what admission changes), so it would be
-    // bounced at the handshake and could neither announce itself nor poll
-    // the statesync manifest. such a joiner connects AS the network's
-    // derived LOBBY identity — the one key every member tracks that any
-    // invite holder can derive. its REAL key still signs everything that
-    // matters (the join proof, and consensus after the promotion reboot).
-    // the door only exists where the mesh tracks it: the network shape
-    // folds the lobby key into every member's mesh, so `peers` carries it
-    // here too (both sides derive the same mesh). a mesh WITHOUT a lobby
-    // key (the dev-seed shape) keeps the old behavior — the joiner parks
-    // under its real identity, refused until the cutover re-tracks it.
-    let lobby = config::lobby_identity(&namespace);
-    let p2p_signer = if joiner && peers.contains(&lobby.public_key()) {
-        lobby
-    } else {
-        signer.clone()
-    };
+    // TRANSPORT IDENTITY: every node — a parked joiner included — connects
+    // under its REAL key (Join v2 §4; the derived lobby identity is retired).
+    // a fresh joiner's key is untracked on every member until its `Redeem`
+    // grant, when the members' drains re-track it onto the mesh immediately
+    // (ahead of the epoch cutover) — pre-admission it needs no mesh at all:
+    // the join gate rides the WireGuard-tunnel doorbell, not a channel.
+    let p2p_signer = signer.clone();
     // the staged reachability plane derives its advertised control
     // endpoint from the mesh `advertised`; keep a copy — discovery's
     // config consumes the original.

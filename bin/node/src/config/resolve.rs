@@ -14,7 +14,7 @@ use super::node_toml::NodeToml;
 use super::{
     Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
     StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap,
-    load_invite_fronts, load_invite_token, load_invite_wireguard, lobby_identity,
+    load_invite_fronts, load_invite_token, load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -112,6 +112,12 @@ pub struct Resolved {
     /// log) rather than aborting boot. `None` = re-derive the compiled
     /// default, exactly like today.
     pub primary_coordinator: Option<String>,
+    /// the TCP relay override (`NodeToml::coordinator_relay`), raw and
+    /// unvalidated — consumed at the join-race wiring site so a bad value
+    /// DEGRADES (relay fallback dark, honest terminal) rather than aborting
+    /// boot, the `primary_coordinator` discipline. `None` = derive the relay
+    /// from the ambient coordinator (its host at TCP/443).
+    pub coordinator_relay: Option<String>,
     /// the WireGuard endpoint this node advertises, resolved once
     /// (`NodeToml::wireguard_advertised`); `None` = derive it from
     /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
@@ -120,7 +126,7 @@ pub struct Resolved {
     /// `wireguard.key` and `coord.cap` live (the network shape's config
     /// directory; the dev shape's `storage_dir`). Threaded so a parked
     /// joiner's gate phase can persist a `coord.cap` delivered over its
-    /// `GateMsg::Admitted` reply via `save_coord_cap`.
+    /// sealed `IntroReply::Admitted` ack via `save_coord_cap`.
     pub workspace: PathBuf,
     /// how provider runs are spawned (`NodeToml::sandbox`). `Direct` (the
     /// default) is the plain host spawn; `Podman` sandboxes every run AND
@@ -254,13 +260,11 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
             ReachDial::Coordinated { coord, coord_key } => coordinated.push((key, coord, coord_key)),
         }
     }
-    // mesh = validators ∪ every reach identity (direct + coordinated) ∪ the
-    // LOBBY identity. A fresh network-shape joiner may be outside this set at
-    // genesis; it parks until governance admits it — but it can always be
-    // HEARD: the lobby key is derivable from the descriptor alone, so every
-    // node folds the same key into the same tracked set (discovery kills peers
-    // whose set at a shared index differs) and an invite-holding joiner can
-    // complete the handshake to announce itself on the lobby channel.
+    // mesh = validators ∪ every reach identity (direct + coordinated). A
+    // fresh network-shape joiner may be outside this set at genesis; it parks
+    // until governance admits it (Join v2 §4: the gate rides the WireGuard-
+    // tunnel doorbell, so a pre-admission joiner needs no mesh door — its
+    // REAL key is re-tracked onto every member's mesh at its Redeem grant).
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
         if !mesh.contains(k) {
@@ -271,10 +275,6 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         if !mesh.contains(k) {
             mesh.push(k.clone());
         }
-    }
-    let lobby = lobby_identity(descriptor.genesis_namespace().as_bytes()).public_key();
-    if !mesh.contains(&lobby) {
-        mesh.push(lobby);
     }
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
@@ -333,6 +333,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // here, so a joiner persists a delivered cap into it.
         workspace: base.to_path_buf(),
         primary_coordinator: raw.primary_coordinator,
+        coordinator_relay: raw.coordinator_relay,
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -649,6 +650,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         coordination: Coordination::Private,
         coord_cap: None,
         primary_coordinator: raw.primary_coordinator,
+        coordinator_relay: raw.coordinator_relay,
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -714,19 +716,10 @@ mod tests {
     }
 
     #[test]
-    fn lobby_identity_is_deterministic_and_lands_in_the_mesh() {
-        let a = lobby_identity(b"net#11111111@aa");
-        let b = lobby_identity(b"net#11111111@aa");
-        assert_eq!(a.public_key(), b.public_key(), "derivable by every holder");
-        let c = lobby_identity(b"net#22222222@bb");
-        assert_ne!(
-            a.public_key(),
-            c.public_key(),
-            "distinct networks get distinct lobby doors"
-        );
-
-        // resolve() folds the lobby key into the tracked mesh (but never into
-        // the consensus validator set).
+    fn the_mesh_carries_no_derived_lobby_identity() {
+        // Join v2 §4: the derived lobby transport identity is RETIRED — the
+        // tracked mesh is exactly the descriptor's real identities, nothing
+        // derivable from the namespace alone.
         let dir = tmp("lobbymesh");
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
@@ -744,11 +737,10 @@ mod tests {
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        let lobby = lobby_identity(d.genesis_namespace().as_bytes()).public_key();
-        assert!(r.mesh.contains(&lobby), "lobby key is tracked");
-        assert!(
-            !r.validators.contains(&lobby),
-            "lobby key never becomes a participant"
+        assert_eq!(
+            r.mesh,
+            vec![me.public_key()],
+            "mesh = the descriptor's real identities only"
         );
     }
 
@@ -814,8 +806,9 @@ mod tests {
         assert_eq!(r.namespace, d.genesis_namespace().into_bytes());
         assert!(String::from_utf8_lossy(&r.namespace).starts_with("net#11223344@"));
         assert_eq!(r.validators.len(), 2);
-        // validators + the derived lobby identity (the join-request door).
-        assert_eq!(r.mesh.len(), 3);
+        // exactly the validators — no derived lobby identity any more (the
+        // join gate rides the tunnel doorbell, Join v2 §4).
+        assert_eq!(r.mesh.len(), 2);
         // self never appears in bootstrappers; the other member does.
         assert_eq!(r.bootstrappers.len(), 1);
         assert_eq!(r.bootstrappers[0].0, other);
@@ -988,8 +981,9 @@ mod tests {
         assert_eq!(r.signer.public_key(), me.public_key());
         assert!(!r.validators.contains(&me.public_key()));
         assert_eq!(r.validators, vec![other.clone()]);
-        let lobby = lobby_identity(d.genesis_namespace().as_bytes()).public_key();
-        assert_eq!(r.mesh, vec![other, lobby]);
+        // no derived lobby door any more (Join v2 §4): the joiner's own key
+        // enters the mesh at its Redeem grant, not at resolve time.
+        assert_eq!(r.mesh, vec![other]);
     }
 
     #[test]
@@ -1182,6 +1176,38 @@ mod tests {
             resolved.primary_coordinator.as_deref(),
             Some("203.0.113.9:3478")
         );
+    }
+
+    /// `coordinator_relay` (Join v2 item 2) rides resolve exactly like
+    /// `primary_coordinator`: the key ABSENT resolves to `None` — the
+    /// zero-config joiner default, deriving the relay from the ambient
+    /// coordinator at the wiring site; the disable sentinel and an explicit
+    /// override both ride the raw string through, unvalidated at resolve
+    /// time (consumed lazily so a bad value degrades rather than aborting
+    /// boot).
+    #[test]
+    fn coordinator_relay_key_survives_resolve_default_absent_and_explicit() {
+        let dir = tmp("coordinator-relay-key");
+        let base = "id = 0\nlisten = \"127.0.0.1:52261\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        std::fs::write(dir.join("node.toml"), base).expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
+        assert_eq!(
+            resolved.coordinator_relay, None,
+            "absent key: derive the relay from the ambient coordinator at the point of use"
+        );
+
+        for (value, expect) in [
+            ("none", "none"),
+            ("relay.example.com:8443", "relay.example.com:8443"),
+        ] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}coordinator_relay = \"{value}\"\n"),
+            )
+            .expect("write");
+            let resolved = resolve(&dir.join("node.toml")).expect("resolve value");
+            assert_eq!(resolved.coordinator_relay.as_deref(), Some(expect));
+        }
     }
 
     /// `wireguard_advertised` (change 3, issue #331): the key ABSENT resolves

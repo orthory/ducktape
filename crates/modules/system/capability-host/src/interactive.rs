@@ -609,10 +609,16 @@ mod tests {
 
     #[cfg(test)]
     fn live_ctx(agent: &str) -> RunContext {
+        let mut pairs = vec![("TERM".to_string(), "xterm-256color".to_string())];
+        // Let the operator pin the model for the live turn (e.g. a less-throttled
+        // tier) without editing the test — forwarded into the sandbox as env.
+        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            pairs.push(("ANTHROPIC_MODEL".to_string(), model));
+        }
         RunContext {
             agent_id: Some(agent.into()),
             executing_node: Some(crate::execution_node_id(b"verify-node-000000000000000000000")),
-            env: std::iter::once(("TERM".to_string(), "xterm-256color".to_string())).collect(),
+            env: pairs.into_iter().collect(),
             ..Default::default()
         }
     }

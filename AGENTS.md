@@ -48,14 +48,10 @@
 - Never stop desktop/QA processes with `pkill -f` — a pattern match will
   cheerfully kill an editor, a grep, or this script. Find them by process cwd,
   executable, and workspace config or let the native app shut them down.
-- Review the PR from a clean context before merging: re-read the diff against
-  `dev`, check for scope creep and missing verification, and address actionable
-  feedback before deciding mergeability.
-- Merge to `dev` only when confidence is high: the change is understood, the
-  relevant gates are green or any skips are justified, and the clean-context
-  review has no blocking concerns. If confidence is medium or low, leave the PR
-  open with the risks, failed checks, or follow-up review needed instead of
-  merging by default.
+- Merge to `dev` only when confidence is high: the change is understood and the
+  relevant gates are green or any skips are justified. If confidence is medium
+  or low, leave the PR open with the risks, failed checks, or follow-up review
+  needed instead of merging by default.
 
 ## Logging
 
@@ -107,3 +103,36 @@
 - The files crate's wasm-readiness gate:
   `cargo check -p files --no-default-features` must stay green
   (no `std::fs`/sdk leaks into the pure core).
+
+## Rust House Rules (code style)
+
+Complement the lint/build gates above; adopted from the user's `seal-neobank`
+house rules. The `rust` skill (let-else guards, macros) still applies.
+
+- **Explicit control flow.** No boolean-flag steering — don't set `did_x = true`
+  up top for a branch below to read; restructure (early-return, extract the two
+  paths, or branch once on a discriminant). Early return over nesting: handle the
+  terminal case and get out, keep the main path at the left margin. Hot paths (the
+  consensus/drain loop, the join gate + settle, signing/redeem) must read
+  top-to-bottom — never thread another flag through one to patch it.
+- **State machines = one visible dispatch, pure steps.** Every input is a named
+  variant on ONE event enum. ONE `match` that does nothing before or after it:
+  each arm is a single delegation to a handler named for its variant — no `_`
+  wildcard (a new variant must fail the build until it's routed), no match guards,
+  no logic inlined in an arm. Step functions DECIDE and return command/directive
+  values; a separate executor performs the effects through a few named writers, in
+  order. Decide-fns never write; writers never decide — that keeps transitions
+  unit-testable without I/O and effect order owned by one place. When the shape is
+  load-bearing, guard it with a source-parsing lint test, not a comment.
+- **Named predicates.** Every non-trivial conditional is a named `let`/`const`
+  above the branch (the name is the documentation). Never chain ternaries; a
+  second `?:`-equivalent means lifting to named predicates + `if`/`match`.
+- **Tests wait on events, never on time.** No bounded spin / sleep-and-retry (a
+  disguised timeout that flakes on slow CI). Synchronize on the system's own
+  events — a channel message, a drained frame, a status callback. No wait seam
+  means a missing hook in the code: add the hook, not a sleep.
+- **In-seam mechanical refactors: just do them and label the step** (flag →
+  discriminant, `if`/`else if` ladder → `match`, name a predicate, extract a
+  nested block). Structural refactors — relocating code across modules, changing a
+  boundary/public shape, adding a file, or fanning out beyond the seam — are
+  ask-first.

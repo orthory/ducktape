@@ -648,17 +648,10 @@ fn user_redeem_invite(
     if invite.token.role != config::InviteRole::Client {
         return Err("this is a node (resident) invite — use `ducktape-node join`".into());
     }
+    // every invite is bearer (기명 dropped in v2): no target lock — this user
+    // key redeems the client invite directly, bound by the join proof below and
+    // made single-use by the nonce.
     let user = load_user_signer(&key_path, stdin)?;
-    if let Some(target) = &invite.token.target
-        && *target != user.public_key()
-    {
-        return Err(format!(
-            "this invite is locked to a different key.\n  invite target: {}\n  this key: {}",
-            hex_bytes(target.as_ref()),
-            hex_bytes(user.public_key().as_ref()),
-        )
-        .into());
-    }
     let binding = invite.descriptor.genesis_namespace();
     let proof = config::sign_join_proof(&user, binding.as_bytes(), &invite.token);
 
@@ -668,13 +661,6 @@ fn user_redeem_invite(
         "token_sig": invite.token.sig.encode().as_ref().to_vec(),
         "joiner": user.public_key().as_ref().to_vec(),
         "proof": proof.encode().as_ref().to_vec(),
-        // empty target bytes = bearer, the wire-wide rule.
-        "target": invite
-            .token
-            .target
-            .as_ref()
-            .map(|t| t.as_ref().to_vec())
-            .unwrap_or_default(),
         "role": invite.token.role.as_u8(),
         "expires_unix_secs": invite.token.expires_unix_secs,
     }});
@@ -1224,13 +1210,8 @@ mod userkey_verb_tests {
         )
     }
 
-    /// encode a one-validator test network's invite blob for `token_role`,
-    /// targeted at `target` (None = bearer).
-    fn test_blob(
-        issuer: &ed25519::PrivateKey,
-        target: Option<&ed25519::PublicKey>,
-        role: config::InviteRole,
-    ) -> String {
+    /// encode a one-validator test network's bearer invite blob for `role`.
+    fn test_blob(issuer: &ed25519::PrivateKey, role: config::InviteRole) -> String {
         let mut d = config::NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
             scheme: config::SCHEME_ED25519.into(),
@@ -1241,21 +1222,22 @@ mod userkey_verb_tests {
         };
         d.add_bootstrap(&issuer.public_key(), "127.0.0.1:52200");
         let binding = d.genesis_namespace();
-        let token = match (target, role) {
-            (Some(t), role) => {
-                config::mint_invite_token(issuer, binding.as_bytes(), t, role, u64::MAX)
-            }
-            (None, _) => config::mint_bearer_client_token(issuer, binding.as_bytes(), u64::MAX),
+        let token = config::mint_invite_token(issuer, binding.as_bytes(), role, u64::MAX);
+        // v2: the WireGuard bootstrap is mandatory — a minimal coordinated one.
+        let wg = config::InviteWireGuard {
+            public_key: [0u8; 32],
+            endpoint: None,
+            intro: None,
+            mesh_port: 52200,
         };
-        config::encode_invite(&d, &token, None, &[], issuer).expect("encode blob")
+        config::encode_invite(&d, &token, &wg, &[], issuer).expect("encode blob")
     }
 
     #[test]
     fn redeem_refuses_a_resident_blob_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let issuer = ed25519::PrivateKey::from_seed(1);
-        let target = ed25519::PrivateKey::from_seed(2);
-        let blob = test_blob(&issuer, Some(&target.public_key()), config::InviteRole::Resident);
+        let blob = test_blob(&issuer, config::InviteRole::Resident);
         let key = dir.path().join("user.key");
         let err = user_redeem_invite(
             &args_of(&[&blob, "--node", "http://127.0.0.1:1", "--key", &key.to_string_lossy()]),
@@ -1264,29 +1246,6 @@ mod userkey_verb_tests {
         .unwrap_err();
         assert!(
             err.to_string().contains("use `ducktape-node join`"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn redeem_refuses_a_targeted_client_blob_for_another_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let issuer = ed25519::PrivateKey::from_seed(1);
-        let someone_else = ed25519::PrivateKey::from_seed(3);
-        let blob = test_blob(
-            &issuer,
-            Some(&someone_else.public_key()),
-            config::InviteRole::Client,
-        );
-        // a FRESH key path mints a new identity — necessarily not the target.
-        let key = dir.path().join("user.key");
-        let err = user_redeem_invite(
-            &args_of(&[&blob, "--node", "http://127.0.0.1:1", "--key", &key.to_string_lossy()]),
-            &mut empty_stdin(),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("locked to a different key"),
             "{err}"
         );
     }

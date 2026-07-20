@@ -21,6 +21,7 @@ pub mod binding;
 pub mod keys;
 pub mod msg;
 pub mod orchestrator;
+pub mod seal;
 pub mod store;
 
 pub use binding::{
@@ -28,6 +29,7 @@ pub use binding::{
     valset_root,
 };
 pub use keys::{KeyError, WireGuardKeypair};
+pub use seal::{open as open_sealed, seal};
 pub use msg::{MsgError, ReachabilityMsg};
 pub use orchestrator::{
     ADVERT_TTL_VIEWS, CoordinatedInviteReply, EndpointResolver, HANDSHAKE_TTL_VIEWS, InstallReply,

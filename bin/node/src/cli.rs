@@ -549,35 +549,32 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !pos.is_empty() {
         return Err(format!("unexpected args: {pos:?}").into());
     }
-    // `--role client` mints a CLIENT invite (submit-only standing, redeemed
-    // via `user-redeem-invite`): with `--target` it locks to that key, and
-    // WITHOUT one it is a BEARER invite — single-use, 1-day default TTL.
-    // the default role stays a targeted Resident invite locked to the ONE
-    // key it admits; a bearer resident does not exist anywhere.
+    // every invite is BEARER (기명 dropped in Join Protocol v2): `--role`
+    // (default resident) selects the standing plane, and there is no `--target`
+    // — whoever redeems the single-use token first wins. A resident invite is
+    // the admission credential itself, kept off the wire by the sealed
+    // first-contact intro; a client invite redeems over `user-redeem-invite`.
     let role = match flags.get("role").map(String::as_str) {
         None | Some("resident") => config::InviteRole::Resident,
         Some("client") => config::InviteRole::Client,
         Some(other) => return Err(format!("--role must be resident or client, got {other:?}").into()),
     };
-    let target = match flags.get("target") {
-        Some(t) => Some(config::decode_key(t)?),
-        // a resident invite is locked to the ONE key it admits — no bearer
-        // path onto the resident plane exists.
-        None if role == config::InviteRole::Resident => {
-            return Err(
-                "--target <invitee-pubkey-hex> is required: every resident invite is locked \
-                 to the person it admits (mint a bearer CLIENT invite with --role client). \
-                 the invitee gets their code from the app's join screen or `ducktape-node \
-                 keygen --dir <workspace>`"
-                    .into(),
-            );
-        }
-        None => None,
-    };
-    let bearer = target.is_none();
+    // reject a stale `--target` loudly rather than silently ignoring it: the
+    // habit meant something in v1 and must not appear to still work.
+    if flags.contains_key("target") {
+        return Err(
+            "--target was removed: every invite is now bearer (무기명) — single-use, and \
+             (for a resident invite) sealed to the receiving member at first contact. \
+             drop --target and hand the blob to the invitee directly."
+                .into(),
+        );
+    }
     let ttl_days: u64 = match flags.get("ttl-days") {
         Some(v) => v.parse().map_err(|e| format!("--ttl-days {v:?}: {e}"))?,
-        None if bearer => config::DEFAULT_BEARER_INVITE_TTL_DAYS,
+        // a client invite defaults to a tight window; a resident invite keeps
+        // the operator-friendly onboarding default (a LOST blob is the residual
+        // risk — single-use + sealing cover interception).
+        None if role == config::InviteRole::Client => config::DEFAULT_BEARER_INVITE_TTL_DAYS,
         None => config::DEFAULT_INVITE_TTL_DAYS,
     };
     if ttl_days == 0 {
@@ -623,64 +620,68 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // plane. endpoints are minted from the advertised host (the listen IP is
     // usually unspecified) + the plane's UDP ports; the mesh port is where
     // the joiner dials this member's overlay ULA once the tunnel routes.
-    let wireguard = match config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? {
-        Some(wg_listen) => {
-            let (wg_keypair, _) =
-                reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
-                    .map_err(|e| format!("wireguard key: {e}"))?;
-            let mesh_port: u16 = raw
-                .listen
-                .parse::<std::net::SocketAddr>()
-                .map(|a| a.port())
-                .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
-            let host = match config::endpoint_host(
-                raw.advertised.as_deref(),
-                &raw.listen,
-                wg_listen,
-                raw.wireguard_advertised.as_deref(),
-            ) {
-                Ok(host) => Some(host),
-                Err(_) if has_coordinated_reach => {
-                    // Coordinated reach gives the joiner a rendezvous
-                    // path; there is deliberately no inviter-hosted
-                    // underlay endpoint to bake into the blob.
-                    None
-                }
-                Err(err) => return Err(err.into()),
-            };
-            match host {
-                Some(host) => {
-                    let intro_port =
-                        config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?
-                            .port();
-                    // the tunnel endpoint carries the FULL advertised
-                    // host:port when `wireguard_advertised` is configured —
-                    // the external port can differ from the bind port in the
-                    // port-forwarded setup the key exists for. The intro
-                    // stays host + intro port (no advertise override exists
-                    // for the intro lane).
-                    let endpoint = config::invite_wireguard_endpoint(
-                        raw.advertised.as_deref(),
-                        &raw.listen,
-                        wg_listen,
-                        raw.wireguard_advertised.as_deref(),
-                    )?;
-                    Some(config::InviteWireGuard {
-                        public_key: wg_keypair.public_key().0,
-                        endpoint: Some(endpoint),
-                        intro: Some(format!("{host}:{intro_port}")),
-                        mesh_port,
-                    })
-                }
-                None => Some(config::InviteWireGuard {
-                    public_key: wg_keypair.public_key().0,
-                    endpoint: None,
-                    intro: None,
-                    mesh_port,
-                }),
+    // the WireGuard bootstrap is MANDATORY in v2 (the overlay plane carries the
+    // data planes and the sealed first-contact intro), so minting REQUIRES a
+    // configured reachability plane — a WG-less invite no longer exists.
+    let Some(wg_listen) = config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? else {
+        return Err(
+            "this member runs no reachability plane, but a v2 invite must carry a WireGuard \
+             bootstrap. set `wireguard_listen` in node.toml (or configure a primary coordinator, \
+             which enables the plane) and mint again."
+                .into(),
+        );
+    };
+    let wireguard = {
+        let (wg_keypair, _) =
+            reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
+                .map_err(|e| format!("wireguard key: {e}"))?;
+        let mesh_port: u16 = raw
+            .listen
+            .parse::<std::net::SocketAddr>()
+            .map(|a| a.port())
+            .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
+        let host = match config::endpoint_host(
+            raw.advertised.as_deref(),
+            &raw.listen,
+            wg_listen,
+            raw.wireguard_advertised.as_deref(),
+        ) {
+            Ok(host) => Some(host),
+            Err(_) if has_coordinated_reach => {
+                // Coordinated reach gives the joiner a rendezvous path; there is
+                // deliberately no inviter-hosted underlay endpoint to bake in.
+                None
             }
+            Err(err) => return Err(err.into()),
+        };
+        match host {
+            Some(host) => {
+                let intro_port =
+                    config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?.port();
+                // the tunnel endpoint carries the FULL advertised host:port when
+                // `wireguard_advertised` is configured — the external port can
+                // differ from the bind port in the port-forwarded setup the key
+                // exists for. The intro stays host + intro port.
+                let endpoint = config::invite_wireguard_endpoint(
+                    raw.advertised.as_deref(),
+                    &raw.listen,
+                    wg_listen,
+                    raw.wireguard_advertised.as_deref(),
+                )?;
+                config::InviteWireGuard {
+                    public_key: wg_keypair.public_key().0,
+                    endpoint: Some(endpoint),
+                    intro: Some(format!("{host}:{intro_port}")),
+                    mesh_port,
+                }
+            }
+            None => config::InviteWireGuard {
+                public_key: wg_keypair.public_key().0,
+                endpoint: None,
+                intro: None,
+                mesh_port,
+            },
         }
-        None => None,
     };
 
     // the fronts: every reachable member the inviter already meshes with, read
@@ -741,36 +742,26 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .expect("clock is past the epoch")
         .as_secs()
         + ttl_days * 24 * 60 * 60;
-    // the expiry now lives INSIDE the token (signed), not as a separate blob
-    // field; a targeted mint locks to the invitee's key, `--role client`
-    // without a target mints a bearer Client token.
-    let token = match &target {
-        Some(target) => config::mint_invite_token(
-            &key,
-            descriptor.genesis_namespace().as_bytes(),
-            target,
-            role,
-            expires,
-        ),
-        None => config::mint_bearer_client_token(
-            &key,
-            descriptor.genesis_namespace().as_bytes(),
-            expires,
-        ),
-    };
+    // the expiry lives INSIDE the token (signed), not as a separate blob field.
+    // every invite is bearer; the role selects the standing plane.
+    let token = config::mint_invite_token(
+        &key,
+        descriptor.genesis_namespace().as_bytes(),
+        role,
+        expires,
+    );
     let blob_string = config::encode_invite(
         &invite_descriptor,
         &token,
-        wireguard.as_ref(),
+        &wireguard,
         &fronts,
         &key,
     )?;
     if role == config::InviteRole::Client {
         eprintln!(
-            "[invite] {} CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
+            "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
              redeem with: ducktape-node user-redeem-invite <blob> --node <member-http-url> \
              --key <user.key>",
-            if bearer { "bearer" } else { "targeted" },
         );
     }
     println!("{blob_string}");
@@ -1617,25 +1608,13 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut descriptor = invite.descriptor.clone();
     let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
     std::fs::create_dir_all(&dir)?;
-    // mint (or reuse) the identity FIRST — before touching the directory shape —
-    // so a target mismatch aborts the join loudly, right here, instead of
-    // parking a node that will only ever be refused at the lobby.
+    // mint (or reuse) this workspace dir's identity. Every invite is bearer
+    // (기명 dropped in v2): there is no target to match, so any freshly minted
+    // key may redeem — the OOB "hand the inviter your join code first" step is
+    // gone. The redeeming key is bound by the join proof and the token is
+    // single-use, so a paste simply admits whoever runs it.
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me_hex = hex_bytes(key.public_key().as_ref());
-    // defense in depth: decode enforces bearer⇒Client and the Client role
-    // was refused above, but a panic at a paste-untrusted-input boundary is
-    // never acceptable — fail as an error if either guard ever drifts.
-    let Some(invite_target) = invite.token.target.clone() else {
-        return Err("bearer invites are client-only — redeem with `user-redeem-invite`".into());
-    };
-    if invite_target != key.public_key() {
-        return Err(format!(
-            "this invite is locked to a different key.\n  invite target: {}\n  this workspace: {me_hex}\n\
-             hand the inviter THIS key (the join code) and ask for a fresh invite.",
-            hex_bytes(invite_target.as_ref()),
-        )
-        .into());
-    }
     config::guard_join_descriptor(&dir, &descriptor)?;
     // plumbing merges: explicit flags win, an existing node.toml's values
     // (network- or dev-shape) survive, defaults fill the rest. computed
@@ -1679,7 +1658,8 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if plumbing.advertised.is_none() {
             plumbing.advertised = Some("overlay".into());
         }
-        if let Some(wg) = &invite.wireguard {
+        {
+            let wg = &invite.wireguard;
             let issuer_identity =
                 wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
                     .map_err(|e| format!("inviter identity: {e:?}"))?;
@@ -1717,10 +1697,11 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the offered fronts, kept beside the token so `run_node` can race the
     // whole union of first-contact paths. Empty clears any stale set.
     config::save_invite_fronts(&dir, &invite.fronts)?;
-    if let Some(wg) = &invite.wireguard {
-        // the tunnel bootstrap the joining node dials BEFORE any p2p; kept
-        // beside the token so `run_node` can bring the interface up first.
-        config::save_invite_wireguard(&dir, &invite.token.issuer, wg)?;
+    {
+        // the tunnel bootstrap the joining node dials BEFORE any p2p (always
+        // present in v2); kept beside the token so `run_node` brings the
+        // interface up first.
+        config::save_invite_wireguard(&dir, &invite.token.issuer, &invite.wireguard)?;
         // mint the WireGuard identity NOW so the run's plane and intro
         // announcer read one settled key file instead of racing to create it.
         reachability::WireGuardKeypair::load_or_generate(&dir.join("wireguard.key"))

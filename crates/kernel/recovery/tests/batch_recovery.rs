@@ -161,6 +161,98 @@ fn a_multi_member_batch_seals_as_one_block_and_replays_byte_identically() {
     });
 }
 
+// ---- op-frame v3 replay parity ----------------------------------------------
+
+/// FORK-CRITICAL for the drain wiring: a journaled batch carrying an op-frame
+/// v3 envelope replays WITH its continuation. the old replay wrapped bare
+/// `(origin, msg)` pairs — a v3 member would decode to nothing, its
+/// continuation's write would vanish, and the recovered app-hash would
+/// diverge from the sealed tip (exactly what `recover()`'s verification
+/// fail-stops on).
+#[test]
+fn a_v3_batch_replays_with_its_continuation() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        // ---- live run: genesis checkpoint, then ONE batch mixing a v2 member
+        // with a v3 envelope (parent sets a, continuation sets b). ----
+        let recovery = Recovery::open(context.child("v3r1"))
+            .await
+            .expect("open recovery");
+        let mut node = OrderedNode::with_sink(fresh_host(), RoundOrderer::new(), recovery);
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest =
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+                .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        let signer = sk(1);
+        node.submit(&signer, 0, set("k1", "v1")).await.expect("v2 member");
+        let envelope = node::encode_frame_v3(
+            &signer,
+            1,
+            &set("a", "1"),
+            Some(&sdk::Continuation {
+                target: "directory".into(),
+                payload: encode_msg(&DirMsg::Set {
+                    key: "b".into(),
+                    value: "2".into(),
+                }),
+            }),
+        );
+        node.submit_frame(envelope).await.expect("v3 admits");
+        assert_eq!(node.flush_batch().await.expect("flush"), 1, "one mixed batch");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1, "one block");
+
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.app_hash();
+        let released = node
+            .take_drained()
+            .into_iter()
+            .find_map(|d| d.op.and_then(|op| op.continuation))
+            .expect("the v3 member surfaced its continuation");
+        assert_eq!(released.disposition, node::Disposition::Applied);
+        assert_eq!(get(node.host(), "a").await.as_deref(), Some("1"));
+        assert_eq!(get(node.host(), "b").await.as_deref(), Some("2"));
+        assert_eq!(get(node.host(), "k1").await.as_deref(), Some("v1"));
+
+        node.sink_mut().sync().await.expect("shutdown sync");
+        drop(node);
+
+        // ---- boot: fresh host, replay the journal suffix. the continuation's
+        // write must reproduce or the app-hash check fail-stops. ----
+        let mut recovery = Recovery::open(context.child("v3r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery
+            .manifest()
+            .expect("manifest decodes")
+            .expect("manifest present");
+        let mut host = fresh_host();
+        assert_eq!(get(&host, "a").await, None);
+        assert_eq!(get(&host, "b").await, None);
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("recover");
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.app_hash, tip_hash,
+            "the v3 batch (parent + released continuation) replays byte-identically"
+        );
+        assert_eq!(get(&host, "a").await.as_deref(), Some("1"));
+        assert_eq!(
+            get(&host, "b").await.as_deref(),
+            Some("2"),
+            "the continuation's write reproduced from the journal"
+        );
+        assert_eq!(get(&host, "k1").await.as_deref(), Some("v1"));
+    });
+}
+
 /// an UNSEALED trailing multi-member batch (crash after `pre_apply`, before the
 /// seal) rolls forward on boot and lands at the SAME roots a sealed run of the
 /// identical batch produces — parity for the roll-forward path, not just the

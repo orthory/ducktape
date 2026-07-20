@@ -4,10 +4,12 @@
 //! WireGuard tunnel up: the inviter itself, plus every reachable member the
 //! inviter meshes with (the invite's `fronts`). This module turns that set into
 //! ONE candidate list (`{inviter} ∪ {fronts}`), races first contact across the
-//! whole union, and stops at the first candidate whose intro is installed —
-//! cancelling the rest. If every path is exhausted it returns an HONEST
-//! terminal (a distinct, mode-naming failure the caller surfaces loudly and
-//! exits on), never a silent success.
+//! whole union, and stops at the first candidate whose doorbell SETTLES THE
+//! GATE (Join v2 §4: the sealed intro is the gate request, and the acked
+//! `Admitted`/terminal `Rejected` is the authoritative outcome) — cancelling
+//! the rest. If every path is exhausted it returns an HONEST terminal (a
+//! distinct, mode-naming failure the caller surfaces loudly and exits on),
+//! never a silent success.
 //!
 //! Two mechanics, reused verbatim from PR #260:
 //! - a candidate with a routable underlay `endpoint` is DIRECT: install the
@@ -16,6 +18,13 @@
 //! - a candidate with no endpoint is COORDINATED (by identity): drive
 //!   `BootstrapCoordinatedInvitePeer` through the joiner's AMBIENT coordinator
 //!   until the ack rides back over the punched underlay.
+//!
+//! Item 2 adds a THIRD, last-resort mechanic: when the UDP race exhausts every
+//! offered path (the network eats outbound UDP), the SAME candidates are
+//! re-raced through the coordinator's TCP/443 relay lane ([`RelayFallback`]) —
+//! the sealed intro rides a TCP stream to the relay, which forwards it to the
+//! member as one UDP datagram and pumps the member's sealed acks back. The
+//! member needs zero changes; only the joiner's transport differs.
 //!
 //! The decision logic (union building, TUN-mode filtering, first-ack-wins,
 //! honest terminal) is pure and unit-tested; the two real mechanics live below
@@ -28,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::ed25519;
+use commonware_cryptography::{Signer as _, ed25519};
 use futures::StreamExt as _;
 
 use crate::config::Front;
@@ -36,6 +45,14 @@ use crate::lobby;
 
 /// how long each attempt paces a retry / waits for an ack.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// hard bound on the TCP relay fallback race (item 2) — the same pattern as
+/// the UDP race's `window`: a mute relay must not hang the join.
+const RELAY_WINDOW: Duration = Duration::from_secs(60);
+
+/// how long one relay TCP connect may take before failing over to the next
+/// relay in the list.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// one first-contact path in the race: the inviter or one front, in a single
 /// shape. `endpoint Some` ⇒ a DIRECT underlay endpoint (`host:wg_port`);
@@ -91,22 +108,47 @@ impl std::fmt::Display for ContactVia {
     }
 }
 
-/// the outcome of a single candidate's attempt.
+/// the outcome of a single candidate's attempt. the sealed intro IS the gate
+/// request (Join v2 §4), so an attempt no longer succeeds at "tunnel up" — it
+/// resolves when the member's doorbell answers the GATE.
 #[derive(Debug, PartialEq)]
 pub enum AttemptResult {
-    /// the inviter/member acked our intro: the tunnel is up.
-    Installed,
-    /// the attempt exhausted its window (or the plane went away).
+    /// the AUTHORITATIVE admission: the member settled `Redeem` and it
+    /// COMMITTED at `height`; `cap` is the opaque coordinator capability
+    /// (private coordination) or `None`.
+    Admitted { height: u64, cap: Option<Vec<u8>> },
+    /// the gate refused TERMINALLY — this invite can never redeem; the whole
+    /// race stops and the joiner exits (ADR R2).
+    Rejected {
+        code: lobby::RejectCode,
+        detail: String,
+    },
+    /// the attempt exhausted its window, was refused non-terminally, or the
+    /// plane went away — the race fails over to the next candidate.
     Failed(String),
 }
 
 /// the race's terminal state.
+// one value per race ROUND (a join makes a handful, ever) and consumed by a
+// single match — boxing `Admitted`'s fields would buy nothing but noise at
+// that match, hence the `large_enum_variant` allowance (the interface.rs
+// precedent).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum FirstContactOutcome {
-    /// a candidate installed our intro first — its tunnel carries the join.
-    Installed {
+    /// a member answered the AUTHORITATIVE `Admitted` — standing is COMMITTED
+    /// and its tunnel carries everything after.
+    Admitted {
         key: ed25519::PublicKey,
         via: ContactVia,
+        height: u64,
+        cap: Option<Vec<u8>>,
+    },
+    /// a member answered a TERMINAL `Rejected` — this invite can never
+    /// redeem. the caller exits loudly instead of failing over (ADR R2).
+    Rejected {
+        code: lobby::RejectCode,
+        detail: String,
     },
     /// every offered path was exhausted. HONEST: the caller must surface this
     /// and exit non-zero rather than proceed as if joined.
@@ -175,10 +217,11 @@ pub fn plan_race(candidates: Vec<Candidate>, tun_mode: bool) -> Vec<Candidate> {
         .collect()
 }
 
-/// Race `attempt` across every candidate concurrently; the FIRST to install
-/// wins and the rest are cancelled (their futures are dropped). Exhaustion ⇒
-/// an honest [`FirstContactOutcome::Terminal`]. Pure over the attempt function
-/// so the selection logic is unit-testable without a live plane.
+/// Race `attempt` across every candidate concurrently; the FIRST to settle
+/// the gate (`Admitted`, or a terminal `Rejected`) wins and the rest are
+/// cancelled (their futures are dropped). Exhaustion ⇒ an honest
+/// [`FirstContactOutcome::Terminal`]. Pure over the attempt function so the
+/// selection logic is unit-testable without a live plane.
 pub async fn race_first_contact<F, Fut>(candidates: Vec<Candidate>, attempt: F) -> FirstContactOutcome
 where
     F: Fn(Candidate) -> Fut,
@@ -205,7 +248,19 @@ where
     let mut last_reason = String::from("every offered first-contact path failed");
     while let Some((key, via, result)) = inflight.next().await {
         match result {
-            AttemptResult::Installed => return FirstContactOutcome::Installed { key, via },
+            AttemptResult::Admitted { height, cap } => {
+                return FirstContactOutcome::Admitted {
+                    key,
+                    via,
+                    height,
+                    cap,
+                };
+            }
+            // a terminal refusal is a NETWORK-WIDE truth (spent nonce, bad
+            // token) — failing over would just collect the same answer.
+            AttemptResult::Rejected { code, detail } => {
+                return FirstContactOutcome::Rejected { code, detail };
+            }
             AttemptResult::Failed(reason) => last_reason = reason,
         }
     }
@@ -215,17 +270,46 @@ where
     }
 }
 
+/// the TCP relay fallback (item 2): how the race reaches candidates once
+/// every UDP path is exhausted. Built by the caller from the AMBIENT
+/// coordinator set (relay host = coordinator host, TCP/443) or an explicit
+/// `coordinator_relay` override — never from the invite.
+#[derive(Clone)]
+pub struct RelayFallback {
+    /// relay endpoints (`host:port`), walked in order per candidate (failover
+    /// — the `discover_reflexive_failover` philosophy) and resolved
+    /// per-attempt via `to_socket_addrs`, like `Candidate` endpoints.
+    pub relays: Vec<String>,
+    /// this node's identity signer — every [`nat_traversal::RelayIntro`]
+    /// carries a fresh proof-of-possession it signs.
+    pub signer: ed25519::PrivateKey,
+    /// the genesis-issued coordinator capability, when the network's relay
+    /// gates privately (the same cap every rendezvous request presents).
+    pub cap: Option<nat_traversal::CoordCap>,
+}
+
 /// the real driver: race the candidate union using #260's two mechanics. The
 /// intro datagram is built ONCE by the caller (this joiner's own token-signed
-/// intro) and reused across every candidate. `window` bounds the whole race;
-/// each attempt paces itself at [`RETRY_INTERVAL`].
+/// intro) and reused across every candidate. `keypair` is this joiner's OWN
+/// WireGuard keypair — post-verify acks arrive SEALED to it (the coordinator
+/// cap must never cross in the clear). `window` bounds the whole race; each
+/// attempt paces itself at [`RETRY_INTERVAL`].
+///
+/// `relay` is the last resort (item 2): a settled UDP outcome (`Admitted`,
+/// terminal `Rejected`) returns untouched, but a UDP-exhausted Terminal
+/// re-races the SAME candidates through the TCP relay lane before giving up —
+/// and a Terminal from BOTH lanes folds the two stories into one reason, so
+/// the exit-3 log names udp and relay alike.
+#[allow(clippy::too_many_arguments)]
 pub async fn drive_first_contact(
     reach: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     candidates: Vec<Candidate>,
     intro: Vec<u8>,
     token_nonce: Vec<u8>,
+    keypair: Arc<reachability::WireGuardKeypair>,
     label: String,
     window: Duration,
+    relay: Option<RelayFallback>,
 ) -> FirstContactOutcome {
     let tried = candidates.len();
     let iters = (window.as_secs() / RETRY_INTERVAL.as_secs()).max(1) as u32;
@@ -233,29 +317,163 @@ pub async fn drive_first_contact(
         let reach = reach.clone();
         let intro = intro.clone();
         let token_nonce = token_nonce.clone();
+        let keypair = keypair.clone();
         let label = label.clone();
         async move {
             match candidate.endpoint.clone() {
                 Some(endpoint) => {
-                    direct_attempt(reach, intro, token_nonce, candidate, endpoint, label, iters).await
+                    direct_attempt(
+                        reach,
+                        intro,
+                        token_nonce,
+                        keypair,
+                        candidate,
+                        endpoint,
+                        label,
+                        iters,
+                    )
+                    .await
                 }
-                None => coordinated_attempt(reach, intro, token_nonce, candidate, label, iters).await,
+                None => {
+                    coordinated_attempt(reach, intro, token_nonce, keypair, candidate, label, iters)
+                        .await
+                }
             }
         }
     };
     // The window is a HARD bound, not just loop pacing: an attempt parked on
     // a reply the plane never sends (its command loop stalled) would
     // otherwise hang the race forever — no Terminal, no exit, no log line.
-    match tokio::time::timeout(window, race_first_contact(candidates, attempt)).await {
+    let udp_outcome =
+        match tokio::time::timeout(window, race_first_contact(candidates.clone(), attempt)).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => FirstContactOutcome::Terminal {
+                tried,
+                reason: format!(
+                    "join window ({}s) elapsed with no candidate acked — every path stayed dark \
+                     (reachability plane unresponsive or peers unreachable)",
+                    window.as_secs()
+                ),
+            },
+        };
+    // the gate SETTLED over UDP (admitted, or terminally refused): the relay
+    // lane exists only for the exhausted case, never to second-guess an
+    // authoritative answer.
+    let (udp_tried, udp_reason) = match udp_outcome {
+        FirstContactOutcome::Terminal { tried, reason } => (tried, reason),
+        settled => return settled,
+    };
+    // an empty candidate set gives the relay nothing to reach either.
+    let Some(relay) = relay.filter(|r| !r.relays.is_empty() && tried > 0) else {
+        return FirstContactOutcome::Terminal {
+            tried: udp_tried,
+            reason: udp_reason,
+        };
+    };
+    // once-per-race lifecycle fact: the join changed lanes.
+    tracing::info!(
+        target: "ducktape::join",
+        event = "join_relay_fallback",
+        node = %label,
+        nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+        relays = relay.relays.len(),
+        tried = udp_tried,
+        "every UDP first-contact path exhausted — engaging the TCP relay fallback"
+    );
+    // the SAME derivation the rendezvous path registers under
+    // (`reachability_plane.rs`): a `NodeKey` IS the raw ed25519 identity
+    // bytes, so the relay's advert-book lookup and its PoP check agree with
+    // the members' own registrations.
+    let caller = reachability::node_key(reachability::identity_of(&relay.signer.public_key()));
+    let relay = Arc::new(relay);
+    let relay_attempt_of = |candidate: Candidate| {
+        let relay = relay.clone();
+        let intro = intro.clone();
+        let token_nonce = token_nonce.clone();
+        let keypair = keypair.clone();
+        let label = label.clone();
+        async move { relay_attempt(relay, caller, intro, token_nonce, keypair, candidate, label).await }
+    };
+    // same HARD bound as the UDP race: a mute relay (TCP accepts, nothing
+    // ever comes back) must not hang the join past its window.
+    let fallback_outcome = match tokio::time::timeout(
+        RELAY_WINDOW,
+        race_first_contact(candidates, relay_attempt_of),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(_elapsed) => FirstContactOutcome::Terminal {
             tried,
             reason: format!(
-                "join window ({}s) elapsed with no candidate acked — every path stayed dark \
-                 (reachability plane unresponsive or peers unreachable)",
-                window.as_secs()
+                "relay window ({}s) elapsed with no candidate acked through any relay",
+                RELAY_WINDOW.as_secs()
             ),
         },
+    };
+    match fallback_outcome {
+        FirstContactOutcome::Terminal { reason, .. } => {
+            tracing::warn!(
+                target: "ducktape::join",
+                node = %label,
+                nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+                attempts = tried,
+                reason = "relay_fallback_exhausted",
+                "TCP relay fallback EXHAUSTED — no candidate acked through any relay"
+            );
+            // fold BOTH lanes' stories into the one honest terminal the
+            // caller's exit-3 log surfaces: udp and relay each named.
+            FirstContactOutcome::Terminal {
+                tried,
+                reason: format!("udp: {udp_reason}; relay: {reason}"),
+            }
+        }
+        settled => settled,
+    }
+}
+
+/// Open one ack datagram for this attempt and decode the member's reply.
+/// Post-verify acks arrive SEALED to this joiner's WG key; a pre-verify
+/// `Refused` is cleartext — try the seal first, fall back to the raw bytes.
+/// `None` ⇒ junk, or another attempt's ack (nonce mismatch): the announcer
+/// ignores it and keeps sending.
+fn open_ack(
+    keypair: &reachability::WireGuardKeypair,
+    token_nonce: &[u8],
+    datagram: &[u8],
+) -> Option<lobby::IntroReply> {
+    let opened = keypair
+        .open_sealed(datagram)
+        .unwrap_or_else(|_| datagram.to_vec());
+    let ack = lobby::decode_intro_ack(&opened).ok()?;
+    if ack.nonce != token_nonce {
+        return None;
+    }
+    Some(ack.reply)
+}
+
+/// What a decoded gate reply does to the attempt: `None` ⇒ the gate is still
+/// settling (`Installed`) — keep announcing, a later retransmit carries the
+/// outcome home; `Some` ⇒ the attempt resolved.
+fn ack_resolution(reply: lobby::IntroReply) -> Option<AttemptResult> {
+    match reply {
+        lobby::IntroReply::Installed => None,
+        lobby::IntroReply::Admitted { height, cap } => {
+            Some(AttemptResult::Admitted { height, cap })
+        }
+        lobby::IntroReply::Rejected {
+            code,
+            detail,
+            terminal: true,
+        } => Some(AttemptResult::Rejected { code, detail }),
+        // a non-terminal refusal (issuer view lag, member busy) fails THIS
+        // candidate over — the race tries the next one.
+        lobby::IntroReply::Rejected {
+            code,
+            detail,
+            terminal: false,
+        } => Some(AttemptResult::Failed(format!("{code:?}: {detail}"))),
+        lobby::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
     }
 }
 
@@ -296,10 +514,12 @@ fn resolve_intro_dest(candidate: &Candidate, endpoint_addr: SocketAddr) -> Resul
 /// guard) targeting the member's intro listener — its explicitly-advertised
 /// `intro` endpoint when present (honoring an operator-overridden
 /// `invite_listen`), otherwise the underlay `wg_port + 1` default.
+#[allow(clippy::too_many_arguments)]
 async fn direct_attempt(
     reach: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     intro: Vec<u8>,
     token_nonce: Vec<u8>,
+    keypair: Arc<reachability::WireGuardKeypair>,
     candidate: Candidate,
     endpoint: String,
     label: String,
@@ -344,6 +564,11 @@ async fn direct_attempt(
         Ok(dest) => dest,
         Err(e) => return AttemptResult::Failed(e),
     };
+    // SEAL the intro to THIS candidate's WireGuard X25519 key (item 5): the
+    // plaintext bundle carries the bearer token, which must never cross the
+    // wire in the clear. Sealed once per candidate (one ephemeral key), reused
+    // across the attempt's retransmits — only this member can open it.
+    let sealed_intro = reachability::seal(&candidate.wg, &intro);
     let stop = Arc::new(AtomicBool::new(false));
     let _guard = StopGuard(stop.clone());
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -352,8 +577,9 @@ async fn direct_attempt(
         .name("first-contact-direct".into())
         .spawn(move || {
             let _ = done_tx.send(run_direct_announcer(
-                &intro,
+                &sealed_intro,
                 &token_nonce,
+                &keypair,
                 intro_dest,
                 iters,
                 &thread_stop,
@@ -370,11 +596,14 @@ async fn direct_attempt(
 }
 
 /// the blocking UDP announce loop (its own thread — nothing here touches the
-/// async runtime): re-send the intro every [`RETRY_INTERVAL`] until the member
-/// acks an install, the window is exhausted, or the stop flag trips.
+/// async runtime): re-send the intro every [`RETRY_INTERVAL`] until the gate
+/// resolves, the window is exhausted, or the stop flag trips. an `Installed`
+/// ack means "the gate is settling in consensus" — keep sending; a later
+/// retransmit's ack carries the settled outcome (Join v2 §4).
 fn run_direct_announcer(
     intro: &[u8],
     token_nonce: &[u8],
+    keypair: &reachability::WireGuardKeypair,
     dest: SocketAddr,
     iters: u32,
     stop: &AtomicBool,
@@ -390,38 +619,43 @@ fn run_direct_announcer(
             return AttemptResult::Failed("cancelled".into());
         }
         let _ = socket.send_to(intro, dest);
-        // the read timeout paces the loop; an ack for THIS invite that reports
-        // installed wins, any other reply is ignored and we retry.
+        // the read timeout paces the loop; a resolving ack for THIS invite
+        // settles the attempt, anything else is ignored and we retry.
         if let Ok((n, _)) = socket.recv_from(&mut buf)
-            && let Ok(ack) = lobby::decode_intro_ack(&buf[..n])
-            && ack.nonce == token_nonce
-            && ack.installed
+            && let Some(reply) = open_ack(keypair, token_nonce, &buf[..n])
+            && let Some(result) = ack_resolution(reply)
         {
-            return AttemptResult::Installed;
+            return result;
         }
     }
     AttemptResult::Failed(format!(
-        "direct intro to {dest} was not acked within the join window"
+        "direct intro to {dest} was not answered within the join window"
     ))
 }
 
 /// COORDINATED: drive `BootstrapCoordinatedInvitePeer` through the ambient
-/// coordinator until the ack rides back over the punched underlay socket.
+/// coordinator until a gate-resolving ack rides back over the punched
+/// underlay socket (`Installed` = still settling — keep driving).
 async fn coordinated_attempt(
     reach: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     intro: Vec<u8>,
     token_nonce: Vec<u8>,
+    keypair: Arc<reachability::WireGuardKeypair>,
     candidate: Candidate,
     label: String,
     iters: u32,
 ) -> AttemptResult {
+    // SEAL the intro to THIS candidate's WireGuard X25519 key (item 5) once,
+    // reused across the attempt's rendezvous retries — the bearer token never
+    // crosses the wire in the clear, and only this member can open it.
+    let sealed_intro = reachability::seal(&candidate.wg, &intro);
     for attempt in 1..=iters {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if reach
             .send(reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
                 peer: candidate.key.clone(),
                 wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
-                intro: intro.clone(),
+                intro: sealed_intro.clone(),
                 reply: reachability::CoordinatedInviteReply(reply_tx),
             })
             .await
@@ -431,11 +665,10 @@ async fn coordinated_attempt(
         }
         match reply_rx.await {
             Ok(Ok(bytes)) => {
-                if let Ok(ack) = lobby::decode_intro_ack(&bytes)
-                    && ack.nonce == token_nonce
-                    && ack.installed
+                if let Some(reply) = open_ack(&keypair, &token_nonce, &bytes)
+                    && let Some(result) = ack_resolution(reply)
                 {
-                    return AttemptResult::Installed;
+                    return result;
                 }
             }
             // the rendezvous underlay is not ready yet — retry within the window.
@@ -467,6 +700,158 @@ async fn coordinated_attempt(
         "first-contact candidate EXHAUSTED — no ack within the join window"
     );
     AttemptResult::Failed("coordinated intro was not acked within the join window".into())
+}
+
+/// what one relay yielded for a candidate: `Resolved` settles the whole
+/// attempt (bubbles into the race); `NextRelay` fails over to the next relay
+/// in the list, carrying the reason the last one is worthless.
+enum RelayLane {
+    Resolved(AttemptResult),
+    NextRelay(String),
+}
+
+/// RELAY (item 2): the same doorbell, reached through a TCP relay. Seal the
+/// intro fresh to THIS candidate's WireGuard key (exactly like the UDP
+/// attempts — the bearer token never crosses in the clear), then walk the
+/// relay list in order until one carries a gate-resolving ack back.
+async fn relay_attempt(
+    relay: Arc<RelayFallback>,
+    caller: nat_traversal::NodeKey,
+    intro: Vec<u8>,
+    token_nonce: Vec<u8>,
+    keypair: Arc<reachability::WireGuardKeypair>,
+    candidate: Candidate,
+    label: String,
+) -> AttemptResult {
+    let sealed_intro = reachability::seal(&candidate.wg, &intro);
+    let target = reachability::node_key(reachability::identity_of(&candidate.key));
+    let mut last_failure = String::from("no relay endpoint was usable");
+    for endpoint in &relay.relays {
+        // resolved per-attempt, like Candidate endpoints — DNS may have moved
+        // between race rounds.
+        let addr = match endpoint.to_socket_addrs().map(|mut addrs| addrs.next()) {
+            Ok(Some(addr)) => addr,
+            Ok(None) => {
+                last_failure = format!("relay endpoint {endpoint:?} did not resolve");
+                continue;
+            }
+            Err(e) => {
+                last_failure = format!("relay endpoint {endpoint:?} unusable ({e})");
+                continue;
+            }
+        };
+        let session = drive_one_relay(
+            &relay,
+            caller,
+            target,
+            &sealed_intro,
+            &token_nonce,
+            &keypair,
+            &candidate,
+            addr,
+            &label,
+        )
+        .await;
+        match session {
+            RelayLane::Resolved(result) => return result,
+            RelayLane::NextRelay(reason) => last_failure = reason,
+        }
+    }
+    AttemptResult::Failed(last_failure)
+}
+
+/// one relay session: connect, then retransmit at the announcer cadence —
+/// a FRESH [`nat_traversal::RelayIntro`] signature each send (the
+/// coordinator's 30 s freshness window makes reusing one across a long
+/// session wrong) — reading each pause out for a Forwarded ack. The outer
+/// [`RELAY_WINDOW`] timeout is the real bound on this loop, so no second
+/// counter caps the sends.
+#[allow(clippy::too_many_arguments)]
+async fn drive_one_relay(
+    relay: &RelayFallback,
+    caller: nat_traversal::NodeKey,
+    target: nat_traversal::NodeKey,
+    sealed_intro: &[u8],
+    token_nonce: &[u8],
+    keypair: &reachability::WireGuardKeypair,
+    candidate: &Candidate,
+    addr: SocketAddr,
+    label: &str,
+) -> RelayLane {
+    let mut conn = match nat_traversal::RelayConn::connect(addr, RELAY_CONNECT_TIMEOUT).await {
+        Ok(conn) => conn,
+        Err(e) => return RelayLane::NextRelay(format!("relay {addr} connect failed ({e})")),
+    };
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let intro_frame = nat_traversal::RelayFrame::Intro(nat_traversal::sign_relay_intro(
+            &relay.signer,
+            caller,
+            target,
+            sealed_intro.to_vec(),
+            nat_traversal::now_secs(),
+            relay.cap.clone(),
+        ));
+        if conn.send(&intro_frame).await.is_err() {
+            return RelayLane::NextRelay(format!("relay {addr} stream broke mid-send"));
+        }
+        // read THIS pause out fully before retransmitting: junk frames must
+        // not accelerate the cadence past the UDP announcer's.
+        let deadline = tokio::time::Instant::now() + RETRY_INTERVAL;
+        loop {
+            let remaining = deadline.duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match conn.recv(remaining).await {
+                Ok(nat_traversal::RelayFrame::Forwarded { payload }) => {
+                    // identical semantics to the UDP announcer: `Installed`
+                    // (or junk) keeps announcing; anything resolving settles.
+                    if let Some(reply) = open_ack(keypair, token_nonce, &payload)
+                        && let Some(result) = ack_resolution(reply)
+                    {
+                        return RelayLane::Resolved(result);
+                    }
+                }
+                Ok(nat_traversal::RelayFrame::Error { reason }) => {
+                    let token = String::from_utf8_lossy(&reason).into_owned();
+                    if reason == nat_traversal::REASON_TARGET_UNREGISTERED {
+                        // THIS candidate has no live advert behind the relay
+                        // — the next relay cannot help it. fail the CANDIDATE,
+                        // naming the lane's stable token.
+                        return RelayLane::Resolved(AttemptResult::Failed(format!(
+                            "relay says {token}: the member is not relay-reachable"
+                        )));
+                    }
+                    // not_authorized / session_limit / anything else refused
+                    // US at this relay — the next relay may not.
+                    return RelayLane::NextRelay(format!("relay {addr} refused ({token})"));
+                }
+                // the relay never speaks the client's frame; a stream that
+                // does is broken.
+                Ok(nat_traversal::RelayFrame::Intro(_)) => {
+                    return RelayLane::NextRelay(format!("relay {addr} spoke a client frame"));
+                }
+                // the pause elapsed silent — retransmit (the timeout IS the
+                // pacing, exactly like the UDP announcer's read timeout).
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
+                Err(_) => {
+                    return RelayLane::NextRelay(format!("relay {addr} stream broke mid-read"));
+                }
+            }
+        }
+        tracing::debug!(
+            target: "ducktape::join",
+            node = %label,
+            nonce = %noded::hex_bytes(&token_nonce[..token_nonce.len().min(8)]),
+            peer = %noded::hex_bytes(&candidate.key.as_ref()[..4]),
+            via = "relay",
+            relay = %addr,
+            attempt,
+            "first-contact intro not yet acked — retrying"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -531,7 +916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn race_installs_the_first_to_ack_without_waiting_on_the_rest() {
+    async fn race_admits_the_first_to_settle_without_waiting_on_the_rest() {
         let winner = key(1);
         let candidates = vec![
             Candidate { key: winner.clone(), wg: [1; 32], mesh_port: 1, endpoint: Some("win".into()), intro: None },
@@ -539,19 +924,111 @@ mod tests {
         ];
         let outcome = race_first_contact(candidates, |c| async move {
             match c.endpoint.as_deref() {
-                Some("win") => AttemptResult::Installed,
+                Some("win") => AttemptResult::Admitted {
+                    height: 7,
+                    cap: Some(vec![1, 2, 3]),
+                },
                 // the loser never resolves; the race must not wait on it.
                 _ => std::future::pending::<AttemptResult>().await,
             }
         })
         .await;
         match outcome {
-            FirstContactOutcome::Installed { key, via } => {
+            FirstContactOutcome::Admitted { key, via, height, cap } => {
                 assert_eq!(key, winner);
                 assert_eq!(via, ContactVia::Direct("win".into()));
+                assert_eq!(height, 7);
+                assert_eq!(cap.as_deref(), Some(&[1u8, 2, 3][..]));
             }
-            other => panic!("expected Installed, got {other:?}"),
+            other => panic!("expected Admitted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_reject_stops_the_race_instead_of_failing_over() {
+        // ADR R2: a terminal refusal (spent nonce, bad token) is network-wide
+        // truth — the race must surface it, never churn the remaining
+        // candidates toward the same answer.
+        let candidates = vec![
+            Candidate { key: key(1), wg: [1; 32], mesh_port: 1, endpoint: Some("reject".into()), intro: None },
+            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: Some("slow".into()), intro: None },
+        ];
+        let outcome = race_first_contact(candidates, |c| async move {
+            match c.endpoint.as_deref() {
+                Some("reject") => AttemptResult::Rejected {
+                    code: lobby::RejectCode::Spent,
+                    detail: "invite already redeemed".into(),
+                },
+                _ => std::future::pending::<AttemptResult>().await,
+            }
+        })
+        .await;
+        match outcome {
+            FirstContactOutcome::Rejected { code, detail } => {
+                assert_eq!(code, lobby::RejectCode::Spent);
+                assert!(detail.contains("already redeemed"), "{detail}");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ack_resolution_maps_each_reply_to_its_attempt_step() {
+        // Installed = the gate is settling: keep announcing.
+        assert_eq!(ack_resolution(lobby::IntroReply::Installed), None);
+        // Admitted settles the attempt with the authoritative outcome.
+        assert_eq!(
+            ack_resolution(lobby::IntroReply::Admitted { height: 3, cap: None }),
+            Some(AttemptResult::Admitted { height: 3, cap: None })
+        );
+        // a TERMINAL reject stops the race; a non-terminal one fails over.
+        assert!(matches!(
+            ack_resolution(lobby::IntroReply::Rejected {
+                code: lobby::RejectCode::Spent,
+                detail: "spent".into(),
+                terminal: true,
+            }),
+            Some(AttemptResult::Rejected { code: lobby::RejectCode::Spent, .. })
+        ));
+        assert!(matches!(
+            ack_resolution(lobby::IntroReply::Rejected {
+                code: lobby::RejectCode::Busy,
+                detail: "settling too slowly".into(),
+                terminal: false,
+            }),
+            Some(AttemptResult::Failed(_))
+        ));
+        assert!(matches!(
+            ack_resolution(lobby::IntroReply::Refused { detail: "no".into() }),
+            Some(AttemptResult::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn open_ack_opens_sealed_and_cleartext_and_drops_foreign_nonces() {
+        let dir = tempfile::tempdir().unwrap();
+        let joiner = reachability::WireGuardKeypair::load_or_generate(&dir.path().join("j.key"))
+            .unwrap()
+            .0;
+        let nonce = vec![9u8; 4];
+        let ack = lobby::IntroAck {
+            nonce: nonce.clone(),
+            reply: lobby::IntroReply::Admitted { height: 1, cap: None },
+        };
+        let plain = lobby::encode_intro_ack(&ack);
+        // sealed (the post-verify shape) opens with the joiner's own key…
+        let sealed = reachability::seal(&joiner.public_key().0, &plain);
+        assert_eq!(
+            open_ack(&joiner, &nonce, &sealed),
+            Some(lobby::IntroReply::Admitted { height: 1, cap: None })
+        );
+        // …and a cleartext pre-verify refusal still decodes via the fallback.
+        assert_eq!(
+            open_ack(&joiner, &nonce, &plain),
+            Some(lobby::IntroReply::Admitted { height: 1, cap: None })
+        );
+        // another attempt's nonce is not ours to interpret.
+        assert_eq!(open_ack(&joiner, &[7u8; 4], &sealed), None);
     }
 
     #[tokio::test]
@@ -644,6 +1121,12 @@ mod tests {
             intro: None,
         }];
         let window = Duration::from_secs(90);
+        let dir = tempfile::tempdir().unwrap();
+        let keypair = Arc::new(
+            reachability::WireGuardKeypair::load_or_generate(&dir.path().join("j.key"))
+                .unwrap()
+                .0,
+        );
         // Paused clock: with the window enforced this resolves at t=90s of
         // virtual time (milliseconds of wall time); without it nothing ever
         // wakes and the guard timeout below trips.
@@ -654,8 +1137,10 @@ mod tests {
                 candidates,
                 vec![1, 2, 3],
                 vec![9, 9],
+                keypair,
                 "mute-plane".into(),
                 window,
+                None,
             ),
         )
         .await
@@ -672,11 +1157,267 @@ mod tests {
         // race — an immediate honest terminal, never a hang.
         let planned = plan_race(build_candidates(Some(inviter(None)), &[]), true);
         assert!(planned.is_empty());
-        let outcome =
-            race_first_contact(planned, |_c| async move { AttemptResult::Installed }).await;
+        let outcome = race_first_contact(planned, |_c| async move {
+            AttemptResult::Admitted {
+                height: 1,
+                cap: None,
+            }
+        })
+        .await;
         assert!(matches!(
             outcome,
             FirstContactOutcome::Terminal { tried: 0, .. }
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // the TCP relay fallback mule (item 2): a UDP-dead joiner against a REAL
+    // relay listener, real sockets, real seals — the point of the whole item.
+
+    const MULE_BINDING: &[u8] = b"net#relaymule@feedface";
+
+    /// a reachability plane that ACKS installs and nothing else — enough for
+    /// the direct announcer to run against the black hole.
+    fn install_only_plane() -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let reachability::ReachabilityCommand::InstallInvitePeer { reply, .. } = cmd {
+                    let _ = reply.0.send(Ok(()));
+                }
+            }
+        });
+        tx
+    }
+
+    /// the joiner's side of the mule: identity signer, WG keypair (post-verify
+    /// acks arrive sealed to it), token-signed intro, and the token nonce —
+    /// the same bundle wiring.rs builds before the race.
+    fn mule_joiner(
+        dir: &std::path::Path,
+    ) -> (
+        ed25519::PrivateKey,
+        Arc<reachability::WireGuardKeypair>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let issuer = ed25519::PrivateKey::from_seed(80);
+        let token = crate::config::mint_invite_token(
+            &issuer,
+            MULE_BINDING,
+            crate::config::InviteRole::Resident,
+            u64::MAX,
+        );
+        let joiner = ed25519::PrivateKey::from_seed(81);
+        let keypair = Arc::new(
+            reachability::WireGuardKeypair::load_or_generate(&dir.join("joiner.key"))
+                .unwrap()
+                .0,
+        );
+        let intro = lobby::encode_intro(&lobby::intro_request(
+            &joiner,
+            MULE_BINDING,
+            &token,
+            keypair.public_key().0,
+        ));
+        (joiner, keypair, intro, token.nonce.to_vec())
+    }
+
+    /// a live relay listener over `coordinator`'s advert book, PoP-gated on
+    /// both ends — the deployed topology in miniature.
+    async fn relay_rig(
+        coordinator: &nat_traversal::Coordinator,
+    ) -> (SocketAddr, nat_traversal::RelayMetrics) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = nat_traversal::RelayMetrics::default();
+        tokio::spawn(nat_traversal::run_relay_listener(
+            listener,
+            Arc::new(nat_traversal::AuthPolicy::Open { require_pop: true }),
+            coordinator.adverts(),
+            metrics.clone(),
+        ));
+        (addr, metrics)
+    }
+
+    /// a UDP-dead direct candidate: both its underlay endpoint and its intro
+    /// listener point at `black_hole` — bound, never served, never answering.
+    fn black_hole_candidate(
+        member_key: ed25519::PublicKey,
+        wg: [u8; 32],
+        hole: SocketAddr,
+    ) -> Candidate {
+        Candidate {
+            key: member_key,
+            wg,
+            mesh_port: 52200,
+            endpoint: Some(hole.to_string()),
+            intro: Some(hole.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_udp_dead_joiner_completes_the_join_over_the_tcp_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let (joiner_signer, keypair, intro, token_nonce) = mule_joiner(dir.path());
+
+        // the member: real identity + real WG keypair, but its only UDP
+        // presence is (a) the black hole the invite's endpoint names and
+        // (b) the rendezvous-registered socket only the relay can reach.
+        let member_signer = ed25519::PrivateKey::from_seed(82);
+        let member_key = member_signer.public_key();
+        let member_wg = reachability::WireGuardKeypair::load_or_generate(&dir.path().join("m.key"))
+            .unwrap()
+            .0;
+        let black_hole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let candidate = black_hole_candidate(
+            member_key.clone(),
+            member_wg.public_key().0,
+            black_hole.local_addr().unwrap(),
+        );
+
+        // the relay rig: the member's advert seeded into the coordinator's
+        // book exactly where the UDP rendezvous would put it.
+        let member_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let member_addr = member_udp.local_addr().unwrap();
+        let mut coordinator =
+            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Open {
+                require_pop: true,
+            });
+        coordinator.handle_at(
+            member_addr,
+            nat_traversal::Msg::Register {
+                key: reachability::node_key(reachability::identity_of(&member_key)),
+            },
+            nat_traversal::now_secs(),
+        );
+        let (relay_addr, metrics) = relay_rig(&coordinator).await;
+
+        // the fake member: the REAL member-side codepath shape end to end —
+        // open the seal with its own WG key, decode + verify the intro
+        // against the network binding, then answer the observed source with
+        // an `Admitted` ack sealed to the joiner's announced WG key.
+        let member_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (n, src) = member_udp
+                .recv_from(&mut buf)
+                .await
+                .expect("forwarded datagram");
+            let opened = member_wg
+                .open_sealed(&buf[..n])
+                .expect("the relayed intro is sealed to the member's WG key");
+            let request = lobby::decode_intro(&opened).expect("decodes");
+            let verified =
+                lobby::verify_intro(&request, MULE_BINDING).expect("verifies against the binding");
+            let ack = lobby::encode_intro_ack(&lobby::IntroAck {
+                nonce: verified.nonce.to_vec(),
+                reply: lobby::IntroReply::Admitted {
+                    height: 7,
+                    cap: None,
+                },
+            });
+            member_udp
+                .send_to(&reachability::seal(&verified.wg_public_key, &ack), src)
+                .await
+                .expect("ack sent");
+        });
+
+        // fails-before: with no relay fallback the UDP-dead race is the
+        // pre-item-2 exit-3 shape — an honest Terminal.
+        let reach = install_only_plane();
+        let window = Duration::from_secs(4);
+        let no_relay = drive_first_contact(
+            reach.clone(),
+            vec![candidate.clone()],
+            intro.clone(),
+            token_nonce.clone(),
+            keypair.clone(),
+            "relay-mule".into(),
+            window,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(no_relay, FirstContactOutcome::Terminal { tried: 1, .. }),
+            "a UDP-dead joiner without the fallback stays terminal: {no_relay:?}"
+        );
+
+        // passes-after: the same race with the fallback rides TCP to the
+        // relay and comes back ADMITTED.
+        let outcome = drive_first_contact(
+            reach,
+            vec![candidate],
+            intro,
+            token_nonce,
+            keypair,
+            "relay-mule".into(),
+            window,
+            Some(RelayFallback {
+                relays: vec![relay_addr.to_string()],
+                signer: joiner_signer,
+                cap: None,
+            }),
+        )
+        .await;
+        match outcome {
+            FirstContactOutcome::Admitted { key, height, .. } => {
+                assert_eq!(key, member_key);
+                assert_eq!(height, 7);
+            }
+            other => panic!("expected Admitted over the relay, got {other:?}"),
+        }
+        tokio::time::timeout(Duration::from_secs(2), member_task)
+            .await
+            .expect("member task finishes")
+            .expect("member-side assertions hold");
+        let m = metrics.snapshot();
+        assert!(m.forwards >= 1, "the relay forwarded the intro: {m:?}");
+        assert!(m.replies >= 1, "the member's ack rode back: {m:?}");
+    }
+
+    #[tokio::test]
+    async fn relay_fallback_with_an_unregistered_target_names_the_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let (joiner_signer, keypair, intro, token_nonce) = mule_joiner(dir.path());
+
+        // nobody ever registered with this coordinator: the relay must refuse
+        // with `target_unregistered`, and the folded terminal must NAME it.
+        let coordinator =
+            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Open {
+                require_pop: true,
+            });
+        let (relay_addr, _metrics) = relay_rig(&coordinator).await;
+
+        let member_key = ed25519::PrivateKey::from_seed(83).public_key();
+        let black_hole = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let candidate =
+            black_hole_candidate(member_key, [7u8; 32], black_hole.local_addr().unwrap());
+
+        let outcome = drive_first_contact(
+            install_only_plane(),
+            vec![candidate],
+            intro,
+            token_nonce,
+            keypair,
+            "relay-mule-unregistered".into(),
+            Duration::from_secs(2),
+            Some(RelayFallback {
+                relays: vec![relay_addr.to_string()],
+                signer: joiner_signer,
+                cap: None,
+            }),
+        )
+        .await;
+        match outcome {
+            FirstContactOutcome::Terminal { tried, reason } => {
+                assert_eq!(tried, 1);
+                assert!(
+                    reason.contains("target_unregistered"),
+                    "the honest failure names the relay lane's token: {reason}"
+                );
+                assert!(reason.contains("udp:"), "both lanes are named: {reason}");
+            }
+            other => panic!("expected Terminal naming target_unregistered, got {other:?}"),
+        }
     }
 }

@@ -146,6 +146,12 @@ async-trait = { workspace = true }
 # in milliseconds of wall time instead of minutes.
 tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
+# airlock_gateway_e2e runs a real airlock gateway (server) on loopback and drives
+# the airlock client through the overlay — proving the cred!=compute remote
+# topology (LoopbackHttp route + allow_authorization). axum serves the in-process
+# mock upstream the gateway swaps into.
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server"] }
+axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
 # loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to

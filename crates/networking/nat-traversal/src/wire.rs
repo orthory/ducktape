@@ -73,17 +73,28 @@ const TAG_AUTH_REQUEST: u8 = 11;
 // Tags 12-15 carried the retired short-invite shelf messages
 // (InvitePut/InvitePutAck/InviteGet/InviteChunk). Reserved like 8/9: a stale
 // peer decodes as BadTag instead of aliasing a future message.
+// Tags >= 16 belong to the TCP relay frames (`relay.rs`) and are NEVER valid
+// here: the PoP signing namespace is shared between UDP requests and the relay
+// intro, so byte-level disjointness of the two encodings is load-bearing — a
+// signature minted over one shape must not verify as the other.
 
-fn put<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, bytes: &[u8]) {
+// The tiny put/Reader encoding helpers are pub(crate) so the TCP relay frames
+// (relay.rs) share ONE encoding idiom with the UDP messages instead of
+// duplicating it.
+pub(crate) fn put<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, bytes: &[u8]) {
     out.try_extend_from_slice(bytes)
         .expect("wire buffer capacity covers every message");
 }
 
-fn put_key<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, key: &NodeKey) {
+pub(crate) fn put_key<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, key: &NodeKey) {
     put(out, &key.0);
 }
 
-fn put_u64<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u64) {
+pub(crate) fn put_u16<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u16) {
+    put(out, &value.to_be_bytes());
+}
+
+pub(crate) fn put_u64<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u64) {
     put(out, &value.to_be_bytes());
 }
 
@@ -101,16 +112,20 @@ fn put_addr<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, addr: &SocketAddr) {
     put(out, &addr.port().to_be_bytes());
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+    /// Bytes not yet consumed — the whole-buffer trailing-garbage check.
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         let end = self.pos.checked_add(n).ok_or(WireError::Short)?;
         if end > self.buf.len() {
             return Err(WireError::Short);
@@ -119,13 +134,17 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(s)
     }
-    fn key(&mut self) -> Result<NodeKey, WireError> {
+    pub(crate) fn key(&mut self) -> Result<NodeKey, WireError> {
         let s = self.take(32)?;
         let mut k = [0u8; 32];
         k.copy_from_slice(s);
         Ok(NodeKey(k))
     }
-    fn u64(&mut self) -> Result<u64, WireError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
+        let s = self.take(2)?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+    pub(crate) fn u64(&mut self) -> Result<u64, WireError> {
         let s = self.take(8)?;
         let mut b = [0u8; 8];
         b.copy_from_slice(s);
@@ -150,12 +169,14 @@ impl<'a> Reader<'a> {
         let port = u16::from_be_bytes([p[0], p[1]]);
         Ok(SocketAddr::new(ip, port))
     }
-    fn sig(&mut self) -> Result<commonware_cryptography::ed25519::Signature, WireError> {
+    pub(crate) fn sig(&mut self) -> Result<commonware_cryptography::ed25519::Signature, WireError> {
         use commonware_codec::DecodeExt as _;
         let s = self.take(64)?;
         commonware_cryptography::ed25519::Signature::decode(s).map_err(|_| WireError::BadCrypto)
     }
-    fn pubkey(&mut self) -> Result<commonware_cryptography::ed25519::PublicKey, WireError> {
+    pub(crate) fn pubkey(
+        &mut self,
+    ) -> Result<commonware_cryptography::ed25519::PublicKey, WireError> {
         use commonware_codec::DecodeExt as _;
         let s = self.take(32)?;
         commonware_cryptography::ed25519::PublicKey::decode(s).map_err(|_| WireError::BadCrypto)

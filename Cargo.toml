@@ -39,18 +39,21 @@ members = [
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/wasm-host",
-    # system — consensus infrastructure modules
-    "crates/modules/system/kv",
-    "crates/modules/system/valset",
-    "crates/modules/system/clients",
-    "crates/modules/system/governance",
-    "crates/modules/system/identity",
-    "crates/modules/system/upgrade", 
+    # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
+    "crates/networking/duckdns",
+    "crates/networking/gateway",
+    # modules/system — system modules and their host-side counterparts
+    "crates/modules/system/kv",
+    "crates/modules/system/valset",
+    "crates/modules/system/clients",
+    "crates/modules/system/governance",
+    "crates/modules/system/identity",
+    "crates/modules/system/upgrade",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
     "crates/modules/system/capability-host",
@@ -59,8 +62,7 @@ members = [
     "crates/modules/system/dispatch-oracle",
     "crates/modules/system/tagging",
     "crates/modules/system/modreg",
-    "crates/networking/duckdns",
-    "crates/networking/gateway",
+    "crates/modules/system/airlock",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -86,6 +88,7 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
     "bin/mcp",
+    "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
 ]
 
 [workspace.package]
