@@ -38,7 +38,7 @@ ifeq ($(HOST_OS),Darwin)
 export MACOSX_DEPLOYMENT_TARGET ?= 14.0
 endif
 
-.PHONY: all dev ui-qa demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check
+.PHONY: all dev ui-qa demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke web app macos-smoke macos-cef-smoke sidecar install install-node install-coordinator install-app stream-types test clean cef-env wasm-modules wasm-modules-check labs-gate
 
 all: app
 
@@ -99,6 +99,12 @@ demo-clear:
 ## `make dev`). see ops/dogfood-forge.sh.
 dogfood-forge:
 	@bash ops/dogfood-forge.sh
+
+## build-check the quarantined labs crate. It is EXCLUDED from the workspace
+## (its own Cargo.lock) so its revm/alloy dep tree never taxes workspace gates;
+## this target is how CI/devs still keep it compiling.
+labs-gate:
+	$(CARGO) check --manifest-path crates/labs/Cargo.toml
 
 ## release build of the networked node (serves the app surface)
 node: cef-env
