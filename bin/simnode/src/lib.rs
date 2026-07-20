@@ -65,8 +65,8 @@
 //! 32 bytes of hex fails loud at startup.
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
-//! separated, and repeatable) appends the kv/valset/governance/upgrade system
-//! modules AFTER the default 15, seeding the validator set with the given
+//! separated, and repeatable) appends the kv/valset/governance/lifecycle system
+//! modules AFTER the default 14, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
 //! binding governance verifies invite tokens against. registering the upgrade
@@ -171,7 +171,7 @@ const BASE_MODULE_IDS: [&str; 14] = [
 ];
 
 /// the four system modules the opt-in `--with-valset` genesis appends AFTER the
-/// default 15, in registry order: the KV store, the membership registry seeded
+/// default 14, in registry order: the KV store, the membership registry seeded
 /// with the genesis validators, governance (the sole authorized author of
 /// valset change), and the lifecycle coordinator — whose mere registration makes
 /// the host-injected once-per-block boundary `Advance` ride every sim block.
@@ -344,7 +344,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 15-module set, byte-identical.
+    /// => the default 14-module set, byte-identical.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -393,7 +393,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     } = opts;
 
     // the status module list and the index tier both extend only under valset
-    // keys; the default path stays the exact 16-module set the parity lane pins.
+    // keys; the default path stays the exact 14-module set the parity lane pins.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
         BASE_MODULE_IDS.to_vec()
     } else {
@@ -737,7 +737,7 @@ struct Sim {
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
     /// the registered module ids, in registry order — the exact set `status`
-    /// reports (the default 15, or those plus VALSET_MODULE_IDS under the flag).
+    /// reports (the default 14, or those plus VALSET_MODULE_IDS under the flag).
     module_ids: Vec<&'static str>,
     /// the fabricated mesh identity `status` reports (`--node-key`), or empty
     /// for the default "no peer-routed features here". no mesh sits behind it.
@@ -830,7 +830,7 @@ fn run_sim(
             Box::new(identity),
             Box::new(gateway),
         ];
-        // opt-in governance genesis, AFTER the default 15 in registry order:
+        // opt-in governance genesis, AFTER the default 14 in registry order:
         // kv, valset (seeded with the given genesis validators exactly like
         // bin/node), governance (the sole authorized author of valset change,
         // bound to the invite namespace), and the lifecycle coordinator — whose
