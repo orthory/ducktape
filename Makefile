@@ -273,13 +273,6 @@ wasm-modules:
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
-	cd crates/guests/vaults-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
-	wasm-tools component new \
-	  crates/guests/vaults-wasm/target/wasm32-unknown-unknown/release/vaults_wasm.wasm \
-	  -o crates/guests/vaults-wasm/component.wasm
-	cp crates/guests/vaults-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/vaults.component.wasm
-
 	cd crates/guests/jobs-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/jobs-wasm/target/wasm32-unknown-unknown/release/jobs_wasm.wasm \
@@ -396,8 +389,6 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
 	cmp crates/guests/directory-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/directory.component.wasm
-	cmp crates/guests/vaults-wasm/component.wasm \
-	  crates/kernel/host/tests/fixtures/vaults.component.wasm
 	cmp crates/guests/jobs-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/jobs.component.wasm
 	cmp crates/guests/inbox-wasm/component.wasm \

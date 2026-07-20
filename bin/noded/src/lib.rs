@@ -434,7 +434,7 @@ pub enum ModuleCategory {
 impl ModuleCategory {
     /// The category a module id belongs to. Ids not listed here —
     /// infrastructure and internal modules (files, saga, identity, kv,
-    /// valset, governance, vaults, directory, …) — fall to `System`, so a new
+    /// valset, governance, directory, …) — fall to `System`, so a new
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
         match id {
@@ -1012,7 +1012,7 @@ mod tests {
             assert_eq!(ModuleCategory::of(id), Automation, "{id}");
         }
         // infra + internals fall to the System bucket — including ids only the
-        // full `node` binary registers (kv/valset/governance/vaults/directory)
+        // full `node` binary registers (kv/valset/governance/directory)
         // and anything unknown, so the view never breaks on a new module.
         for id in [
             "files",
@@ -1023,7 +1023,6 @@ mod tests {
             "kv",
             "valset",
             "governance",
-            "vaults",
             "directory",
             "totally-unknown",
         ] {
