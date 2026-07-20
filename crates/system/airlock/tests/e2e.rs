@@ -71,7 +71,6 @@ async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
     let (app, vendor) = server::build_with_quoter(
         GatewayConfig {
             attest: "snp".into(),
-            measurement: None,
             anthropic_base: upstream.into(),
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),

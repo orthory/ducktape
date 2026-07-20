@@ -1078,10 +1078,9 @@ impl AirlockConfig {
                 .into()));
         };
         let Some(attest) = env_nonempty("DUCKTAPE_AIRLOCK_ATTEST") else {
-            return Some(Err("airlock is enabled but DUCKTAPE_AIRLOCK_ATTEST is not set — choose \
-                             'mock' (DEV ONLY: the mock quote is signed by a public seed and is \
-                             forgeable) or a real TEE vendor ('tdx'/'snp')"
-                .into()));
+            return Some(Err(
+                "airlock is enabled but DUCKTAPE_AIRLOCK_ATTEST is not set ('tdx'/'snp')".into(),
+            ));
         };
         // Typed at the boundary: THIS is the one place `DUCKTAPE_AIRLOCK_*`
         // env is read, so misconfig fails here, not mid-verify.
@@ -1123,17 +1122,10 @@ async fn verify_gateway(
         .fetch_quote()
         .await
         .map_err(|e| format!("airlock fetch quote: {e}"))?;
-    let report_data = match mode {
-        AttestMode::Mock => {
-            attest::mock_verify(&quote, expected).map_err(|e| format!("airlock verify: {e}"))?
-        }
-        AttestMode::Tdx | AttestMode::Snp => {
-            let roots = trust_roots(cfg, mode)?;
-            airlock::verify::verify_quote(&quote, expected, &roots)
-                .await
-                .map_err(|e| format!("airlock verify: {e}"))?
-        }
-    };
+    let roots = trust_roots(cfg, mode)?;
+    let report_data = airlock::verify::verify_quote(&quote, expected, &roots)
+        .await
+        .map_err(|e| format!("airlock verify: {e}"))?;
     Ok(attest::split_report_data(&report_data).0)
 }
 
@@ -1159,7 +1151,6 @@ fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<TrustRoots, Stri
                 .map(|r| TrustRoots::Snp(Box::new(r)))
                 .map_err(|e| format!("airlock SNP roots: {e}"))
         }
-        AttestMode::Mock => Err("mock has no trust roots".into()),
     }
 }
 
@@ -2295,8 +2286,7 @@ mod tests {
         let (app, vendor) = airlock::server::build_with_quoter(
             airlock::server::GatewayConfig {
                 attest: "snp".into(),
-                measurement: None,
-                anthropic_base: upstream.into(),
+                    anthropic_base: upstream.into(),
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,

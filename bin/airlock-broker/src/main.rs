@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
@@ -57,8 +57,7 @@ struct ServeArgs {
     /// The local node's browser-gateway base URL that routes duck:// authorities
     /// onto the overlay. Required with --remote.
     via: Option<String>,
-    /// mock | tdx | snp — how to verify the gateway quote. No default: choosing
-    /// forgeable mock must be an explicit act.
+    /// tdx | snp — how to verify the gateway quote. No default.
     attest: String,
     /// Expected audited-image measurement (48-byte hex).
     measurement: String,
@@ -72,7 +71,7 @@ fn parse_args() -> Result<ServeArgs> {
         gateway_host: arg_or("--gateway-host", "http://127.0.0.1:9100"),
         remote: arg("--remote"),
         via: arg("--via"),
-        attest: arg("--attest").context("--attest is required (mock|tdx|snp)")?,
+        attest: arg("--attest").context("--attest is required (tdx|snp)")?,
         measurement: arg("--measurement").context("--measurement is required")?,
         sub: arg_or("--sub", "compute-provider"),
     })
@@ -97,7 +96,6 @@ fn resolve_roots(mode: AttestMode) -> Result<airlock::verify::TrustRoots> {
             };
             Ok(TrustRoots::Snp(Box::new(SnpRoots::amd(product, vcek)?)))
         }
-        AttestMode::Mock => bail!("mock has no trust roots"),
     }
 }
 
@@ -172,15 +170,9 @@ async fn attested_seal_pk(
 ) -> Result<[u8; 32]> {
     // Roots come from flags alone — resolve BEFORE any network so a bad
     // --snp-product/--snp-vcek fails fast.
-    let roots = match mode {
-        AttestMode::Mock => None,
-        AttestMode::Tdx | AttestMode::Snp => Some(resolve_roots(mode)?),
-    };
+    let roots = resolve_roots(mode)?;
     let (quote, _vendor) = gateway.fetch_quote().await?;
-    let report_data = match &roots {
-        None => attest::mock_verify(&quote, expected)?,
-        Some(roots) => airlock::verify::verify_quote(&quote, expected, roots).await?,
-    };
+    let report_data = airlock::verify::verify_quote(&quote, expected, &roots).await?;
     Ok(attest::split_report_data(&report_data).0)
 }
 

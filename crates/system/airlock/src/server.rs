@@ -19,7 +19,7 @@ use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
-use crate::attest::{self, AttestMode, Measurement};
+use crate::attest::{self, AttestMode};
 use crate::handshake;
 use crate::seal::{self, SealKeypair};
 use crate::token::{self, Claims};
@@ -29,10 +29,8 @@ use crate::wire::{
 
 /// Everything the gateway needs to serve. Keys are minted inside [`build`].
 pub struct GatewayConfig {
-    /// mock | tdx | snp | auto.
+    /// tdx | snp | auto.
     pub attest: String,
-    /// 48-byte hex; required for `--attest mock`.
-    pub measurement: Option<String>,
     pub anthropic_base: String,
     pub oauth_token_url: String,
     pub oauth_client_id: String,
@@ -59,7 +57,7 @@ struct AppState {
     sess_sk: SigningKey,
     sess_pk: VerifyingKey,
     quote: Vec<u8>,
-    /// "mock" | "tdx" | "snp" — advertised so the client picks the right verifier.
+    /// "tdx" | "snp" — advertised so the client picks the right verifier.
     vendor: String,
     http: reqwest::Client,
     cfg: Config,
@@ -82,30 +80,16 @@ fn now_secs() -> u64 {
 /// vendor roots, so this seam grants no forgery power.
 pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> + Send + Sync>;
 
-/// Build the gateway router and report the vendor ("mock"/"tdx"/"snp").
-/// Resolves `cfg.attest` to a configfs-tsm (or mock) quoter; `auto` probes the
-/// hardware for the vendor.
+/// Build the gateway router and report the vendor ("tdx"/"snp").
+/// Resolves `cfg.attest` to a configfs-tsm quoter; `auto` probes the hardware
+/// for the vendor.
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
-    let (mode, quoter): (AttestMode, Quoter) = if cfg.attest == "auto" {
-        let mode = tsm_probe_provider()?;
-        (mode, tsm_quoter(mode))
+    let mode = if cfg.attest == "auto" {
+        tsm_probe_provider()?
     } else {
-        let mode: AttestMode = cfg.attest.parse()?;
-        match mode {
-            AttestMode::Mock => {
-                let m = Measurement::from_hex(
-                    cfg.measurement
-                        .as_deref()
-                        .context("measurement is required for attest=mock")?,
-                )?;
-                (mode, Box::new(move |rd: &[u8; attest::REPORT_DATA_LEN]| {
-                    Ok(attest::mock_quote(rd, &m))
-                }) as Quoter)
-            }
-            AttestMode::Tdx | AttestMode::Snp => (mode, tsm_quoter(mode)),
-        }
+        cfg.attest.parse::<AttestMode>()?
     };
-    build_with_quoter(cfg, mode.as_str(), quoter)
+    build_with_quoter(cfg, mode.as_str(), tsm_quoter(mode))
 }
 
 fn tsm_quoter(expected: AttestMode) -> Quoter {

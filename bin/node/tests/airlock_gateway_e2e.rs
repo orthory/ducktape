@@ -234,7 +234,6 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
     let (app, vendor) = server::build_with_quoter(
         GatewayConfig {
             attest: "snp".into(),
-            measurement: None,
             anthropic_base: upstream.clone(),
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),

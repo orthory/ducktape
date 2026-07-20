@@ -44,7 +44,7 @@ fn resolve_gateway() -> Result<Gateway> {
 }
 
 fn attest_mode() -> Result<AttestMode> {
-    arg("--attest").context("--attest is required (mock|tdx|snp)")?.parse()
+    arg("--attest").context("--attest is required (tdx|snp)")?.parse()
 }
 
 /// Flags -> typed trust roots (tdx/snp only). The roots themselves are pinned
@@ -66,7 +66,6 @@ fn resolve_roots(mode: AttestMode) -> Result<airlock::verify::TrustRoots> {
             };
             Ok(TrustRoots::Snp(Box::new(SnpRoots::amd(product, vcek)?)))
         }
-        AttestMode::Mock => bail!("mock has no trust roots"),
     }
 }
 
@@ -92,15 +91,9 @@ async fn main() -> Result<()> {
 async fn attested_seal_pk(gw: &Gateway, mode: AttestMode, expected: &Measurement) -> Result<[u8; 32]> {
     // Roots come from flags alone — resolve BEFORE any network so a bad
     // --snp-product/--snp-vcek fails fast.
-    let roots = match mode {
-        AttestMode::Mock => None,
-        AttestMode::Tdx | AttestMode::Snp => Some(resolve_roots(mode)?),
-    };
+    let roots = resolve_roots(mode)?;
     let (quote, _vendor) = gw.fetch_quote().await?;
-    let report_data = match &roots {
-        None => attest::mock_verify(&quote, expected)?,
-        Some(roots) => airlock::verify::verify_quote(&quote, expected, roots).await?,
-    };
+    let report_data = airlock::verify::verify_quote(&quote, expected, &roots).await?;
     Ok(attest::split_report_data(&report_data).0)
 }
 

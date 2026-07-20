@@ -108,10 +108,6 @@ pub fn peek_measurement(
     quote: &[u8],
 ) -> Result<(String, [u8; REPORT_DATA_LEN])> {
     match mode {
-        AttestMode::Mock => {
-            let (m, rd) = crate::attest::mock_peek(quote)?;
-            Ok((m.to_hex(), rd))
-        }
         AttestMode::Tdx => {
             let q = dcap_qvl::quote::Quote::parse(quote)
                 .map_err(|e| anyhow!("parse TDX quote: {e:?}"))?;
