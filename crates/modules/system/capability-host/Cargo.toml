@@ -34,6 +34,7 @@ sha2 = { workspace = true }
 toml = "0.8"
 # "net" pulls in tokio::io::unix::AsyncFd — the async wrapper around the
 # interactive session's pty master (see src/interactive.rs).
+tokio-stream = "0.1"
 tokio = { workspace = true, features = ["process", "io-util", "net"] }
 tracing = { workspace = true }
 

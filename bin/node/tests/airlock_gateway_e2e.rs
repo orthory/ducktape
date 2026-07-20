@@ -525,23 +525,44 @@ fn airlock_single_node_self_serves_its_own_route() {
             .await
             .unwrap();
         let seal_pk = attest::split_report_data(&rd).0;
-        let token = gw
-            .open_session(&seal_pk, "self")
+        // SEALED session: the request/response bodies cross the overlay as
+        // ciphertext (streaming + body AEAD combined, over the real wire).
+        let (token, keys) = gw
+            .open_session_sealed(&seal_pk, "self")
             .await
-            .expect("handshake through the gateway");
+            .expect("sealed handshake through the gateway");
+        let plaintext =
+            br#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        let sealed_body = airlock::bodyseal::seal_request(&keys, plaintext);
         let resp = gw
             .route(gw.http().post(gw.url("/v1/messages")))
             .bearer_auth(&token)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "oauth-2025-04-20")
             .header("content-type", "application/json")
-            .body(r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#)
+            .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
+            .body(sealed_body.clone())
             .send()
             .await
             .expect("proxied messages through the gateway");
         let status = resp.status();
-        let body = resp.text().await.unwrap();
-        (status, body)
+        let wire = resp.bytes().await.unwrap();
+        assert!(
+            !wire.windows(10).any(|w| w == b"AIRLOCK-OK"),
+            "the overlay must carry ciphertext, never the plaintext reply"
+        );
+        let mut opener = airlock::bodyseal::StreamOpener::new(&keys, &airlock::bodyseal::request_binding(&sealed_body));
+        let items = opener.feed(&wire).expect("unseal the proxied reply");
+        assert!(opener.finished(), "sealed reply must end with the Final marker");
+        let body: Vec<u8> = items
+            .into_iter()
+            .filter_map(|item| match item {
+                airlock::bodyseal::OpenedItem::Data(data) => Some(data),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        (status, String::from_utf8_lossy(&body).into_owned())
     });
 
     assert_eq!(reply.0, reqwest::StatusCode::OK, "self-served proxied call: {reply:?}");

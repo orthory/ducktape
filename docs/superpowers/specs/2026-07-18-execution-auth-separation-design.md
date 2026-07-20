@@ -173,11 +173,14 @@ the gateway/duckdns *consensus modules* but no WireGuard/`data_plane` transport
 
 ## Out of scope (later specs)
 
-Body-level AEAD of proxied traffic, SSE-over-overlay streaming (see §graft
-"Remaining"), revocation, multi-tenant budgets, sealed-to-disk credential
-persistence. Subscription-OAuth proxied by a third party remains an accepted,
-named ToS risk — TEE custody is mitigation, not
-a solution.
+~~Body-level AEAD of proxied traffic, SSE-over-overlay streaming~~ — BOTH
+SHIPPED 2026-07-20 (`2026-07-20-sse-overlay-streaming-body-aead-design.md`):
+the overlay streams end to end and airlock sessions are sealed-body (path
+hosts see ciphertext; stolen bearers useless; revocation = restart, absolute
+because keys are memory-only). Still later: per-sub revocation endpoint,
+multi-tenant budgets, sealed-to-disk credential persistence.
+Subscription-OAuth proxied by a third party remains an accepted, named ToS
+risk — TEE custody is mitigation, not a solution.
 
 ## TODO — full 2-node + TEE validation
 

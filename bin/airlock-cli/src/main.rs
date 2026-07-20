@@ -125,8 +125,8 @@ async fn run_cmd() -> Result<()> {
     let sub = arg_or("--sub", "demo");
 
     let seal_pk = attested_seal_pk(&gw, mode, &expected).await?;
-    let token = gw.open_session(&seal_pk, &sub).await?;
-    println!("✓ session established (attested handshake, scoped to sub={sub})");
+    let (token, keys) = gw.open_session_sealed(&seal_pk, &sub).await?;
+    println!("✓ sealed session established (attested handshake, scoped to sub={sub})");
 
     let body = serde_json::json!({
         "model": arg_or("--model", "claude-sonnet-5"),
@@ -134,6 +134,7 @@ async fn run_cmd() -> Result<()> {
         "stream": true,
         "messages": [{ "role": "user", "content": arg_or("--prompt", "Say hello in three words.") }],
     });
+    let sealed_body = airlock::bodyseal::seal_request(&keys, &serde_json::to_vec(&body)?);
     let resp = gw
         .route(gw.http().post(gw.url("/v1/messages")))
         .bearer_auth(token)
@@ -142,13 +143,37 @@ async fn run_cmd() -> Result<()> {
         // capability header — the same one Claude Code sends. Harmless with an API key.
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("content-type", "application/json")
-        .body(serde_json::to_vec(&body)?)
+        .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
+        .body(sealed_body.clone())
         .send()
         .await?;
     let status = resp.status();
-    let text = resp.text().await?;
+    let sealed_outer = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/octet-stream"));
     println!("gateway /v1/messages -> {status}");
-    println!("{text}");
+    if sealed_outer {
+        // A self-test is fine buffered: unseal the whole stream and print it.
+        let wire = resp.bytes().await?;
+        let mut opener = airlock::bodyseal::StreamOpener::new(&keys, &airlock::bodyseal::request_binding(&sealed_body));
+        let items = opener.feed(&wire)?;
+        if !opener.finished() {
+            bail!("sealed response was truncated (no Final marker)");
+        }
+        for item in items {
+            if let airlock::bodyseal::OpenedItem::Data(data) = item {
+                print!("{}", String::from_utf8_lossy(&data));
+            }
+        }
+        println!();
+    } else {
+        if status.is_success() {
+            bail!("sealed session received a plaintext success body (forged by a path host?)");
+        }
+        println!("{}", resp.text().await?);
+    }
     if !status.is_success() {
         bail!("messages call failed: {status}");
     }

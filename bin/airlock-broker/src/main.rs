@@ -26,6 +26,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use airlock::attest::{self, AttestMode, Measurement};
+use airlock::bodyseal::{self, OpenedItem};
+use airlock::handshake::SessionKeys;
 use airlock::client::Gateway;
 
 /// `--flag value` / `--flag=value` lookup over argv (no clap — house rule).
@@ -107,8 +109,9 @@ struct BrokerState {
     /// The opaque per-run bearer the sandbox must present. Unrelated to the
     /// session token; dies with this process.
     run_bearer: String,
-    /// The current gateway session token, re-minted on demand (expiry / first use).
-    session: Mutex<String>,
+    /// The current sealed session: scoped token + the body-AEAD keys, re-minted
+    /// together on demand (expiry / first use).
+    session: Mutex<(String, SessionKeys)>,
 }
 
 #[tokio::main]
@@ -121,8 +124,8 @@ async fn main() -> Result<()> {
     // Verify the gateway BEFORE handshaking, so the session binds to the attested
     // enclave and not whatever answered.
     let seal_pk = attested_seal_pk(&gateway, mode, &expected).await?;
-    let session = gateway.open_session(&seal_pk, &args.sub).await?;
-    eprintln!("[broker] gateway verified + session established (sub={})", args.sub);
+    let session = gateway.open_session_sealed(&seal_pk, &args.sub).await?;
+    eprintln!("[broker] gateway verified + sealed session established (sub={})", args.sub);
 
     let run_bearer = random_bearer();
     let state = Arc::new(BrokerState {
@@ -232,8 +235,10 @@ fn presented_bearer(headers: &HeaderMap) -> Option<&str> {
         .and_then(|s| s.strip_prefix("Bearer "))
 }
 
-/// Forward one request to the gateway with the current session token, streaming
-/// the response body back unbuffered (Claude SSE must not be buffered).
+/// Forward one request to the gateway with the current sealed session:
+/// the body is AEAD'd under the handshake keys (path hosts see ciphertext),
+/// the response stream is unsealed head-first and relayed unbuffered
+/// (Claude SSE must not be buffered).
 async fn forward(
     st: &BrokerState,
     method: &Method,
@@ -241,14 +246,26 @@ async fn forward(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<Response, AppErr> {
-    let session = st.session.lock().await.clone();
+    let (session, keys) = st.session.lock().await.clone();
     let url = st.gateway.url(path_and_query);
-    let mut rb = st.gateway.http().request(method.clone(), &url).body(body.to_vec());
+    let sealed_body = if body.is_empty() {
+        Vec::new()
+    } else {
+        bodyseal::seal_request(&keys, body)
+    };
+    let mut rb = st
+        .gateway
+        .http()
+        .request(method.clone(), &url)
+        .body(sealed_body.clone());
     rb = st.gateway.route(rb);
+    if !body.is_empty() {
+        rb = rb.header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1);
+    }
     for (name, value) in headers.iter() {
         let ours = matches!(
             name.as_str(),
-            "authorization" | "host" | "content-length" | "accept-encoding"
+            "authorization" | "host" | "content-length" | "accept-encoding" | "x-airlock-body-seal"
         );
         if ours {
             continue;
@@ -256,19 +273,115 @@ async fn forward(
         rb = rb.header(name, value);
     }
 
-    let resp = rb
+    let mut resp = rb
         .bearer_auth(session)
         .send()
         .await
         .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("gateway: {e}")))?;
     let status = resp.status();
-    let content_type = resp.headers().get("content-type").cloned();
+    let sealed_outer = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/octet-stream"));
+    if !sealed_outer {
+        // Plaintext from the gateway itself (pre-proxy errors). A plaintext
+        // SUCCESS on a sealed session can only be a path-host forgery.
+        if status.is_success() {
+            return Err(AppErr(
+                StatusCode::BAD_GATEWAY,
+                "airlock: sealed session received a plaintext success body".into(),
+            ));
+        }
+        let content_type = resp.headers().get("content-type").cloned();
+        let mut builder = Response::builder().status(status.as_u16());
+        if let Some(v) = content_type {
+            builder = builder.header("content-type", v);
+        }
+        return builder
+            .body(Body::from_stream(resp.bytes_stream()))
+            .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")));
+    }
+
+    // Unseal head-first: the inner content-type rides the sealed head chunk.
+    let mut opener = bodyseal::StreamOpener::new(&keys, &bodyseal::request_binding(&sealed_body));
+    let mut pending: Vec<Bytes> = Vec::new();
+    let mut inner_ct: Option<String> = None;
+    while inner_ct.is_none() {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let items = opener
+                    .feed(&chunk)
+                    .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("airlock: {e}")))?;
+                for item in items {
+                    match item {
+                        OpenedItem::Head(ct) => inner_ct = Some(ct),
+                        OpenedItem::Data(data) => pending.push(Bytes::from(data)),
+                        OpenedItem::Final => {}
+                    }
+                }
+            }
+            Ok(None) => {
+                return Err(AppErr(
+                    StatusCode::BAD_GATEWAY,
+                    "airlock: sealed response ended before its head".into(),
+                ));
+            }
+            Err(e) => return Err(AppErr(StatusCode::BAD_GATEWAY, format!("gateway: {e}"))),
+        }
+    }
+    let finished_at_head = opener.finished();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        for data in pending {
+            if tx.send(Ok(data)).await.is_err() {
+                return;
+            }
+        }
+        if finished_at_head {
+            return;
+        }
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    let items = match opener.feed(&chunk) {
+                        Ok(items) => items,
+                        Err(e) => {
+                            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                            return;
+                        }
+                    };
+                    for item in items {
+                        if let OpenedItem::Data(data) = item
+                            && tx.send(Ok(Bytes::from(data))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if opener.finished() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    // ended WITHOUT the Final marker = authenticated truncation
+                    let _ = tx
+                        .send(Err(std::io::Error::other("airlock: sealed response truncated")))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                    return;
+                }
+            }
+        }
+    });
     let mut builder = Response::builder().status(status.as_u16());
-    if let Some(v) = content_type {
-        builder = builder.header("content-type", v);
+    if let Some(ct) = inner_ct {
+        builder = builder.header("content-type", ct);
     }
     builder
-        .body(Body::from_stream(resp.bytes_stream()))
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
         .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
 }
 
@@ -278,7 +391,7 @@ async fn forward(
 async fn self_rehandshake(st: &BrokerState) -> Result<Response, AppErr> {
     let fresh = st
         .gateway
-        .open_session(&st.seal_pk, &st.sub)
+        .open_session_sealed(&st.seal_pk, &st.sub)
         .await
         .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("re-handshake: {e}")))?;
     *st.session.lock().await = fresh;

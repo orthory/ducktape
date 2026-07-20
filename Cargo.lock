@@ -74,6 +74,7 @@ dependencies = [
  "chacha20poly1305",
  "dcap-qvl",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "hkdf",
  "p384",
@@ -86,6 +87,7 @@ dependencies = [
  "sev",
  "sha2",
  "tokio",
+ "tokio-stream",
  "x25519-dalek",
  "x509-cert",
 ]
@@ -101,6 +103,7 @@ dependencies = [
  "rand 0.8.6",
  "reqwest 0.12.28",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -766,6 +769,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
  "tracing",
 ]

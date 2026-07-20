@@ -41,6 +41,9 @@ pub enum CredentialPayload {
 pub struct SessionRequest {
     pub sub: String,
     pub client_eph_pk_b64: String,
+    /// Sealed-body session: bodies are AEAD'd broker<->enclave (`bodyseal`)
+    /// and the enclave refuses plaintext. Echoed into the token claims.
+    pub body_seal: bool,
 }
 
 /// The token, AEAD-sealed under the handshake session key. Only the client that

@@ -21,6 +21,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
 use crate::attest::{self, AttestMode};
+use crate::bodyseal;
 use crate::handshake;
 use crate::seal::{self, SealKeypair};
 use crate::token::{self, Claims};
@@ -69,6 +70,9 @@ struct AppState {
     /// Remaining request budget per session `sub`. Refillable by asking for a new
     /// /session and unbounded in `sub`; the overlay ACL gates who may reach it.
     budgets: Mutex<HashMap<String, u32>>,
+    /// Per-sub sealed-request nonces already served — replay dedupe. Bounded
+    /// by the request budget per sub; dies with the process like every key.
+    seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
 }
 
 fn now_secs() -> u64 {
@@ -158,6 +162,7 @@ pub fn build_with_quoter(
         })),
         refresh_gate: tokio::sync::Mutex::new(()),
         budgets: Mutex::new(HashMap::new()),
+        seen_nonces: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -301,7 +306,7 @@ async fn session(
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
         .ok_or_else(|| AppErr(StatusCode::BAD_REQUEST, "bad client_eph_pk".into()))?;
-    let session_key = handshake::enclave_session_key(&st.seal_kp, &eph);
+    let keys = handshake::enclave_session_keys(&st.seal_kp, &eph);
 
     let now = now_secs();
     let claims = Claims {
@@ -309,10 +314,12 @@ async fn session(
         iat: now,
         exp: now + st.cfg.session_ttl_secs,
         max_requests: st.cfg.max_requests,
+        eph: req.client_eph_pk_b64.clone(),
+        seal: req.body_seal,
     };
     st.budgets.lock().unwrap().insert(req.sub, st.cfg.max_requests);
     let token = token::issue(&st.sess_sk, &claims);
-    let sealed = handshake::seal_token(&session_key, token.as_bytes());
+    let sealed = handshake::seal_token(&keys.session, token.as_bytes());
     Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
 }
 
@@ -351,6 +358,66 @@ async fn proxy_inner(
     if claims.exp < now {
         return Err(AppErr(StatusCode::UNAUTHORIZED, "session token expired".into()));
     }
+    // Sealed-body session: re-derive the handshake keys statelessly from the
+    // claims' ephemeral pk, unseal the request, and REFUSE plaintext — a
+    // stolen bearer alone (visible to path hosts) cannot produce a sealable
+    // body. A plaintext session must not send the seal header. The raw blob's
+    // nonce becomes (a) the per-sub replay-dedup key and (b) the binding the
+    // response stream key is derived under, so an authentic response cannot
+    // be replayed as the answer to a different request.
+    let seal_keys = if claims.seal {
+        let eph = BASE64
+            .decode(&claims.eph)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
+            .ok_or_else(|| AppErr(StatusCode::UNAUTHORIZED, "bad eph in claims".into()))?;
+        Some(handshake::enclave_session_keys(&st.seal_kp, &eph))
+    } else {
+        None
+    };
+    let sealed_request = headers
+        .get(bodyseal::SEAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(bodyseal::SEAL_V1);
+    let binding = bodyseal::request_binding(&body);
+    let body = match (&seal_keys, sealed_request) {
+        (Some(keys), true) => {
+            let replayed = !st
+                .seen_nonces
+                .lock()
+                .unwrap()
+                .entry(claims.sub.clone())
+                .or_default()
+                .insert(binding.clone());
+            if replayed {
+                return Err(AppErr(
+                    StatusCode::BAD_REQUEST,
+                    "airlock: replayed sealed request".into(),
+                ));
+            }
+            Bytes::from(
+                bodyseal::open_request(keys, &body)
+                    .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
+            )
+        }
+        (Some(_), false) if !body.is_empty() => {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: sealed session requires a sealed body".into(),
+            ));
+        }
+        (Some(_), false) => body,
+        (None, true) => {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: session was not opened for sealed bodies".into(),
+            ));
+        }
+        (None, false) => body,
+    };
+
+    // Budget spends only AFTER the sealed body validated — a path host feeding
+    // garbage blobs must not burn the session's requests (review finding).
     {
         let mut b = st.budgets.lock().unwrap();
         let rem = b
@@ -391,7 +458,7 @@ async fn proxy_inner(
     for (name, value) in headers.iter() {
         if matches!(
             name.as_str(),
-            "authorization" | "host" | "content-length" | "accept-encoding"
+            "authorization" | "host" | "content-length" | "accept-encoding" | "x-airlock-body-seal"
         ) {
             continue;
         }
@@ -405,12 +472,53 @@ async fn proxy_inner(
 
     let status = resp.status();
     let ct = resp.headers().get("content-type").cloned();
-    let mut builder = Response::builder().status(status.as_u16());
-    if let Some(v) = ct {
-        builder = builder.header("content-type", v);
-    }
-    builder
-        .body(Body::from_stream(resp.bytes_stream()))
+    let Some(keys) = seal_keys else {
+        // Plaintext session: passthrough, streamed.
+        let mut builder = Response::builder().status(status.as_u16());
+        if let Some(v) = ct {
+            builder = builder.header("content-type", v);
+        }
+        return builder
+            .body(Body::from_stream(resp.bytes_stream()))
+            .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")));
+    };
+
+    // Sealed session: re-seal the upstream stream chunk by chunk. The inner
+    // content-type rides the sealed head chunk; the outer body is opaque. An
+    // upstream error mid-stream ends WITHOUT the final marker — the broker
+    // sees authenticated truncation, never a silent clean EOF.
+    let inner_ct = ct
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, &binding);
+    let head_chunk = sealer.seal_head(&inner_ct);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        use futures_util::StreamExt as _;
+        let mut opening = salt;
+        opening.extend(head_chunk);
+        if tx.send(Ok(Bytes::from(opening))).await.is_err() {
+            return;
+        }
+        let mut upstream = resp.bytes_stream();
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if tx.send(Ok(Bytes::from(sealer.seal_chunk(&chunk)))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return, // no Final marker -> authenticated truncation
+            }
+        }
+        let _ = tx.send(Ok(Bytes::from(sealer.seal_final()))).await;
+    });
+    Response::builder()
+        .status(status.as_u16())
+        .header("content-type", "application/octet-stream")
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)))
         .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
 }
 

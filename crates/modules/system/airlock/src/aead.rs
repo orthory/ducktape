@@ -10,6 +10,15 @@ use rand_core::{OsRng, RngCore};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
+/// HKDF-SHA256 with an explicit salt (per-stream keys in `bodyseal`).
+pub fn hkdf32_salted(shared: &[u8; 32], salt: &[u8], label: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(salt), shared);
+    let mut okm = [0u8; 32];
+    hk.expand(label, &mut okm)
+        .expect("32 is a valid HKDF-SHA256 output length");
+    okm
+}
+
 /// HKDF-SHA256 → 32-byte key from a shared secret, domain-separated by `label`.
 pub fn hkdf32(shared: &[u8; 32], label: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, shared);
