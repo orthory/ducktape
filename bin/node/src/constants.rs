@@ -142,8 +142,7 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 26] = [
-    "kv",
+pub(crate) const MODULE_IDS: [&str; 25] = [
     "pages",
     "chat",
     "forge",
@@ -176,7 +175,7 @@ pub(crate) const MODULE_IDS: [&str; 26] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
     // tail inside the native snapshot persisted as one host-KV value.
     ("agent", 3),
@@ -208,7 +207,6 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     ("identity", 2),
     ("inbox", 2),
     ("jobs", 2),
-    ("kv", 1),
     ("modreg", 1),
     // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
@@ -268,7 +266,7 @@ pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
 /// including genuinely historical pre-wasm-cutover workspaces, whose module
 /// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
 /// re-genesis, no shim).
-pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
+pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
     ("agent", 3),
     ("automations", 2),
     ("capability", 2),
@@ -284,7 +282,6 @@ pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
     ("identity", 2),
     ("inbox", 2),
     ("jobs", 2),
-    ("kv", 1),
     ("modreg", 1),
     ("pages", 1),
     ("runs", 3),
@@ -304,8 +301,8 @@ pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
 /// dormant-registry route.
 pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
     "commit:clients-v1:",
-    "2f9bc45b9abc691c65d9f6175f7a3aba39962dc8b6fce27ba207162887a60375:",
-    "c0b1afec448fb8ba7d0be5abf969a52a32d5769bca8701dafa437948126a5595:",
+    "14f1d63c54bf56f602f75cefa658b7f7843438a87a6b52e3d872b6a7f4d3c31b:",
+    "27e67fbf3113ca99d67999230f84fadccbe0b522290bdea2904881c2ee3fd560:",
     "dormant-registry-v1"
 );
 
