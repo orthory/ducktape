@@ -348,6 +348,52 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
 /// strictly sorted and unique. the signer is a genuine current member, so these
 /// are the POLICY gate refusing — not the membership or signature gates.
 #[test]
+fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
+    let storage = tempfile::tempdir().expect("storage dir");
+    let (sim, key, node) = published(storage.path());
+
+    // At the ceiling: admitted (a claude turn's context is multi-MB).
+    let at_ceiling = gateway::RouteDefinition {
+        target: gateway::RouteTarget::LoopbackHttp,
+        policy: gateway::RoutePolicy {
+            audience: gateway::RouteAudience::Owner,
+            methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
+            max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES,
+            max_response_bytes: 1024,
+            allow_authorization: false,
+            allow_upgrade: false,
+        },
+    };
+    sim.submit_ok(
+        "gateway",
+        signed_set_route(&key, statement(&key, &node, named("big"), 1, Some(at_ceiling))),
+        Some(&node),
+    );
+
+    // One byte past: refused by the admission gate.
+    let over = gateway::RouteDefinition {
+        target: gateway::RouteTarget::LoopbackHttp,
+        policy: gateway::RoutePolicy {
+            audience: gateway::RouteAudience::Owner,
+            methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
+            max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES + 1,
+            max_response_bytes: 1024,
+            allow_authorization: false,
+            allow_upgrade: false,
+        },
+    };
+    let error = sim.submit_rejected(
+        "gateway",
+        unsigned_set_route(&key, statement(&key, &node, named("huge"), 1, Some(over))),
+        Some(&node),
+    );
+    assert!(
+        error.contains("request body cap exceeds"),
+        "the 16 MiB request-cap admission gate: {error}"
+    );
+}
+
+#[test]
 fn malformed_route_policies_are_refused_by_the_content_and_method_gates() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, key, node) = published(storage.path());

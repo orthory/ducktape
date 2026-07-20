@@ -637,8 +637,8 @@ fn airlock_embedded_gateway_self_serves() {
     });
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );

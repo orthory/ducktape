@@ -1,6 +1,7 @@
 use gateway::{
-    GatewayReply, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
-    RouteStatement, RouteSummary, RouteTarget, route_signing_preimage,
+    GatewayReply, MAX_REQUEST_BODY_BYTES, RouteAudience, RouteDefinition, RouteMethod, RouteName,
+    RoutePolicy, RouteStatement, RouteSummary, RouteTarget, route_signing_preimage,
+    validate_policy,
 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -91,4 +92,21 @@ fn management_replies_keep_the_small_external_json_shape() {
             }]
         })
     );
+}
+
+#[test]
+fn request_cap_admission_stops_exactly_at_the_16_mib_ceiling() {
+    // A claude turn's context is multi-MB; per-route policies may pin lower,
+    // but the ceiling itself is 16 MiB — one byte over is refused at ingest.
+    let policy = |max_request_bytes| RoutePolicy {
+        audience: RouteAudience::Network,
+        methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
+        max_request_bytes,
+        max_response_bytes: 4096,
+        allow_authorization: false,
+        allow_upgrade: false,
+    };
+    assert_eq!(MAX_REQUEST_BODY_BYTES, 16 * 1024 * 1024);
+    assert!(validate_policy(&policy(MAX_REQUEST_BODY_BYTES)).is_ok());
+    assert!(validate_policy(&policy(MAX_REQUEST_BODY_BYTES + 1)).is_err());
 }
