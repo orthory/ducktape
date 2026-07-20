@@ -49,8 +49,7 @@ async fn main() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let cfg = GatewayConfig {
-        attest: arg_or("--attest", "mock"),
-        measurement: arg("--measurement"),
+        attest: arg("--attest").context("--attest is required (tdx|snp|auto)")?,
         anthropic_base: arg_or("--anthropic-base", "http://127.0.0.1:9101"),
         oauth_token_url: arg_or("--oauth-token-url", "http://127.0.0.1:9101/oauth/token"),
         oauth_client_id: arg_or("--oauth-client-id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),

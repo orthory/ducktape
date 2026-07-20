@@ -29,7 +29,6 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
-use duckdns::DuckDns;
 use gateway::Gateway;
 use files::Files;
 use forge::Forge;
@@ -45,7 +44,6 @@ use inbox::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
-use jobs::Jobs;
 use saga::SagaModule;
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
@@ -87,11 +85,9 @@ fn main() {
         // the deterministic user->nodes binding registry: no valset gating and
         // a fixed demo chain id (the demo has no real network descriptor).
         let identity = Identity::new("identity", None, "demo".into());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
         let gateway = Gateway::new("gateway", "identity", None, "demo");
         let inbox = Inbox::new("inbox");
         let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
-        let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
             "runs",
@@ -101,7 +97,7 @@ fn main() {
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2) — mandatory for envelope composition.
@@ -119,18 +115,16 @@ fn main() {
             Box::new(tagging),
             Box::new(tasks),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
             Box::new(inbox),
             Box::new(files),
-            Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(automations),
         ])
         .expect("genesis");
 
-        println!("=== super-app demo — 20 registered modules over one host ===");
+        println!("=== super-app demo — 19 registered modules over one host ===");
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -179,7 +173,7 @@ fn main() {
             .submit(Msg {
                 target: "forge".into(),
                 payload: forge_encode_msg(&ForgeMsg::Commit {
-                    // empty repo -> the default repo (back-compat wire).
+                    // empty repo slug -> the default repo (single-repo wire).
                     repo: String::new(),
                     path: "README.md".into(),
                     content: "# hello from a git-backed module\n".into(),

@@ -15,7 +15,8 @@ the activation height `H`, and every ready validator flips to new logic together
 at `H`.
 
 This skill is the maintained operational runbook for the upgrade policy. The
-`ScheduleUpgrade` / `SignalReady` op surface and the `upgrade` system module
+`ScheduleUpgrade` / `UpgradeReady` op surface and the `lifecycle` system module (the
+merged upgrade + modreg coordinator)
 referenced below must ship **in the dual-path binary** — confirm they exist in
 the build you are rolling before you begin.
 
@@ -57,7 +58,7 @@ These encode the upgrade policy. Never trade them for speed.
 - **Version is monotonic; recovery is roll-forward only.** No downgrades, no
   state rewinds. Fix a bad upgrade with a new `ScheduleUpgrade` to
   `to_version + 1`, never by rolling back committed state.
-- **This runbook covers the SECOND-and-later upgrade.** It assumes the `upgrade`
+- **This runbook covers the SECOND-and-later upgrade.** It assumes the `lifecycle`
   module is already genesis-embedded and live on every node. Retrofitting the
   module onto a network that lacks it (Ducktape-2 as it stands) is a one-time
   coordinated genesis bump, NOT a no-downtime operation — out of scope here.
@@ -166,10 +167,10 @@ GovAction::ScheduleUpgrade { name: "<upgrade-name>", activation_height: H, to_ve
 
 1. From a member node, `Propose` the `ScheduleUpgrade` and shepherd votes to a
    simple majority (`members.len()/2 + 1`), then `Execute`. The passing proposal
-   emits an upgrade-module follow-up that records the pending upgrade in agreed,
+   emits a lifecycle-module follow-up that records the pending upgrade in agreed,
    app-hash-included state.
 2. Confirm the pending upgrade is live and identical on every node. Query the
-   `upgrade` module (mirror the governance `GovQuery::Proposal` query pattern):
+   `lifecycle` module (mirror the governance `GovQuery::Proposal` query pattern):
 
 ```bash
 # per the spec's query surface, e.g.:
@@ -185,7 +186,7 @@ ducktape node upgrade-status --config <member node.toml>
 Authorization is not activation. A passing vote only SCHEDULES; activation still
 requires the R=n readiness quorum below.
 
-## Step 4: Roll Node-By-Node And Confirm SignalReady
+## Step 4: Roll Node-By-Node And Confirm UpgradeReady
 
 Restart validators onto the new binary **one at a time**, confirming each is
 healthy and has signaled before moving to the next. There is no network downtime
@@ -201,7 +202,7 @@ For each validator:
 grep -E "converged app_hash=|synced app_hash=|recovered app_hash=" <node.log> | tail
 ```
 
-3. Confirm it emitted `SignalReady { name, to_version }`. A node signals only
+3. Confirm it emitted `UpgradeReady { name, to_version }`. A node signals only
    when its own `MAX_PROTOCOL_VERSION >= to_version`, so a signal is a truthful
    statement about the running binary. Watch the readiness count climb:
 

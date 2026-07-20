@@ -9,10 +9,11 @@ name = "airlock-broker"
 path = "src/main.rs"
 
 [dependencies]
-airlock = { path = "../../crates/system/airlock", features = ["client"] }
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "verify"] }
 anyhow = "1"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros"] }
 axum = "0.8"
+tokio-stream = "0.1"
 reqwest = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"

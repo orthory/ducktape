@@ -426,7 +426,6 @@ fn full_surface_blocks_authorship_and_ws() {
             "forge",
             "files",
             "identity",
-            "duckdns",
             "gateway"
         ]
     );

@@ -43,17 +43,17 @@ The decoupled model is the only one that respects the teardown-respawn contract 
 | Vault need | Already in tree | Ref |
 |---|---|---|
 | Order the DKG / sign / decrypt / reshare ceremony | Consensus `Orderer` — total-order broadcast of opaque frames; the log is a **non-equivocating coordinator** | `crates/kernel/node/src/lib.rs:706`, `consensus/src/lib.rs:1081` |
-| Decide committee membership + access policy | `governance` Propose/Vote/Execute (strict-majority tally), sole author of membership ops | `crates/system/governance/src/{lib.rs:74,interface.rs:50}` |
-| Two-tier membership to seat a committee | `valset` validators (quorum seat) vs residents (mesh/statesync, no seat) | `crates/system/valset/src/interface.rs:15` |
-| Admit a member with a single-use proof | invite `InviteToken` + joiner PoP, re-verified on `Redeem` | `crates/system/governance/src/invite.rs` |
-| Delegate a capability off a genesis root, TTL-bounded | keyless-coordinator `CoordCap{issuer∈genesis_set, not_after, sig}` | `crates/system/nat-traversal/src/auth.rs` |
-| Ciphertext-on-consensus + reader ACL (the vault precedent) | `vaults` module — opaque ciphertext, client-side X25519 envelopes, ACL = write-integrity + reader bookkeeping | `crates/apps/vaults/`, registered `bin/node/src/host_state.rs:135` |
+| Decide committee membership + access policy | `governance` Propose/Vote/Execute (strict-majority tally), sole author of membership ops | `crates/modules/system/governance/src/{lib.rs:74,interface.rs:50}` |
+| Two-tier membership to seat a committee | `valset` validators (quorum seat) vs residents (mesh/statesync, no seat) | `crates/modules/system/valset/src/interface.rs:15` |
+| Admit a member with a single-use proof | invite `InviteToken` + joiner PoP, re-verified on `Redeem` | `crates/modules/system/governance/src/invite.rs` |
+| Delegate a capability off a genesis root, TTL-bounded | keyless-coordinator `CoordCap{issuer∈genesis_set, not_after, sig}` | `crates/networking/nat-traversal/src/auth.rs` |
+| Ciphertext-on-consensus + reader ACL (the vault precedent) | `vaults` module — opaque ciphertext, client-side X25519 envelopes, ACL = write-integrity + reader bookkeeping | `crates/modules/apps/vaults/`, registered `bin/node/src/host_state.rs:135` |
 | Node-side crypto that keeps keys out of the webview | sealed-lanes ADR plans `/v1/crypto/{pubkey,seal,open}` and notes they'd "also finally serve vaults" | `docs/adr/2026-07-06-private-team-messaging.mdx` |
 | Rich single-key custody to model share custody on | mnemonic=seed, argon2id → XChaCha20-Poly1305, zeroized session cache | `bin/node/src/userkey.rs` |
 | Snapshot/install so a new committee member syncs shares | statesync `serve_sync` (committed-state-only, root-verified) | `crates/kernel/sdk/src/lib.rs:356` |
 | A place to register the new module | canonical genesis registry | `bin/node/src/host_state.rs:97-188` |
 
-**Naming collision to resolve:** `crates/apps/vaults` already exists and is explicitly *not* the MPC vault (console-redesign-spec: "Explicitly NOT doing … multisig treasury vault"). Recommend the threshold system be a **new module** (`keybase` or `custody`) that sits as a heavier tier *alongside* client-sealed `vaults` — don't overload the existing name.
+**Naming collision to resolve:** `crates/modules/apps/vaults` already exists and is explicitly *not* the MPC vault (console-redesign-spec: "Explicitly NOT doing … multisig treasury vault"). Recommend the threshold system be a **new module** (`keybase` or `custody`) that sits as a heavier tier *alongside* client-sealed `vaults` — don't overload the existing name.
 
 ---
 
@@ -146,10 +146,10 @@ Lazy read: **BLS12-381 for decryption reuses a curve consensus already links; FR
 Codebase (authoritative):
 - Consensus rejection of threshold-BLS: `crates/kernel/consensus/src/lib.rs:100-101`; `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md:440`
 - Epoch teardown-respawn: `crates/kernel/consensus/src/valset_orchestrator.rs`
-- Governance: `crates/system/governance/src/{lib.rs,interface.rs,invite.rs}`; valset tiers `crates/system/valset/src/interface.rs:15`
-- CoordCap delegation: `crates/system/nat-traversal/src/auth.rs`
-- Existing `vaults`: `crates/apps/vaults/`; sealed-lanes ADR: `docs/adr/2026-07-06-private-team-messaging.mdx`
-- Custody / keys: `bin/node/src/userkey.rs`; identity registry: `crates/system/identity/src/lib.rs`; module SDK: `crates/kernel/sdk/src/lib.rs:320`
+- Governance: `crates/modules/system/governance/src/{lib.rs,interface.rs,invite.rs}`; valset tiers `crates/modules/system/valset/src/interface.rs:15`
+- CoordCap delegation: `crates/networking/nat-traversal/src/auth.rs`
+- Existing `vaults`: `crates/modules/apps/vaults/`; sealed-lanes ADR: `docs/adr/2026-07-06-private-team-messaging.mdx`
+- Custody / keys: `bin/node/src/userkey.rs`; identity registry: `crates/modules/system/identity/src/lib.rs`; module SDK: `crates/kernel/sdk/src/lib.rs:320`
 
 External:
 - FROST: [ZcashFoundation/frost](https://github.com/ZcashFoundation/frost), [RFC 9591](https://datatracker.ietf.org/doc/rfc9591/), [frost-ed25519](https://crates.io/crates/frost-ed25519)

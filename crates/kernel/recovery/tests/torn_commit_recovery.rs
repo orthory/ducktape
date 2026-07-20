@@ -907,7 +907,7 @@ struct StaticUpgrade {
 #[async_trait::async_trait(?Send)]
 impl Module for StaticUpgrade {
     fn id(&self) -> ModuleId {
-        "upgrade".into()
+        "lifecycle".into()
     }
     fn root(&self) -> StateRoot {
         digest(&[
@@ -924,17 +924,20 @@ impl Module for StaticUpgrade {
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // the host injects exactly one System-origin `Advance` at each block >= H;
         // accept it as a no-op (this mock arms purely by height).
-        match upgrade::decode_msg(&msg.payload).map_err(Error::Module)? {
-            upgrade::UpgradeMsg::Advance => Ok(()),
-            other => Err(Error::Module(format!("static upgrade got {other:?}"))),
+        match lifecycle::decode_msg(&msg.payload).map_err(Error::Module)? {
+            lifecycle::LifecycleMsg::Advance => Ok(()),
+            other => Err(Error::Module(format!("static lifecycle got {other:?}"))),
         }
     }
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let upgrade::UpgradeQuery::Status =
-            upgrade::decode_query(req).map_err(Error::Module)?;
-        let status = upgrade::UpgradeStatus {
+        let lifecycle::LifecycleQuery::UpgradeStatus =
+            lifecycle::decode_query(req).map_err(Error::Module)?
+        else {
+            return Err(Error::QueryUnsupported);
+        };
+        let status = lifecycle::UpgradeStatus {
             current_version: 0,
-            pending: Some(upgrade::ScheduledUpgrade {
+            pending: Some(lifecycle::ScheduledUpgrade {
                 name: self.name.clone(),
                 activation_height: self.activation_height,
                 to_version: self.to_version,
@@ -945,8 +948,8 @@ impl Module for StaticUpgrade {
             ready_count: 1,
             armed: true,
         };
-        Ok(upgrade::encode_reply(
-            &upgrade::UpgradeReply::Status(status),
+        Ok(lifecycle::encode_reply(
+            &lifecycle::LifecycleReply::UpgradeStatus(status),
         ))
     }
 }

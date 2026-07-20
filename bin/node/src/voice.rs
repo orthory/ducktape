@@ -1943,7 +1943,7 @@ mod tests {
 
 /// Headless end-to-end proof that huddle audio crosses the REAL userspace
 /// WireGuard overlay — no TUN, no root, no mics, no GUI (the
-/// `crates/system/overlay-net/tests/loopback_pair` harness shape). Two voice
+/// `crates/networking/overlay-net/tests/loopback_pair` harness shape). Two voice
 /// hubs run on their OWN runtimes (`spawn_hub`) and bind the per-service
 /// overlay sockets over two loopback-peered virtual stacks; audio fed into one
 /// comes out the other, Opus-decoded. Unlike the in-memory tests above, this

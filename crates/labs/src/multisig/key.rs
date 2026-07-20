@@ -12,7 +12,7 @@
 //!
 //! ## why this key is NOT a Ducktape member key
 //!
-//! It never enters consensus. `crates/system/identity/src/scheme.rs` keeps a
+//! It never enters consensus. `crates/modules/system/identity/src/scheme.rs` keeps a
 //! deliberately CLOSED `KeyKind` enum and warns that adding `Secp256k1` would
 //! require hand-rolling commonware's signing preimage inside a consensus module
 //! — "a correctness footgun". We do not add it. This key's only verifier is

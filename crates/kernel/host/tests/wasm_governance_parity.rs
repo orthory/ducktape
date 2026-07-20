@@ -32,19 +32,18 @@ use governance::{
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{bind_preimage, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof,
     IDENTITY_BIND_NS};
-use modreg::{
-    decode_reply as modreg_decode_reply, encode_query as modreg_encode_query, Modreg, ModregQuery,
-    ModregReply,
+use lifecycle::{
+    decode_reply as lifecycle_decode_reply, encode_query as lifecycle_encode_query, Lifecycle,
+    LifecycleQuery, LifecycleReply,
 };
 use sdk::{Error, Module as _, Msg, Origin, StateRoot};
-use upgrade::Upgrade;
 use valset::{
     decode_reply as valset_decode_reply, encode_query as valset_encode_query, Valset, ValsetQuery,
     ValsetReply,
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/governance-wasm` by the
+/// GENERATED artifact — built from `crates/guests/governance-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const GOVERNANCE_WASM: &[u8] = include_bytes!("fixtures/governance.component.wasm");
 
@@ -77,9 +76,9 @@ fn wasm_governance() -> WasmModule {
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
 fn native_governance() -> Governance {
-    Governance::new("governance", "valset", "upgrade", "identity")
+    Governance::new("governance", "valset", "lifecycle", "identity")
         .with_invite_binding(INVITE)
-        .with_modreg("modreg")
+        .with_code_registry("lifecycle")
 }
 
 fn native_identity() -> Identity {
@@ -96,20 +95,19 @@ fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
 
 /// a code registry with one seeded tenant, so UpdateModule has a module to
 /// re-code (mirrors bin/node's genesis-seeded registry).
-fn seeded_modreg() -> Modreg {
-    let mut modreg = Modreg::new("modreg", "valset");
-    modreg.seed("hello", vec![0xAA; 32]);
-    modreg
+fn seeded_lifecycle() -> Lifecycle {
+    let mut lifecycle = Lifecycle::new("lifecycle", "valset");
+    lifecycle.seed("hello", vec![0xAA; 32]);
+    lifecycle
 }
 
-/// the full native sibling set both hosts carry: valset (membership), upgrade
-/// (node upgrades), identity (account shares), modreg (code swaps).
+/// the full native sibling set both hosts carry: valset (membership), identity
+/// (account shares), lifecycle (node upgrades + code swaps).
 fn siblings(validators: &[Vec<u8>]) -> Vec<Box<dyn sdk::Module>> {
     vec![
         Box::new(seeded_valset(validators)),
-        Box::new(Upgrade::new("upgrade", "valset")),
         Box::new(native_identity()),
-        Box::new(seeded_modreg()),
+        Box::new(seeded_lifecycle()),
     ]
 }
 
@@ -230,7 +228,7 @@ fn root_of(h: &Host) -> StateRoot {
     h.module_root("governance").expect("governance registered")
 }
 
-const SIBLING_IDS: [&str; 4] = ["valset", "upgrade", "identity", "modreg"];
+const SIBLING_IDS: [&str; 3] = ["valset", "lifecycle", "identity"];
 
 /// the read matrix: the full proposal listing, per-id gets (present + absent),
 /// the redemption audit trail, and the share registry.
@@ -512,12 +510,12 @@ async fn same_ops_inner() {
         Origin::External(a_pub.clone()),
         execute("p-upg"),
         true,
-        &["upgrade"],
+        &["lifecycle"],
     )
     .await;
 
     // ---- UpdateModule: a WASM governance drives the CODE REGISTRY — the
-    // passing authorization emits ModregMsg::Schedule into the native modreg
+    // passing authorization emits LifecycleMsg::ScheduleSwap into the native lifecycle
     // sibling, scheduling a height-gated code swap for the "hello" tenant.
     roundtrip(
         &mut native,
@@ -549,16 +547,16 @@ async fn same_ops_inner() {
         Origin::External(a_pub.clone()),
         execute("p-code"),
         true,
-        &["modreg"],
+        &["lifecycle"],
     )
     .await;
     // decoded proof on BOTH hosts: the registry now carries the pending swap.
     for host in [&native, &wasm] {
         let reply = host
-            .query("modreg", &modreg_encode_query(&ModregQuery::Status))
+            .query("lifecycle", &lifecycle_encode_query(&LifecycleQuery::ModuleStatus))
             .await
-            .expect("modreg status");
-        let ModregReply::Status { modules } = modreg_decode_reply(&reply).expect("decode") else {
+            .expect("lifecycle module status");
+        let LifecycleReply::ModuleStatus { modules } = lifecycle_decode_reply(&reply).expect("decode") else {
             panic!("expected Status reply");
         };
         let hello = modules

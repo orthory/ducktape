@@ -17,7 +17,7 @@
 //!     left to arm — still reconciles its genesis code to the committed ACTIVE
 //!     hash instead of forking on stale code.
 //!
-//! Fixtures are GENERATED artifacts (see `crates/examples/hello-wasm{,-v2}`),
+//! Fixtures are GENERATED artifacts (see `crates/guests/hello-wasm{,-v2}`),
 //! committed so the proof is self-contained.
 
 use std::collections::BTreeMap;
@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BASELINE_VERSION, BlockContext, CodeSource, Host, MODREG_MODULE_ID};
-use modreg::{ModregMsg, ModregQuery, ModregReply, Modreg};
+use host::{BASELINE_VERSION, BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID};
+use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -34,7 +34,7 @@ const HELLO_V1: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 const HELLO_V2: &[u8] = include_bytes!("fixtures/hello-v2.component.wasm");
 
 /// the swap boundary used throughout: far enough past genesis to clear
-/// `modreg::MIN_SWAP_LEAD` from the scheduling block.
+/// `lifecycle::MIN_SWAP_LEAD` from the scheduling block.
 const H: u64 = 10;
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -66,7 +66,7 @@ const MEMBER: [u8; 32] = [7; 32];
 /// as hello's genesis-active code.
 fn host_with_wasm() -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Modreg::new(MODREG_MODULE_ID, "valset")));
+    host.register(Box::new(Lifecycle::new(LIFECYCLE_MODULE_ID, "valset")));
     let mut valset = valset::Valset::new("valset");
     valset.insert(MEMBER.to_vec());
     host.register(Box::new(valset));
@@ -77,7 +77,7 @@ fn host_with_wasm() -> Host {
         &mut host,
         0,
         Origin::System,
-        modreg_msg(&ModregMsg::Register {
+        lifecycle_msg(&LifecycleMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: sha(HELLO_V1),
         }),
@@ -95,15 +95,15 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }
 
-fn modreg_msg(m: &ModregMsg) -> Msg {
+fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
     Msg {
-        target: MODREG_MODULE_ID.into(),
-        payload: modreg::encode_msg(m),
+        target: LIFECYCLE_MODULE_ID.into(),
+        payload: lifecycle::encode_msg(m),
     }
 }
 
 fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
-    modreg_msg(&ModregMsg::Schedule {
+    lifecycle_msg(&LifecycleMsg::ScheduleSwap {
         name: "hello-v2".into(),
         module_id: "hello".into(),
         activation_height,
@@ -114,7 +114,7 @@ fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
 /// the member's byte-receipt signal: what `code_announce` self-submits once
 /// the component is verified-resident. latches the swap `ready` (R = n = 1).
 fn signal_ready_msg() -> Msg {
-    modreg_msg(&ModregMsg::SignalReady {
+    lifecycle_msg(&LifecycleMsg::SwapReady {
         name: "hello-v2".into(),
         module_id: "hello".into(),
     })
@@ -133,10 +133,10 @@ fn count(host: &Host) -> u64 {
 }
 
 fn active_hash(host: &Host) -> (Vec<u8>, bool) {
-    let req = modreg::encode_query(&ModregQuery::Status);
-    let bytes = block_on(host.query(MODREG_MODULE_ID, &req)).expect("status");
-    match modreg::decode_reply(&bytes).expect("decode") {
-        ModregReply::Status { modules } => {
+    let req = lifecycle::encode_query(&LifecycleQuery::ModuleStatus);
+    let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
+    match lifecycle::decode_reply(&bytes).expect("decode") {
+        LifecycleReply::ModuleStatus { modules } => {
             let m = modules.iter().find(|m| m.module_id == "hello").expect("hello entry");
             (m.active_code_hash.clone(), m.pending.is_some())
         }
@@ -260,8 +260,8 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     // joiner: modreg installed from the source's committed snapshot (the
     // verify-then-adopt state-sync path), wasm module freshly wired from
     // GENESIS (v1) code.
-    let modreg_root = source.module_root(MODREG_MODULE_ID).expect("modreg root");
-    let mut joined_modreg = Modreg::new(MODREG_MODULE_ID, "valset");
+    let modreg_root = source.module_root(LIFECYCLE_MODULE_ID).expect("modreg root");
+    let mut joined_modreg = Lifecycle::new(LIFECYCLE_MODULE_ID, "valset");
     // reach the committed snapshot through the module's own state-sync surface,
     // exactly as a joiner would receive it.
     let handle = {
@@ -273,7 +273,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
             .expect("finalized snapshot");
         snap.modules
             .into_iter()
-            .find(|m| m.id == MODREG_MODULE_ID)
+            .find(|m| m.id == LIFECYCLE_MODULE_ID)
             .expect("modreg snapshot")
             .state_sync
     };

@@ -142,31 +142,28 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 26] = [
-    "kv",
+pub(crate) const MODULE_IDS: [&str; 20] = [
     "pages",
     "chat",
     "forge",
     "valset",
-    "clients",
     "governance",
-    "upgrade",
-    "modreg",
+    "lifecycle",
     "hello",
     "saga",
     "capability",
     "dispatch",
     "tagging",
     "tasks",
-    "vaults",
     "identity",
-    "duckdns",
+    // the MERGED gateway owns the whole `.duck` name → AccountId → route
+    // pipeline: the route plane PLUS the human-name handle plane that the
+    // retired `duckdns` module used to own separately.
     "gateway",
     "inbox",
     "directory",
     "automations",
     "files",
-    "jobs",
     "agent",
     "runs",
 ];
@@ -176,7 +173,7 @@ pub(crate) const MODULE_IDS: [&str; 26] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
     // tail inside the native snapshot persisted as one host-KV value.
     ("agent", 3),
@@ -189,27 +186,30 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     // moved into wasm; the canonical state encoding never changed shape, so
     // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
     ("chat", 1),
-    ("clients", 1),
     ("directory", 1),
     // 1 (UNCHANGED — dispatch stays NATIVE): its read facade serves
     // COMMITTED-ONLY state by design (runs' mid-block lease_holder read
     // depends on it), a view the wasm adapter's staged-fold cannot represent.
     ("dispatch", 1),
-    ("duckdns", 2),
     ("files", 1),
     ("forge", 1),
-    // 2: wasm adapter ports — the native canonical snapshot persisted as one
-    // host-KV value, plus the GENESIS-CONFIG `__config` store entry carrying
-    // the per-network parameters (gateway/identity: chain id; governance: the
-    // invite binding), so root()/snapshot bytes changed shape at cutover.
-    ("gateway", 2),
+    // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
+    // revision 3 folds the `.duck` handle registry (the retired `duckdns`
+    // module's plane) into the same host-KV snapshot under one root — a
+    // state-schema break (beta re-genesis, no shim). governance stays at 2
+    // (identity moved to 3 when it absorbed the client ACL — see below). The
+    // per-network chain id still rides the GENESIS-CONFIG `__config`.
+    ("gateway", 3),
     ("governance", 2),
     ("hello", 1),
-    ("identity", 2),
+    // 3: identity absorbed the submit-door client ACL (the retired `clients`
+    // module's ed25519 key set) as a tail folded into its account snapshot/root
+    // — a state-schema break from revision 2 (beta re-genesis, no shim).
+    ("identity", 3),
     ("inbox", 2),
-    ("jobs", 2),
-    ("kv", 1),
-    ("modreg", 1),
+    // 1: the native lifecycle module (merged upgrade + modreg): protocol-version
+    // coordination + the module code registry, one app-hashed root.
+    ("lifecycle", 1),
     // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
     // 3: the wasm adapter port — the native canonical snapshot (itself at
@@ -220,105 +220,15 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
     // empty host-KV root, but every written state re-encodes — a break).
     ("saga", 2),
     ("tagging", 2),
-    ("tasks", 2),
-    ("upgrade", 1),
+    // 3: the tasks+jobs merge — the `tasks` work module now hosts BOTH the task
+    // board and the (former `jobs`) job board, so its canonical snapshot/root
+    // encoding is the two boards concatenated (revision 2 was the wasm port).
+    ("tasks", 3),
     ("valset", 1),
-    // 2: the wasm adapter port — the native canonical snapshot persisted as
-    // one host-KV value, so root()/snapshot bytes changed shape at cutover.
-    ("vaults", 2),
 ];
-
-/// The exact pre-wasm production registry still running on the dogfood v1
-/// network. A latest binary may reopen this schema for a binary-only roll, but
-/// it must not reinterpret any module as wasm or advertise this as a fresh
-/// genesis/state-sync target. The route is deliberately exact: every other
-/// historical schema remains fail-closed.
-pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 26] = [
-    ("agent", 1),
-    ("automations", 1),
-    ("capability", 1),
-    ("chat", 1),
-    ("clients", 1),
-    ("directory", 1),
-    ("dispatch", 1),
-    ("duckdns", 1),
-    ("files", 1),
-    ("forge", 1),
-    ("gateway", 1),
-    ("governance", 1),
-    ("hello", 1),
-    ("identity", 1),
-    ("inbox", 1),
-    ("jobs", 1),
-    ("kv", 1),
-    ("modreg", 1),
-    ("pages", 1),
-    ("runs", 2),
-    ("saga", 1),
-    ("tagging", 1),
-    ("tasks", 1),
-    ("upgrade", 1),
-    ("valset", 1),
-    ("vaults", 1),
-];
-
-/// The only registry this binary can migrate in place: the CURRENT schema
-/// minus `clients` — a workspace captured (or restored) with the clients
-/// module still dormant below its activation version. Everything else —
-/// including genuinely historical pre-wasm-cutover workspaces, whose module
-/// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
-/// re-genesis, no shim).
-pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 25] = [
-    ("agent", 3),
-    ("automations", 2),
-    ("capability", 2),
-    ("chat", 1),
-    ("directory", 1),
-    ("dispatch", 1),
-    ("duckdns", 2),
-    ("files", 1),
-    ("forge", 1),
-    ("gateway", 2),
-    ("governance", 2),
-    ("hello", 1),
-    ("identity", 2),
-    ("inbox", 2),
-    ("jobs", 2),
-    ("kv", 1),
-    ("modreg", 1),
-    ("pages", 1),
-    ("runs", 3),
-    ("saga", 2),
-    ("tagging", 2),
-    ("tasks", 2),
-    ("upgrade", 1),
-    ("valset", 1),
-    ("vaults", 2),
-];
-
-pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
-
-/// The numeric version is insufficient evidence because older non-bridge
-/// binaries already advertise support through v3. This exact logical artifact
-/// binds readiness to the only accepted source schema, destination schema, and
-/// dormant-registry route.
-pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
-    "commit:clients-v1:",
-    "2f9bc45b9abc691c65d9f6175f7a3aba39962dc8b6fce27ba207162887a60375:",
-    "c0b1afec448fb8ba7d0be5abf969a52a32d5769bca8701dafa437948126a5595:",
-    "dormant-registry-v1"
-);
 
 pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
     host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
-}
-
-pub(crate) fn native_v1_state_schema_fingerprint() -> [u8; 32] {
-    host::state_schema_fingerprint(NATIVE_V1_MODULE_STATE_SCHEMAS.iter().copied())
-}
-
-pub(crate) fn pre_clients_state_schema_fingerprint() -> [u8; 32] {
-    host::state_schema_fingerprint(PRE_CLIENTS_MODULE_STATE_SCHEMAS.iter().copied())
 }
 
 /// how long an app-surface submit reply may be held awaiting finalization
@@ -353,6 +263,6 @@ pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
 // joiner would fail closed on the first post-admission checkpoint. whoever
 // removes this assert is claiming that restore half now exists.
 const _: () = assert!(
-    MAX_PROTOCOL_VERSION < modreg::ADMISSION_ACTIVATION_VERSION,
+    MAX_PROTOCOL_VERSION < lifecycle::ADMISSION_ACTIVATION_VERSION,
     "land the admitted-module restore/state-sync path before crossing the admission boundary"
 );

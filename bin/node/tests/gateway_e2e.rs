@@ -17,11 +17,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use common::{Cluster, hex, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
-use duckdns::{DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply};
 use gateway::{
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
-    RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
-    RouteTarget,
+    DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
+    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
 };
 use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 
@@ -54,22 +52,22 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
     )?;
     match identity::decode_reply(&bytes).ok()? {
         IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
+        IdentityReply::Accounts(_) | IdentityReply::Clients(_) => None,
     }
 }
 
 fn resolve_alice(cluster: &Cluster, reader: usize) -> Option<Vec<u8>> {
     let bytes = cluster.query(
         reader,
-        "duckdns",
-        &duckdns::encode_query(&DuckDnsQuery::Resolve {
+        "gateway",
+        &gateway::encode_query(&GatewayQuery::Resolve {
             name: DuckDnsName {
                 handle: "alice".into(),
             },
         }),
     )?;
-    match duckdns::decode_reply(&bytes).ok()? {
-        DuckDnsReply::Resolved(Some(account)) => Some(account.account_id),
+    match gateway::decode_reply(&bytes).ok()? {
+        GatewayReply::Resolved(Some(account)) => Some(account.account_id),
         _ => None,
     }
 }
@@ -133,7 +131,7 @@ fn route_revision(cluster: &Cluster, reader: usize) -> Option<u64> {
             .as_ref()
             .as_ref()
             .map(|record| record.statement.revision),
-        GatewayReply::Routes(_) => None,
+        _ => None,
     }
 }
 
@@ -306,8 +304,8 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
 
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );

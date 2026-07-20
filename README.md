@@ -1,7 +1,7 @@
 # Ducktape
 
 A consensus-based workplace super-app: one BFT-replicated state machine that
-hosts isolated product modules — documents, forge, chat, agent workflows — the
+hosts isolated product modules — pages, forge, chat, agent workflows — the
 way CosmWasm isolates contracts, but in native Rust.
 
 Each module owns its authenticated state substrate and exposes exactly one
@@ -14,24 +14,33 @@ If two nodes agree on the app-hash, they agree on every module's state.
 Modules never link each other's implementation crates. A module depends only on:
 
 - `sdk` — the module contract and deterministic system API, and
-- the types-only `*-interface` crates of modules it needs to address.
+- the types-only wire types (payload/query/reply shapes + codecs) each module
+  publishes at its own crate root, for the modules it needs to address.
 
 Cross-module reads go through host-routed queries. Cross-module writes are
 emitted as messages that the host drains as follow-up ops.
 
 ## Repository Layout
 
+The tree groups by function into three layers — module / kernel / networking:
+
 | Path | Contents |
 | --- | --- |
-| `crates/kernel/` | The platform: `sdk` (module contract), `state` (app-hash composition), `host` (registry + dispatch + block lifecycle), `node` (transport seam), `consensus` (commonware Simplex BFT orderer), `reactor` (worker loop for non-deterministic effects) |
-| `crates/system/` | Consensus-infrastructure modules: `kv` (QMDB byte-KV), `valset` (ed25519 validator membership), `saga` (deterministic async continuations), `wireguard-upgrade` |
-| `crates/apps/` | Product modules: `forge` (git-backed project state), `document`, `chat`, `agent` (LLM-run orchestrator: registry, watches, runs), `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes), `memory` (generation-pinned shared agent workspace), `jobs` (first-claim-wins work board) |
-| `crates/examples/` | Demo and test scaffolding modules: `directory`, `greeter` |
-| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (real-socket validator process), `coordinator` (untrusted UDP rendezvous/STUN helper) |
+| `crates/kernel/` | The platform: `sdk` (module contract + codec), `host` (submit/execute loop, app-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `wasm-host` (pinned wasmtime runtime for hot-swappable module components) |
+| `crates/networking/` | The netstack: host-side transport infra — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net` — plus the consensus modules that govern it, `duckdns` and `gateway` (the merged name→AccountId→route module) |
+| `crates/modules/system/` | System modules and their host-side counterparts: `kv` (byte-KV), `valset` (ed25519 validator membership), `clients`, `governance`, `identity`, `lifecycle` (merged module registry + upgrade), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `airlock` (exec/credential gateway), plus `blobstore`, `dispatch-oracle`, `capability-host` |
+| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`), `jobs` (first-claim-wins work board) |
+| `crates/duckfs/` | The versioned-filesystem engine: `core` (pure, wasm-ready — the `files` module wraps it), `disk`, `client` (OS-side) |
+| `crates/guests/` | The wasm ports — one `*-wasm` guest per module (compiles the native crate to a component the node embeds) plus `guest-adapter` (the shared `ducktape:module` world binding) |
+| `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
+| `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
+| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` / `airlock-broker` / `airlock-cli` (credential gateway) |
 | `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |
 
-`*-interface` crates alongside each module are the only legal cross-module
-surface.
+Each module publishes its wire surface — types-only payload/query/reply shapes
+and codecs — at its own crate root; those wire types plus host-routed queries
+are the only legal cross-module surface. `kv` and `vaults` remain as crates but
+are no longer registered in the production genesis module set.
 
 ## Quick Start
 
@@ -179,7 +188,7 @@ Korean) under `docs/pages`.
 
 The platform spine is checked in and verified: the module contract, host
 registry, global app-hash, ordered node path, commonware Simplex orderer,
-saga/reactor async seam, and several root-backed product modules, plus state
+the saga async seam, and several root-backed product modules, plus state
 sync for QMDB-backed, forge, and snapshot-style modules.
 
 Still open — mostly live orchestration: network-backed module sync from a

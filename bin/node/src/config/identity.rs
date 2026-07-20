@@ -14,7 +14,7 @@ use super::{hex_bytes, unhex};
 /// unix — this is the NODE's identity (mesh/valset/frame-signing key) only.
 /// the user's identity is a separate keypair held by the app
 /// (`~/.ducktape/user.key`) and bound to this node's key through the
-/// `identity` module (`crates/system/identity`); this file never holds it.
+/// `identity` module (`crates/modules/system/identity`); this file never holds it.
 pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bool), String> {
     if path.exists() {
         return load_identity(path).map(|k| (k, false));

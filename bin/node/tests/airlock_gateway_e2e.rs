@@ -8,8 +8,10 @@
 //! proxied `/v1/messages` — through BOB's browser-gateway door and over the
 //! authenticated WireGuard overlay to Alice's enclave, and gets the swapped
 //! credential's reply back. This proves the remote topology the design's §graft
-//! calls out, minus real hardware attestation and the real Anthropic upstream
-//! (a mock upstream stands in, so the test is deterministic and spends no quota).
+//! calls out, minus silicon-backed quote GENERATION and the real Anthropic
+//! upstream (a testkit-minted SNP quote — checked by the REAL chain verifier
+//! under the test enclave's roots — and a mock upstream stand in, so the test
+//! is deterministic and spends no quota).
 //!
 //! The session-key handshake is load-bearing HERE: the quote is fetched and
 //! verified OVER the untrusted overlay before any token is derived, so a relaying
@@ -22,10 +24,9 @@ use std::time::Duration;
 
 use common::{Cluster, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
-use duckdns::{DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply};
 use gateway::{
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience, RouteDefinition,
-    RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
+    DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
+    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
 };
 use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 
@@ -45,6 +46,18 @@ const FINALIZE: Duration = Duration::from_secs(60);
 
 fn measurement_hex() -> String {
     "11".repeat(attest::MRTD_LEN)
+}
+
+/// ONE test enclave (measures `0x11`x48) shared by the tests in this file. Its
+/// minted SNP chain is verified through the REAL `airlock::verify` path — but
+/// only under its own roots, never under the AMD builtins.
+fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
+    static ENCLAVE: std::sync::OnceLock<Arc<airlock::testkit::SnpTestEnclave>> =
+        std::sync::OnceLock::new();
+    ENCLAVE.get_or_init(|| {
+        let m = Measurement::from_hex(&measurement_hex()).unwrap();
+        Arc::new(airlock::testkit::SnpTestEnclave::new(&m).unwrap())
+    })
 }
 
 // ----- identity + duckdns helpers (mirrors gateway_e2e) ---------------------
@@ -75,22 +88,22 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
     )?;
     match identity::decode_reply(&bytes).ok()? {
         IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
+        IdentityReply::Accounts(_) | IdentityReply::Clients(_) => None,
     }
 }
 
 fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<u8>> {
     let bytes = cluster.query(
         reader,
-        "duckdns",
-        &duckdns::encode_query(&DuckDnsQuery::Resolve {
+        "gateway",
+        &gateway::encode_query(&GatewayQuery::Resolve {
             name: DuckDnsName {
                 handle: handle.into(),
             },
         }),
     )?;
-    match duckdns::decode_reply(&bytes).ok()? {
-        DuckDnsReply::Resolved(Some(account)) => Some(account.account_id),
+    match gateway::decode_reply(&bytes).ok()? {
+        GatewayReply::Resolved(Some(account)) => Some(account.account_id),
         _ => None,
     }
 }
@@ -111,11 +124,25 @@ fn signed_airlock_route(
     publisher: &[u8],
     revision: u64,
 ) -> GatewayMsg {
+    signed_loopback_route(member, chain, publisher, "airlock", revision, 4 * 1024 * 1024, true)
+}
+
+/// A member-signed LoopbackHttp route. `max_response_bytes == 0` = unbounded
+/// streaming (SSE).
+fn signed_loopback_route(
+    member: &ed25519::PrivateKey,
+    chain: &str,
+    publisher: &[u8],
+    name: &str,
+    revision: u64,
+    max_response_bytes: u64,
+    allow_authorization: bool,
+) -> GatewayMsg {
     let statement = RouteStatement {
         version: 1,
         chain_id: chain.into(),
         account_id: member.public_key().as_ref().to_vec(),
-        name: RouteName::named("airlock"),
+        name: RouteName::named(name),
         publisher_node: publisher.to_vec(),
         revision,
         route: Some(RouteDefinition {
@@ -124,8 +151,8 @@ fn signed_airlock_route(
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
                 max_request_bytes: 1024 * 1024,
-                max_response_bytes: 4 * 1024 * 1024,
-                allow_authorization: true,
+                max_response_bytes,
+                allow_authorization,
                 allow_upgrade: false,
             },
         }),
@@ -147,12 +174,16 @@ fn signed_airlock_route(
 }
 
 fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> Option<u64> {
+    route_revision(cluster, reader, account, "airlock")
+}
+
+fn route_revision(cluster: &Cluster, reader: usize, account: &[u8], name: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
         &gateway::encode_query(&GatewayQuery::Get {
             account_id: account.to_vec(),
-            name: RouteName::named("airlock"),
+            name: RouteName::named(name),
         }),
     )?;
     match gateway::decode_reply(&bytes).ok()? {
@@ -160,7 +191,7 @@ fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> O
             .as_ref()
             .as_ref()
             .map(|record| record.statement.revision),
-        GatewayReply::Routes(_) => None,
+        _ => None,
     }
 }
 
@@ -205,7 +236,8 @@ async fn bind_and_serve(app: Router) -> String {
     format!("http://{addr}")
 }
 
-/// Boot the mock upstream and the airlock gateway (mock attest) pointed at it.
+/// Boot the mock upstream and the airlock gateway (testkit quoter, verified by
+/// the real SNP verifier) pointed at it.
 /// Returns `(gateway_base_url, gateway_loopback_port)`.
 async fn boot_gateway_and_upstream() -> (String, u16) {
     let upstream = bind_and_serve(
@@ -216,17 +248,21 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
     )
     .await;
 
-    let (app, vendor) = server::build(GatewayConfig {
-        attest: "mock".into(),
-        measurement: Some(measurement_hex()),
-        anthropic_base: upstream.clone(),
-        oauth_token_url: format!("{upstream}/oauth/token"),
-        oauth_client_id: "test-client".into(),
-        session_ttl_secs: 3600,
-        max_requests: 100,
-    })
+    let (app, vendor) = server::build_with_quoter(
+        GatewayConfig {
+            attest: "snp".into(),
+            anthropic_base: upstream.clone(),
+            oauth_token_url: format!("{upstream}/oauth/token"),
+            oauth_client_id: "test-client".into(),
+            session_ttl_secs: 3600,
+            max_requests: 100,
+        },
+        "snp",
+        test_enclave().quoter(),
+        None,
+    )
     .unwrap();
-    assert_eq!(vendor, "mock");
+    assert_eq!(vendor, "snp");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -236,11 +272,10 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
 }
 
 // TODO(full-spec, needs hardware): this proves the node-to-node overlay hop with
-// MOCK attestation and a MOCK upstream. The full 2-node + TEE run — real
-// `--attest tdx`/`snp` on a confidential VM (+ the matching vendor verify wired
-// into the compute path, which capability-host currently refuses) and the real
-// Anthropic API via the static bearer (PR #681) — is deferred to real hardware.
-// See the design spec "TODO — full 2-node + TEE validation".
+// a minted SNP chain (real verifier, test roots) and a mock upstream. The full
+// 2-node + TEE run — silicon-backed quote GENERATION on a confidential VM and
+// the real Anthropic API via the static bearer (PR #681) — is deferred to real
+// hardware. See the design spec "TODO — full 2-node + TEE validation".
 #[test]
 fn airlock_over_gateway_two_wireguard_nodes() {
     let _serial = serial();
@@ -257,7 +292,10 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         let gw = AirlockClient::local(gw_base.clone());
         let (quote, _vendor) = gw.fetch_quote().await.unwrap();
         let expected = Measurement::from_hex(&measurement_hex()).unwrap();
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
             &CredentialPayload::Refresh { refresh_token: "seed".into() },
@@ -304,8 +342,8 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     // Alice maps `alice.duck`, so `airlock.alice.duck` resolves to her account.
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );
@@ -354,7 +392,10 @@ fn airlock_over_gateway_two_wireguard_nodes() {
 
         // 1) attest OVER the overlay, verify the quote, read the attested seal_pk.
         let (quote, _vendor) = gw.fetch_quote().await.expect("fetch quote over overlay");
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
 
         // 2) session-key handshake OVER the overlay → scoped token.
         let token = gw
@@ -405,7 +446,10 @@ fn airlock_single_node_self_serves_its_own_route() {
         let gw = AirlockClient::local(gw_base.clone());
         let (quote, _vendor) = gw.fetch_quote().await.unwrap();
         let expected = Measurement::from_hex(&measurement_hex()).unwrap();
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
             &CredentialPayload::Refresh { refresh_token: "seed".into() },
@@ -440,8 +484,8 @@ fn airlock_single_node_self_serves_its_own_route() {
 
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );
@@ -479,11 +523,448 @@ fn airlock_single_node_self_serves_its_own_route() {
         let gw = AirlockClient::remote("airlock.alice.duck".into(), via);
         let expected = Measurement::from_hex(&measurement_hex()).unwrap();
         let (quote, _vendor) = gw.fetch_quote().await.expect("fetch quote through the gateway");
-        let seal_pk = attest::split_report_data(&attest::mock_verify(&quote, &expected).unwrap()).0;
+        let rd = airlock::verify::verify_quote(&quote, &expected, &test_enclave().roots())
+            .await
+            .unwrap();
+        let seal_pk = attest::split_report_data(&rd).0;
+        // SEALED session: the request/response bodies cross the overlay as
+        // ciphertext (streaming + body AEAD combined, over the real wire).
+        let (token, keys) = gw
+            .open_session_sealed(&seal_pk, "self")
+            .await
+            .expect("sealed handshake through the gateway");
+        let plaintext =
+            br#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        let sealed_body = airlock::bodyseal::seal_request(&keys, plaintext);
+        let resp = gw
+            .route(gw.http().post(gw.url("/v1/messages")))
+            .bearer_auth(&token)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("content-type", "application/json")
+            .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
+            .body(sealed_body.clone())
+            .send()
+            .await
+            .expect("proxied messages through the gateway");
+        let status = resp.status();
+        let wire = resp.bytes().await.unwrap();
+        assert!(
+            !wire.windows(10).any(|w| w == b"AIRLOCK-OK"),
+            "the overlay must carry ciphertext, never the plaintext reply"
+        );
+        let mut opener = airlock::bodyseal::StreamOpener::new(&keys, &airlock::bodyseal::request_binding(&sealed_body));
+        let items = opener.feed(&wire).expect("unseal the proxied reply");
+        assert!(opener.finished(), "sealed reply must end with the Final marker");
+        let body: Vec<u8> = items
+            .into_iter()
+            .filter_map(|item| match item {
+                airlock::bodyseal::OpenedItem::Data(data) => Some(data),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    });
+
+    assert_eq!(reply.0, reqwest::StatusCode::OK, "self-served proxied call: {reply:?}");
+    assert!(
+        reply.1.contains("AIRLOCK-OK"),
+        "the swapped credential's reply must return: {reply:?}"
+    );
+}
+
+/// Streamed SSE through the gateway frame wire on one real node, plus the
+/// running response cap. The upstream sends ONE chunk and then BLOCKS until
+/// the client has read it — a buffered proxy cannot pass this (it would
+/// deadlock waiting for the body to end), so success proves end-to-end
+/// streaming through browser door -> duplex frame wire -> loopback upstream.
+#[test]
+fn gateway_streams_and_caps_over_the_frame_wire() {
+    let _serial = serial();
+    let rt = Runtime::new().unwrap();
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = 6 * 1024 * 1024; // > the old 4 MiB buffered ceiling
+
+    // Upstream: /events streams TOTAL bytes but holds after the first chunk
+    // until the client releases the gate; /flood streams 1 MiB ungated.
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let upstream = {
+        let gate = gate.clone();
+        rt.block_on(async move {
+            use axum::routing::get;
+            let events = move || {
+                let gate = gate.clone();
+                async move {
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+                    tokio::spawn(async move {
+                        let chunk = bytes::Bytes::from(vec![b'a'; CHUNK]);
+                        if tx.send(Ok(chunk.clone())).await.is_err() {
+                            return;
+                        }
+                        gate.notified().await; // the CLIENT read the first chunk
+                        for _ in 0..(TOTAL / CHUNK - 1) {
+                            if tx.send(Ok(chunk.clone())).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(
+                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                        ),
+                    )
+                }
+            };
+            // Sized overflow: Content-Length is declared, so the proxy can
+            // refuse BEFORE the head (502) instead of truncating.
+            let flood = || async {
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from(vec![b'b'; 1024 * 1024]),
+                )
+            };
+            // Unsized overflow: chunked, no Content-Length — the head commits,
+            // then the RUNNING cap truncates the body mid-stream.
+            let flood_chunked = || async {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+                tokio::spawn(async move {
+                    let chunk = bytes::Bytes::from(vec![b'c'; CHUNK]);
+                    for _ in 0..16 {
+                        if tx.send(Ok(chunk.clone())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                )
+            };
+            bind_and_serve(
+                Router::new()
+                    .route("/events", get(events))
+                    .route("/flood", get(flood))
+                    .route("/flood-chunked", get(flood_chunked)),
+            )
+            .await
+        })
+    };
+    let upstream_port: u16 = upstream.rsplit(':').next().unwrap().parse().unwrap();
+
+    let mut cluster = Cluster::new(&[0], &[0]);
+    cluster.wireguard = true;
+    cluster.wireguard_socket = true;
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", READY);
+    cluster.wait_marker(0, "converged app_hash=", READY);
+    cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
+
+    let alice = ed25519::PrivateKey::from_seed(42);
+    let alice_node = Cluster::identity(0);
+    cluster.submit(
+        0,
+        "identity",
+        &identity::encode_msg(&IdentityMsg::BindNode {
+            authorizer: bind_auth(&alice, &cluster.namespace, &alice_node),
+        }),
+    );
+    poll_until("identity binding", FINALIZE, || {
+        account_of_node(&cluster, 0, &alice_node)
+            .filter(|account| account.account_id == alice.public_key().as_ref())
+    });
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle { handle: Some("alice".into()) }),
+    );
+    poll_until("alice.duck resolution", FINALIZE, || resolve_handle(&cluster, 0, "alice"));
+
+    let workspace = cluster.workspace(0);
+    for label in ["sse", "capped"] {
+        let (ok, output) = cluster.run_verb(&[
+            "gateway-route-bind",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--label",
+            label,
+            "--port",
+            &upstream_port.to_string(),
+        ]);
+        assert!(ok, "{label} port bind failed: {output}");
+    }
+    // "sse": max_response_bytes 0 = unbounded stream; "capped": 64 KiB cap.
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_loopback_route(
+            &alice,
+            &cluster.namespace,
+            &alice_node,
+            "sse",
+            1,
+            0,
+            false,
+        )),
+    );
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_loopback_route(
+            &alice,
+            &cluster.namespace,
+            &alice_node,
+            "capped",
+            1,
+            CHUNK as u64,
+            false,
+        )),
+    );
+    poll_until("both routes live", FINALIZE, || {
+        (route_revision(&cluster, 0, alice.public_key().as_ref(), "sse") == Some(1)
+            && route_revision(&cluster, 0, alice.public_key().as_ref(), "capped") == Some(1))
+        .then_some(())
+    });
+
+    let (status, browser) = cluster.http(0, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via = browser["base"].as_str().unwrap().to_string();
+
+    // Unbounded stream: 6 MiB arrives; the first chunk is READ before the
+    // upstream is allowed to send the rest.
+    let total = rt.block_on({
+        let via = via.clone();
+        let gate = gate.clone();
+        async move {
+            use futures::StreamExt as _;
+            let resp = reqwest::Client::new()
+                .get(format!("{via}/events"))
+                .header("x-duck-authority", "sse.alice.duck")
+                .send()
+                .await
+                .expect("streamed GET through the gateway");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            let mut stream = resp.bytes_stream();
+            let first = stream.next().await.expect("first chunk").expect("first chunk ok");
+            assert!(!first.is_empty());
+            gate.notify_one(); // only now may the upstream finish
+            let mut total = first.len();
+            while let Some(chunk) = stream.next().await {
+                total += chunk.expect("streamed chunk").len();
+            }
+            total
+        }
+    });
+    assert_eq!(total, TOTAL, "the full 6 MiB must stream through the frame wire");
+
+    // Sized overflow (Content-Length declared): refused BEFORE the head.
+    let sized_status = rt.block_on({
+        let via = via.clone();
+        async move {
+            reqwest::Client::new()
+                .get(format!("{via}/flood"))
+                .header("x-duck-authority", "capped.alice.duck")
+                .send()
+                .await
+                .expect("sized capped GET through the gateway")
+                .status()
+        }
+    });
+    assert_eq!(
+        sized_status,
+        reqwest::StatusCode::BAD_GATEWAY,
+        "a declared over-cap length is refused pre-head"
+    );
+
+    // Unsized overflow: the head commits, then the RUNNING cap truncates.
+    let (status, received) = rt.block_on(async move {
+        use futures::StreamExt as _;
+        let resp = reqwest::Client::new()
+            .get(format!("{via}/flood-chunked"))
+            .header("x-duck-authority", "capped.alice.duck")
+            .send()
+            .await
+            .expect("capped GET through the gateway");
+        let status = resp.status();
+        let mut received = 0usize;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => received += chunk.len(),
+                Err(_) => break, // aborted mid-body = the truncation contract
+            }
+        }
+        (status, received)
+    });
+    assert_eq!(status, reqwest::StatusCode::OK, "the head commits before the cap trips");
+    assert!(
+        received < 16 * CHUNK,
+        "the running cap must truncate the body ({received} bytes made it through)"
+    );
+}
+
+/// The credential-provider node EMBEDS the airlock gateway itself: with
+/// `DUCKTAPE_AIRLOCK_SERVE` set, the node runs the gateway in-process, registers
+/// its port as the `airlock` route, and seeds the credential from the configured
+/// file — no separate `airlock-gateway serve` / `gateway-route-bind` / seal steps.
+/// The client then self-serves through it exactly as above. Proves the node embed.
+///
+/// The non-CVM half of the embed contract, runnable on any box WITHOUT
+/// TDX/SNP silicon: a credential node whose embedded gateway cannot attest
+/// must FAIL BOOT loudly — no "listening" claim, no route registration, no
+/// half-alive node with a route pointing at a dead gateway.
+#[test]
+fn airlock_embed_without_tee_fails_boot_loudly() {
+    let _serial = serial();
+    let mut cluster = Cluster::new(&[0], &[0]);
+    cluster.wireguard = true;
+    cluster.wireguard_socket = true;
+    cluster.env[0] = vec![
+        ("DUCKTAPE_AIRLOCK_SERVE".into(), "1".into()),
+        ("DUCKTAPE_AIRLOCK_SERVE_ATTEST".into(), "auto".into()),
+    ];
+    cluster.spawn(0);
+    // The attest probe names the reason (configfs-tsm absent on a non-CVM box)…
+    let output = cluster.wait_marker(0, "are we inside a TDX/SEV-SNP guest", READY);
+    // …and the node must not have claimed the gateway is up before dying.
+    assert!(
+        !output.contains("airlock gateway listening"),
+        "a node that cannot attest must not claim its gateway listens: {output}"
+    );
+    cluster.wait_exit(0, READY);
+}
+
+/// HARDWARE-ONLY since mock attestation was deleted: the embedded gateway
+/// attests via configfs-tsm, so the node must run inside a TDX/SNP guest
+/// (task #26). On SNP hardware set AIRLOCK_E2E_SNP_PRODUCT=milan|genoa|turin.
+#[test]
+#[ignore = "needs TDX/SNP silicon: the embedded gateway attests via configfs-tsm (task #26)"]
+fn airlock_embedded_gateway_self_serves() {
+    let _serial = serial();
+    let rt = Runtime::new().unwrap();
+
+    // A mock Anthropic upstream that accepts ONLY the seeded static bearer.
+    let upstream = rt.block_on(async {
+        use axum::response::IntoResponse as _;
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|headers: axum::http::HeaderMap| async move {
+                let got = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if got != "Bearer test-access-token" {
+                    return (axum::http::StatusCode::UNAUTHORIZED, format!("got {got:?}"))
+                        .into_response();
+                }
+                ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+            }),
+        );
+        bind_and_serve(app).await
+    });
+
+    // The Claude credentials file the node seeds its static bearer from.
+    let creds = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    std::fs::write(
+        creds.path(),
+        r#"{"claudeAiOauth":{"accessToken":"test-access-token"}}"#,
+    )
+    .unwrap();
+
+    let mut cluster = Cluster::new(&[0], &[0]);
+    cluster.wireguard = true;
+    cluster.wireguard_socket = true;
+    // The node runs the airlock gateway itself — no external serve/bind/seal.
+    cluster.env[0] = vec![
+        ("DUCKTAPE_AIRLOCK_SERVE".into(), "1".into()),
+        ("DUCKTAPE_AIRLOCK_SERVE_ATTEST".into(), "auto".into()),
+        ("DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE".into(), upstream.clone()),
+        (
+            "DUCKTAPE_AIRLOCK_SERVE_CREDENTIALS".into(),
+            creds.path().to_str().unwrap().into(),
+        ),
+        ("DUCKTAPE_AIRLOCK_SERVE_CRED_KIND".into(), "bearer".into()),
+    ];
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", READY);
+    cluster.wait_marker(0, "converged app_hash=", READY);
+    cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
+    // the node's OWN airlock gateway came up + registered its route.
+    cluster.wait_marker(0, "airlock gateway listening", READY);
+
+    let alice = ed25519::PrivateKey::from_seed(42);
+    let alice_node = Cluster::identity(0);
+    cluster.submit(
+        0,
+        "identity",
+        &identity::encode_msg(&IdentityMsg::BindNode {
+            authorizer: bind_auth(&alice, &cluster.namespace, &alice_node),
+        }),
+    );
+    poll_until("identity binding", FINALIZE, || {
+        account_of_node(&cluster, 0, &alice_node)
+            .filter(|account| account.account_id == alice.public_key().as_ref())
+    });
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
+            handle: Some("alice".into()),
+        }),
+    );
+    poll_until("alice.duck resolution", FINALIZE, || {
+        resolve_handle(&cluster, 0, "alice")
+    });
+    // Publish the route (the one manual, signed operator act). The node already
+    // registered the port; this just signs the LoopbackHttp record.
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_airlock_route(&alice, &cluster.namespace, &alice_node, 1)),
+    );
+    poll_until("airlock route revision 1", FINALIZE, || {
+        (airlock_route_revision(&cluster, 0, alice.public_key().as_ref()) == Some(1)).then_some(())
+    });
+
+    let (status, browser) = cluster.http(0, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via = browser["base"].as_str().unwrap().to_string();
+
+    let reply = rt.block_on(async {
+        let gw = AirlockClient::remote("airlock.alice.duck".into(), via);
+        let (quote, vendor) = gw.fetch_quote().await.expect("fetch quote via embedded gateway");
+        // TOFU on first hardware run: pin the measurement the quote itself
+        // carries, then run the REAL vendor verify against pinned roots — the
+        // signature chain (not the pin) is what this lane proves.
+        let mode: airlock::attest::AttestMode = vendor.parse().expect("vendor mode");
+        let (mrtd_hex, _) = airlock::verify::peek_measurement(mode, &quote).expect("peek");
+        let expected = Measurement::from_hex(&mrtd_hex).unwrap();
+        let roots = match mode {
+            airlock::attest::AttestMode::Tdx => {
+                airlock::verify::TrustRoots::Tdx(airlock::verify::TdxRoots { pccs_url: None })
+            }
+            airlock::attest::AttestMode::Snp => {
+                let product = std::env::var("AIRLOCK_E2E_SNP_PRODUCT")
+                    .expect("snp hardware: set AIRLOCK_E2E_SNP_PRODUCT=milan|genoa|turin")
+                    .parse()
+                    .expect("snp product");
+                airlock::verify::TrustRoots::Snp(Box::new(
+                    airlock::verify::SnpRoots::amd(product, airlock::verify::VcekSource::Kds)
+                        .expect("snp roots"),
+                ))
+            }
+        };
+        let rd = airlock::verify::verify_quote(&quote, &expected, &roots)
+            .await
+            .expect("real vendor verify of the embedded gateway quote");
+        let seal_pk = attest::split_report_data(&rd).0;
         let token = gw
             .open_session(&seal_pk, "self")
             .await
-            .expect("handshake through the gateway");
+            .expect("handshake via embedded gateway");
         let resp = gw
             .route(gw.http().post(gw.url("/v1/messages")))
             .bearer_auth(&token)
@@ -493,15 +974,16 @@ fn airlock_single_node_self_serves_its_own_route() {
             .body(r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#)
             .send()
             .await
-            .expect("proxied messages through the gateway");
+            .expect("proxied messages via embedded gateway");
         let status = resp.status();
         let body = resp.text().await.unwrap();
         (status, body)
     });
 
-    assert_eq!(reply.0, reqwest::StatusCode::OK, "self-served proxied call: {reply:?}");
+    assert_eq!(reply.0, reqwest::StatusCode::OK, "embedded-gateway proxied call: {reply:?}");
     assert!(
         reply.1.contains("AIRLOCK-OK"),
-        "the swapped credential's reply must return: {reply:?}"
+        "the node-embedded gateway must swap the seeded credential and reply: {reply:?}"
     );
+    drop(creds); // keep the creds file alive until the node has read it
 }

@@ -38,7 +38,7 @@ use std::process::{Command, Stdio};
 use serde_json::json;
 use support::{AGENT_ID, Harness};
 
-/// exactly the tool args `crates/system/capability-host/specs/claude.toml`
+/// exactly the tool args `crates/modules/system/capability-host/specs/claude.toml`
 /// splices in after `-p`. if you change them there, change them here.
 const MCP_CONFIG: &str = r#"{"mcpServers":{"ducktape":{"command":"ducktape","args":["mcp"]}}}"#;
 

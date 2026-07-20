@@ -125,7 +125,6 @@ pub enum Change {
     Put {
         path: String,
         exec: bool,
-        #[serde(default)]
         meta: BTreeMap<String, String>,
         content: Content,
     },
@@ -223,7 +222,6 @@ pub struct EntryInfo {
     pub size: u64,
     pub exec: bool,
     pub object: DigestHex,
-    #[serde(default)]
     pub meta: BTreeMap<String, String>,
 }
 

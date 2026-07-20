@@ -39,7 +39,7 @@ use common::{Cluster, poll_until, serial};
 use directory::{DirMsg, DirQuery, DirReply};
 use forge::{ForgeMsg, ForgeQuery, ForgeReply};
 use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
-use upgrade::{UpgradeQuery, UpgradeReply, UpgradeStatus};
+use lifecycle::{LifecycleQuery, LifecycleReply, UpgradeStatus};
 
 /// convergence / boundary-crossing budget: mesh formation, readiness rounds, and
 /// filler-driven view advancement are real-time on a loaded CI core; polls exit
@@ -87,10 +87,12 @@ fn forge_head(cluster: &Cluster, idx: usize, repo: &str) -> Option<String> {
 fn upgrade_status(cluster: &Cluster, idx: usize) -> Option<UpgradeStatus> {
     let reply = cluster.query(
         idx,
-        "upgrade",
-        &upgrade::encode_query(&UpgradeQuery::Status),
+        "lifecycle",
+        &lifecycle::encode_query(&LifecycleQuery::UpgradeStatus),
     )?;
-    let UpgradeReply::Status(st) = upgrade::decode_reply(&reply).ok()?;
+    let LifecycleReply::UpgradeStatus(st) = lifecycle::decode_reply(&reply).ok()? else {
+        return None;
+    };
     Some(st)
 }
 

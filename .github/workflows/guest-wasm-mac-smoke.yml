@@ -14,8 +14,8 @@ on:
     paths:
       - ".github/workflows/guest-wasm-mac-smoke.yml"
       - "patches/blst/**"
-      - "crates/examples/identity-wasm/**"
-      - "crates/examples/guest-adapter/**"
+      - "crates/guests/identity-wasm/**"
+      - "crates/guests/guest-adapter/**"
 
 concurrency:
   group: guest-wasm-mac-smoke-${{ github.ref }}
@@ -52,14 +52,14 @@ jobs:
           rustc -vV
 
       - name: build identity-wasm (no C toolchain)
-        working-directory: crates/examples/identity-wasm
+        working-directory: crates/guests/identity-wasm
         run: cargo build --target wasm32-unknown-unknown --release
 
       - name: install wasm-tools
         run: cargo install wasm-tools --locked
 
       - name: componentize
-        working-directory: crates/examples/identity-wasm
+        working-directory: crates/guests/identity-wasm
         run: |
           wasm-tools component new \
             target/wasm32-unknown-unknown/release/identity_wasm.wasm \
@@ -68,7 +68,7 @@ jobs:
             "$RUNNER_TEMP/identity.component.wasm"
 
       - name: assert blst dead-stripped
-        working-directory: crates/examples/identity-wasm
+        working-directory: crates/guests/identity-wasm
         run: |
           wasm-tools print \
             target/wasm32-unknown-unknown/release/identity_wasm.wasm \

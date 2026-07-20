@@ -43,20 +43,22 @@ fn route_record(publisher: [u8; 32]) -> gateway::RouteRecord {
 async fn ws_side_door_mints_consumes_and_bridges_to_the_lane() {
     let (handle, mut cmd_rx, _events) = NodeHandle::channel();
 
-    // Fake actor: resolve the duck authority (duckdns) and the route (gateway).
+    // Fake actor: the merged gateway module answers both the handle authority
+    // Resolve and the route Get, dispatched by query variant.
     tokio::spawn(async move {
         while let Some(command) = cmd_rx.next().await {
-            if let NodeCommand::Query { target, reply, .. } = command {
-                let bytes = match target.as_str() {
-                    "duckdns" => duckdns::encode_reply(&duckdns::DuckDnsReply::Resolved(Some(
-                        duckdns::ResolvedAccount {
+            if let NodeCommand::Query { target, req, reply } = command {
+                assert_eq!(target, "gateway");
+                let bytes = match gateway::decode_query(&req).unwrap() {
+                    gateway::GatewayQuery::Resolve { .. } => gateway::encode_reply(
+                        &gateway::GatewayReply::Resolved(Some(gateway::ResolvedAccount {
                             account_id: vec![1; 32],
-                        },
-                    ))),
-                    "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(
-                        Some(route_record([2u8; 32])),
-                    ))),
-                    other => panic!("unexpected query target {other}"),
+                        })),
+                    ),
+                    gateway::GatewayQuery::Get { .. } => gateway::encode_reply(
+                        &gateway::GatewayReply::Route(Box::new(Some(route_record([2u8; 32])))),
+                    ),
+                    other => panic!("unexpected query {other:?}"),
                 };
                 let _ = reply.send(Ok(bytes));
             }

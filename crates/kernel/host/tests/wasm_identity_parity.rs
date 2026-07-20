@@ -37,7 +37,7 @@ use sha2::{Digest as _, Sha256};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/examples/identity-wasm` by the
+/// GENERATED artifact — built from `crates/guests/identity-wasm` by the
 /// module build target; committed so this proof is self-contained.
 const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/identity.component.wasm");
 
@@ -53,7 +53,7 @@ fn wasm_identity_with_chain(chain_id: &str) -> WasmModule {
         .expect("load component")
         // the adapter port's host-KV snapshot is revision 2 of the identity
         // canonical state.
-        .with_state_schema_revision(2);
+        .with_state_schema_revision(3);
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
     module.install(&bytes, root).expect("install genesis config");

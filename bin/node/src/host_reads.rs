@@ -37,22 +37,23 @@ pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the clients module's current CLIENT set (committed state — called
-/// between drains, outside any block). the submit door admits a client's
-/// own-signed frame; this is a SEPARATE read from the valset residents (the
-/// clients module is deliberately not valset), so a client's standing can never
-/// leak into the statesync/mesh reads keyed off valset.
+/// read the current CLIENT set — the submit-door ACL, now a facet of the
+/// identity account plane (committed state — called between drains, outside any
+/// block). the submit door admits a client's own-signed frame; this is a
+/// SEPARATE read from the valset residents (client standing is structurally
+/// distinct from valset), so a client's standing can never leak into the
+/// statesync/mesh reads keyed off valset.
 pub(crate) async fn read_clients(host: &Host) -> Vec<Vec<u8>> {
-    use clients::{ClientsQuery, ClientsReply, decode_reply, encode_query};
+    use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
     let Ok(reply) = host
-        .query("clients", &encode_query(&ClientsQuery::Clients))
+        .query("identity", &encode_query(&IdentityQuery::Clients))
         .await
     else {
         return Vec::new();
     };
     match decode_reply(&reply) {
-        Ok(ClientsReply::Clients(v)) => v,
-        Err(_) => Vec::new(),
+        Ok(IdentityReply::Clients(v)) => v,
+        _ => Vec::new(),
     }
 }
 
@@ -94,10 +95,10 @@ pub(crate) fn joiner_epoch_mesh(
 /// (pre-retrofit) or the reply is unreadable, so this never forks on a decode slip
 /// — matching `Host::effective_version`'s graceful fallback.
 pub(crate) async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrade<ed25519::PublicKey> {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
     let baseline = || consensus::BoundaryUpgrade::baseline(host::BASELINE_VERSION);
     let Ok(reply) = host
-        .query("upgrade", &encode_query(&UpgradeQuery::Status))
+        .query(host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus))
         .await
     else {
         return baseline();
@@ -106,7 +107,9 @@ pub(crate) async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrad
         Ok(r) => r,
         Err(_) => return baseline(),
     };
-    let UpgradeReply::Status(status) = reply;
+    let LifecycleReply::UpgradeStatus(status) = reply else {
+        return baseline();
+    };
     let pending = status.pending.map(|up| {
         let ready: std::collections::BTreeSet<ed25519::PublicKey> = status
             .ready
@@ -134,10 +137,10 @@ pub(crate) async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrad
 /// committed read (not the raw orchestrator state) means a checkpoint captures the
 /// same fields a live node would derive at that height.
 pub(crate) async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCoords>) {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
     let baseline = (host::BASELINE_VERSION, None);
     let Ok(reply) = host
-        .query("upgrade", &encode_query(&UpgradeQuery::Status))
+        .query(host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus))
         .await
     else {
         return baseline;
@@ -146,7 +149,9 @@ pub(crate) async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk
         Ok(r) => r,
         Err(_) => return baseline,
     };
-    let UpgradeReply::Status(status) = reply;
+    let LifecycleReply::UpgradeStatus(status) = reply else {
+        return baseline;
+    };
     let pending = status.pending.map(|up| sdk::UpgradeCoords {
         name: up.name,
         activation_height: up.activation_height,
@@ -159,19 +164,21 @@ pub(crate) async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk
 /// between drains). `None` when the module is absent (pre-retrofit) or the reply
 /// is unreadable — so the transition-marker latches degrade to silent on a
 /// baseline net, never panicking.
-pub(crate) async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade::UpgradeStatus> {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+pub(crate) async fn read_upgrade_status_raw(host: &Host) -> Option<lifecycle::UpgradeStatus> {
+    use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
     let reply = host
-        .query("upgrade", &encode_query(&UpgradeQuery::Status))
+        .query(host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus))
         .await
         .ok()?;
-    let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
+    let LifecycleReply::UpgradeStatus(status) = decode_reply(&reply).ok()? else {
+        return None;
+    };
     Some(status)
 }
 
 /// Stable node-owned projection of the upgrade module's committed status.
 pub(crate) fn upgrade_operations(
-    status: &upgrade::UpgradeStatus,
+    status: &lifecycle::UpgradeStatus,
     local_validator: Option<&ed25519::PublicKey>,
 ) -> noded::UpgradeOperationalStatus {
     let locally_ready = status.pending.as_ref().and_then(|_| {
@@ -262,9 +269,9 @@ mod tests {
     fn upgrade_projection_identifies_this_validators_readiness() {
         let ready = ed25519::PrivateKey::from_seed(1).public_key();
         let waiting = ed25519::PrivateKey::from_seed(2).public_key();
-        let status = upgrade::UpgradeStatus {
+        let status = lifecycle::UpgradeStatus {
             current_version: 1,
-            pending: Some(upgrade::ScheduledUpgrade {
+            pending: Some(lifecycle::ScheduledUpgrade {
                 name: "v2".into(),
                 activation_height: 50,
                 to_version: 2,

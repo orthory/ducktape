@@ -1,6 +1,6 @@
 //! M-of-N multisig coordination for external-chain (EVM) transactions.
 //!
-//! Named `multisig`, not `vault`: `crates/apps/vaults` already exists and is a
+//! Named `multisig`, not `vault`: `crates/modules/apps/vaults` already exists and is a
 //! different thing (client-sealed team secrets). The product surface still
 //! calls this a Vault.
 //!

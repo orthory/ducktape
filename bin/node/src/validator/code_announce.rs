@@ -1,8 +1,8 @@
-//! the node-local worker behind modreg's byte-receipt gate: the state-driven
+//! the node-local worker behind lifecycle's code-swap byte-receipt gate: the state-driven
 //! twin of [`super::announce::ReadinessSignaller`] for CODE swaps.
 //!
-//! it polls COMMITTED modreg state each pump tick and, per pending swap,
-//! drives this validator to a truthful `ModregMsg::SignalReady`:
+//! it polls COMMITTED lifecycle module state each pump tick and, per pending swap,
+//! drives this validator to a truthful `LifecycleMsg::SwapReady`:
 //!
 //! - bytes verified-resident in the local store → self-submit ONE signal
 //!   (latched locally; the module's committed readiness set keeps it
@@ -32,7 +32,6 @@ pub(crate) struct CodeReadinessSignaller {
     /// digests a fetch is already running for — cleared by the pump when a
     /// fetch task finishes (either way), so a failed fetch retries next tick.
     pub(crate) fetching: BTreeSet<[u8; 32]>,
-    signal_enabled: bool,
 }
 
 /// what one pump tick should do: signals to submit, fetches to spawn.
@@ -48,25 +47,17 @@ impl CodeReadinessSignaller {
             me,
             signaled: BTreeSet::new(),
             fetching: BTreeSet::new(),
-            signal_enabled: true,
         }
     }
 
-    /// Preserve the healing fetch lane while suppressing `SignalReady`, which
-    /// protocol-v1 validators cannot decode and do not require for activation.
-    pub(crate) fn fetch_only(mut self) -> Self {
-        self.signal_enabled = false;
-        self
-    }
-
-    /// the PURE decision core: given committed modreg status and a local
+    /// the PURE decision core: given committed lifecycle module status and a local
     /// residency check, decide this tick's signals and fetches. truthful
     /// (signals only verified-resident bytes), idempotent (committed
     /// readiness, the in-flight latch, and the fetch dedupe all short-
     /// circuit), and quiet once a swap is `ready`.
     pub(crate) fn decide(
         &mut self,
-        modules: &[modreg::ModuleCode],
+        modules: &[lifecycle::ModuleCode],
         resident: impl Fn(&[u8; 32]) -> bool,
     ) -> CodeActions {
         let mut actions = CodeActions::default();
@@ -88,17 +79,15 @@ impl CodeReadinessSignaller {
                 continue; // malformed hash can never verify — stay silent.
             };
             if resident(&digest) {
-                if self.signal_enabled {
-                    self.signaled.insert(key.clone());
-                    let msg = Msg {
-                        target: host::MODREG_MODULE_ID.into(),
-                        payload: modreg::encode_msg(&modreg::ModregMsg::SignalReady {
-                            name: key.1.clone(),
-                            module_id: key.0.clone(),
-                        }),
-                    };
-                    actions.signals.push((key, msg));
-                }
+                self.signaled.insert(key.clone());
+                let msg = Msg {
+                    target: host::LIFECYCLE_MODULE_ID.into(),
+                    payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::SwapReady {
+                        name: key.1.clone(),
+                        module_id: key.0.clone(),
+                    }),
+                };
+                actions.signals.push((key, msg));
             } else if self.fetching.insert(digest) {
                 actions.fetches.push(digest);
             }
@@ -126,11 +115,11 @@ mod tests {
         hash: u8,
         ready: bool,
         signed: &[Vec<u8>],
-    ) -> modreg::ModuleCode {
-        modreg::ModuleCode {
+    ) -> lifecycle::ModuleCode {
+        lifecycle::ModuleCode {
             module_id: module.into(),
             active_code_hash: vec![0; 32],
-            pending: Some(modreg::ScheduledSwap {
+            pending: Some(lifecycle::ScheduledSwap {
                 name: name.into(),
                 activation_height: 10,
                 code_hash: vec![hash; 32],
@@ -166,24 +155,6 @@ mod tests {
     }
 
     #[test]
-    fn native_v1_fetch_only_mode_heals_missing_bytes_without_signalling() {
-        let mut s = CodeReadinessSignaller::new(me()).fetch_only();
-        let modules = [
-            pending("held", "v2", 1, false, &[]),
-            pending("missing", "v2", 2, false, &[]),
-        ];
-        let actions = s.decide(&modules, |digest| digest == &[1; 32]);
-        assert!(actions.signals.is_empty());
-        assert_eq!(actions.fetches, vec![[2; 32]]);
-        assert!(
-            s.decide(&modules, |digest| digest == &[1; 32])
-                .fetches
-                .is_empty(),
-            "deduped"
-        );
-    }
-
-    #[test]
     fn committed_readiness_and_ready_latch_keep_quiet() {
         let mut s = CodeReadinessSignaller::new(me());
         // our signal already committed: silent.
@@ -194,7 +165,7 @@ mod tests {
         let acts = s.decide(&armed, |_| true);
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());
         // no pending at all: silent.
-        let idle = vec![modreg::ModuleCode {
+        let idle = vec![lifecycle::ModuleCode {
             module_id: "c".into(),
             active_code_hash: vec![0; 32],
             pending: None,
