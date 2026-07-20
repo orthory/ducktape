@@ -17,20 +17,38 @@ use crate::aead;
 use crate::seal::SealKeypair;
 
 const SESSION_LABEL: &[u8] = b"airlock-session-v1";
+const BODY_LABEL: &[u8] = b"airlock-body-v1";
+
+/// Both keys the handshake yields: `session` wraps the token handoff; `body`
+/// roots the broker<->enclave body AEAD (`bodyseal`). Same ECDH secret, two
+/// HKDF labels — the enclave re-derives both statelessly from the ephemeral
+/// public key the token claims carry.
+#[derive(Clone)]
+pub struct SessionKeys {
+    pub session: [u8; 32],
+    pub body: [u8; 32],
+}
+
+fn derive_keys(shared: &[u8; 32]) -> SessionKeys {
+    SessionKeys {
+        session: aead::hkdf32(shared, SESSION_LABEL),
+        body: aead::hkdf32(shared, BODY_LABEL),
+    }
+}
 
 /// Client side: given the enclave's attested `seal_pk`, produce this session's
-/// ephemeral public key (sent to the enclave) and the shared session key.
-pub fn client_handshake(seal_pk: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+/// ephemeral public key (sent to the enclave) and the shared keys.
+pub fn client_handshake(seal_pk: &[u8; 32]) -> ([u8; 32], SessionKeys) {
     let eph = StaticSecret::random_from_rng(rand_core::OsRng);
     let eph_pk = PublicKey::from(&eph).to_bytes();
     let shared = eph.diffie_hellman(&PublicKey::from(*seal_pk));
-    (eph_pk, aead::hkdf32(shared.as_bytes(), SESSION_LABEL))
+    (eph_pk, derive_keys(shared.as_bytes()))
 }
 
-/// Enclave side: derive the same session key from the client's ephemeral public
-/// key using the enclave's static seal secret.
-pub fn enclave_session_key(seal_kp: &SealKeypair, client_eph_pk: &[u8; 32]) -> [u8; 32] {
-    aead::hkdf32(&seal_kp.ecdh(client_eph_pk), SESSION_LABEL)
+/// Enclave side: derive the same keys from the client's ephemeral public key
+/// using the enclave's static seal secret.
+pub fn enclave_session_keys(seal_kp: &SealKeypair, client_eph_pk: &[u8; 32]) -> SessionKeys {
+    derive_keys(&seal_kp.ecdh(client_eph_pk))
 }
 
 /// AEAD-wrap a token under the session key.
@@ -51,34 +69,36 @@ mod tests {
         let enclave = SealKeypair::generate();
         let seal_pk = enclave.public_bytes();
 
-        let (client_eph_pk, client_key) = client_handshake(&seal_pk);
-        let enclave_key = enclave_session_key(&enclave, &client_eph_pk);
-        assert_eq!(client_key, enclave_key, "ECDH must agree");
+        let (client_eph_pk, client_keys) = client_handshake(&seal_pk);
+        let enclave_keys = enclave_session_keys(&enclave, &client_eph_pk);
+        assert_eq!(client_keys.session, enclave_keys.session, "ECDH must agree");
+        assert_eq!(client_keys.body, enclave_keys.body, "body key must agree too");
+        assert_ne!(client_keys.session, client_keys.body, "labels must separate the keys");
 
-        let blob = seal_token(&enclave_key, b"scoped.session.token");
-        assert_eq!(open_token(&client_key, &blob).unwrap(), b"scoped.session.token");
+        let blob = seal_token(&enclave_keys.session, b"scoped.session.token");
+        assert_eq!(open_token(&client_keys.session, &blob).unwrap(), b"scoped.session.token");
     }
 
     #[test]
     fn a_different_client_key_cannot_open() {
         let enclave = SealKeypair::generate();
-        let (client_eph_pk, _client_key) = client_handshake(&enclave.public_bytes());
-        let enclave_key = enclave_session_key(&enclave, &client_eph_pk);
-        let blob = seal_token(&enclave_key, b"secret-token");
+        let (client_eph_pk, _client_keys) = client_handshake(&enclave.public_bytes());
+        let enclave_keys = enclave_session_keys(&enclave, &client_eph_pk);
+        let blob = seal_token(&enclave_keys.session, b"secret-token");
 
         // A client that did its own handshake gets a different key.
-        let (_other_eph, other_key) = client_handshake(&enclave.public_bytes());
-        assert!(open_token(&other_key, &blob).is_err());
+        let (_other_eph, other_keys) = client_handshake(&enclave.public_bytes());
+        assert!(open_token(&other_keys.session, &blob).is_err());
     }
 
     #[test]
     fn tampered_sealed_token_rejected() {
         let enclave = SealKeypair::generate();
-        let (client_eph_pk, client_key) = client_handshake(&enclave.public_bytes());
-        let enclave_key = enclave_session_key(&enclave, &client_eph_pk);
-        let mut blob = seal_token(&enclave_key, b"secret-token");
+        let (client_eph_pk, client_keys) = client_handshake(&enclave.public_bytes());
+        let enclave_keys = enclave_session_keys(&enclave, &client_eph_pk);
+        let mut blob = seal_token(&enclave_keys.session, b"secret-token");
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
-        assert!(open_token(&client_key, &blob).is_err());
+        assert!(open_token(&client_keys.session, &blob).is_err());
     }
 }

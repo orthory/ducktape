@@ -15,6 +15,12 @@ pub struct Claims {
     pub iat: u64,
     pub exp: u64,
     pub max_requests: u32,
+    /// base64url of the session's client ephemeral X25519 pk — the enclave
+    /// re-derives the handshake keys from it statelessly per request.
+    pub eph: String,
+    /// Sealed-body session: the enclave REFUSES unsealed `/v1` bodies, so a
+    /// stolen bearer alone (visible to path hosts) is useless.
+    pub seal: bool,
 }
 
 pub fn issue(sess_sk: &SigningKey, claims: &Claims) -> String {
@@ -48,7 +54,14 @@ mod tests {
     use rand_core::OsRng;
 
     fn claims() -> Claims {
-        Claims { sub: "demo".into(), iat: 100, exp: 200, max_requests: 5 }
+        Claims {
+            sub: "demo".into(),
+            iat: 100,
+            exp: 200,
+            max_requests: 5,
+            eph: "AAAA".into(),
+            seal: true,
+        }
     }
 
     #[test]
@@ -65,7 +78,9 @@ mod tests {
         let (_, sig) = tok.split_once('.').unwrap();
         let forged = format!(
             "{}.{sig}",
-            URL_SAFE_NO_PAD.encode(br#"{"sub":"attacker","iat":100,"exp":200,"max_requests":999}"#)
+            URL_SAFE_NO_PAD.encode(
+                br#"{"sub":"attacker","iat":100,"exp":200,"max_requests":999,"eph":"AAAA","seal":false}"#
+            )
         );
         assert!(verify(&sk.verifying_key(), &forged).is_err());
     }

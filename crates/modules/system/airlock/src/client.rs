@@ -73,12 +73,33 @@ impl Gateway {
     /// return the scoped session token. ECDHs the attested key, so the token can
     /// only be opened by this client — a relaying node cannot read it.
     pub async fn open_session(&self, seal_pk: &[u8; 32], sub: &str) -> Result<String> {
-        let (client_eph_pk, session_key) = handshake::client_handshake(seal_pk);
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false).await?;
+        Ok(token)
+    }
+
+    /// Sealed-body session: bodies must be AEAD'd under the returned keys
+    /// (`bodyseal`); the enclave refuses plaintext on this token.
+    pub async fn open_session_sealed(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+    ) -> Result<(String, handshake::SessionKeys)> {
+        self.open_session_with(seal_pk, sub, true).await
+    }
+
+    async fn open_session_with(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+        body_seal: bool,
+    ) -> Result<(String, handshake::SessionKeys)> {
+        let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
         let resp: SessionResponse = self
             .route(self.http.post(self.url("/session")))
             .json(&SessionRequest {
                 sub: sub.to_string(),
                 client_eph_pk_b64: BASE64.encode(client_eph_pk),
+                body_seal,
             })
             .send()
             .await?
@@ -86,10 +107,10 @@ impl Gateway {
             .json()
             .await?;
         let sealed = BASE64.decode(&resp.sealed_token_b64).context("sealed token base64")?;
-        let token = handshake::open_token(&session_key, &sealed).context(
+        let token = handshake::open_token(&keys.session, &sealed).context(
             "open session token (handshake key mismatch — quote not from the real enclave?)",
         )?;
-        String::from_utf8(token).context("session token was not utf-8")
+        Ok((String::from_utf8(token).context("session token was not utf-8")?, keys))
     }
 
     /// Seal `payload` (a refresh token or a static bearer) to the ALREADY-VERIFIED

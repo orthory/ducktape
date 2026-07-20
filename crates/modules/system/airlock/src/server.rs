@@ -301,7 +301,7 @@ async fn session(
         .ok()
         .and_then(|v| <[u8; 32]>::try_from(v).ok())
         .ok_or_else(|| AppErr(StatusCode::BAD_REQUEST, "bad client_eph_pk".into()))?;
-    let session_key = handshake::enclave_session_key(&st.seal_kp, &eph);
+    let keys = handshake::enclave_session_keys(&st.seal_kp, &eph);
 
     let now = now_secs();
     let claims = Claims {
@@ -309,10 +309,12 @@ async fn session(
         iat: now,
         exp: now + st.cfg.session_ttl_secs,
         max_requests: st.cfg.max_requests,
+        eph: req.client_eph_pk_b64.clone(),
+        seal: req.body_seal,
     };
     st.budgets.lock().unwrap().insert(req.sub, st.cfg.max_requests);
     let token = token::issue(&st.sess_sk, &claims);
-    let sealed = handshake::seal_token(&session_key, token.as_bytes());
+    let sealed = handshake::seal_token(&keys.session, token.as_bytes());
     Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
 }
 
