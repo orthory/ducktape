@@ -28,6 +28,11 @@
 #                      ducktape:module world binding they all share)
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
 #                      canary), greeter (the types-only composition example)
+#   crates/labs/     — quarantined experimental consensus modules (evm,
+#                      multisig): in-tree and tested but registered by NO
+#                      genesis set. EXCLUDED from the workspace as its own
+#                      standalone crate so its heavy deps (revm, alloy) never
+#                      tax the shipping build; gated via `make labs-gate`
 #   bin/             — demo (in-process walkthrough), node (validator),
 #                      noded (the app-facing daemon), simnode (deterministic
 #                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)
@@ -83,14 +88,16 @@ members = [
     "crates/modules/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
-    # labs — consensus modules deliberately absent from every genesis set
-    "crates/labs",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/fs",
     "bin/mcp",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
 ]
+# labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
+# its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
+# the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
+exclude = ["crates/labs"]
 
 [workspace.package]
 edition = "2024"
@@ -109,8 +116,9 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-revm = { version = "41", default-features = false, features = ["std"] }
-alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
+# revm + alloy-primitives are NOT here on purpose: they are quarantined as
+# direct pinned deps in crates/labs/Cargo.toml (the standalone labs crate), so
+# the shipping workspace never builds the EVM dep tree. See labs-gate.
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
@@ -216,7 +224,6 @@ agent = { path = "crates/modules/apps/agent" }
 runs = { path = "crates/modules/apps/runs" }
 tasks = { path = "crates/modules/apps/tasks" }
 vaults = { path = "crates/modules/apps/vaults" }
-labs = { path = "crates/labs" }
 automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
