@@ -11,7 +11,6 @@
 
 mod frames;
 mod interface;
-mod legacy;
 mod manifest;
 mod module;
 mod proxy;
@@ -19,7 +18,6 @@ mod registry;
 
 pub use frames::*;
 pub use interface::*;
-pub use legacy::LegacyGateway;
 pub use manifest::*;
 pub use module::Gateway;
 pub use proxy::*;
