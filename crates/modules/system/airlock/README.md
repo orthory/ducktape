@@ -114,6 +114,25 @@ non-zero cap is enforced as a RUNNING total (declared over-length refused
 before the head; unsized overflow truncates the body mid-stream). The
 request-body admission ceiling is 16 MiB.
 
+## Body AEAD (sealed sessions)
+
+Airlock sessions are **sealed-body** (2026-07-20): the broker seals request
+bodies and unseals response streams under keys derived from the same handshake
+ECDH (`bodyseal`; per-stream salted key, counter nonces, authenticated Final
+marker). Consequences:
+
+- **Path hosts see ciphertext** — including the credential-provider's node
+  process OUTSIDE the enclave (`proxy_loopback` relays opaque bytes), closing
+  the "operator reads conversation content" gap.
+- **A stolen bearer alone is useless**: the enclave refuses plaintext bodies
+  on a sealed session, and a plaintext success reply is refused by the broker
+  as forgery. Missing Final marker = authenticated truncation (aborts, never a
+  clean EOF).
+- The sandbox is unmodified — the broker terminates the AEAD.
+- Session revocation = gateway restart (the token-signing and seal keys are
+  memory-only, so every outstanding token and body key dies with the process);
+  a per-sub revocation endpoint waits for real multi-tenancy.
+
 ## Session-key handshake
 
 The client reads the gateway's `seal_pk` out of the **verified** quote REPORTDATA,
