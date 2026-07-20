@@ -32,7 +32,8 @@ use crate::{NodeCommand, NodeHandle, error_response};
 /// because it has no authenticated network transport. `publisher_node` and the
 /// caps are derived from the locally finalized RouteRecord, never client input.
 pub enum GatewayJob {
-    /// A bounded HTTP exchange: one request, one buffered response.
+    /// One HTTP exchange: one request, a streamed response (head at reply
+    /// time, body chunks over the bounded channel).
     Http {
         publisher_node: [u8; 32],
         max_response_bytes: u64,
@@ -50,10 +51,25 @@ pub enum GatewayJob {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A streamed response body: `Ok` chunks until the sender closes (end of
+/// body) or an `Err` item (mid-stream failure -> the relay aborts). Bounded,
+/// so the paced overlay stream backpressures the upstream.
+pub type GatewayBody = tokio::sync::mpsc::Receiver<Result<bytes::Bytes, GatewayFailure>>;
+
+#[derive(Debug)]
 pub struct GatewayResponse {
     pub head: gateway::ProxyResponseHead,
-    pub body: Vec<u8>,
+    pub body: GatewayBody,
+}
+
+/// Collect a streamed body to completion — the buffered-by-contract consumers
+/// (the JSON proxy lane) and tests use this; the streaming door does not.
+pub async fn collect_body(body: &mut GatewayBody) -> Result<Vec<u8>, GatewayFailure> {
+    let mut out = Vec::new();
+    while let Some(item) = body.recv().await {
+        out.extend_from_slice(&item?);
+    }
+    Ok(out)
 }
 
 /// One WebSocket message crossing the browser↔mesh boundary on the caller
@@ -233,11 +249,6 @@ async fn proxy_current(
         .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
         .map_err(|_| GatewayFailure::Unavailable("gateway plane dropped the request".into()))??;
     gateway::validate_response_head(&response.head).map_err(GatewayFailure::Unavailable)?;
-    if response.body.len() as u64 > max_response_bytes {
-        return Err(GatewayFailure::Unavailable(
-            "publisher exceeded the route response cap".into(),
-        ));
-    }
     Ok(response)
 }
 
@@ -257,11 +268,15 @@ pub(crate) async fn gateway_proxy(
         }
     };
     match proxy_current(&handle, request.head, body).await {
-        Ok(response) => Json(GatewayProxyReply {
-            head: response.head,
-            body_b64: base64::engine::general_purpose::STANDARD.encode(response.body),
-        })
-        .into_response(),
+        // The JSON lane is buffered BY CONTRACT (body_b64); collect the stream.
+        Ok(mut response) => match collect_body(&mut response.body).await {
+            Ok(body) => Json(GatewayProxyReply {
+                head: response.head,
+                body_b64: base64::engine::general_purpose::STANDARD.encode(body),
+            })
+            .into_response(),
+            Err(failure) => gateway_failure_response(failure),
+        },
         Err(failure) => gateway_failure_response(failure),
     }
 }
@@ -539,7 +554,14 @@ async fn gateway_browser_proxy(
     {
         Body::empty()
     } else {
-        Body::from(response.body)
+        // Streamed relay: chunks flow to the browser as the publisher sends
+        // them; a mid-stream failure aborts the response body (truncation),
+        // which is the standard proxy contract once the head is committed.
+        use futures::StreamExt as _;
+        Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(response.body)
+                .map(|item| item.map_err(|failure| std::io::Error::other(format!("{failure:?}")))),
+        )
     };
     builder
         .body(body)

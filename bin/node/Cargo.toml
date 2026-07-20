@@ -84,6 +84,7 @@ data-plane = { workspace = true }
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }
 futures = "0.3"
+bytes = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
