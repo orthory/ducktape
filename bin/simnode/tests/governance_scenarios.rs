@@ -453,8 +453,8 @@ fn a_client_role_invite_grants_client_standing_not_residency_and_is_single_use()
         Some("relay"),
     );
 
-    // client standing is granted — queryable in the clients module.
-    let clients = sim.query("clients", json!("clients"));
+    // client standing is granted — queryable via identity's client facet.
+    let clients = sim.query("identity", json!("clients"));
     assert!(
         has_key(&clients["clients"], client.public_key().as_ref()),
         "joiner holds client standing: {clients}"
@@ -557,7 +557,7 @@ fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
         ),
         Some("relay"),
     );
-    let clients = sim.query("clients", json!("clients"));
+    let clients = sim.query("identity", json!("clients"));
     assert!(
         has_key(&clients["clients"], a.public_key().as_ref()),
         "first redeemer holds client standing: {clients}"
@@ -586,7 +586,7 @@ fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
         error.contains("already redeemed"),
         "single-use first-wins: {error}"
     );
-    let clients = sim.query("clients", json!("clients"));
+    let clients = sim.query("identity", json!("clients"));
     assert!(
         !has_key(&clients["clients"], b.public_key().as_ref()),
         "the loser gained nothing: {clients}"
@@ -630,7 +630,7 @@ fn a_bearer_resident_invite_is_rejected_as_client_only() {
         !has_key(&residents["residents"], joiner.public_key().as_ref()),
         "no resident standing granted: {residents}"
     );
-    let clients = sim.query("clients", json!("clients"));
+    let clients = sim.query("identity", json!("clients"));
     assert!(
         !has_key(&clients["clients"], joiner.public_key().as_ref()),
         "no client standing granted: {clients}"

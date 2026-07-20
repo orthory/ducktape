@@ -32,7 +32,6 @@ pub(crate) struct CodeReadinessSignaller {
     /// digests a fetch is already running for — cleared by the pump when a
     /// fetch task finishes (either way), so a failed fetch retries next tick.
     pub(crate) fetching: BTreeSet<[u8; 32]>,
-    signal_enabled: bool,
 }
 
 /// what one pump tick should do: signals to submit, fetches to spawn.
@@ -48,15 +47,7 @@ impl CodeReadinessSignaller {
             me,
             signaled: BTreeSet::new(),
             fetching: BTreeSet::new(),
-            signal_enabled: true,
         }
-    }
-
-    /// Preserve the healing fetch lane while suppressing `SignalReady`, which
-    /// protocol-v1 validators cannot decode and do not require for activation.
-    pub(crate) fn fetch_only(mut self) -> Self {
-        self.signal_enabled = false;
-        self
     }
 
     /// the PURE decision core: given committed lifecycle module status and a local
@@ -88,17 +79,15 @@ impl CodeReadinessSignaller {
                 continue; // malformed hash can never verify — stay silent.
             };
             if resident(&digest) {
-                if self.signal_enabled {
-                    self.signaled.insert(key.clone());
-                    let msg = Msg {
-                        target: host::LIFECYCLE_MODULE_ID.into(),
-                        payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::SwapReady {
-                            name: key.1.clone(),
-                            module_id: key.0.clone(),
-                        }),
-                    };
-                    actions.signals.push((key, msg));
-                }
+                self.signaled.insert(key.clone());
+                let msg = Msg {
+                    target: host::LIFECYCLE_MODULE_ID.into(),
+                    payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::SwapReady {
+                        name: key.1.clone(),
+                        module_id: key.0.clone(),
+                    }),
+                };
+                actions.signals.push((key, msg));
             } else if self.fetching.insert(digest) {
                 actions.fetches.push(digest);
             }
@@ -163,24 +152,6 @@ mod tests {
         let acts = s.decide(&modules, |_| true);
         assert_eq!(acts.signals.len(), 1);
         assert_eq!(acts.signals[0].0, ("missing".into(), "v2".into()));
-    }
-
-    #[test]
-    fn native_v1_fetch_only_mode_heals_missing_bytes_without_signalling() {
-        let mut s = CodeReadinessSignaller::new(me()).fetch_only();
-        let modules = [
-            pending("held", "v2", 1, false, &[]),
-            pending("missing", "v2", 2, false, &[]),
-        ];
-        let actions = s.decide(&modules, |digest| digest == &[1; 32]);
-        assert!(actions.signals.is_empty());
-        assert_eq!(actions.fetches, vec![[2; 32]]);
-        assert!(
-            s.decide(&modules, |digest| digest == &[1; 32])
-                .fetches
-                .is_empty(),
-            "deduped"
-        );
     }
 
     #[test]

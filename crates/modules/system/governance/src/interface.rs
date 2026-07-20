@@ -143,7 +143,7 @@ pub enum GovMsg {
     /// via the redeemed-nonce set in consensus state. success emits the
     /// role's grant in the same block: `Resident` → `ValsetMsg::Grant`
     /// (full node standing — mesh + statesync, no quorum seat), `Client` →
-    /// `ClientsMsg::Grant` (submit authorization only).
+    /// `IdentityMsg::GrantClient` (submit authorization only).
     Redeem {
         issuer: Vec<u8>,
         nonce: Vec<u8>,
@@ -152,7 +152,7 @@ pub enum GovMsg {
         proof: Vec<u8>,
         /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
         /// redeem grants valset resident standing; a `Client` redeem grants
-        /// submit-only client standing in the `clients` module. EVERY invite
+        /// submit-only client standing in the identity module. EVERY invite
         /// is bearer (기명 dropped in Join Protocol v2): no `target` — the
         /// `proof` binds the redemption to whichever key presents it and the
         /// nonce set makes that exactly-once.

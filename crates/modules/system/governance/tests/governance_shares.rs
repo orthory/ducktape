@@ -130,6 +130,9 @@ impl Module for IdentityStub {
                     self.accounts.values().cloned().collect(),
                 )));
             }
+            IdentityQuery::Clients => {
+                return Ok(identity_encode_reply(&IdentityReply::Clients(Vec::new())));
+            }
         };
         Ok(identity_encode_reply(&IdentityReply::Account(account)))
     }

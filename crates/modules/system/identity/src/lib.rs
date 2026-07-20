@@ -45,7 +45,20 @@
 //! record with no nodes but surviving members/name/nonce); an account with an
 //! EMPTY member set is NOT (every live account keeps at least one key).
 //!
-//! this is the v2 account format; a mixed v1/v2 network would fork.
+//! ## client standing (the submit-door ACL, a facet of the account plane)
+//!
+//! identity also carries the CLIENT set: ed25519 keys that hold SUBMIT
+//! authorization at a validator's door and nothing else — no consensus seat,
+//! no mesh, no statesync (the sync/mesh planes read valset, never this set, so
+//! a client can never leak into standing). governance's `role=Client` invite
+//! redemption emits [`IdentityMsg::GrantClient`] as a MODULE-origin follow-up;
+//! [`IdentityMsg::RevokeClient`] drops a key. it stages through its own
+//! `clients_pending` overlay and folds into `clients` on commit, and it is part
+//! of identity's ONE root/snapshot (encoded after the accounts), so a joiner
+//! restores it with the rest of the account plane.
+//!
+//! this is the account format at schema revision 3; a mixed-revision network
+//! would fork.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -59,6 +72,8 @@ pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_challenge, web
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use commonware_codec::DecodeExt as _;
+use commonware_cryptography::ed25519::PublicKey;
 use sdk::codec::{Cursor, push_bytes, push_opt_str};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
@@ -104,6 +119,10 @@ struct AccountRecord {
     updated_at: u64,
 }
 
+/// the two committed halves a snapshot decodes into: the account registry and
+/// the trailing client-standing set (the submit-door ACL).
+type DecodedState = (BTreeMap<Vec<u8>, AccountRecord>, BTreeSet<Vec<u8>>);
+
 pub struct Identity {
     id: ModuleId,
     /// the valset module consulted to gate `BindNode` to current members
@@ -124,6 +143,13 @@ pub struct Identity {
     /// this block's staged per-account upserts (`Some`) / clears (`None`).
     /// read ahead of `accounts` (read-your-writes), merged in on `commit_block`.
     pending: BTreeMap<Vec<u8>, Option<AccountRecord>>,
+    /// committed CLIENT standing — the submit-door ACL, folded into `root()`
+    /// after the accounts. governance grants/revokes keys here on `role=Client`
+    /// invite redemption; structurally distinct from membership (never valset).
+    clients: BTreeSet<Vec<u8>>,
+    /// this block's staged client changes: `true` == staged grant, `false` ==
+    /// staged revoke. read ahead of `clients`, merged in on `commit_block`.
+    clients_pending: BTreeMap<Vec<u8>, bool>,
 }
 
 impl Identity {
@@ -136,7 +162,38 @@ impl Identity {
             node_index: BTreeMap::new(),
             member_index: BTreeMap::new(),
             pending: BTreeMap::new(),
+            clients: BTreeSet::new(),
+            clients_pending: BTreeMap::new(),
         }
+    }
+
+    /// validate that `key` is a well-formed 32-byte ed25519 public key — the
+    /// explicit length guard keeps the 32-byte invariant independent of decode's
+    /// trailing-byte behavior; `PublicKey::decode` then checks the curve point.
+    fn validate_client_key(key: &[u8]) -> Result<(), Error> {
+        if key.len() != 32 {
+            return Err(Error::Module(format!(
+                "invalid ed25519 client key: expected 32 bytes, got {}",
+                key.len()
+            )));
+        }
+        PublicKey::decode(key)
+            .map_err(|e| Error::Module(format!("invalid ed25519 client key: {e}")))?;
+        Ok(())
+    }
+
+    /// the committed client set with this block's staged changes applied,
+    /// sorted (order-independent) — read-your-writes over `clients_pending`.
+    fn effective_clients(&self) -> Vec<Vec<u8>> {
+        let mut set = self.clients.clone();
+        for (k, present) in &self.clients_pending {
+            if *present {
+                set.insert(k.clone());
+            } else {
+                set.remove(k);
+            }
+        }
+        set.into_iter().collect()
     }
 
     /// the AUTHENTICATED submitter key -- a non-empty external origin, or a
@@ -292,8 +349,13 @@ impl Identity {
     /// (`len+pubkey`, kind tag `u8`, label flag + `len+label` if set,
     /// rp-hash flag + 32 bytes if set, `u64-le added_at`), `u64-le` node count
     /// then per sorted node (`len+node`, label flag `u8` + `len+label` if set),
-    /// and `u64-le updated_at`. both indexes are derived and excluded.
-    fn encode_state(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> Vec<u8> {
+    /// and `u64-le updated_at`. both indexes are derived and excluded. a CLIENT
+    /// TAIL follows the accounts: `u64-le` client count then each sorted client
+    /// key (`len+key`) — the submit-door ACL, folded into the one root.
+    fn encode_state(
+        accounts: &BTreeMap<Vec<u8>, AccountRecord>,
+        clients: &BTreeSet<Vec<u8>>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(accounts.len() as u64).to_le_bytes());
         for (account_id, record) in accounts {
@@ -325,16 +387,24 @@ impl Identity {
             }
             out.extend_from_slice(&record.updated_at.to_le_bytes());
         }
+        out.extend_from_slice(&(clients.len() as u64).to_le_bytes());
+        for key in clients {
+            push_bytes(&mut out, key);
+        }
         out
     }
 
-    /// the state-based commitment: `ZERO` when empty, else sha256 over exactly
-    /// the bytes `encode_state` emits.
-    fn root_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> StateRoot {
-        if accounts.is_empty() {
+    /// the state-based commitment: `ZERO` when the account plane is entirely
+    /// empty (no accounts AND no clients), else sha256 over exactly the bytes
+    /// `encode_state` emits.
+    fn root_of(
+        accounts: &BTreeMap<Vec<u8>, AccountRecord>,
+        clients: &BTreeSet<Vec<u8>>,
+    ) -> StateRoot {
+        if accounts.is_empty() && clients.is_empty() {
             return StateRoot::ZERO;
         }
-        StateRoot(Sha256::digest(Self::encode_state(accounts)).into())
+        StateRoot(Sha256::digest(Self::encode_state(accounts, clients)).into())
     }
 
     fn node_index_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -362,24 +432,27 @@ impl Identity {
     /// canonical bytes of the COMMITTED registry -- exactly what `root()`
     /// hashes. pending is deliberately excluded.
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.accounts)
+        Self::encode_state(&self.accounts, &self.clients)
     }
 
     /// replace committed state with a decoded snapshot iff its recomputed root
-    /// equals `expected`. decode/verify land in a temporary map, so on any
-    /// `Err` committed state and both indexes are byte-identical to before.
+    /// equals `expected`. decode/verify land in temporaries, so on any `Err`
+    /// committed state, both indexes, and the client set are byte-identical to
+    /// before.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let decoded = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&decoded);
+        let (accounts, clients) = Self::decode_snapshot(bytes)?;
+        let root = Self::root_of(&accounts, &clients);
         if root != expected {
             return Err(Error::Module(format!(
                 "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
             )));
         }
-        self.node_index = Self::node_index_of(&decoded);
-        self.member_index = Self::member_index_of(&decoded);
-        self.accounts = decoded;
+        self.node_index = Self::node_index_of(&accounts);
+        self.member_index = Self::member_index_of(&accounts);
+        self.accounts = accounts;
+        self.clients = clients;
         self.pending.clear();
+        self.clients_pending.clear();
         Ok(())
     }
 
@@ -389,9 +462,10 @@ impl Identity {
     /// member keys (within an account) and node keys (within an account) must
     /// each arrive strictly increasing; the kind tag must be known; the rp-hash
     /// flag must be present exactly for WebAuthn members; every account carries
-    /// at least one member; and no node or member key may appear in two
-    /// accounts (states the execute path can never commit).
-    fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, AccountRecord>, Error> {
+    /// at least one member; no node or member key may appear in two accounts
+    /// (states the execute path can never commit); and the trailing CLIENT set's
+    /// keys must arrive strictly increasing too.
+    fn decode_snapshot(bytes: &[u8]) -> Result<DecodedState, Error> {
         let mut cur = Cursor::new(bytes);
         let count = cur.u64("snapshot account count")?;
         // per-account minimum: id-len(8) + name flag(1) + avatar flag(1) + bio
@@ -436,6 +510,24 @@ impl Identity {
                 },
             );
         }
+
+        // the trailing client set (the submit-door ACL): count-bounded before
+        // allocation, keys strictly increasing, decoded BEFORE the finish so
+        // trailing garbage past it still rejects.
+        let client_count = cur.u64("snapshot client count")?;
+        cur.bound(client_count, 8, "snapshot client")?;
+        let mut clients = BTreeSet::new();
+        let mut prev_client: Option<Vec<u8>> = None;
+        for _ in 0..client_count {
+            let key = cur.bytes("snapshot client key")?.to_vec();
+            if prev_client.as_deref().is_some_and(|p| p >= key.as_slice()) {
+                return Err(Error::Module(
+                    "snapshot client keys must be strictly increasing".into(),
+                ));
+            }
+            prev_client = Some(key.clone());
+            clients.insert(key);
+        }
         cur.finish("snapshot")?;
 
         // no node and no member key may be claimed by two accounts: the execute
@@ -456,7 +548,7 @@ impl Identity {
             }
         }
 
-        Ok(accounts)
+        Ok((accounts, clients))
     }
 
     fn decode_members(cur: &mut Cursor) -> Result<BTreeMap<Vec<u8>, MemberMeta>, Error> {
@@ -541,7 +633,7 @@ impl Module for Identity {
     }
 
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.accounts)
+        Self::root_of(&self.accounts, &self.clients)
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
@@ -573,6 +665,8 @@ impl Module for Identity {
             IdentityMsg::SetNodeLabel { node_key, label } => {
                 self.set_node_label(ctx, node_key, label)
             }
+            IdentityMsg::GrantClient { key } => self.grant_client(ctx, key),
+            IdentityMsg::RevokeClient { key } => self.revoke_client(ctx, key),
         }
     }
 
@@ -616,10 +710,20 @@ impl Module for Identity {
                     });
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
+            IdentityQuery::Clients => {
+                Ok(encode_reply(&IdentityReply::Clients(self.effective_clients())))
+            }
         }
     }
 
     async fn commit_block(&mut self) -> Result<(), Error> {
+        for (key, present) in std::mem::take(&mut self.clients_pending) {
+            if present {
+                self.clients.insert(key);
+            } else {
+                self.clients.remove(&key);
+            }
+        }
         for (account_id, change) in std::mem::take(&mut self.pending) {
             // drop every index entry currently pointing at this account; the
             // new sets (if any) are reinserted below.
@@ -645,6 +749,7 @@ impl Module for Identity {
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending.clear();
+        self.clients_pending.clear();
         Ok(())
     }
 }
@@ -982,6 +1087,52 @@ impl Identity {
         record.updated_at = ctx.env().consensus_time;
         self.pending.insert(account_id, Some(record));
         Ok(())
+    }
+
+    /// grant CLIENT (submit-door) standing to `key`. GOVERNANCE-GATED exactly
+    /// like valset membership: only a module origin (governance's redeem
+    /// follow-up) or a system origin (genesis) may stage it — an external key
+    /// cannot self-grant. staged into `clients_pending`, folded on commit.
+    fn grant_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
+        Self::require_module_origin(ctx)?;
+        Self::validate_client_key(&key)?;
+        self.clients_pending.insert(key, true);
+        Ok(())
+    }
+
+    /// revoke client standing by `key`; a no-op if the key holds none. same
+    /// governance origin gate as [`Identity::grant_client`].
+    fn revoke_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
+        Self::require_module_origin(ctx)?;
+        self.clients_pending.insert(key, false);
+        Ok(())
+    }
+
+    /// client standing changes only via governance: a module origin (its redeem
+    /// follow-up) or a system origin (genesis). part of the deterministic Env,
+    /// enforced identically on every node.
+    fn require_module_origin(ctx: &dyn Ctx) -> Result<(), Error> {
+        match &ctx.env().origin {
+            Origin::Module(_) | Origin::System => Ok(()),
+            Origin::External(_) => Err(Error::Module(
+                "client standing changes only via governance".into(),
+            )),
+        }
+    }
+}
+
+/// the CURRENT client set at `identity_id`: its staged-over-committed
+/// projection, via the host-routed read lane. the one shared read the redeem
+/// path and the submit door's caller funnel through.
+pub async fn clients(ctx: &dyn Ctx, identity_id: &str) -> Result<Vec<Vec<u8>>, Error> {
+    let reply = ctx
+        .query(identity_id, &encode_query(&IdentityQuery::Clients))
+        .await?;
+    match decode_reply(&reply).map_err(Error::Module)? {
+        IdentityReply::Clients(list) => Ok(list),
+        other => Err(Error::Module(format!(
+            "identity answered a Clients query with {other:?}"
+        ))),
     }
 }
 

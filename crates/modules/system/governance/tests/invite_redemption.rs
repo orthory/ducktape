@@ -23,9 +23,9 @@ use governance::{
     GovMsg, GovQuery, GovReply, Governance, decode_reply as gov_decode, encode_msg as gov_encode,
     encode_query as gov_query,
 };
-use clients::Clients;
-use clients::{
-    ClientsQuery, ClientsReply, decode_reply as clients_decode, encode_query as clients_query,
+use identity::Identity;
+use identity::{
+    IdentityQuery, IdentityReply, decode_reply as identity_decode, encode_query as identity_query,
 };
 use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
@@ -94,11 +94,10 @@ fn gov_host() -> Host {
     valset.insert(key_bytes(&keypair(2)));
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Clients::new("clients")),
+        Box::new(Identity::new("identity", None, "testnet".into())),
         Box::new(
             Governance::new("governance", "valset", "upgrade", "identity")
-                .with_invite_binding(BINDING)
-                .with_clients("clients"),
+                .with_invite_binding(BINDING),
         ),
     ])
     .expect("genesis")
@@ -149,11 +148,12 @@ async fn residents(host: &Host) -> Vec<Vec<u8>> {
 
 async fn clients(host: &Host) -> Vec<Vec<u8>> {
     let reply = host
-        .query("clients", &clients_query(&ClientsQuery::Clients))
+        .query("identity", &identity_query(&IdentityQuery::Clients))
         .await
-        .expect("clients query");
-    match clients_decode(&reply).expect("decode") {
-        ClientsReply::Clients(v) => v,
+        .expect("identity query");
+    match identity_decode(&reply).expect("decode") {
+        IdentityReply::Clients(v) => v,
+        other => panic!("expected Clients, got {other:?}"),
     }
 }
 
@@ -410,85 +410,6 @@ fn a_client_role_token_grants_client_standing_not_residency() {
         let audit = redemptions(&host).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].joiner, key_bytes(&client));
-    });
-}
-
-#[test]
-fn legacy_clients_are_invisible_until_protocol_v1() {
-    block_on(async {
-        let mut valset = Valset::new("valset");
-        valset.insert(key_bytes(&keypair(1)));
-        let mut host = Host::genesis(vec![
-            Box::new(valset),
-            Box::new(Clients::new("clients")),
-            Box::new(
-                Governance::new("governance", "valset", "upgrade", "identity")
-                    .with_invite_binding(BINDING)
-                    .with_clients_after_version("clients", 1),
-            ),
-        ])
-        .expect("genesis");
-        host.defer_module_until("clients", 1).expect("legacy route");
-
-        assert!(
-            matches!(
-                host.query("clients", &clients_query(&ClientsQuery::Clients))
-                    .await,
-                Err(Error::UnknownModule(module)) if module == "clients"
-            ),
-            "clients must not exist on any pre-v1 host surface"
-        );
-        assert!(
-            host.state_schema().iter().all(|(id, _)| id != "clients"),
-            "pre-v1 state manifests retain the legacy 25-module schema"
-        );
-
-        let issuer = keypair(1);
-        let resident = keypair(8);
-        let resident_token = mint(&issuer, 7, InviteRole::Resident, u64::MAX);
-        submit_as_version(
-            &mut host,
-            &key_bytes(&resident),
-            1,
-            0,
-            redeem_msg(&resident_token, &resident),
-        )
-        .await
-        .expect("resident admission stays available before v1");
-
-        let client = keypair(9);
-        let client_token = mint(&issuer, 8, InviteRole::Client, u64::MAX);
-        let error = submit_as_version(
-            &mut host,
-            &key_bytes(&client),
-            2,
-            0,
-            redeem_msg(&client_token, &client),
-        )
-        .await
-        .expect_err("client admission is gated before v1");
-        assert!(
-            matches!(error, SubmitError::Rejected(Error::Module(ref message))
-                if message.contains("activates at protocol v1")),
-            "got {error:?}"
-        );
-
-        submit_as_version(
-            &mut host,
-            &key_bytes(&client),
-            3,
-            1,
-            redeem_msg(&client_token, &client),
-        )
-        .await
-        .expect("v1 activates clients before dispatch");
-        assert_eq!(clients(&host).await, vec![key_bytes(&client)]);
-        assert!(host.state_schema().iter().any(|(id, _)| id == "clients"));
-
-        host.set_active_version(0);
-        assert!(host.module_root("clients").is_none());
-        host.set_active_version(1);
-        assert_eq!(clients(&host).await, vec![key_bytes(&client)]);
     });
 }
 

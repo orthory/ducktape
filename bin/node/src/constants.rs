@@ -142,12 +142,11 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 22] = [
+pub(crate) const MODULE_IDS: [&str; 21] = [
     "pages",
     "chat",
     "forge",
     "valset",
-    "clients",
     "governance",
     "lifecycle",
     "hello",
@@ -175,7 +174,7 @@ pub(crate) const MODULE_IDS: [&str; 22] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 22] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 21] = [
     // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
     // tail inside the native snapshot persisted as one host-KV value.
     ("agent", 3),
@@ -188,7 +187,6 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 22] = [
     // moved into wasm; the canonical state encoding never changed shape, so
     // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
     ("chat", 1),
-    ("clients", 1),
     ("directory", 1),
     // 1 (UNCHANGED — dispatch stays NATIVE): its read facade serves
     // COMMITTED-ONLY state by design (runs' mid-block lease_holder read
@@ -199,12 +197,16 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 22] = [
     // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
     // revision 3 folds the `.duck` handle registry (the retired `duckdns`
     // module's plane) into the same host-KV snapshot under one root — a
-    // state-schema break (beta re-genesis, no shim). identity/governance stay
-    // at 2. The per-network chain id still rides the GENESIS-CONFIG `__config`.
+    // state-schema break (beta re-genesis, no shim). governance stays at 2
+    // (identity moved to 3 when it absorbed the client ACL — see below). The
+    // per-network chain id still rides the GENESIS-CONFIG `__config`.
     ("gateway", 3),
     ("governance", 2),
     ("hello", 1),
-    ("identity", 2),
+    // 3: identity absorbed the submit-door client ACL (the retired `clients`
+    // module's ed25519 key set) as a tail folded into its account snapshot/root
+    // — a state-schema break from revision 2 (beta re-genesis, no shim).
+    ("identity", 3),
     ("inbox", 2),
     ("jobs", 2),
     // 1: the native lifecycle module (merged upgrade + modreg): protocol-version
@@ -224,98 +226,8 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 22] = [
     ("valset", 1),
 ];
 
-/// The exact pre-wasm production registry still running on the dogfood v1
-/// network. A latest binary may reopen this schema for a binary-only roll, but
-/// it must not reinterpret any module as wasm or advertise this as a fresh
-/// genesis/state-sync target. The route is deliberately exact: every other
-/// historical schema remains fail-closed.
-pub(crate) const NATIVE_V1_MODULE_STATE_SCHEMAS: [(&str, u32); 24] = [
-    ("agent", 1),
-    ("automations", 1),
-    ("capability", 1),
-    ("chat", 1),
-    ("clients", 1),
-    ("directory", 1),
-    ("dispatch", 1),
-    ("duckdns", 1),
-    ("files", 1),
-    ("forge", 1),
-    ("gateway", 1),
-    ("governance", 1),
-    ("hello", 1),
-    ("identity", 1),
-    ("inbox", 1),
-    ("jobs", 1),
-    ("kv", 1),
-    ("lifecycle", 1),
-    ("pages", 1),
-    ("runs", 2),
-    ("saga", 1),
-    ("tagging", 1),
-    ("tasks", 1),
-    ("valset", 1),
-];
-
-/// The only registry this binary can migrate in place: the CURRENT schema
-/// minus `clients` — a workspace captured (or restored) with the clients
-/// module still dormant below its activation version. Everything else —
-/// including genuinely historical pre-wasm-cutover workspaces, whose module
-/// revisions predate the rev-2/3 breaks above — remains fail-closed (beta
-/// re-genesis, no shim).
-pub(crate) const PRE_CLIENTS_MODULE_STATE_SCHEMAS: [(&str, u32); 21] = [
-    ("agent", 3),
-    ("automations", 2),
-    ("capability", 2),
-    ("chat", 1),
-    ("directory", 1),
-    ("dispatch", 1),
-    ("files", 1),
-    ("forge", 1),
-    // merged gateway, revision 3 (see MODULE_STATE_SCHEMAS).
-    ("gateway", 3),
-    ("governance", 2),
-    ("hello", 1),
-    ("identity", 2),
-    ("inbox", 2),
-    ("jobs", 2),
-    ("lifecycle", 1),
-    ("pages", 1),
-    ("runs", 3),
-    ("saga", 2),
-    ("tagging", 2),
-    ("tasks", 2),
-    ("valset", 1),
-];
-
-pub(crate) const CLIENTS_MODULE_ACTIVATION_VERSION: u32 = 1;
-
-/// The numeric version is insufficient evidence because older non-bridge
-/// binaries already advertise support through v3. This exact logical artifact
-/// binds readiness to the only accepted source schema, destination schema, and
-/// dormant-registry route.
-///
-/// Both fingerprints moved with the duckdns→gateway merge flag day: the source
-/// (`pre_clients`) and destination (current `MODULE_STATE_SCHEMAS`) schemas
-/// dropped `duckdns` and bumped `gateway` to revision 3. Recomputed for this
-/// merge alone — the campaign integrator MUST re-pin both after combining every
-/// module-plane trim (each trim moves the whole-set fingerprint).
-pub(crate) const CLIENTS_MODULE_UPGRADE_NAME: &str = concat!(
-    "commit:clients-v1:",
-    "68759333723c4b38428fffc6718f7ee78e90f799fb6c253e63f243a273793eb1:",
-    "e6554042b7d79c97be1d422d0de906e1c513159e61d206026375597b64532476:",
-    "dormant-registry-v1"
-);
-
 pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
     host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
-}
-
-pub(crate) fn native_v1_state_schema_fingerprint() -> [u8; 32] {
-    host::state_schema_fingerprint(NATIVE_V1_MODULE_STATE_SCHEMAS.iter().copied())
-}
-
-pub(crate) fn pre_clients_state_schema_fingerprint() -> [u8; 32] {
-    host::state_schema_fingerprint(PRE_CLIENTS_MODULE_STATE_SCHEMAS.iter().copied())
 }
 
 /// how long an app-surface submit reply may be held awaiting finalization

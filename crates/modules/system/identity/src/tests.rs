@@ -36,6 +36,18 @@ impl TestCtx {
         ctx.residents = Some(residents);
         ctx
     }
+    /// a governance-follow-up origin (module), the only origin allowed to move
+    /// client standing besides genesis.
+    fn module(name: &str) -> Self {
+        let mut ctx = Self::external(&[]);
+        ctx.env.origin = sdk::Origin::Module(name.into());
+        ctx
+    }
+    fn system() -> Self {
+        let mut ctx = Self::external(&[]);
+        ctx.env.origin = sdk::Origin::System;
+        ctx
+    }
 }
 #[async_trait::async_trait(?Send)]
 impl Ctx for TestCtx {
@@ -904,4 +916,116 @@ fn account_of_member(id: &Identity, member: &[u8]) -> Option<AccountView> {
         IdentityReply::Account(a) => a,
         other => panic!("expected Account, got {other:?}"),
     }
+}
+
+// ---- client standing (the submit-door ACL facet) ------------------------
+
+fn client_set(id: &Identity) -> Vec<Vec<u8>> {
+    let reply = block_on(id.query(&encode_query(&IdentityQuery::Clients))).unwrap();
+    match decode_reply(&reply).unwrap() {
+        IdentityReply::Clients(v) => v,
+        other => panic!("expected Clients, got {other:?}"),
+    }
+}
+
+/// run one client op from `ctx`, committing on success (mirrors `apply` but
+/// keeps the caller's chosen origin — module/system/external).
+fn run_client(id: &mut Identity, ctx: &mut TestCtx, msg: IdentityMsg) -> Result<(), Error> {
+    let m = Msg {
+        target: "identity".into(),
+        payload: encode_msg(&msg),
+    };
+    let r = block_on(id.execute(ctx, &m));
+    if r.is_ok() {
+        block_on(id.commit_block()).unwrap();
+    } else {
+        block_on(id.abort_block()).unwrap();
+    }
+    r
+}
+
+#[test]
+fn client_grant_from_module_origin_moves_root_and_reads_back() {
+    let mut id = new_identity();
+    assert_eq!(id.root(), StateRoot::ZERO, "empty plane -> ZERO");
+    let key = ed_pub(&ed(1));
+
+    // staged: read-your-writes sees it before commit; root reflects committed.
+    let mut ctx = TestCtx::module("governance");
+    let m = Msg {
+        target: "identity".into(),
+        payload: encode_msg(&IdentityMsg::GrantClient { key: key.clone() }),
+    };
+    block_on(id.execute(&mut ctx, &m)).unwrap();
+    assert_eq!(id.root(), StateRoot::ZERO, "root reflects committed only");
+    assert_eq!(client_set(&id), vec![key.clone()], "read-your-writes");
+    block_on(id.commit_block()).unwrap();
+    assert_ne!(id.root(), StateRoot::ZERO, "a committed grant moves the root");
+    assert_eq!(client_set(&id), vec![key]);
+}
+
+#[test]
+fn client_grant_from_external_origin_is_refused() {
+    let mut id = new_identity();
+    let mut ctx = TestCtx::external(&ed_pub(&ed(9)));
+    let err = run_client(
+        &mut id,
+        &mut ctx,
+        IdentityMsg::GrantClient { key: ed_pub(&ed(1)) },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Module(m) if m.contains("only via governance")),
+        "external self-grant must be refused",
+    );
+    assert!(client_set(&id).is_empty());
+}
+
+#[test]
+fn client_revoke_restores_the_empty_plane_root() {
+    let mut id = new_identity();
+    let empty = id.snapshot();
+    let key = ed_pub(&ed(2));
+    let mut sys = TestCtx::system();
+    run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: key.clone() }).unwrap();
+    assert_eq!(client_set(&id), vec![key.clone()]);
+    run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key }).unwrap();
+    assert!(client_set(&id).is_empty(), "revoke removed it");
+    assert_eq!(id.root(), StateRoot::ZERO);
+    assert_eq!(id.snapshot(), empty, "revoking the last client restores the empty snapshot");
+}
+
+#[test]
+fn client_grant_rejects_a_malformed_key() {
+    let mut id = new_identity();
+    let mut sys = TestCtx::system();
+    let err = run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: vec![0u8; 16] }).unwrap_err();
+    assert!(matches!(err, Error::Module(_)));
+    assert!(client_set(&id).is_empty());
+}
+
+#[test]
+fn snapshot_round_trips_accounts_and_clients_together() {
+    let mut id = new_identity();
+    // an account AND a client, so the client tail rides a non-empty snapshot.
+    found_account(&mut id, &ed(3), b"node-x");
+    let ckey = ed_pub(&ed(7));
+    let mut sys = TestCtx::system();
+    run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: ckey.clone() }).unwrap();
+
+    let bytes = id.snapshot();
+    let root = id.root();
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    assert_eq!(StateRoot(digest), root, "sha256(snapshot()) == root()");
+
+    let mut joiner = new_identity();
+    joiner.install(&bytes, root).unwrap();
+    assert_eq!(joiner.root(), root);
+    assert_eq!(client_set(&joiner), vec![ckey]);
+
+    // a flipped bit in the client tail is caught by the recomputed-root check.
+    let mut tampered = bytes.clone();
+    *tampered.last_mut().unwrap() ^= 0x01;
+    assert!(joiner.install(&tampered, root).is_err());
+    assert_eq!(joiner.root(), root, "a failed install left committed state intact");
 }

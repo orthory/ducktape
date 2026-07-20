@@ -58,7 +58,6 @@ members = [
     # modules/system — system modules and their host-side counterparts
     "crates/modules/system/kv",
     "crates/modules/system/valset",
-    "crates/modules/system/clients",
     "crates/modules/system/governance",
     "crates/modules/system/identity",
     "crates/modules/system/lifecycle",
@@ -203,7 +202,6 @@ wasm-host = { path = "crates/kernel/wasm-host" }
 # internal — module impl crates
 kv = { path = "crates/modules/system/kv" }
 valset = { path = "crates/modules/system/valset" }
-clients = { path = "crates/modules/system/clients" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }
 lifecycle = { path = "crates/modules/system/lifecycle" }

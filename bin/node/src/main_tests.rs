@@ -760,34 +760,19 @@ fn readiness_signaller_emits_exactly_once_when_member_and_supported() {
 }
 
 #[test]
-fn readiness_signaller_only_attests_the_compiled_clients_route() {
+fn readiness_signaller_refuses_a_commitment_route() {
+    // named routes carrying a required readiness commitment (the retired
+    // dormant-registry migration mechanism) are attested by NO compiled route
+    // anymore: the signaller stays silent so the boundary cleanly aborts rather
+    // than arming onto a binary that cannot honor the route. plain numeric
+    // upgrades (no commitment prefix) are still attested — see the test above.
     let me = vec![7u8; 32];
     let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
-    let st = status(
-        Some((
-            crate::constants::CLIENTS_MODULE_UPGRADE_NAME,
-            100,
-            crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION,
-        )),
-        &[&me],
-        &[],
-    );
+    let commit_route = status(Some(("commit:some-route", 100, 1)), &[&me], &[]);
     assert_eq!(
-        s.decide(&st),
-        Some((
-            crate::constants::CLIENTS_MODULE_UPGRADE_NAME.into(),
-            crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION,
-            lifecycle::required_readiness_commitment(crate::constants::CLIENTS_MODULE_UPGRADE_NAME)
-                .map(|bytes| bytes.to_vec()),
-        ))
-    );
-
-    let mut unknown = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
-    let wrong = status(Some(("commit:unknown-route", 100, 1)), &[&me], &[]);
-    assert_eq!(
-        unknown.decide(&wrong),
+        s.decide(&commit_route),
         None,
-        "a numeric version match cannot attest an unknown route"
+        "a commitment-required named route is attested by no compiled route",
     );
 }
 
