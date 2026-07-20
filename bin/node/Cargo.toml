@@ -28,12 +28,11 @@ valset = { workspace = true }
 clients = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
-# the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
-# committed boundary snapshot; the module itself is genesis-wired post-retrofit).
-upgrade = { workspace = true }
-# the module code registry + the wasm runtime it governs: genesis-wired, with
-# height-gated live code swaps realized through the blobstore-backed CodeSource.
-modreg = { workspace = true }
+# the network lifecycle module: the no-downtime protocol-version coordinator AND
+# the module code registry, one genesis-wired module. read_upgrade_state reads
+# its committed boundary snapshot; height-gated live code swaps are realized
+# through the blobstore-backed CodeSource.
+lifecycle = { workspace = true }
 wasm-host = { workspace = true }
 saga = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side

@@ -381,11 +381,11 @@ where
     /// upgrade's frozen readiness set. returns `(boundary_version, verdict)`.
     ///
     /// PURE — no clock/IO/RNG — so every honest node computes the identical value.
-    /// this STRUCTURALLY MIRRORS `upgrade::effective_version` (risk R4):
+    /// this STRUCTURALLY MIRRORS `lifecycle::effective_version` (risk R4):
     /// armed iff the pending upgrade reached its activation height, the boundary
     /// valset is non-empty, and every boundary member is present in `ready`. the
     /// upgrade module's own `Advance` handler and `effective_version` helper route
-    /// through the shared `upgrade::effective_version` predicate; this generic mirror can
+    /// through the shared `lifecycle::effective_version` predicate; this generic mirror can
     /// never disagree with them on the same frozen inputs (the orchestrator is
     /// generic over `Member`, so it cannot call the `Vec<u8>`-typed shared fn
     /// directly — the mirror is the single deterministic contract, guarded by the

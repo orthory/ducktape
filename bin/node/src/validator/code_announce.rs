@@ -1,8 +1,8 @@
-//! the node-local worker behind modreg's byte-receipt gate: the state-driven
+//! the node-local worker behind lifecycle's code-swap byte-receipt gate: the state-driven
 //! twin of [`super::announce::ReadinessSignaller`] for CODE swaps.
 //!
-//! it polls COMMITTED modreg state each pump tick and, per pending swap,
-//! drives this validator to a truthful `ModregMsg::SignalReady`:
+//! it polls COMMITTED lifecycle module state each pump tick and, per pending swap,
+//! drives this validator to a truthful `LifecycleMsg::SwapReady`:
 //!
 //! - bytes verified-resident in the local store → self-submit ONE signal
 //!   (latched locally; the module's committed readiness set keeps it
@@ -59,14 +59,14 @@ impl CodeReadinessSignaller {
         self
     }
 
-    /// the PURE decision core: given committed modreg status and a local
+    /// the PURE decision core: given committed lifecycle module status and a local
     /// residency check, decide this tick's signals and fetches. truthful
     /// (signals only verified-resident bytes), idempotent (committed
     /// readiness, the in-flight latch, and the fetch dedupe all short-
     /// circuit), and quiet once a swap is `ready`.
     pub(crate) fn decide(
         &mut self,
-        modules: &[modreg::ModuleCode],
+        modules: &[lifecycle::ModuleCode],
         resident: impl Fn(&[u8; 32]) -> bool,
     ) -> CodeActions {
         let mut actions = CodeActions::default();
@@ -91,8 +91,8 @@ impl CodeReadinessSignaller {
                 if self.signal_enabled {
                     self.signaled.insert(key.clone());
                     let msg = Msg {
-                        target: host::MODREG_MODULE_ID.into(),
-                        payload: modreg::encode_msg(&modreg::ModregMsg::SignalReady {
+                        target: host::LIFECYCLE_MODULE_ID.into(),
+                        payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::SwapReady {
                             name: key.1.clone(),
                             module_id: key.0.clone(),
                         }),
@@ -126,11 +126,11 @@ mod tests {
         hash: u8,
         ready: bool,
         signed: &[Vec<u8>],
-    ) -> modreg::ModuleCode {
-        modreg::ModuleCode {
+    ) -> lifecycle::ModuleCode {
+        lifecycle::ModuleCode {
             module_id: module.into(),
             active_code_hash: vec![0; 32],
-            pending: Some(modreg::ScheduledSwap {
+            pending: Some(lifecycle::ScheduledSwap {
                 name: name.into(),
                 activation_height: 10,
                 code_hash: vec![hash; 32],
@@ -194,7 +194,7 @@ mod tests {
         let acts = s.decide(&armed, |_| true);
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());
         // no pending at all: silent.
-        let idle = vec![modreg::ModuleCode {
+        let idle = vec![lifecycle::ModuleCode {
             module_id: "c".into(),
             active_code_hash: vec![0; 32],
             pending: None,

@@ -1,6 +1,6 @@
 //! Module-code distribution over the WireGuard data plane.
 //!
-//! Consensus commits WHICH code a module runs as a 32-byte hash (modreg);
+//! Consensus commits WHICH code a module runs as a 32-byte hash (lifecycle);
 //! this plane moves the content-addressed BYTES — wasm components today,
 //! quack capsules tomorrow. Two stream intents, both self-verifying (the
 //! receiver publishes a blob only when the assembled whole re-hashes to the

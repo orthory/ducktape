@@ -111,10 +111,25 @@ fn read_manifest_without_opening_workspace(
         .map_err(Into::into)
 }
 
+fn checkpoint_lifecycle(
+    manifest: &recovery::Manifest,
+) -> Result<lifecycle::Lifecycle, Box<dyn std::error::Error>> {
+    let mut lifecycle = lifecycle::Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+    lifecycle.install(
+        manifest
+            .snapshot(host::LIFECYCLE_MODULE_ID)
+            .ok_or("checkpoint has no lifecycle snapshot")?,
+        manifest
+            .root(host::LIFECYCLE_MODULE_ID)
+            .ok_or("checkpoint has no lifecycle root")?,
+    )?;
+    Ok(lifecycle)
+}
+
 fn checkpoint_upgrade_status(
     manifest: &recovery::Manifest,
-) -> Result<upgrade::UpgradeStatus, Box<dyn std::error::Error>> {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+) -> Result<lifecycle::UpgradeStatus, Box<dyn std::error::Error>> {
+    use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
 
     let mut valset = valset::Valset::new("valset");
     valset.install(
@@ -125,25 +140,19 @@ fn checkpoint_upgrade_status(
             .root("valset")
             .ok_or("checkpoint has no valset root")?,
     )?;
-    let mut upgrade = upgrade::Upgrade::new("upgrade", "valset");
-    upgrade.install(
-        manifest
-            .snapshot("upgrade")
-            .ok_or("checkpoint has no upgrade snapshot")?,
-        manifest
-            .root("upgrade")
-            .ok_or("checkpoint has no upgrade root")?,
-    )?;
-    let host = host::Host::genesis(vec![Box::new(valset), Box::new(upgrade)])?;
+    let lifecycle = checkpoint_lifecycle(manifest)?;
+    let host = host::Host::genesis(vec![Box::new(valset), Box::new(lifecycle)])?;
     let runtime =
         commonware_runtime::tokio::Runner::new(commonware_runtime::tokio::Config::default());
     runtime
         .start(|_| async move {
             let raw = host
-                .query("upgrade", &encode_query(&UpgradeQuery::Status))
+                .query(host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus))
                 .await
                 .map_err(|error| error.to_string())?;
-            let UpgradeReply::Status(status) = decode_reply(&raw)?;
+            let LifecycleReply::UpgradeStatus(status) = decode_reply(&raw)? else {
+                return Err("lifecycle returned an unexpected reply".to_string());
+            };
             Ok::<_, String>(status)
         })
         .map_err(Into::into)
@@ -152,22 +161,13 @@ fn checkpoint_upgrade_status(
 fn checkpoint_modreg_is_idle(
     manifest: &recovery::Manifest,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut modreg = modreg::Modreg::new(host::MODREG_MODULE_ID, "valset").with_legacy_v1_state();
-    modreg.install(
-        manifest
-            .snapshot(host::MODREG_MODULE_ID)
-            .ok_or("checkpoint has no modreg snapshot")?,
-        manifest
-            .root(host::MODREG_MODULE_ID)
-            .ok_or("checkpoint has no modreg root")?,
-    )?;
-    Ok(!modreg.has_pending_swaps())
+    Ok(!checkpoint_lifecycle(manifest)?.has_pending_swaps())
 }
 
 fn validate_bridge_preflight(
     phase: PreflightPhase,
     manifest: &recovery::Manifest,
-    status: &upgrade::UpgradeStatus,
+    status: &lifecycle::UpgradeStatus,
 ) -> Result<&'static str, String> {
     if status.current_version != manifest.current_version {
         return Err(format!(
@@ -243,7 +243,7 @@ fn validate_bridge_preflight(
 fn validate_native_v1_preflight(
     phase: PreflightPhase,
     manifest: &recovery::Manifest,
-    status: &upgrade::UpgradeStatus,
+    status: &lifecycle::UpgradeStatus,
     modreg_idle: bool,
 ) -> Result<&'static str, String> {
     if phase != PreflightPhase::Roll {
@@ -1004,7 +1004,7 @@ fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `max_supported` version this binary can execute. degrades gracefully on a net
 /// WITHOUT the module (pre-retrofit): the query errors and we report baseline.
 fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
+    use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
     let (_, flags) = parse_flags(args)?;
     let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
@@ -1012,7 +1012,7 @@ fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         .rpc_listen
         .ok_or("upgrade-status drives the node's local rpc — set `rpc_listen` in node.toml")?;
 
-    let raw = match rpc_query(&addr, "upgrade", &encode_query(&UpgradeQuery::Status)) {
+    let raw = match rpc_query(&addr, host::LIFECYCLE_MODULE_ID, &encode_query(&LifecycleQuery::UpgradeStatus)) {
         Ok(bytes) => bytes,
         // module absent (pre-retrofit) or unreachable: report the binary baseline
         // rather than failing — the CLI is inert on a net without the module.
@@ -1023,7 +1023,9 @@ fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             return Ok(());
         }
     };
-    let UpgradeReply::Status(status) = decode_reply(&raw)?;
+    let LifecycleReply::UpgradeStatus(status) = decode_reply(&raw)? else {
+        return Err("lifecycle returned an unexpected reply".into());
+    };
     println!("current_version: {}", status.current_version);
     println!("max_supported (this binary): {MAX_PROTOCOL_VERSION}");
     match &status.pending {
@@ -1761,11 +1763,11 @@ mod preflight_state_tests {
         }
     }
 
-    fn status(pending: Option<(&str, u64, u32)>, armed: bool) -> upgrade::UpgradeStatus {
-        upgrade::UpgradeStatus {
+    fn status(pending: Option<(&str, u64, u32)>, armed: bool) -> lifecycle::UpgradeStatus {
+        lifecycle::UpgradeStatus {
             current_version: 0,
             pending: pending.map(|(name, activation_height, to_version)| {
-                upgrade::ScheduledUpgrade {
+                lifecycle::ScheduledUpgrade {
                     name: name.into(),
                     activation_height,
                     to_version,

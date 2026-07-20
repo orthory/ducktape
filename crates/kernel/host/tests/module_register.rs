@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BlockContext, CodeSource, Host, MODREG_MODULE_ID, ModuleFactory};
-use modreg::{ModregMsg, ModregQuery, ModregReply, Modreg};
+use host::{BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID, ModuleFactory};
+use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -63,7 +63,7 @@ const MEMBER: [u8; 32] = [7; 32];
 /// anywhere: the module this proof admits does not exist at genesis.
 fn bare_host(with_factory: bool) -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Modreg::new(MODREG_MODULE_ID, "valset")));
+    host.register(Box::new(Lifecycle::new(LIFECYCLE_MODULE_ID, "valset")));
     let mut valset = valset::Valset::new("valset");
     valset.insert(MEMBER.to_vec());
     host.register(Box::new(valset));
@@ -79,20 +79,20 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
         consensus_time: height,
         origin,
         // admission ops are version-gated; the whole proof runs past the boundary.
-        protocol_version: modreg::ADMISSION_ACTIVATION_VERSION,
+        protocol_version: lifecycle::ADMISSION_ACTIVATION_VERSION,
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }
 
-fn modreg_msg(m: &ModregMsg) -> Msg {
+fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
     Msg {
-        target: MODREG_MODULE_ID.into(),
-        payload: modreg::encode_msg(m),
+        target: LIFECYCLE_MODULE_ID.into(),
+        payload: lifecycle::encode_msg(m),
     }
 }
 
 fn schedule_register_msg() -> Msg {
-    modreg_msg(&ModregMsg::ScheduleRegister {
+    lifecycle_msg(&LifecycleMsg::ScheduleRegister {
         name: "kanban-v1".into(),
         module_id: "kanban".into(),
         activation_height: H,
@@ -101,7 +101,7 @@ fn schedule_register_msg() -> Msg {
 }
 
 fn signal_ready_msg() -> Msg {
-    modreg_msg(&ModregMsg::SignalReady {
+    lifecycle_msg(&LifecycleMsg::SwapReady {
         name: "kanban-v1".into(),
         module_id: "kanban".into(),
     })
@@ -120,10 +120,10 @@ fn count(host: &Host) -> u64 {
 }
 
 fn kanban_entry(host: &Host) -> Option<(Vec<u8>, bool)> {
-    let req = modreg::encode_query(&ModregQuery::Status);
-    let bytes = block_on(host.query(MODREG_MODULE_ID, &req)).expect("status");
-    match modreg::decode_reply(&bytes).expect("decode") {
-        ModregReply::Status { modules } => modules
+    let req = lifecycle::encode_query(&LifecycleQuery::ModuleStatus);
+    let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
+    match lifecycle::decode_reply(&bytes).expect("decode") {
+        LifecycleReply::ModuleStatus { modules } => modules
             .iter()
             .find(|m| m.module_id == "kanban")
             .map(|m| (m.active_code_hash.clone(), m.pending.is_some())),

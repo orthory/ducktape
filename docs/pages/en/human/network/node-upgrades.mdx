@@ -76,9 +76,9 @@ ordinary no-downtime restart. The critical rule: the dual-path binary must be on
 every node *before* the schedule takes effect, not merely before `H`.
 
 **3. Signal ready.** Once a validator is running the new binary, it emits a
-`SignalReady` signal. Crucially, a node only signals when its own binary actually
+`UpgradeReady` signal. Crucially, a node only signals when its own binary actually
 carries the target version — "ready" is a truthful machine statement about the
-running code, not a claim an operator types by hand. The upgrade module tallies
+running code, not a claim an operator types by hand. The lifecycle module tallies
 these signals from current validators.
 
 **4. Activate at `H`.** When block `H` is reached, every node evaluates one
@@ -199,7 +199,7 @@ any root-changing module upgrade takes once a live network exists.
 
 ## What this policy does not cover
 
-Introducing the upgrade module itself onto a network that predates it — such as
+Introducing the lifecycle module itself onto a network that predates it — such as
 Ducktape-2 as it stands — is a one-time coordinated genesis change, not a
 no-downtime upgrade; the zero-downtime guarantee applies to the second and later
 upgrades, once the mechanism is present everywhere. Changing the **set** of

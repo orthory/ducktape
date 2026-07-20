@@ -130,11 +130,11 @@ fn shares_view(sim: &Sim) -> Value {
 }
 
 fn upgrade_status(sim: &Sim) -> Value {
-    sim.query("upgrade", json!("status"))["status"].clone()
+    sim.query("lifecycle", json!("upgrade_status"))["upgrade_status"].clone()
 }
 
 fn signal(name: &str, to_version: u64) -> Value {
-    json!({ "signal_ready": { "name": name, "to_version": to_version, "commitment": null } })
+    json!({ "upgrade_ready": { "name": name, "to_version": to_version, "commitment": null } })
 }
 
 fn schedule(name: &str, activation_height: u64, to_version: u64) -> Value {
@@ -349,13 +349,13 @@ fn a_governance_cancel_clears_a_pending_upgrade_early_and_frees_the_slot() {
         schedule("v2", activation, 2),
         1_000_000,
     );
-    sim.submit_ok("upgrade", signal("v2", 2), Some(v0.as_str()));
+    sim.submit_ok("lifecycle", signal("v2", 2), Some(v0.as_str()));
     let st = upgrade_status(&sim);
     assert!(st["pending"].is_object(), "v2 is pending: {st}");
     assert_eq!(st["ready_count"], 1, "one validator signaled: {st}");
 
     // CANCEL v2 through governance, WELL before the boundary. the emitted
-    // UpgradeMsg::Cancel drains under Origin::Module(governance) and clears both
+    // LifecycleMsg::CancelUpgrade drains under Origin::Module(governance) and clears both
     // the pending slot and the residual readiness.
     assert!(height(&sim) < activation, "still before the boundary");
     pass(&sim, &[&v0, &v1], "cancel-v2", cancel("v2"), 1_000_000);
@@ -382,7 +382,7 @@ fn a_governance_cancel_clears_a_pending_upgrade_early_and_frees_the_slot() {
         "the freed slot took v3"
     );
     for v in &validators {
-        sim.submit_ok("upgrade", signal("v3", 3), Some(origin(v).as_str()));
+        sim.submit_ok("lifecycle", signal("v3", 3), Some(origin(v).as_str()));
     }
     walk_to(&sim, activation2);
     let st = upgrade_status(&sim);
@@ -410,7 +410,7 @@ fn a_governance_cancel_clears_a_pending_upgrade_early_and_frees_the_slot() {
 ///
 /// - single-op drain: the queue is `[root, Advance, …]`, and the root's
 ///   follow-ups push BEHIND the injections — so the governance cancel's
-///   emitted `UpgradeMsg::Cancel` drains AFTER the `Advance` already cleared
+///   emitted `LifecycleMsg::CancelUpgrade` drains AFTER the `Advance` already cleared
 ///   the slot, and dies with "no matching pending upgrade to cancel". the
 ///   whole block aborts, rolling the `Advance` back with it: state is
 ///   untouched, the boundary has not passed.

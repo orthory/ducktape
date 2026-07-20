@@ -24,7 +24,7 @@ use identity::Identity;
 use inbox::Inbox;
 use jobs::Jobs;
 use kv::Kv;
-use modreg::Modreg;
+use lifecycle::Lifecycle;
 use pages::Pages;
 use recovery::Manifest;
 use runs::RunsModule;
@@ -36,7 +36,6 @@ use statesync::{
 };
 use tagging::TaggingModule;
 use tasks::Tasks;
-use upgrade::Upgrade;
 use valset::Valset;
 use wasm_host::WasmModule;
 
@@ -53,8 +52,7 @@ struct NativeV1Modules {
     valset: Valset,
     clients: clients::Clients,
     governance: Governance,
-    upgrade: Upgrade,
-    modreg: Modreg,
+    lifecycle: Lifecycle,
     hello: WasmModule,
     saga: SagaModule,
     capability: CapabilityRegistry,
@@ -83,8 +81,7 @@ impl NativeV1Modules {
             Box::new(self.valset),
             Box::new(self.clients),
             Box::new(self.governance),
-            Box::new(self.upgrade),
-            Box::new(self.modreg),
+            Box::new(self.lifecycle),
             Box::new(self.hello),
             Box::new(self.saga),
             Box::new(self.capability),
@@ -112,9 +109,9 @@ impl NativeV1Modules {
 fn ensure_upgrade_matches(
     current_version: u32,
     pending: Option<(&str, u64, u32)>,
-    upgrade: &Upgrade,
+    lifecycle: &Lifecycle,
 ) -> Result<(), String> {
-    let (snapshot_version, snapshot_pending) = upgrade.committed_coordinates();
+    let (snapshot_version, snapshot_pending) = lifecycle.committed_coordinates();
     if snapshot_version != current_version {
         return Err(format!(
             "upgrade snapshot protocol_v{snapshot_version} disagrees with manifest protocol_v{current_version}"
@@ -133,7 +130,7 @@ fn ensure_upgrade_matches(
     Ok(())
 }
 
-fn recovery_control_modules(manifest: &Manifest) -> Result<(Upgrade, Modreg), String> {
+fn recovery_control_modules(manifest: &Manifest) -> Result<Lifecycle, String> {
     if manifest.pending_upgrade.is_some() {
         return Err("native v1 recovery requires pending_upgrade: none".into());
     }
@@ -148,22 +145,16 @@ fn recovery_control_modules(manifest: &Manifest) -> Result<(Upgrade, Modreg), St
         ))
     };
 
-    let mut upgrade = Upgrade::new("upgrade", "valset");
-    let (bytes, root) = snapshot_of("upgrade")?;
-    upgrade
+    let mut lifecycle = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+    let (bytes, root) = snapshot_of(host::LIFECYCLE_MODULE_ID)?;
+    lifecycle
         .install(bytes, root)
-        .map_err(|error| format!("upgrade install: {error}"))?;
-    ensure_upgrade_matches(manifest.current_version, None, &upgrade)?;
-
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset").with_legacy_v1_state();
-    let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID)?;
-    modreg
-        .install(bytes, root)
-        .map_err(|error| format!("modreg install: {error}"))?;
-    if modreg.has_pending_swaps() {
+        .map_err(|error| format!("lifecycle install: {error}"))?;
+    ensure_upgrade_matches(manifest.current_version, None, &lifecycle)?;
+    if lifecycle.has_pending_swaps() {
         return Err("native v1 recovery requires no pending module code swaps".into());
     }
-    Ok((upgrade, modreg))
+    Ok(lifecycle)
 }
 
 pub(super) async fn restore_host(
@@ -176,7 +167,7 @@ pub(super) async fn restore_host(
 ) -> Result<Host, String> {
     // Validate mutable boundary coordinators before opening QMDB, Forge,
     // DuckFS, or the blob plane. No new-schema transition is admitted here.
-    let (upgrade, modreg) = recovery_control_modules(manifest)?;
+    let lifecycle = recovery_control_modules(manifest)?;
     let kv = Kv::new(
         "kv",
         Box::new(QmdbStore::init(context.child("kv"), "kv").await),
@@ -218,10 +209,10 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|error| format!("clients install: {error}"))?;
 
-    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
+    let mut governance = Governance::new("governance", "valset", "lifecycle", "identity")
         .with_invite_binding(bindings.invite)
         .with_clients("clients")
-        .with_modreg(host::MODREG_MODULE_ID);
+        .with_code_registry(host::LIFECYCLE_MODULE_ID);
     let (bytes, root) = snapshot_of("governance")?;
     governance
         .install(bytes, root)
@@ -348,8 +339,7 @@ pub(super) async fn restore_host(
         valset,
         clients,
         governance,
-        upgrade,
-        modreg,
+        lifecycle,
         hello,
         saga,
         capability,
@@ -405,22 +395,16 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         }
     };
 
-    let (bytes, root) = snapshot_of("upgrade").await?;
-    let mut upgrade = Upgrade::new("upgrade", "valset");
-    upgrade
+    // The lifecycle module carries both the protocol-version coordinate and the
+    // code registry. Refuse a pending code swap before creating qmdb/DuckFS
+    // scratch: this exact binary-roll route admits no in-flight code-plane change.
+    let (bytes, root) = snapshot_of(host::LIFECYCLE_MODULE_ID).await?;
+    let mut lifecycle = Lifecycle::new(host::LIFECYCLE_MODULE_ID, "valset");
+    lifecycle
         .install(&bytes, root)
-        .map_err(|error| format!("upgrade install: {error}"))?;
-    ensure_upgrade_matches(manifest.current_version, None, &upgrade)?;
-
-    // A native-v1 code swap uses the old height-only pending shape. Refuse it
-    // before creating qmdb/DuckFS scratch: mixed old/new code-plane semantics
-    // are not part of this exact binary-roll route.
-    let (bytes, root) = snapshot_of(host::MODREG_MODULE_ID).await?;
-    let mut modreg = Modreg::new(host::MODREG_MODULE_ID, "valset").with_legacy_v1_state();
-    modreg
-        .install(&bytes, root)
-        .map_err(|error| format!("modreg install: {error}"))?;
-    if modreg.has_pending_swaps() {
+        .map_err(|error| format!("lifecycle install: {error}"))?;
+    ensure_upgrade_matches(manifest.current_version, None, &lifecycle)?;
+    if lifecycle.has_pending_swaps() {
         return Err("native v1 state sync requires no pending module code swaps".into());
     }
 
@@ -550,10 +534,10 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .map_err(|error| format!("tagging install: {error}"))?;
 
     let (bytes, root) = snapshot_of("governance").await?;
-    let mut governance = Governance::new("governance", "valset", "upgrade", "identity")
+    let mut governance = Governance::new("governance", "valset", "lifecycle", "identity")
         .with_invite_binding(bindings.invite)
         .with_clients("clients")
-        .with_modreg(host::MODREG_MODULE_ID);
+        .with_code_registry(host::LIFECYCLE_MODULE_ID);
     governance
         .install(&bytes, root)
         .map_err(|error| format!("governance install: {error}"))?;
@@ -671,8 +655,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         valset,
         clients,
         governance,
-        upgrade,
-        modreg,
+        lifecycle,
         hello,
         saga,
         capability,

@@ -25,8 +25,8 @@ use futures::executor::block_on;
 
 use host::{BASELINE_VERSION, BlockContext, Host};
 use sdk::{Msg, Origin};
-use upgrade::Upgrade;
-use upgrade::{UpgradeMsg, encode_msg as upgrade_encode};
+use lifecycle::Lifecycle;
+use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode};
 use valset::Valset;
 use valset::{ValsetMsg, ValsetQuery, ValsetReply, encode_msg as valset_encode};
 
@@ -53,8 +53,8 @@ fn apply(host: &mut Host, height: u64, pv: u32, origin: Origin, msg: Msg) {
 
 fn schedule(name: &str, activation_height: u64, to_version: u32) -> Msg {
     Msg {
-        target: "upgrade".into(),
-        payload: upgrade_encode(&UpgradeMsg::Schedule {
+        target: "lifecycle".into(),
+        payload: lifecycle_encode(&LifecycleMsg::ScheduleUpgrade {
             name: name.into(),
             activation_height,
             to_version,
@@ -64,8 +64,8 @@ fn schedule(name: &str, activation_height: u64, to_version: u32) -> Msg {
 
 fn signal(name: &str, to_version: u32) -> Msg {
     Msg {
-        target: "upgrade".into(),
-        payload: upgrade_encode(&UpgradeMsg::SignalReady {
+        target: "lifecycle".into(),
+        payload: lifecycle_encode(&LifecycleMsg::UpgradeReady {
             name: name.into(),
             to_version,
             commitment: None,
@@ -75,23 +75,29 @@ fn signal(name: &str, to_version: u32) -> Msg {
 
 fn current_version(host: &Host) -> u32 {
     let reply = block_on(host.query(
-        "upgrade",
-        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
+        "lifecycle",
+        &lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus),
     ))
     .expect("status query");
-    let upgrade::UpgradeReply::Status(s) =
-        upgrade::decode_reply(&reply).expect("decode status");
+    let lifecycle::LifecycleReply::UpgradeStatus(s) =
+        lifecycle::decode_reply(&reply).expect("decode status")
+    else {
+        panic!("expected UpgradeStatus");
+    };
     s.current_version
 }
 
 fn pending_is_none(host: &Host) -> bool {
     let reply = block_on(host.query(
-        "upgrade",
-        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
+        "lifecycle",
+        &lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus),
     ))
     .expect("status query");
-    let upgrade::UpgradeReply::Status(s) =
-        upgrade::decode_reply(&reply).expect("decode status");
+    let lifecycle::LifecycleReply::UpgradeStatus(s) =
+        lifecycle::decode_reply(&reply).expect("decode status")
+    else {
+        panic!("expected UpgradeStatus");
+    };
     s.pending.is_none()
 }
 
@@ -125,7 +131,7 @@ fn boundary_with_optional_admission(admit_extra: bool) -> Host {
     valset.insert(m0.clone());
     valset.insert(m1.clone());
     host.register(Box::new(valset));
-    host.register(Box::new(Upgrade::new("upgrade", "valset")));
+    host.register(Box::new(Lifecycle::new("lifecycle", "valset")));
 
     apply(&mut host, 1, BASELINE_VERSION, Origin::System, schedule("proto-v2", ADMIT_H, TO_VERSION));
     apply(&mut host, 2, BASELINE_VERSION, Origin::External(m0.clone()), signal("proto-v2", TO_VERSION));

@@ -6,7 +6,7 @@ use host::Host;
 use recovery::Manifest;
 use sdk::{Ctx, Error, Module, StateSyncHandle};
 use std::sync::{Arc, Mutex};
-use upgrade::{ScheduledUpgrade, UpgradeStatus};
+use lifecycle::{ScheduledUpgrade, UpgradeStatus};
 
 #[test]
 fn gateway_requires_a_loopback_node_api_and_real_overlay() {
@@ -777,7 +777,7 @@ fn readiness_signaller_only_attests_the_compiled_clients_route() {
         Some((
             crate::constants::CLIENTS_MODULE_UPGRADE_NAME.into(),
             crate::constants::CLIENTS_MODULE_ACTIVATION_VERSION,
-            upgrade::required_readiness_commitment(crate::constants::CLIENTS_MODULE_UPGRADE_NAME)
+            lifecycle::required_readiness_commitment(crate::constants::CLIENTS_MODULE_UPGRADE_NAME)
                 .map(|bytes| bytes.to_vec()),
         ))
     );

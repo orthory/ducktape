@@ -50,7 +50,7 @@ kv = { workspace = true }
 valset = { workspace = true }
 clients = { workspace = true }
 governance = { workspace = true }
-upgrade = { workspace = true }
+lifecycle = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 # variable-length hex decode for the `hex:` origin escape and `--with-valset`

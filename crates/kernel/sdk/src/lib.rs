@@ -112,7 +112,7 @@ pub type ModuleId = String;
 // ============================================================================
 
 /// the coordinates of a scheduled upgrade, mirrored for the manifests. shape
-/// matches `upgrade::ScheduledUpgrade` but carries no module dependency.
+/// matches `lifecycle::ScheduledUpgrade` but carries no module dependency.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UpgradeCoords {
     pub name: String,

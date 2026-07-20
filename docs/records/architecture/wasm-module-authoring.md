@@ -114,7 +114,7 @@ commit it as one change. The check rides the pre-push `make test` gate.
 ## Live update: how new code ships
 
 The consensus commitment to WHICH code a module runs is the code registry
-(`crates/modules/system/modreg`): per module, the active 32-byte sha256 of its component
+(`crates/modules/system/lifecycle`): per module, the active 32-byte sha256 of its component
 bytes plus at most one pending height-gated swap. The BYTES travel out-of-band,
 content-addressed on the node blob plane. The flow:
 
@@ -124,10 +124,10 @@ content-addressed on the node blob plane. The flow:
    rather than forks — so distribute first, then schedule).
 3. Drive governance: `GovAction::UpdateModule { name, module_id,
    activation_height, code_hash }` — a member-gated proposal + majority tally;
-   on passing it emits `ModregMsg::Schedule` into the registry. Cancel before
+   on passing it emits `LifecycleMsg::ScheduleSwap` into the registry. Cancel before
    the boundary with `GovAction::CancelModuleUpdate`.
 4. At the first applied block at/after `activation_height`, two things happen
-   on every node: the drain's injected modreg `Advance` flips the committed
+   on every node: the drain's injected lifecycle `Advance` flips the committed
    active hash (in the app-hash), and the host's out-of-block realization
    (`Host::realize_module_swaps`) verifies `sha256(bytes) == hash` and swaps
    the running component, keeping the host-owned state.
