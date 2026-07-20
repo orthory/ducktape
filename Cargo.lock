@@ -72,7 +72,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chacha20poly1305",
- "dcap-qvl 0.5.2",
+ "dcap-qvl",
  "ed25519-dalek",
  "hex",
  "hkdf",
@@ -109,7 +109,6 @@ version = "0.1.0"
 dependencies = [
  "airlock",
  "anyhow",
- "dcap-qvl 0.3.12",
  "hex",
  "reqwest 0.12.28",
  "serde_json",
@@ -2398,43 +2397,6 @@ dependencies = [
 
 [[package]]
 name = "dcap-qvl"
-version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67e7842b81018f3b991dc65ec0a95ff347332de58478c4ac43459095af00cc89"
-dependencies = [
- "anyhow",
- "asn1_der",
- "base64 0.22.1",
- "borsh",
- "byteorder",
- "chrono",
- "const-oid",
- "dcap-qvl-webpki",
- "der",
- "derive_more 2.1.1",
- "futures",
- "hex",
- "log",
- "p256",
- "parity-scale-codec",
- "pem",
- "reqwest 0.12.28",
- "ring",
- "rustls-pki-types",
- "scale-info",
- "serde",
- "serde-human-bytes",
- "serde_json",
- "sha2",
- "signature",
- "tracing",
- "urlencoding",
- "wasm-bindgen-futures",
- "x509-cert",
-]
-
-[[package]]
-name = "dcap-qvl"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92a14fb8954c867d6855e44d98eab18e769816357738406691ebe60d8fdd005d"
@@ -3024,18 +2986,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "enum-as-inner"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1e6a265c649f3f5979b601d26f1d05ada116434c87741c9493cb56218f76cbc"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
 ]
 
 [[package]]
@@ -3672,36 +3622,11 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "hickory-proto 0.26.1",
+ "hickory-proto",
  "idna",
  "ipnet",
  "jni",
  "rand 0.10.2",
- "thiserror 2.0.18",
- "tinyvec",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "hickory-proto"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8a6fe56c0038198998a6f217ca4e7ef3a5e51f46163bd6dd60b5c71ca6c6502"
-dependencies = [
- "async-trait",
- "cfg-if",
- "data-encoding",
- "enum-as-inner",
- "futures-channel",
- "futures-io",
- "futures-util",
- "idna",
- "ipnet",
- "once_cell",
- "rand 0.9.4",
- "ring",
  "thiserror 2.0.18",
  "tinyvec",
  "tokio",
@@ -3731,27 +3656,6 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.25.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc62a9a99b0bfb44d2ab95a7208ac952d31060efc16241c87eaf36406fecf87a"
-dependencies = [
- "cfg-if",
- "futures-util",
- "hickory-proto 0.25.2",
- "ipconfig",
- "moka",
- "once_cell",
- "parking_lot",
- "rand 0.9.4",
- "resolv-conf",
- "smallvec",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "hickory-resolver"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
@@ -3759,7 +3663,7 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "hickory-net",
- "hickory-proto 0.26.1",
+ "hickory-proto",
  "ipconfig",
  "ipnet",
  "jni",
@@ -6199,7 +6103,6 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "hickory-resolver 0.25.2",
  "http",
  "http-body",
  "http-body-util",
@@ -6208,7 +6111,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
- "once_cell",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -6241,7 +6143,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
- "hickory-resolver 0.26.1",
+ "hickory-resolver",
  "http",
  "http-body",
  "http-body-util",

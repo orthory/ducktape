@@ -13,7 +13,7 @@ use sev::certs::snp::{ca, Certificate, Chain, Verifiable};
 use sev::firmware::guest::AttestationReport;
 use sev::parser::Decoder;
 
-use crate::attest::{Measurement, REPORT_DATA_LEN};
+use crate::attest::{AttestMode, Measurement, REPORT_DATA_LEN};
 
 /// AMD EPYC generation whose pinned root keys the verifier trusts. Pinned by
 /// the operator beside the measurement — a measurement only means something on
@@ -97,6 +97,35 @@ pub enum TrustRoots {
     Tdx(TdxRoots),
     /// Boxed: a CA chain is ~1 KiB and would dominate the enum size.
     Snp(Box<SnpRoots>),
+}
+
+/// Structurally parse a quote WITHOUT verifying any signature, returning the
+/// embedded measurement (hex) and REPORTDATA. TOFU inspection only — the
+/// `airlock-cli inspect` flow that pins a measurement for later verified use.
+/// Never a trust decision.
+pub fn peek_measurement(
+    mode: AttestMode,
+    quote: &[u8],
+) -> Result<(String, [u8; REPORT_DATA_LEN])> {
+    match mode {
+        AttestMode::Mock => {
+            let (m, rd) = crate::attest::mock_peek(quote)?;
+            Ok((m.to_hex(), rd))
+        }
+        AttestMode::Tdx => {
+            let q = dcap_qvl::quote::Quote::parse(quote)
+                .map_err(|e| anyhow!("parse TDX quote: {e:?}"))?;
+            let td = q.report.as_td10().context("quote is not a TDX TD10 report")?;
+            let mut rd = [0u8; REPORT_DATA_LEN];
+            rd.copy_from_slice(&td.report_data[..REPORT_DATA_LEN]);
+            Ok((hex::encode(td.mr_td), rd))
+        }
+        AttestMode::Snp => {
+            let report = AttestationReport::decode(&mut &quote[..], ())
+                .context("parse SEV-SNP attestation report")?;
+            Ok((hex::encode(report.measurement), report.report_data))
+        }
+    }
 }
 
 /// Verify `quote` against pinned trust roots and the expected measurement and
