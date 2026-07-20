@@ -82,6 +82,7 @@ data-plane = { workspace = true }
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }
 futures = "0.3"
+bytes = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
@@ -146,6 +147,8 @@ async-trait = { workspace = true }
 # in milliseconds of wall time instead of minutes.
 tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
+# the streaming e2e feeds an SSE upstream through a channel-backed Body.
+tokio-stream = "0.1"
 # airlock is also a runtime dependency (see [dependencies] — src/airlock_serve.rs);
 # tests additionally need the real verifier + the minted-chain testkit. axum
 # serves the in-process mock upstream airlock_gateway_e2e swaps into.

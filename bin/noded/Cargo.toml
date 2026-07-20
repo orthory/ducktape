@@ -16,6 +16,9 @@ name = "ducktape-noded"
 path = "src/main.rs"
 
 [dependencies]
+# streamed gateway response bodies (GatewayBody chunks + Body::from_stream relay).
+bytes = "1"
+tokio-stream = "0.1"
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 host = { workspace = true }
