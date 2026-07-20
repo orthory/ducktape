@@ -142,7 +142,7 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 21] = [
+pub(crate) const MODULE_IDS: [&str; 20] = [
     "pages",
     "chat",
     "forge",
@@ -164,7 +164,6 @@ pub(crate) const MODULE_IDS: [&str; 21] = [
     "directory",
     "automations",
     "files",
-    "jobs",
     "agent",
     "runs",
 ];
@@ -174,7 +173,7 @@ pub(crate) const MODULE_IDS: [&str; 21] = [
 /// Keep this alphabetically ordered and bump a module's revision in the same
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 21] = [
+pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
     // tail inside the native snapshot persisted as one host-KV value.
     ("agent", 3),
@@ -208,7 +207,6 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 21] = [
     // — a state-schema break from revision 2 (beta re-genesis, no shim).
     ("identity", 3),
     ("inbox", 2),
-    ("jobs", 2),
     // 1: the native lifecycle module (merged upgrade + modreg): protocol-version
     // coordination + the module code registry, one app-hashed root.
     ("lifecycle", 1),
@@ -222,7 +220,10 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 21] = [
     // empty host-KV root, but every written state re-encodes — a break).
     ("saga", 2),
     ("tagging", 2),
-    ("tasks", 2),
+    // 3: the tasks+jobs merge — the `tasks` work module now hosts BOTH the task
+    // board and the (former `jobs`) job board, so its canonical snapshot/root
+    // encoding is the two boards concatenated (revision 2 was the wasm port).
+    ("tasks", 3),
     ("valset", 1),
 ];
 

@@ -23,7 +23,7 @@ use dispatch::{
     encode_reply as dispatch_encode_reply, encode_result_event as dispatch_encode_result_event,
 };
 use futures::executor::block_on;
-use jobs::{JobsEvent, encode_event as jobs_encode_event};
+use tasks::{JobsEvent, encode_job_event as jobs_encode_event};
 use runs::{RunsModule, dispatch_id_for, job_run_id_for, job_spec_hash, run_id_for};
 use runs::{
     PendingRun, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply, encode_msg, encode_query,

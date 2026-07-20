@@ -38,7 +38,6 @@ use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
-use jobs::Jobs;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use tagging::TaggingModule;
@@ -146,10 +145,9 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )),
         Box::new(Tasks::new("tasks")),
-        Box::new(Jobs::new("jobs")),
     ])
     .expect("genesis")
 }

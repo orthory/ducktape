@@ -22,7 +22,6 @@ saga = { path = "../../system/saga", default-features = false }
 tagging = { workspace = true }
 dispatch = { workspace = true }
 tasks = { path = "../tasks", default-features = false }
-jobs = { workspace = true }
 # the duckfs wire types (FilesQuery::Refs / FilesReply::Refs / RefsInfo) the v3
 # composer queries for the committed head it pins as source_snapshot (W2), plus
 # `paths::canonical`. linked through the `files` MODULE's crate root (which

@@ -62,7 +62,6 @@ duckfs-core = { workspace = true }
 duckfs-disk = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
-jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability orchestrator runs

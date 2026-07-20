@@ -60,9 +60,9 @@ noded/simnode/demo run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
 if it should be testable in sim-lane or visible in the app, it does.
 
-NEVER touch `NATIVE_V1_MODULE_STATE_SCHEMAS` or `PRE_CLIENTS_MODULE_STATE_SCHEMAS`
-— frozen fingerprints of historical networks; editing them breaks fail-closed
-restore. A new module joins only the two live arrays.
+A new module joins the two live arrays — `MODULE_IDS` and
+`MODULE_STATE_SCHEMAS` — and keep each array's declared `[..; N]` length equal
+to its contents (the auto-merge count trap).
 
 ## 4. Gates — ordering is load-bearing
 
@@ -82,7 +82,7 @@ make wasm-modules-check                                   # 5. committed copies 
 | Mistake | Reality |
 |---|---|
 | Registering only in `bin/node` | noded/simnode/demo compose their own instances; the module is invisible in daemon/sim lanes |
-| Editing the frozen schema arrays | they fingerprint historical networks — restore fails closed |
+| Array `[..; N]` length left stale after adding/removing a module | the declared length must equal the contents or the build fails (the auto-merge count trap) |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | `include_bytes!` before `make wasm-modules` | bin/node cannot compile until the component exists |
 | Rebuilding one guest's component alone | bytes are toolchain-dependent; refresh the set together or `wasm-modules-check` fails |

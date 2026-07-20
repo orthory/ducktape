@@ -19,12 +19,13 @@ use files::{
     encode_reply as files_encode_reply,
 };
 use futures::executor::block_on;
-use jobs::{
-    Claim as JobClaim, Job, encode_event as jobs_encode_event, encode_reply as jobs_encode_reply,
-};
 use sdk::Env;
 use tagging::{Author, encode_event as tagging_encode_event};
-use tasks::{Task, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply};
+use tasks::{
+    Claim as JobClaim, Job, Task, decode_task_msg as tasks_decode_msg,
+    encode_job_event as jobs_encode_event, encode_job_reply as jobs_encode_reply,
+    encode_task_reply as tasks_encode_reply,
+};
 
 /// a canned registry: agent id -> record, served by the ctx's "agent"
 /// query arm exactly like the live registry module would answer.
@@ -272,7 +273,7 @@ impl CaptureCtx {
         self.msgs
             .iter()
             .filter(|m| m.target == "jobs")
-            .map(|m| jobs::decode_msg(&m.payload).expect("jobs msg"))
+            .map(|m| tasks::decode_job_msg(&m.payload).expect("jobs msg"))
             .collect()
     }
     /// decoded dispatch-plane msgs emitted this dispatch.
@@ -411,7 +412,7 @@ impl Ctx for CaptureCtx {
                 _ => Err(Error::QueryUnsupported),
             },
             "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
-            "jobs" => match jobs::decode_query(req).map_err(Error::Module)? {
+            "jobs" => match tasks::decode_job_query(req).map_err(Error::Module)? {
                 JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
                     self.jobs.get(&job_id).cloned(),
                 ))),

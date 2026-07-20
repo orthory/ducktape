@@ -24,7 +24,6 @@ gateway = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
-jobs = { workspace = true }
 valset = { workspace = true }
 sdk = { workspace = true }
 commonware-runtime = { workspace = true }

@@ -1,21 +1,28 @@
-//! the jobs module under test: the full lifecycle, every race/guard rejection,
-//! caps, lease clamping, queries, origin-derived identity, snapshot/install, and
-//! commit/abort staging — plus real-`Host` proofs that first-claim-wins under
-//! the host's ordered dispatch.
+//! the job board under test (via the merged `tasks` work module): the full
+//! lifecycle, every race/guard rejection, caps, lease clamping, queries,
+//! origin-derived identity, snapshot/install, and commit/abort staging — plus
+//! real-`Host` proofs that first-claim-wins under the host's ordered dispatch.
+//!
+//! the board lives inside the `tasks` module now, so ops ride the `WorkMsg`
+//! envelope (`encode_job_*`) and the combined snapshot carries an empty
+//! task-board prefix ahead of the job-board bytes.
 
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
-use jobs::{
-    Jobs, MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIST_LIMIT, MAX_PAYLOAD, MAX_SPEC, MAX_WORKERS,
+use tasks::{
+    Tasks as Jobs, MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIST_LIMIT, MAX_PAYLOAD, MAX_SPEC,
+    MAX_WORKERS,
 };
-use jobs::{
+use tasks::{
     BoardCounts, Job, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
-    decode_event as decode_jobs_event, decode_reply, encode_event as encode_jobs_event, encode_msg,
-    encode_query,
+    decode_job_event as decode_jobs_event, decode_job_reply as decode_reply,
+    encode_job_event as encode_jobs_event, encode_job_msg as encode_msg,
+    encode_job_query as encode_query,
 };
 use sdk::{Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 
-const JOBS: &str = "jobs";
+// the merged work module's genesis id -- the job board now lives here.
+const JOBS: &str = "tasks";
 
 // ---- wire builders ---------------------------------------------------------
 
@@ -1030,6 +1037,7 @@ fn snapshot_one(
     result: Option<(bool, &str)>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    out.extend_from_slice(&0u64.to_le_bytes()); // empty task board (task count)
     out.extend_from_slice(&1u64.to_le_bytes()); // job count
     push_string(&mut out, "j1"); // job_id
     push_string(&mut out, "k"); // kind
@@ -1062,6 +1070,7 @@ fn snapshot_one(
 
 fn snapshot_workers(workers: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
+    out.extend_from_slice(&0u64.to_le_bytes()); // empty task board (task count)
     out.extend_from_slice(&0u64.to_le_bytes()); // job count
     out.extend_from_slice(&(workers.len() as u64).to_le_bytes());
     for worker in workers {

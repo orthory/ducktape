@@ -140,10 +140,10 @@ use files::{
     decode_reply as files_decode_reply, encode_msg as files_encode_msg,
     encode_query as files_encode_query,
 };
-use jobs::{
-    JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_event as jobs_decode_event,
-    decode_reply as jobs_decode_reply, encode_msg as jobs_encode_msg,
-    encode_query as jobs_encode_query,
+use tasks::{
+    JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_job_event as jobs_decode_event,
+    decode_job_reply as jobs_decode_reply, encode_job_msg as jobs_encode_msg,
+    encode_job_query as jobs_encode_query,
 };
 use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -154,8 +154,8 @@ use tagging::{
     encode_msg as tagging_encode_msg,
 };
 use tasks::{
-    TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply as tasks_decode_reply,
-    encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
+    TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_task_reply as tasks_decode_reply,
+    encode_task_msg as tasks_encode_msg, encode_task_query as tasks_encode_query,
 };
 
 /// how many transcript messages (newest-first, ending at the anchor) one run
@@ -534,7 +534,7 @@ impl RunsModule {
         let tagging = tagging.into();
         let dispatch = dispatch.into();
         let agent = agent.into();
-        let mut ids = BTreeSet::from([
+        let core = BTreeSet::from([
             id.clone(),
             chat.clone(),
             saga.clone(),
@@ -542,16 +542,21 @@ impl RunsModule {
             dispatch.clone(),
             agent.clone(),
         ]);
-        let mut expected = 6;
-        for module in [&tasks, &jobs].into_iter().flatten() {
-            ids.insert(module.clone());
-            expected += 1;
-        }
         assert_eq!(
-            ids.len(),
-            expected,
-            "runs collaborator module ids must be pairwise distinct"
+            core.len(),
+            6,
+            "runs core collaborator module ids must be pairwise distinct"
         );
+        // the task board and the job board now live in ONE merged work module,
+        // so `tasks` and `jobs` MAY be the same id -- the invariant that keeps
+        // the privileged intakes spoof-proof is only that each is distinct from
+        // every core collaborator's origin.
+        for module in [&tasks, &jobs].into_iter().flatten() {
+            assert!(
+                !core.contains(module),
+                "a task/job module id collides with a core runs collaborator"
+            );
+        }
         Self {
             id,
             chat,

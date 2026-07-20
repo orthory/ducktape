@@ -2042,7 +2042,6 @@ dependencies = [
  "host",
  "identity",
  "inbox",
- "jobs",
  "kv",
  "runs",
  "saga",
@@ -3084,7 +3083,6 @@ dependencies = [
  "greeter",
  "identity",
  "inbox",
- "jobs",
  "kv",
  "lifecycle",
  "p256",
@@ -3548,19 +3546,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jobs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "host",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "jobserver"
 version = "0.1.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4019,7 +4004,6 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
- "jobs",
  "kv",
  "libc",
  "lifecycle",
@@ -4086,7 +4070,6 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
- "jobs",
  "node",
  "pages",
  "rand 0.8.6",
@@ -5316,7 +5299,6 @@ dependencies = [
  "forge",
  "futures",
  "host",
- "jobs",
  "pages",
  "saga",
  "sdk",
@@ -5812,7 +5794,6 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
- "jobs",
  "kv",
  "lifecycle",
  "node",

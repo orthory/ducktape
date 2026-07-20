@@ -63,7 +63,7 @@ use dispatch::{
 };
 use files::Files;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use jobs::{Jobs, JobsMsg, encode_msg as jobs_encode_msg};
+use tasks::{JobsMsg, encode_job_msg as jobs_encode_msg};
 use pages::Pages;
 use runs::{
     RunsModule, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
@@ -75,8 +75,8 @@ use sdk::{Error, Event, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tagging::TaggingModule;
 use tasks::{
-    TaskQuery, TaskReply, Tasks, decode_reply as tasks_decode_reply,
-    encode_query as tasks_encode_query,
+    TaskQuery, TaskReply, Tasks, decode_task_reply as tasks_decode_reply,
+    encode_task_query as tasks_encode_query,
 };
 use valset::Valset;
 use wasm_host::WasmModule;
@@ -104,7 +104,7 @@ fn native_runs() -> RunsModule {
         "dispatch",
         "agent",
         Some("tasks".into()),
-        Some("jobs".into()),
+        Some("tasks".into()),
     )
     .with_files_module("files")
     .with_sink_forge("forge")
@@ -133,7 +133,6 @@ async fn siblings(
         Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
         Box::new(Tasks::new("tasks")),
-        Box::new(Jobs::new("jobs")),
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
     if let Some(members) = assignment_members {
@@ -1481,7 +1480,7 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
         // guest — into a same-block claim + dispatch + saga trigger, and the
         // WorkerRequest carries the composed job payload identically.
         let submit = Msg {
-            target: "jobs".into(),
+            target: "tasks".into(),
             payload: jobs_encode_msg(&JobsMsg::Submit {
                 job_id: "job-1".into(),
                 kind: "agent/quackbot".into(),
@@ -1521,17 +1520,18 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
         // check that the board item really finalized through the wasm module.
         let reply = wasm
             .query(
-                "jobs",
-                &jobs::encode_query(&jobs::JobsQuery::Get {
+                "tasks",
+                &tasks::encode_job_query(&tasks::JobsQuery::Get {
                     job_id: "job-1".into(),
                 }),
             )
             .await
             .expect("jobs query");
-        let jobs::JobsReply::Job(Some(job)) = jobs::decode_reply(&reply).expect("decode") else {
+        let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&reply).expect("decode")
+        else {
             panic!("job expected");
         };
-        assert_eq!(job.status, jobs::JobStatus::Done);
+        assert_eq!(job.status, tasks::JobStatus::Done);
         assert!(job.result.expect("finalize result").ok);
     });
 }
