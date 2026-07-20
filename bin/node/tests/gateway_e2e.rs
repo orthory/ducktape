@@ -398,7 +398,11 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     assert!(lower_headers.contains(&format!("connect-src duck://{authority}")));
     assert!(lower_headers.contains("worker-src 'none'"));
     assert!(lower_headers.contains("webrtc 'block'"));
-    assert!(!lower_headers.contains("set-cookie:"));
+    // the browser lane forwards Set-Cookie like the programmatic lane above:
+    // the pane's document origin is duck://<authority> (see the CSP asserts),
+    // so the embedded browser scopes cookies per route authority exactly like
+    // the web — and a self-hosted app behind a route needs its session cookie.
+    assert!(lower_headers.contains("set-cookie:"));
     assert!(String::from_utf8_lossy(&html).contains("<title>Alice</title>"));
 
     // A page whose Origin does not match the forwarded authority is rejected.
