@@ -40,13 +40,12 @@ use std::collections::BTreeMap;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use identity::{
-    IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
-    encode_query as identity_encode_query,
+    IdentityMsg, IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
+    encode_msg as identity_encode_msg, encode_query as identity_encode_query,
 };
 use sdk::codec::{Cursor, push_bytes};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use clients::{ClientsMsg, encode_msg as clients_encode_msg};
 use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -144,17 +143,11 @@ pub struct Governance {
     /// genesis wiring — identical on every node; `None` (a net without the code
     /// registry wired) rejects those proposals at the door, deterministically.
     code_registry_id: Option<ModuleId>,
-    /// the Identity account registry used in account-share mode.
+    /// the Identity account registry used in account-share mode AND as the
+    /// submit-door client ACL: a redeemed `role=Client` invite emits an
+    /// `IdentityMsg::GrantClient` follow-up here (identity is always wired, so
+    /// Client redemption needs no separate module gate).
     identity_id: ModuleId,
-    /// the id of the client-ACL module a redeemed `role=Client` invite grants
-    /// standing in. genesis wiring — every node of a network must wire the same
-    /// id (or none). `None` (a shape without the module) rejects Client redeems
-    /// deterministically; Resident redeems are unaffected.
-    clients_id: Option<ModuleId>,
-    /// First protocol version allowed to route Client invite redemptions to
-    /// `clients`. Non-hashed genesis/runtime wiring used only by the one
-    /// pre-clients module-set migration; fresh networks keep the default 0.
-    clients_min_version: u32,
     /// Current deterministic protocol selector supplied by the host. This is
     /// deliberately not snapshot state: replay derives it from the block.
     active_version: u32,
@@ -196,8 +189,6 @@ impl Governance {
             lifecycle_id: lifecycle_id.into(),
             code_registry_id: None,
             identity_id: identity_id.into(),
-            clients_id: None,
-            clients_min_version: 0,
             active_version: 0,
             invite_binding: None,
             proposals: BTreeMap::new(),
@@ -218,26 +209,6 @@ impl Governance {
     /// path targets).
     pub fn with_code_registry(mut self, id: impl Into<ModuleId>) -> Self {
         self.code_registry_id = Some(id.into());
-        self
-    }
-
-    /// wire the client-ACL module a redeemed `role=Client` invite grants standing
-    /// in. genesis wiring — every node of a network must wire the same id (or
-    /// none), or nodes diverge on whether Client redeems are accepted.
-    pub fn with_clients(mut self, clients_id: impl Into<ModuleId>) -> Self {
-        self.clients_id = Some(clients_id.into());
-        self
-    }
-
-    /// Wire `clients`, but refuse Client invite redemption until the host has
-    /// activated `version`. Resident redemption remains available throughout.
-    pub fn with_clients_after_version(
-        mut self,
-        clients_id: impl Into<ModuleId>,
-        version: u32,
-    ) -> Self {
-        self.clients_id = Some(clients_id.into());
-        self.clients_min_version = version;
         self
     }
 
@@ -1342,9 +1313,10 @@ impl Governance {
         // the standing grant differs by role: a Resident invite grants valset
         // resident standing (mesh + statesync, pre-promotion); a Client invite
         // grants client-ACL standing — SUBMIT AUTHORIZATION ONLY, never
-        // statesync or a quorum seat (that is why clients live in a separate
-        // module the sync door never reads). the dedup gate and the emitted
-        // follow-up op are role-specific; every check above is shared.
+        // statesync or a quorum seat (client standing is a facet of identity,
+        // structurally distinct from valset so the sync door never reads it).
+        // the dedup gate and the emitted follow-up op are role-specific; every
+        // check above is shared.
         let grant = match token.role {
             invite::InviteRole::Resident => {
                 if members.iter().any(|m| m == &joiner) {
@@ -1363,18 +1335,10 @@ impl Governance {
                 }
             }
             invite::InviteRole::Client => {
-                if self.active_version < self.clients_min_version {
-                    return Err(Error::Module(format!(
-                        "client redemption activates at protocol v{}",
-                        self.clients_min_version
-                    )));
-                }
-                let Some(clients_id) = self.clients_id.as_deref() else {
-                    return Err(Error::Module(
-                        "this network is not wired for client redemption (no clients module)".into(),
-                    ));
-                };
-                if clients::clients(ctx, clients_id)
+                // client standing is a facet of the identity account plane
+                // (identity is always wired), so redemption needs no separate
+                // module gate — it emits an `IdentityMsg::GrantClient` follow-up.
+                if identity::clients(ctx, &self.identity_id)
                     .await?
                     .iter()
                     .any(|c| c == &joiner)
@@ -1382,8 +1346,8 @@ impl Governance {
                     return Err(Error::Module("joiner already holds client standing".into()));
                 }
                 Msg {
-                    target: clients_id.to_string(),
-                    payload: clients_encode_msg(&ClientsMsg::Grant {
+                    target: self.identity_id.to_string(),
+                    payload: identity_encode_msg(&IdentityMsg::GrantClient {
                         key: joiner.clone(),
                     }),
                 }

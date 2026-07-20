@@ -4,7 +4,6 @@
 //! state into the canonical host. The live node loop only consumes the three
 //! lifecycle operations and output adapter exported below.
 
-use clients::Clients;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use dispatch::DispatchModule;
@@ -23,60 +22,22 @@ use statesync::{
 use valset::Valset;
 use wasm_host::WasmModule;
 
-use crate::constants::{
-    CLIENTS_MODULE_ACTIVATION_VERSION, current_state_schema_fingerprint,
-    native_v1_state_schema_fingerprint, pre_clients_state_schema_fingerprint,
-};
+use crate::constants::current_state_schema_fingerprint;
 use crate::util::hex;
 
-mod native_v1;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum StateSchemaRoute {
-    Exact,
-    AddClientsAtV1,
-    NativeV1,
-}
-
-fn classify_recovery_state_schema(
-    found: Option<[u8; 32]>,
-    current_version: u32,
-) -> Result<StateSchemaRoute, String> {
-    if found == Some(native_v1_state_schema_fingerprint()) && current_version == 1 {
-        return Ok(StateSchemaRoute::NativeV1);
-    }
-    classify_state_schema(found, current_version)
-}
-
-fn classify_state_schema(
-    found: Option<[u8; 32]>,
-    current_version: u32,
-) -> Result<StateSchemaRoute, String> {
-    if found == Some(current_state_schema_fingerprint()) {
-        return Ok(StateSchemaRoute::Exact);
-    }
-    if found == Some(pre_clients_state_schema_fingerprint())
-        && current_version < CLIENTS_MODULE_ACTIVATION_VERSION
-    {
-        return Ok(StateSchemaRoute::AddClientsAtV1);
-    }
-    recovery::check_state_schema(found, current_state_schema_fingerprint())
-        .map(|()| StateSchemaRoute::Exact)
+/// fail closed unless a recovery manifest's captured schema is EXACTLY this
+/// binary's current module set. no in-place migration route survives: every
+/// historical schema (pre-`clients`-absorb, pre-wasm-cutover, ...) re-genesises.
+pub(super) fn preflight_recovery_schema(manifest: &Manifest) -> Result<(), String> {
+    recovery::check_state_schema(manifest.state_schema, current_state_schema_fingerprint())
         .map_err(|error| error.to_string())
 }
 
-pub(super) fn preflight_recovery_schema(manifest: &Manifest) -> Result<StateSchemaRoute, String> {
-    let route = classify_recovery_state_schema(manifest.state_schema, manifest.current_version)?;
-    if route == StateSchemaRoute::NativeV1 && manifest.pending_upgrade.is_some() {
-        return Err("native v1 recovery requires pending_upgrade: none".into());
-    }
-    Ok(route)
-}
-
-pub(super) fn preflight_sync_schema(
-    manifest: &statesync::Manifest,
-) -> Result<StateSchemaRoute, String> {
-    classify_recovery_state_schema(Some(manifest.state_schema), manifest.current_version)
+/// the state-sync twin of [`preflight_recovery_schema`]: a peer can only offer
+/// state for the exact schema this joiner runs.
+pub(super) fn preflight_sync_schema(manifest: &statesync::Manifest) -> Result<(), String> {
+    recovery::check_state_schema(Some(manifest.state_schema), current_state_schema_fingerprint())
+        .map_err(|error| error.to_string())
 }
 
 /// Consensus-visible network names shared by genesis, restore, and state sync.
@@ -474,15 +435,17 @@ fn genesis_config_wasm(
     module
 }
 
-/// identity at its GENESIS code + config (adapter-ported, revision 2 — see
-/// [`genesis_jobs_wasm`]): the per-network chain id rides `__config`.
+/// identity at its GENESIS code + config (adapter-ported): the per-network
+/// chain id rides `__config`. revision 3: identity absorbed the submit-door
+/// client ACL (the retired `clients` module's ed25519 key set) as a tail folded
+/// into its account snapshot/root — a state-schema break from revision 2.
 fn genesis_identity_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     genesis_config_wasm(
         IDENTITY_MODULE_ID,
         IDENTITY_WASM_COMPONENT,
         &[("chain_id", bindings.identity_chain_id.as_bytes())],
         "identity",
-        2,
+        3,
     )
 }
 
@@ -527,7 +490,6 @@ struct ProductionModules {
     chat: WasmModule,
     forge: Forge,
     valset: Valset,
-    clients: Clients,
     governance: WasmModule,
     lifecycle: Lifecycle,
     hello_wasm: WasmModule,
@@ -557,7 +519,6 @@ impl ProductionModules {
             Box::new(self.chat),
             Box::new(self.forge),
             Box::new(self.valset),
-            Box::new(self.clients),
             Box::new(self.governance),
             Box::new(self.lifecycle),
             Box::new(self.hello_wasm),
@@ -618,21 +579,17 @@ pub(super) async fn genesis_host(
     for v in genesis_validators {
         valset.insert(v.as_ref().to_vec());
     }
-    // the client ACL: empty at genesis. a redeemed role=Client invite records a
-    // key here (governance emits ClientsMsg::Grant). SEPARATE from valset by
-    // design — a client never gets statesync/quorum standing.
-    let clients = Clients::new("clients");
     ProductionModules {
         pages,
         chat,
         forge,
         valset,
-        clients,
         // governance is the SOLE authorized author of valset AND client-ACL
         // changes: member proposals + ballots, deterministic tally, follow-up
-        // membership ops, and the redeem-time client grant. adapter-ported;
-        // the invite binding rides its GENESIS CONFIG, the clients sibling id
-        // is compiled into the guest like the rest.
+        // membership ops, and the redeem-time client grant (an
+        // `IdentityMsg::GrantClient` follow-up into identity — the client set is
+        // now a facet of the account plane, empty at genesis). adapter-ported;
+        // the invite binding rides its GENESIS CONFIG, sibling ids compiled in.
         governance: genesis_governance_wasm(bindings),
         // the network lifecycle module (merged upgrade + modreg): the
         // no-downtime protocol-version coordinator (at-most-one pending upgrade +
@@ -718,11 +675,7 @@ pub(super) async fn restore_host(
     // Must precede every module/storage constructor below. A clean-break
     // mismatch is classification, not a failed install attempt, and the
     // archived workspace must remain byte-for-byte untouched.
-    let schema_route = preflight_recovery_schema(manifest)?;
-    if schema_route == StateSchemaRoute::NativeV1 {
-        return native_v1::restore_host(context, forge_repo, duckfs_dir, manifest, bindings, blobs)
-            .await;
-    }
+    preflight_recovery_schema(manifest)?;
     // store-backed wasm tenants restore like the other qmdb modules: the
     // stores reopen themselves at their committed positions and the wasm
     // wrapper computes root() straight from them (no snapshot install — see
@@ -754,22 +707,10 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut clients = Clients::new("clients");
-    if schema_route == StateSchemaRoute::Exact {
-        let (bytes, root) = snapshot_of("clients")?;
-        clients
-            .install(bytes, root)
-            .map_err(|e| format!("clients install: {e}"))?;
-    }
-
     // wasm tenants with GENESIS CONFIG restore like any other wasm module:
     // construct through the genesis builder (config-only initial store), then
     // adopt the checkpoint snapshot — the config rides in those bytes, so the
     // install simply replaces the interim store with the same-config one.
-    // NOTE on the schema route: the guest compiles `.with_clients` (gate open
-    // from v0), matching the Exact route. the AddClientsAtV1 route cannot
-    // reach this tree — the wasm cutover's revision fences refuse pre-clients
-    // workspaces before any route is derived (beta re-genesis, no shim).
     let mut governance = genesis_governance_wasm(bindings);
     let (bytes, root) = snapshot_of(GOVERNANCE_MODULE_ID)?;
     governance
@@ -881,12 +822,11 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("automations install: {e}"))?;
 
-    let mut host = ProductionModules {
+    let host = ProductionModules {
         pages,
         chat,
         forge,
         valset,
-        clients,
         governance,
         lifecycle,
         hello_wasm,
@@ -907,10 +847,6 @@ pub(super) async fn restore_host(
     }
     .compose()
     .map_err(|e| format!("restore host: {e}"))?;
-    if schema_route == StateSchemaRoute::AddClientsAtV1 {
-        host.defer_module_until("clients", CLIENTS_MODULE_ACTIVATION_VERSION)
-            .map_err(|e| format!("restore host: {e}"))?;
-    }
     Ok(host)
 }
 
@@ -978,13 +914,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
 ) -> Result<Host, String> {
     // Refuse before creating scratch/canonical stores. A peer can only offer
     // state for the exact binary schema this joiner understands.
-    let schema_route = preflight_sync_schema(manifest)?;
-    if schema_route == StateSchemaRoute::NativeV1 {
-        return native_v1::sync_all_modules(
-            context, client, manifest, bindings, substrates, attempt,
-        )
-        .await;
-    }
+    preflight_sync_schema(manifest)?;
     let SyncSubstrates {
         forge_repo,
         duckfs_dir,
@@ -1082,14 +1012,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
 
-    let mut clients = Clients::new("clients");
-    if schema_route == StateSchemaRoute::Exact {
-        let (bytes, root) = snapshot_of("clients").await?;
-        clients
-            .install(&bytes, root)
-            .map_err(|e| format!("clients install: {e}"))?;
-    }
-
     let (bytes, root) = snapshot_of(SAGA_MODULE_ID).await?;
     let mut saga = genesis_saga_wasm();
     saga.install(&bytes, root)
@@ -1115,8 +1037,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
 
     // wasm tenants with GENESIS CONFIG join like any other wasm module:
     // construct through the genesis builder (config-only initial store), then
-    // adopt the served snapshot, root-checked — the config rides in it (the
-    // schema-route note on the restore path above applies here too).
+    // adopt the served snapshot, root-checked — the config rides in it.
     let (bytes, root) = snapshot_of(GOVERNANCE_MODULE_ID).await?;
     let mut governance = genesis_governance_wasm(bindings);
     governance
@@ -1231,7 +1152,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         chat,
         forge,
         valset,
-        clients,
         governance,
         lifecycle,
         hello_wasm,
@@ -1252,10 +1172,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     }
     .compose()
     .map_err(|e| format!("compose synced host: {e}"))?;
-    if schema_route == StateSchemaRoute::AddClientsAtV1 {
-        host.defer_module_until("clients", CLIENTS_MODULE_ACTIVATION_VERSION)
-            .map_err(|e| format!("compose synced host: {e}"))?;
-    }
     // realize the served boundary version into EVERY dual-path module's branch
     // selector so `root()` (and with it the app-hash check below) recomputes over
     // the boundary's format — the state-sync analogue of the activation hook the
@@ -1302,54 +1218,7 @@ mod tests {
     use commonware_runtime::Runner as _;
 
     use super::*;
-    use crate::constants::{
-        MODULE_IDS, MODULE_STATE_SCHEMAS, native_v1_state_schema_fingerprint,
-        pre_clients_state_schema_fingerprint,
-    };
-
-    #[test]
-    fn pre_clients_schema_has_one_explicit_height_gated_route() {
-        // the ONE migratable fingerprint: the current schema minus `clients`
-        // (re-pinned at the wasm cutover — the pre-cutover 77418fd6… world is
-        // fail-closed like every other historical schema).
-        assert_eq!(
-            crate::config::hex_bytes(&pre_clients_state_schema_fingerprint()),
-            "68759333723c4b38428fffc6718f7ee78e90f799fb6c253e63f243a273793eb1"
-        );
-        assert_eq!(
-            classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 0),
-            Ok(StateSchemaRoute::AddClientsAtV1)
-        );
-        assert!(
-            classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 1).is_err(),
-            "a legacy schema already claiming v1 must fail closed"
-        );
-        assert_eq!(
-            classify_state_schema(Some(current_state_schema_fingerprint()), 1),
-            Ok(StateSchemaRoute::Exact)
-        );
-    }
-
-    #[test]
-    fn native_v1_schema_has_one_exact_compatibility_route() {
-        assert_eq!(
-            crate::config::hex_bytes(&native_v1_state_schema_fingerprint()),
-            "3c22f767f741d3d4d78d8f8005cbc0aea1427afee88a75fc586a7d1729ddb63c"
-        );
-        assert_eq!(
-            classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 1),
-            Ok(StateSchemaRoute::NativeV1)
-        );
-        assert!(
-            classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 0).is_err()
-        );
-        assert!(
-            classify_recovery_state_schema(Some(native_v1_state_schema_fingerprint()), 2).is_err()
-        );
-        let mut unknown = native_v1_state_schema_fingerprint();
-        unknown[0] ^= 1;
-        assert!(classify_recovery_state_schema(Some(unknown), 1).is_err());
-    }
+    use crate::constants::{MODULE_IDS, MODULE_STATE_SCHEMAS};
 
     /// the registry ↔ `MODULE_IDS` parity pin. [`ProductionModules`] already
     /// forces genesis, restore, and state sync onto one module set at compile
@@ -1390,78 +1259,6 @@ mod tests {
             assert_eq!(
                 host.state_schema_fingerprint(),
                 current_state_schema_fingerprint()
-            );
-        });
-    }
-
-    #[test]
-    fn pre_clients_checkpoint_restores_without_rewriting_legacy_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let forge_repo = dir.path().join("forge");
-        let duckfs_dir = dir.path().join("duckfs");
-        let cfg = commonware_runtime::tokio::Config::default()
-            .with_storage_directory(dir.path().join("storage"));
-        let executor = commonware_runtime::tokio::Runner::new(cfg);
-        executor.start(|context| async move {
-            let mut legacy = genesis_host(
-                &context,
-                &forge_repo,
-                &duckfs_dir,
-                &[],
-                NetworkBindings {
-                    invite: b"legacy-clients-route",
-                    identity_chain_id: "legacy-clients-route",
-                },
-                blobstore::BlobHandle::default(),
-            )
-            .await;
-            legacy
-                .defer_module_until("clients", CLIENTS_MODULE_ACTIVATION_VERSION)
-                .expect("construct legacy registry");
-            let legacy_hash = legacy.app_hash();
-            let manifest = Manifest::capture(
-                &legacy,
-                None,
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-                None,
-                0,
-                None,
-                0,
-                1,
-            )
-            .expect("capture legacy checkpoint");
-            assert_eq!(
-                manifest.state_schema,
-                Some(pre_clients_state_schema_fingerprint())
-            );
-            drop(legacy);
-
-            let mut restored = restore_host(
-                &context,
-                &forge_repo,
-                &duckfs_dir,
-                &manifest,
-                NetworkBindings {
-                    invite: b"legacy-clients-route",
-                    identity_chain_id: "legacy-clients-route",
-                },
-                blobstore::BlobHandle::default(),
-            )
-            .await
-            .expect("restore legacy checkpoint through clients route");
-            restored.set_active_version(0);
-            assert_eq!(restored.app_hash(), legacy_hash);
-            assert!(restored.module_root("clients").is_none());
-
-            restored.set_active_version(CLIENTS_MODULE_ACTIVATION_VERSION);
-            assert!(restored.module_root("clients").is_some());
-            assert_ne!(
-                restored.app_hash(),
-                legacy_hash,
-                "the clients root joins the app hash only at the v1 boundary"
             );
         });
     }

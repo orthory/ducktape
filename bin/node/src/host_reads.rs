@@ -37,22 +37,23 @@ pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the clients module's current CLIENT set (committed state — called
-/// between drains, outside any block). the submit door admits a client's
-/// own-signed frame; this is a SEPARATE read from the valset residents (the
-/// clients module is deliberately not valset), so a client's standing can never
-/// leak into the statesync/mesh reads keyed off valset.
+/// read the current CLIENT set — the submit-door ACL, now a facet of the
+/// identity account plane (committed state — called between drains, outside any
+/// block). the submit door admits a client's own-signed frame; this is a
+/// SEPARATE read from the valset residents (client standing is structurally
+/// distinct from valset), so a client's standing can never leak into the
+/// statesync/mesh reads keyed off valset.
 pub(crate) async fn read_clients(host: &Host) -> Vec<Vec<u8>> {
-    use clients::{ClientsQuery, ClientsReply, decode_reply, encode_query};
+    use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
     let Ok(reply) = host
-        .query("clients", &encode_query(&ClientsQuery::Clients))
+        .query("identity", &encode_query(&IdentityQuery::Clients))
         .await
     else {
         return Vec::new();
     };
     match decode_reply(&reply) {
-        Ok(ClientsReply::Clients(v)) => v,
-        Err(_) => Vec::new(),
+        Ok(IdentityReply::Clients(v)) => v,
+        _ => Vec::new(),
     }
 }
 

@@ -45,13 +45,13 @@ impl ReadinessSignaller {
         if pending.to_version > self.max_version {
             return None;
         }
-        let commitment = match lifecycle::required_readiness_commitment(&pending.name) {
-            Some(expected) if pending.name == crate::constants::CLIENTS_MODULE_UPGRADE_NAME => {
-                Some(expected.to_vec())
-            }
-            Some(_) => return None,
-            None => None,
-        };
+        // a named-route upgrade demanding a specific readiness commitment: this
+        // binary recognizes no such route (the clients dormant-registry route is
+        // retired), so stay silent and let the boundary cleanly abort. plain
+        // numeric upgrades carry no commitment.
+        if lifecycle::required_readiness_commitment(&pending.name).is_some() {
+            return None;
+        }
         // only a CURRENT boundary member is in the readiness denominator (R = n).
         if !status.members.iter().any(|m| m == &self.me) {
             return None;
@@ -66,7 +66,7 @@ impl ReadinessSignaller {
             return None;
         }
         self.signaled = Some((pending.name.clone(), pending.to_version));
-        Some((pending.name.clone(), pending.to_version, commitment))
+        Some((pending.name.clone(), pending.to_version, None))
     }
 
     /// query committed upgrade state and, when a signal is due, build the

@@ -39,7 +39,7 @@ pub const INVITE_JOIN_NAMESPACE: &[u8] = b"ducktape-invite-join-v1";
 pub const INVITE_NONCE_LEN: usize = 16;
 
 /// the standing an invite grants. `Resident` = full node standing (mesh +
-/// statesync). `Client` = submit authorization only (the `clients` module —
+/// statesync). `Client` = submit authorization only (identity's client facet —
 /// no statesync, no mesh, no quorum seat). Both are BEARER; the role, not a
 /// target, selects the plane the grant lands in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
