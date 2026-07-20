@@ -116,7 +116,7 @@ where
         if path == IntroPath::Direct {
             ack(sealed_reply(lobby::IntroReply::Refused {
                 detail: "a client invite is not redeemable at a node join — it grants submit \
-                         access; redeem it with `ducktape-node user-redeem-invite`"
+                         access; redeem it with `ducktape user-redeem-invite`"
                     .into(),
             }))
             .await;

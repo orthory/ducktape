@@ -2,7 +2,7 @@
 //! ONLY the files module on a dedicated thread pumping `NodeCommand`s (the shape
 //! of `bin/noded/src/main.rs`'s actor loop, minus the oracle/index/metrics
 //! machinery a files-only node has no use for), fronted by `noded::router` on a
-//! local tokio listener. the CLI subprocess (`env!(CARGO_BIN_EXE_ducktape-fs)`)
+//! local tokio listener. the CLI subprocess (`env!(CARGO_BIN_EXE_ducktape fs)`)
 //! drives it over http exactly as it would a real daemon.
 //!
 //! shut down cleanly on drop (POST /v1/admin/shutdown → serve returns → the handle
@@ -35,7 +35,7 @@ impl Harness {
     /// router on the server thread, and block until `/v1/status` answers.
     pub fn start() -> Self {
         let dir = tempfile::Builder::new()
-            .prefix("ducktape-fs-e2e")
+            .prefix("ducktape fs-e2e")
             .tempdir()
             .expect("harness tempdir");
         let duckfs_dir = dir.path().join("duckfs");
@@ -81,18 +81,18 @@ impl Harness {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// a `ducktape-fs` invocation pre-pointed at this node via `--node`.
+    /// a `ducktape fs` invocation pre-pointed at this node via `--node`.
     pub fn cli(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-fs"));
-        cmd.args(args).arg("--node").arg(self.node_url());
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("fs").args(args).arg("--node").arg(self.node_url());
         cmd
     }
 
-    /// a bare `ducktape-fs` invocation (no `--node`) — for the resolution-error
+    /// a bare `ducktape fs` invocation (no `--node`) — for the resolution-error
     /// and stub-verb cases.
     pub fn cli_bare(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-fs"));
-        cmd.args(args);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("fs").args(args);
         cmd
     }
 

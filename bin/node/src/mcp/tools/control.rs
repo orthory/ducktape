@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use super::{Tool, arg_str, schema};
-use crate::identity::Run;
-use crate::node::{NodeError, Result};
+use crate::mcp::identity::Run;
+use crate::mcp::node::{NodeError, Result};
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![

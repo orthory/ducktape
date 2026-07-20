@@ -19,8 +19,8 @@ stage="$stage_root/ducktape"
 
 [ -x "$release_dir/ducktape-iced" ] \
   || { echo "[linux-app] $release_dir/ducktape-iced missing — run the release build first" >&2; exit 1; }
-[ -x "$release_dir/ducktape-node" ] \
-  || { echo "[linux-app] $release_dir/ducktape-node missing — run the release node build first" >&2; exit 1; }
+[ -x "$release_dir/ducktape" ] \
+  || { echo "[linux-app] $release_dir/ducktape missing — run the release node build first" >&2; exit 1; }
 
 rm -rf "$stage"
 mkdir -p "$stage"
@@ -28,7 +28,7 @@ mkdir -p "$stage"
 # The installed binary is named ducktape: the wayland app_id / x11 WM_CLASS is
 # the binary name, and the desktop entry's StartupWMClass must match it.
 install -m 755 "$release_dir/ducktape-iced" "$stage/ducktape"
-install -m 755 "$release_dir/ducktape-node" "$stage/ducktape-node"
+install -m 755 "$release_dir/ducktape" "$stage/ducktape"
 
 cef_libs=(
   libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1

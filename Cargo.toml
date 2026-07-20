@@ -19,9 +19,10 @@
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
 #                      canary), greeter (the types-only composition example),
 #                      evm (experimental; genesis-registered in the daemons)
-#   bin/             — demo (in-process walkthrough), node (validator),
-#                      noded (the app-facing daemon), simnode (deterministic
-#                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)
+#   bin/             — demo (in-process walkthrough), node (the `ducktape`
+#                      CLI: validator + fs verbs + mcp server), noded (the
+#                      app-facing daemon), simnode (deterministic /v1 twin),
+#                      coordinator (STUN rendezvous)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -79,8 +80,6 @@ members = [
     "crates/module-view-host",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
-    "bin/fs",
-    "bin/mcp",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
 ]
 

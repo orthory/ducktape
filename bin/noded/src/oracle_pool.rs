@@ -136,7 +136,7 @@ where
         // the agent tool plane: every run's child gets this daemon's http base
         // as DUCKTAPE_NODE and the running binary's dir on PATH, so the MCP
         // server the runner CLI spawns (outside the agent's sandbox) finds both
-        // `ducktape-mcp` and the node it acts against.
+        // `ducktape mcp` and the node it acts against.
         .with_node_url(node_http_base),
     );
 

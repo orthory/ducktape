@@ -1277,8 +1277,8 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
         assert_eq!(claude[0], "-p", "the mode selector stays first");
         assert!(
             claude.windows(2).any(|w| w[0] == "--mcp-config"
-                && w[1].contains("\"ducktape\"")
-                && w[1].contains("ducktape-mcp")),
+                && w[1].contains("\"command\":\"ducktape\"")
+                && w[1].contains("\"args\":[\"mcp\"]")),
             "claude configures the ducktape MCP server: {claude:?}"
         );
         assert!(
@@ -1318,11 +1318,13 @@ resume_args = ["run", "resume", "{{session_id}}", "--model", "m", "-"]
         // tool args splice after args[0] instead of being appended.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
             assert_eq!(
-                spec.args[..3],
+                spec.args[..5],
                 [
                     "exec",
                     "-c",
-                    "mcp_servers.ducktape.command=\"ducktape-mcp\""
+                    "mcp_servers.ducktape.command=\"ducktape\"",
+                    "-c",
+                    "mcp_servers.ducktape.args=[\"mcp\"]"
                 ],
                 "{}: mcp override right after the subcommand",
                 spec.tag

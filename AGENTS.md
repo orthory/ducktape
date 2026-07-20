@@ -36,12 +36,12 @@
 - **Reap retired QA state BEFORE removing the worktree — this order is not
   optional.** The current Iced workflow has no Fleet instance manager, but old
   external instance homes can still contain a pidfile and detached
-  `ducktape-node`. Deleting their worktree first used to delete the teardown
+  `ducktape`. Deleting their worktree first used to delete the teardown
   hook and leave the node running forever. `ops/worktree-clean.sh` retains a
   self-contained, identity-verified reaper for that historical state.
 - **`ops/worktree-clean.sh` does the whole sequence safely.** Dry-run by
   default; `--yes` to act. It reaps orphaned retired-QA instances (killing only a pid
-  it has verified is that workspace's own `ducktape-node`, by exe and
+  it has verified is that workspace's own `ducktape`, by exe and
   `--config` — never `pkill -f`), then removes worktrees whose branch is fully
   merged into `origin/dev`. It REFUSES a worktree that is dirty or carries a
   commit not in `dev`; unmerged work is never its to throw away.
@@ -59,7 +59,7 @@
   stderr (tee'd into `<workspace>/daemon.log`) and the in-memory `LogRing` the
   app's Logs tab streams over the ws `logs` topic. A `println!` reaches NEITHER:
   it is invisible in the app and unfilterable by `RUST_LOG`. Program output is
-  not logging — a CLI's stdout (`bin/fs`, `bin/mcp`, `ducktape-node <subcommand>`)
+  not logging — a CLI's stdout (`ducktape <subcommand>`, `ducktape fs`/`ducktape mcp` included)
   stays `println!`.
 - Two conventions coexist ON PURPOSE, and they are orthogonal — a `target` says
   WHERE an event came from, an `event` field says WHAT it is:

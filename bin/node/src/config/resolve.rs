@@ -237,7 +237,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     }
     let key_path = base.join(raw.key_file.as_deref().unwrap_or("identity.key"));
     let signer = load_identity(&key_path).map_err(|e| {
-        format!("{e} — run `ducktape-node init` or `ducktape-node join <invite>` first")
+        format!("{e} — run `ducktape init` or `ducktape join <invite>` first")
     })?;
     let me = signer.public_key();
 
@@ -603,7 +603,7 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
 
     let storage_dir = match raw.storage_dir {
         Some(path) => absolute_runtime_path(Path::new(&path))?,
-        None => std::env::temp_dir().join(format!("ducktape-node-{id}")),
+        None => std::env::temp_dir().join(format!("ducktape-{id}")),
     };
     let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
@@ -879,7 +879,7 @@ mod tests {
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
         assert_eq!(
             default.storage_dir,
-            std::env::temp_dir().join("ducktape-node-8")
+            std::env::temp_dir().join("ducktape-8")
         );
         assert!(default.storage_dir.is_absolute());
     }

@@ -1,5 +1,5 @@
 //! process-level harness for the real-socket node e2e: spawns REAL
-//! `ducktape-node` binaries (via `CARGO_BIN_EXE_ducktape-node`) with generated
+//! `ducktape` binaries (via `CARGO_BIN_EXE_ducktape`) with generated
 //! toml configs, captures their stdout to files, polls for the node's
 //! greppable markers, and speaks the json-lines rpc — the rust replacement for
 //! what `demo-2node.sh` used to orchestrate in bash.
@@ -154,7 +154,7 @@ impl NetworkShapeCluster {
     }
 
     pub fn init_founder(&self, name: &str) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args([
                 "init",
                 "--name",
@@ -192,7 +192,7 @@ impl NetworkShapeCluster {
     /// and return its pubkey hex — the JOIN CODE the invite locks to.
     /// `join_friend` reuses this pre-generated identity.
     pub fn keygen_friend(&self, _idx: usize) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args(["keygen", "--dir"])
             .arg(&self.friend_dir)
             .output()
@@ -211,7 +211,7 @@ impl NetworkShapeCluster {
     pub fn invite(&self) -> String {
         let target = self.keygen_friend(1);
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args(["invite", "--config"])
             .arg(cfg)
             .args(["--target", &target])
@@ -242,7 +242,7 @@ impl NetworkShapeCluster {
     /// `join-requests` verb's JSON stdout.
     pub fn join_requests(&self) -> serde_json::Value {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args(["join-requests", "--config"])
             .arg(cfg)
             .output()
@@ -260,7 +260,7 @@ impl NetworkShapeCluster {
     /// success — the caller inspects the outcome (a targeted invite refuses a
     /// mismatched local identity at the CLI, before any node spawns).
     pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args([
                 "join",
                 invite,
@@ -307,7 +307,7 @@ impl NetworkShapeCluster {
         let log = self.dir.path().join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
@@ -411,7 +411,7 @@ impl NetworkShapeCluster {
     /// `resident-remove`) against node 0's running rpc, from node 0's config.
     pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args([verb, pubkey_hex, "--config"])
             .arg(cfg)
             .output()
@@ -576,14 +576,14 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
-            .expect("spawn ducktape-node");
+            .expect("spawn ducktape");
         self.nodes[idx] = Some(NodeProc { id, child, log });
     }
 
@@ -675,7 +675,7 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .arg("--config")
             .arg(&path)
             .stdout(Stdio::from(out))
@@ -695,13 +695,13 @@ impl Cluster {
         self.peer_ids.len() - 1
     }
 
-    /// run a ducktape-node VERB (invite-accept, admit, ...) to completion and
+    /// run a ducktape VERB (invite-accept, admit, ...) to completion and
     /// return (success, combined output).
     pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args(args)
             .output()
-            .expect("run ducktape-node verb");
+            .expect("run ducktape verb");
         (
             out.status.success(),
             format!(
@@ -745,7 +745,7 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}-sync.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .arg("--config")
             .arg(&cfg)
             .arg("--sync-only")

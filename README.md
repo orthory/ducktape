@@ -86,7 +86,7 @@ Ducktape has a native Rust desktop app under `app/src-iced` and a React web
 twin under `app/`. The iced app owns every product screen and the desktop
 lifecycle; pinned CEF is embedded only as the Browser pane. Both surfaces use
 the same node HTTP/WebSocket contracts. The desktop app also owns the workspace
-registry and starts or adopts each workspace's `ducktape-node` process.
+registry and starts or adopts each workspace's `ducktape` process.
 
 Install the current platform's self-contained desktop package. Every default is
 rootless: macOS uses `~/Applications`, Linux uses `~/.ducktape` plus
@@ -126,7 +126,7 @@ On first launch the desktop app opens the onboarding gate: found a new network
 or join one from an invite blob. Each becomes a **workspace** under
 `~/.ducktape/workspaces/<id>/` (its own descriptor, ed25519 identity, storage,
 and `daemon.log`), tracked in `~/.ducktape/registry.json`. Selecting a workspace
-spawns/adopts its `ducktape-node` on the workspace's own port and dials it; a
+spawns/adopts its `ducktape` on the workspace's own port and dials it; a
 joiner parks until a member admits it (Settings → Admit a joiner) and then
 promotes itself, with the park→admitted→promoted phase shown live. The web build
 has no registry — it dials a single configured node (`VITE_DUCKTAPE_NODE_URL`).

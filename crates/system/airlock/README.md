@@ -60,7 +60,7 @@ airlock-gateway serve --attest mock --measurement $MEAS \
 airlock-cli seal --attest mock --measurement $MEAS --host http://127.0.0.1:9100 \
     --credentials ~/.claude/.credentials.json --cred-kind bearer
 # register the loopback port node-locally
-ducktape-node gateway-route-bind --workspace <node-workspace> --label airlock --port 9100
+ducktape gateway-route-bind --workspace <node-workspace> --label airlock --port 9100
 # publish the signed LoopbackHttp route (allow_authorization:true, max_response_bytes ≤ 4 MiB
 # — the buffered proxy enforces this cap literally; 0/"unbounded" awaits SSE-over-overlay);
 # construct the RouteStatement exactly as signed_airlock_route() does in the test,

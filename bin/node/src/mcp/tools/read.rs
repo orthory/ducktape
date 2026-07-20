@@ -29,8 +29,8 @@ use runs::RunsQuery;
 use tasks::TaskQuery;
 
 use super::{Tool, arg_str, opt_u64, schema};
-use crate::identity::{Run, TARGET_AGENT, TARGET_RUNS};
-use crate::node::{NodeError, Result};
+use crate::mcp::identity::{Run, TARGET_AGENT, TARGET_RUNS};
+use crate::mcp::node::{NodeError, Result};
 
 const TARGET_CHAT: &str = "chat";
 const TARGET_TASKS: &str = "tasks";

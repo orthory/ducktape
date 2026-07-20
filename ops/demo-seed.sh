@@ -33,11 +33,11 @@ command -v curl    >/dev/null || die "curl is required"
 # ── 1. node binary ─────────────────────────────────────────────
 NODE_BIN="${DUCKTAPE_NODE_BIN:-}"
 if [ -z "$NODE_BIN" ]; then
-  log "building ducktape-node (cargo build -p node-bin)…"
+  log "building ducktape (cargo build -p node-bin)…"
   blog="$(mktemp)"
   cargo build -p node-bin >"$blog" 2>&1 || die "node-bin build failed — see $blog"
   NODE_BIN="$(cargo metadata --no-deps --format-version 1 \
-    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape-node"
+    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape"
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 

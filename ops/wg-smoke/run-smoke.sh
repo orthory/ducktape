@@ -40,7 +40,7 @@ IP0=172.30.0.10
 IP1=172.30.0.11
 SCRATCH="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SCRATCH/smoke.log"
-BIN="${BIN:-$(cd "$SCRATCH/../.." && pwd)/target/debug/ducktape-node}"
+BIN="${BIN:-$(cd "$SCRATCH/../.." && pwd)/target/debug/ducktape}"
 # arch + openresolv + iptables — the same base the interop smoke bakes (a
 # host-built binary needs the host's glibc; the debian rust image's is too
 # old). baked here if absent.
@@ -110,17 +110,17 @@ ENTRY='
     iptables -A INPUT -s "$PEER" -p tcp -j REJECT;
   fi &&
   mkdir -p /run/wireguard &&
-  exec ducktape-node --config /data/node.toml'
+  exec ducktape --config /data/node.toml'
 
 # node0: the TUN backend — privileged, device-backed.
 podman run -d --name dtwg-node0 --network $NET --ip "$IP0" \
   --cap-add NET_ADMIN --device /dev/net/tun \
-  -v "$BIN":/usr/local/bin/ducktape-node:ro -v "$SCRATCH/node0":/data \
+  -v "$BIN":/usr/local/bin/ducktape:ro -v "$SCRATCH/node0":/data \
   $IMG bash -c "$ENTRY" >/dev/null || fail "start node0"
 # node1: the userspace socket backend — NO tun device to be had.
 podman run -d --name dtwg-node1 --network $NET --ip "$IP1" \
   --cap-add NET_ADMIN \
-  -v "$BIN":/usr/local/bin/ducktape-node:ro -v "$SCRATCH/node1":/data \
+  -v "$BIN":/usr/local/bin/ducktape:ro -v "$SCRATCH/node1":/data \
   $IMG bash -c "$ENTRY" >/dev/null || fail "start node1"
 
 wait_marker() { # container marker timeout

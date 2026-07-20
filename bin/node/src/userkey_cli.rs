@@ -646,7 +646,7 @@ fn user_redeem_invite(
     // fail-closed expiry + envelope/token verification at decode.
     let invite = config::decode_invite(blob)?;
     if invite.token.role != config::InviteRole::Client {
-        return Err("this is a node (resident) invite — use `ducktape-node join`".into());
+        return Err("this is a node (resident) invite — use `ducktape join`".into());
     }
     // every invite is bearer (기명 dropped in v2): no target lock — this user
     // key redeems the client invite directly, bound by the join proof below and
@@ -1245,7 +1245,7 @@ mod userkey_verb_tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("use `ducktape-node join`"),
+            err.to_string().contains("use `ducktape join`"),
             "{err}"
         );
     }

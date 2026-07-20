@@ -1,7 +1,7 @@
 # ducktape build + install entry points.
 #
 # `make install` builds the networked node and native iced desktop app,
-# installs ducktape-node, and installs the platform package: Ducktape.app on
+# installs ducktape, and installs the platform package: Ducktape.app on
 # macOS, a self-contained app dir on Linux, or a current-user app plus Start
 # menu shortcut on Windows. Every package carries the pinned CEF runtime used
 # only by the Browser pane.
@@ -68,7 +68,7 @@ dev: cef-env
 else
 dev: cef-env
 	$(CARGO) build -p node-bin
-	CARGO_INCREMENTAL=0 DUCKTAPE_NODE_BIN="$(abspath target/debug/ducktape-node)" $(CARGO) run -p ducktape-iced
+	CARGO_INCREMENTAL=0 DUCKTAPE_NODE_BIN="$(abspath target/debug/ducktape)" $(CARGO) run -p ducktape-iced
 endif
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
@@ -76,7 +76,7 @@ endif
 ## jobs, an inbox note, an automation rule — plus TWO gateway web-app routes: a
 ## NETWORK-hosted static site (DuckFS) and a USER-hosted loopback app. Registers a
 ## "demo" workspace in ~/.ducktape and makes it active; just open the app. Builds
-## ducktape-node if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
+## ducktape if needed (or set DUCKTAPE_NODE_BIN). See ops/demo-seed.sh.
 demo-seed: cef-env
 	@bash ops/demo-seed.sh
 
@@ -185,7 +185,7 @@ install-coordinator: cef-env
 
 ## macOS: Ducktape.app -> $(APP_DEST); Windows: current-user LocalAppData plus
 ## a Start-menu shortcut; Linux: the staged self-contained dir ->
-## $(DUCKTAPE_HOME)/app (binary + ducktape-node sidecar + pinned CEF
+## $(DUCKTAPE_HOME)/app (binary + ducktape sidecar + pinned CEF
 ## runtime in ONE directory, so sidecar sibling-resolution and the DT_RPATH
 ## $ORIGIN lookup both land beside the executable), plus a launcher symlink
 ## in $(BIN_DEST) — a symlink, NOT a copy: ld.so resolves $ORIGIN through

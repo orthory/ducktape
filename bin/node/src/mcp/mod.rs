@@ -1,4 +1,4 @@
-//! `ducktape-mcp` — the agent tool plane.
+//! `ducktape mcp` — the agent tool plane.
 //!
 //! a stdio MCP server that gives a Ducktape agent run typed access to the
 //! network it is running inside: read chat, tasks, pages, forge items and the
@@ -41,14 +41,14 @@ mod node;
 mod rpc;
 mod tools;
 
-use rpc::{PROTOCOL_VERSION, Request, Response, SERVER_NAME, tool_failure, tool_result};
+use self::rpc::{PROTOCOL_VERSION, Request, Response, SERVER_NAME, tool_failure, tool_result};
 
 /// JSON-RPC's "method not found".
 const METHOD_NOT_FOUND: i32 = -32601;
 /// JSON-RPC's "parse error".
 const PARSE_ERROR: i32 = -32700;
 
-fn main() {
+pub(crate) fn serve() {
     let run = identity::Run::from_env();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

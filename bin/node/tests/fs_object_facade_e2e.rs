@@ -3,6 +3,7 @@
 //! to raw bytes, DELETE is an idempotent single-change rm. one url = one
 //! object; the listing story stays /v1/files/ls.
 
+#[path = "fs_support/mod.rs"]
 mod support;
 
 use std::io::{Read as _, Write as _};

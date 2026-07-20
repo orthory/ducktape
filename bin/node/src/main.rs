@@ -63,6 +63,7 @@ mod constants;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
+mod fs_cli;
 mod gateway_plane;
 mod gateway_routes;
 mod host_reads;
@@ -73,6 +74,7 @@ mod joiner_mesh_tests;
 mod lobby;
 #[cfg(test)]
 mod main_tests;
+mod mcp;
 mod oracle_pool;
 mod overlay_book;
 mod plane_metrics;
@@ -153,17 +155,34 @@ fn hold_macos_activity() {
     let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
         NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
             | NSActivityOptions::LatencyCritical,
-        &NSString::from_str("ducktape-node follows 1s consensus blocks"),
+        &NSString::from_str("ducktape follows 1s consensus blocks"),
     );
     std::mem::forget(token);
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(command) = args.first()
-        && let Some(result) = cli::dispatch(command, &args[1..])
-    {
-        return result;
+    if let Some(command) = args.first() {
+        match command.as_str() {
+            // the folded client families. `fs` owns a 0/1/2 exit-code contract,
+            // so it exits directly (after flushing the stream `cat` wrote to);
+            // `mcp` is the stdio server the agent runner spawns and holds until
+            // its stdin closes.
+            "fs" => {
+                let code = fs_cli::run(&args[1..]);
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code.into());
+            }
+            "mcp" => {
+                mcp::serve();
+                return Ok(());
+            }
+            _ => {}
+        }
+        if let Some(result) = cli::dispatch(command, &args[1..]) {
+            return result;
+        }
     }
 
     // the run path: `--config <path> | -n/--network <chain id> [--sync-only]`.
@@ -179,14 +198,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want a subcommand — \
+                     fs <verb>|mcp|\
                      keygen|user-key|user-sign-bind|user-sign-unbind|\
                      user-sign-possession|user-sign-add-member|user-sign-remove-member|\
-                     user-sign-gateway-route|gateway-route-bind|gateway-route-unbind|\
+                     user-sign-gateway-route|user-sign-frame|user-sign-admin|\
+                     user-redeem-invite|gateway-route-bind|gateway-route-unbind|\
                      gateway-route-list|\
                      user-webauthn-challenge|user-p256-payload|\
                      init|invite|admit|\
                      invite-accept|promote|resident-remove|\
-                     join-requests|member-remove|member-leave|member-status|join|\
+                     join-requests|join-state|member-remove|member-leave|member-status|join|\
                      preflight-state|upgrade-status — or \
                      --config <path> | -n/--network <chain id> [--sync-only])"
                 )

@@ -50,7 +50,7 @@ impl Harness {
     /// Stand the same real node up with an explicitly bounded Forge read cap.
     pub fn start_with_forge_read(allowed_actions: &[&str], forge_read: &[&str]) -> Self {
         let dir = tempfile::Builder::new()
-            .prefix("ducktape-mcp-e2e")
+            .prefix("ducktape mcp-e2e")
             .tempdir()
             .expect("harness tempdir");
         let port = free_port();
@@ -121,12 +121,13 @@ impl Harness {
         );
     }
 
-    /// a `ducktape-mcp` subprocess wired exactly as the node's provisioner wires
+    /// a `ducktape mcp` subprocess wired exactly as the node's provisioner wires
     /// one: the node url and the agent id in the environment, and NOTHING else.
     /// if the binary needed more than this to work, the provisioner would have
     /// to supply more than this — so the test wires only what production does.
     pub fn mcp(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-mcp"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("mcp");
         cmd.env("DUCKTAPE_NODE", self.node_url())
             .env("DUCKTAPE_RUN_AGENT", AGENT_ID)
             .stdin(Stdio::piped())
@@ -152,10 +153,11 @@ impl Harness {
         cmd
     }
 
-    /// a `ducktape-mcp` subprocess with NO agent bound — the "started outside a
+    /// a `ducktape mcp` subprocess with NO agent bound — the "started outside a
     /// provisioned run" shape.
     pub fn mcp_agentless(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-mcp"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("mcp");
         cmd.env("DUCKTAPE_NODE", self.node_url())
             .env_remove("DUCKTAPE_RUN_AGENT")
             .stdin(Stdio::piped())
@@ -177,7 +179,7 @@ impl Harness {
     /// a full MCP session: initialize, then one `tools/call` per entry, in
     /// order, down one stdin — the shape a real runner uses.
     pub fn session(&self, mut cmd: Command, calls: &[Value]) -> Vec<Value> {
-        let mut child: Child = cmd.spawn().expect("spawn ducktape-mcp");
+        let mut child: Child = cmd.spawn().expect("spawn ducktape mcp");
         let mut stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
 
@@ -231,7 +233,7 @@ impl Harness {
 
     /// the `initialize` result, for the guide/protocol assertions.
     pub fn initialize(&self) -> Value {
-        let mut child = self.mcp().spawn().expect("spawn ducktape-mcp");
+        let mut child = self.mcp().spawn().expect("spawn ducktape mcp");
         let mut stdin = child.stdin.take().expect("stdin");
         let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
         writeln!(

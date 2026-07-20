@@ -10,7 +10,7 @@ version.workspace = true
 # host::Host, and prints its evolving app-hash so a demo script can assert two
 # OS processes converge over real sockets.
 [[bin]]
-name = "ducktape-node"
+name = "ducktape"
 path = "src/main.rs"
 
 [dependencies]
@@ -58,6 +58,8 @@ files = { workspace = true }
 # duckfs reusable core and disk scratch helpers; the `files` crate above remains
 # the consensus module adapter.
 duckfs-core = { workspace = true }
+# the `ducktape fs` verb family drives the checkout/commit engine + HttpNode.
+duckfs-client = { workspace = true }
 duckfs-disk = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
@@ -136,7 +138,7 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 
-# the process-level e2e suite (tests/) spawns REAL `ducktape-node` binaries and
+# the process-level e2e suite (tests/) spawns REAL `ducktape` binaries and
 # drives them through the rpc with TYPED interface-crate payloads — payload
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
@@ -161,9 +163,6 @@ defguard_wireguard_rs = { workspace = true }
 # replica::tests assembles real finalization certificates (sign -> assemble)
 # to exercise the cert-lane decode + fold planner.
 commonware-parallel = { workspace = true }
-# the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
-# library, over each node's real http surface) across a two-validator cluster.
-duckfs-client = { workspace = true }
 # coordinated_invite_cli seeds a signed mesh-state.json so `invite` bundles
 # member fronts, building the persisted adverts with the same crates the node
 # already depends on (reachability::store + wireguard advert types +

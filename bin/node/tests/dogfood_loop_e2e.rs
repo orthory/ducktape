@@ -1,4 +1,4 @@
-//! the agent dogfooding loop (M1), end to end on REAL `ducktape-node`
+//! the agent dogfooding loop (M1), end to end on REAL `ducktape`
 //! validators: issue mention → forge-worktree run → PR, then the PR channel
 //! as a SESSION, then a deterministic concurrent-advance rebase.
 //!

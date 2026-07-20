@@ -436,7 +436,9 @@ resume_args = ["resume", "stale-id"]
             vec![
                 "exec",
                 "-c",
-                "mcp_servers.ducktape.command=\"ducktape-mcp\"",
+                "mcp_servers.ducktape.command=\"ducktape\"",
+                "-c",
+                "mcp_servers.ducktape.args=[\"mcp\"]",
                 "-c",
                 "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
                 "-c",
@@ -453,7 +455,7 @@ resume_args = ["resume", "stale-id"]
             vec![
                 "-p",
                 "--mcp-config",
-                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape-mcp\"}}}",
+                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
                 "--allowedTools",
                 "mcp__ducktape",
                 "--output-format",
@@ -470,7 +472,9 @@ resume_args = ["resume", "stale-id"]
             vec![
                 "exec",
                 "-c",
-                "mcp_servers.ducktape.command=\"ducktape-mcp\"",
+                "mcp_servers.ducktape.command=\"ducktape\"",
+                "-c",
+                "mcp_servers.ducktape.args=[\"mcp\"]",
                 "-c",
                 "mcp_servers.ducktape.env_vars=[\"DUCKTAPE_NODE\",\"DUCKTAPE_RUN_AGENT\",\"DUCKTAPE_RUN_WORKSPACE\",\"DUCKTAPE_RUN_SKILLS\",\"DUCKTAPE_RUN_ACTION_URL\",\"DUCKTAPE_RUN_ACTION_TOKEN\",\"DUCKTAPE_RUN_ID\",\"DUCKTAPE_PROVIDER_CONTROL_URL\",\"DUCKTAPE_PROVIDER_CONTROL_TOKEN\"]",
                 "-c",
@@ -491,7 +495,7 @@ resume_args = ["resume", "stale-id"]
             vec![
                 "-p",
                 "--mcp-config",
-                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape-mcp\"}}}",
+                "{\"mcpServers\":{\"ducktape\":{\"command\":\"ducktape\",\"args\":[\"mcp\"]}}}",
                 "--allowedTools",
                 "mcp__ducktape",
                 "--output-format",

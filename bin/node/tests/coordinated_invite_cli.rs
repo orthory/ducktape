@@ -22,7 +22,7 @@ fn command_output(out: &std::process::Output) -> String {
 /// pubkey hex — the join code every targeted invite locks to. `join --dir <dir>`
 /// reuses this identity, so the join-side target self-check passes.
 fn keygen(dir: &Path) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["keygen", "--dir"])
         .arg(dir)
         .output()
@@ -111,7 +111,7 @@ fn identity_hex(seed: u64) -> String {
         .collect()
 }
 
-/// run `ducktape-node --config <config> <extra…>` with combined output to
+/// run `ducktape --config <config> <extra…>` with combined output to
 /// `log`, polling until it exits on its own or `timeout` elapses (then kill +
 /// reap). Returns `(exit code, captured log)`; `None` code means it was killed
 /// for timing out — a HANG, which for the honest-terminal path is a failure.
@@ -123,14 +123,14 @@ fn run_node_until_exit(
 ) -> (Option<i32>, String) {
     let out = std::fs::File::create(log).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("--config")
         .arg(config)
         .args(extra)
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn ducktape-node");
+        .expect("spawn ducktape");
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait().expect("poll node") {
@@ -153,7 +153,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "init",
             "--name",
@@ -170,7 +170,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
 
     let target = keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
         .args(["--target", &target])
@@ -183,7 +183,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
     let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "join",
             &blob,
@@ -230,7 +230,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "init",
             "--name",
@@ -266,7 +266,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
         .expect("seed mesh-state.json");
 
     let target = keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
         .args(["--target", &target])
@@ -279,7 +279,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     );
     let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "join",
             &blob,
@@ -327,7 +327,7 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "init",
             "--name",
@@ -346,7 +346,7 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
     // a default founder advertises the overlay ULA (not a routable host), so its
     // WireGuard bootstrap is coordinated-only — no underlay endpoint baked in.
     let target = keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
         .args(["--target", &target])
@@ -361,7 +361,7 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
 
     // join in TUN mode: the friend's node.toml carries `wireguard_effect = "tun"`.
     let ports = alloc_ports(4);
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "join",
             &blob,
@@ -429,7 +429,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
     let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
     drop(wg_probe);
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "init",
             "--name",
@@ -462,13 +462,13 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let log_path = dir.path().join("founder-heal.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("--config")
         .arg(founder.join("node.toml"))
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn ducktape-node");
+        .expect("spawn ducktape");
 
     let wait_for = |marker: &str, budget: Duration| -> (bool, String) {
         let deadline = Instant::now() + budget;
@@ -543,7 +543,7 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
 
     // a socket-mode network whose only coordinator is an unroutable blackhole
     // (RFC5737 TEST-NET-3 — guaranteed never to answer).
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args([
             "init",
             "--name",
@@ -570,13 +570,13 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     let log_path = dir.path().join("founder-run.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("--config")
         .arg(founder.join("node.toml"))
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn ducktape-node");
+        .expect("spawn ducktape");
 
     let deadline = Instant::now() + Duration::from_secs(25);
     let (degraded, log) = loop {

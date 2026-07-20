@@ -41,8 +41,8 @@ use agent::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
 use tasks::TaskStatus;
 
 use super::{Tool, arg_bool, arg_str, opt_u64, schema};
-use crate::identity::Run;
-use crate::node::{NodeError, Result};
+use crate::mcp::identity::Run;
+use crate::mcp::node::{NodeError, Result};
 
 pub(super) fn tools() -> Vec<Tool> {
     vec![

@@ -27,7 +27,7 @@ make app       # self-contained package under target/release/bundle
 make install   # current-user install; no root required
 ```
 
-Every desktop package includes the matching `ducktape-node` sidecar and pinned
+Every desktop package includes the matching `ducktape` sidecar and pinned
 CEF payload. Platform staging lives in `stage-macos-iced-app.sh`,
 `stage-linux-app.sh`, and `stage-windows-app.ps1`. Do not copy only the main
 executable: its sibling sidecar and CEF resources are part of the package
@@ -84,7 +84,7 @@ make macos-cef-smoke   # staged CEF child, navigation, bounds, teardown
 The terminal running `macos-smoke` needs Accessibility permission. On Linux
 and Windows, launch the staged package from `target/release/bundle`, complete
 onboarding in an isolated user profile, enter a workspace, and open Browser.
-Verify that `ducktape-node` belongs to that workspace and that the CEF child
+Verify that `ducktape` belongs to that workspace and that the CEF child
 exits with the app. Use the `qa` skill for the exact checklist.
 
 ## Worktree cleanup

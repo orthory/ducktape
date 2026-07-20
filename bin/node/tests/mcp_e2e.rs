@@ -1,4 +1,4 @@
-//! e2e for `ducktape-mcp` against an in-process node (see `support/mod.rs`).
+//! e2e for `ducktape mcp` against an in-process node (see `support/mod.rs`).
 //!
 //! the binary is driven as a REAL subprocess over stdio, wired with exactly the
 //! two environment variables the node's provisioner sets — so what these tests
@@ -15,6 +15,7 @@
 //!   the very next call refuses — no cached permission outlives its revocation.
 //! - a refusal is a tool RESULT, not a protocol error, so the model can read it.
 
+#[path = "mcp_support/mod.rs"]
 mod support;
 
 use serde_json::json;

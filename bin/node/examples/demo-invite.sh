@@ -2,14 +2,14 @@
 # the network-shape onboarding ceremony over real sockets — no seeds, no
 # hand-written configs:
 #
-#   founder: ducktape-node init --name demo          -> chain-id + identity
-#            ducktape-node invite                    -> one-line paste blob
-#   friend:  ducktape-node join <blob>               -> workspace + identity
+#   founder: ducktape init --name demo          -> chain-id + identity
+#            ducktape invite                    -> one-line paste blob
+#   friend:  ducktape join <blob>               -> workspace + identity
 #            (sends the printed pubkey back)
-#   founder: ducktape-node admit <pubkey>            -> pre-genesis membership
-#            ducktape-node invite                    -> REFRESHED blob
-#   friend:  ducktape-node join <refreshed blob>     -> now a member
-#   both:    ducktape-node --config .../node.toml    -> one network
+#   founder: ducktape admit <pubkey>            -> pre-genesis membership
+#            ducktape invite                    -> REFRESHED blob
+#   friend:  ducktape join <refreshed blob>     -> now a member
+#   both:    ducktape --config .../node.toml    -> one network
 #
 # the assertion: both identities boot the SAME genesis app-hash (identical
 # descriptor -> identical genesis), an op submitted on the founder's node is
@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 command -v bun >/dev/null || { echo "bun is required" >&2; exit 1; }
 command -v nc  >/dev/null || { echo "nc is required" >&2; exit 1; }
 
-BIN=ducktape-node
+BIN=ducktape
 echo "building $BIN..."
 cargo build -p node-bin --bin "$BIN" >/dev/null 2>&1
 BIN_PATH="$(cargo metadata --no-deps --format-version 1 | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/$BIN"

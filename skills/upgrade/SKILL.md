@@ -108,7 +108,7 @@ Build the release binary from the branch that carries the dual-path change and
 its bumped `MAX_PROTOCOL_VERSION`.
 
 ```bash
-cargo build --release --bin ducktape-node   # crate: node-bin, at bin/node
+cargo build --release --bin ducktape   # crate: node-bin, at bin/node
 ```
 
 Record an identity for the artifact so every operator can confirm they run the
@@ -116,7 +116,7 @@ same code (the spec's defense-in-depth: signals should attest to the running
 binary, not a hand-typed claim):
 
 ```bash
-sha256sum target/release/ducktape-node
+sha256sum target/release/ducktape
 git rev-parse HEAD
 ```
 
@@ -173,7 +173,7 @@ GovAction::ScheduleUpgrade { name: "<upgrade-name>", activation_height: H, to_ve
 
 ```bash
 # per the spec's query surface, e.g.:
-ducktape-node upgrade-status --config <member node.toml>
+ducktape upgrade-status --config <member node.toml>
 # expect: current_version, pending { name, activation_height=H, to_version }, readiness=0
 ```
 
@@ -206,7 +206,7 @@ grep -E "converged app_hash=|synced app_hash=|recovered app_hash=" <node.log> | 
    statement about the running binary. Watch the readiness count climb:
 
 ```bash
-ducktape-node upgrade-status --config <member node.toml>   # readiness += 1 per rolled node
+ducktape upgrade-status --config <member node.toml>   # readiness += 1 per rolled node
 ```
 
 Signals are validator-origin, idempotent (one member = one signal,
@@ -225,7 +225,7 @@ denominator and threshold are recomputed against the boundary valset, and a
 signal from a non-member is dead weight).
 
 ```bash
-ready=$(ducktape-node upgrade-status --config <member node.toml> | ready-count)
+ready=$(ducktape upgrade-status --config <member node.toml> | ready-count)
 echo "ready=$ready  floor(2f+1)=$quorum_floor  arming_policy(R=n)=$target"
 ```
 
@@ -269,7 +269,7 @@ Watch the boundary land and confirm the network is still finalizing past `H`:
 ```bash
 # the network keeps producing converged app_hashes across and beyond H
 grep -E "converged app_hash=" <node.log> | tail
-ducktape-node upgrade-status --config <member node.toml>   # current_version == to_version, pending cleared
+ducktape upgrade-status --config <member node.toml>   # current_version == to_version, pending cleared
 ```
 
 ## Step 7: Verify App-Hash Continuity Across H
