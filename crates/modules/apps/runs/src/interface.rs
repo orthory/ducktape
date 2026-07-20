@@ -191,7 +191,8 @@ pub enum RunsMsg {
         /// numeric resource demands, threaded verbatim onto the emitted
         /// `DispatchMsg::Dispatch` — the only demand surface in this phase;
         /// every other intake (chat mention, page comment, jobs) dispatches
-        /// demandless. empty = legacy demandless run.
+        /// demandless. empty = a demandless run (every non-RequestRun intake
+        /// dispatches demandless).
         #[serde(default)]
         demands: BTreeMap<String, u64>,
         /// library skill NAMES curated for THIS run, on top of the agent's own

@@ -1,4 +1,4 @@
-//! Non-transferable account shares through a real Host. The legacy validator
+//! Non-transferable account shares through a real Host. The validator-mode
 //! electorate adopts one explicit allocation; later proposals freeze account
 //! power, so two nodes owned by one account share one ballot and later share
 //! changes cannot rewrite an open proposal's decision boundary.
@@ -270,7 +270,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
                 },
             )
             .await
-            .expect("legacy validator vote");
+            .expect("validator-mode ballot on the adopt proposal");
         }
         let adoption = proposal(&host, "adopt").await;
         assert_eq!(adoption.voter_kind, VoterKind::ValidatorNode);

@@ -151,8 +151,7 @@ pub enum SagaMsg {
         capability: Option<String>,
         /// numeric resource demands (e.g. "cores", "mem_gb"). with `capability`
         /// set, assignment draws from providers whose ANNOUNCED capacity covers
-        /// every dimension; empty = capability-only assignment (legacy).
-        #[serde(default)]
+        /// every dimension; empty = capability-only assignment.
         demands: BTreeMap<String, u64>,
         /// static binding: when set, EVERY attempt leases to exactly this
         /// node key — no rendezvous, no pool query; `capability` (if also
@@ -236,9 +235,9 @@ pub struct WorkerRequest {
 }
 
 /// fixed self-description for host-local worker control effects. controls are
-/// deliberately a SEPARATE wire shape from [`WorkerRequest`], so legacy work
-/// requests keep their byte contract and an older host simply leaves an
-/// unknown control effect unclaimed.
+/// deliberately a SEPARATE wire shape from [`WorkerRequest`], so existing work
+/// requests keep their byte contract and a host that does not recognize a
+/// control effect simply leaves it unclaimed.
 pub const WORKER_CONTROL_KIND: &str = "ducktape_worker_control";
 
 /// the first host-local worker control protocol. bump before changing the

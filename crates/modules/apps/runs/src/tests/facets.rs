@@ -70,103 +70,6 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
 }
 
 #[test]
-fn effects_facet_applies_cap_checked() {
-    // response_text is plain prose with NO action; the task write comes from
-    // the host-assembled effects facet (R1).
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
-    let facets = serde_json::json!({
-        "effects": [{"kind":"tasks.create","task_id":"t1","title":"from effect"}]
-    });
-    let mut ctx = CaptureCtx::new()
-        .at(8)
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper("done", facets))),
-    )
-    .unwrap();
-    assert_eq!(
-        ctx.task_msgs(),
-        vec![TaskMsg::CreateTask {
-            task_id: "t1".into(),
-            title: "from effect".into(),
-        }]
-    );
-    commit(&mut m);
-    assert_eq!(get_pending(&m, &run_id), None);
-}
-
-#[test]
-fn unknown_effect_kind_fails_the_run() {
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
-    let facets = serde_json::json!({
-        "effects": [{"kind":"forge.delete_universe","task_id":"t1"}]
-    });
-    let mut ctx = CaptureCtx::new()
-        .at(8)
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper("done", facets))),
-    )
-    .unwrap();
-    assert!(
-        ctx.task_msgs().is_empty(),
-        "no task write escapes a failed run"
-    );
-    assert!(
-        ctx.events
-            .iter()
-            .any(|e| String::from_utf8_lossy(&e.payload).contains("unknown effect kind")),
-        "the failure names the unknown effect kind"
-    );
-    commit(&mut m);
-    assert_eq!(get_pending(&m, &run_id), None);
-}
-
-#[test]
-fn empty_effects_falls_back_to_response_parsed_actions() {
-    // critic #4 fallback: with an EMPTY effects facet, a model that emitted
-    // the action only in prose still gets it applied — never a silent drop.
-    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
-    let response_text = String::from_utf8(response_json(
-        &["on it"],
-        vec![AgentAction::CreateTask {
-            task_id: "t1".into(),
-            title: "from prose".into(),
-        }],
-    ))
-    .unwrap();
-    let mut ctx = CaptureCtx::new()
-        .at(8)
-        .with_dispatch_origin()
-        .with_registry(&registry)
-        .with_transcript("general", transcript(2));
-    exec(
-        &mut m,
-        &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(runner_wrapper(&response_text, serde_json::json!({}))),
-        ),
-    )
-    .unwrap();
-    assert_eq!(
-        ctx.task_msgs(),
-        vec![TaskMsg::CreateTask {
-            task_id: "t1".into(),
-            title: "from prose".into(),
-        }]
-    );
-}
-
-#[test]
 fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
     // the wire sink echoes title/body — delivery IGNORES them and derives
     // both from the message facet (asserted exactly below).
@@ -429,14 +332,14 @@ fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
 
 #[test]
 fn malformed_facet_fails_the_run_without_aborting() {
-    // effects is not an array → decode_run_result_v1 fails → the run fails
+    // sink is not an object → decode_run_result_v1 fails → the run fails
     // deterministically (R4), never a delivery-block abort.
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
     let bad = serde_json::json!({
         "ducktape_runner_result": 1,
         "response_text": "hi",
         "workspace_receipt": {"source_prefix":"p","source_snapshot":null,"output_snapshot":null,"commit_height":null,"rebased":false,"no_changes":false},
-        "effects": "not-an-array"
+        "sink": "not-an-object"
     });
     let mut ctx = CaptureCtx::new()
         .at(8)
@@ -494,7 +397,7 @@ fn status_failed_overrides_a_present_message() {
 }
 
 #[test]
-fn job_finalize_is_a_delivery_receipt_with_data_and_output_ref() {
+fn job_finalize_is_a_delivery_receipt_with_output_ref() {
     let registry = job_registry(); // agent "duck" with tasks.create
     let mut m = module();
     let mut ctx = CaptureCtx::new()
@@ -507,10 +410,18 @@ fn job_finalize_is_a_delivery_receipt_with_data_and_output_ref() {
 
     let facets = serde_json::json!({
         "workspace_receipt": {"source_prefix":"/ws/duck","source_snapshot":null,"output_snapshot":"deadbeef","commit_height":7,"rebased":false,"no_changes":false},
-        "data": "{\"summary\":\"ok\"}",
-        "effects": [{"kind":"tasks.create","task_id":"t1","title":"todo"}],
         "status": "ok"
     });
+    // the prose carries the task write (the production path — the oracle never
+    // lifts effects; a job run with no action would fail validation).
+    let prose = String::from_utf8(response_json(
+        &[],
+        vec![AgentAction::CreateTask {
+            task_id: "t1".into(),
+            title: "todo".into(),
+        }],
+    ))
+    .unwrap();
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -519,11 +430,11 @@ fn job_finalize_is_a_delivery_receipt_with_data_and_output_ref() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper("done", facets))),
+        &result_event(&run_id, Ok(runner_wrapper(&prose, facets))),
     )
     .unwrap();
 
-    // the effects facet applied a task write.
+    // the prose-parsed action applied a task write.
     assert_eq!(
         ctx.task_msgs(),
         vec![TaskMsg::CreateTask {
@@ -541,7 +452,6 @@ fn job_finalize_is_a_delivery_receipt_with_data_and_output_ref() {
     let v: serde_json::Value = serde_json::from_str(payload).unwrap();
     assert_eq!(v["ducktape_delivery"], 1);
     assert_eq!(v["status"], "ok");
-    assert_eq!(v["data"], "{\"summary\":\"ok\"}");
     assert_eq!(v["output_ref"]["output_snapshot"], "deadbeef");
     assert_eq!(v["output_ref"]["commit_height"], 7);
     assert_eq!(v["output_ref"]["source_prefix"], "/ws/duck");
@@ -627,8 +537,16 @@ fn job_finalize_output_ref_carries_forge_coordinates() {
             "branch": "agent/item-7",
             "output_commit": oid,
         },
-        "effects": [{"kind":"tasks.create","task_id":"t1","title":"todo"}],
     });
+    // the prose carries the action (job runs with no action fail validation).
+    let prose = String::from_utf8(response_json(
+        &[],
+        vec![AgentAction::CreateTask {
+            task_id: "t1".into(),
+            title: "todo".into(),
+        }],
+    ))
+    .unwrap();
     let mut ctx = CaptureCtx::new()
         .at(10)
         .with_dispatch_origin()
@@ -637,7 +555,7 @@ fn job_finalize_output_ref_carries_forge_coordinates() {
     exec(
         &mut m,
         &mut ctx,
-        &result_event(&run_id, Ok(runner_wrapper("done", facets))),
+        &result_event(&run_id, Ok(runner_wrapper(&prose, facets))),
     )
     .unwrap();
     let finalize = ctx.job_msgs();

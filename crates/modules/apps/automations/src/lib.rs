@@ -7,8 +7,8 @@
 //! in the SAME block as the event (P2).
 //!
 //! [`Trigger`] is a chat message-posted filter (chat is the only event source
-//! today); the snapshot codec keeps a trigger-kind byte so a future
-//! filesystem-change (duckfs) trigger can join without a state break.
+//! today) and is a flat single-shape struct in the snapshot codec. A future
+//! non-chat trigger is its own state break (flag day).
 //!
 //! ## Origin-gated intake (spoof-proofing)
 //!
@@ -768,10 +768,7 @@ fn encode_state(rules: &BTreeMap<String, Rule>, history: &VecDeque<RunRecord>) -
 }
 
 fn push_trigger(out: &mut Vec<u8>, trigger: &Trigger) {
-    // the leading 0 is the legacy single-variant trigger-kind byte, kept so
-    // the committed root preimage stays byte-identical; a future non-chat
-    // trigger claims the next discriminant.
-    out.push(0);
+    // Trigger is a flat single-shape struct in the snapshot (no kind byte).
     codec::push_opt_str(out, trigger.channel_id.as_deref());
     codec::push_opt_str(out, trigger.mention.as_deref());
     codec::push_opt_str(out, trigger.text_contains.as_deref());
@@ -890,35 +887,24 @@ fn read_opt_string(c: &mut Cursor<'_>, what: &str) -> Result<Option<String>, Err
 }
 
 fn read_trigger(c: &mut Cursor<'_>) -> Result<Trigger, Error> {
-    match c.byte("snapshot trigger kind")? {
-        0 => {
-            let channel_id = read_opt_string(c, "trigger channel_id")?;
-            if let Some(channel_id) = &channel_id {
-                require_non_empty("trigger channel_id", channel_id)?;
-                Automations::validate_len("trigger channel_id", channel_id, MAX_ID_BYTES)?;
-            }
-            let mention = read_opt_string(c, "trigger mention")?;
-            if let Some(mention) = &mention {
-                Automations::validate_len("trigger mention", mention, MAX_FILTER_BYTES)?;
-            }
-            let text_contains = read_opt_string(c, "trigger text_contains")?;
-            if let Some(text_contains) = &text_contains {
-                Automations::validate_len(
-                    "trigger text_contains",
-                    text_contains,
-                    MAX_FILTER_BYTES,
-                )?;
-            }
-            Ok(Trigger {
-                channel_id,
-                mention,
-                text_contains,
-            })
-        }
-        other => Err(Error::Module(format!(
-            "snapshot has unknown trigger discriminant {other}"
-        ))),
+    let channel_id = read_opt_string(c, "trigger channel_id")?;
+    if let Some(channel_id) = &channel_id {
+        require_non_empty("trigger channel_id", channel_id)?;
+        Automations::validate_len("trigger channel_id", channel_id, MAX_ID_BYTES)?;
     }
+    let mention = read_opt_string(c, "trigger mention")?;
+    if let Some(mention) = &mention {
+        Automations::validate_len("trigger mention", mention, MAX_FILTER_BYTES)?;
+    }
+    let text_contains = read_opt_string(c, "trigger text_contains")?;
+    if let Some(text_contains) = &text_contains {
+        Automations::validate_len("trigger text_contains", text_contains, MAX_FILTER_BYTES)?;
+    }
+    Ok(Trigger {
+        channel_id,
+        mention,
+        text_contains,
+    })
 }
 
 fn read_action(c: &mut Cursor<'_>) -> Result<Action, Error> {

@@ -28,7 +28,6 @@ pub struct ConflictReport {
     pub ours: Vec<String>,
     pub theirs: Vec<String>,
     pub clashing: Vec<String>,
-    #[serde(default)]
     pub remedy: String,
 }
 

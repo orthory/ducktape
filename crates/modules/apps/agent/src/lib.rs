@@ -78,7 +78,7 @@ struct AgentState {
     /// C4 ordered skill refs — the agent's SOUL (order is significant to the
     /// hash, and to the order `Always` bodies assemble in host-side).
     skills: Vec<SkillRef>,
-    /// owner-assigned semantic role; general is the legacy default.
+    /// owner-assigned semantic role; general is the default.
     role: AgentRole,
 }
 
@@ -179,8 +179,9 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         put_caps(&mut out, &a.caps);
         put_skills(&mut out, &a.skills);
     }
-    // Sparse additive role tail. If every record is General, omit it entirely
-    // so legacy snapshots and their roots remain byte-for-byte valid.
+    // Sparse additive role tail. If every record is General (the common case),
+    // omit it entirely — the root stays byte-for-byte identical to an
+    // all-General registry.
     let roles = agents
         .iter()
         .filter(|(_, agent)| agent.role != AgentRole::General)
@@ -457,8 +458,9 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
         )?;
     }
 
-    // A missing tail is the legacy encoding. A present tail is a canonical,
-    // strictly-ascending sparse map of non-default role assignments.
+    // A missing tail means every agent is General (the common case). A present
+    // tail is a canonical, strictly-ascending sparse map of non-default role
+    // assignments.
     if !buf.is_empty() {
         let role_count = take_count(&mut buf, 8 + 1, "agent role")?;
         if role_count == 0 {
@@ -499,10 +501,6 @@ pub struct AgentModule {
     /// in lockstep. an opaque id: this crate never decodes its interface.
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
-    /// Recovery-only execution mode for the exact protocol-v1 native
-    /// registry. Its snapshot predates roles, so role-bearing snapshots remain
-    /// unavailable while that workspace advertises the revision-1 fingerprint.
-    legacy_v1: bool,
     /// committed state — what `root()` and the app-hash commit to.
     agents: BTreeMap<String, AgentState>,
     /// this block's staged writes, read ahead of committed state
@@ -533,17 +531,9 @@ impl AgentModule {
             id,
             saga,
             hook,
-            legacy_v1: false,
             agents: BTreeMap::new(),
             pending_agents: BTreeMap::new(),
         }
-    }
-
-    /// Preserve the exact protocol-v1 snapshot/root contract while rolling a
-    /// newer node binary over an existing native workspace.
-    pub fn with_legacy_v1_state(mut self) -> Self {
-        self.legacy_v1 = true;
-        self
     }
 
     // ---- staged-over-committed reads ---------------------------------------
@@ -891,15 +881,6 @@ impl AgentModule {
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let agents = decode_committed(bytes).map_err(Error::Module)?;
-        if self.legacy_v1
-            && agents
-                .values()
-                .any(|agent| agent.role != AgentRole::General)
-        {
-            return Err(Error::Module(
-                "native-v1 agent snapshot contains a role tail".into(),
-            ));
-        }
         if committed_root(&agents) != expected {
             return Err(Error::Module(
                 "snapshot does not match expected root".into(),
@@ -918,11 +899,7 @@ impl Module for AgentModule {
     }
 
     fn state_schema_revision(&self) -> u32 {
-        if self.legacy_v1 {
-            1
-        } else {
-            2
-        }
+        2
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
@@ -1065,9 +1042,9 @@ mod tests {
 
     #[test]
     fn agent_response_commit_message_is_optional_and_round_trips_exactly() {
-        let legacy = decode_response(br#"{"reply_blocks":[],"actions":[]}"#).unwrap();
-        assert_eq!(legacy.commit_message, None);
-        assert!(legacy.delegations.is_empty());
+        let clean = decode_response(br#"{"reply_blocks":[],"actions":[]}"#).unwrap();
+        assert_eq!(clean.commit_message, None);
+        assert!(clean.delegations.is_empty());
 
         let message = "fix: exact subject\n\nExact body.";
         let response = AgentResponse {
@@ -1972,8 +1949,8 @@ mod tests {
     }
 
     #[test]
-    fn historical_role_tail_round_trips_with_legacy_defaults() {
-        let legacy: AgentRecord = serde_json::from_value(serde_json::json!({
+    fn role_defaults_to_general_and_round_trips_through_the_sparse_tail() {
+        let record: AgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "bot",
             "owner": { "external": [9] },
             "display_name": "BOT",
@@ -1983,11 +1960,11 @@ mod tests {
             "created_at": 0,
             "updated_at": 0
         }))
-        .expect("legacy records omit role");
-        assert_eq!(legacy.role, AgentRole::General);
+        .expect("a record without a role decodes to General");
+        assert_eq!(record.role, AgentRole::General);
         assert!(
-            serde_json::to_value(&legacy).unwrap().get("role").is_none(),
-            "the default role stays absent on the legacy JSON wire"
+            serde_json::to_value(&record).unwrap().get("role").is_none(),
+            "the default role stays absent on the JSON wire"
         );
 
         let mut m = module();
@@ -2008,32 +1985,6 @@ mod tests {
             get_agent(&joiner, "bot").unwrap().role,
             AgentRole::ProjectLibrarian
         );
-    }
-
-    #[test]
-    fn native_v1_mode_keeps_revision_one_and_rejects_role_tails() {
-        let mut legacy = module().with_legacy_v1_state();
-        assert_eq!(Module::state_schema_revision(&legacy), 1);
-        assert_eq!(Module::state_schema_revision(&module()), 2);
-
-        let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
-        exec(&mut legacy, &mut owner, &admin(&register("bot", &[]))).unwrap();
-        commit(&mut legacy);
-        let (legacy_bytes, legacy_root) = (legacy.snapshot(), legacy.root());
-
-        let mut current = module();
-        exec(&mut current, &mut owner, &admin(&register("bot", &[]))).unwrap();
-        commit(&mut current);
-        current.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
-        let err = legacy
-            .install(&current.snapshot(), current.root())
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("native-v1 agent snapshot contains a role tail")
-        );
-        assert_eq!(legacy.snapshot(), legacy_bytes);
-        assert_eq!(legacy.root(), legacy_root);
     }
 
     /// the library grant is an ORDINARY duckfs read cap — no special namespace,
@@ -2292,23 +2243,24 @@ mod tests {
     }
 
     /// THE TRAP THE DUCKDNS SIDE FELL INTO, PINNED SHUT HERE. `validate_agent_id`
-    /// is an ADMISSION rule and must never reach `decode_committed`: agents
-    /// registered before the rule existed hold ids it rejects (`"qa luna"`), and
-    /// their bytes are in every committed snapshot. If decode enforced the rule,
-    /// a node on the new binary could not install agent state (no state sync) and
-    /// could not restore its own recovery checkpoint — a permanent brick with no
-    /// migration path. A legacy agent DECODES. It simply cannot be re-registered.
+    /// is an ADMISSION rule and must NEVER reach `decode_committed`: decode must
+    /// accept whatever a consensus-agreed root commits to, so its accept-set is a
+    /// SUPERSET of what admission allows. A committed snapshot can hold an id that
+    /// admission would reject (`"qa luna"`). If decode enforced the admission
+    /// rule, a node on the new binary could not install that state (no state sync)
+    /// and could not restore its own recovery checkpoint — a permanent brick.
+    /// Decode accepts; only registration validates.
     #[test]
-    fn a_snapshot_holding_a_legacy_non_label_agent_id_still_installs() {
-        // forge the bytes an old binary committed: register a same-length label
-        // id and swap it in the canonical encoding (every length prefix stays
-        // valid). `register` uppercases the display name, so the id is the only
-        // occurrence of this window.
-        const LEGACY: &str = "qa luna";
+    fn decode_does_not_enforce_the_admission_label_rule() {
+        // forge a snapshot holding an id admission would reject: register a
+        // same-length label id and swap it in the canonical encoding (every
+        // length prefix stays valid). `register` uppercases the display name, so
+        // the id is the only occurrence of this window.
+        const NON_LABEL: &str = "qa luna";
         const STAND_IN: &str = "qa-luna";
-        assert_eq!(LEGACY.len(), STAND_IN.len());
+        assert_eq!(NON_LABEL.len(), STAND_IN.len());
         assert!(
-            validate_agent_id(LEGACY).is_err(),
+            validate_agent_id(NON_LABEL).is_err(),
             "no live Register could ever admit it"
         );
 
@@ -2322,18 +2274,18 @@ mod tests {
             .windows(STAND_IN.len())
             .position(|w| w == STAND_IN.as_bytes())
             .expect("the stand-in id is in the canonical bytes");
-        bytes[at..at + LEGACY.len()].copy_from_slice(LEGACY.as_bytes());
+        bytes[at..at + NON_LABEL.len()].copy_from_slice(NON_LABEL.as_bytes());
         let root = StateRoot(Sha256::digest(&bytes).into());
 
         let mut joiner = module();
         joiner
             .install(&bytes, root)
-            .expect("a legacy non-label agent id must still DECODE");
+            .expect("a non-label id must still DECODE");
         assert_eq!(joiner.root(), root);
         assert_eq!(joiner.snapshot(), bytes, "and re-encode identically");
         assert!(
-            get_agent(&joiner, LEGACY).is_some(),
-            "the legacy agent is intact and keeps working"
+            get_agent(&joiner, NON_LABEL).is_some(),
+            "the agent is intact and keeps working"
         );
     }
 }

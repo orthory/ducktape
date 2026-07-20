@@ -107,10 +107,11 @@ pub enum VoterKind {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VotingRule {
-    /// Compatibility for proposals restored from the pre-share snapshot shape:
-    /// use the validator set current at execution, exactly as the old binary did.
+    /// Inert: reachable only for a proposal restored from a pre-share snapshot
+    /// (no current network emits it). Uses the validator set current at
+    /// execution. Pending removal with the `electorate: None` path.
     DynamicValidatorMajority,
-    /// Pass once `yes_power >= required_yes`; this covers legacy validator
+    /// Pass once `yes_power >= required_yes`; this covers validator-set
     /// snapshots and structural proposals requiring two thirds of all shares.
     Threshold { required_yes: u64 },
     /// At the deadline, participation must reach `quorum` and yes must exceed
@@ -184,7 +185,7 @@ pub struct ProposalView {
     pub votes: Vec<(Vec<u8>, bool)>,
     pub voter_kind: VoterKind,
     /// the proposal-time power snapshot. empty only for a proposal restored
-    /// from the legacy dynamic-validator snapshot format.
+    /// from a pre-share snapshot (inert; no current network emits it).
     pub electorate: Vec<(Vec<u8>, u64)>,
     pub voting_rule: VotingRule,
 }

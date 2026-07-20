@@ -26,7 +26,7 @@ impl ResourceLedger {
     /// Turn omitted dimensions into an honest upper bound. On a sandboxed
     /// node, leaving (say) memory unspecified means the run may use the whole
     /// node, not zero memory: reserve and enforce the full announced capacity
-    /// for that dimension. An empty ledger is the Direct legacy path, where a
+    /// for that dimension. An empty ledger is the Direct path, where a
     /// demandless run remains deliberately unrestricted.
     pub(crate) fn accounted_demands(
         &self,
@@ -54,7 +54,7 @@ impl ResourceLedger {
     /// free = capacity − Σ running, per dimension; a demanded dimension the
     /// capacity never named is a mismatch (absent ≠ infinite). Callers pass
     /// [`Self::accounted_demands`] so omitted sandbox dimensions cost their
-    /// full capacity; only the empty-capacity Direct legacy path stays free.
+    /// full capacity; only the empty-capacity Direct path stays free.
     pub fn fits(&self, demands: &BTreeMap<String, u64>) -> bool {
         let running = self.running.lock().expect("ledger lock");
         self.fits_locked(&running, demands)

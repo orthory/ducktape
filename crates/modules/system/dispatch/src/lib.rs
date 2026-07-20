@@ -1406,11 +1406,11 @@ mod tests {
     }
 
     #[test]
-    fn work_spec_without_demands_field_still_decodes() {
-        let old = br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
-        let work = crate::decode_work_spec(old).unwrap();
-        assert!(work.demands.is_empty());
-        assert_eq!(work.admission, AdmissionPolicy::Queue);
+    fn work_spec_without_demands_field_is_rejected() {
+        // FLAG DAY: demands is required — a spec that omits the key fails to
+        // decode rather than silently defaulting to a demandless job.
+        let no_demands = br#"{"kind":"dispatch-work-v1","dispatch_id":"d","capability":"c","payload":[]}"#;
+        assert!(crate::decode_work_spec(no_demands).is_err());
     }
 
     #[test]

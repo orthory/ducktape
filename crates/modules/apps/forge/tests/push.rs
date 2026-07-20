@@ -498,8 +498,8 @@ fn commit_and_push_coexist_on_one_module() {
     let _ = std::fs::remove_dir_all(&dst_dir);
 }
 
-/// `list_repos` answers the INTEGRATION head: a main-only repo keeps the
-/// legacy fallback, but once `dev` is born the listing reports dev's oid —
+/// `list_repos` answers the INTEGRATION head: a main-only repo falls back to
+/// the main head, but once `dev` is born the listing reports dev's oid —
 /// the branch every browse surface reads, so a dev-only repo must never list
 /// as unborn to a remote client.
 #[test]
@@ -517,7 +517,7 @@ fn list_repos_reports_the_integration_head() {
     commit_one(&mut dst, 2, "b.txt", "two", "c2");
     let main_head = on_disk_head(&dst_dir).unwrap();
 
-    // main-only: the listing falls back to the legacy main head.
+    // main-only: the listing falls back to the main head.
     assert_eq!(
         repo_heads(&dst),
         vec![("default".into(), Some(main_head.to_string()))]

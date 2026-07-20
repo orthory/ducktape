@@ -171,12 +171,11 @@ pub struct WorkSpec {
     /// never by host code, never from static text.
     pub payload: Vec<u8>,
     /// numeric resource demands, validated by `capability::validate_resources`
-    /// at dispatch time; empty = demandless legacy job. the same value the
+    /// at dispatch time; empty = demandless job. the same value the
     /// dispatch handler threads onto the emitted `SagaMsg::Trigger` — the host
     /// worker reads demands from here, saga stays spec-opaque.
-    #[serde(default)]
     pub demands: BTreeMap<String, u64>,
-    /// host-local resource admission behavior. Omitted legacy specs queue.
+    /// host-local resource admission behavior. Omitted specs queue.
     #[serde(default, skip_serializing_if = "AdmissionPolicy::is_queue")]
     pub admission: AdmissionPolicy,
 }
@@ -185,7 +184,7 @@ pub struct WorkSpec {
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionPolicy {
-    /// Wait for currently occupied capacity, preserving legacy behavior.
+    /// Wait for currently occupied capacity — the default: wait for capacity.
     #[default]
     Queue,
     /// Attempt one atomic reservation and settle immediately when occupied.
@@ -248,10 +247,9 @@ pub enum DispatchMsg {
         payload: Vec<u8>,
         /// numeric resource demands, validated by
         /// `capability::validate_resources` at dispatch time; empty =
-        /// demandless legacy job. threaded verbatim onto both the composed
+        /// demandless job. threaded verbatim onto both the composed
         /// `WorkSpec` and the emitted `SagaMsg::Trigger` — one source, so the
         /// two can never drift.
-        #[serde(default)]
         demands: BTreeMap<String, u64>,
         /// host-local admission behavior; omitted callers retain Queue.
         #[serde(default, skip_serializing_if = "AdmissionPolicy::is_queue")]
@@ -375,11 +373,11 @@ mod tests {
     }
 
     #[test]
-    fn admission_defaults_to_queue_for_legacy_messages_and_specs() {
-        let legacy_msg =
+    fn queue_admission_is_omitted_and_defaults_on_decode() {
+        let queue_msg =
             br#"{"dispatch":{"dispatch_id":"d","recipe_id":"r","payload":[],"demands":{}}}"#;
-        let msg = decode_msg(legacy_msg).unwrap();
-        assert_eq!(encode_msg(&msg), legacy_msg);
+        let msg = decode_msg(queue_msg).unwrap();
+        assert_eq!(encode_msg(&msg), queue_msg);
         assert!(matches!(
             msg,
             DispatchMsg::Dispatch {

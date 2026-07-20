@@ -2094,8 +2094,7 @@ fn archived_channels_reject_writes_until_unarchived() {
 fn ownerless_channels_admit_any_user_for_rename_and_archive() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
-        // a system-minted channel has no owner — also the shape a legacy record
-        // (created before the field existed) decodes to via serde defaults.
+        // a system-minted channel has no owner (owner == None).
         module
             .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
             .await

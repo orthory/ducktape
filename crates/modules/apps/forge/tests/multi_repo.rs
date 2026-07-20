@@ -287,15 +287,16 @@ fn stale_push_on_one_repo_does_not_touch_another() {
 }
 
 #[test]
-fn legacy_commit_targets_default_and_is_addressable() {
+fn empty_repo_targets_default_and_is_addressable() {
     let base = tmp_base("compat");
     let mut f = Forge::init("forge", base.clone()).unwrap();
 
-    // the EXACT single-repo wire: a commit with NO `repo` key.
-    let legacy = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
+    // the single-repo wire: a commit with an explicit empty `repo` slug, which
+    // the module maps to the default repo.
+    let wire = br#"{"commit":{"repo":"","path":"a.txt","content":"hi","message":"m"}}"#;
     let msg = Msg {
         target: "forge".into(),
-        payload: legacy.to_vec(),
+        payload: wire.to_vec(),
     };
     block_on(f.execute(&mut TestCtx::at(5), &msg)).unwrap();
     block_on(f.commit_block()).unwrap();

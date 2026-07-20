@@ -5,9 +5,7 @@
 //!
 //! FLAG DAY: the pre-forge flat duckfs shape (no `kind`) no longer decodes —
 //! a mixed-binary envelope fails loudly at the serde step, never silently
-//! misreads. within a tagged variant, unknown ADDITIVE fields stay tolerated
-//! (internally-tagged serde ignores them), so the old advisory `mount_path`
-//! or a future additive key never kills an in-flight run.
+//! misreads. serde ignores unknown fields within an internally-tagged variant.
 
 use serde::Deserialize;
 
@@ -45,7 +43,7 @@ pub enum WorkspaceSource {
         /// surface and an audit/M2 signal.
         branch_born: bool,
         /// whether consensus granted `forge_push` for this repo when the run
-        /// was composed. absent on old envelopes means false.
+        /// was composed.
         forge_push: bool,
     },
 }
@@ -78,9 +76,9 @@ impl WorkspaceSource {
 }
 
 /// the wire decode of a v3 envelope's `workspace` block (contract §1). source
-/// coordinates are required at the serde step (a malformed envelope fails to
-/// parse — acceptance IS validation); additive metadata (`item_title`, the
-/// `forge_push` verdict) defaults for old in-flight envelopes.
+/// coordinates and the `forge_push` verdict are required at the serde step (a
+/// malformed envelope fails to parse — acceptance IS validation); the
+/// `item_title` metadata still defaults for old in-flight envelopes.
 /// [`WireWorkspace::validate`] adds the per-field non-empty checks and surfaces
 /// the plain [`WorkspaceSource`].
 #[derive(Deserialize)]
@@ -98,7 +96,6 @@ pub(crate) enum WireWorkspace {
         commit: String,
         branch: String,
         branch_born: bool,
-        #[serde(default)]
         forge_push: bool,
     },
 }
@@ -172,31 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn an_old_forge_shape_defaults_forge_push_to_false() {
-        // Additive and fail-closed: an in-flight envelope from before the
-        // forge_push field existed cannot gain write authority.
-        let ws: WireWorkspace = serde_json::from_str(&format!(
-            r#"{{"kind":"forge","repo":"app","item_title":"Fix the gate","commit":"{}","branch":"agent/item-7","branch_born":false}}"#,
-            "d0".repeat(20)
-        ))
-        .unwrap();
-        assert_eq!(
-            ws.validate().unwrap(),
-            WorkspaceSource::Forge {
-                repo: "app".into(),
-                item_title: Some("Fix the gate".into()),
-                commit: "d0".repeat(20),
-                branch: "agent/item-7".into(),
-                branch_born: false,
-                forge_push: false,
-            }
-        );
-    }
-
-    #[test]
     fn a_pre_title_forge_envelope_keeps_running_without_a_fallback() {
         let ws: WireWorkspace = serde_json::from_str(
-            r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false}"#,
+            r#"{"kind":"forge","repo":"app","commit":"d0","branch":"agent/item-7","branch_born":false,"forge_push":false}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -221,10 +196,11 @@ mod tests {
     #[test]
     fn a_forge_workspace_missing_a_field_fails_to_decode() {
         for broken in [
-            r#"{"kind":"forge","commit":"c","branch":"b","branch_born":true}"#, // no repo
-            r#"{"kind":"forge","repo":"app","branch":"b","branch_born":true}"#, // no commit
-            r#"{"kind":"forge","repo":"app","commit":"c","branch_born":true}"#, // no branch
-            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b"}"#,       // no branch_born
+            r#"{"kind":"forge","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, // no repo
+            r#"{"kind":"forge","repo":"app","branch":"b","branch_born":true,"forge_push":true}"#, // no commit
+            r#"{"kind":"forge","repo":"app","commit":"c","branch_born":true,"forge_push":true}"#, // no branch
+            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","forge_push":true}"#,       // no branch_born
+            r#"{"kind":"forge","repo":"app","commit":"c","branch":"b","branch_born":true}"#, // no forge_push
         ] {
             assert!(
                 serde_json::from_str::<WireWorkspace>(broken).is_err(),
@@ -236,9 +212,9 @@ mod tests {
     #[test]
     fn validation_rejects_empty_forge_coordinates_per_field() {
         let cases = [
-            (r#"{"kind":"forge","repo":"","commit":"c","branch":"b","branch_born":true}"#, "repo"),
-            (r#"{"kind":"forge","repo":"app","commit":"","branch":"b","branch_born":true}"#, "commit"),
-            (r#"{"kind":"forge","repo":"app","commit":"c","branch":"","branch_born":true}"#, "branch"),
+            (r#"{"kind":"forge","repo":"","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, "repo"),
+            (r#"{"kind":"forge","repo":"app","commit":"","branch":"b","branch_born":true,"forge_push":true}"#, "commit"),
+            (r#"{"kind":"forge","repo":"app","commit":"c","branch":"","branch_born":true,"forge_push":true}"#, "branch"),
         ];
         for (json, field) in cases {
             let err = serde_json::from_str::<WireWorkspace>(json)

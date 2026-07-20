@@ -531,32 +531,28 @@ fn post_message_without_its_own_grant_fails_the_run() {
 }
 
 #[test]
-fn a_post_message_effect_from_the_host_lane_decodes_and_threads() {
-    // the host-assembled effects facet is authoritative when non-empty (R1), so
-    // the new kind must decode there too — thread included.
+fn a_post_message_action_decodes_and_threads() {
+    // a `chat.post_message` action in the response prose threads under the
+    // named root — the prose-parsed action lane (the production path).
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
         .with_registry(&registry)
         .with_transcript("general", transcript(2));
+    let prose = String::from_utf8(response_json(
+        &["done"],
+        vec![AgentAction::PostMessage {
+            channel_id: "general".into(),
+            text: "threaded update".into(),
+            thread: Some(1),
+        }],
+    ))
+    .unwrap();
     exec(
         &mut m,
         &mut ctx,
-        &result_event(
-            &run_id,
-            Ok(runner_wrapper(
-                "done",
-                serde_json::json!({
-                    "effects": [{
-                        "kind": ACTION_CHAT_POST_MESSAGE,
-                        "channel_id": "general",
-                        "text": "threaded update",
-                        "thread": 1,
-                    }]
-                }),
-            )),
-        ),
+        &result_event(&run_id, Ok(runner_wrapper(&prose, serde_json::json!({})))),
     )
     .unwrap();
 

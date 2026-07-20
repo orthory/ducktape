@@ -129,7 +129,6 @@ pub struct ScheduledSwap {
     /// validator pubkeys that verified the target BYTES locally and signaled
     /// (`LifecycleMsg::SwapReady`), strictly increasing. committed state, in
     /// the root like everything else here.
-    #[serde(default)]
     pub readiness: Vec<Vec<u8>>,
     /// LATCHED true the moment `readiness` covers the whole boundary member
     /// set (R = n, evaluated at signal time). the arm predicate is
@@ -137,7 +136,6 @@ pub struct ScheduledSwap {
     /// a validator set that has not demonstrably received the bytes. a
     /// member admitted AFTER the latch heals through the fetch lane
     /// (fail-closed backstop) rather than blocking the swap.
-    #[serde(default)]
     pub ready: bool,
 }
 

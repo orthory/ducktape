@@ -63,8 +63,9 @@ const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
 /// intentionally the small-network implementation; checkpointed power history
 /// replaces it if real deployments outgrow this bound.
 const MAX_SHARE_ACCOUNTS: usize = 256;
-/// Optional state extension marker. Legacy snapshots have no marker and retain
-/// their historical bytes/root; the first frozen electorate or adopted share
+/// Optional state extension marker. The initial/empty state (no frozen
+/// electorate, no adopted share registry) and redemptions-only states omit it
+/// and retain their bytes/root; the first frozen electorate or adopted share
 /// registry appends this section.
 const SHARES_EXT_MAGIC: &[u8; 8] = b"DGOVSHR1";
 
@@ -76,7 +77,10 @@ struct Proposal {
     deadline: u64,
     status: ProposalStatus,
     votes: BTreeMap<Vec<u8>, bool>,
-    /// `None` only for proposals decoded from the legacy snapshot format.
+    /// `None` only for a proposal decoded from a pre-share (pre-`AdoptShares`)
+    /// snapshot — inert tolerance no current flag-day network emits. Pending
+    /// removal in a dedicated re-genesis PR (it restructures the two-phase
+    /// snapshot decoder on the voting path, so it does not ride a doc sweep).
     electorate: Option<Electorate>,
 }
 
@@ -966,8 +970,9 @@ impl Governance {
                     vec![principal]
                 }
             },
-            // legacy dynamic-validator proposals (pre-share snapshots): the
-            // electorate is the CURRENT member set, same node-keyed treatment.
+            // pre-share snapshot proposals (inert; no current network emits
+            // them): the electorate is the CURRENT member set, same node-keyed
+            // treatment.
             None => {
                 let members = self.members(ctx).await?;
                 let voters = self
@@ -1024,8 +1029,8 @@ impl Governance {
                 )
             }
             None => {
-                // Compatibility for a proposal restored from the legacy
-                // snapshot shape: retain its execution-time validator tally.
+                // Inert path for a proposal restored from a pre-share snapshot
+                // shape: retain its execution-time validator tally.
                 let members = self.members(ctx).await?;
                 let yes = members
                     .iter()

@@ -173,7 +173,7 @@ fn main() {
             .submit(Msg {
                 target: "forge".into(),
                 payload: forge_encode_msg(&ForgeMsg::Commit {
-                    // empty repo -> the default repo (back-compat wire).
+                    // empty repo slug -> the default repo (single-repo wire).
                     repo: String::new(),
                     path: "README.md".into(),
                     content: "# hello from a git-backed module\n".into(),
