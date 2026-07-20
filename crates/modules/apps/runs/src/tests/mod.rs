@@ -14,7 +14,7 @@ use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
     encode_reply as dispatch_encode_reply, encode_result_event,
 };
-use duckfs_core::{
+use files::{
     decode_msg as files_decode_msg, decode_query as files_decode_query,
     encode_reply as files_encode_reply,
 };
@@ -454,7 +454,7 @@ impl Ctx for CaptureCtx {
             },
             "files" => match files_decode_query(req).map_err(Error::Module)? {
                 FilesQuery::Refs {} => Ok(files_encode_reply(&FilesReply::Refs(
-                    duckfs_core::RefsInfo {
+                    files::RefsInfo {
                         head: self.files_head.clone(),
                         pins: BTreeMap::new(),
                         window_len: 0,

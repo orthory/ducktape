@@ -24,9 +24,13 @@ dispatch = { workspace = true }
 tasks = { path = "../tasks", default-features = false }
 jobs = { workspace = true }
 # the duckfs wire types (FilesQuery::Refs / FilesReply::Refs / RefsInfo) the v3
-# composer queries for the committed head it pins as source_snapshot (W2).
-# duckfs-core is pure wire (no std::fs), matching runs' other wire-type deps.
-duckfs-core = { workspace = true }
+# composer queries for the committed head it pins as source_snapshot (W2), plus
+# `paths::canonical`. linked through the `files` MODULE's crate root (which
+# re-exports duckfs-core) rather than duckfs-core directly, per the module rule:
+# a module links other modules' wire surface, not their pure-core internals.
+# default-features = false drops files' native `Files`/duckfs-disk (std::fs) so
+# the `runs-wasm` guest graph stays pure, same as chat/tasks/pages above.
+files = { path = "../files", default-features = false }
 base64 = { workspace = true }
 # the pages wire types (PageQuery::GetPage / PageReply / Block) the injector
 # queries for `[[page:<id>]]` refs (M2). a normal prod-safe dep — pages pulls

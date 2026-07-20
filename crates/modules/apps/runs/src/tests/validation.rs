@@ -207,7 +207,7 @@ fn duckfs_write_text_requires_current_refs_head() {
         } => {
             assert_eq!(base_snapshot.as_deref(), Some(head.as_str()));
             assert_eq!(message, "agent duckfs.write_text");
-            assert!(message.len() <= duckfs_core::MAX_MESSAGE_BYTES);
+            assert!(message.len() <= files::MAX_MESSAGE_BYTES);
         }
         other => panic!("expected files commit, got {other:?}"),
     }
