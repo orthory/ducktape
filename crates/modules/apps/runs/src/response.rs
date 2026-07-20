@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use agent::{CapRequest, MAX_DUCKFS_WRITE_TEXT_BYTES};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use duckfs_core::paths::canonical as canonical_duckfs_path;
+use files::paths::canonical as canonical_duckfs_path;
 
 use super::facets::{
     WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, output_ref_of,

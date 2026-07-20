@@ -29,7 +29,7 @@ use std::collections::BTreeSet;
 
 use agent::{AgentRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
 use chat::{AuthorRef, Block, MessageView};
-use duckfs_core::paths::canonical as canonical_duckfs_path;
+use files::paths::canonical as canonical_duckfs_path;
 use serde::Serialize;
 
 use crate::facets::WireSink;

@@ -5328,7 +5328,7 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch",
- "duckfs-core",
+ "files",
  "forge",
  "futures",
  "host",
