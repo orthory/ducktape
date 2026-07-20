@@ -81,6 +81,14 @@ impl SnpTestEnclave {
         Ok(out)
     }
 
+    /// A server-injectable quoter minting quotes bound to the live REPORTDATA.
+    /// Takes `Arc<Self>` because the server keeps the closure for its lifetime.
+    #[cfg(feature = "server")]
+    pub fn quoter(self: &std::sync::Arc<Self>) -> crate::server::Quoter {
+        let enclave = self.clone();
+        Box::new(move |rd| enclave.quote(rd))
+    }
+
     /// Trust roots under which — and only under which — `quote()` verifies.
     pub fn roots(&self) -> TrustRoots {
         TrustRoots::Snp(Box::new(SnpRoots {

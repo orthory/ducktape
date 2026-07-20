@@ -76,9 +76,45 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
-/// Build the gateway router and report the detected vendor ("mock"/"tdx"/"snp").
-/// Mints the enclave keys and generates the attestation quote.
+/// Quote generation, injected. Production uses configfs-tsm; the testkit
+/// injects a minted-chain quoter. A process that injects a quoter already
+/// controls the process — clients only trust what verifies against pinned
+/// vendor roots, so this seam grants no forgery power.
+pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> + Send + Sync>;
+
+/// Build the gateway router and report the vendor ("mock"/"tdx"/"snp").
+/// Resolves `cfg.attest` to a configfs-tsm (or mock) quoter; `auto` probes the
+/// hardware for the vendor.
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
+    let (mode, quoter): (AttestMode, Quoter) = if cfg.attest == "auto" {
+        let mode = tsm_probe_provider()?;
+        (mode, tsm_quoter(mode))
+    } else {
+        let mode: AttestMode = cfg.attest.parse()?;
+        match mode {
+            AttestMode::Mock => {
+                let m = Measurement::from_hex(
+                    cfg.measurement
+                        .as_deref()
+                        .context("measurement is required for attest=mock")?,
+                )?;
+                (mode, Box::new(move |rd: &[u8; attest::REPORT_DATA_LEN]| {
+                    Ok(attest::mock_quote(rd, &m))
+                }) as Quoter)
+            }
+            AttestMode::Tdx | AttestMode::Snp => (mode, tsm_quoter(mode)),
+        }
+    };
+    build_with_quoter(cfg, mode.as_str(), quoter)
+}
+
+fn tsm_quoter(expected: AttestMode) -> Quoter {
+    Box::new(move |rd| tsm_gen_quote(Some(expected), rd).map(|(_, quote)| quote))
+}
+
+/// Build the gateway with an injected quote generator. Mints the enclave keys
+/// and calls `quoter` once on the freshly bound REPORTDATA.
+pub fn build_with_quoter(cfg: GatewayConfig, vendor: &str, quoter: Quoter) -> Result<(Router, String)> {
     // Enclave-bound keys, memory only.
     let seal_kp = SealKeypair::generate();
     let sess_sk = SigningKey::generate(&mut OsRng);
@@ -86,24 +122,8 @@ pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
 
     let seal_pk = seal_kp.public_bytes();
     let report_data = attest::make_report_data(&seal_pk, &sess_pk.to_bytes());
-
-    // `auto` picks the vendor from the hardware; explicit mock|tdx|snp are as named.
-    let (mode, quote) = if cfg.attest == "auto" {
-        tsm_gen_quote(None, &report_data)?
-    } else {
-        let mode: AttestMode = cfg.attest.parse()?;
-        match mode {
-            AttestMode::Mock => {
-                let m = cfg
-                    .measurement
-                    .as_deref()
-                    .context("measurement is required for attest=mock")?;
-                (mode, attest::mock_quote(&report_data, &Measurement::from_hex(m)?))
-            }
-            AttestMode::Tdx | AttestMode::Snp => tsm_gen_quote(Some(mode), &report_data)?,
-        }
-    };
-    let vendor = mode.as_str().to_string();
+    let quote = quoter(&report_data)?;
+    let vendor = vendor.to_string();
 
     let state = Arc::new(AppState {
         seal_kp,
@@ -158,11 +178,7 @@ fn tsm_gen_quote(
     let result = (|| -> Result<(AttestMode, Vec<u8>)> {
         let provider =
             fs::read_to_string(format!("{dir}/provider")).context("read configfs-tsm provider")?;
-        let detected = match provider.trim() {
-            "tdx_guest" => AttestMode::Tdx,
-            "sev_guest" => AttestMode::Snp,
-            other => bail!("unsupported configfs-tsm provider {other:?} (want tdx_guest/sev_guest)"),
-        };
+        let detected = provider_to_mode(provider.trim())?;
         if let Some(want) = expected
             && want != detected
         {
@@ -178,6 +194,26 @@ fn tsm_gen_quote(
     })();
     let _ = fs::remove_dir(&dir);
     result
+}
+
+fn provider_to_mode(provider: &str) -> Result<AttestMode> {
+    match provider {
+        "tdx_guest" => Ok(AttestMode::Tdx),
+        "sev_guest" => Ok(AttestMode::Snp),
+        other => bail!("unsupported configfs-tsm provider {other:?} (want tdx_guest/sev_guest)"),
+    }
+}
+
+/// Probe the configfs-tsm provider to learn the hardware vendor without
+/// generating a quote (the `auto` mode).
+fn tsm_probe_provider() -> Result<AttestMode> {
+    use std::fs;
+    let dir = format!("/sys/kernel/config/tsm/report/airlock-probe-{}", std::process::id());
+    fs::create_dir(&dir)
+        .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
+    let provider = fs::read_to_string(format!("{dir}/provider"));
+    let _ = fs::remove_dir(&dir);
+    provider_to_mode(provider.context("read configfs-tsm provider")?.trim())
 }
 
 // -------- handlers --------

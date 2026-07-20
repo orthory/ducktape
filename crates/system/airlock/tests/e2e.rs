@@ -1,7 +1,10 @@
 //! End-to-end: the whole custody path in one process, over real HTTP —
 //! attest → seal credential → handshake → proxied call → credential swap →
-//! reply. Run with `cargo test -p airlock --features server,client`.
-#![cfg(all(feature = "server", feature = "client"))]
+//! reply. The gateway runs a testkit quoter (minted SNP chain) and the client
+//! side verifies it through the REAL `airlock::verify` path under the
+//! enclave's own roots. Run with
+//! `cargo test -p airlock --features server,client,testkit`.
+#![cfg(all(feature = "server", feature = "client", feature = "testkit"))]
 
 use std::sync::{Arc, Mutex};
 
@@ -16,10 +19,15 @@ use tokio::net::TcpListener;
 use airlock::attest::{self, Measurement};
 use airlock::client::Gateway;
 use airlock::server::{self, GatewayConfig};
+use airlock::testkit::SnpTestEnclave;
 
 /// 48-byte measurement (all 0x11) shared by the gateway and the verifying client.
-fn measurement_hex() -> String {
-    "11".repeat(attest::MRTD_LEN)
+fn measurement() -> Measurement {
+    Measurement([0x11; attest::MRTD_LEN])
+}
+
+fn enclave() -> Arc<SnpTestEnclave> {
+    Arc::new(SnpTestEnclave::new(&measurement()).unwrap())
 }
 
 /// A mock Anthropic upstream. `/oauth/token` mints `acc-1`; `/v1/messages`
@@ -59,18 +67,22 @@ async fn spawn(app: Router) -> String {
     format!("http://{addr}")
 }
 
-async fn boot_gateway(upstream: &str) -> String {
-    let (app, vendor) = server::build(GatewayConfig {
-        attest: "mock".into(),
-        measurement: Some(measurement_hex()),
-        anthropic_base: upstream.into(),
-        oauth_token_url: format!("{upstream}/oauth/token"),
-        oauth_client_id: "test-client".into(),
-        session_ttl_secs: 3600,
-        max_requests: 100,
-    })
+async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
+    let (app, vendor) = server::build_with_quoter(
+        GatewayConfig {
+            attest: "snp".into(),
+            measurement: None,
+            anthropic_base: upstream.into(),
+            oauth_token_url: format!("{upstream}/oauth/token"),
+            oauth_client_id: "test-client".into(),
+            session_ttl_secs: 3600,
+            max_requests: 100,
+        },
+        "snp",
+        enclave.quoter(),
+    )
     .unwrap();
-    assert_eq!(vendor, "mock");
+    assert_eq!(vendor, "snp");
     spawn(app).await
 }
 
@@ -82,23 +94,26 @@ async fn boot_upstream() -> String {
     spawn(app).await
 }
 
-/// The verified `seal_pk` the client trusts only because it checked the quote.
-async fn attested_seal_pk(gw: &Gateway) -> [u8; 32] {
+/// The verified `seal_pk` the client trusts only because it checked the quote
+/// — through the real SNP verifier, under the enclave's own roots.
+async fn attested_seal_pk(gw: &Gateway, enclave: &Arc<SnpTestEnclave>) -> [u8; 32] {
     let (quote, vendor) = gw.fetch_quote().await.unwrap();
-    assert_eq!(vendor, "mock");
-    let expected = Measurement::from_hex(&measurement_hex()).unwrap();
-    let rd = attest::mock_verify(&quote, &expected).unwrap();
+    assert_eq!(vendor, "snp");
+    let rd = airlock::verify::verify_quote(&quote, &measurement(), &enclave.roots())
+        .await
+        .unwrap();
     attest::split_report_data(&rd).0
 }
 
 #[tokio::test]
 async fn full_custody_path_swaps_session_token_for_the_credential() {
     let upstream = boot_upstream().await;
-    let gateway_url = boot_gateway(&upstream).await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
     let gw = Gateway::local(gateway_url.clone());
 
     // Credential Provider: verify the quote, then seal + upload the refresh token.
-    let seal_pk = attested_seal_pk(&gw).await;
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
     gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
         refresh_token: "ref-seed".into(),
     })
@@ -123,7 +138,7 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
 #[tokio::test]
 async fn proxy_rejects_a_request_without_a_valid_session_token() {
     let upstream = boot_upstream().await;
-    let gateway_url = boot_gateway(&upstream).await;
+    let gateway_url = boot_gateway(&upstream, &enclave()).await;
 
     // A bare bearer that is not a gateway-issued session token is refused before
     // any credential is spent.
@@ -142,7 +157,7 @@ async fn a_forged_gateway_cannot_mint_a_token_the_client_opens() {
     // If the client handshakes against a DIFFERENT enclave's seal_pk than the one
     // that answered, open_token fails — the session binds to the attested key.
     let upstream = boot_upstream().await;
-    let gateway_url = boot_gateway(&upstream).await;
+    let gateway_url = boot_gateway(&upstream, &enclave()).await;
     let gw = Gateway::local(gateway_url);
 
     let wrong_seal_pk = [0x42u8; 32]; // not the gateway's attested key
@@ -181,10 +196,11 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
             }),
         );
     let upstream = spawn(app).await;
-    let gateway_url = boot_gateway(&upstream).await;
+    let enclave = enclave();
+    let gateway_url = boot_gateway(&upstream, &enclave).await;
     let gw = Gateway::local(gateway_url.clone());
 
-    let seal_pk = attested_seal_pk(&gw).await;
+    let seal_pk = attested_seal_pk(&gw, &enclave).await;
     gw.upload_sealed_credential(
         &seal_pk,
         &airlock::wire::CredentialPayload::Bearer { access_token: "static-access-xyz".into() },
