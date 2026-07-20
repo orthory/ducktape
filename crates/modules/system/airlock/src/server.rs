@@ -13,7 +13,8 @@ use axum::extract::{OriginalUri, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::{Json, Router};
+use axum::Json;
+pub use axum::Router;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -170,21 +171,10 @@ pub fn build_with_quoter(
     Ok((app, vendor))
 }
 
-/// Bind-and-serve helper for the binary.
-pub async fn serve(listener: tokio::net::TcpListener, cfg: GatewayConfig) -> Result<()> {
-    let (app, _vendor) = build(cfg)?;
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-/// Bind-and-serve, seeding an initial in-process credential (see [`build_seeded`]).
-/// Used by the node embed, where the credential provider is the gateway process.
-pub async fn serve_seeded(
-    listener: tokio::net::TcpListener,
-    cfg: GatewayConfig,
-    initial_credential: Option<CredentialPayload>,
-) -> Result<()> {
-    let (app, _vendor) = build_seeded(cfg, initial_credential)?;
+/// Serve an already-built gateway router. The node embed BUILDS (and thus
+/// attests) at boot — before registering its route or claiming to listen —
+/// and only serves here; a box that cannot attest never reaches this point.
+pub async fn serve_router(listener: tokio::net::TcpListener, app: Router) -> Result<()> {
     axum::serve(listener, app).await?;
     Ok(())
 }
