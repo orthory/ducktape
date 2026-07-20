@@ -24,6 +24,10 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) joiner: bool,
     pub(crate) label: &'a str,
     pub(crate) storage: &'a std::path::Path,
+    /// the config dir where `gateway-routes.json` lives (= `storage` in the dev
+    /// shape). An embedded airlock gateway registers its loopback port here so
+    /// the gateway proxy can find it.
+    pub(crate) workspace: &'a std::path::Path,
     pub(crate) rpc_listen: Option<String>,
     pub(crate) http_listen: Option<String>,
     pub(crate) gateway_listen: Option<String>,
@@ -49,6 +53,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         joiner,
         label,
         storage,
+        workspace,
         rpc_listen,
         http_listen,
         gateway_listen,
@@ -88,6 +93,36 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             Some((listener, actual))
         }
         _ => None,
+    };
+    // An embedded airlock gateway (credential-provider node, DUCKTAPE_AIRLOCK_SERVE):
+    // run it in-process on loopback and register its port as the `airlock` gateway
+    // route, so a compute node can reach it over the overlay (airlock.<handle>.duck).
+    // Bound here (out of the runtime) like the browser gateway; served on the
+    // app-surface thread below. Only when the gateway plane is up to serve it; route
+    // PUBLICATION stays a one-time signed operator step.
+    let airlock_bits = match crate::airlock_serve::AirlockServe::from_env() {
+        None => None,
+        Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
+        Some(Ok(serve)) if !sync_only && gateway_enabled => {
+            let listener = std::net::TcpListener::bind((
+                std::net::Ipv4Addr::LOCALHOST,
+                serve.port.unwrap_or(0),
+            ))?;
+            listener.set_nonblocking(true)?;
+            let port = listener.local_addr()?.port();
+            crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
+                .map_err(|error| format!("register airlock gateway route: {error}"))?;
+            println!(
+                "[node {label}] airlock gateway listening on http://127.0.0.1:{port} (route \"airlock\")"
+            );
+            Some((listener, serve.cfg, serve.credential))
+        }
+        Some(Ok(_)) => {
+            eprintln!(
+                "[node {label}] DUCKTAPE_AIRLOCK_SERVE set but the gateway plane is off — not serving airlock"
+            );
+            None
+        }
     };
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
     // the derived per-module index (noded's exact store, <storage>/index),
@@ -250,6 +285,23 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                         noded::serve_browser_gateway(listener, gateway_handle).await
                                     {
                                         eprintln!("gateway browser server error: {error}");
+                                    }
+                                });
+                            }
+                            if let Some((airlock_listener, airlock_cfg, airlock_cred)) = airlock_bits
+                            {
+                                let airlock_listener =
+                                    tokio::net::TcpListener::from_std(airlock_listener)
+                                        .expect("adopt airlock gateway listener");
+                                tokio::spawn(async move {
+                                    if let Err(error) = airlock::server::serve_seeded(
+                                        airlock_listener,
+                                        airlock_cfg,
+                                        airlock_cred,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("airlock gateway server error: {error}");
                                     }
                                 });
                             }

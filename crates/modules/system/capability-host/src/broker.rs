@@ -2294,6 +2294,7 @@ mod tests {
             },
             "snp",
             test_enclave().quoter(),
+            None,
         )
         .unwrap();
         assert_eq!(vendor, "snp");
