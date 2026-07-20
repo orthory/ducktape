@@ -12,7 +12,6 @@ use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
 use host::Host;
-use kv::Kv;
 use modreg::Modreg;
 use recovery::Manifest;
 use sdk::StateRoot;
@@ -553,7 +552,6 @@ fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
 /// until it builds one. `constants::MODULE_IDS` mirrors this set for the
 /// status surfaces; the parity test below pins the two together.
 struct ProductionModules {
-    kv: Kv,
     pages: WasmModule,
     chat: WasmModule,
     forge: Forge,
@@ -587,7 +585,6 @@ impl ProductionModules {
     /// module set and each module's constructed state compose the app-hash.
     fn compose(self) -> Result<Host, sdk::Error> {
         let mut host = Host::genesis(vec![
-            Box::new(self.kv),
             Box::new(self.pages),
             Box::new(self.chat),
             Box::new(self.forge),
@@ -623,7 +620,7 @@ impl ProductionModules {
 
 /// the PRODUCTION module set — genesis state, identical on every node (a
 /// different set composes a different app-hash and the network forks at
-/// genesis). system infrastructure (kv, valset seeded with the genesis
+/// genesis). system infrastructure (valset seeded with the genesis
 /// validators, saga) plus every product module. `forge_repo` is this node's
 /// on-disk git substrate; wrapper modules run EMBEDDED substrates for now.
 pub(super) async fn genesis_host(
@@ -634,10 +631,6 @@ pub(super) async fn genesis_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Host {
-    let kv = Kv::new(
-        "kv",
-        Box::new(QmdbStore::init(context.child("kv"), "kv").await),
-    );
     // pages/chat are STORE-BACKED wasm tenants: the host still constructs the
     // concrete qmdb stores exactly as before — only the executor wrapped
     // around them changed (and `.with_tagging` moved into the guests).
@@ -665,7 +658,6 @@ pub(super) async fn genesis_host(
     // design — a client never gets statesync/quorum standing.
     let clients = Clients::new("clients");
     ProductionModules {
-        kv,
         pages,
         chat,
         forge,
@@ -770,10 +762,6 @@ pub(super) async fn restore_host(
         return native_v1::restore_host(context, forge_repo, duckfs_dir, manifest, bindings, blobs)
             .await;
     }
-    let kv = Kv::new(
-        "kv",
-        Box::new(QmdbStore::init(context.child("kv"), "kv").await),
-    );
     // store-backed wasm tenants restore like the other qmdb modules: the
     // stores reopen themselves at their committed positions and the wasm
     // wrapper computes root() straight from them (no snapshot install — see
@@ -953,7 +941,6 @@ pub(super) async fn restore_host(
         .map_err(|e| format!("automations install: {e}"))?;
 
     let mut host = ProductionModules {
-        kv,
         pages,
         chat,
         forge,
@@ -1104,20 +1091,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
             Ok::<_, String>((target, resolver))
         }
     };
-
-    let (target, resolver) = fetch_target("kv").await?;
-    let kv = Kv::new(
-        "kv",
-        Box::new(
-            QmdbStore::sync_from(
-                scratch_context.child(child_label("kv")),
-                "kv",
-                target,
-                resolver,
-            )
-            .await?,
-        ),
-    );
 
     // store-backed wasm tenants join like the other qmdb modules: rebuild the
     // CONCRETE store at the manifest's pinned target (merkle-verified against
@@ -1333,7 +1306,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     // [`genesis_host`] by construction — a missing module composes a
     // different app-hash and the join fails its final check.
     let mut host = ProductionModules {
-        kv,
         pages,
         chat,
         forge,
@@ -1424,7 +1396,7 @@ mod tests {
         // fail-closed like every other historical schema).
         assert_eq!(
             crate::config::hex_bytes(&pre_clients_state_schema_fingerprint()),
-            "2f9bc45b9abc691c65d9f6175f7a3aba39962dc8b6fce27ba207162887a60375"
+            "14f1d63c54bf56f602f75cefa658b7f7843438a87a6b52e3d872b6a7f4d3c31b"
         );
         assert_eq!(
             classify_state_schema(Some(pre_clients_state_schema_fingerprint()), 0),
