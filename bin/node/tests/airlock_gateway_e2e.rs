@@ -533,6 +533,7 @@ fn airlock_single_node_self_serves_its_own_route() {
             .expect("sealed handshake through the gateway");
         let plaintext =
             br#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+        let sealed_body = airlock::bodyseal::seal_request(&keys, plaintext);
         let resp = gw
             .route(gw.http().post(gw.url("/v1/messages")))
             .bearer_auth(&token)
@@ -540,7 +541,7 @@ fn airlock_single_node_self_serves_its_own_route() {
             .header("anthropic-beta", "oauth-2025-04-20")
             .header("content-type", "application/json")
             .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
-            .body(airlock::bodyseal::seal_request(&keys, plaintext).to_vec())
+            .body(sealed_body.clone())
             .send()
             .await
             .expect("proxied messages through the gateway");
@@ -550,7 +551,7 @@ fn airlock_single_node_self_serves_its_own_route() {
             !wire.windows(10).any(|w| w == b"AIRLOCK-OK"),
             "the overlay must carry ciphertext, never the plaintext reply"
         );
-        let mut opener = airlock::bodyseal::StreamOpener::new(&keys);
+        let mut opener = airlock::bodyseal::StreamOpener::new(&keys, &airlock::bodyseal::request_binding(&sealed_body));
         let items = opener.feed(&wire).expect("unseal the proxied reply");
         assert!(opener.finished(), "sealed reply must end with the Final marker");
         let body: Vec<u8> = items

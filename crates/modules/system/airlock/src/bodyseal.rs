@@ -2,9 +2,13 @@
 //! sealed CHUNK STREAM: `[16B stream salt]` then repeated `[u32 BE len][ct]`,
 //! nonce = `[4B zero ‖ u64 BE counter]` under a per-stream key — position is
 //! authenticated, so reordering, replay, or splicing across streams fails to
-//! open, and the mandatory `Final` marker makes truncation detectable. Path
-//! hosts (the publisher node outside the enclave, any relay) see ciphertext,
-//! and a stolen bearer alone cannot produce a sealable body.
+//! open, and the mandatory `Final` marker makes truncation detectable. The
+//! stream key ALSO binds the request blob's nonce, so an authentic response
+//! captured for one request cannot be replayed as the answer to another
+//! (empty-body GETs have no nonce and stay unbound — a GET-for-GET response
+//! swap is the accepted residual). Path hosts (the publisher node outside the
+//! enclave, any relay) see ciphertext, and a stolen bearer alone cannot
+//! produce a sealable body; the enclave dedupes request nonces per sub.
 
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::aead::Aead;
@@ -43,8 +47,21 @@ pub fn open_request(keys: &SessionKeys, blob: &[u8]) -> Result<Vec<u8>> {
     aead::open(&request_key(keys), blob).context("sealed request body")
 }
 
-fn stream_cipher(keys: &SessionKeys, salt: &[u8; SALT_LEN]) -> ChaCha20Poly1305 {
-    let key = aead::hkdf32_salted(&keys.body, salt, STREAM_LABEL);
+/// The request blob's unique nonce — the response-stream binding value (and
+/// the enclave's per-sub replay-dedup key). Empty input (a bodyless request)
+/// yields an empty binding.
+pub fn request_binding(sealed_blob: &[u8]) -> Vec<u8> {
+    sealed_blob.get(..12).map(<[u8]>::to_vec).unwrap_or_default()
+}
+
+fn stream_cipher(
+    keys: &SessionKeys,
+    salt: &[u8; SALT_LEN],
+    binding: &[u8],
+) -> ChaCha20Poly1305 {
+    let mut label = STREAM_LABEL.to_vec();
+    label.extend_from_slice(binding);
+    let key = aead::hkdf32_salted(&keys.body, salt, &label);
     ChaCha20Poly1305::new(Key::from_slice(&key))
 }
 
@@ -70,10 +87,12 @@ pub struct StreamSealer {
 }
 
 impl StreamSealer {
-    pub fn new(keys: &SessionKeys) -> (Self, Vec<u8>) {
+    /// `binding` = `request_binding(sealed request blob)` — ties this response
+    /// to the one request it answers (empty for a bodyless request).
+    pub fn new(keys: &SessionKeys, binding: &[u8]) -> (Self, Vec<u8>) {
         let mut salt = [0u8; SALT_LEN];
         OsRng.fill_bytes(&mut salt);
-        (Self { cipher: stream_cipher(keys, &salt), counter: 0 }, salt.to_vec())
+        (Self { cipher: stream_cipher(keys, &salt, binding), counter: 0 }, salt.to_vec())
     }
 
     fn seal_marked(&mut self, mark: u8, payload: &[u8]) -> Vec<u8> {
@@ -116,6 +135,7 @@ pub enum OpenedItem {
 /// Broker side: incremental parser over arbitrary byte splits.
 pub struct StreamOpener {
     keys: SessionKeys,
+    binding: Vec<u8>,
     cipher: Option<ChaCha20Poly1305>,
     buf: Vec<u8>,
     counter: u64,
@@ -123,8 +143,17 @@ pub struct StreamOpener {
 }
 
 impl StreamOpener {
-    pub fn new(keys: &SessionKeys) -> Self {
-        Self { keys: keys.clone(), cipher: None, buf: Vec::new(), counter: 0, finished: false }
+    /// `binding` must equal the sealer's — the requester passes
+    /// `request_binding(<the sealed blob it sent>)`.
+    pub fn new(keys: &SessionKeys, binding: &[u8]) -> Self {
+        Self {
+            keys: keys.clone(),
+            binding: binding.to_vec(),
+            cipher: None,
+            buf: Vec::new(),
+            counter: 0,
+            finished: false,
+        }
     }
 
     /// Feed bytes as they arrive; returns every item completed by this feed.
@@ -141,7 +170,7 @@ impl StreamOpener {
                 }
                 let salt: [u8; SALT_LEN] = self.buf[..SALT_LEN].try_into().unwrap();
                 self.buf.drain(..SALT_LEN);
-                self.cipher = Some(stream_cipher(&self.keys, &salt));
+                self.cipher = Some(stream_cipher(&self.keys, &salt, &self.binding));
             }
             if self.buf.len() < 4 {
                 break;
@@ -209,7 +238,7 @@ mod tests {
     }
 
     fn sealed_stream(keys: &SessionKeys, chunks: &[&[u8]]) -> Vec<u8> {
-        let (mut sealer, mut wire) = StreamSealer::new(keys);
+        let (mut sealer, mut wire) = StreamSealer::new(keys, b"");
         wire.extend(sealer.seal_head("text/event-stream"));
         for chunk in chunks {
             wire.extend(sealer.seal_chunk(chunk));
@@ -223,7 +252,7 @@ mod tests {
         let keys = keys();
         let wire = sealed_stream(&keys, &[b"data: a\n\n", b"data: b\n\n"]);
         // Feed one byte at a time — the parser must reassemble.
-        let mut opener = StreamOpener::new(&keys);
+        let mut opener = StreamOpener::new(&keys, b"");
         let mut items = Vec::new();
         for byte in &wire {
             items.extend(opener.feed(std::slice::from_ref(byte)).unwrap());
@@ -251,7 +280,7 @@ mod tests {
     #[test]
     fn reordered_chunks_fail_to_open() {
         let keys = keys();
-        let (mut sealer, salt) = StreamSealer::new(&keys);
+        let (mut sealer, salt) = StreamSealer::new(&keys, b"");
         let head = sealer.seal_head("t");
         let c1 = sealer.seal_chunk(b"one");
         let c2 = sealer.seal_chunk(b"two");
@@ -262,7 +291,7 @@ mod tests {
         wire.extend(c2);
         wire.extend(c1);
         wire.extend(fin);
-        let mut opener = StreamOpener::new(&keys);
+        let mut opener = StreamOpener::new(&keys, b"");
         assert!(opener.feed(&wire).is_err());
     }
 
@@ -273,7 +302,7 @@ mod tests {
         // Drop the final sealed chunk (17 bytes ct + 4 len = last 21+ bytes;
         // compute exactly: final = 1 marker byte + 16 tag = 17 ct + 4 frame).
         let truncated = &wire[..wire.len() - (4 + 1 + 16)];
-        let mut opener = StreamOpener::new(&keys);
+        let mut opener = StreamOpener::new(&keys, b"");
         let items = opener.feed(truncated).unwrap();
         assert!(items.iter().all(|item| !matches!(item, OpenedItem::Final)));
         assert!(!opener.finished(), "a stream without the final marker is TRUNCATED");
@@ -284,26 +313,45 @@ mod tests {
         let keys_a = keys();
         let keys_b = keys();
         let wire = sealed_stream(&keys_a, &[b"secret"]);
-        assert!(StreamOpener::new(&keys_b).feed(&wire).is_err());
+        assert!(StreamOpener::new(&keys_b, b"").feed(&wire).is_err());
 
         // Splice: a chunk from stream A inserted into stream B fails (per-
         // stream salt -> different key), even at the same counter position.
-        let (mut sealer_b, salt_b) = StreamSealer::new(&keys_a);
+        let (mut sealer_b, salt_b) = StreamSealer::new(&keys_a, b"");
         let head_b = sealer_b.seal_head("t");
-        let (mut sealer_c, _salt_c) = StreamSealer::new(&keys_a);
+        let (mut sealer_c, _salt_c) = StreamSealer::new(&keys_a, b"");
         let _head_c = sealer_c.seal_head("t");
         let foreign = sealer_c.seal_chunk(b"foreign");
         let mut wire = salt_b;
         wire.extend(head_b);
         wire.extend(foreign);
-        let mut opener = StreamOpener::new(&keys_a);
+        let mut opener = StreamOpener::new(&keys_a, b"");
         assert!(opener.feed(&wire).is_err());
+    }
+
+    #[test]
+    fn a_response_bound_to_one_request_cannot_answer_another() {
+        // The replay the review flagged: an authentic sealed response for
+        // request A, returned verbatim for request B, must fail to open.
+        let keys = keys();
+        let blob_a = seal_request(&keys, b"request A");
+        let blob_b = seal_request(&keys, b"request B");
+        let (mut sealer, salt) = StreamSealer::new(&keys, &request_binding(&blob_a));
+        let mut wire = salt;
+        wire.extend(sealer.seal_head("t"));
+        wire.extend(sealer.seal_chunk(b"answer for A"));
+        wire.extend(sealer.seal_final());
+
+        let mut opener_b = StreamOpener::new(&keys, &request_binding(&blob_b));
+        assert!(opener_b.feed(&wire).is_err(), "replayed response must not open for B");
+        let mut opener_a = StreamOpener::new(&keys, &request_binding(&blob_a));
+        assert!(opener_a.feed(&wire).is_ok(), "the bound requester still opens it");
     }
 
     #[test]
     fn data_after_final_is_refused() {
         let keys = keys();
-        let (mut sealer, salt) = StreamSealer::new(&keys);
+        let (mut sealer, salt) = StreamSealer::new(&keys, b"");
         let head = sealer.seal_head("t");
         let fin = sealer.seal_final();
         let extra = sealer.seal_chunk(b"zombie");
@@ -311,7 +359,7 @@ mod tests {
         wire.extend(head);
         wire.extend(fin);
         wire.extend(extra);
-        let mut opener = StreamOpener::new(&keys);
+        let mut opener = StreamOpener::new(&keys, b"");
         assert!(opener.feed(&wire).is_err());
     }
 }

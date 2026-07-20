@@ -1409,11 +1409,13 @@ async fn probe_ok() -> StatusCode {
 /// credential) and send it, WITHOUT consuming the body — factored out of
 /// [`forward_messages`] so a gateway 401 can be retried after an airlock
 /// re-handshake. The caller streams the returned response body.
+/// Returns the response plus the sealed request's BINDING (its blob nonce,
+/// empty when unsealed) — the response stream key is derived under it.
 async fn send_upstream(
     state: &AnthropicBrokerState,
     headers: &HeaderMap,
     body: &Bytes,
-) -> reqwest::Result<reqwest::Response> {
+) -> reqwest::Result<(reqwest::Response, Vec<u8>)> {
     let mut request = state.client.post(&state.messages_url).body(body.clone());
     // Forward request headers VERBATIM — including `anthropic-version` and
     // `anthropic-beta` (the subscription OAuth capability rides beta; stripping
@@ -1454,22 +1456,27 @@ async fn send_upstream(
             request = request.header(name, value);
         }
     }
-    let request = {
+    let (request, binding) = {
         let auth = state.auth.lock().await;
         // Airlock sessions are sealed-body: encrypt the child's plaintext under
         // the handshake body key (fresh nonce per attempt, so the 401-retry
         // path re-seals safely) and mark the request. The enclave refuses
         // plaintext on this token, so the bearer alone grants nothing.
-        let request = if let AnthropicAuth::Airlock(session) = &*auth {
-            request
-                .body(airlock::bodyseal::seal_request(&session.keys, body))
-                .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
+        let (request, binding) = if let AnthropicAuth::Airlock(session) = &*auth {
+            let sealed = airlock::bodyseal::seal_request(&session.keys, body);
+            let binding = airlock::bodyseal::request_binding(&sealed);
+            (
+                request
+                    .body(sealed)
+                    .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1),
+                binding,
+            )
         } else {
-            request
+            (request, Vec::new())
         };
-        auth.authorize(request)
+        (auth.authorize(request), binding)
     };
-    request.send().await
+    Ok((request.send().await?, binding))
 }
 
 async fn forward_messages(
@@ -1510,8 +1517,8 @@ async fn forward_messages(
     // never 502s the session.
     state.refresh_if_needed().await;
 
-    let mut upstream = match send_upstream(&state, &headers, &body).await {
-        Ok(resp) => resp,
+    let (mut upstream, mut binding) = match send_upstream(&state, &headers, &body).await {
+        Ok(sent) => sent,
         Err(e) => {
             return response(
                 StatusCode::BAD_GATEWAY,
@@ -1524,8 +1531,8 @@ async fn forward_messages(
     // status — passes straight through (`airlock_reauth` returns false).
     let token_expired = upstream.status() == StatusCode::UNAUTHORIZED;
     if token_expired && state.airlock_reauth().await {
-        upstream = match send_upstream(&state, &headers, &body).await {
-            Ok(resp) => resp,
+        (upstream, binding) = match send_upstream(&state, &headers, &body).await {
+            Ok(sent) => sent,
             Err(e) => {
                 return response(
                     StatusCode::BAD_GATEWAY,
@@ -1553,7 +1560,7 @@ async fn forward_messages(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/octet-stream"));
         if sealed_outer {
-            return relay_sealed(upstream, keys, permit).await;
+            return relay_sealed(upstream, keys, binding, permit).await;
         }
         if upstream.status().is_success() {
             return response(
@@ -1609,12 +1616,13 @@ async fn forward_messages(
 async fn relay_sealed(
     mut upstream: reqwest::Response,
     keys: airlock::handshake::SessionKeys,
+    binding: Vec<u8>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response<Body> {
     use airlock::bodyseal::OpenedItem;
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut opener = airlock::bodyseal::StreamOpener::new(&keys);
+    let mut opener = airlock::bodyseal::StreamOpener::new(&keys, &binding);
     let mut pending: Vec<Bytes> = Vec::new();
     let mut inner_ct: Option<String> = None;
     // The response head can only be built once the sealed head chunk opens.

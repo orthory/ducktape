@@ -253,7 +253,11 @@ async fn forward(
     } else {
         bodyseal::seal_request(&keys, body)
     };
-    let mut rb = st.gateway.http().request(method.clone(), &url).body(sealed_body);
+    let mut rb = st
+        .gateway
+        .http()
+        .request(method.clone(), &url)
+        .body(sealed_body.clone());
     rb = st.gateway.route(rb);
     if !body.is_empty() {
         rb = rb.header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1);
@@ -300,7 +304,7 @@ async fn forward(
     }
 
     // Unseal head-first: the inner content-type rides the sealed head chunk.
-    let mut opener = bodyseal::StreamOpener::new(&keys);
+    let mut opener = bodyseal::StreamOpener::new(&keys, &bodyseal::request_binding(&sealed_body));
     let mut pending: Vec<Bytes> = Vec::new();
     let mut inner_ct: Option<String> = None;
     while inner_ct.is_none() {

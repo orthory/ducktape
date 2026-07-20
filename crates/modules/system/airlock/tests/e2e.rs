@@ -220,7 +220,7 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         .bearer_auth(&token)
         .header(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1)
         .header("content-type", "application/json")
-        .body(sealed_body)
+        .body(sealed_body.clone())
         .send()
         .await
         .unwrap();
@@ -235,7 +235,7 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         !wire.windows(9).any(|w| w == b"SEALED-OK"),
         "the wire response must not contain the plaintext"
     );
-    let mut opener = bodyseal::StreamOpener::new(&keys);
+    let mut opener = bodyseal::StreamOpener::new(&keys, &bodyseal::request_binding(&sealed_body));
     let items = opener.feed(&wire).unwrap();
     assert!(opener.finished(), "the sealed stream must end with the Final marker");
     let plaintext: Vec<u8> = items

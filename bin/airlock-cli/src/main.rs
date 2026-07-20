@@ -134,6 +134,7 @@ async fn run_cmd() -> Result<()> {
         "stream": true,
         "messages": [{ "role": "user", "content": arg_or("--prompt", "Say hello in three words.") }],
     });
+    let sealed_body = airlock::bodyseal::seal_request(&keys, &serde_json::to_vec(&body)?);
     let resp = gw
         .route(gw.http().post(gw.url("/v1/messages")))
         .bearer_auth(token)
@@ -143,7 +144,7 @@ async fn run_cmd() -> Result<()> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("content-type", "application/json")
         .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1)
-        .body(airlock::bodyseal::seal_request(&keys, &serde_json::to_vec(&body)?))
+        .body(sealed_body.clone())
         .send()
         .await?;
     let status = resp.status();
@@ -156,7 +157,7 @@ async fn run_cmd() -> Result<()> {
     if sealed_outer {
         // A self-test is fine buffered: unseal the whole stream and print it.
         let wire = resp.bytes().await?;
-        let mut opener = airlock::bodyseal::StreamOpener::new(&keys);
+        let mut opener = airlock::bodyseal::StreamOpener::new(&keys, &airlock::bodyseal::request_binding(&sealed_body));
         let items = opener.feed(&wire)?;
         if !opener.finished() {
             bail!("sealed response was truncated (no Final marker)");

@@ -70,6 +70,9 @@ struct AppState {
     /// Remaining request budget per session `sub`. Refillable by asking for a new
     /// /session and unbounded in `sub`; the overlay ACL gates who may reach it.
     budgets: Mutex<HashMap<String, u32>>,
+    /// Per-sub sealed-request nonces already served — replay dedupe. Bounded
+    /// by the request budget per sub; dies with the process like every key.
+    seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
 }
 
 fn now_secs() -> u64 {
@@ -159,6 +162,7 @@ pub fn build_with_quoter(
         })),
         refresh_gate: tokio::sync::Mutex::new(()),
         budgets: Mutex::new(HashMap::new()),
+        seen_nonces: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -354,21 +358,13 @@ async fn proxy_inner(
     if claims.exp < now {
         return Err(AppErr(StatusCode::UNAUTHORIZED, "session token expired".into()));
     }
-    {
-        let mut b = st.budgets.lock().unwrap();
-        let rem = b
-            .get_mut(&claims.sub)
-            .ok_or_else(|| AppErr(StatusCode::FORBIDDEN, "no budget for sub".into()))?;
-        if *rem == 0 {
-            return Err(AppErr(StatusCode::TOO_MANY_REQUESTS, "budget exhausted".into()));
-        }
-        *rem -= 1;
-    }
-
     // Sealed-body session: re-derive the handshake keys statelessly from the
     // claims' ephemeral pk, unseal the request, and REFUSE plaintext — a
     // stolen bearer alone (visible to path hosts) cannot produce a sealable
-    // body. A plaintext session must not send the seal header.
+    // body. A plaintext session must not send the seal header. The raw blob's
+    // nonce becomes (a) the per-sub replay-dedup key and (b) the binding the
+    // response stream key is derived under, so an authentic response cannot
+    // be replayed as the answer to a different request.
     let seal_keys = if claims.seal {
         let eph = BASE64
             .decode(&claims.eph)
@@ -383,11 +379,27 @@ async fn proxy_inner(
         .get(bodyseal::SEAL_HEADER)
         .and_then(|v| v.to_str().ok())
         == Some(bodyseal::SEAL_V1);
+    let binding = bodyseal::request_binding(&body);
     let body = match (&seal_keys, sealed_request) {
-        (Some(keys), true) => Bytes::from(
-            bodyseal::open_request(keys, &body)
-                .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
-        ),
+        (Some(keys), true) => {
+            let replayed = !st
+                .seen_nonces
+                .lock()
+                .unwrap()
+                .entry(claims.sub.clone())
+                .or_default()
+                .insert(binding.clone());
+            if replayed {
+                return Err(AppErr(
+                    StatusCode::BAD_REQUEST,
+                    "airlock: replayed sealed request".into(),
+                ));
+            }
+            Bytes::from(
+                bodyseal::open_request(keys, &body)
+                    .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
+            )
+        }
         (Some(_), false) if !body.is_empty() => {
             return Err(AppErr(
                 StatusCode::BAD_REQUEST,
@@ -403,6 +415,19 @@ async fn proxy_inner(
         }
         (None, false) => body,
     };
+
+    // Budget spends only AFTER the sealed body validated — a path host feeding
+    // garbage blobs must not burn the session's requests (review finding).
+    {
+        let mut b = st.budgets.lock().unwrap();
+        let rem = b
+            .get_mut(&claims.sub)
+            .ok_or_else(|| AppErr(StatusCode::FORBIDDEN, "no budget for sub".into()))?;
+        if *rem == 0 {
+            return Err(AppErr(StatusCode::TOO_MANY_REQUESTS, "budget exhausted".into()));
+        }
+        *rem -= 1;
+    }
 
     // Ensure a fresh access token, then swap session token -> real credential.
     let stale = st
@@ -467,7 +492,7 @@ async fn proxy_inner(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
-    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys);
+    let (mut sealer, salt) = bodyseal::StreamSealer::new(&keys, &binding);
     let head_chunk = sealer.seal_head(&inner_ct);
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     tokio::spawn(async move {
