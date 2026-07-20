@@ -137,7 +137,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
             println!(
                 "[node {label}] identity {} is not in the genesis validator set — joiner \
                  mode: no invite token on disk, so a member must grant standing manually \
-                 (`ducktape-node invite-accept {}`)",
+                 (`ducktape node invite-accept {}`)",
                 hex_bytes(signer.public_key().as_ref()),
                 hex_bytes(signer.public_key().as_ref())
             );

@@ -1,4 +1,4 @@
-//! real-socket cluster e2e: REAL `ducktape-node` OS processes over localhost
+//! real-socket cluster e2e: REAL `ducktape` OS processes over localhost
 //! TCP, driven end to end through the json-lines rpc with TYPED payloads from
 //! the modules' crate-root wire types (the drift that silently rotted the old bash demo
 //! — a module rename plus a payload reshape — now fails to compile instead).

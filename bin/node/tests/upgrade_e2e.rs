@@ -1,6 +1,6 @@
 //! real-socket end-to-end proof of the height-gated, no-downtime node upgrade.
 //!
-//! `cluster_upgrade` (the headline) drives REAL `ducktape-node` OS processes
+//! `cluster_upgrade` (the headline) drives REAL `ducktape` OS processes
 //! through the WHOLE mechanism on one cluster, over the same json-lines rpc + the
 //! greppable transition markers the runtime emits. The sequence:
 //! seed committed FORGE state (a stable per-module witness across the boundary);
@@ -22,10 +22,10 @@
 //! - (f) a fresh state-sync joiner across `H` rebuilds the IDENTICAL app-hash
 //!   (version-aware install).
 //!
-//! plus a live `ducktape-node upgrade-status` CLI read against a scheduled net.
+//! plus a live `ducktape node upgrade-status` CLI read against a scheduled net.
 //!
 //! NOTE on the mixed-old/new-binary leg: a single `cargo test` links ONE node
-//! binary (`CARGO_BIN_EXE_ducktape-node`, `MAX_PROTOCOL_VERSION = 3`), so a true
+//! binary (`CARGO_BIN_EXE_ducktape`, `MAX_PROTOCOL_VERSION = 3`), so a true
 //! mixed old/new handshake cannot be spawned here. The structurally-load-bearing
 //! property it would assert — version gating rides the app/consensus payload, not
 //! the p2p handshake namespace `sha256(scheme ‖ validators)` — is covered by the
@@ -440,7 +440,7 @@ fn cluster_upgrade() {
     // pending upgrade, readiness count, and armed verdict.
     let cfg0 = cluster.config_file(0);
     let cfg0s = cfg0.to_str().expect("utf-8 config path");
-    let (ok, out) = cluster.run_verb(&["upgrade-status", "--config", cfg0s]);
+    let (ok, out) = cluster.run_verb(&["node", "upgrade-status", "--config", cfg0s]);
     assert!(ok, "upgrade-status CLI failed:\n{out}");
     assert!(
         out.contains("pending: name=proto-v2") && out.contains("to_version=2"),

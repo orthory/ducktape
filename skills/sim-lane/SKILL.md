@@ -81,7 +81,7 @@ test seems to need a wait, the flow is broken, not slow.
   (`signing::author_pubkey_hex()`); the override answers only
   `user-key status` and `user-sign-frame` — any other verb errors loudly.
   It is process-global and authoritative; never expect a real
-  `ducktape-node` subprocess inside `cargo test -p ducktape-iced`.
+  `ducktape` subprocess inside `cargo test -p ducktape-iced`.
 
 ## Embedding the node in any crate's test
 

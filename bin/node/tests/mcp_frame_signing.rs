@@ -72,8 +72,9 @@ fn capture_action(tool: &str, arguments: Value) -> (Value, Captured) {
 }
 
 fn command(action_url: Option<String>) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ducktape-mcp"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ducktape"));
     command
+        .arg("mcp")
         .env("DUCKTAPE_RUN_AGENT", AGENT_ID)
         .env("DUCKTAPE_RUN_ID", RUN_ID)
         .env_remove("DUCKTAPE_RUN_SESSION_KEY")

@@ -75,7 +75,8 @@ async function main() {
   const nodeHex = Buffer.from(nodeBytes).toString("hex");
 
   const bind = JSON.parse(sign([
-    "user-sign-bind",
+    "user",
+    "sign-bind",
     "--key", userKey,
     "--chain-id", chain,
     "--node-pub", nodeHex,
@@ -132,7 +133,8 @@ async function main() {
 
   async function publish(statement) {
     const message = JSON.parse(sign([
-      "user-sign-gateway-route",
+      "user",
+      "sign-gateway-route",
       "--key", userKey,
       "--statement", JSON.stringify(statement),
     ]));

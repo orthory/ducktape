@@ -26,11 +26,11 @@ use chat::ChatQuery;
 use forge::ForgeQuery;
 use pages::PageQuery;
 use runs::RunsQuery;
-use tasks::TaskQuery;
+use tasks::{TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
-use crate::identity::{Run, TARGET_AGENT, TARGET_RUNS};
-use crate::node::{NodeError, Result};
+use crate::mcp::identity::{Run, TARGET_AGENT, TARGET_RUNS};
+use crate::mcp::node::{NodeError, Result};
 
 const TARGET_CHAT: &str = "chat";
 const TARGET_TASKS: &str = "tasks";
@@ -262,7 +262,7 @@ fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
 }
 
 fn tasks_list(run: &Run, _args: &Value) -> Result<Value> {
-    run.node.query(TARGET_TASKS, encode(&TaskQuery::List)?)
+    run.node.query(TARGET_TASKS, encode(&WorkQuery::Task(TaskQuery::List))?)
 }
 
 fn pages_list(run: &Run, _args: &Value) -> Result<Value> {
@@ -449,7 +449,10 @@ mod tests {
             .unwrap(),
             json!({"pr_diff": {"repo": "app", "number": 8}})
         );
-        assert_eq!(encode(&TaskQuery::List).unwrap(), json!("list"));
+        assert_eq!(
+            encode(&WorkQuery::Task(TaskQuery::List)).unwrap(),
+            json!({"task": "list"})
+        );
         assert_eq!(encode(&PageQuery::ListPages).unwrap(), json!("list_pages"));
         assert_eq!(
             encode(&ForgeQuery::GetItem {

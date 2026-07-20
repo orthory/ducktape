@@ -140,7 +140,7 @@ crate's `#[test]` — lives in `skills/sim-lane`.
 ```bash
 Xvfb :99 -screen 0 1400x900x24 -nolisten tcp &
 export DISPLAY=:99 HOME=<isolated> XDG_RUNTIME_DIR=<short-path, chmod 700>
-export DUCKTAPE_NODE_BIN="$(pwd)/target/debug/ducktape-node"
+export DUCKTAPE_NODE_BIN="$(pwd)/target/debug/ducktape"
 dbus-run-session -- bash -c '
   /usr/libexec/at-spi2-registryd &            # bare sessions cannot dbus-activate it
   target/debug/ducktape-iced & sleep 15

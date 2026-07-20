@@ -1,4 +1,4 @@
-//! live multi-node dispatch e2e: REAL `ducktape-node` validators over
+//! live multi-node dispatch e2e: REAL `ducktape` validators over
 //! localhost TCP, with REAL script-backed providers wired through the full
 //! capability-host path (operator spec dir -> discovery -> announce ->
 //! resolve -> spawned CLI), driving the whole agent loop across nodes:

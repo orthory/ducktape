@@ -323,7 +323,8 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     );
     let workspace = cluster.workspace(0);
     let (ok, output) = cluster.run_verb(&[
-        "gateway-route-bind",
+        "gateway",
+        "bind",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",

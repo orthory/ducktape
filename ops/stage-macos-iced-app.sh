@@ -53,8 +53,8 @@ cef_framework="$versioned_framework"
 
 [ -x "$build_dir/$source_binary" ] \
   || { echo "[macos-app] missing $build_dir/$source_binary" >&2; exit 1; }
-[ -x "$build_dir/ducktape-node" ] \
-  || { echo "[macos-app] missing $build_dir/ducktape-node" >&2; exit 1; }
+[ -x "$build_dir/ducktape" ] \
+  || { echo "[macos-app] missing $build_dir/ducktape" >&2; exit 1; }
 [ -f "$cef_framework/Chromium Embedded Framework" ] \
   || { echo "[macos-app] missing pinned CEF $cef_version for $cef_arch below $cef_root" >&2; exit 1; }
 [ -f "$icon" ] || { echo "[macos-app] missing $icon" >&2; exit 1; }
@@ -63,7 +63,7 @@ cef_framework="$versioned_framework"
 rm -rf "$app"
 mkdir -p "$contents/MacOS" "$contents/Resources" "$frameworks"
 install -m 755 "$build_dir/$source_binary" "$contents/MacOS/ducktape"
-install -m 755 "$build_dir/ducktape-node" "$contents/MacOS/ducktape-node"
+install -m 755 "$build_dir/ducktape" "$contents/MacOS/ducktape"
 ditto "$cef_framework" "$frameworks/Chromium Embedded Framework.framework"
 
 install -m 644 "$icon" "$contents/Resources/ducktape.icns"

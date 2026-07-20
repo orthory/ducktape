@@ -137,13 +137,13 @@ path = "workspace-parent:CLAUDE.md"
 # merely configured would be dead weight — the `mcp__ducktape` prefix
 # pre-allows exactly this server's tools and nothing else.
 #
-# `ducktape-mcp` is resolved from the RUN's PATH — the provisioner puts its
+# `ducktape` is resolved from the RUN's PATH — the provisioner puts its
 # directory there — so this spec names no absolute path and stays portable
 # across hosts. The config value is literal JSON; argv goes straight to exec,
 # no shell ever sees it.
 args = [
     "--mcp-config",
-    '{"mcpServers":{"ducktape":{"command":"ducktape-mcp"}}}',
+    '{"mcpServers":{"ducktape":{"command":"ducktape","args":["mcp"]}}}',
     "--allowedTools",
     "mcp__ducktape",
 ]

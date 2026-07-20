@@ -14,26 +14,31 @@ use config::hex_bytes;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
-/// Run a user-identity command, or return `None` when `command` belongs to a
-/// different command family.
-pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> {
-    let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let result = match command {
-        "user-key" => cmd_user_key(args, &mut stdin),
-        "user-sign-bind" => cmd_user_sign_bind(args, &mut stdin),
-        "user-sign-unbind" => cmd_user_sign_unbind(args, &mut stdin),
-        "user-sign-possession" => cmd_user_sign_possession(args, &mut stdin),
-        "user-sign-add-member" => cmd_user_sign_add_member(args, &mut stdin),
-        "user-sign-remove-member" => cmd_user_sign_remove_member(args, &mut stdin),
-        "user-sign-gateway-route" => cmd_user_sign_gateway_route(args, &mut stdin),
-        "user-sign-frame" => cmd_user_sign_frame(args, &mut stdin),
-        "user-redeem-invite" => cmd_user_redeem_invite(args, &mut stdin),
-        "user-sign-admin" => cmd_user_sign_admin(args, &mut stdin),
-        "user-webauthn-challenge" => cmd_user_webauthn_challenge(args),
-        "user-p256-payload" => cmd_user_p256_payload(args),
-        _ => return None,
+const USAGE: &str = "usage: ducktape user <verb> — key | sign-bind | sign-unbind | \
+     sign-possession | sign-add-member | sign-remove-member | sign-gateway-route | \
+     sign-frame | sign-admin | redeem-invite | webauthn-challenge | p256-payload";
+
+/// Run one verb of the `ducktape user` family.
+pub(super) fn run(argv: &[String]) -> CommandResult {
+    let Some((verb, args)) = argv.split_first() else {
+        return Err(USAGE.into());
     };
-    Some(result)
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    match verb.as_str() {
+        "key" => cmd_user_key(args, &mut stdin),
+        "sign-bind" => cmd_user_sign_bind(args, &mut stdin),
+        "sign-unbind" => cmd_user_sign_unbind(args, &mut stdin),
+        "sign-possession" => cmd_user_sign_possession(args, &mut stdin),
+        "sign-add-member" => cmd_user_sign_add_member(args, &mut stdin),
+        "sign-remove-member" => cmd_user_sign_remove_member(args, &mut stdin),
+        "sign-gateway-route" => cmd_user_sign_gateway_route(args, &mut stdin),
+        "sign-frame" => cmd_user_sign_frame(args, &mut stdin),
+        "redeem-invite" => cmd_user_redeem_invite(args, &mut stdin),
+        "sign-admin" => cmd_user_sign_admin(args, &mut stdin),
+        "webauthn-challenge" => cmd_user_webauthn_challenge(args),
+        "p256-payload" => cmd_user_p256_payload(args),
+        other => Err(format!("unknown user verb {other:?}\n{USAGE}").into()),
+    }
 }
 
 // ============================================================================
@@ -646,7 +651,7 @@ fn user_redeem_invite(
     // fail-closed expiry + envelope/token verification at decode.
     let invite = config::decode_invite(blob)?;
     if invite.token.role != config::InviteRole::Client {
-        return Err("this is a node (resident) invite — use `ducktape-node join`".into());
+        return Err("this is a node (resident) invite — use `ducktape node join`".into());
     }
     // every invite is bearer (기명 dropped in v2): no target lock — this user
     // key redeems the client invite directly, bound by the join proof below and
@@ -1245,7 +1250,7 @@ mod userkey_verb_tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("use `ducktape-node join`"),
+            err.to_string().contains("use `ducktape node join`"),
             "{err}"
         );
     }

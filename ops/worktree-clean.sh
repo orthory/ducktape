@@ -69,8 +69,9 @@ kill_instance_node() {
 
   exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
   cfg=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep -A1 -x -- '--config' | tail -1)
-  case "$exe" in *ducktape-node) ;; *)
-    say "REFUSING to kill pid $pid — not a ducktape-node ($exe)"; return 0 ;;
+  # `*ducktape-node` matches pre-rename zombies; `*ducktape` the unified CLI.
+  case "$exe" in *ducktape-node|*ducktape) ;; *)
+    say "REFUSING to kill pid $pid — not a ducktape node ($exe)"; return 0 ;;
   esac
   if [ "$(readlink -f "$cfg" 2>/dev/null)" != "$(readlink -f "$workspace/node.toml" 2>/dev/null)" ]; then
     say "REFUSING to kill pid $pid — its --config is not this workspace's"; return 0

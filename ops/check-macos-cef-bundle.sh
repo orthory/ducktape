@@ -62,7 +62,7 @@ check_macos_minimum() {
 }
 
 [ -x "$contents/MacOS/ducktape" ] || fail "missing main executable"
-[ -x "$contents/MacOS/ducktape-node" ] || fail "missing node sidecar"
+[ -x "$contents/MacOS/ducktape" ] || fail "missing node sidecar"
 [ -f "$contents/Resources/ducktape.icns" ] || fail "missing application icon"
 [ -f "$framework" ] || fail "missing Chromium Embedded Framework"
 case "$(uname -m)" in

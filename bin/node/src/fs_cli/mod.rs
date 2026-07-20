@@ -1,4 +1,4 @@
-//! `ducktape-fs` — the duckfs working-copy CLI.
+//! `ducktape fs` — the duckfs working-copy CLI.
 //!
 //! a hand-rolled verb dispatcher (no clap — the workspace forbids it) over the
 //! `duckfs-client` engine and its `HttpNode` transport. it ships the read verbs
@@ -14,14 +14,12 @@ mod args;
 mod read_cmds;
 mod work_cmds;
 
-use std::process::ExitCode;
-
-use args::CliError;
+use self::args::CliError;
 
 const USAGE: &str = "\
-ducktape-fs — the duckfs working-copy CLI
+ducktape fs — the duckfs working-copy CLI
 
-usage: ducktape-fs <verb> [args...]
+usage: ducktape fs <verb> [args...]
 
 read verbs (need --node <http-url> or the DUCKTAPE_NODE env):
   ls <path> [--snapshot S] [--limit N]     list a directory
@@ -37,19 +35,18 @@ working-copy verbs (the node comes from --node/DUCKTAPE_NODE or the .duckfs inde
   pin <snapshot> <name>                    pin a snapshot so gc keeps it
 ";
 
-fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+pub(crate) fn run(argv: &[String]) -> u8 {
     let Some((verb, rest)) = argv.split_first() else {
         eprintln!("{USAGE}");
-        return ExitCode::from(2);
+        return 2;
     };
     match dispatch(verb.as_str(), rest) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => 0,
         Err(e) => {
             if !e.message.is_empty() {
-                eprintln!("ducktape-fs: {}", e.message);
+                eprintln!("ducktape fs: {}", e.message);
             }
-            ExitCode::from(e.code)
+            e.code
         }
     }
 }

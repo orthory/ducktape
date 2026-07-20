@@ -7,6 +7,7 @@
 //! lane: the same commit through the unsigned convenience lane (author
 //! `ext:noded`) is REJECTED from that home subtree.
 
+#[path = "fs_support/mod.rs"]
 mod support;
 
 use std::io::{Read as _, Write as _};

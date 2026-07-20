@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent::{AgentRecord, CapRequest};
 use serde_json::json;
 
-use crate::node::{Node, NodeError, Result};
+use crate::mcp::node::{Node, NodeError, Result};
 
 pub const ENV_NODE: &str = "DUCKTAPE_NODE";
 pub const ENV_AGENT: &str = "DUCKTAPE_RUN_AGENT";

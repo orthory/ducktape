@@ -33,9 +33,10 @@
 #                      genesis set. EXCLUDED from the workspace as its own
 #                      standalone crate so its heavy deps (revm, alloy) never
 #                      tax the shipping build; gated via `make labs-gate`
-#   bin/             — demo (in-process walkthrough), node (validator),
-#                      noded (the app-facing daemon), simnode (deterministic
-#                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)
+#   bin/             — demo (in-process walkthrough), node (the `ducktape`
+#                      CLI: validator + fs verbs + mcp server), noded (the
+#                      app-facing daemon), simnode (deterministic /v1 twin),
+#                      coordinator (STUN rendezvous)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -87,8 +88,6 @@ members = [
     "crates/examples/directory", "crates/examples/greeter",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
-    "bin/fs",
-    "bin/mcp",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
 ]
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:

@@ -1,5 +1,5 @@
 //! the FULL-STACK live proof: a real runner CLI, driving the real
-//! `ducktape-mcp` binary, against a real node — and consensus refusing the write
+//! `ducktape mcp` binary, against a real node — and consensus refusing the write
 //! it tries to make.
 //!
 //! the chain under test is the whole one: `claude` spawns the server from the
@@ -30,6 +30,7 @@
 //! test is worthless if it proves a different command line than the one
 //! production runs.
 
+#[path = "mcp_support/mod.rs"]
 mod support;
 
 use std::process::{Command, Stdio};
@@ -39,7 +40,7 @@ use support::{AGENT_ID, Harness};
 
 /// exactly the tool args `crates/modules/system/capability-host/specs/claude.toml`
 /// splices in after `-p`. if you change them there, change them here.
-const MCP_CONFIG: &str = r#"{"mcpServers":{"ducktape":{"command":"ducktape-mcp"}}}"#;
+const MCP_CONFIG: &str = r#"{"mcpServers":{"ducktape":{"command":"ducktape","args":["mcp"]}}}"#;
 
 #[test]
 #[ignore = "drives the real `claude` CLI: needs auth, network, and budget"]
@@ -51,9 +52,9 @@ fn a_real_claude_run_drives_the_tool_plane_and_consensus_gates_its_write() {
     // if this is wrong the runner silently starts no server and the model
     // reports the tool "unavailable" — a failure mode that cost me an hour, so
     // it is asserted rather than assumed.
-    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_ducktape-mcp"));
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_ducktape"));
     let bin_dir = bin.parent().expect("the test binary has a directory");
-    assert!(bin.exists(), "ducktape-mcp was not built at {bin:?}");
+    assert!(bin.exists(), "ducktape was not built at {bin:?}");
     let path = format!(
         "{}:{}",
         bin_dir.display(),

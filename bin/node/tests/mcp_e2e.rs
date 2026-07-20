@@ -1,4 +1,4 @@
-//! e2e for `ducktape-mcp` against an in-process node (see `support/mod.rs`).
+//! e2e for `ducktape mcp` against an in-process node (see `support/mod.rs`).
 //!
 //! the binary is driven as a REAL subprocess over stdio, wired with exactly the
 //! two environment variables the node's provisioner sets — so what these tests
@@ -15,6 +15,7 @@
 //!   the very next call refuses — no cached permission outlives its revocation.
 //! - a refusal is a tool RESULT, not a protocol error, so the model can read it.
 
+#[path = "mcp_support/mod.rs"]
 mod support;
 
 use serde_json::json;
@@ -186,7 +187,7 @@ fn one_session_carries_many_calls_and_never_answers_the_notification() {
     let h = Harness::start(&["tasks.create"]);
     h.submit(
         "tasks",
-        json!({"create_task": {"task_id": "seeded", "title": "from the test"}}),
+        json!({"task": {"create_task": {"task_id": "seeded", "title": "from the test"}}}),
         OWNER,
     );
 
@@ -204,7 +205,7 @@ fn one_session_carries_many_calls_and_never_answers_the_notification() {
     );
     assert_eq!(results.len(), 3);
     assert_eq!(payload(&results[0])["agent_id"], AGENT_ID);
-    assert_eq!(payload(&results[1])["tasks"][0]["id"], "seeded");
+    assert_eq!(payload(&results[1])["task"]["tasks"][0]["id"], "seeded");
 }
 
 #[test]
@@ -296,7 +297,7 @@ fn an_ungated_read_reaches_the_module() {
     let h = Harness::start(&["tasks.create"]);
     h.submit(
         "tasks",
-        json!({"create_task": {"task_id": "seeded", "title": "from the test"}}),
+        json!({"task": {"create_task": {"task_id": "seeded", "title": "from the test"}}}),
         OWNER,
     );
 
@@ -304,8 +305,8 @@ fn an_ungated_read_reaches_the_module() {
     // them are ungated — inventing a gate the registry cannot express would be
     // a permission nobody could grant.
     let listed = payload(&h.call(h.mcp(), "ducktape_tasks", json!({})));
-    assert_eq!(listed["tasks"][0]["id"], "seeded");
-    assert_eq!(listed["tasks"][0]["title"], "from the test");
+    assert_eq!(listed["task"]["tasks"][0]["id"], "seeded");
+    assert_eq!(listed["task"]["tasks"][0]["title"], "from the test");
 }
 
 #[test]
@@ -313,14 +314,14 @@ fn a_run_with_no_agent_can_read_but_never_write() {
     let h = Harness::start(ALL_ACTIONS);
     h.submit(
         "tasks",
-        json!({"create_task": {"task_id": "seeded", "title": "visible"}}),
+        json!({"task": {"create_task": {"task_id": "seeded", "title": "visible"}}}),
         OWNER,
     );
 
     // no DUCKTAPE_RUN_AGENT: the server is bound to a node but acting for
     // nobody. ungated reads still work...
     let listed = payload(&h.call(h.mcp_agentless(), "ducktape_tasks", json!({})));
-    assert_eq!(listed["tasks"][0]["id"], "seeded");
+    assert_eq!(listed["task"]["tasks"][0]["id"], "seeded");
 
     // ...and every write refuses, because there is no grant to check against and
     // no owner to attribute it to. it must NOT fall back to the node's own
@@ -333,9 +334,9 @@ fn a_run_with_no_agent_can_read_but_never_write() {
     let (is_error, text) = content(&refused);
     assert!(is_error, "an agentless write must refuse: {text}");
 
-    let reply = h.query("tasks", json!("list"));
+    let reply = h.query("tasks", json!({"task": "list"}));
     assert_eq!(
-        reply["tasks"].as_array().unwrap().len(),
+        reply["task"]["tasks"].as_array().unwrap().len(),
         1,
         "the agentless write must not have landed: {reply}"
     );

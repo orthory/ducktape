@@ -20,7 +20,7 @@
 //!
 //! whichever lane materializes it, every run is handed the same TOOL PLANE
 //! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
-//! `PATH` (where `ducktape-mcp` ships), the node's http base as `DUCKTAPE_NODE`,
+//! `PATH` (where `ducktape mcp` ships), the node's http base as `DUCKTAPE_NODE`,
 //! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
 //! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
 //! and know who it acts for; the GRANT itself is never in the env (see
@@ -185,10 +185,10 @@ pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
 }
 
 /// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
-/// binary. `ducktape-mcp` ships beside `noded`/`node`, and the runner CLI
+/// binary. `ducktape mcp` ships beside `noded`/`node`, and the runner CLI
 /// (codex/claude) spawns the MCP server by BARE command name from OUTSIDE the
 /// agent's sandbox — so putting this one dir on the child's PATH is the whole
-/// of how `ducktape-mcp` resolves.
+/// of how `ducktape mcp` resolves.
 ///
 /// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
 /// degrades to NO entry rather than failing the run: the agent still runs,
@@ -205,9 +205,9 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// is, where its W6 skill trees are, which node its tools dial, and which agent
 /// it is acting for.
 ///
-/// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape-fs` reads — one
+/// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape fs` reads — one
 /// name for "the node this process talks to", so every Ducktape tool a run
-/// spawns (the `ducktape-mcp` server the runner CLI starts, outside the agent's
+/// spawns (the `ducktape mcp` server the runner CLI starts, outside the agent's
 /// sandbox, included) finds the node without a second convention. a node with
 /// no http surface has nothing to name, so the var is simply absent.
 ///

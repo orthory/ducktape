@@ -10,7 +10,7 @@ use duckfs_client::api::{ApiError, NodeApi};
 use duckfs_client::http::HttpNode;
 use duckfs_core::{DiffKind, EntryKindWire, MAX_PAGE, MAX_READ_BYTES};
 
-use crate::args::{CliError, flag_u64, parse_flags, resolve_node};
+use crate::fs_cli::args::{CliError, flag_u64, parse_flags, resolve_node};
 
 /// build the transport for a read verb from the resolved node address.
 fn node(flags: &BTreeMap<String, String>) -> Result<HttpNode, CliError> {

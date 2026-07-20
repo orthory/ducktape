@@ -46,7 +46,7 @@ gotcha, the 2-validator-quorum teardown caveat).
 
 - The coordinator deployed and answering (per [`coordinator.md`](coordinator.md);
   verify with the Task-2 subprocess proof or `ss -lunp 'sport = :3478'`).
-- Validator A and Validator B each have a built `ducktape-node`.
+- Validator A and Validator B each have a built `ducktape`.
 - A founder able to mint v3 invites.
 - For the tunnel steps: real WireGuard userspace/kernel on A and B.
 

@@ -155,7 +155,7 @@ path = "config-home:AGENTS.md"
 # IMMEDIATELY AFTER args[0] (the `exec` subcommand). Not appended: codex's
 # trailing bare "-" (prompt from stdin) must stay LAST.
 #
-# `ducktape-mcp` is resolved from the RUN's PATH — the provisioner puts its
+# `ducktape` is resolved from the RUN's PATH — the provisioner puts its
 # directory there — so this spec names no absolute path and stays portable
 # across hosts. The values carry embedded double quotes because codex parses
 # a -c override as TOML; argv goes straight to exec, no shell ever sees it.
@@ -177,7 +177,9 @@ path = "config-home:AGENTS.md"
 # network, and this is the only door through it.
 args = [
     "-c",
-    'mcp_servers.ducktape.command="ducktape-mcp"',
+    'mcp_servers.ducktape.command="ducktape"',
+    "-c",
+    'mcp_servers.ducktape.args=["mcp"]',
     "-c",
     'mcp_servers.ducktape.env_vars=["DUCKTAPE_NODE","DUCKTAPE_RUN_AGENT","DUCKTAPE_RUN_WORKSPACE","DUCKTAPE_RUN_SKILLS","DUCKTAPE_RUN_ACTION_URL","DUCKTAPE_RUN_ACTION_TOKEN","DUCKTAPE_RUN_ID","DUCKTAPE_PROVIDER_CONTROL_URL","DUCKTAPE_PROVIDER_CONTROL_TOKEN"]',
     "-c",

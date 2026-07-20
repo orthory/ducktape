@@ -1,4 +1,4 @@
-//! live portable-runtime e2e: REAL `ducktape-node` validators, a REAL
+//! live portable-runtime e2e: REAL `ducktape` validators, a REAL
 //! script-backed provider, and the REAL `NodedProvisioner` driving duckfs
 //! checkout/commit — the full ADR loop this repo's unit suites only mock:
 //!

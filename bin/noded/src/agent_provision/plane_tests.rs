@@ -1,6 +1,6 @@
 //! the agent TOOL PLANE both lanes hand every run: the node base its tools
 //! dial (`DUCKTAPE_NODE`), the identity they act under (`DUCKTAPE_RUN_AGENT`),
-//! and the bin dir on PATH where `ducktape-mcp` is found.
+//! and the bin dir on PATH where `ducktape mcp` is found.
 //!
 //! the duckfs-lane cases here run the REAL `checkout_with` engine against a
 //! stand-in files actor on the `NodeCommand` lane ([`spawn_files_actor`], which
@@ -303,7 +303,7 @@ async fn a_run_gets_the_node_base_its_agent_id_and_the_tool_bin_dir_on_path() {
         SKILL_BODY
     );
 
-    // PATH: the dir holding the RUNNING binary — `ducktape-mcp` ships beside
+    // PATH: the dir holding the RUNNING binary — `ducktape mcp` ships beside
     // it, and the runner CLI resolves the server by bare command name.
     let exe_dir = std::env::current_exe()
         .unwrap()

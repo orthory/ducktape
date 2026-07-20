@@ -14,7 +14,7 @@ The huddle call path is: app client → `/v1/call/ws` → node call hub
 `docs/adr/2026-07-07-per-use-data-plane.mdx`) → remote hub → playout. The
 node's own tests wire two hubs through *in-process channels* — they never
 exercise the **real mesh**. This bed does, on two separate
-`ducktape-node` processes/containers.
+`ducktape` processes/containers.
 
 **A single node cannot host a real call**: the hub fans media out by *node key*
 and excludes self, so two clients on one node produce an empty recipient set.
@@ -87,7 +87,7 @@ Teardown: `docker compose -f ops/callbed/docker-compose.yml down -v`.
 
 | File | Role |
 |------|------|
-| `Dockerfile.node` | builds `ducktape-node` + `coordinator`, ships them + the scripts + curl |
+| `Dockerfile.node` | builds `ducktape` + `coordinator`, ships them + the scripts + curl |
 | `bootstrap.sh` | offline peering ceremony → `node0`/`node1` configs in `/shared` (socket WG effect, ambient coordinator on both nodes, advertised WG endpoints) |
 | `node-entry.sh` | waits for its config, runs the validator |
 | `docker-compose.yml` | `bootstrap` (one-shot) → `coordinator` → `node0` + `node1` → `driver` |

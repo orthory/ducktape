@@ -11,7 +11,7 @@ use duckfs_client::commit::{CommitError, CommitOptions, commit_with};
 use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
-use crate::args::{CliError, node_flag_or_env, parse_flags, resolve_node};
+use crate::fs_cli::args::{CliError, node_flag_or_env, parse_flags, resolve_node};
 
 /// resolve the node for a verb running inside `dir`: `--node` / `DUCKTAPE_NODE`
 /// first, else the `.duckfs` index's recorded node url.
@@ -99,12 +99,12 @@ pub fn commit(args: &[String]) -> Result<(), CliError> {
         Ok(summary) => {
             println!("{}", summary.snapshot);
             if summary.rebased {
-                eprintln!("ducktape-fs: auto-rebased onto the current head before committing");
+                eprintln!("ducktape fs: auto-rebased onto the current head before committing");
             }
             Ok(())
         }
         Err(CommitError::Conflict(report)) => {
-            eprintln!("ducktape-fs: commit conflict");
+            eprintln!("ducktape fs: commit conflict");
             eprintln!("  base: {}", report.base.as_deref().unwrap_or("(none)"));
             eprintln!("  head: {}", report.head.as_deref().unwrap_or("(none)"));
             for path in &report.clashing {

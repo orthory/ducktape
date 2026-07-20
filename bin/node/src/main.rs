@@ -63,6 +63,7 @@ mod constants;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
+mod fs_cli;
 mod gateway_plane;
 mod airlock_serve;
 mod gateway_routes;
@@ -74,6 +75,7 @@ mod joiner_mesh_tests;
 mod lobby;
 #[cfg(test)]
 mod main_tests;
+mod mcp;
 mod oracle_pool;
 mod overlay_book;
 mod plane_metrics;
@@ -154,20 +156,53 @@ fn hold_macos_activity() {
     let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
         NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
             | NSActivityOptions::LatencyCritical,
-        &NSString::from_str("ducktape-node follows 1s consensus blocks"),
+        &NSString::from_str("ducktape follows 1s consensus blocks"),
     );
     std::mem::forget(token);
 }
 
+const TOP_USAGE: &str = "\
+usage: ducktape <command> ...
+
+  node     run a workspace node, plus operator verbs (init, invite, join, ...)
+  user     user-identity keys and signing
+  gateway  local loopback bindings for signed gateway routes
+  fs       the duckfs working-copy CLI
+  mcp      the stdio MCP server an agent runner spawns";
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let Some((family, rest)) = argv.split_first() else {
+        return Err(TOP_USAGE.into());
+    };
+    let args: &[String] = match family.as_str() {
+        // each family owns its verbs and its own usage. `fs` owns a 0/1/2
+        // exit-code contract, so it exits directly (after flushing the stream
+        // `cat` wrote to); `mcp` is the stdio server the agent runner spawns
+        // and holds until its stdin closes.
+        "fs" => {
+            let code = fs_cli::run(rest);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code.into());
+        }
+        "mcp" => {
+            mcp::serve();
+            return Ok(());
+        }
+        "user" => return userkey_cli::run(rest),
+        "gateway" => return gateway_routes::run(rest),
+        "node" => rest,
+        other => return Err(format!("unknown command {other:?}\n\n{TOP_USAGE}").into()),
+    };
     if let Some(command) = args.first()
         && let Some(result) = cli::dispatch(command, &args[1..])
     {
         return result;
     }
 
-    // the run path: `--config <path> | -n/--network <chain id> [--sync-only]`.
+    // the run path: `ducktape node --config <path> | -n/--network <chain id>
+    // [--sync-only]`.
     let mut cfg_path: Option<PathBuf> = None;
     let mut network: Option<String> = None;
     let mut sync_only = false;
@@ -179,17 +214,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--sync-only" => sync_only = true,
             other => {
                 return Err(format!(
-                    "unexpected arg {other:?} (want a subcommand — \
-                     keygen|user-key|user-sign-bind|user-sign-unbind|\
-                     user-sign-possession|user-sign-add-member|user-sign-remove-member|\
-                     user-sign-gateway-route|gateway-route-bind|gateway-route-unbind|\
-                     gateway-route-list|\
-                     user-webauthn-challenge|user-p256-payload|\
-                     init|invite|admit|\
-                     invite-accept|promote|resident-remove|\
-                     join-requests|member-remove|member-leave|member-status|join|\
-                     upgrade-status — or \
-                     --config <path> | -n/--network <chain id> [--sync-only])"
+                    "unexpected arg {other:?} (want a node verb — \
+                     keygen|init|invite|admit|invite-accept|promote|resident-remove|\
+                     join-requests|join-state|member-remove|member-leave|member-status|join|\
+                     upgrade-status — or the run path: \
+                     ducktape node --config <path> | -n/--network <chain id> [--sync-only])"
                 )
                 .into());
             }

@@ -88,7 +88,12 @@ airlock-cli seal --attest snp --snp-product milan --measurement $MEAS \
     --host http://127.0.0.1:9100 \
     --credentials ~/.claude/.credentials.json --cred-kind bearer
 # register the loopback port node-locally
-ducktape-node gateway-route-bind --workspace <node-workspace> --label airlock --port 9100
+ducktape gateway bind --workspace <node-workspace> --label airlock --port 9100
+# publish the signed LoopbackHttp route (allow_authorization:true, max_response_bytes ≤ 4 MiB
+# — the buffered proxy enforces this cap literally; 0/"unbounded" awaits SSE-over-overlay);
+# construct the RouteStatement exactly as signed_airlock_route() does in the test,
+# then: user sign-gateway-route --key <user.key> --statement <json>  → submit to the
+# node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle> on duckdns.
 ```
 
 **Compute node** (runs the sandbox): point the broker at the remote gateway — no
