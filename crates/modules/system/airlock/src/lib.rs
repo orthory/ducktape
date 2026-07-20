@@ -10,6 +10,7 @@
 
 mod aead;
 pub mod attest;
+pub mod bodyseal;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "testkit")]
