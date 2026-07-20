@@ -785,11 +785,16 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                     value: "application/json".into(),
                 }],
             },
-            body: br#"{"ok":true}"#.to_vec(),
+            body: {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#))).unwrap();
+                drop(tx);
+                rx
+            },
         }));
     });
     let request_body = br#"{"name":"duck"}"#;
-    let mut request = post(
+    let request = post(
         "/v1/gateway/proxy",
         serde_json::json!({
             "head": {
@@ -873,7 +878,12 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
                     value: "application/json".into(),
                 }],
             },
-            body: br#"{"ok":true}"#.to_vec(),
+            body: {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#))).unwrap();
+                drop(tx);
+                rx
+            },
         }));
     });
     let authority = "app.demo.duck";

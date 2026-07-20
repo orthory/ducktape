@@ -69,9 +69,9 @@ ducktape-node --config node.toml                  # gateway comes up + route reg
 # clients pin the audited image's measurement on THEIR side (--measurement /
 # DUCKTAPE_AIRLOCK_MEASUREMENT + --snp-product); the serving node takes none.
 # then the ONE manual, signed ownership act — publish the LoopbackHttp route
-# (allow_authorization:true, max_response_bytes ≤ 4 MiB — the buffered proxy enforces
-# the cap literally; 0/"unbounded" awaits SSE-over-overlay). Build the RouteStatement
-# exactly as signed_airlock_route() in the test, then:
+# (allow_authorization:true; max_response_bytes 0 = unbounded live stream, the
+# right choice for claude SSE). Build the RouteStatement exactly as
+# signed_airlock_route() in the test, then:
 #   ducktape-node user-sign-gateway-route --key <user.key> --statement <json>
 #   → submit to the node RPC (cmd:submit, target:"gateway"). Also SetHandle <handle>.
 ```
@@ -107,9 +107,12 @@ export DUCKTAPE_AIRLOCK_SNP_PRODUCT=milan           # snp: pin the platform gene
 ```
 
 The quote is fetched + verified **over the overlay** before any token is derived,
-so a relaying node cannot substitute its key or read the session token. Note the
-overlay proxy currently **buffers** responses (4 MiB); live SSE streaming for long
-interactive turns is the remaining transport slice (spec §graft "Remaining").
+so a relaying node cannot substitute its key or read the session token. The
+overlay proxy **streams** responses end to end (2026-07-20): publish the route
+with `max_response_bytes: 0` (unbounded stream — now literal) for live SSE; a
+non-zero cap is enforced as a RUNNING total (declared over-length refused
+before the head; unsized overflow truncates the body mid-stream). The
+request-body admission ceiling is 16 MiB.
 
 ## Session-key handshake
 

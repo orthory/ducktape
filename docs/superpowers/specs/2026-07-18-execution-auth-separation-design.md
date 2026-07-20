@@ -162,10 +162,11 @@ publish → browser door → `allow_authorization` bearer forward → `proxy_loo
 test for the node-to-node overlay hop (runs where inline 2-node WireGuard peers
 reliably). The README's "Remote overlay" section is the operator runbook.
 
-**Remaining (SSE streaming only).** The overlay proxy **buffers** responses (4 MiB
-cap; only the WS-upgrade lane streams), so live `claude` SSE for long interactive
-turns needs the WS-upgrade lane or a streaming `read_proxy_response`. A short turn
-fits the buffered path. Note: `simnode` cannot exercise the overlay — it carries
+**Remaining: none on transport (2026-07-20,
+`2026-07-20-sse-overlay-streaming-body-aead-design.md`).** The overlay proxy
+STREAMS responses end to end (`max_response_bytes: 0` = unbounded; non-zero =
+running cap), the self-serve path rides the same frame wire, and the
+request-body admission ceiling is 16 MiB. Note: `simnode` cannot exercise the overlay — it carries
 the gateway/duckdns *consensus modules* but no WireGuard/`data_plane` transport
 (`handle.gateway == None`); the node-to-node overlay proxy requires two real
 `bin/node` instances, not the deterministic `/v1` twin.
