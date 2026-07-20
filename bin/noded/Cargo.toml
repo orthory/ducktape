@@ -27,7 +27,6 @@ duckdns = { workspace = true }
 gateway = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
-jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 dispatch = { workspace = true }

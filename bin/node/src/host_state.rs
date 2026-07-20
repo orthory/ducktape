@@ -102,12 +102,10 @@ const DIRECTORY_WASM_COMPONENT: &[u8] =
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
 
-/// jobs / inbox / tasks GENESIS components — adapter-ported tenants (the
-/// native crate compiled into the guest; canonical snapshot persisted through
-/// the host-KV store; revision 2 in `MODULE_STATE_SCHEMAS`).
-const JOBS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/jobs-wasm/component.wasm");
-const JOBS_MODULE_ID: &str = "jobs";
+/// inbox / tasks GENESIS components — adapter-ported tenants (the native crate
+/// compiled into the guest; canonical snapshot persisted through the host-KV
+/// store). `tasks` is the MERGED work module (task board + job board), revision
+/// 3 in `MODULE_STATE_SCHEMAS`.
 const INBOX_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/inbox-wasm/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
@@ -172,7 +170,7 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 /// watch/pending-entry/session accessors shadow the committed maps with the
 /// block's overlays), so the whole-state fold is behavior-identical (pinned
 /// by `wasm_runs_parity`). its ten collaborator ids — chat, saga, tagging,
-/// dispatch, agent, tasks, jobs, plus the files/forge/pages builder chain —
+/// dispatch, agent, tasks, plus the files/forge/pages builder chain —
 /// are genesis-constant and compiled into the guest (the exact production
 /// constructor these builders used to call natively). the dispatch reads it
 /// depends on (`turn_taken`'s permanent record, the session lane's
@@ -216,10 +214,6 @@ fn seeded_lifecycle() -> Lifecycle {
     reg.seed(
         DIRECTORY_MODULE_ID,
         sha2::Sha256::digest(DIRECTORY_WASM_COMPONENT).to_vec(),
-    );
-    reg.seed(
-        JOBS_MODULE_ID,
-        sha2::Sha256::digest(JOBS_WASM_COMPONENT).to_vec(),
     );
     reg.seed(
         INBOX_MODULE_ID,
@@ -286,7 +280,6 @@ fn seeded_lifecycle() -> Lifecycle {
 pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(HELLO_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DIRECTORY_WASM_COMPONENT.to_vec());
-    blobs.put_chunk(JOBS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(INBOX_WASM_COMPONENT.to_vec());
     blobs.put_chunk(TASKS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(TAGGING_WASM_COMPONENT.to_vec());
@@ -318,31 +311,27 @@ fn genesis_directory_wasm() -> WasmModule {
         .expect("embedded directory component loads")
 }
 
-/// jobs / inbox / tasks at their GENESIS code. adapter-ported, revision 2: the
-/// adapter port persists the native canonical snapshot under the host-KV
-/// encoding — a state-schema break from the native module's root, fenced by
-/// the recovery/state-sync preflight. same boot-time code reconciliation story
-/// as [`genesis_hello_wasm`].
-fn genesis_jobs_wasm() -> WasmModule {
-    WasmModule::from_bytes(JOBS_MODULE_ID, JOBS_WASM_COMPONENT)
-        .expect("embedded jobs component loads")
-        .with_state_schema_revision(2)
-}
-
+/// inbox at its GENESIS code. adapter-ported, revision 2: the adapter port
+/// persists the native canonical snapshot under the host-KV encoding — a
+/// state-schema break from the native module's root, fenced by the
+/// recovery/state-sync preflight. same boot-time code reconciliation story as
+/// [`genesis_hello_wasm`].
 fn genesis_inbox_wasm() -> WasmModule {
     WasmModule::from_bytes(INBOX_MODULE_ID, INBOX_WASM_COMPONENT)
         .expect("embedded inbox component loads")
         .with_state_schema_revision(2)
 }
 
+/// the merged `tasks` work module (task board + job board): revision 3, the
+/// merge that folded the former `jobs` module into this one.
 fn genesis_tasks_wasm() -> WasmModule {
     WasmModule::from_bytes(TASKS_MODULE_ID, TASKS_WASM_COMPONENT)
         .expect("embedded tasks component loads")
-        .with_state_schema_revision(2)
+        .with_state_schema_revision(3)
 }
 
 /// tagging / capability at their GENESIS code (adapter-ported,
-/// revision 2 — see [`genesis_jobs_wasm`]).
+/// revision 2 — see [`genesis_inbox_wasm`]).
 fn genesis_tagging_wasm() -> WasmModule {
     WasmModule::from_bytes(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT)
         .expect("embedded tagging component loads")
@@ -502,7 +491,6 @@ struct ProductionModules {
     gateway: WasmModule,
     inbox: WasmModule,
     files: Files,
-    jobs: WasmModule,
     agent: WasmModule,
     runs: WasmModule,
     directory: WasmModule,
@@ -531,7 +519,6 @@ impl ProductionModules {
             Box::new(self.gateway),
             Box::new(self.inbox),
             Box::new(self.files),
-            Box::new(self.jobs),
             Box::new(self.agent),
             Box::new(self.runs),
             Box::new(self.directory),
@@ -636,7 +623,6 @@ pub(super) async fn genesis_host(
         // ops so a notification commits atomically with the causing event (P2).
         inbox: genesis_inbox_wasm(),
         files: Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open"),
-        jobs: genesis_jobs_wasm(),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
         // adapter-ported; the saga dead-letter + runs hook ids are compiled
@@ -645,7 +631,7 @@ pub(super) async fn genesis_host(
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
         // adapter-ported; the whole production wiring (chat/saga/tagging/
-        // dispatch/agent/tasks/jobs + the files/forge/pages builder chain) is
+        // dispatch/agent/tasks + the files/forge/pages builder chain) is
         // compiled into the guest.
         runs: genesis_runs_wasm(),
         // the first real wasm tenant: bytes-compatible with the retired native
@@ -792,11 +778,6 @@ pub(super) async fn restore_host(
     let files =
         Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
 
-    let mut jobs = genesis_jobs_wasm();
-    let (bytes, root) = snapshot_of(JOBS_MODULE_ID)?;
-    jobs.install(bytes, root)
-        .map_err(|e| format!("jobs install: {e}"))?;
-
     let mut agent = genesis_agent_wasm();
     let (bytes, root) = snapshot_of(AGENT_MODULE_ID)?;
     agent
@@ -839,7 +820,6 @@ pub(super) async fn restore_host(
         gateway,
         inbox,
         files,
-        jobs,
         agent,
         runs,
         directory,
@@ -1112,11 +1092,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     .await
     .map_err(|e| format!("files sync: {e}"))?;
 
-    let (bytes, root) = snapshot_of(JOBS_MODULE_ID).await?;
-    let mut jobs = genesis_jobs_wasm();
-    jobs.install(&bytes, root)
-        .map_err(|e| format!("jobs install: {e}"))?;
-
     let (bytes, root) = snapshot_of(AGENT_MODULE_ID).await?;
     let mut agent = genesis_agent_wasm();
     agent
@@ -1164,7 +1139,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         gateway,
         inbox,
         files,
-        jobs,
         agent,
         runs,
         directory,

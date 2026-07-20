@@ -366,22 +366,25 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
 fn the_jobs_authorization_matrix_gates_every_transition() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    // the job board now lives in the merged `tasks` module; ops ride the
+    // WorkMsg envelope's `job` arm.
+    let job = |op: serde_json::Value| serde_json::json!({ "job": op });
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } }),
+        "tasks",
+        job(serde_json::json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } })),
         Some("poster"),
     );
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } }),
+        "tasks",
+        job(serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } })),
         Some("worker-a"),
     );
 
     // finalize and release are the claimant's alone: a stranger is refused by
     // identity, not by state — the job IS processing.
     let error = sim.submit_rejected(
-        "jobs",
-        serde_json::json!({ "finalize": { "job_id": "j1", "ok": true, "payload": "" } }),
+        "tasks",
+        job(serde_json::json!({ "finalize": { "job_id": "j1", "ok": true, "payload": "" } })),
         Some("intruder"),
     );
     assert!(
@@ -389,8 +392,8 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
         "finalize gate: {error}"
     );
     let error = sim.submit_rejected(
-        "jobs",
-        serde_json::json!({ "release": { "job_id": "j1" } }),
+        "tasks",
+        job(serde_json::json!({ "release": { "job_id": "j1" } })),
         Some("intruder"),
     );
     assert!(
@@ -401,13 +404,13 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
     // release it back to pending so the CANCEL test hits the submitter gate, not
     // the pending-only status guard.
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "release": { "job_id": "j1" } }),
+        "tasks",
+        job(serde_json::json!({ "release": { "job_id": "j1" } })),
         Some("worker-a"),
     );
     let error = sim.submit_rejected(
-        "jobs",
-        serde_json::json!({ "cancel": { "job_id": "j1" } }),
+        "tasks",
+        job(serde_json::json!({ "cancel": { "job_id": "j1" } })),
         Some("worker-a"),
     );
     assert!(
@@ -418,8 +421,8 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
     // prune only applies to terminal jobs: j1 is pending, so even its own
     // submitter is refused by the status guard.
     let error = sim.submit_rejected(
-        "jobs",
-        serde_json::json!({ "prune": { "job_id": "j1" } }),
+        "tasks",
+        job(serde_json::json!({ "prune": { "job_id": "j1" } })),
         Some("poster"),
     );
     assert!(
@@ -434,26 +437,30 @@ fn the_jobs_authorization_matrix_gates_every_transition() {
 fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
+    // the job board now lives in the merged `tasks` module; ops and the `get`
+    // query ride the WorkMsg/WorkQuery envelope's `job` arm, and the reply is a
+    // WorkReply::Job wrapping a JobsReply::Job (hence the doubled `["job"]`).
+    let job = |op: serde_json::Value| serde_json::json!({ "job": op });
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } }),
+        "tasks",
+        job(serde_json::json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } })),
         Some("poster"),
     );
 
-    let claim = serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } });
-    let reclaim = serde_json::json!({ "reclaim": { "job_id": "j1" } });
+    let claim = job(serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } }));
+    let reclaim = job(serde_json::json!({ "reclaim": { "job_id": "j1" } }));
     let mut fill: u64 = 0;
 
     // walk claim/expiry cycles. each claim bumps `attempt`; the LOGICAL clock is
     // the lease clock, so inbox filler blocks age the lease past its deadline.
     // claims 1..MAX requeue on expiry; the MAX-th claim's expiry fails the job.
-    for attempt in 1..=jobs::MAX_ATTEMPTS {
-        let claimed_at = sim.submit_ok("jobs", claim.clone(), Some("worker"))["height"]
+    for attempt in 1..=tasks::MAX_ATTEMPTS {
+        let claimed_at = sim.submit_ok("tasks", claim.clone(), Some("worker"))["height"]
             .as_u64()
             .expect("claim height");
         // lease_views clamps to MIN_LEASE_VIEWS (10), so deadline = claim + 10;
         // the reclaim must execute at a height strictly past it.
-        let deadline = claimed_at + jobs::MIN_LEASE_VIEWS;
+        let deadline = claimed_at + tasks::MIN_LEASE_VIEWS;
         while sim.status()["height"].as_u64().expect("height") < deadline {
             sim.submit_ok(
                 "inbox",
@@ -462,27 +469,28 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
             );
             fill += 1;
         }
-        sim.submit_ok("jobs", reclaim.clone(), Some("scavenger"));
+        sim.submit_ok("tasks", reclaim.clone(), Some("scavenger"));
 
-        let job = sim.query("jobs", serde_json::json!({ "get": { "job_id": "j1" } }));
+        let reply = sim.query("tasks", job(serde_json::json!({ "get": { "job_id": "j1" } })));
+        let job_view = &reply["job"];
         assert_eq!(
-            job["job"]["attempt"].as_u64(),
+            job_view["job"]["attempt"].as_u64(),
             Some(attempt),
-            "attempt tracks the claim count: {job}"
+            "attempt tracks the claim count: {reply}"
         );
-        if attempt < jobs::MAX_ATTEMPTS {
+        if attempt < tasks::MAX_ATTEMPTS {
             assert_eq!(
-                job["job"]["status"], "pending",
-                "an expired reclaim below the ceiling requeues: {job}"
+                job_view["job"]["status"], "pending",
+                "an expired reclaim below the ceiling requeues: {reply}"
             );
         } else {
             assert_eq!(
-                job["job"]["status"], "failed",
-                "the ceiling-th expired reclaim fails the job: {job}"
+                job_view["job"]["status"], "failed",
+                "the ceiling-th expired reclaim fails the job: {reply}"
             );
             assert_eq!(
-                job["job"]["result"]["payload"], "attempts exhausted",
-                "the failure carries the ceiling reason: {job}"
+                job_view["job"]["result"]["payload"], "attempts exhausted",
+                "the failure carries the ceiling reason: {reply}"
             );
         }
     }

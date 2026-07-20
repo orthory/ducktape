@@ -40,7 +40,6 @@ directory = { workspace = true }
 # (root-continuous cutover — revision stays 1).
 pages = { workspace = true }
 chat = { workspace = true }
-jobs = { workspace = true }
 inbox = { workspace = true }
 tasks = { workspace = true }
 tagging = { workspace = true }

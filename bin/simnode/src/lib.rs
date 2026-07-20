@@ -66,7 +66,7 @@
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
 //! separated, and repeatable) appends the kv/valset/governance/upgrade system
-//! modules AFTER the default 16, seeding the validator set with the given
+//! modules AFTER the default 15, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
 //! binding governance verifies invite tokens against. registering the upgrade
@@ -133,7 +133,6 @@ use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::{AppliedOp, BlockOps, IndexStore};
-use jobs::Jobs;
 use kv::Kv;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
@@ -161,7 +160,6 @@ const BASE_MODULE_IDS: [&str; 15] = [
     "tasks",
     "inbox",
     "automations",
-    "jobs",
     "agent",
     "runs",
     "pages",
@@ -346,7 +344,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 16-module set, byte-identical.
+    /// => the default 15-module set, byte-identical.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -739,7 +737,7 @@ struct Sim {
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
     /// the registered module ids, in registry order — the exact set `status`
-    /// reports (the default 16, or those plus VALSET_MODULE_IDS under the flag).
+    /// reports (the default 15, or those plus VALSET_MODULE_IDS under the flag).
     module_ids: Vec<&'static str>,
     /// the fabricated mesh identity `status` reports (`--node-key`), or empty
     /// for the default "no peer-routed features here". no mesh sits behind it.
@@ -788,7 +786,6 @@ fn run_sim(
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
             "runs",
@@ -798,7 +795,7 @@ fn run_sim(
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2) — mandatory for envelope composition.
@@ -825,7 +822,6 @@ fn run_sim(
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
-            Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(pages),
@@ -834,7 +830,7 @@ fn run_sim(
             Box::new(identity),
             Box::new(gateway),
         ];
-        // opt-in governance genesis, AFTER the default 16 in registry order:
+        // opt-in governance genesis, AFTER the default 15 in registry order:
         // kv, valset (seeded with the given genesis validators exactly like
         // bin/node), governance (the sole authorized author of valset change,
         // bound to the invite namespace), and the lifecycle coordinator — whose

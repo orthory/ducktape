@@ -40,7 +40,6 @@ use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
-use jobs::Jobs;
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
@@ -63,7 +62,6 @@ const MODULE_IDS: [&str; 15] = [
     "tasks",
     "inbox",
     "automations",
-    "jobs",
     "agent",
     "runs",
     "pages",
@@ -259,7 +257,6 @@ fn run_node(
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
             "runs",
@@ -269,7 +266,7 @@ fn run_node(
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2). its presence is what selects the v3 composer; unwired,
@@ -314,7 +311,6 @@ fn run_node(
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
-            Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(pages),

@@ -13,7 +13,8 @@ use host::{BlockContext, Host};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use tasks::Tasks;
 use tasks::{
-    TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
+    TaskQuery, TaskReply, decode_task_reply as tasks_decode_reply,
+    encode_task_query as tasks_encode_query,
 };
 
 const AUTO: &str = "automations";
@@ -230,7 +231,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
             },
             Msg {
                 target: TASKS.into(),
-                payload: tasks::encode_msg(&tasks::TaskMsg::CreateTask {
+                payload: tasks::encode_task_msg(&tasks::TaskMsg::CreateTask {
                     task_id: "auto-general-5".into(),
                     title: "squatted".into(),
                 }),

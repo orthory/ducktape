@@ -85,7 +85,8 @@ const TAGGING_ID: &str = "tagging";
 const DISPATCH_ID: &str = "dispatch";
 const AGENT_ID: &str = "agent";
 const TASKS_ID: &str = "tasks";
-const JOBS_ID: &str = "jobs";
+// the job board merged into the `tasks` work module: both roles resolve here.
+const JOBS_ID: &str = "tasks";
 const FILES_ID: &str = "files";
 const FORGE_ID: &str = "forge";
 const PAGES_ID: &str = "pages";

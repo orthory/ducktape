@@ -440,7 +440,7 @@ impl ModuleCategory {
         match id {
             "chat" | "tasks" | "inbox" | "pages" => Self::Workspace,
             "forge" | "agent" => Self::Developer,
-            "automations" | "jobs" => Self::Automation,
+            "automations" => Self::Automation,
             _ => Self::System,
         }
     }
@@ -1008,7 +1008,7 @@ mod tests {
         for id in ["forge", "agent"] {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
-        for id in ["automations", "jobs"] {
+        for id in ["automations"] {
             assert_eq!(ModuleCategory::of(id), Automation, "{id}");
         }
         // infra + internals fall to the System bucket — including ids only the

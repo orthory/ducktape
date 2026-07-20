@@ -1,197 +1,99 @@
-//! deterministic in-memory task module.
+//! the `tasks` work module -- ONE consensus module hosting TWO boards:
 //!
-//! the first task slice is intentionally state-based rather than qmdb-backed:
-//! the API needs ordered list/query semantics and a small canonical state. the
-//! module stages writes during `execute`, publishes them only at
-//! `commit_block`, and computes `root()` from committed `BTreeMap` contents.
-//! `snapshot`/`install` use the exact canonical byte stream that `root()` hashes
-//! so a joiner can verify a peer-provided image before mutating local state.
+//! * a **task board** (assigned-list kind): ordered human task lists, and
+//! * a **job board** (first-claim kind): a consensus-native work board where
+//!   exactly one worker claim wins by consensus order.
+//!
+//! both are intentionally state-based rather than qmdb-backed: each needs
+//! ordered list/query semantics over a small canonical state. each board stages
+//! writes during `execute`, publishes them only at `commit_block`, and the
+//! module `root()` hashes the concatenation of the two boards' committed
+//! canonical byte streams. `snapshot`/`install` use that exact stream so a
+//! joiner can verify a peer-provided image before mutating local state.
+//!
+//! ops and queries ride ONE wire envelope ([`WorkMsg`]/[`WorkQuery`]): the
+//! module's single `execute`/`query` decodes the envelope and routes to the
+//! matching board. see `interface` for the wire surface.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the derived-tier materialized view; registered only by serving binaries.
-// native-only: `indexer` drags unix-only IO, and the index is node-local
-// derived state — the wasm guest (`tasks-wasm`) builds without it.
+
+mod job_board;
+mod task_board;
+
+use job_board::JobBoard;
+use task_board::TaskBoard;
+
+// re-export the job board's public caps so external callers keep referring to
+// `tasks::MAX_PAYLOAD` etc.
+pub use job_board::{
+    MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_LIST_LIMIT, MAX_PAYLOAD,
+    MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
+};
+
+// the derived-tier materialized view over the task board; registered only by
+// serving binaries. native-only: `indexer` drags unix-only IO, and the index is
+// node-local derived state -- the wasm guest (`tasks-wasm`) builds without it.
 #[cfg(feature = "native")]
 pub mod index;
 
-use std::collections::BTreeMap;
-
-use sdk::codec::{self, Cursor};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, require_non_empty};
+use sdk::codec::Cursor;
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
 
 pub struct Tasks {
     id: ModuleId,
-    tasks: BTreeMap<String, Task>,
-    pending: BTreeMap<String, Task>,
+    tasks: TaskBoard,
+    jobs: JobBoard,
 }
 
 impl Tasks {
     pub fn new(id: impl Into<ModuleId>) -> Self {
         Self {
             id: id.into(),
-            tasks: BTreeMap::new(),
-            pending: BTreeMap::new(),
+            tasks: TaskBoard::new(),
+            jobs: JobBoard::new(),
         }
     }
 
-    fn get(&self, task_id: &str) -> Option<&Task> {
-        self.pending
-            .get(task_id)
-            .or_else(|| self.tasks.get(task_id))
-    }
-
-    fn list(&self) -> Vec<Task> {
-        let mut merged = self.tasks.clone();
-        for (id, task) in &self.pending {
-            merged.insert(id.clone(), task.clone());
-        }
-        merged.into_values().collect()
-    }
-
-    fn stage_create(
-        &mut self,
-        task_id: String,
-        title: String,
-        consensus_time: u64,
-    ) -> Result<(), Error> {
-        require_non_empty("task_id", &task_id)?;
-        require_non_empty("title", &title)?;
-        if self.get(&task_id).is_some() {
-            return Err(Error::Module(format!("task already exists: {task_id}")));
-        }
-
-        self.pending.insert(
-            task_id.clone(),
-            Task {
-                id: task_id,
-                title,
-                status: TaskStatus::Open,
-                created_at: consensus_time,
-                updated_at: consensus_time,
-            },
-        );
-        Ok(())
-    }
-
-    fn stage_status(
-        &mut self,
-        task_id: String,
-        status: TaskStatus,
-        consensus_time: u64,
-    ) -> Result<(), Error> {
-        require_non_empty("task_id", &task_id)?;
-        let mut task = self
-            .get(&task_id)
-            .cloned()
-            .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
-        if task.status == status {
-            return Ok(());
-        }
-
-        task.status = status;
-        task.updated_at = consensus_time;
-        self.pending.insert(task_id, task);
-        Ok(())
-    }
-
-    fn root_of(tasks: &BTreeMap<String, Task>) -> StateRoot {
-        let mut h = Sha256::new();
-        h.update(Self::encode_tasks(tasks));
-        StateRoot(h.finalize().into())
-    }
-
-    fn encode_tasks(tasks: &BTreeMap<String, Task>) -> Vec<u8> {
+    /// the canonical committed encoding: the task board's bytes followed by the
+    /// job board's bytes. this is the exact `root()` preimage AND the snapshot.
+    fn encode_state(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&(tasks.len() as u64).to_le_bytes());
-        for task in tasks.values() {
-            codec::push_str(&mut out, &task.id);
-            codec::push_str(&mut out, &task.title);
-            out.push(status_byte(&task.status));
-            out.extend_from_slice(&task.created_at.to_le_bytes());
-            out.extend_from_slice(&task.updated_at.to_le_bytes());
-        }
+        self.tasks.encode_committed(&mut out);
+        self.jobs.encode_committed(&mut out);
         out
     }
 
+    fn root_of(bytes: &[u8]) -> StateRoot {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        StateRoot(h.finalize().into())
+    }
+
     pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_tasks(&self.tasks)
+        self.encode_state()
     }
 
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let tasks = decode_snapshot(bytes)?;
-        if Self::root_of(&tasks) != expected {
+        let mut c = Cursor::new(bytes);
+        let tasks = TaskBoard::decode_from(&mut c)?;
+        let jobs = JobBoard::decode_from(&mut c)?;
+        c.finish("work snapshot")?;
+
+        // recompute the combined root over the two boards' committed bytes and
+        // reject any image that does not hash to the expected root.
+        let mut encoded = Vec::new();
+        tasks.encode_committed(&mut encoded);
+        jobs.encode_committed(&mut encoded);
+        if Self::root_of(&encoded) != expected {
             return Err(Error::Module("snapshot root mismatch".into()));
         }
         self.tasks = tasks;
-        self.pending.clear();
+        self.jobs = jobs;
         Ok(())
     }
-}
-
-fn status_byte(status: &TaskStatus) -> u8 {
-    match status {
-        TaskStatus::Open => 0,
-        TaskStatus::InProgress => 1,
-        TaskStatus::Done => 2,
-    }
-}
-
-fn status_from_byte(value: u8) -> Result<TaskStatus, Error> {
-    match value {
-        0 => Ok(TaskStatus::Open),
-        1 => Ok(TaskStatus::InProgress),
-        2 => Ok(TaskStatus::Done),
-        _ => Err(Error::Module("snapshot has invalid task status".into())),
-    }
-}
-
-fn decode_snapshot(bytes: &[u8]) -> Result<BTreeMap<String, Task>, Error> {
-    let mut c = Cursor::new(bytes);
-    let count = c.u64("snapshot task count")?;
-    // each task costs at least 33 bytes (two length prefixes, the status byte,
-    // two u64 stamps), bounding a forged count before the loop.
-    c.bound(count, 33, "snapshot task count")?;
-
-    let mut tasks: BTreeMap<String, Task> = BTreeMap::new();
-    for _ in 0..count {
-        let id = c.string("snapshot task_id")?;
-        let title = c.string("snapshot title")?;
-        let status = status_from_byte(c.byte("snapshot status")?)?;
-        let created_at = c.u64("snapshot created_at")?;
-        let updated_at = c.u64("snapshot updated_at")?;
-
-        require_non_empty("task_id", &id)?;
-        require_non_empty("title", &title)?;
-        // no updated_at >= created_at check: `stage_status` stamps updated_at
-        // with the block's consensus_time unconditionally and NOTHING guarantees
-        // cross-block monotonicity, so a legitimately committed state can hold
-        // updated_at < created_at. install must accept every execute-reachable
-        // state — the root comparison is the integrity check.
-        if tasks
-            .last_key_value()
-            .is_some_and(|(last, _)| last.as_str() >= id.as_str())
-        {
-            return Err(Error::Module(
-                "snapshot task ids not strictly ascending".into(),
-            ));
-        }
-
-        tasks.insert(
-            id.clone(),
-            Task {
-                id,
-                title,
-                status,
-                created_at,
-                updated_at,
-            },
-        );
-    }
-    c.finish("tasks snapshot")?;
-    Ok(tasks)
 }
 
 #[async_trait::async_trait(?Send)]
@@ -201,43 +103,47 @@ impl Module for Tasks {
     }
 
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.tasks)
+        Self::root_of(&self.encode_state())
     }
 
-    /// advertise the snapshot lane: [`Tasks::snapshot`] is the exact preimage
-    /// of `root()`, and [`Tasks::install`] verifies before adopting — without
-    /// this override, sync orchestration saw `Unsupported` and a joiner could
-    /// not rebuild the module at all.
+    /// advertise the snapshot lane: [`Tasks::snapshot`] is the exact preimage of
+    /// `root()`, and [`Tasks::install`] verifies before adopting -- without this
+    /// override, sync orchestration saw `Unsupported` and a joiner could not
+    /// rebuild the module at all.
     fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, Error> {
         Ok(sdk::StateSyncHandle::SnapshotBytes(self.snapshot()))
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        match decode_msg(&msg.payload).map_err(Error::Module)? {
-            TaskMsg::CreateTask { task_id, title } => {
-                self.stage_create(task_id, title, ctx.env().consensus_time)
-            }
-            TaskMsg::UpdateStatus { task_id, status } => {
-                self.stage_status(task_id, status, ctx.env().consensus_time)
+        match decode_work_msg(&msg.payload).map_err(Error::Module)? {
+            WorkMsg::Task(task_msg) => self.tasks.execute(task_msg, ctx.env().consensus_time),
+            WorkMsg::Job(job_msg) => {
+                let id = self.id.clone();
+                self.jobs.execute(ctx, job_msg, &id).await
             }
         }
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
-            TaskQuery::List => Ok(encode_reply(&TaskReply::Tasks(self.list()))),
+        match decode_work_query(req).map_err(Error::Module)? {
+            WorkQuery::Task(TaskQuery::List) => {
+                Ok(encode_work_reply(&WorkReply::Task(self.tasks.query_list())))
+            }
+            WorkQuery::Job(job_query) => Ok(encode_work_reply(&WorkReply::Job(
+                self.jobs.query(job_query),
+            ))),
         }
     }
 
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, task) in std::mem::take(&mut self.pending) {
-            self.tasks.insert(id, task);
-        }
+        self.tasks.commit();
+        self.jobs.commit();
         Ok(())
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
+        self.tasks.abort();
+        self.jobs.abort();
         Ok(())
     }
 }

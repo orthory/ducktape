@@ -5,7 +5,8 @@ use sdk::{
 };
 use tasks::Tasks;
 use tasks::{
-    TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_reply, encode_msg, encode_query,
+    TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_task_reply as decode_reply,
+    encode_task_msg as encode_msg, encode_task_query as encode_query,
 };
 
 const TASKS: &str = "tasks";

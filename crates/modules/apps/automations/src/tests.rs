@@ -31,7 +31,7 @@ use futures::executor::block_on;
 use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
 use sdk::{Env, Event};
 use tasks::{
-    Task, TaskStatus, decode_msg as tasks_decode_msg, encode_reply as tasks_encode_reply,
+    Task, TaskStatus, decode_task_msg as tasks_decode_msg, encode_task_reply as tasks_encode_reply,
 };
 
 const CHAT: &str = "chat";

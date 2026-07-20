@@ -12,7 +12,9 @@
 //! in `vaults-wasm` (the first adapter tenant) and `guest-adapter`; tasks is
 //! the same shape: a pure `SnapshotBytes` module whose canonical snapshot is
 //! persisted as ONE host-KV value per dispatch. that host-KV encoding is a
-//! STATE-SCHEMA BREAK versus the native root (revision 2; beta networks
+//! STATE-SCHEMA BREAK versus the native root (revision 3 — the tasks+jobs merge
+//! folded the former `jobs` module's job board into this one, so the canonical
+//! snapshot is now the task board and job board concatenated; beta networks
 //! re-genesis, no back-compat shim).
 
 use guest_adapter::{block_on, host, load_state, save_state, Guest, WitCtx};

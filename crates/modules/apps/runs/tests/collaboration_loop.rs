@@ -42,10 +42,9 @@ use dispatch::{
     encode_query as dispatch_encode_query,
 };
 use host::{BlockContext, Host};
-use jobs::Jobs;
-use jobs::{
-    Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_reply as jobs_decode_reply,
-    encode_msg as jobs_encode_msg, encode_query as jobs_encode_query,
+use tasks::{
+    Job, JobStatus, JobsMsg, JobsQuery, JobsReply, decode_job_reply as jobs_decode_reply,
+    encode_job_msg as jobs_encode_msg, encode_job_query as jobs_encode_query,
 };
 use saga::SagaModule;
 use saga::{
@@ -56,7 +55,8 @@ use sdk::{Event, Msg, Origin, StateRoot};
 use tagging::TaggingModule;
 use tasks::Tasks;
 use tasks::{
-    TaskQuery, TaskReply, decode_reply as tasks_decode_reply, encode_query as tasks_encode_query,
+    TaskQuery, TaskReply, decode_task_reply as tasks_decode_reply,
+    encode_task_query as tasks_encode_query,
 };
 
 /// the minimal host-assembled runner-result wrapper the oracle now ALWAYS
@@ -259,10 +259,9 @@ async fn genesis(context: deterministic::Context) -> Host {
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )),
         Box::new(Tasks::new("tasks")),
-        Box::new(Jobs::new("jobs")),
     ])
     .expect("genesis")
 }
@@ -357,7 +356,7 @@ async fn task_ids(host: &Host) -> Vec<String> {
 async fn job_view(host: &Host, job_id: &str) -> Option<Job> {
     let reply = host
         .query(
-            "jobs",
+            "tasks",
             &jobs_encode_query(&JobsQuery::Get {
                 job_id: job_id.into(),
             }),
@@ -372,7 +371,7 @@ async fn job_view(host: &Host, job_id: &str) -> Option<Job> {
 
 fn jobs_msg(payload: JobsMsg) -> Msg {
     Msg {
-        target: "jobs".into(),
+        target: "tasks".into(),
         payload: jobs_encode_msg(&payload),
     }
 }

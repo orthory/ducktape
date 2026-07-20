@@ -93,8 +93,8 @@ use sdk::codec::{self, Cursor};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, require_non_empty};
 use sha2::{Digest, Sha256};
 use tasks::{
-    TaskMsg, TaskQuery, TaskReply, decode_reply as tasks_decode_reply,
-    encode_msg as tasks_encode_msg, encode_query as tasks_encode_query,
+    TaskMsg, TaskQuery, TaskReply, decode_task_reply as tasks_decode_reply,
+    encode_task_msg as tasks_encode_msg, encode_task_query as tasks_encode_query,
 };
 
 /// max rules retained. registering beyond this is rejected at execute.

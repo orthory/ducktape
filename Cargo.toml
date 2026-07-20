@@ -77,13 +77,12 @@ members = [
     "crates/modules/apps/pages",
     "crates/modules/apps/chat",
     "crates/modules/apps/agent",
-    "crates/modules/apps/runs", 
-    "crates/modules/apps/tasks", 
-    "crates/modules/apps/vaults", 
-    "crates/modules/apps/automations", 
-    "crates/modules/apps/inbox", 
+    "crates/modules/apps/runs",
+    "crates/modules/apps/tasks",
+    "crates/modules/apps/vaults",
+    "crates/modules/apps/automations",
+    "crates/modules/apps/inbox",
     "crates/modules/apps/files",
-    "crates/modules/apps/jobs",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # bin — runnable binaries
@@ -226,7 +225,6 @@ files = { path = "crates/modules/apps/files" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
-jobs = { path = "crates/modules/apps/jobs" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)

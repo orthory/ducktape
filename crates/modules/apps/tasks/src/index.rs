@@ -24,7 +24,10 @@ use indexer::{
     ViewReader,
 };
 use serde::{Deserialize, Serialize};
-use crate::{TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_msg, decode_reply, encode_query};
+use crate::{
+    TaskMsg, TaskQuery, TaskReply, TaskStatus, WorkMsg, decode_task_reply, decode_work_msg,
+    encode_task_query,
+};
 
 /// default and max page size for by-status listing.
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -141,7 +144,13 @@ impl ModuleIndexer for TasksIndex {
         payload: &[u8],
         out: &mut Derived,
     ) -> Result<()> {
-        match decode_msg(payload).map_err(Error::Mapper)? {
+        // the "tasks" module now hosts a job board too; its ops share this op
+        // stream. the task index materializes only task-board ops -- a job op
+        // is a deterministic skip, exactly as jobs carried no index before.
+        let WorkMsg::Task(msg) = decode_work_msg(payload).map_err(Error::Mapper)? else {
+            return Ok(());
+        };
+        match msg {
             TaskMsg::CreateTask { task_id, title } => put_row(
                 out,
                 &TaskRow {
@@ -225,8 +234,8 @@ impl ModuleIndexer for TasksIndex {
         meta: &RebuildMeta,
         out: &mut Backfill<'_>,
     ) -> Result<()> {
-        let reply = state.query(&encode_query(&TaskQuery::List)).await?;
-        let TaskReply::Tasks(tasks) = decode_reply(&reply).map_err(Error::State)?;
+        let reply = state.query(&encode_task_query(&TaskQuery::List)).await?;
+        let TaskReply::Tasks(tasks) = decode_task_reply(&reply).map_err(Error::State)?;
         for task in tasks {
             let row = TaskRow {
                 task_id: task.id,
@@ -250,7 +259,7 @@ impl ModuleIndexer for TasksIndex {
 mod tests {
     use super::*;
     use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
-    use crate::encode_msg;
+    use crate::encode_task_msg;
 
     fn store(dir: &std::path::Path) -> IndexStore {
         IndexStore::open(dir, &["tasks"])
@@ -262,7 +271,7 @@ mod tests {
         AppliedOp {
             module: "tasks".into(),
             origin: OriginTag::external("jess"),
-            payload: encode_msg(msg),
+            payload: encode_task_msg(msg),
         }
     }
 
@@ -391,12 +400,10 @@ mod tests {
     impl indexer::StateReader for CanonicalTasks {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
             assert!(matches!(
-                crate::decode_query(req),
+                crate::decode_task_query(req),
                 Ok(TaskQuery::List)
             ));
-            Ok(crate::encode_reply(&TaskReply::Tasks(
-                self.0.clone(),
-            )))
+            Ok(crate::encode_task_reply(&TaskReply::Tasks(self.0.clone())))
         }
     }
 
