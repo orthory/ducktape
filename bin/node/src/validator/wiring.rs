@@ -62,6 +62,10 @@ pub(super) struct RuntimeWiring {
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
+    /// unix seconds of the last served state-sync request — the drain reads it
+    /// to defer oplog pruning while a syncer is actively pulling (the sync
+    /// retention lease, see sync/serve.rs).
+    pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
 }
 
@@ -260,8 +264,10 @@ pub(super) async fn finish(
         blob_requester,
         blob_proof,
     );
+    let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let state_tx = sync_state_tx;
+        let sync_lease_serve = sync_lease.clone();
         let mut sync_tx = sync_tx;
         let mut ingress = sync_ingress;
         let blob_pending = blob_pending.clone();
@@ -416,7 +422,16 @@ pub(super) async fn finish(
                             offset,
                             len,
                         } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
-                        req => drive_sync_request(&mut server, &state_tx, req).await,
+                        req => {
+                            // renew the sync retention lease: this node is
+                            // actively serving a syncer, so the drain defers
+                            // oplog pruning until the lease lapses.
+                            sync_lease_serve.store(
+                                crate::sync::serve::unix_now_secs(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            drive_sync_request(&mut server, &state_tx, req).await
+                        }
                     };
                     let framed = statesync::encode_rpc_authed(
                         &[0u8; 32],
@@ -469,6 +484,7 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_lease,
         relay_ingress,
     }
 }

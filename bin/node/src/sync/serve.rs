@@ -297,6 +297,27 @@ where
     pos
 }
 
+/// how long after the last served state-sync request the source keeps
+/// deferring oplog pruning (sliding — every request renews it). generous vs
+/// the 32-block checkpoint cadence so one slow module fetch cannot lose the
+/// race; bounded so a dead syncer cannot wedge retention forever. this is the
+/// anti-treadmill: without it a busy chain prunes a slow syncer's boundary out
+/// from under it on every attempt, and a rebootstrapping replica can NEVER
+/// converge (observed: boundary 297→318→340→… forever).
+pub(crate) const SYNC_LEASE_SECS: u64 = 60;
+
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub(crate) fn sync_lease_active(lease: &std::sync::atomic::AtomicU64) -> bool {
+    let last_served = lease.load(std::sync::atomic::Ordering::Relaxed);
+    unix_now_secs().saturating_sub(last_served) < SYNC_LEASE_SECS
+}
+
 pub(crate) fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
     match disposition {
         statesync::FrameDisposition::Applied => node::Disposition::Applied,

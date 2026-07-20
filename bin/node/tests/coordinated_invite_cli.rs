@@ -10,6 +10,15 @@ use wireguard::{
     Transport, ValidatorIdentity, X25519PublicKey,
 };
 
+/// serialize this binary's tests: every one that reaches `join` or spawns a
+/// node touches real sockets (including init's default WireGuard listen), and
+/// two ceremonies in flight collide on ports.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn command_output(out: &std::process::Output) -> String {
     format!(
         "stdout:\n{}\nstderr:\n{}",
@@ -149,6 +158,7 @@ fn run_node_until_exit(
 
 #[test]
 fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
@@ -169,11 +179,10 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
         command_output(&init)
     );
 
-    let target = keygen(&friend);
+    keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
-        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -226,6 +235,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
 /// `invite-fronts.json` — the joiner's own record of the paths it will race.
 #[test]
 fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
@@ -265,11 +275,10 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     reachability::store::save(&storage.join("mesh-state.json"), &mesh)
         .expect("seed mesh-state.json");
 
-    let target = keygen(&friend);
+    keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
-        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -323,6 +332,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
 /// and never a silent success.
 #[test]
 fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
@@ -345,11 +355,10 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
 
     // a default founder advertises the overlay ULA (not a routable host), so its
     // WireGuard bootstrap is coordinated-only — no underlay endpoint baked in.
-    let target = keygen(&friend);
+    keygen(&friend);
     let invite = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
-        .args(["--target", &target])
         .output()
         .expect("run invite");
     assert!(
@@ -414,6 +423,7 @@ fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
 /// hand).
 #[test]
 fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let founder = dir.path().join("founder");
 
@@ -538,6 +548,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
 /// stays up.
 #[test]
 fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
+    let _serial = serial();
     let dir = tempfile::tempdir().expect("tempdir");
     let founder = dir.path().join("founder");
 

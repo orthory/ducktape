@@ -523,6 +523,6 @@ fn reachability_plane_converges_mesh_on_boot() {
     cluster.spawn(1);
     for i in 0..2 {
         cluster.wait_marker(i, "mesh verified", Duration::from_secs(60));
-        cluster.wait_marker(i, "tunnel config staged on", Duration::from_secs(60));
+        cluster.wait_marker(i, "tunnels applied (config accepted", Duration::from_secs(60));
     }
 }

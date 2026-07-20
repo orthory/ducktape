@@ -192,6 +192,7 @@ pub(crate) async fn run_validator(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_lease,
         relay_ingress,
     } = wiring::finish(
         &context,
@@ -340,6 +341,7 @@ pub(crate) async fn run_validator(
         validators,
         dev_demo,
         checkpoint_blocks,
+        sync_lease,
         announce_capabilities,
         sandbox,
         sandbox_capacity,

@@ -32,9 +32,10 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
 
-    // the joiner's announce reaches the founder, which redeems it — NO verb
-    // runs anywhere in this window.
-    cluster.wait_marker(1, "invite announce sent to member", Duration::from_secs(90));
+    // the joiner reaches the founder on its own (Join v2 first contact or the
+    // announce fallback), and the founder redeems it — NO verb runs anywhere
+    // in this window.
+    cluster.wait_admitted(1, Duration::from_secs(90));
     cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
 
     // the redemption lands in consensus state: the friend holds RESIDENT
@@ -107,26 +108,27 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     });
 
     // second redeemer: the SAME blob under a FRESH identity — the shared-blob
-    // mistake. every invite is now TARGETED, so `join` refuses the mismatched
-    // local key at the CLI, loudly, BEFORE any node spawns. (the spent-nonce
-    // lobby path this test used to drive is now unreachable — a non-target key
-    // can never announce; the nonce single-use invariant is covered by the
-    // governance redemption rig.)
+    // mistake. a bearer invite (Join v2) mints the workspace locally without
+    // complaint — there is no targeted key for the CLI to check — and the
+    // single-use invariant lands TERMINALLY at first contact: the founder's
+    // gate sees the spent nonce and refuses permanently, and the joiner stops
+    // loudly instead of parking forever.
     cluster.kill(1);
     std::fs::remove_dir_all(&cluster.friend_dir).expect("wipe first redeemer");
     let out = cluster.try_join_friend(&invite);
     assert!(
-        !out.status.success(),
-        "a mismatched-target join must fail loudly at the CLI, not park a node"
+        out.status.success(),
+        "a bearer join mints the workspace locally; the refusal is at first contact:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("locked to a different key"),
-        "the join names the real problem: {stderr}"
+    cluster.spawn(1);
+    cluster.wait_marker(
+        0,
+        "ALREADY-REDEEMED invite",
+        std::time::Duration::from_secs(90),
     );
-    assert!(
-        stderr.contains("fresh invite"),
-        "the refusal carries actionable guidance (ask for a fresh invite): {stderr}"
-    );
+    cluster.wait_marker(1, "join gate refused", std::time::Duration::from_secs(90));
+    // the refusal is terminal: the joiner exits instead of spinning.
+    cluster.wait_exit(1, std::time::Duration::from_secs(60));
     let _ = friend_key;
 }

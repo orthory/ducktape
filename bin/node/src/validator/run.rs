@@ -90,6 +90,9 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) validators: Vec<ed25519::PublicKey>,
     pub(super) dev_demo: bool,
     pub(super) checkpoint_blocks: u64,
+    /// sync retention lease (unix secs of the last served state-sync request)
+    /// — the drain defers oplog pruning while it is fresh.
+    pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) announce_capabilities: bool,
     pub(super) sandbox: capability_host::SandboxBackend,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
@@ -129,6 +132,7 @@ struct ValidatorRuntime<'a> {
     validators: Vec<ed25519::PublicKey>,
     dev_demo: bool,
     checkpoint_blocks: u64,
+    sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     announce_capabilities: bool,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
@@ -205,6 +209,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         validators,
         dev_demo,
         checkpoint_blocks,
+        sync_lease,
         announce_capabilities,
         sandbox,
         sandbox_capacity,
@@ -438,6 +443,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         validators,
         dev_demo,
         checkpoint_blocks,
+        sync_lease,
         announce_capabilities,
         stream_hub,
         index,

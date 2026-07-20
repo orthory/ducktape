@@ -958,14 +958,6 @@ where
                 "invalid frame range ({after_height}, {up_to_height}]"
             )));
         }
-        if let Some(retained_start) = self.manifest()?.and_then(|m| m.height)
-            && after_height < retained_start
-        {
-            return Err(Error::RangePruned {
-                after_height,
-                retained_start,
-            });
-        }
         if after_height == up_to_height {
             return Ok(Vec::new());
         }
@@ -983,6 +975,40 @@ where
                 let (_pos, bytes) = item.map_err(storage_err)?;
                 records.push(Record::decode(&bytes)?);
             }
+        }
+
+        // the honest retention floor is the journal's own first retained
+        // block. the latest MANIFEST height is only a proxy: it advances on
+        // every periodic checkpoint even when the physical prune is deferred
+        // (the sync retention lease), and refusing against it starves a slow
+        // syncer of frames that are still right here — the rebootstrap
+        // treadmill. an empty journal has no floor of its own, so the
+        // manifest boundary remains the anchor there.
+        let first_retained = records.iter().find_map(|record| match record {
+            Record::Block { height, .. } => Some(*height),
+            _ => None,
+        });
+        let Some(retained_start) = first_retained else {
+            if let Some(retained_start) = self.manifest()?.and_then(|m| m.height)
+                && after_height < retained_start
+            {
+                return Err(Error::RangePruned {
+                    after_height,
+                    retained_start,
+                });
+            }
+            return Ok(Vec::new());
+        };
+        // report the lowest ANCHORABLE height: a client at `first - 1` can be
+        // served (its next frame is the first retained one), so that is the
+        // floor it can act on — and it matches the checkpoint the physical
+        // prune trails in the steady state.
+        let retained_start = retained_start.saturating_sub(1);
+        if after_height < retained_start {
+            return Err(Error::RangePruned {
+                after_height,
+                retained_start,
+            });
         }
 
         let mut out = Vec::new();

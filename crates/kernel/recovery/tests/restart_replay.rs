@@ -402,11 +402,53 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
         assert_eq!(frames[1].frame, frame2);
         assert_eq!(frames[1].disposition, Disposition::Applied);
 
-        let err = node
+        // a checkpoint alone does NOT refuse: the journal still physically
+        // holds block 1, and the retention floor is the journal's own — not
+        // the manifest height, which advances even when pruning is deferred
+        // (the sync retention lease would otherwise be useless).
+        let still_served = node
             .sink_mut()
             .read_finalized_frames(0, 3)
             .await
-            .expect_err("range below checkpoint is pruned");
+            .expect("frames below the checkpoint are served while retained");
+        assert_eq!(still_served.len(), 3);
+        assert_eq!(still_served[0].height, 1);
+
+        let _ = pos;
+    });
+}
+
+#[test]
+fn range_read_refuses_below_the_retained_floor() {
+    // a journal whose first retained block is height 2 — a pruned prefix's
+    // exact shape (journal pruning is section-granular, so a small journal
+    // cannot be pruned in place; this constructs the post-prune shape
+    // directly). below the floor is a genuine gap, and the reported floor is
+    // the lowest anchorable height (first retained - 1). its own runner:
+    // deterministic storage partitions are global per runner, so a second
+    // Recovery in the same test would share the first one's journal.
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        use node::BlockSink as _;
+        let mut pruned = Recovery::open(context.child("floor"))
+            .await
+            .expect("open pruned-shape recovery");
+        let signer = sk(9);
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 9, &set("k9", "v9"))]);
+        pruned.pre_apply(2, &frame).await.expect("wal record");
+        pruned
+            .seal(&node::BlockSeal {
+                height: 2,
+                disposition: Disposition::Applied,
+                roots: vec![],
+                app_hash: sdk::StateRoot([0u8; 32]),
+            })
+            .await
+            .expect("seal");
+        let err = pruned
+            .read_finalized_frames(0, 2)
+            .await
+            .expect_err("range below the retained floor is refused");
         assert!(matches!(
             err,
             recovery::Error::RangePruned {
@@ -414,5 +456,13 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
                 retained_start: 1
             }
         ));
+        // at the floor itself the journal serves: the gap is real, not a
+        // manifest-proxy refusal.
+        let frames = pruned
+            .read_finalized_frames(1, 2)
+            .await
+            .expect("the retained frame serves");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].height, 2);
     });
 }
