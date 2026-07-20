@@ -140,16 +140,11 @@ pub struct Channel {
     /// the off-consensus voice plane.
     pub huddle: Vec<HuddleMember>,
     /// the user who created the channel (`AuthorRef::User` bytes). `None` for
-    /// module/system-minted channels and for legacy records created before this
-    /// field existed — the stored codec is serde_json, so the default decodes
-    /// old records without a schema-revision bump. only the owner may
-    /// rename/archive an owned channel; a `None` owner is open to any user.
-    #[serde(default)]
+    /// module/system-minted channels, which have no user owner. only the owner
+    /// may rename/archive an owned channel; a `None` owner is open to any user.
     pub owner: Option<Vec<u8>>,
     /// archived channels reject posts, reactions, and huddle joins; membership,
-    /// rename, and unarchive stay allowed. `#[serde(default)]` = false for
-    /// legacy records.
-    #[serde(default)]
+    /// rename, and unarchive stay allowed.
     pub archived: bool,
 }
 
@@ -215,9 +210,9 @@ pub enum ChatMsg {
     },
     /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
     /// the reserved `:` namespace gate + the record byte cap). only the
-    /// channel's `owner` (a `User` origin) may rename an owned channel; a legacy
-    /// owner-less channel admits any user, mirroring `SetMembership`. module and
-    /// system origins pass as elsewhere.
+    /// channel's `owner` (a `User` origin) may rename an owned channel; an
+    /// unowned (module/system-minted) channel admits any user, mirroring
+    /// `SetMembership`. module and system origins pass as elsewhere.
     RenameChannel { channel_id: String, name: String },
     /// archive or unarchive a channel. an archived channel rejects posts,
     /// reactions, and huddle joins; membership, rename, and unarchive stay

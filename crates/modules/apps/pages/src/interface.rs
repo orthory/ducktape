@@ -81,7 +81,7 @@ pub struct Block {
     pub kind: BlockKind,
     /// the text payload — the page title for `Page`, empty for `Divider`.
     pub text: String,
-    /// Persistent inline formatting. Missing on legacy records.
+    /// Persistent inline formatting. Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<SpanMark>,
     /// only meaningful for `Todo` (false everywhere else).
@@ -134,8 +134,8 @@ pub enum PageMsg {
     UpdateText {
         block_id: String,
         text: String,
-        /// New clients can replace content + marks atomically during a
-        /// split/merge. Legacy clients omit this and existing marks rebase.
+        /// A split/merge can replace content + marks atomically. Omitted (the
+        /// common plain edit) leaves the block's existing marks to rebase.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         marks: Option<Vec<SpanMark>>,
     },
@@ -191,16 +191,17 @@ pub enum PageMsg {
         comment_id: String,
         target: String,
         text: String,
-        /// Exact selection for a new thread. Replies omit it; legacy payloads
-        /// decode as block-level comments.
+        /// Exact selection for a new thread. Replies and block-level comments
+        /// omit it (a comment with no text selection).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         anchor: Option<RelativeAnchor>,
         /// Structured mentions carried by this comment. Only agent refs are
-        /// translated into tagging-plane entities; default keeps old payloads
-        /// wire-compatible.
+        /// translated into tagging-plane entities; omitted when the comment
+        /// mentions no one.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         mentions: Vec<AuthorRef>,
-        /// `default` so a pre-M2 payload without the key still decodes.
+        /// Present only for an agent-authored comment; omitted for a human
+        /// author (see `PostMessage::as_agent`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         as_agent: Option<String>,
     },
@@ -427,10 +428,11 @@ mod interface_tests {
     }
 
     #[test]
-    fn legacy_edit_comment_defaults_missing_mentions() {
-        let legacy = br#"{"edit_comment":{"comment_id":"c1","text":"reworded"}}"#;
+    fn edit_comment_without_mentions_decodes() {
+        // the exact wire an edit that adds no mentions emits (skip_if_empty).
+        let wire = br#"{"edit_comment":{"comment_id":"c1","text":"reworded"}}"#;
         assert_eq!(
-            decode_msg(legacy).unwrap(),
+            decode_msg(wire).unwrap(),
             PageMsg::EditComment {
                 comment_id: "c1".into(),
                 text: "reworded".into(),
@@ -440,7 +442,7 @@ mod interface_tests {
     }
 
     #[test]
-    fn legacy_blocks_and_comments_default_missing_ranges() {
+    fn omitted_optional_fields_decode_to_defaults() {
         let block: Block = serde_json::from_slice(
             br#"{"id":"b1","parent":"p1","page":"p1","kind":"paragraph","text":"hello","checked":false,"children":[]}"#,
         )
@@ -460,8 +462,9 @@ mod interface_tests {
             }
         );
 
-        let legacy = br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
-        let PageMsg::AddComment { anchor, mentions, as_agent, .. } = decode_msg(legacy).unwrap()
+        // a reply / block-level comment (the runs agent emits exactly this).
+        let wire = br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
+        let PageMsg::AddComment { anchor, mentions, as_agent, .. } = decode_msg(wire).unwrap()
         else {
             panic!("expected AddComment")
         };

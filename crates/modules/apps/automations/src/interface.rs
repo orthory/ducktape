@@ -8,10 +8,8 @@
 use serde::{Deserialize, Serialize};
 
 /// what makes a rule fire: a chat message-posted filter. every `None` field is
-/// a wildcard; every `Some` field must match the triggering event. (formerly a
-/// single-variant `MessagePosted` enum; the snapshot layout still carries a
-/// trigger-kind byte so a future non-chat trigger can join that codec without
-/// a state break.)
+/// a wildcard; every `Some` field must match the triggering event. a flat
+/// single-shape struct in both the JSON wire and the snapshot codec.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 // deny_unknown_fields is load-bearing: every field is an Option, so without
 // it the RETIRED tagged shape ({"message_posted":{...}}) would silently parse

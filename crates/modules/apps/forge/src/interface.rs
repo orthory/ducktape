@@ -8,13 +8,12 @@
 //!
 //! ## the default repo
 //!
-//! the `repo` field on every [`ForgeMsg`] variant carries
-//! `#[serde(default)]`, so a wire message that omits it deserializes with
-//! `repo == ""`; the module normalizes an empty repo to the well-known
-//! `"default"` repo. a single-repo client that sends
-//! `{"commit":{path,content,message}}` and queries `"head"` therefore keeps
-//! targeting one canonical repo with no change — the multi-repo surface
-//! ([`ForgeQuery::HeadOf`]/[`ForgeQuery::ListRepos`]) is purely additive.
+//! the `repo` field is REQUIRED on every [`ForgeMsg`] variant, but an empty
+//! slug is a first-class value: the module normalizes `repo == ""` to the
+//! well-known `"default"` repo. a single-repo client sends `repo: ""` and
+//! queries `"head"` to keep targeting one canonical repo; the multi-repo
+//! surface ([`ForgeQuery::HeadOf`]/[`ForgeQuery::ListRepos`]) is purely
+//! additive.
 
 use serde::{Deserialize, Serialize};
 
@@ -32,16 +31,13 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 /// ([`ForgeMsg::OpenIssue`] .. [`ForgeMsg::SubmitReview`]) — see
 /// [`crate::tracker`].
 ///
-/// every variant names its target repo via `repo`. the field is
-/// `#[serde(default)]`, so an omitted/empty `repo` deserializes to `""` and the
-/// module maps it to the `"default"` repo (see the module docstring) — the
-/// single-repo wire needs no `repo` key at all.
+/// every variant names its target repo via `repo` (required on the wire). an
+/// empty `repo` slug maps to the `"default"` repo (see the module docstring).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeMsg {
     Commit {
-        /// the target repo slug; empty/absent -> the `"default"` repo.
-        #[serde(default)]
+        /// the target repo slug; empty -> the `"default"` repo.
         repo: String,
         path: String,
         content: String,
@@ -54,7 +50,6 @@ pub enum ForgeMsg {
     /// carries `None`. this is what a stock `git push` lands as (the smart-HTTP
     /// bridge translates the command list).
     PushRefs {
-        #[serde(default)]
         repo: String,
         updates: Vec<RefUpdate>,
         pack_digest: Option<Vec<u8>>,
@@ -64,7 +59,6 @@ pub enum ForgeMsg {
     /// creating the hidden discussion channel `forge:<repo>:<n>` — atomic with
     /// the record.
     OpenIssue {
-        #[serde(default)]
         repo: String,
         title: String,
         #[serde(default)]
@@ -73,7 +67,6 @@ pub enum ForgeMsg {
     /// open a pull request from a born `source_branch` onto `target_branch`
     /// (empty -> "dev"). same number space + discussion channel as issues.
     OpenPr {
-        #[serde(default)]
         repo: String,
         title: String,
         #[serde(default)]
@@ -84,7 +77,6 @@ pub enum ForgeMsg {
     },
     /// edit an item's title and/or body — author-only.
     EditItem {
-        #[serde(default)]
         repo: String,
         number: u64,
         title: Option<String>,
@@ -93,7 +85,6 @@ pub enum ForgeMsg {
     /// close (`open: false`) or reopen (`open: true`) an item. merged PRs are
     /// terminal; an unchanged state is a deterministic no-op.
     SetItemState {
-        #[serde(default)]
         repo: String,
         number: u64,
         open: bool,
@@ -107,7 +98,6 @@ pub enum ForgeMsg {
     /// 40-char sha1 hex; `pack_digest` is 64-char sha256 hex (this surface is
     /// app-facing, unlike the raw-byte push lane).
     MergePr {
-        #[serde(default)]
         repo: String,
         number: u64,
         prev_target_oid: String,
@@ -119,7 +109,6 @@ pub enum ForgeMsg {
     /// line-anchored diff comments, anchored at `commit_oid` (the source head
     /// the reviewer saw). approvals are advisory — never merge-blocking.
     SubmitReview {
-        #[serde(default)]
         repo: String,
         number: u64,
         verdict: ReviewVerdict,
@@ -218,8 +207,8 @@ pub struct PrDiff {
 pub struct RepoHead {
     /// the repo's normalized slug.
     pub name: String,
-    /// the repo's committed INTEGRATION head (dev, falling back to legacy
-    /// main) as hex, or `None` if neither branch is born.
+    /// the repo's committed INTEGRATION head (dev, falling back to main) as
+    /// hex, or `None` if neither branch is born.
     pub head: Option<String>,
 }
 
@@ -247,37 +236,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn commit_without_repo_decodes_with_empty_repo() {
-        // the exact bytes a single-repo client (and the app's forge-client)
-        // sends: no `repo` key. `#[serde(default)]` must fill it with "" so the
-        // module can map it to the default repo — this is the defaulting contract.
-        let legacy = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
-        let msg = decode_msg(legacy).expect("repo-less commit must decode");
+    fn repo_is_required_on_the_wire() {
+        // `repo` is a required field (no `#[serde(default)]`): a message that
+        // omits the key is rejected. every live producer emits `repo` — the
+        // single-repo ergonomic is `repo: ""`, an explicit empty slug that the
+        // module maps to the default repo, not an absent key.
+        let no_repo_key = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
+        assert!(
+            decode_msg(no_repo_key).is_err(),
+            "a commit without a repo key must be rejected"
+        );
+        let no_repo_push = br#"{"push_refs":{"updates":[{"ref_name":"main","prev_oid":null,"new_oid":[1,2,3]}],"pack_digest":[4,5]}}"#;
+        assert!(
+            decode_msg(no_repo_push).is_err(),
+            "a push_refs without a repo key must be rejected"
+        );
+        // the explicit empty slug still decodes (single-repo ergonomic).
+        let empty_repo = br#"{"commit":{"repo":"","path":"a.txt","content":"hi","message":"m"}}"#;
         assert_eq!(
-            msg,
+            decode_msg(empty_repo).unwrap(),
             ForgeMsg::Commit {
                 repo: String::new(),
                 path: "a.txt".into(),
                 content: "hi".into(),
                 message: "m".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn push_refs_without_repo_decodes_with_empty_repo() {
-        let legacy = br#"{"push_refs":{"updates":[{"ref_name":"main","prev_oid":null,"new_oid":[1,2,3]}],"pack_digest":[4,5]}}"#;
-        let msg = decode_msg(legacy).expect("repo-less push_refs must decode");
-        assert_eq!(
-            msg,
-            ForgeMsg::PushRefs {
-                repo: String::new(),
-                updates: vec![RefUpdate {
-                    ref_name: "main".into(),
-                    prev_oid: None,
-                    new_oid: Some(vec![1, 2, 3]),
-                }],
-                pack_digest: Some(vec![4, 5]),
             }
         );
     }

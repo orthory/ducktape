@@ -1435,7 +1435,7 @@ mod tests {
         assert_eq!(decode_worker_control(&bytes).unwrap(), control);
         assert!(
             decode_worker_request(&bytes).is_err(),
-            "a control can never decode as legacy work"
+            "a control can never decode as a work request"
         );
 
         let mut wrong = control.clone();
@@ -1445,16 +1445,16 @@ mod tests {
         wrong.kind = "other".into();
         assert!(decode_worker_control(&encode_worker_control(&wrong)).is_err());
 
-        let legacy = WorkerRequest {
+        let request = WorkerRequest {
             saga_id: "s1".into(),
             attempt: 2,
             spec: b"work".to_vec(),
             deadline: None,
             assignee: Some(b"node-a".to_vec()),
         };
-        let legacy_bytes = encode_worker_request(&legacy);
-        assert_eq!(decode_worker_request(&legacy_bytes).unwrap(), legacy);
-        assert!(decode_worker_control(&legacy_bytes).is_err());
+        let request_bytes = encode_worker_request(&request);
+        assert_eq!(decode_worker_request(&request_bytes).unwrap(), request);
+        assert!(decode_worker_control(&request_bytes).is_err());
     }
 
     #[test]

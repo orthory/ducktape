@@ -1134,7 +1134,7 @@ format = "text"
     }
 
     #[test]
-    fn run_key_for_legacy_saga_uses_whole_id() {
+    fn run_key_for_unnamespaced_saga_returns_whole_id() {
         assert_eq!(run_key_for("s1"), "s1");
     }
 
@@ -2003,8 +2003,9 @@ format = "text"
             },
             "skills": [
                 {"name":"persona","source_prefix":"/shared/skills/persona","always": true},
-                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
+                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32), "always": false}
             ],
+            "library_readable": false,
             "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
@@ -2084,6 +2085,7 @@ format = "text"
                 "forge_push": true
             },
             "skills": [],
+            "library_readable": false,
             "result_contract": {
                 "ducktape_runner_result": 1,
                 "sink": {"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}

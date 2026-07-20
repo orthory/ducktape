@@ -317,8 +317,8 @@ impl Status {
     }
 }
 
-/// the serialized receipt shape. Runs retains decode-only compatibility for
-/// historical fields this producer no longer emits.
+/// the serialized receipt shape — exactly the fields this producer emits. Runs
+/// decodes this shape and rejects anything else (deny_unknown_fields).
 #[derive(Serialize)]
 struct RunnerResultWire<'a> {
     ducktape_runner_result: u64,

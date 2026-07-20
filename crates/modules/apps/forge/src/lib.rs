@@ -74,12 +74,11 @@
 //! branch are protected (never deleted, fast-forward-guarded at materialize);
 //! feature branches may force-push and be deleted — the GitHub flow.
 //!
-//! ## back-compat: the default repo (no app change)
+//! ## the default repo
 //!
-//! every [`ForgeMsg`] carries a `#[serde(default)] repo`, so a legacy wire
-//! message with no `repo` deserializes with `repo == ""`; the module
-//! normalizes an empty repo to the well-known `"default"` repo. the unit
-//! [`ForgeQuery::Head`] answers the default repo's `main` head.
+//! every [`ForgeMsg`] carries a required `repo` field; an empty slug maps to
+//! the well-known `"default"` repo. the unit [`ForgeQuery::Head`] answers the
+//! default repo's `main` head.
 //!
 //! ## the determinism landmine (per repo)
 //!
@@ -133,8 +132,8 @@ use crate::refs::{
 };
 use crate::tracker::{author_from_origin, parse_hex_oid, Tracker};
 
-/// the well-known repo an empty/absent `repo` field maps to — the target of the
-/// legacy single-repo wire (see the module docstring).
+/// the well-known repo an empty `repo` field maps to — the single-repo wire
+/// (see the module docstring).
 const DEFAULT_REPO: &str = "default";
 
 /// the max repo-name length in bytes (names are a filesystem path segment and a
@@ -552,7 +551,7 @@ impl Forge {
         Ok(())
     }
 
-    /// this repo's read-your-writes `main` head hex (the legacy Head surface).
+    /// this repo's read-your-writes `main` head hex (the single-repo Head surface).
     fn read_head(&self, name: &str) -> Option<String> {
         self.repos
             .get(name)
@@ -765,8 +764,8 @@ impl Module for Forge {
                 Ok(encode_reply(&ForgeReply::Head(self.read_head(&name))))
             }
             ForgeQuery::ListRepos => {
-                // the committed INTEGRATION head (dev, falling back to legacy
-                // main) — the same branch every browse surface reads, so a
+                // the committed INTEGRATION head (dev, falling back to main) —
+                // the same branch every browse surface reads, so a
                 // dev-only repo lists as browsable, not unborn.
                 let repos = self
                     .repos

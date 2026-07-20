@@ -7,7 +7,7 @@
 //! that: when the run carries an agent identity (see [`crate::RunContext`])
 //! and the host wired a workspaces root, the child's cwd becomes
 //! `<workspaces_root>/<agent_id>`, created on demand. everything else — no
-//! `[workspace]` section, a legacy envelope-less run, an embedder that wired
+//! `[workspace]` section, an agent-less run, an embedder that wired
 //! no root — keeps the scratch-dir fence unchanged.
 
 use serde::Deserialize;

@@ -5,10 +5,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
-use super::facets::{
-    WireStatus, decode_run_result_v1, effects_to_actions, encode_delivery_receipt, output_ref_of,
-    valid_data,
-};
+use super::facets::{WireStatus, decode_run_result_v1, encode_delivery_receipt, output_ref_of};
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, AgentStatus,
     BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DELEGATED_CHILD_CORES,
@@ -393,15 +390,7 @@ impl RunsModule {
                 .fail_delegated_run(ctx, run_id, entry, "run reported a failed status".into())
                 .await;
         }
-        let mut response = agent_response_from_text(&result.response_text, false);
-        if !result.effects.is_empty() {
-            response.actions = match effects_to_actions(&result.effects) {
-                Ok(actions) => actions,
-                Err(reason) => {
-                    return self.fail_delegated_run(ctx, run_id, entry, reason).await;
-                }
-            };
-        }
+        let response = agent_response_from_text(&result.response_text, false);
         let response = match self
             .validate_response(&*ctx, run_id, entry, Lane::DelegatedSettle, response)
             .await
@@ -538,15 +527,14 @@ impl RunsModule {
             .await;
     }
 
-    /// THE single delivery path. message facet + host-assembled effects → one
+    /// THE single delivery path. the model prose normalizes into one
     /// [`AgentResponse`] (validate/emit reused); the sink is applied (cap-gated,
-    /// probe-guarded, degrades to a breadcrumb, never aborts); data (R5) +
-    /// artifact (O1) + status fold into the faceted finalize payload. a plain
-    /// (message-only) wrapper — prose, no facets — delivers exactly the model
-    /// prose + its parsed actions; marker-less bytes FAIL the run (flag day,
-    /// the flat tolerance is gone). idempotent by run_id — every effect
-    /// applies once, here, from the winning attempt (X2); nothing is emitted
-    /// mid-run.
+    /// probe-guarded, degrades to a breadcrumb, never aborts); artifact (O1) +
+    /// status fold into the faceted finalize payload. a plain (message-only)
+    /// wrapper — prose, no facets — delivers exactly the model prose + its
+    /// parsed actions; marker-less bytes FAIL the run (flag day, the flat
+    /// tolerance is gone). idempotent by run_id — every effect applies once,
+    /// here, from the winning attempt (X2); nothing is emitted mid-run.
     async fn deliver_run_result(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -564,18 +552,7 @@ impl RunsModule {
                 .fail_run(ctx, run_id, entry, "run reported a failed status".into())
                 .await;
         }
-        let mut response = agent_response_from_text(&result.response_text, entry.job_id.is_some());
-        // R1: host-assembled effects are authoritative. FALLBACK: only override
-        // the response-parsed actions when the effects facet is non-empty, so a
-        // model that emitted actions only in prose (an oracle that didn't lift
-        // them) still gets them applied — never a silent drop. a message-only
-        // result has empty effects, so it keeps its prose-parsed actions.
-        if !result.effects.is_empty() {
-            response.actions = match effects_to_actions(&result.effects) {
-                Ok(actions) => actions,
-                Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
-            };
-        }
+        let response = agent_response_from_text(&result.response_text, entry.job_id.is_some());
         let response = match self
             .validate_response(&*ctx, run_id, entry, Lane::Settle, response)
             .await
@@ -593,12 +570,7 @@ impl RunsModule {
         // build the faceted finalize payload — and render the message facet
         // the PR sink derives its title/body from — BEFORE moving `response`
         // into emit_response; emission order is response → sink → finalize.
-        let payload = encode_delivery_receipt(
-            &response,
-            valid_data(&result.data),
-            &result.workspace_receipt,
-            result.status,
-        );
+        let payload = encode_delivery_receipt(&response, &result.workspace_receipt, result.status);
         let message = sink::message_facet_text(&response.reply_blocks);
         // the run's durable executor attribution (sink.rs's saga lookup) —
         // computed once here, shared by the PR-body breadcrumb and the ring.
@@ -720,9 +692,9 @@ impl RunsModule {
                 return Err(format!("child agent is paused: {}", child.agent_id));
             }
             let mut scoped_child = parent.scoped_for_call(&child);
-            // Legacy terminal delegation has no call edge with which to count a
-            // recursive tree. Keep that compatibility lane to one final wave;
-            // live recursive calls use DelegateRun and its root-wide live-call cap.
+            // Terminal (sessionless) delegation has no call edge with which to
+            // count a recursive tree. Keep that lane to one final wave; live
+            // recursive calls use DelegateRun and its root-wide live-call cap.
             scoped_child.caps.subagent_budget = 0;
             // the parent CURATES library skills for this child, on top of the
             // child's own — confined to the library by construction (names, not

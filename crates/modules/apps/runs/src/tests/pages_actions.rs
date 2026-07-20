@@ -117,17 +117,22 @@ fn delivery_ctx(registry: &Registry) -> CaptureCtx {
         .with_page("p1", page_blocks("p1", "Spec"))
 }
 
-fn comment_effect(target: &str) -> serde_json::Value {
-    serde_json::json!({
-        "effects": [{"kind": ACTION_PAGES_COMMENT, "target": target, "body": "looks good"}]
-    })
+fn comment_effect(target: &str) -> Vec<AgentAction> {
+    vec![AgentAction::AddPageComment {
+        target: target.into(),
+        body: "looks good".into(),
+    }]
 }
 
-fn deliver(m: &mut RunsModule, ctx: &mut CaptureCtx, run_id: &str, facets: serde_json::Value) {
+/// deliver a run whose prose carries `actions` — the production path feeding
+/// the pages lane (the oracle never lifts an effects facet; the pages actions
+/// arrive as the model's prose-parsed actions). "done" is the chat reply.
+fn deliver(m: &mut RunsModule, ctx: &mut CaptureCtx, run_id: &str, actions: Vec<AgentAction>) {
+    let prose = String::from_utf8(response_json(&["done"], actions)).expect("utf-8");
     exec(
         m,
         ctx,
-        &result_event(run_id, Ok(runner_wrapper("done", facets))),
+        &result_event(run_id, Ok(runner_wrapper(&prose, serde_json::json!({})))),
     )
     .unwrap();
 }
@@ -252,13 +257,20 @@ fn an_unresolvable_target_and_an_empty_body_each_degrade_alone() {
         &mut m,
         &mut ctx,
         &run_id,
-        serde_json::json!({
-            "effects": [
-                {"kind": ACTION_PAGES_COMMENT, "target": "ghost", "body": "hi"},
-                {"kind": ACTION_PAGES_COMMENT, "target": "b-p", "body": ""},
-                {"kind": ACTION_PAGES_SET_CHECKED, "block": "b-t", "checked": true},
-            ]
-        }),
+        vec![
+            AgentAction::AddPageComment {
+                target: "ghost".into(),
+                body: "hi".into(),
+            },
+            AgentAction::AddPageComment {
+                target: "b-p".into(),
+                body: "".into(),
+            },
+            AgentAction::SetPageChecked {
+                block: "b-t".into(),
+                checked: true,
+            },
+        ],
     );
 
     let msgs = ctx.page_msgs();
@@ -290,12 +302,16 @@ fn set_checked_requires_a_todo_block_and_carries_no_attribution() {
         &mut m,
         &mut ctx,
         &run_id,
-        serde_json::json!({
-            "effects": [
-                {"kind": ACTION_PAGES_SET_CHECKED, "block": "b-p", "checked": true},
-                {"kind": ACTION_PAGES_SET_CHECKED, "block": "b-t", "checked": true},
-            ]
-        }),
+        vec![
+            AgentAction::SetPageChecked {
+                block: "b-p".into(),
+                checked: true,
+            },
+            AgentAction::SetPageChecked {
+                block: "b-t".into(),
+                checked: true,
+            },
+        ],
     );
 
     let msgs = ctx.page_msgs();
@@ -367,12 +383,16 @@ fn same_block_thread_cap_degrades_the_overflow_comment_without_aborting() {
         &mut m,
         &mut ctx,
         &run_id,
-        serde_json::json!({
-            "effects": [
-                {"kind": ACTION_PAGES_COMMENT, "target": "b-p", "body": "first"},
-                {"kind": ACTION_PAGES_COMMENT, "target": "b-p", "body": "second"},
-            ]
-        }),
+        vec![
+            AgentAction::AddPageComment {
+                target: "b-p".into(),
+                body: "first".into(),
+            },
+            AgentAction::AddPageComment {
+                target: "b-p".into(),
+                body: "second".into(),
+            },
+        ],
     );
 
     let msgs = ctx.page_msgs();
@@ -487,13 +507,17 @@ fn task_actions_keep_their_all_or_nothing_lane() {
         &mut m,
         &mut ctx,
         &run_id,
-        serde_json::json!({
-            "effects": [
-                {"kind": ACTION_PAGES_COMMENT, "target": "b-p", "body": "hi"},
-                // tasks.create was never granted — the strict lane fails the run.
-                {"kind": "tasks.create", "task_id": "t9", "title": "nope"},
-            ]
-        }),
+        vec![
+            AgentAction::AddPageComment {
+                target: "b-p".into(),
+                body: "hi".into(),
+            },
+            // tasks.create was never granted — the strict lane fails the run.
+            AgentAction::CreateTask {
+                task_id: "t9".into(),
+                title: "nope".into(),
+            },
+        ],
     );
     assert!(ctx.page_msgs().is_empty(), "nothing applies on a failed run");
     assert!(ctx.task_msgs().is_empty());

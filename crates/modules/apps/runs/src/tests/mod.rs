@@ -5,8 +5,8 @@ use crate::response::{
 };
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
 use agent::{
-    ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS, encode_event as agent_encode_event,
-    encode_reply as agent_encode_reply,
+    ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
+    encode_event as agent_encode_event, encode_reply as agent_encode_reply,
 };
 use base64::Engine as _;
 use chat::{AuthorRef, Channel, MessageHead, decode_msg as chat_decode_msg};
@@ -895,8 +895,8 @@ fn engage_post(
 }
 
 /// build a faceted RunnerResult wrapper: the three core fields plus whatever
-/// facet keys `facets` carries (data / effects / sink / status, and a
-/// `workspace_receipt` override when present).
+/// facet keys `facets` carries (sink / status, and a `workspace_receipt`
+/// override when present).
 fn runner_wrapper(response_text: &str, facets: serde_json::Value) -> Vec<u8> {
     let mut obj = serde_json::json!({
         "ducktape_runner_result": 1,

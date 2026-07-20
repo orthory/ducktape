@@ -197,7 +197,6 @@ pub enum CapabilityMsg {
         capabilities: Vec<String>,
         /// announced numeric capacity (e.g. "cores", "mem_gb"). EMPTY for a
         /// direct-spawn node: tags-only, never matches a demands-carrying job.
-        #[serde(default)]
         resources: BTreeMap<String, u64>,
     },
     /// claim a capability CLASS for the submitting MODULE — the claimant is
@@ -290,13 +289,20 @@ mod tests {
     }
 
     #[test]
-    fn announce_without_resources_field_still_decodes() {
-        // old wire JSON (pre-resources) must decode with an empty map.
-        let old = br#"{"announce":{"capabilities":["codex"]}}"#;
+    fn announce_requires_the_resources_field() {
+        // `resources` is required on the wire (no serde default): a resources-less
+        // announce is rejected. every producer emits it — a tags-only node sends
+        // an explicit `"resources":{}`.
+        let no_key = br#"{"announce":{"capabilities":["codex"]}}"#;
+        assert!(
+            decode_msg(no_key).is_err(),
+            "an announce without a resources key must be rejected"
+        );
+        let empty = br#"{"announce":{"capabilities":["codex"],"resources":{}}}"#;
         let CapabilityMsg::Announce {
             capabilities,
             resources,
-        } = decode_msg(old).unwrap()
+        } = decode_msg(empty).unwrap()
         else {
             panic!("expected an announce");
         };

@@ -1,23 +1,18 @@
 use super::envelope::RUNNER_RESULT_VERSION;
-use super::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED, ACTION_TASKS_CREATE,
-    ACTION_TASKS_UPDATE_STATUS, AgentAction, AgentResponse, Deserialize,
-    JOB_FINALIZE_PAYLOAD_BYTES, MAX_ACTIONS_PER_RUN, Serialize,
-};
+use super::{AgentResponse, Deserialize, Serialize};
 
-/// the R5 typed-data facet ceiling — data larger than this degrades to null.
-const MAX_DATA_BYTES: usize = 32 * 1024;
 /// the faceted job-finalize payload envelope version (the `ducktape_delivery`
 /// wrapper every run's finalize carries).
 const DELIVERY_RECEIPT_VERSION: u32 = 1;
 
 /// the wrapper the oracle's provisioning path returns instead of the bare
 /// response text: the model prose plus the host-assembled facets — message
-/// (`response_text`) / data / effects / artifact (`workspace_receipt`) / sink /
-/// status. `deny_unknown_fields`: the assembled shape is this crate's own
-/// contract with dispatch-oracle, and an unrecognized key is drift, not
-/// forward compat. the facet fields keep `#[serde(default)]` because the
-/// oracle SKIP-SERIALIZES empty/default facets (the minimal
+/// (`response_text`) / artifact (`workspace_receipt`) / sink / status.
+/// `deny_unknown_fields`: the assembled shape is this crate's own contract
+/// with dispatch-oracle, and an unrecognized key is drift, not forward compat
+/// — the retired `data`/`effects` facets are now rejected here, not tolerated.
+/// `sink`/`status` keep `#[serde(default)]` because the oracle SKIP-SERIALIZES
+/// them when empty/default (the minimal
 /// `{ducktape_runner_result, response_text, workspace_receipt}` shape) —
 /// load-bearing, not forward-compat. the single delivery path
 /// ([`RunsModule::deliver_run_result`]) applies whatever facets are present.
@@ -27,11 +22,6 @@ pub(super) struct RunnerResult {
     pub(super) ducktape_runner_result: u32,
     pub(super) response_text: String,
     pub(super) workspace_receipt: WorkspaceReceipt,
-    /// R5 typed-data facet: an already-serialized JSON text or `None`.
-    pub(super) data: Option<String>,
-    /// R2 declarative effects, host-assembled (lifted from the model's actions).
-    #[serde(default)]
-    pub(super) effects: Vec<WireEffect>,
     /// O1/O2 output sink; default [`WireSink::Chain`].
     #[serde(default)]
     pub(super) sink: WireSink,
@@ -68,43 +58,6 @@ pub(super) fn output_ref_of(receipt: &WorkspaceReceipt) -> Option<String> {
         (Some(branch), Some(oid)) => Some(format!("{branch}@{oid}")),
         _ => receipt.output_snapshot.clone(),
     }
-}
-
-/// one host-assembled declarative effect (R2). `kind` is a run-effect wire name
-/// (`tasks.create` / `tasks.update_status` / `pages.comment` /
-/// `pages.set_checked`); the remaining fields carry the action's payload.
-/// mapped to an [`AgentAction`] by [`effects_to_actions`], where an unknown
-/// `kind` fails the run deterministically (R4).
-#[derive(Deserialize, Debug)]
-pub(super) struct WireEffect {
-    kind: String,
-    #[serde(default)]
-    task_id: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    status: String,
-    /// `pages.comment`: the page or block id the comment anchors to.
-    #[serde(default)]
-    target: String,
-    /// `pages.comment`: the comment text.
-    #[serde(default)]
-    body: String,
-    /// `pages.set_checked`: the todo block id.
-    #[serde(default)]
-    block: String,
-    /// `pages.set_checked`: the desired checked state.
-    #[serde(default)]
-    checked: bool,
-    /// `chat.post_message`: the channel the agent speaks into.
-    #[serde(default)]
-    channel_id: String,
-    /// `chat.post_message`: the message body (one paragraph block).
-    #[serde(default)]
-    text: String,
-    /// `chat.post_message`: the thread root the post replies under, if any.
-    #[serde(default)]
-    thread: Option<u64>,
 }
 
 /// the O1/O2 output sink. internally tagged on `mode`; a MISSING sink field
@@ -174,65 +127,12 @@ pub(super) fn decode_run_result_v1(bytes: &[u8]) -> Result<RunnerResult, String>
     Ok(result)
 }
 
-/// map host-assembled declarative effects into the validated [`AgentAction`]
-/// vocabulary: the two task verbs plus the two pages verbs (chat.post is the
-/// message facet, not an effect). an UNKNOWN kind fails the run
-/// deterministically (R4) — this is the concrete gate for any verb beyond the
-/// known set. payload validity is NOT checked here: task payloads are the
-/// strict validator's job, pages payloads degrade per-action at apply.
-pub(super) fn effects_to_actions(effects: &[WireEffect]) -> Result<Vec<AgentAction>, String> {
-    if effects.len() > MAX_ACTIONS_PER_RUN {
-        return Err(format!(
-            "{} effects exceed the cap of {MAX_ACTIONS_PER_RUN}",
-            effects.len()
-        ));
-    }
-    effects
-        .iter()
-        .map(|e| match e.kind.as_str() {
-            ACTION_CHAT_POST_MESSAGE => Ok(AgentAction::PostMessage {
-                channel_id: e.channel_id.clone(),
-                text: e.text.clone(),
-                thread: e.thread,
-            }),
-            ACTION_TASKS_CREATE => Ok(AgentAction::CreateTask {
-                task_id: e.task_id.clone(),
-                title: e.title.clone(),
-            }),
-            ACTION_TASKS_UPDATE_STATUS => Ok(AgentAction::UpdateTaskStatus {
-                task_id: e.task_id.clone(),
-                status: e.status.clone(),
-            }),
-            ACTION_PAGES_COMMENT => Ok(AgentAction::AddPageComment {
-                target: e.target.clone(),
-                body: e.body.clone(),
-            }),
-            ACTION_PAGES_SET_CHECKED => Ok(AgentAction::SetPageChecked {
-                block: e.block.clone(),
-                checked: e.checked,
-            }),
-            other => Err(format!("unknown effect kind: {other}")),
-        })
-        .collect()
-}
-
-/// the R5 data facet, valid only when it is within the size ceiling AND parses
-/// as JSON; anything else degrades to null (never fails the run).
-pub(super) fn valid_data(data: &Option<String>) -> Option<&str> {
-    data.as_deref().filter(|s| {
-        s.len() <= MAX_DATA_BYTES && serde_json::from_str::<serde_json::Value>(s).is_ok()
-    })
-}
-
-/// the faceted job-finalize payload: the validated response plus the data
-/// facet, the derived output_ref (O1), and the status. deterministic — fixed
-/// serde field order, data embedded verbatim as already-validated JSON.
+/// the faceted job-finalize payload: the validated response, the derived
+/// output_ref (O1), and the status. deterministic — fixed serde field order.
 #[derive(Serialize)]
 struct DeliveryReceipt<'a> {
     ducktape_delivery: u32,
     response: &'a AgentResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_ref: Option<OutputRef<'a>>,
     status: &'static str,
@@ -258,7 +158,6 @@ struct OutputRef<'a> {
 
 pub(super) fn encode_delivery_receipt(
     response: &AgentResponse,
-    data: Option<&str>,
     receipt: &WorkspaceReceipt,
     status: WireStatus,
 ) -> String {
@@ -279,41 +178,15 @@ pub(super) fn encode_delivery_receipt(
         WireStatus::Degraded => "degraded",
         WireStatus::Failed => "failed",
     };
-    let encode = |data: Option<&str>| {
-        serde_json::to_string(&DeliveryReceipt {
-            ducktape_delivery: DELIVERY_RECEIPT_VERSION,
-            response,
-            data,
-            output_ref: output_ref.clone(),
-            status,
-        })
-        .expect("delivery receipt serializes")
-    };
-    // the finalize payload MUST stay valid JSON within the jobs cap: the naive
-    // byte-truncation the jobs board applies would corrupt it. the response is
+    // the finalize payload MUST stay valid JSON within the jobs cap (the naive
+    // byte-truncation the jobs board applies would corrupt it). the response is
     // capped by validation (MAX_REPLY_BLOCKS_BYTES + MAX_ACTIONS_BYTES) and
-    // output_ref/status are tiny, so a no-data receipt always fits; the
-    // optional `data` facet is embedded only if the whole receipt still fits,
-    // else DROPPED here (the full data facet stays in the dispatch-history
-    // audit lane, R6, so nothing durable is lost). the ladder re-checks its own
-    // fallback — never hand the jobs board something it would byte-truncate.
-    let full = encode(data);
-    if full.len() <= JOB_FINALIZE_PAYLOAD_BYTES {
-        return full;
-    }
-    let without_data = encode(None);
-    if without_data.len() <= JOB_FINALIZE_PAYLOAD_BYTES {
-        return without_data;
-    }
-    // unreachable while the validation caps hold (32Ki blocks + 8Ki actions
-    // << 64Ki cap); a deterministic stub keeps the payload valid JSON with the
-    // O1 output_ref intact even if a cap regresses.
+    // output_ref/status are tiny, so this receipt always fits by construction.
     serde_json::to_string(&DeliveryReceipt {
         ducktape_delivery: DELIVERY_RECEIPT_VERSION,
-        response: &AgentResponse::default(),
-        data: None,
+        response,
         output_ref,
-        status: "degraded",
+        status,
     })
     .expect("delivery receipt serializes")
 }

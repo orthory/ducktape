@@ -280,17 +280,17 @@ pub enum AgentStatus {
     Paused,
 }
 
-/// Persisted role discriminant retained for snapshot compatibility. Omitted
-/// legacy records are ordinary agents.
+/// Owner-assigned semantic role. General is the default; a record that omits
+/// the role is an ordinary (General) agent.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     #[default]
     General,
-    /// Compatibility-only reservation: revision-2 native Agent snapshots and
-    /// revision-3 Wasm snapshots may already encode discriminant 1. Removing
-    /// or renumbering it would make committed state undecodable; it does not
-    /// select a special execution or knowledge-loading path.
+    /// Reserved discriminant, not emitted by any current producer (no
+    /// registration path sets a non-General role yet). Kept stable — renumbering
+    /// would make committed state undecodable if a future writer uses it — but it
+    /// selects no special execution or knowledge-loading path.
     ProjectLibrarian,
 }
 
@@ -491,9 +491,9 @@ pub struct ReplyBlock {
 }
 
 /// One run-scoped call to a registered peer agent. The live MCP path is the
-/// primary API; the final response field remains a compatibility path. Runs
-/// derives identity/authority from the caller and accepts only an existing
-/// agent plus a bounded instruction.
+/// primary API; the final response field is the settlement-time path, secondary
+/// to the live agent-call tool. Runs derives identity/authority from the caller
+/// and accepts only an existing agent plus a bounded instruction.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DelegationRequest {
     pub agent_id: String,
@@ -509,7 +509,7 @@ pub struct DelegationRequest {
 }
 
 /// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,
-/// a compatibility-only final delegation batch, and an optional workspace
+/// a settlement-time final delegation batch, and an optional workspace
 /// commit message.
 /// lenient by construction — all fields default, unknown JSON fields are
 /// ignored — so a model answer either IS this shape or the consumer wraps it
@@ -525,9 +525,9 @@ pub struct AgentResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegations: Vec<DelegationRequest>,
     /// complete Git commit message authored by the agent for uncommitted
-    /// workspace changes. Optional for clean and legacy responses; existing
-    /// agent commits keep their own messages. The host owns only safety
-    /// validation, Git identity, and Forge-title recovery.
+    /// workspace changes. Optional; a clean response (no workspace changes) omits
+    /// it; existing agent commits keep their own messages. The host owns only
+    /// safety validation, Git identity, and Forge-title recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_message: Option<String>,
 }
@@ -612,8 +612,8 @@ pub enum AgentMsg {
         display_name: String,
         capability: String,
         allowed_actions: Vec<String>,
-        /// runtime-identity fields. `default` so a submitter's JSON that omits
-        /// them still decodes; the module accepts them unconditionally.
+        /// runtime-identity fields, all optional — a registration that sets none
+        /// omits them; the module accepts them unconditionally.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recipe_hash: Option<Vec<u8>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

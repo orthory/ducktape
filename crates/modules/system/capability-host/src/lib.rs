@@ -224,8 +224,8 @@ impl Eq for RunCancellation {}
 
 /// per-run, host-local context riding beside the prompt: which agent is
 /// running and which conversation thread the run continues. populated by the
-/// worker from the run envelope; legacy envelope-less runs pass
-/// [`RunContext::default`] and behave exactly as before. NEVER consensus
+/// worker from the run envelope; a run with no agent identity uses
+/// [`RunContext::default`]. NEVER consensus
 /// data — providers only use it to pick a workspace dir and a session slot
 /// on this machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -236,9 +236,9 @@ pub struct RunContext {
     /// set by the oracle pool before provider.run so the output sink can key
     /// a per-run ring the app subscribes as run-output:<dispatch_id>.
     pub run_key: Option<String>,
-    /// host-local cancellation for this live run. `None` preserves the legacy
-    /// run-to-completion behavior; cancelling the token terminates the provider
-    /// process tree and any managed Podman container.
+    /// host-local cancellation for this live run. `None` = the run cannot be
+    /// cancelled (runs to completion); cancelling the token terminates the
+    /// provider process tree and any managed Podman container.
     pub cancellation: Option<RunCancellation>,
     /// canonical [`execution_node_id`] of the node running this attempt. Direct
     /// runs may omit it; Podman requires it so lifecycle cleanup can never
@@ -272,7 +272,7 @@ pub struct RunContext {
     /// doors, and the SPEC picks which: a spec declaring `[context]` gets it
     /// written to the file its CLI already auto-loads (see
     /// [`ContextLocation`]); one that declares none gets it prepended to the
-    /// stdin prompt. `None` (a probe or legacy run) means neither door does
+    /// stdin prompt. `None` (no assembled context) means neither door does
     /// anything.
     pub context_doc: Option<String>,
 }
@@ -340,8 +340,8 @@ pub trait Provider: Send + Sync {
     /// stopped and its wait/reap completed. If that proof cannot be obtained,
     /// the implementation must remain pending fail-closed rather than return.
     async fn run(&self, prompt: &str, ctx: &RunContext) -> Result<String, String>;
-    /// the same run plus optional executor-reported usage. legacy/custom
-    /// providers inherit the text-only default without changing their API.
+    /// the same run plus optional executor-reported usage. text-only providers
+    /// inherit the text-only default without changing their API.
     async fn run_with_usage(
         &self,
         prompt: &str,
@@ -6086,7 +6086,7 @@ mode = "persistent"
             "the child ran in the agent's persistent workspace"
         );
 
-        // a second agent gets its own dir; a context-less (legacy) run stays
+        // a second agent gets its own dir; a context-less run stays
         // in the scratch dir even though the spec says persistent.
         let other = p.run("q", &agent_ctx("other", "t#1")).await.unwrap();
         assert_eq!(
@@ -6284,7 +6284,7 @@ fi"#,
             "cold"
         );
 
-        // a context-less legacy run has no session identity: cold, no store
+        // a context-less run has no session identity: cold, no store
         // beyond the two thread slots.
         assert_eq!(p.run("q", &RunContext::default()).await.unwrap(), "cold");
     }

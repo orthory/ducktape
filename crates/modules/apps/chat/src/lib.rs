@@ -409,9 +409,9 @@ impl Chat {
     }
 
     /// authorize a channel-admin op (rename/archive). an owned channel admits
-    /// only its owner among `User` origins; a legacy owner-less channel admits
-    /// any user, mirroring `SetMembership`'s trust posture; module/agent/system
-    /// origins are genesis-fixed trusted code and always pass.
+    /// only its owner among `User` origins; an unowned (module/system-minted)
+    /// channel admits any user, mirroring `SetMembership`'s trust posture;
+    /// module/agent/system origins are genesis-fixed trusted code and always pass.
     fn check_channel_admin(channel: &Channel, author: &AuthorRef) -> Result<(), Error> {
         match author {
             AuthorRef::User(user) => match &channel.owner {

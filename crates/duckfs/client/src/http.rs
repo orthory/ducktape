@@ -112,7 +112,6 @@ struct BlockSummaryWire {
 #[derive(Deserialize)]
 struct PageWire {
     entries: Vec<EntryInfo>,
-    #[serde(default)]
     next: Option<String>,
 }
 

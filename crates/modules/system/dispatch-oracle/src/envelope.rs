@@ -39,11 +39,9 @@ pub const RUN_ENVELOPE_VERSION: u64 = 3;
 pub const RUNNER_RESULT_VERSION: u64 = 1;
 
 /// the wire shape shared by supported envelopes. field ORDER is the composer's
-/// business (committed bytes); decoding here is by name. unknown fields are
-/// tolerated on purpose — an ADDITIVE field under the same version must not
-/// kill in-flight runs mid-upgrade; semantic changes bump the marker instead.
-/// `ducktape_run` is validated before this body is deserialized, so the marker
-/// is intentionally absent here.
+/// business (committed bytes); decoding here is by name. serde ignores unknown
+/// fields on this tagged shape. `ducktape_run` is validated before this body is
+/// deserialized, so the marker is intentionally absent here.
 #[derive(Deserialize)]
 struct WireEnvelope {
     agent_id: String,
@@ -73,10 +71,9 @@ struct WireEnvelope {
     /// the committed `duckfs_read` verdict on the global skill library: the
     /// composer asks the agent's record (`agent::AgentRecord::library_readable`)
     /// and states the answer here, because the host has no consensus registry to
-    /// ask. defaulted `false` — an envelope that never stated the grant cannot
-    /// have earned it, and the paragraph it gates would only send the agent at a
-    /// door the tool plane refuses.
-    #[serde(default)]
+    /// ask. required (the composer always states it) — an envelope that never
+    /// stated the grant cannot have earned it, and the paragraph it gates would
+    /// only send the agent at a door the tool plane refuses.
     library_readable: bool,
     result_contract: Option<WireResultContract>,
 }
@@ -92,9 +89,8 @@ struct WireSkill {
     source_snapshot: Option<String>,
     /// the committed load mode (`SkillRef::load`): `true` = this skill's full
     /// body is INLINED into the run's context document — the agent's persona
-    /// lives here now that `prompt_hash` is retired. defaulted so the field is
-    /// additive: an unset mode is on-demand (indexed, not inlined).
-    #[serde(default)]
+    /// lives here now that `prompt_hash` is retired. required: `false` =
+    /// on-demand (indexed, not inlined), `true` = inlined.
     always: bool,
 }
 
@@ -302,8 +298,9 @@ mod tests {
                 "source_snapshot": "aa".repeat(32)
             },
             "skills": [
-                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32)}
+                {"name":"release","source_prefix":"/shared/skills/release","source_snapshot": "bb".repeat(32), "always": false}
             ],
+            "library_readable": false,
             "result_contract": {"ducktape_runner_result": 1}
         })
         .to_string()
@@ -332,6 +329,7 @@ mod tests {
                 "forge_push": true
             },
             "skills": [],
+            "library_readable": false,
             "result_contract": {
                 "ducktape_runner_result": 1,
                 "sink": {"mode":"pr","repo":"app","source_branch":"agent/item-7","target_branch":"main"}
@@ -497,13 +495,13 @@ mod tests {
     #[test]
     fn the_load_mode_rides_each_skill_into_the_plan_in_curation_order() {
         // the soul's whole shape depends on these two bits: WHICH skills inline
-        // (the persona) and in WHAT order (curation). an unset mode is
-        // on-demand — additive, and the safe default (indexed, not inlined).
+        // (the persona) and in WHAT order (curation). `always:false` is
+        // on-demand (indexed, not inlined); `always:true` inlines.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["skills"] = serde_json::json!([
             {"name":"persona","source_prefix":"/shared/skills/persona","always":true},
             {"name":"release","source_prefix":"/shared/skills/release","always":false},
-            {"name":"legacy","source_prefix":"/shared/skills/legacy"},
+            {"name":"legacy","source_prefix":"/shared/skills/legacy","always":false},
         ]);
         let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
         let modes: Vec<(&str, bool)> = workspace
@@ -514,16 +512,16 @@ mod tests {
         assert_eq!(
             modes,
             vec![("persona", true), ("release", false), ("legacy", false)],
-            "curation order survives verbatim, and a mode-less skill is on-demand"
+            "curation order survives verbatim, and always:false is on-demand"
         );
     }
 
     /// the library grant crosses the wall as plain data: consensus decided it
     /// (the agent's `duckfs_read` caps), and the plan carries it to the
     /// assembler, which is what decides whether the run is ever TOLD the shared
-    /// library exists. an envelope that never stated it defaults to DENIED —
-    /// advertising a door the tool plane would refuse is the one outcome this
-    /// field exists to prevent.
+    /// library exists. a `false` grant means the run is never pointed at the
+    /// library — advertising a door the tool plane would refuse is the one
+    /// outcome this field exists to prevent.
     #[test]
     fn the_library_read_grant_rides_the_envelope_into_the_plan() {
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
@@ -531,12 +529,12 @@ mod tests {
         let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
         assert!(workspace.library_readable);
 
-        // the composer's own default (an agent with no grant) and a pre-field
-        // envelope are the same wire: no key.
+        // the composer stating `false` (an agent with no grant) rides through
+        // as false.
         let Prepared { workspace, .. } = prepare(&envelope_json()).unwrap();
         assert!(
             !workspace.library_readable,
-            "an unstated grant is no grant: the run is never pointed at the library"
+            "a false grant is no grant: the run is never pointed at the library"
         );
     }
 
@@ -630,24 +628,6 @@ mod tests {
             }
         );
         assert!(workspace.skills.is_empty());
-    }
-
-    #[test]
-    fn an_old_forge_envelope_cannot_gain_push_authority() {
-        let mut envelope: serde_json::Value = serde_json::from_str(&forge_envelope_json()).unwrap();
-        envelope["workspace"]
-            .as_object_mut()
-            .unwrap()
-            .remove("forge_push");
-
-        let prepared = prepare(&envelope.to_string()).unwrap();
-        assert!(matches!(
-            prepared.workspace.source,
-            crate::workspace_source::WorkspaceSource::Forge {
-                forge_push: false,
-                ..
-            }
-        ));
     }
 
     #[test]
