@@ -124,11 +124,25 @@ fn signed_airlock_route(
     publisher: &[u8],
     revision: u64,
 ) -> GatewayMsg {
+    signed_loopback_route(member, chain, publisher, "airlock", revision, 4 * 1024 * 1024, true)
+}
+
+/// A member-signed LoopbackHttp route. `max_response_bytes == 0` = unbounded
+/// streaming (SSE).
+fn signed_loopback_route(
+    member: &ed25519::PrivateKey,
+    chain: &str,
+    publisher: &[u8],
+    name: &str,
+    revision: u64,
+    max_response_bytes: u64,
+    allow_authorization: bool,
+) -> GatewayMsg {
     let statement = RouteStatement {
         version: 1,
         chain_id: chain.into(),
         account_id: member.public_key().as_ref().to_vec(),
-        name: RouteName::named("airlock"),
+        name: RouteName::named(name),
         publisher_node: publisher.to_vec(),
         revision,
         route: Some(RouteDefinition {
@@ -137,8 +151,8 @@ fn signed_airlock_route(
                 audience: RouteAudience::Network,
                 methods: vec![RouteMethod::Get, RouteMethod::Head, RouteMethod::Post],
                 max_request_bytes: 1024 * 1024,
-                max_response_bytes: 4 * 1024 * 1024,
-                allow_authorization: true,
+                max_response_bytes,
+                allow_authorization,
                 allow_upgrade: false,
             },
         }),
@@ -160,12 +174,16 @@ fn signed_airlock_route(
 }
 
 fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> Option<u64> {
+    route_revision(cluster, reader, account, "airlock")
+}
+
+fn route_revision(cluster: &Cluster, reader: usize, account: &[u8], name: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
         &gateway::encode_query(&GatewayQuery::Get {
             account_id: account.to_vec(),
-            name: RouteName::named("airlock"),
+            name: RouteName::named(name),
         }),
     )?;
     match gateway::decode_reply(&bytes).ok()? {
@@ -530,6 +548,238 @@ fn airlock_single_node_self_serves_its_own_route() {
     assert!(
         reply.1.contains("AIRLOCK-OK"),
         "the swapped credential's reply must return: {reply:?}"
+    );
+}
+
+/// Streamed SSE through the gateway frame wire on one real node, plus the
+/// running response cap. The upstream sends ONE chunk and then BLOCKS until
+/// the client has read it — a buffered proxy cannot pass this (it would
+/// deadlock waiting for the body to end), so success proves end-to-end
+/// streaming through browser door -> duplex frame wire -> loopback upstream.
+#[test]
+fn gateway_streams_and_caps_over_the_frame_wire() {
+    let _serial = serial();
+    let rt = Runtime::new().unwrap();
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = 6 * 1024 * 1024; // > the old 4 MiB buffered ceiling
+
+    // Upstream: /events streams TOTAL bytes but holds after the first chunk
+    // until the client releases the gate; /flood streams 1 MiB ungated.
+    let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+    let upstream = {
+        let gate = gate.clone();
+        rt.block_on(async move {
+            use axum::routing::get;
+            let events = move || {
+                let gate = gate.clone();
+                async move {
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+                    tokio::spawn(async move {
+                        let chunk = bytes::Bytes::from(vec![b'a'; CHUNK]);
+                        if tx.send(Ok(chunk.clone())).await.is_err() {
+                            return;
+                        }
+                        gate.notified().await; // the CLIENT read the first chunk
+                        for _ in 0..(TOTAL / CHUNK - 1) {
+                            if tx.send(Ok(chunk.clone())).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                    (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(
+                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                        ),
+                    )
+                }
+            };
+            // Sized overflow: Content-Length is declared, so the proxy can
+            // refuse BEFORE the head (502) instead of truncating.
+            let flood = || async {
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from(vec![b'b'; 1024 * 1024]),
+                )
+            };
+            // Unsized overflow: chunked, no Content-Length — the head commits,
+            // then the RUNNING cap truncates the body mid-stream.
+            let flood_chunked = || async {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+                tokio::spawn(async move {
+                    let chunk = bytes::Bytes::from(vec![b'c'; CHUNK]);
+                    for _ in 0..16 {
+                        if tx.send(Ok(chunk.clone())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                )
+            };
+            bind_and_serve(
+                Router::new()
+                    .route("/events", get(events))
+                    .route("/flood", get(flood))
+                    .route("/flood-chunked", get(flood_chunked)),
+            )
+            .await
+        })
+    };
+    let upstream_port: u16 = upstream.rsplit(':').next().unwrap().parse().unwrap();
+
+    let mut cluster = Cluster::new(&[0], &[0]);
+    cluster.wireguard = true;
+    cluster.wireguard_socket = true;
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", READY);
+    cluster.wait_marker(0, "converged app_hash=", READY);
+    cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
+
+    let alice = ed25519::PrivateKey::from_seed(42);
+    let alice_node = Cluster::identity(0);
+    cluster.submit(
+        0,
+        "identity",
+        &identity::encode_msg(&IdentityMsg::BindNode {
+            authorizer: bind_auth(&alice, &cluster.namespace, &alice_node),
+        }),
+    );
+    poll_until("identity binding", FINALIZE, || {
+        account_of_node(&cluster, 0, &alice_node)
+            .filter(|account| account.account_id == alice.public_key().as_ref())
+    });
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle { handle: Some("alice".into()) }),
+    );
+    poll_until("alice.duck resolution", FINALIZE, || resolve_handle(&cluster, 0, "alice"));
+
+    let workspace = cluster.workspace(0);
+    for label in ["sse", "capped"] {
+        let (ok, output) = cluster.run_verb(&[
+            "gateway-route-bind",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--label",
+            label,
+            "--port",
+            &upstream_port.to_string(),
+        ]);
+        assert!(ok, "{label} port bind failed: {output}");
+    }
+    // "sse": max_response_bytes 0 = unbounded stream; "capped": 64 KiB cap.
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_loopback_route(
+            &alice,
+            &cluster.namespace,
+            &alice_node,
+            "sse",
+            1,
+            0,
+            false,
+        )),
+    );
+    cluster.submit(
+        0,
+        "gateway",
+        &gateway::encode_msg(&signed_loopback_route(
+            &alice,
+            &cluster.namespace,
+            &alice_node,
+            "capped",
+            1,
+            CHUNK as u64,
+            false,
+        )),
+    );
+    poll_until("both routes live", FINALIZE, || {
+        (route_revision(&cluster, 0, alice.public_key().as_ref(), "sse") == Some(1)
+            && route_revision(&cluster, 0, alice.public_key().as_ref(), "capped") == Some(1))
+        .then_some(())
+    });
+
+    let (status, browser) = cluster.http(0, "GET", "/v1/gateway/browser", None);
+    assert_eq!(status, 200, "browser base failed: {browser}");
+    let via = browser["base"].as_str().unwrap().to_string();
+
+    // Unbounded stream: 6 MiB arrives; the first chunk is READ before the
+    // upstream is allowed to send the rest.
+    let total = rt.block_on({
+        let via = via.clone();
+        let gate = gate.clone();
+        async move {
+            use futures::StreamExt as _;
+            let resp = reqwest::Client::new()
+                .get(format!("{via}/events"))
+                .header("x-duck-authority", "sse.alice.duck")
+                .send()
+                .await
+                .expect("streamed GET through the gateway");
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            let mut stream = resp.bytes_stream();
+            let first = stream.next().await.expect("first chunk").expect("first chunk ok");
+            assert!(!first.is_empty());
+            gate.notify_one(); // only now may the upstream finish
+            let mut total = first.len();
+            while let Some(chunk) = stream.next().await {
+                total += chunk.expect("streamed chunk").len();
+            }
+            total
+        }
+    });
+    assert_eq!(total, TOTAL, "the full 6 MiB must stream through the frame wire");
+
+    // Sized overflow (Content-Length declared): refused BEFORE the head.
+    let sized_status = rt.block_on({
+        let via = via.clone();
+        async move {
+            reqwest::Client::new()
+                .get(format!("{via}/flood"))
+                .header("x-duck-authority", "capped.alice.duck")
+                .send()
+                .await
+                .expect("sized capped GET through the gateway")
+                .status()
+        }
+    });
+    assert_eq!(
+        sized_status,
+        reqwest::StatusCode::BAD_GATEWAY,
+        "a declared over-cap length is refused pre-head"
+    );
+
+    // Unsized overflow: the head commits, then the RUNNING cap truncates.
+    let (status, received) = rt.block_on(async move {
+        use futures::StreamExt as _;
+        let resp = reqwest::Client::new()
+            .get(format!("{via}/flood-chunked"))
+            .header("x-duck-authority", "capped.alice.duck")
+            .send()
+            .await
+            .expect("capped GET through the gateway");
+        let status = resp.status();
+        let mut received = 0usize;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => received += chunk.len(),
+                Err(_) => break, // aborted mid-body = the truncation contract
+            }
+        }
+        (status, received)
+    });
+    assert_eq!(status, reqwest::StatusCode::OK, "the head commits before the cap trips");
+    assert!(
+        received < 16 * CHUNK,
+        "the running cap must truncate the body ({received} bytes made it through)"
     );
 }
 
