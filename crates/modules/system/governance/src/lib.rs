@@ -77,11 +77,9 @@ struct Proposal {
     deadline: u64,
     status: ProposalStatus,
     votes: BTreeMap<Vec<u8>, bool>,
-    /// `None` only for a proposal decoded from a pre-share (pre-`AdoptShares`)
-    /// snapshot — inert tolerance no current flag-day network emits. Pending
-    /// removal in a dedicated re-genesis PR (it restructures the two-phase
-    /// snapshot decoder on the voting path, so it does not ride a doc sweep).
-    electorate: Option<Electorate>,
+    /// the electorate and rule frozen at `Propose` — every proposal has one, so
+    /// later mode/membership/share changes cannot move its decision boundary.
+    electorate: Electorate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,18 +470,7 @@ impl Governance {
     }
 
     fn view_of(id: &str, p: &Proposal) -> ProposalView {
-        let (voter_kind, electorate, voting_rule) = match &p.electorate {
-            Some(e) => (
-                e.voter_kind,
-                e.powers.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-                e.rule,
-            ),
-            None => (
-                VoterKind::ValidatorNode,
-                Vec::new(),
-                VotingRule::DynamicValidatorMajority,
-            ),
-        };
+        let electorate = &p.electorate;
         ProposalView {
             proposal_id: id.to_string(),
             action: p.action.clone(),
@@ -492,9 +479,9 @@ impl Governance {
             deadline: p.deadline,
             status: p.status,
             votes: p.votes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-            voter_kind,
-            electorate,
-            voting_rule,
+            voter_kind: electorate.voter_kind,
+            electorate: electorate.powers.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            voting_rule: electorate.rule,
         }
     }
 
@@ -635,11 +622,10 @@ impl Governance {
             push_bytes(&mut out, &r.issuer);
             out.extend_from_slice(&r.height.to_le_bytes());
         }
-        let frozen: Vec<(&String, &Electorate)> = proposals
-            .iter()
-            .filter_map(|(id, proposal)| proposal.electorate.as_ref().map(|e| (id, e)))
-            .collect();
-        if shares.is_some() || !frozen.is_empty() || share_mode {
+        // every proposal freezes its electorate, so the extension carries one
+        // record per proposal. it rides whenever there is anything to persist:
+        // a proposal (hence its electorate), a share registry, or a mode flag.
+        if shares.is_some() || !proposals.is_empty() || share_mode {
             out.extend_from_slice(SHARES_EXT_MAGIC);
             out.push(1); // extension version
             match shares {
@@ -653,15 +639,15 @@ impl Governance {
                 }
                 None => out.push(0),
             }
-            out.extend_from_slice(&(frozen.len() as u64).to_le_bytes());
-            for (id, electorate) in frozen {
+            out.extend_from_slice(&(proposals.len() as u64).to_le_bytes());
+            for (id, proposal) in proposals {
+                let electorate = &proposal.electorate;
                 push_bytes(&mut out, id.as_bytes());
                 out.push(match electorate.voter_kind {
                     VoterKind::ValidatorNode => 0,
                     VoterKind::Account => 1,
                 });
                 match electorate.rule {
-                    VotingRule::DynamicValidatorMajority => out.push(0),
                     VotingRule::Threshold { required_yes } => {
                         out.push(1);
                         out.extend_from_slice(&required_yes.to_le_bytes());
@@ -917,7 +903,7 @@ impl Governance {
                 deadline,
                 status: ProposalStatus::Open,
                 votes: BTreeMap::new(),
-                electorate: Some(electorate),
+                electorate,
             },
         );
         Ok(())
@@ -940,50 +926,32 @@ impl Governance {
             return Err(Error::Module("voting closed at the deadline".into()));
         }
         let submitter = Self::external_origin(ctx)?;
+        let electorate = &proposal.electorate;
         // the ballots this op casts, by the proposal's frozen principal kind.
-        let voters: Vec<Vec<u8>> = match &proposal.electorate {
-            Some(electorate) => match electorate.voter_kind {
-                // node-keyed ballots (N validators = N votes): a submitter in
-                // the frozen electorate casts its own; an account member's op
-                // casts EVERY bound node still in the electorate — the same
-                // power the account held when each node voted for itself.
-                VoterKind::ValidatorNode => {
-                    let voters = self
-                        .node_ballots(ctx, &submitter, &|node| electorate.powers.contains_key(node))
-                        .await?;
-                    if voters.is_empty() {
-                        return Err(Error::Module(
-                            "submitter is not a member of this proposal's frozen electorate"
-                                .into(),
-                        ));
-                    }
-                    voters
-                }
-                VoterKind::Account => {
-                    let principal = self.account_principal(ctx, &submitter).await?;
-                    if !electorate.powers.contains_key(&principal) {
-                        return Err(Error::Module(
-                            "submitter is not a member of this proposal's frozen electorate"
-                                .into(),
-                        ));
-                    }
-                    vec![principal]
-                }
-            },
-            // pre-share snapshot proposals (inert; no current network emits
-            // them): the electorate is the CURRENT member set, same node-keyed
-            // treatment.
-            None => {
-                let members = self.members(ctx).await?;
+        let voters: Vec<Vec<u8>> = match electorate.voter_kind {
+            // node-keyed ballots (N validators = N votes): a submitter in the
+            // frozen electorate casts its own; an account member's op casts
+            // EVERY bound node still in the electorate — the same power the
+            // account held when each node voted for itself.
+            VoterKind::ValidatorNode => {
                 let voters = self
-                    .node_ballots(ctx, &submitter, &|node| members.iter().any(|m| m == node))
+                    .node_ballots(ctx, &submitter, &|node| electorate.powers.contains_key(node))
                     .await?;
                 if voters.is_empty() {
                     return Err(Error::Module(
-                        "submitter is not a current validator-set member".into(),
+                        "submitter is not a member of this proposal's frozen electorate".into(),
                     ));
                 }
                 voters
+            }
+            VoterKind::Account => {
+                let principal = self.account_principal(ctx, &submitter).await?;
+                if !electorate.powers.contains_key(&principal) {
+                    return Err(Error::Module(
+                        "submitter is not a member of this proposal's frozen electorate".into(),
+                    ));
+                }
+                vec![principal]
             }
         };
         // Re-voting overwrites by frozen principal. Two nodes bound to one
@@ -1009,48 +977,20 @@ impl Governance {
             return Err(Error::Module("proposal is settled".into()));
         }
 
-        let mut current_members = None;
-        let (yes, no, total, rule) = match &proposal.electorate {
-            Some(electorate) => {
-                let mut yes = 0u64;
-                let mut no = 0u64;
-                for (principal, power) in &electorate.powers {
-                    match proposal.votes.get(principal) {
-                        Some(true) => yes += power,
-                        Some(false) => no += power,
-                        None => {}
-                    }
-                }
-                (
-                    yes,
-                    no,
-                    Self::total_power(&electorate.powers)?,
-                    electorate.rule,
-                )
+        let electorate = &proposal.electorate;
+        let mut yes = 0u64;
+        let mut no = 0u64;
+        for (principal, power) in &electorate.powers {
+            match proposal.votes.get(principal) {
+                Some(true) => yes += power,
+                Some(false) => no += power,
+                None => {}
             }
-            None => {
-                // Inert path for a proposal restored from a pre-share snapshot
-                // shape: retain its execution-time validator tally.
-                let members = self.members(ctx).await?;
-                let yes = members
-                    .iter()
-                    .filter(|member| proposal.votes.get(*member) == Some(&true))
-                    .count() as u64;
-                let no = members
-                    .iter()
-                    .filter(|member| proposal.votes.get(*member) == Some(&false))
-                    .count() as u64;
-                let total = members.len() as u64;
-                current_members = Some(members);
-                (yes, no, total, VotingRule::DynamicValidatorMajority)
-            }
-        };
+        }
+        let total = Self::total_power(&electorate.powers)?;
+        let rule = electorate.rule;
 
         let (passes, decidable_early) = match rule {
-            VotingRule::DynamicValidatorMajority => {
-                let required_yes = total / 2 + 1;
-                (yes >= required_yes, yes >= required_yes)
-            }
             VotingRule::Threshold { required_yes } => (yes >= required_yes, yes >= required_yes),
             VotingRule::ParticipatingMajority { quorum } => {
                 let participation = yes + no;
@@ -1085,10 +1025,7 @@ impl Governance {
                     // authoritatively (returning an Err that would abort the WHOLE
                     // block), so we pre-check here and cleanly REJECT the proposal
                     // instead — the happy path never emits a set-emptying Leave.
-                    let members = match &current_members {
-                        Some(members) => members.clone(),
-                        None => self.members(ctx).await?,
-                    };
+                    let members = self.members(ctx).await?;
                     if members.iter().all(|m| m == key) {
                         proposal.status = ProposalStatus::Rejected;
                     } else {
@@ -1504,13 +1441,28 @@ type DecodedState = (
     bool,
 );
 
+/// a proposal decoded from the snapshot's proposal section — everything but the
+/// frozen electorate, which rides the later share-extension section. every
+/// proposal must be paired with exactly one electorate before it becomes a
+/// `Proposal`; one the extension does not name is refused (no network freezes a
+/// proposal without an electorate).
+struct PendingProposal {
+    action: GovAction,
+    proposer: Vec<u8>,
+    created_at: u64,
+    deadline: u64,
+    status: ProposalStatus,
+    votes: BTreeMap<Vec<u8>, bool>,
+}
+
 fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
     let mut cur = Cursor::new(bytes);
     let count = cur.u64("snapshot proposal count")?;
     // every proposal costs at least its id length prefix — a forged count can
     // never drive allocation past the buffer.
     cur.bound(count, 8, "snapshot proposal")?;
-    let mut proposals = BTreeMap::new();
+    // phase 1: the proposal section, sans electorate (see `PendingProposal`).
+    let mut pending: BTreeMap<String, PendingProposal> = BTreeMap::new();
     let mut prev_id: Option<String> = None;
     for _ in 0..count {
         let id = cur.string("snapshot proposal id")?;
@@ -1624,16 +1576,15 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             votes.insert(voter, approve);
         }
         prev_id = Some(id.clone());
-        proposals.insert(
+        pending.insert(
             id,
-            Proposal {
+            PendingProposal {
                 action,
                 proposer,
                 created_at,
                 deadline,
                 status,
                 votes,
-                electorate: None,
             },
         );
     }
@@ -1663,6 +1614,10 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
         );
     }
 
+    // phase 2: the share extension carries the registry, the mode flag, and
+    // EVERY proposal's frozen electorate. an absent extension is legal only
+    // when there is nothing to carry (no proposals, no shares, no share mode).
+    let mut electorates: BTreeMap<String, Electorate> = BTreeMap::new();
     let (shares, share_mode) = if cur.remaining() == 0 {
         (None, false)
     } else {
@@ -1715,7 +1670,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
         };
 
         let meta_count = cur.u64("snapshot electorate count")?;
-        if meta_count > proposals.len() as u64 {
+        if meta_count > pending.len() as u64 {
             return Err(Error::Module(
                 "snapshot has more electorates than proposals".into(),
             ));
@@ -1740,8 +1695,9 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                     )));
                 }
             };
+            // tag 0 is retired with the dynamic-validator rule: it no longer
+            // names a rule, so it is refused here like any other bad tag.
             let rule = match cur.byte("snapshot voting-rule tag")? {
-                0 => VotingRule::DynamicValidatorMajority,
                 1 => VotingRule::Threshold {
                     required_yes: cur.u64("snapshot required_yes")?,
                 },
@@ -1784,11 +1740,6 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             }
             let total = Governance::total_power(&powers)?;
             match rule {
-                VotingRule::DynamicValidatorMajority => {
-                    return Err(Error::Module(
-                        "snapshot cannot freeze a dynamic voting rule".into(),
-                    ));
-                }
                 VotingRule::Threshold { required_yes }
                     if required_yes == 0 || required_yes > total =>
                 {
@@ -1803,8 +1754,8 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                 }
                 _ => {}
             }
-            let proposal = proposals
-                .get_mut(&id)
+            let proposal = pending
+                .get(&id)
                 .ok_or_else(|| Error::Module("snapshot electorate names no proposal".into()))?;
             if proposal
                 .votes
@@ -1815,11 +1766,14 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                     "snapshot ballot is outside its frozen electorate".into(),
                 ));
             }
-            proposal.electorate = Some(Electorate {
-                voter_kind,
-                powers,
-                rule,
-            });
+            electorates.insert(
+                id.clone(),
+                Electorate {
+                    voter_kind,
+                    powers,
+                    rule,
+                },
+            );
             previous_id = Some(id);
         }
         let share_mode = if cur.remaining() == 0 {
@@ -1837,5 +1791,84 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
         (shares, share_mode)
     };
     cur.finish("snapshot")?;
+    // assemble: pair every proposal with its frozen electorate. there is no
+    // dynamic-electorate fallback — a proposal the extension did not name is
+    // refused here (the retired `electorate: None` shape).
+    let mut proposals = BTreeMap::new();
+    for (id, p) in pending {
+        let electorate = electorates
+            .remove(&id)
+            .ok_or_else(|| Error::Module("snapshot proposal has no frozen electorate".into()))?;
+        proposals.insert(
+            id,
+            Proposal {
+                action: p.action,
+                proposer: p.proposer,
+                created_at: p.created_at,
+                deadline: p.deadline,
+                status: p.status,
+                votes: p.votes,
+                electorate,
+            },
+        );
+    }
     Ok((proposals, redeemed, shares, share_mode))
+}
+
+#[cfg(test)]
+mod dead_electorate_refusal {
+    //! the retired dynamic-validator path — `electorate: None` /
+    //! `VotingRule::DynamicValidatorMajority` — must be UNREACHABLE. these craft
+    //! the two shapes the old decoder tolerated and prove the new one refuses
+    //! both, so no snapshot can resurrect the dynamic electorate.
+    use super::*;
+
+    /// the proposal section without the share extension that carries frozen
+    /// electorates: the pre-share shape that used to decode to `electorate:
+    /// None`. it must be refused now — every proposal freezes an electorate.
+    fn one_proposal_no_extension() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one proposal
+        push_bytes(&mut bytes, b"p"); // proposal id
+        bytes.push(2); // Signal action tag
+        push_bytes(&mut bytes, b"x"); // signal text
+        push_bytes(&mut bytes, &[0u8; 32]); // proposer
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // created_at
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // deadline
+        bytes.push(0); // status Open
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // vote count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // redemption count
+        bytes
+    }
+
+    #[test]
+    fn a_proposal_without_a_frozen_electorate_is_refused() {
+        let err = decode_state(&one_proposal_no_extension())
+            .expect_err("a proposal with no frozen electorate must not decode");
+        assert!(
+            matches!(&err, Error::Module(m) if m.contains("no frozen electorate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_retired_dynamic_voting_rule_tag_is_refused() {
+        // the same proposal, this time WITH an extension that tags its frozen
+        // electorate with the retired dynamic rule (tag 0). the tag no longer
+        // names a rule, so decode refuses it before reading powers.
+        let mut bytes = one_proposal_no_extension();
+        bytes.extend_from_slice(SHARES_EXT_MAGIC); // extension magic
+        bytes.push(1); // extension version
+        bytes.push(0); // share-active flag: no registry
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one electorate record
+        push_bytes(&mut bytes, b"p"); // names the proposal
+        bytes.push(0); // voter_kind ValidatorNode
+        bytes.push(0); // voting-rule tag 0 — the retired dynamic rule
+        let err = decode_state(&bytes)
+            .expect_err("the retired dynamic voting-rule tag must not decode");
+        assert!(
+            matches!(&err, Error::Module(m) if m.contains("bad voting-rule tag")),
+            "unexpected error: {err:?}"
+        );
+    }
 }
