@@ -2286,11 +2286,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dispatch",
- "modreg",
+ "lifecycle",
  "sdk",
  "sha2",
  "tracing",
- "upgrade",
 ]
 
 [[package]]
@@ -2733,6 +2732,7 @@ dependencies = [
  "kv",
  "revm",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
@@ -2759,6 +2759,18 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "lifecycle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+ "valset",
+]
 
 [[package]]
 name = "linux-raw-sys"
@@ -2829,18 +2841,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys",
-]
-
-[[package]]
-name = "modreg"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
- "valset",
 ]
 
 [[package]]
@@ -4035,6 +4035,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdk-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "sdk",
+ "sha2",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4898,18 +4907,6 @@ name = "untrusted"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
-
-[[package]]
-name = "upgrade"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "sdk",
- "serde",
- "serde_json",
- "sha2",
- "valset",
-]
 
 [[package]]
 name = "url"
