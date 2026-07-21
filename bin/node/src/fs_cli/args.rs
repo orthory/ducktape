@@ -45,7 +45,10 @@ impl CliError {
 
 /// the flag this token names, if any: the one short alias `-n` (→ `network`,
 /// the workspace selector shared with the node family) or any `--long` flag. a
-/// positional (a duckfs path, a flag's value) names none.
+/// positional (a duckfs path, a flag's value) names none. the flag test must
+/// recognize `-n` too, else a `-n` sitting right after a value-less flag is
+/// silently eaten as its ignored value and the network is dropped (a value never
+/// begins with `-`).
 fn flag_name(tok: &str) -> Option<&str> {
     match tok {
         "-n" => Some("network"),
@@ -53,13 +56,19 @@ fn flag_name(tok: &str) -> Option<&str> {
     }
 }
 
+/// flags that take NO value — a bare presence is the whole signal, so they never
+/// consume the following token even when it is a positional (`ls --json <path>`
+/// keeps `<path>` positional, `commit --no-rebase <dir>` keeps `<dir>`
+/// positional). every other flag consumes the next token unless that token is
+/// itself a flag.
+const BOOL_FLAGS: &[&str] = &["json", "no-rebase"];
+
 /// split `args` into positionals and `--key value` flags. a flag consumes the
-/// next token as its value UNLESS that token is itself a flag, in which case it
-/// is a value-less boolean (`--no-rebase`) recorded as an empty string — so both
-/// `commit --no-rebase --message m` AND `commit --no-rebase -n net` parse
-/// correctly. the flag test must recognize `-n` too, else a `-n` sitting right
-/// after `--no-rebase` is silently eaten as its ignored value and the network is
-/// dropped (a value never begins with `-`).
+/// next token as its value UNLESS the flag is a known valueless boolean
+/// ([`BOOL_FLAGS`]) or the next token is itself a flag (recognized via
+/// [`flag_name`], so `-n` counts), in which case the value is an empty string —
+/// so `commit --no-rebase --message m`, `commit --no-rebase -n net`, `commit
+/// --no-rebase <dir>`, and `ls --json <path>` all parse correctly.
 pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, String>), CliError> {
     let mut positional = Vec::new();
     let mut flags = BTreeMap::new();
@@ -69,8 +78,9 @@ pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, Str
             positional.push(a.clone());
             continue;
         };
+        let is_bool_flag = BOOL_FLAGS.contains(&name);
         let next_is_value = it.peek().is_some_and(|next| flag_name(next).is_none());
-        let value = if next_is_value {
+        let value = if !is_bool_flag && next_is_value {
             it.next().cloned().unwrap_or_default()
         } else {
             String::new()
@@ -138,6 +148,10 @@ mod tests {
             .collect()
     }
 
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn dash_n_maps_to_network_and_leaves_positionals() {
         let (pos, f) = parse_flags(&["-n".into(), "ducktape".into(), "some/path".into()]).unwrap();
@@ -176,5 +190,43 @@ mod tests {
             resolve_node_addr(&f).unwrap(),
             Some("http://explicit:8844".to_string())
         );
+    }
+
+    #[test]
+    fn value_flag_consumes_next_token() {
+        let (pos, flags) = parse_flags(&args(&["/p", "--snapshot", "s1"])).unwrap();
+        assert_eq!(pos, vec!["/p".to_string()]);
+        assert_eq!(flags.get("snapshot").map(String::as_str), Some("s1"));
+    }
+
+    #[test]
+    fn json_before_positional_does_not_eat_it() {
+        // `ls --json <path>` — --json must NOT swallow the path.
+        let (pos, flags) = parse_flags(&args(&["--json", "/dir"])).unwrap();
+        assert!(flags.contains_key("json"));
+        assert_eq!(pos, vec!["/dir".to_string()]);
+    }
+
+    #[test]
+    fn json_as_last_arg() {
+        let (pos, flags) = parse_flags(&args(&["/dir", "--json"])).unwrap();
+        assert!(flags.contains_key("json"));
+        assert_eq!(pos, vec!["/dir".to_string()]);
+    }
+
+    #[test]
+    fn no_rebase_before_positional_does_not_eat_it() {
+        // `commit --no-rebase <dir>` — --no-rebase is valueless, <dir> stays positional.
+        let (pos, flags) = parse_flags(&args(&["--no-rebase", "mydir"])).unwrap();
+        assert!(flags.contains_key("no-rebase"));
+        assert_eq!(pos, vec!["mydir".to_string()]);
+    }
+
+    #[test]
+    fn no_rebase_between_value_flags() {
+        let (pos, flags) = parse_flags(&args(&["--no-rebase", "--message", "hi"])).unwrap();
+        assert!(pos.is_empty());
+        assert!(flags.contains_key("no-rebase"));
+        assert_eq!(flags.get("message").map(String::as_str), Some("hi"));
     }
 }
