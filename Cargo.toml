@@ -44,7 +44,7 @@
 resolver = "2"
 members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
-    "crates/kernel/sdk", "crates/kernel/host",
+    "crates/kernel/sdk", "crates/kernel/sdk-testkit", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/wasm-host",
@@ -187,6 +187,10 @@ wasmtime = "=46.0.1"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
+# dev-only shared test doubles for the sdk boundary traits (TestCtx +
+# in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
+# the Module Rule (modules link only sdk + wire surfaces) is untouched.
+sdk-testkit = { path = "crates/kernel/sdk-testkit" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }

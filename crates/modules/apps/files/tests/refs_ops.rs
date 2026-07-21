@@ -66,7 +66,7 @@ fn exec(
     h: u64,
     op: sdk::Msg,
 ) -> Result<TestCtx, sdk::Error> {
-    let mut ctx = TestCtx::new(origin, h);
+    let mut ctx = test_ctx(origin, h);
     futures::executor::block_on(f.execute(&mut ctx, &op))?;
     Ok(ctx)
 }
@@ -456,7 +456,7 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     .expect("commit under a different top-level name");
     commit_block(&mut f);
     assert!(
-        ctx.emitted.is_empty(),
+        ctx.msgs().is_empty(),
         "no false-positive notification across the segment boundary"
     );
 
@@ -470,8 +470,8 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     )
     .expect("commit under the watched prefix");
     commit_block(&mut f);
-    assert_eq!(ctx.emitted.len(), 1, "fires under the real segment prefix");
-    assert_eq!(ctx.emitted[0].target, "indexer");
+    assert_eq!(ctx.msgs().len(), 1, "fires under the real segment prefix");
+    assert_eq!(ctx.msgs()[0].target, "indexer");
 }
 
 #[test]
@@ -491,8 +491,8 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(ctx.emitted.len(), 1, "root watch fires for /sharedsecret/x");
-    assert_eq!(ctx.emitted[0].target, "indexer");
+    assert_eq!(ctx.msgs().len(), 1, "root watch fires for /sharedsecret/x");
+    assert_eq!(ctx.msgs()[0].target, "indexer");
 
     let ctx = commit(
         &mut f,
@@ -503,8 +503,8 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(ctx.emitted.len(), 1, "root watch fires for /shared/y too");
-    assert_eq!(ctx.emitted[0].target, "indexer");
+    assert_eq!(ctx.msgs().len(), 1, "root watch fires for /shared/y too");
+    assert_eq!(ctx.msgs()[0].target, "indexer");
 }
 
 // ---- root-movement discipline: staged-then-abort is a no-op -----------------

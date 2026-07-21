@@ -24,7 +24,7 @@
 //!   never the canonical dir or unrelated siblings.
 
 mod harness;
-use harness::{TestCtx, open_files};
+use harness::{open_files, test_ctx};
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -58,7 +58,7 @@ fn put_inline(path: &str, bytes: &[u8]) -> Change {
 
 fn commit(f: &mut files::Files, height: u64, base: Option<&str>, changes: Vec<Change>) {
     block_on(f.execute(
-        &mut TestCtx::new(Origin::System, height),
+        &mut test_ctx(Origin::System, height),
         &sdk::Msg {
             target: "files".into(),
             payload: encode_msg(&FilesMsg::Commit {
