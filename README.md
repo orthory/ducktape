@@ -42,6 +42,34 @@ and codecs — at its own crate root; those wire types plus host-routed queries
 are the only legal cross-module surface. `kv` and `vaults` remain as crates but
 are no longer registered in the production genesis module set.
 
+### Layer contracts
+
+Every layer boundary is a small trait, and each obeys the same three rules: the
+contract lives at its crate root (opening the crate shows it first); every trait
+ships a sim/test arm in the same crate — behind feature `sim` where the double
+carries a build cost; and this table is the map from each boundary to its real
+and swappable arms. Rationale and the full seam designs are in
+[`docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md`](docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md)
+(lands with PR #718). Rows tagged "(this campaign)" are the seams being added
+now; their PRs are open and unmerged.
+
+| Contract (trait · crate) | Real arm(s) | Sim / test arm | Consumers |
+| --- | --- | --- | --- |
+| `Orderer` · `crates/kernel/node` | `SimplexOrderer`, `FollowerOrderer` | `RoundOrderer`, `ArrivalOrderer` | node replication loop, bin/node validator engine |
+| `sdk::Module` / `sdk::Ctx` / `host::ModuleFactory` · `sdk`, `crates/kernel/host` | native module, `WasmModule` | dozens of in-crate test modules | host execute/dispatch loop |
+| `host::worker::Worker` · `crates/kernel/host` | `DispatchPool` | `MockOracle`, `FlakyOracle`, `EchoWorker` | host non-deterministic-effect dispatch |
+| `SyncClient` · `crates/kernel/statesync` | four fetch clients | `ChannelClient`, `StoreClient`, `LiarClient` | statesync joiner / backfill engine |
+| `DataPlaneTransport` · `crates/networking/data-plane` | `OverlaySockets` | `SimEndpoint` (feature `sim`) | overlay demux + acceptor loops |
+| `WireGuardEffect` · `crates/networking/wireguard` | defguard, userspace | `FakeWireGuardEffect` | mesh bring-up (bin/node boot) |
+| commonware runtime `E` (`Clock` / `Storage` / `Rng`) | `tokio::Context` | `deterministic::Runner` | host, node, statesync |
+| `ObjectStore` · `crates/duckfs/core` | `DiskStore` | `MemStore` | `files` module, duckfs client |
+| `Blobs` · `blobstore` — (this campaign, PR #716 — unmerged) | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
+| `RefsStore` · `crates/duckfs/core` — (this campaign, PR #715 — unmerged) | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
+| `IndexDisk` · `crates/kernel/indexer` — (this campaign, PR #717 — unmerged) | disk arm (moved `std::fs`) | mem arm (feature `sim`) | indexer derived-tier writes |
+| `MeshCarrier` · `bin/node` — (this campaign, PR #719 — unmerged) | `MeshHead` (`authenticated::discovery` Network) | `simulated::Network` arm | bin/node mesh boot, validator engine |
+| commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync — (this campaign, PR #720 — unmerged) | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
+| `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` — (this campaign, PR #718/#721 — unmerged) | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
+
 ## Quick Start
 
 Run the workspace tests:
