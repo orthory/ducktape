@@ -40,7 +40,7 @@ struct GatePending {
     /// the packed coord cap to deliver on `Admitted` (private coordination).
     cap: Option<Vec<u8>>,
     /// answer `Busy` (non-terminal) once past this instant (§3.2 timeout).
-    deadline: std::time::Instant,
+    deadline: std::time::SystemTime,
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
@@ -147,11 +147,11 @@ struct ValidatorRuntime<'a> {
         node::FrameId,
         (
             futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::Instant,
+            std::time::SystemTime,
         ),
     >,
     pending_relays:
-        std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::Instant)>,
+        std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::SystemTime)>,
     /// join gates held open awaiting their `Redeem` frame's consensus fate,
     /// keyed by frame id (the settle-then-answer seam, resolved in `on_drain`).
     pending_gates: std::collections::HashMap<node::FrameId, GatePending>,
@@ -163,11 +163,11 @@ struct ValidatorRuntime<'a> {
     join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
     blocks_since_checkpoint: u64,
     last_reach_view: Option<u64>,
-    last_flush: std::time::Instant,
+    last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
-    last_crank: std::time::Instant,
-    last_nudge: std::time::Instant,
+    last_crank: std::time::SystemTime,
+    last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
     signaller: ReadinessSignaller,
     code_signaller: super::code_announce::CodeReadinessSignaller,
@@ -264,7 +264,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         node::FrameId,
         (
             futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::Instant,
+            std::time::SystemTime,
         ),
     > = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
@@ -273,7 +273,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // the Reply goes.
     let pending_relays: std::collections::HashMap<
         node::FrameId,
-        (ed25519::PublicKey, std::time::Instant),
+        (ed25519::PublicKey, std::time::SystemTime),
     > = std::collections::HashMap::new();
     // join gates held open awaiting their Redeem frame's consensus fate, and
     // the joiner→frame in-flight index that dedups a re-Request while settling.
@@ -297,7 +297,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let last_reach_view: Option<u64> = None;
     // the per-block-time flush cadence: packs the window's enqueued frames
     // (real ops and/or an idle nop) into one batch block. see the flush loop.
-    let last_flush = std::time::Instant::now();
+    let last_flush = context.current();
     // a cutover Retarget the plane's command queue could not take yet
     // (NON-BLOCKING sends: the plane is not consensus, so the loop never
     // waits on it). retried every drain beat until it lands; a newer
@@ -311,9 +311,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // visibly live.
     let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
     // throttle for the saga crank pump below.
-    let last_crank = std::time::Instant::now();
+    let last_crank = context.current();
     // throttle for the dispatch delivery-nudge pump below.
-    let last_nudge = std::time::Instant::now();
+    let last_nudge = context.current();
     // the host-owned worker set (reactor seam): effects of finalized
     // blocks are offered here, and claimed follow-ups re-enter the ordered
     // lane as their own blocks.

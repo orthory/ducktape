@@ -332,11 +332,11 @@ impl ValidatorRuntime<'_> {
                 node::Disposition::Discarded => continue,
             });
         }
-        validator_relay.expire(std::time::Instant::now(), relay_tx);
+        validator_relay.expire(context.current(), relay_tx);
         // expire holds the mesh never finalized in time. the op may
         // still land later — clients re-query on block events.
         if !pending_submits.is_empty() {
-            let now = std::time::Instant::now();
+            let now = context.current();
             let expired: Vec<node::FrameId> = pending_submits
                 .iter()
                 .filter(|(_, (_, deadline))| *deadline <= now)
@@ -354,7 +354,7 @@ impl ValidatorRuntime<'_> {
         // finalized in time, so answer the resident truthfully — the
         // op may still land, it re-queries on the next block.
         if !pending_relays.is_empty() {
-            let now = std::time::Instant::now();
+            let now = context.current();
             let expired: Vec<node::FrameId> = pending_relays
                 .iter()
                 .filter(|(_, (_, deadline))| *deadline <= now)
@@ -383,7 +383,7 @@ impl ValidatorRuntime<'_> {
         // exiting. the Redeem may still land later — a re-forward then hits
         // the V9 idempotent Admitted.
         if !pending_gates.is_empty() {
-            let now = std::time::Instant::now();
+            let now = context.current();
             let expired: Vec<node::FrameId> = pending_gates
                 .iter()
                 .filter(|(_, g)| g.deadline <= now)
@@ -984,6 +984,7 @@ impl ValidatorRuntime<'_> {
     // blocks). real ops are never gated — they must not wait.
     async fn pump_heartbeat(&mut self) {
         let Self {
+            context,
             node,
             next_seq,
             signer,
@@ -992,8 +993,10 @@ impl ValidatorRuntime<'_> {
             heartbeat_disabled,
             ..
         } = self;
-        if !*heartbeat_disabled && last_flush.elapsed() >= consensus::BLOCK_TIME {
-            *last_flush = std::time::Instant::now();
+        let now = context.current();
+        let flush_due = now.duration_since(*last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
+        if !*heartbeat_disabled && flush_due {
+            *last_flush = now;
             if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
                 let seq = *next_seq;
                 *next_seq += 1;
@@ -1191,6 +1194,7 @@ impl ValidatorRuntime<'_> {
     // cranks from other nodes are deterministic no-ops.
     async fn pump_saga_crank(&mut self) {
         let Self {
+            context,
             node,
             next_seq,
             signer,
@@ -1198,12 +1202,14 @@ impl ValidatorRuntime<'_> {
             last_crank,
             ..
         } = self;
-        if last_crank.elapsed() >= consensus::BLOCK_TIME
+        let now = context.current();
+        let crank_due = now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
+        if crank_due
             && let Some(finalized_height) = node.finalized().map(|f| f.height)
             && let Some(expiry) = saga_next_expiry(node.host()).await
             && expiry <= finalized_height
         {
-            *last_crank = std::time::Instant::now();
+            *last_crank = now;
             let seq = *next_seq;
             *next_seq += 1;
             if let Err(e) = node
@@ -1238,6 +1244,7 @@ impl ValidatorRuntime<'_> {
     // from other nodes are free.
     async fn pump_dispatch_nudge(&mut self) {
         let Self {
+            context,
             node,
             next_seq,
             signer,
@@ -1245,10 +1252,10 @@ impl ValidatorRuntime<'_> {
             last_nudge,
             ..
         } = self;
-        if last_nudge.elapsed() >= consensus::BLOCK_TIME
-            && dispatch_pending_deliveries(node.host()).await > 0
-        {
-            *last_nudge = std::time::Instant::now();
+        let now = context.current();
+        let nudge_due = now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
+        if nudge_due && dispatch_pending_deliveries(node.host()).await > 0 {
+            *last_nudge = now;
             let seq = *next_seq;
             *next_seq += 1;
             if let Err(e) = node

@@ -161,11 +161,11 @@ mod tests {
     /// absent until the responses that establish them are served.
     #[test]
     fn scrape_encodes_served_peers() {
-        use commonware_runtime::{Metrics as _, Runner as _};
+        use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 
         let executor = commonware_runtime::deterministic::Runner::default();
         executor.start(|context| async move {
-            let monitor = ServeMonitor::default();
+            let monitor = ServeMonitor::new(context.child("statesync_monitor"));
             monitor.record(
                 "abcd1234",
                 SyncRequest::TipCoords.kind_name(),

@@ -2,7 +2,7 @@
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_runtime::Metrics as _;
+use commonware_runtime::{Clock as _, Metrics as _};
 
 use sdk::Msg;
 
@@ -181,6 +181,7 @@ impl ValidatorRuntime<'_> {
     /// is COMMITTED, `Rejected{terminal}` means stop.
     pub(super) async fn on_gate_forward(&mut self, fwd: lobby::GateForward) {
         let Self {
+            context,
             node,
             gate_outcomes,
             next_seq,
@@ -350,7 +351,7 @@ impl ValidatorRuntime<'_> {
                     super::GatePending {
                         joiner: joiner_bytes,
                         cap: minted_cap,
-                        deadline: std::time::Instant::now() + GATE_SETTLE_TIMEOUT,
+                        deadline: context.current() + GATE_SETTLE_TIMEOUT,
                     },
                 );
             }
@@ -372,6 +373,7 @@ impl ValidatorRuntime<'_> {
 
     pub(super) async fn on_relay(&mut self, peer: ed25519::PublicKey, bytes: Vec<u8>) {
         let Self {
+            context,
             node,
             relay_tx,
             pending_submits,
@@ -379,6 +381,7 @@ impl ValidatorRuntime<'_> {
             validator_relay,
             ..
         } = self;
+        let now = context.current();
 
         let Ok(msg) = relay::decode_msg(&bytes) else {
             return;
@@ -397,6 +400,7 @@ impl ValidatorRuntime<'_> {
             (Vec::new(), Vec::new(), Vec::new())
         };
         let Some(action) = validator_relay.on_message(
+            now,
             peer,
             msg,
             &members_now,
@@ -414,7 +418,7 @@ impl ValidatorRuntime<'_> {
             } => match node.submit_frame(frame).await {
                 Ok(id) => {
                     debug_assert_eq!(id, frame_id);
-                    pending_relays.insert(id, (peer, std::time::Instant::now() + SUBMIT_HOLD));
+                    pending_relays.insert(id, (peer, now + SUBMIT_HOLD));
                 }
                 Err(e) => relay_runtime::send_reply(
                     relay_tx,
@@ -458,6 +462,7 @@ impl ValidatorRuntime<'_> {
         reply: futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
     ) {
         let Self {
+            context,
             node,
             relay_tx,
             signer,
@@ -465,6 +470,7 @@ impl ValidatorRuntime<'_> {
             validator_relay,
             ..
         } = self;
+        let now = context.current();
 
         let peers: Vec<ed25519::PublicKey> = if relay::required_blob_digest(&frame).is_some() {
             read_valset_members(node.host())
@@ -476,7 +482,7 @@ impl ValidatorRuntime<'_> {
         } else {
             Vec::new()
         };
-        match validator_relay.prepare_local(frame, reply, peers, relay_tx) {
+        match validator_relay.prepare_local(now, frame, reply, peers, relay_tx) {
             Ok(Some(relay_runtime::ValidatorAction::SubmitLocal {
                 frame_id,
                 frame,
