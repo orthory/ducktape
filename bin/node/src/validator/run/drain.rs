@@ -888,54 +888,31 @@ impl ValidatorRuntime<'_> {
         // one drain can apply MANY blocks; the events accumulated across all of
         // them, so stamp them with the drain's finalized tip.
         let height = node.finalized().map_or(0, |f| f.height);
+        // the same worker routing the noded submit lane and the sim run — but
+        // each claimed follow-up re-enters the ORDERED lane as its own batch
+        // (not an inline block), so this lane SUBMITS the follows rather than
+        // inline-draining them: the continuous block cadence carries them.
+        let host::worker::Offered { follows, unclaimed } =
+            host::worker::offer(workers.as_slice(), node.take_events()).await;
+        for follow in follows {
+            let seq = *next_seq;
+            *next_seq += 1;
+            if let Err(e) = node.submit(signer, seq, follow).await {
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    height,
+                    error = %e,
+                    "worker follow-up submit failed"
+                );
+            }
+        }
+        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+        // guest cannot log) — unless it decodes as a worker request, which
+        // means a saga is stuck Pending.
         let mut notes = noded::log::ModuleNotes::new(height);
-        for eff in node.take_events() {
-            let mut claimed = false;
-            for w in workers.iter() {
-                match w.run(&eff).await {
-                    Ok(host::worker::WorkOutcome::Handled(Some(follow))) => {
-                        let seq = *next_seq;
-                        *next_seq += 1;
-                        if let Err(e) = node.submit(signer, seq, follow).await {
-                            tracing::warn!(
-                                target: "ducktape::modules",
-                                node = %label,
-                                height,
-                                source = %eff.source,
-                                error = %e,
-                                "worker follow-up submit failed"
-                            );
-                        }
-                        claimed = true;
-                        break;
-                    }
-                    // a deliberate skip (e.g. leased to another
-                    // node): claimed, nothing to submit.
-                    Ok(host::worker::WorkOutcome::Handled(None)) => {
-                        claimed = true;
-                        break;
-                    }
-                    Ok(host::worker::WorkOutcome::NotMine) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "ducktape::modules",
-                            node = %label,
-                            height,
-                            source = %eff.source,
-                            error = %e,
-                            "worker failed to handle a module event"
-                        );
-                        claimed = true; // errored ≠ unclaimed; don't double-log
-                        break;
-                    }
-                }
-            }
-            // an unclaimed event is the module's ONLY diagnostic channel (a wasm
-            // guest cannot log) — unless it decodes as a worker request, which
-            // means a saga is stuck Pending.
-            if !claimed {
-                notes.unclaimed(&eff);
-            }
+        for eff in &unclaimed {
+            notes.unclaimed(eff);
         }
         notes.finish();
         if dev_demo && !*converged && *applied >= expected {
