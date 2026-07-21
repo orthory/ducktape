@@ -301,6 +301,13 @@ pub struct WasmModule {
     /// [`Module::state_schema_revision`]). a byte-compatible port keeps the
     /// native module's revision; a port that changes the state layout bumps it.
     state_schema_revision: u32,
+    /// serve QUERY rounds from committed state ALONE — the staged overlay is
+    /// dropped for the read (execute rounds are untouched). opt-in, for a ported
+    /// native module whose query surface was committed-only regardless of caller
+    /// (e.g. dispatch, whose between-block delivery injection must never observe a
+    /// same-block staged write). off by default: every other tenant keeps the
+    /// read-your-writes query surface.
+    committed_queries: bool,
 }
 
 impl WasmModule {
@@ -320,6 +327,7 @@ impl WasmModule {
             staged: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
             state_schema_revision: 1,
+            committed_queries: false,
         })
     }
 
@@ -376,6 +384,18 @@ impl WasmModule {
     /// layout must bump it in the same change, exactly like a native module.
     pub fn with_state_schema_revision(mut self, revision: u32) -> Self {
         self.state_schema_revision = revision;
+        self
+    }
+
+    /// serve this tenant's QUERY rounds from committed state ALONE — drop the
+    /// staged overlay for the read (execute rounds keep their read-your-writes
+    /// stage). the opt-in for a ported native module whose query surface was
+    /// committed-only regardless of caller: dispatch answers `Module::query` from
+    /// committed state so a same-block sibling read never observes an uncommitted
+    /// write (the between-block delivery injection depends on it). every other
+    /// tenant leaves this off and keeps the read-your-writes query surface.
+    pub fn with_committed_queries(mut self) -> Self {
+        self.committed_queries = true;
         self
     }
 
@@ -464,10 +484,19 @@ impl WasmModule {
         sealed: bool,
         req: &[u8],
     ) -> (Result<Vec<u8>, SdkError>, SiblingMemo, Option<PendingRead>) {
+        // committed-only tenants (opt-in) answer queries from committed state
+        // alone: the staged overlay is dropped for this read. execute rounds are
+        // untouched — and a query round never writes, so an empty stage is a pure
+        // read-view change, not a loss of read-your-writes.
+        let staged = if self.committed_queries {
+            BTreeMap::new()
+        } else {
+            self.staged.clone()
+        };
         let data = HostData {
             env: Some(env),
             committed: self.committed_for_round(),
-            staged: self.staged.clone(),
+            staged,
             memo,
             pending: None,
             sealed,

@@ -35,10 +35,11 @@
 //! (register / update / remove) plus rejections — none of which route to saga —
 //! so the recorder stays empty throughout, which is itself the claim: admin ops
 //! do not touch the saga lane, and an aborted block delivers nothing. PART 2
-//! (Task 3) extends this file with the dispatch → saga → delivery flow that puts
-//! the recorder to work.
+//! (Task 3) pins the committed-only query lane: a mid-block sibling read of
+//! dispatch's query surface must not see a same-block staged write, on either
+//! runtime — the contract runs' consensus-visible sibling reads rely on.
 
-use host::{BlockContext, FinalizedBlock, Host, SubmitError};
+use host::{BlockContext, FinalizedBlock, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 use dispatch::{
@@ -57,6 +58,10 @@ fn wasm_dispatch() -> WasmModule {
         // adapter port persists the native canonical snapshot as one host-KV
         // value — the revision-2 declaration bin/node makes at cutover.
         .with_state_schema_revision(2)
+        // dispatch's query surface is committed-only regardless of caller (the
+        // native contract): a same-block staged write must never leak into a
+        // mid-block sibling read. this is Task 4's genesis wiring, pinned here.
+        .with_committed_queries()
 }
 
 /// EXACTLY the production wiring in bin/node's host state: the saga collaborator
@@ -129,6 +134,69 @@ impl Module for Recorder {
     }
 }
 
+/// a sibling that probes dispatch's query surface MID-BLOCK (PART 2): on delivery
+/// it issues `ctx.query("dispatch", <payload>)` — the payload IS the encoded
+/// [`DispatchQuery`] — and records the raw reply. dispatch answers its query
+/// surface from COMMITTED state alone regardless of caller, so a recipe
+/// registered earlier in the SAME block must read back `Recipe(None)` here; this
+/// probe is how the same-block matrix observes that, identically on both runtimes.
+struct RecipeProbe {
+    id: ModuleId,
+    committed: Vec<Vec<u8>>,
+    staged: Vec<Vec<u8>>,
+}
+
+impl RecipeProbe {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.into(),
+            committed: Vec::new(),
+            staged: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for RecipeProbe {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    fn root(&self) -> StateRoot {
+        if self.committed.is_empty() {
+            return StateRoot::ZERO;
+        }
+        let mut h = Sha256::new();
+        for reply in &self.committed {
+            h.update((reply.len() as u64).to_le_bytes());
+            h.update(reply);
+        }
+        StateRoot(h.finalize().into())
+    }
+
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        // the mid-block sibling read: dispatch answers committed-only, so a
+        // recipe registered earlier in THIS block is invisible here.
+        let reply = ctx.query("dispatch", &msg.payload).await?;
+        self.staged.push(reply);
+        Ok(())
+    }
+
+    async fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(serde_json::to_vec(&self.committed).expect("serializable"))
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        self.committed.append(&mut self.staged);
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged.clear();
+        Ok(())
+    }
+}
+
 fn native_host() -> Host {
     Host::genesis(vec![
         Box::new(native_dispatch()),
@@ -141,6 +209,25 @@ fn wasm_host_() -> Host {
     Host::genesis(vec![
         Box::new(wasm_dispatch()),
         Box::new(Recorder::new("saga")),
+    ])
+    .expect("genesis")
+}
+
+/// PART 2's hosts: dispatch plus the mid-block [`RecipeProbe`] under `"probe"`.
+/// RegisterRecipe is an admin op (routes nowhere), so no saga stand-in is needed
+/// here — the only sibling traffic is the probe reading dispatch's query surface.
+fn native_probe_host() -> Host {
+    Host::genesis(vec![
+        Box::new(native_dispatch()),
+        Box::new(RecipeProbe::new("probe")),
+    ])
+    .expect("genesis")
+}
+
+fn wasm_probe_host() -> Host {
+    Host::genesis(vec![
+        Box::new(wasm_dispatch()),
+        Box::new(RecipeProbe::new("probe")),
     ])
     .expect("genesis")
 }
@@ -191,6 +278,15 @@ async fn recipe(h: &Host, recipe_id: &str) -> DispatchReply {
         .await
         .expect("recipe query");
     decode_reply(&reply).expect("reply decodes")
+}
+
+/// the probe's committed log of mid-block dispatch replies, decoded (PART 2).
+async fn probed_replies(h: &Host) -> Vec<DispatchReply> {
+    let raw = h.query("probe", &[]).await.expect("probe query");
+    let logs: Vec<Vec<u8>> = serde_json::from_slice(&raw).expect("probe log decodes");
+    logs.iter()
+        .map(|b| decode_reply(b).expect("reply decodes"))
+        .collect()
 }
 
 fn event_tuples(events: &[Event]) -> Vec<(String, Vec<u8>)> {
@@ -490,5 +586,74 @@ async fn snapshot_install_inner() {
         fresh.root(),
         live_root,
         "the installed guest matches the source root"
+    );
+}
+
+/// PART 2: the committed-only query lane — the load-bearing contract of the
+/// cutover. dispatch answers its query surface from COMMITTED state ALONE
+/// regardless of caller, so a recipe registered earlier in the SAME block is
+/// invisible to a mid-block sibling read. runs' consensus-visible sibling reads
+/// (turn-taken, lease-holder) rely on this; the wasm adapter loads its snapshot
+/// through the host's staged overlay, so without the committed-only query lane it
+/// would leak the same-block write. this matrix pins the contract: op 1 registers
+/// a recipe (staged, uncommitted) and op 2 — a sibling in the SAME block — reads
+/// it back through dispatch's query surface, and BOTH runtimes must answer
+/// `Recipe(None)`.
+#[test]
+fn same_block_sibling_query_reads_dispatch_committed_only() {
+    futures::executor::block_on(same_block_inner());
+}
+
+async fn same_block_inner() {
+    let mut native = native_probe_host();
+    let mut wasm = wasm_probe_host();
+    let alice = external(b"alice");
+
+    // ONE block, two ops: op 1 registers "summarize" on dispatch (staged, not yet
+    // committed); op 2 delivers to the probe, whose execute queries dispatch for
+    // that very recipe MID-BLOCK. the committed-only contract means the probe must
+    // read `Recipe(None)` — the same-block registration is invisible on the query
+    // surface, on native by construction and on wasm via the committed-only lane.
+    let probe_req = encode_query(&DispatchQuery::Recipe {
+        recipe_id: "summarize".into(),
+    });
+    let batch = vec![
+        (alice.clone(), op(&full_recipe())),
+        (
+            alice.clone(),
+            Msg {
+                target: "probe".into(),
+                payload: probe_req,
+            },
+        ),
+    ];
+    let n_out = native
+        .submit_block(block(1, alice.clone()), batch.clone())
+        .await
+        .expect("native block");
+    let w_out = wasm
+        .submit_block(block(1, alice), batch)
+        .await
+        .expect("wasm block");
+    for out in [&n_out, &w_out] {
+        assert!(
+            out.members
+                .iter()
+                .all(|m| matches!(m, MemberOutcome::Applied { .. })),
+            "both ops must apply: {:?}",
+            out.members
+        );
+    }
+
+    assert_eq!(
+        probed_replies(&native).await,
+        vec![DispatchReply::Recipe(None)],
+        "native dispatch answers the mid-block sibling query from committed state only"
+    );
+    assert_eq!(
+        probed_replies(&wasm).await,
+        vec![DispatchReply::Recipe(None)],
+        "wasm dispatch must answer the mid-block sibling query from committed state only \
+         (the staged overlay must not leak the same-block registration)"
     );
 }
