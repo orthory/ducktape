@@ -32,7 +32,7 @@ fn command_output(out: &std::process::Output) -> String {
 /// reuses this identity, so the join-side target self-check passes.
 fn keygen(dir: &Path) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-        .args(["keygen", "--dir"])
+        .args(["key", "--dir"])
         .arg(dir)
         .output()
         .expect("run keygen");
@@ -120,7 +120,7 @@ fn identity_hex(seed: u64) -> String {
         .collect()
 }
 
-/// run `ducktape node --config <config> <extra…>` with combined output to
+/// run `ducktape node run --config <config> <extra…>` with combined output to
 /// `log`, polling until it exits on its own or `timeout` elapses (then kill +
 /// reap). Returns `(exit code, captured log)`; `None` code means it was killed
 /// for timing out — a HANG, which for the honest-terminal path is a failure.
@@ -133,6 +133,7 @@ fn run_node_until_exit(
     let out = std::fs::File::create(log).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        .arg("run")
         .arg("--config")
         .arg(config)
         .args(extra)
@@ -473,6 +474,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let out = std::fs::File::create(&log_path).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        .arg("run")
         .arg("--config")
         .arg(founder.join("node.toml"))
         .stdout(Stdio::from(out))
@@ -582,6 +584,7 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     let out = std::fs::File::create(&log_path).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        .arg("run")
         .arg("--config")
         .arg(founder.join("node.toml"))
         .stdout(Stdio::from(out))

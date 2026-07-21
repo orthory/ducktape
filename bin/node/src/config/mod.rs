@@ -806,6 +806,36 @@ fn http_base_of(http_listen: &str) -> String {
     format!("http://{host}:{port}")
 }
 
+/// enumerate the workspace registry: `(chain_id, node.toml path)` per
+/// registered network, sorted by chain_id. an ABSENT registry root is an empty
+/// list, not an error — nothing has been registered yet. one unreadable
+/// descriptor is skipped, never fatal (same tolerance as `find_workspace_config`).
+pub fn list_workspaces() -> Result<Vec<(String, PathBuf)>, String> {
+    list_workspaces_in(&workspaces_root()?)
+}
+
+fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read workspace registry {root:?}: {e}")),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let descriptor_path = dir.join("network.toml");
+        if !descriptor_path.is_file() {
+            continue;
+        }
+        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
+            continue;
+        };
+        out.push((d.chain_id, dir.join("node.toml")));
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +865,37 @@ mod tests {
         assert!(load_coord_cap(dir.path()).is_none());
         save_coord_cap(dir.path(), &cap).unwrap();
         assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+    }
+
+    #[test]
+    fn list_workspaces_enumerates_sorted_and_tolerates_junk() {
+        let root = tempfile::tempdir().unwrap();
+        // absent subdir contents => empty, and an absent root is empty too.
+        assert!(
+            list_workspaces_in(&root.path().join("nope"))
+                .unwrap()
+                .is_empty()
+        );
+        for id in ["zebra#00000002", "alpha#00000001"] {
+            let dir = root.path().join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            NetworkDescriptor {
+                chain_id: id.into(),
+                scheme: SCHEME_ED25519.into(),
+                validators: vec![],
+                bootstrap: vec![],
+                reach: vec![],
+                coordination: None,
+            }
+            .save(&dir.join("network.toml"))
+            .unwrap();
+        }
+        // a bare dir with no network.toml is skipped, not counted.
+        std::fs::create_dir_all(root.path().join("not-a-workspace")).unwrap();
+        let got = list_workspaces_in(root.path()).unwrap();
+        let ids: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(ids, ["alpha#00000001", "zebra#00000002"]);
+        assert!(got[0].1.ends_with("alpha#00000001/node.toml"));
     }
 
     #[test]
