@@ -43,30 +43,39 @@ impl CliError {
     }
 }
 
-/// split `args` into positionals and `--key value` flags. `-n` is the one short
-/// alias, for `--network` (the workspace selector shared with the node family).
-/// a `--flag` consumes the next token as its value UNLESS that token is itself a
-/// `--flag`, in which case it is a value-less boolean (`--no-rebase`) recorded as
-/// an empty string — so `commit --no-rebase --message m` parses correctly (a
-/// duckfs path or value never starts with `--`).
+/// the flag this token names, if any: the one short alias `-n` (→ `network`,
+/// the workspace selector shared with the node family) or any `--long` flag. a
+/// positional (a duckfs path, a flag's value) names none.
+fn flag_name(tok: &str) -> Option<&str> {
+    match tok {
+        "-n" => Some("network"),
+        other => other.strip_prefix("--"),
+    }
+}
+
+/// split `args` into positionals and `--key value` flags. a flag consumes the
+/// next token as its value UNLESS that token is itself a flag, in which case it
+/// is a value-less boolean (`--no-rebase`) recorded as an empty string — so both
+/// `commit --no-rebase --message m` AND `commit --no-rebase -n net` parse
+/// correctly. the flag test must recognize `-n` too, else a `-n` sitting right
+/// after `--no-rebase` is silently eaten as its ignored value and the network is
+/// dropped (a value never begins with `-`).
 pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, String>), CliError> {
     let mut positional = Vec::new();
     let mut flags = BTreeMap::new();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
-        let name = match a.as_str() {
-            "-n" => Some("network"),
-            other => other.strip_prefix("--"),
-        };
-        if let Some(name) = name {
-            let value = match it.peek() {
-                Some(next) if !next.starts_with("--") => it.next().cloned().unwrap_or_default(),
-                _ => String::new(),
-            };
-            flags.insert(name.to_string(), value);
-        } else {
+        let Some(name) = flag_name(a) else {
             positional.push(a.clone());
-        }
+            continue;
+        };
+        let next_is_value = it.peek().is_some_and(|next| flag_name(next).is_none());
+        let value = if next_is_value {
+            it.next().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        flags.insert(name.to_string(), value);
     }
     Ok((positional, flags))
 }
@@ -134,6 +143,25 @@ mod tests {
         let (pos, f) = parse_flags(&["-n".into(), "ducktape".into(), "some/path".into()]).unwrap();
         assert_eq!(f.get("network").map(String::as_str), Some("ducktape"));
         assert_eq!(pos, vec!["some/path".to_string()]);
+    }
+
+    #[test]
+    fn dash_n_after_value_less_boolean_is_not_swallowed() {
+        // `--no-rebase` is a value-less boolean; a `-n` directly after it must be
+        // recognized as its own flag, not eaten as --no-rebase's ignored value.
+        let (pos, f) = parse_flags(&[
+            "wt/dir".into(),
+            "--no-rebase".into(),
+            "-n".into(),
+            "mynet".into(),
+            "--message".into(),
+            "m".into(),
+        ])
+        .unwrap();
+        assert_eq!(f.get("no-rebase").map(String::as_str), Some(""));
+        assert_eq!(f.get("network").map(String::as_str), Some("mynet"));
+        assert_eq!(f.get("message").map(String::as_str), Some("m"));
+        assert_eq!(pos, vec!["wt/dir".to_string()]);
     }
 
     #[test]

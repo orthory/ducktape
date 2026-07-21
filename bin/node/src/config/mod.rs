@@ -789,14 +789,20 @@ fn resolve_network_in(root: &Path, needle: &str) -> Result<(PathBuf, Option<Stri
 }
 
 /// `http://<host:port>` for a node.toml `http_listen`, rewriting a wildcard
-/// bind (`0.0.0.0`/`[::]`) to loopback: those mean "every interface", and
-/// 127.0.0.1 is the one a CLI on the same host as the node shares with it.
+/// bind to the SAME family's loopback: a wildcard means "every interface", and
+/// a co-located CLI reaches the node over loopback. `0.0.0.0` → `127.0.0.1`,
+/// but `[::]` → `[::1]`, NOT 127.0.0.1 — a bindv6only `[::]` listener refuses
+/// v4 loopback dials (mirrors `agent_provision::node_http_base`).
 fn http_base_of(http_listen: &str) -> String {
     let Some((host, port)) = http_listen.rsplit_once(':') else {
         return format!("http://{http_listen}");
     };
-    let is_wildcard = host == "0.0.0.0" || host == "[::]";
-    let host = if is_wildcard { "127.0.0.1" } else { host };
+    let loopback = match host {
+        "0.0.0.0" => Some("127.0.0.1"),
+        "[::]" => Some("[::1]"),
+        _ => None,
+    };
+    let host = loopback.unwrap_or(host);
     format!("http://{host}:{port}")
 }
 
@@ -1056,7 +1062,8 @@ mod tests {
     #[test]
     fn http_base_substitutes_wildcard_hosts_only() {
         assert_eq!(http_base_of("0.0.0.0:8844"), "http://127.0.0.1:8844");
-        assert_eq!(http_base_of("[::]:8844"), "http://127.0.0.1:8844");
+        // a bindv6only `[::]` refuses v4 loopback dials → v6 loopback, not 127.0.0.1
+        assert_eq!(http_base_of("[::]:8844"), "http://[::1]:8844");
         assert_eq!(http_base_of("127.0.0.1:8844"), "http://127.0.0.1:8844");
         assert_eq!(http_base_of("[::1]:8844"), "http://[::1]:8844");
         assert_eq!(http_base_of("192.168.1.5:80"), "http://192.168.1.5:80");
