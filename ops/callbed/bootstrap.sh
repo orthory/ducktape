@@ -3,7 +3,7 @@
 # (init -> invite -> join -> admit -> invite -> join, same as
 # bin/node/examples/demo-invite.sh) ONCE, writing each node's config dir into
 # the shared volume (/shared/node0, /shared/node1). Each node container then
-# runs `ducktape node --config /shared/nodeK/node.toml`; they peer at runtime.
+# runs `ducktape node run --config /shared/nodeK/node.toml`; they peer at runtime.
 #
 # Nodes BIND 0.0.0.0 but ADVERTISE their compose service name (node0/node1) so
 # peers dial each other by DNS on the compose network. The whole ceremony is

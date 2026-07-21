@@ -22,7 +22,7 @@
 //! - (f) a fresh state-sync joiner across `H` rebuilds the IDENTICAL app-hash
 //!   (version-aware install).
 //!
-//! plus a live `ducktape node upgrade-status` CLI read against a scheduled net.
+//! plus a live `ducktape node upgrade status` CLI read against a scheduled net.
 //!
 //! NOTE on the mixed-old/new-binary leg: a single `cargo test` links ONE node
 //! binary (`CARGO_BIN_EXE_ducktape`, `MAX_PROTOCOL_VERSION = 3`), so a true
@@ -436,19 +436,19 @@ fn cluster_upgrade() {
         cluster.wait_marker(i, "upgrade armed name=proto-v2 to_version=2", CONVERGE);
     }
 
-    // upgrade-status CLI leg: a live read against the scheduled net reports the
+    // upgrade status CLI leg: a live read against the scheduled net reports the
     // pending upgrade, readiness count, and armed verdict.
     let cfg0 = cluster.config_file(0);
     let cfg0s = cfg0.to_str().expect("utf-8 config path");
-    let (ok, out) = cluster.run_verb(&["node", "upgrade-status", "--config", cfg0s]);
-    assert!(ok, "upgrade-status CLI failed:\n{out}");
+    let (ok, out) = cluster.run_verb(&["node", "upgrade", "status", "--config", cfg0s]);
+    assert!(ok, "upgrade status CLI failed:\n{out}");
     assert!(
         out.contains("pending: name=proto-v2") && out.contains("to_version=2"),
-        "upgrade-status must report the pending upgrade:\n{out}"
+        "upgrade status must report the pending upgrade:\n{out}"
     );
     assert!(
         out.contains("armed (R == n): true"),
-        "upgrade-status must report the armed verdict once R==n:\n{out}"
+        "upgrade status must report the armed verdict once R==n:\n{out}"
     );
 
     // 5. cross H (fillers advance finalized views) -> the ACTIVATION marker on

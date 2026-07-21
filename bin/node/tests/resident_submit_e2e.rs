@@ -91,11 +91,11 @@ fn resident_posts_to_chat_with_its_own_authorship() {
         "the refusal names the joining/no-standing contract: {refused}"
     );
 
-    // grant RESIDENT standing (invite-accept = AddResident), then wait for the
+    // grant RESIDENT standing (resident accept = AddResident), then wait for the
     // follow arm to grant standing AND pre-sync a boundary — the write gate
     // needs both (serving is Some only after the first boundary).
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{out}");
     cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 

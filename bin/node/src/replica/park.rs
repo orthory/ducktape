@@ -554,8 +554,8 @@ pub(super) async fn park(
             // holds standing indefinitely — that bail is gated off.)
             fatal!(label, "still no standing after {attempt} attempts — \
                  the invite may be spent or expired, or no member is reachable; \
-                 ask for a fresh invite (manual fallback: `ducktape \
-                 invite-accept {}`)",
+                 ask for a fresh invite (manual fallback: `ducktape node \
+                 resident accept {}`)",
                 hex_bytes(&me_bytes));
         }
         // the serve window: between manifest polls, pump the local

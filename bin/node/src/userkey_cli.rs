@@ -37,6 +37,10 @@ pub(super) fn run(argv: &[String]) -> CommandResult {
         "sign-admin" => cmd_user_sign_admin(args, &mut stdin),
         "webauthn-challenge" => cmd_user_webauthn_challenge(args),
         "p256-payload" => cmd_user_p256_payload(args),
+        "help" | "--help" | "-h" => {
+            println!("{USAGE}");
+            Ok(())
+        }
         other => Err(format!("unknown user verb {other:?}\n{USAGE}").into()),
     }
 }

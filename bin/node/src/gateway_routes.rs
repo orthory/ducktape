@@ -151,6 +151,10 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "bind" => bind(args),
         "unbind" => unbind(args),
         "list" => list(args),
+        "help" | "--help" | "-h" => {
+            println!("{USAGE}");
+            Ok(())
+        }
         other => Err(format!("unknown gateway verb {other:?}\n{USAGE}").into()),
     }
 }

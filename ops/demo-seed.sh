@@ -65,7 +65,7 @@ CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --primary-coordinator none \
   --wireguard-effect socket --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
-PUB="$("$NODE_BIN" node keygen --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
+PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
 # ── 3. register in ~/.ducktape/registry.json (merge; make it active) ──
 bun - "$REG" "$ID" "$CHAIN" "$PUB" "$P1" "$P2" "$P3" <<'JS'
@@ -89,7 +89,7 @@ log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
 # ── 4. start the node, wait for its http surface ───────────────
 log "starting node (http 127.0.0.1:$P2)…"
-"$NODE_BIN" node --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
+"$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
 NODE_PID=$!
 trap 'kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null' EXIT
 URL="http://127.0.0.1:$P2"

@@ -194,15 +194,15 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// mint (or reuse) the friend workspace's identity via the `keygen` verb
+    /// mint (or reuse) the friend workspace's identity via the `node key` verb
     /// and return its pubkey hex — the JOIN CODE the invite locks to.
     /// `join_friend` reuses this pre-generated identity.
     pub fn keygen_friend(&self, _idx: usize) -> String {
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-            .args(["keygen", "--dir"])
+            .args(["key", "--dir"])
             .arg(&self.friend_dir)
             .output()
-            .expect("run keygen");
+            .expect("run node key");
         assert!(
             out.status.success(),
             "keygen failed:\n{}",
@@ -244,21 +244,21 @@ impl NetworkShapeCluster {
     }
 
     /// the founder's verified join-request queue, parsed from the
-    /// `join-requests` verb's JSON stdout.
+    /// `join requests` verb's JSON stdout.
     pub fn join_requests(&self) -> serde_json::Value {
         let cfg = self.config_file(0);
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-            .args(["join-requests", "--config"])
+            .args(["join", "requests", "--config"])
             .arg(cfg)
             .output()
-            .expect("run join-requests");
+            .expect("run node join requests");
         assert!(
             out.status.success(),
-            "join-requests failed:\n{}",
+            "join requests failed:\n{}",
             command_output(&out)
         );
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("join-requests prints json")
+            .expect("join requests prints json")
     }
 
     /// run the `join` verb against the friend workspace WITHOUT asserting
@@ -321,6 +321,7 @@ impl NetworkShapeCluster {
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
@@ -446,22 +447,28 @@ impl NetworkShapeCluster {
         reply["status"].clone()
     }
 
-    /// drive a membership ceremony verb (`promote`, `invite-accept`,
-    /// `resident-remove`) against node 0's running rpc, from node 0's config.
+    /// drive a membership ceremony verb (`member promote`, `resident accept`,
+    /// `resident remove`) against node 0's running rpc, from node 0's config.
+    /// `verb` is the space-separated two-token spelling; it is split into argv.
     pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-            .args([verb, pubkey_hex, "--config"])
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("node");
+        for token in verb.split(' ') {
+            cmd.arg(token);
+        }
+        let out = cmd
+            .args([pubkey_hex, "--config"])
             .arg(cfg)
             .output()
             .unwrap_or_else(|e| panic!("run {verb}: {e}"));
         (out.status.success(), command_output(&out))
     }
 
-    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
-    /// `invite-accept` semantics) from node 0's config.
+    /// drive the DIRECT admission ceremony (`member promote` — the pre-staged
+    /// `resident accept` semantics) from node 0's config.
     pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
-        self.run_membership_verb("promote", pubkey_hex)
+        self.run_membership_verb("member promote", pubkey_hex)
     }
 
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
@@ -643,6 +650,7 @@ impl Cluster {
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
@@ -742,6 +750,7 @@ impl Cluster {
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
         let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&path)
             .stdout(Stdio::from(out))
@@ -761,7 +770,7 @@ impl Cluster {
         self.peer_ids.len() - 1
     }
 
-    /// run a ducktape VERB (invite-accept, admit, ...) to completion and
+    /// run a ducktape VERB (resident accept, admit, ...) to completion and
     /// return (success, combined output).
     pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
@@ -812,6 +821,7 @@ impl Cluster {
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
         let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&cfg)
             .arg("--sync-only")

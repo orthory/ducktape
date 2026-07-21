@@ -74,6 +74,7 @@ fn solo_founder_invites_a_friend() {
     let cfg = cluster.config_file(0);
     let (ok, out) = cluster.run_verb(&[
         "node",
+        "member",
         "promote",
         &friend_hex,
         "--config",
@@ -145,6 +146,7 @@ fn live_quorum_admits_a_fourth_validator() {
         let cfg = cluster.config_file(member);
         let (ok, out) = cluster.run_verb(&[
             "node",
+        "member",
         "promote",
             &friend_hex,
             "--config",

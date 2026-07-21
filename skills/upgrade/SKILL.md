@@ -158,7 +158,7 @@ withhold the quorum.
 
 Governance is the sole author of the pending upgrade. Drive it exactly like
 membership admission is driven (`GovMsg::Propose` / `Vote` / `Execute` over a
-member node's local RPC — the same path `invite-accept` wraps for
+member node's local RPC — the same path `resident accept` wraps for
 `AddValidator`), with the `ScheduleUpgrade` action:
 
 ```text
@@ -174,7 +174,7 @@ GovAction::ScheduleUpgrade { name: "<upgrade-name>", activation_height: H, to_ve
 
 ```bash
 # per the spec's query surface, e.g.:
-ducktape node upgrade-status --config <member node.toml>
+ducktape node upgrade status --config <member node.toml>
 # expect: current_version, pending { name, activation_height=H, to_version }, readiness=0
 ```
 
@@ -207,7 +207,7 @@ grep -E "converged app_hash=|synced app_hash=|recovered app_hash=" <node.log> | 
    statement about the running binary. Watch the readiness count climb:
 
 ```bash
-ducktape node upgrade-status --config <member node.toml>   # readiness += 1 per rolled node
+ducktape node upgrade status --config <member node.toml>   # readiness += 1 per rolled node
 ```
 
 Signals are validator-origin, idempotent (one member = one signal,
@@ -226,7 +226,7 @@ denominator and threshold are recomputed against the boundary valset, and a
 signal from a non-member is dead weight).
 
 ```bash
-ready=$(ducktape node upgrade-status --config <member node.toml> | ready-count)
+ready=$(ducktape node upgrade status --config <member node.toml> | ready-count)
 echo "ready=$ready  floor(2f+1)=$quorum_floor  arming_policy(R=n)=$target"
 ```
 
@@ -270,7 +270,7 @@ Watch the boundary land and confirm the network is still finalizing past `H`:
 ```bash
 # the network keeps producing converged app_hashes across and beyond H
 grep -E "converged app_hash=" <node.log> | tail
-ducktape node upgrade-status --config <member node.toml>   # current_version == to_version, pending cleared
+ducktape node upgrade status --config <member node.toml>   # current_version == to_version, pending cleared
 ```
 
 ## Step 7: Verify App-Hash Continuity Across H

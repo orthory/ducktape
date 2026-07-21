@@ -70,8 +70,8 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
     assert_eq!(friend_key.len(), 64, "join prints the friend's pubkey hex");
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{out}");
     cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 

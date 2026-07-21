@@ -107,8 +107,8 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
     let friend_key = cluster.join_friend_manual(&invite);
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{out}");
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     let (ok, out) = cluster.run_promote(&friend_key);
@@ -418,10 +418,10 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
 ///   4. a restarted resident parks straight back into resident mode (the
 ///      pre-sync writes no checkpoint manifest — a reboot is clean) and serves
 ///      again;
-///   5. `resident-remove` REVOKES standing through the same ceremony: committed
+///   5. `resident remove` REVOKES standing through the same ceremony: committed
 ///      residents empty, the node falls back to a parked joiner, and a second
 ///      run is an honest no-op;
-///   6. `invite-accept` re-grants, and the resident resumes the follow (a
+///   6. `resident accept` re-grants, and the resident resumes the follow (a
 ///      post-re-grant write becomes readable through its surface);
 ///   7. `promote` then seats a WARM validator through the normal path.
 ///
@@ -555,11 +555,11 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
 
-    let (ok, text) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{text}");
+    let (ok, text) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{text}");
     assert!(
         text.contains("granted resident standing"),
-        "unexpected invite-accept output:\n{text}"
+        "unexpected resident accept output:\n{text}"
     );
 
     // the grant's boundary admits the resident to the mesh; the parked node
@@ -748,15 +748,15 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             == serde_json::json!(true)
     }));
 
-    // (5) resident-remove: the ceremony verb revokes standing. committed
+    // (5) resident remove: the ceremony verb revokes standing. committed
     //     state clears, and the resident — whose respawned log is fresh, so
     //     the parked marker is unambiguously post-revoke — falls back to a
     //     parked joiner at the boundary whose manifest drops it.
-    let (ok, out) = cluster.run_membership_verb("resident-remove", &friend_key);
-    assert!(ok, "resident-remove failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident remove", &friend_key);
+    assert!(ok, "resident remove failed:\n{out}");
     assert!(
         out.contains("revoked resident standing"),
-        "unexpected resident-remove output:\n{out}"
+        "unexpected resident remove output:\n{out}"
     );
     poll("the revoke to clear resident standing", Box::new(|| {
         cluster
@@ -766,19 +766,19 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     }));
     cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
     //     a second run is an honest no-op — the inverted guard, end to end.
-    let (ok, out) = cluster.run_membership_verb("resident-remove", &friend_key);
-    assert!(ok, "resident-remove (no standing) failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident remove", &friend_key);
+    assert!(ok, "resident remove (no standing) failed:\n{out}");
     assert!(
         out.contains("holds no resident standing"),
-        "unexpected no-op resident-remove output:\n{out}"
+        "unexpected no-op resident remove output:\n{out}"
     );
 
-    // (6) re-grant: invite-accept restores standing and the resident resumes
+    // (6) re-grant: resident accept restores standing and the resident resumes
     //     the follow — a write finalized AFTER the re-grant becomes readable
     //     through the resident's own surface (stale serves can't fake this:
     //     the revoked node never synced a boundary carrying this key).
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "re-grant invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "re-grant resident accept failed:\n{out}");
     assert!(
         out.contains("granted resident standing"),
         "unexpected re-grant output:\n{out}"

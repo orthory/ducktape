@@ -90,7 +90,7 @@ fn a_bearer_client_invite_redeems_over_http_exactly_once() {
     // the standing is committed consensus state, queryable from the node.
     let pub_a = {
         let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-            .args(["keygen", "--out"])
+            .args(["key", "--out"])
             .arg(&key_a)
             .output()
             .expect("keygen reuse");

@@ -9,7 +9,7 @@
 #   founder: ducktape node admit <pubkey>            -> pre-genesis membership
 #            ducktape node invite                    -> REFRESHED blob
 #   friend:  ducktape node join <refreshed blob>     -> now a member
-#   both:    ducktape node --config .../node.toml    -> one network
+#   both:    ducktape node run --config .../node.toml    -> one network
 #
 # the assertion: both identities boot the SAME genesis app-hash (identical
 # descriptor -> identical genesis), an op submitted on the founder's node is
@@ -56,9 +56,9 @@ echo "friend: join (refreshed — now a member)..."
 loga=$(mktemp)
 logb=$(mktemp)
 echo "launching both members..."
-"$BIN_PATH" node --config "$A/node.toml" >"$loga" 2>&1 &
+"$BIN_PATH" node run --config "$A/node.toml" >"$loga" 2>&1 &
 pa=$!
-"$BIN_PATH" node --config "$B/node.toml" >"$logb" 2>&1 &
+"$BIN_PATH" node run --config "$B/node.toml" >"$logb" 2>&1 &
 pb=$!
 
 rpc() { # rpc <port> <json>
