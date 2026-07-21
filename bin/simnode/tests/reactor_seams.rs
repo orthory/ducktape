@@ -261,11 +261,14 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
         "unknown-module callback: {error}"
     );
 
-    // neither rejected trigger minted a block — the sim journals no rejected op.
+    // each rejected trigger JOURNALS a block now (validator parity — the op
+    // rides the drain and seals its height with a `rejected` row), so two
+    // rejects advanced the height by two. what stays true is the SEMANTIC guard:
+    // no saga was minted, so nothing is wedged at Pending.
     assert_eq!(
         sim.status()["height"],
-        0,
-        "a rejected trigger mints no block"
+        2,
+        "each rejected trigger seals its own block (validator parity)"
     );
     // …and no wedged saga exists to be stuck at Pending.
     for id in ["s1", "s2"] {

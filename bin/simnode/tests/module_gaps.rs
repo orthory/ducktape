@@ -298,8 +298,8 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
     let before_hash = before["appHash"].as_str().expect("app hash").to_string();
 
     // the triggering post fires both rules; the second CreateTask collides with
-    // the first's staged id, and the WHOLE block aborts (P2) — the sim mints no
-    // block for a rejected op.
+    // the first's staged id, and the WHOLE block aborts (P2) — the op is rejected
+    // and moves no state (the atomic block rolled back).
     let (code, reply) = sim.submit(
         "chat",
         post_message("general", "trigger", "please deploy now"),
@@ -317,19 +317,20 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         "the abort names the duplicate id: {reply}"
     );
 
-    // NOTHING survives: no block was minted, so the app-hash and height are
-    // byte-identical, the triggering message never entered chat, no task landed,
-    // and neither rule recorded a fire.
+    // NO STATE survives: the rejected op journals a block (validator parity — so
+    // the HEIGHT advances by one) but the atomic abort rolled back every write,
+    // so the app-hash is byte-identical, the triggering message never entered
+    // chat, no task landed, and neither rule recorded a fire.
     let after = sim.status();
     assert_eq!(
         after["height"].as_u64(),
-        Some(before_height),
-        "no block minted: {after}"
+        Some(before_height + 1),
+        "the rejected op sealed its own block (validator parity): {after}"
     );
     assert_eq!(
         after["appHash"].as_str(),
         Some(before_hash.as_str()),
-        "app-hash unmoved: {after}"
+        "app-hash unmoved (the rejected op rolled back): {after}"
     );
     let message = sim.query(
         "chat",
