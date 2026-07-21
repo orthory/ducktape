@@ -85,7 +85,7 @@ pub(crate) async fn run_validator(
     // phases — a later phase folding past a gap an earlier phase detected
     // would advance watermarks over the hole and hide it from the final
     // heal below.
-    let mut boot_fold = IndexFold::new(&index, blobs.clone());
+    let mut boot_fold = IndexFold::new(&index, std::sync::Arc::new(blobs.clone()));
     let (host, resumed, next_seq, prev_ckpt, recovery_manifest_for_resume) = boot::restore(
         &context,
         &index,

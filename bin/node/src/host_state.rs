@@ -68,7 +68,7 @@ const HELLO_WASM_MODULE_ID: &str = "hello";
 /// are content-addressed chunks on the node's blob plane (staged there before
 /// the governance schedule, exactly like a forge Push packfile). a hash the
 /// store lacks is a `None` — the boundary fails closed rather than forking.
-pub(super) struct BlobCodeSource(pub(super) blobstore::BlobHandle);
+pub(super) struct BlobCodeSource(pub(super) std::sync::Arc<dyn blobstore::Blobs>);
 
 #[async_trait::async_trait(?Send)]
 impl host::CodeSource for BlobCodeSource {
