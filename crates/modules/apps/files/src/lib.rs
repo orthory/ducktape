@@ -12,6 +12,16 @@ mod module;
 #[cfg(feature = "native")]
 pub use module::Files;
 
+// the wasm-guest port. compiled for the `guest` feature (the wasm build) and
+// under `test` (so the native suite can drive the pure `dispatch` seam against
+// an in-memory odb); ABSENT under the bare `--no-default-features` wasm-
+// readiness gate, keeping sdk/guest-adapter out of the pure core.
+#[cfg(any(feature = "guest", test))]
+mod guest;
+
+#[cfg(feature = "guest")]
+pub use guest::FilesGuest;
+
 #[cfg(not(feature = "native"))]
 pub use duckfs_core::testkit;
 

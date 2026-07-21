@@ -93,7 +93,7 @@ members = [
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
-exclude = ["crates/labs"]
+exclude = ["crates/labs", "crates/guests/guest-adapter"]
 
 [workspace.package]
 edition = "2024"
