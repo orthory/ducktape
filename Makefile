@@ -294,6 +294,13 @@ wasm-modules:
 	cp crates/guests/tagging-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tagging.component.wasm
 
+	cd crates/guests/dispatch-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/guests/dispatch-wasm/target/wasm32-unknown-unknown/release/dispatch_wasm.wasm \
+	  -o crates/guests/dispatch-wasm/component.wasm
+	cp crates/guests/dispatch-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/dispatch.component.wasm
+
 	cd crates/guests/capability-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/capability-wasm/target/wasm32-unknown-unknown/release/capability_wasm.wasm \
@@ -381,6 +388,8 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/tasks.component.wasm
 	cmp crates/guests/tagging-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/tagging.component.wasm
+	cmp crates/guests/dispatch-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/dispatch.component.wasm
 	cmp crates/guests/capability-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/capability.component.wasm
 	cmp crates/guests/identity-wasm/component.wasm \
