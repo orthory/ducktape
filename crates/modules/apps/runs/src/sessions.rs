@@ -29,8 +29,8 @@
 //! ## the two authorizations (X2)
 //!
 //! - **open** — the origin must be the run's committed LEASE-HOLDER: the node
-//!   the dispatch plane actually handed the work to (`DispatchView::assignee`,
-//!   which the read facade derives from saga's committed lease). self-authorizing,
+//!   the dispatch plane actually handed the work to (the `assignee` on the saga
+//!   the dispatch names, read directly). self-authorizing,
 //!   so an automated issue-mention run works with nobody at a keyboard, and
 //!   correct cross-node, because the lease names the node really executing.
 //! - **act** — the origin must BE the bound session key. no other origin, not
@@ -79,6 +79,10 @@ use super::{
     MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN,
     delegated_run_id_for, delegation_id_for, dispatch_decode_reply, dispatch_encode_query,
     dispatch_id_for, page_thread_id,
+};
+use dispatch::DispatchStatus;
+use saga::{
+    SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
 
 impl RunsModule {
@@ -478,10 +482,12 @@ impl RunsModule {
         Ok(())
     }
 
-    /// the node key holding the run's execution lease — the dispatch plane's
-    /// `assignee`, which its read facade resolves from saga's COMMITTED lease at
-    /// query time. `None` (a delivered run runs nowhere) and a missing dispatch
-    /// are both refusals: neither names a node that could be executing this run.
+    /// the node key holding the run's execution lease. dispatch names the saga
+    /// carrying the work (only while still `AwaitingResult` — a delivered run
+    /// runs nowhere), and saga owns the live lease: its `assignee` IS the holder.
+    /// a missing dispatch, a terminal dispatch, and a saga with no committed
+    /// lease are all refusals — none names a node that could be executing this
+    /// run right now.
     async fn lease_holder(&self, ctx: &dyn Ctx, dispatch_id: &str) -> Result<Vec<u8>, String> {
         let reply = ctx
             .query(
@@ -493,12 +499,31 @@ impl RunsModule {
             )
             .await
             .map_err(|e| format!("dispatch lookup failed: {e}"))?;
-        match dispatch_decode_reply(&reply) {
-            Ok(DispatchReply::Dispatch(Some(view))) => view
+        let view = match dispatch_decode_reply(&reply) {
+            Ok(DispatchReply::Dispatch(Some(view))) => view,
+            Ok(DispatchReply::Dispatch(None)) => {
+                return Err("the run has no dispatch record".into());
+            }
+            _ => return Err("unexpected dispatch reply for a dispatch lookup".into()),
+        };
+        // a lease exists only while the dispatch still awaits its saga; the saga
+        // id it names is the one whose committed lease we read.
+        let DispatchStatus::AwaitingResult { saga_id } = view.status else {
+            return Err("the run holds no execution lease".into());
+        };
+        let reply = ctx
+            .query(
+                &self.saga,
+                &saga_encode_query(&SagaQuery::Get { saga_id }),
+            )
+            .await
+            .map_err(|e| format!("saga lookup failed: {e}"))?;
+        match saga_decode_reply(&reply) {
+            Ok(SagaReply::Saga(Some(saga))) => saga
                 .assignee
                 .ok_or_else(|| "the run holds no execution lease".to_string()),
-            Ok(DispatchReply::Dispatch(None)) => Err("the run has no dispatch record".into()),
-            _ => Err("unexpected dispatch reply for a dispatch lookup".into()),
+            Ok(SagaReply::Saga(None)) => Err("the run holds no execution lease".into()),
+            _ => Err("unexpected saga reply for a saga lookup".into()),
         }
     }
 }

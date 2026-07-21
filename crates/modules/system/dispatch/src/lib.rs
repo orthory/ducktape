@@ -42,9 +42,8 @@ use std::collections::BTreeMap;
 
 use capability::{validate_resources, validate_tag};
 use saga::{
-    SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, SagaQuery, SagaReply, decode_callback,
-    decode_reply as saga_decode_reply, encode_msg as saga_encode_msg,
-    encode_query as saga_encode_query, put_origin, take_origin,
+    SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback, encode_msg as saga_encode_msg,
+    put_origin, take_origin,
 };
 use sdk::codec;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -828,37 +827,8 @@ impl DispatchModule {
                 Status::Delivered => DispatchStatus::Delivered,
             },
             outcome: d.outcome.clone(),
-            assignee: None,
-            attempt: None,
-            max_attempts: None,
-            lease_expires_at: None,
-            deadline: None,
-            lease_updated_at: None,
-            reassignable: None,
             created_at: d.created_at,
             updated_at: d.updated_at,
-        }
-    }
-
-    /// the saga's current lease holder, read through the host-routed sibling
-    /// lane — the filtered-facade pattern (cf. `lifecycle::members`). read-only:
-    /// this never stages, so it is safe inside `query_with`.
-    async fn saga_view(
-        &self,
-        ctx: &dyn Ctx,
-        saga_id: &str,
-    ) -> Result<Option<saga::SagaView>, Error> {
-        let reply = ctx
-            .query(
-                &self.saga,
-                &saga_encode_query(&SagaQuery::Get {
-                    saga_id: saga_id.to_string(),
-                }),
-            )
-            .await?;
-        match saga_decode_reply(&reply).map_err(Error::Module)? {
-            SagaReply::Saga(saga) => Ok(saga),
-            other => Err(Error::Module(format!("saga answered Get with {other:?}"))),
         }
     }
 
@@ -939,41 +909,6 @@ impl Module for DispatchModule {
         }
     }
 
-    async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
-        // only the single-dispatch read is enriched with the live assignee;
-        // every other variant (including the host's committed-only
-        // PendingDeliveries injection read) stays on the plain `query` path.
-        match decode_query(req).map_err(Error::Module)? {
-            DispatchQuery::Dispatch {
-                receiver,
-                dispatch_id,
-            } => {
-                let key = dispatch_key(&receiver, &dispatch_id);
-                let Some(d) = self.committed.dispatches.get(&key) else {
-                    return Ok(encode_reply(&DispatchReply::Dispatch(None)));
-                };
-                let mut view = Self::view(d);
-                // "running on" is only meaningful while the saga is live; a
-                // delivered run has left every node.
-                if matches!(d.status, Status::AwaitingResult)
-                    && let Some(saga) = self.saga_view(ctx, &d.saga_id).await?
-                {
-                    view.assignee = saga.assignee;
-                    view.attempt = Some(saga.attempt);
-                    view.max_attempts = Some(saga.max_attempts);
-                    view.lease_expires_at = saga.lease_expires_at;
-                    view.deadline = saga.deadline;
-                    view.lease_updated_at = Some(saga.updated_at);
-                    view.reassignable = Some(
-                        saga.pinned_assignee.is_none() && saga.attempt + 1 < saga.max_attempts,
-                    );
-                }
-                Ok(encode_reply(&DispatchReply::Dispatch(Some(view))))
-            }
-            _ => self.query(req).await,
-        }
-    }
-
     async fn commit_block(&mut self) -> Result<(), Error> {
         for (id, staged) in std::mem::take(&mut self.staged_recipes) {
             match staged {
@@ -1010,7 +945,6 @@ mod tests {
         env: Env,
         msgs: Vec<Msg>,
         events: Vec<Event>,
-        saga_reply: Option<Vec<u8>>,
     }
     impl CaptureCtx {
         fn new() -> Self {
@@ -1024,7 +958,6 @@ mod tests {
                 },
                 msgs: Vec::new(),
                 events: Vec::new(),
-                saga_reply: None,
             }
         }
         fn at(mut self, height: u64) -> Self {
@@ -1036,12 +969,6 @@ mod tests {
             self.env.origin = origin;
             self
         }
-        /// canned answer for a `saga` `Get` — how a query_with test stands in
-        /// for the real sibling module.
-        fn with_saga_reply(mut self, reply: Vec<u8>) -> Self {
-            self.saga_reply = Some(reply);
-            self
-        }
     }
     #[async_trait::async_trait(?Send)]
     impl Ctx for CaptureCtx {
@@ -1051,11 +978,8 @@ mod tests {
         fn module_root(&self, _target: &str) -> Option<StateRoot> {
             Some(StateRoot::ZERO)
         }
-        async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-            match &self.saga_reply {
-                Some(bytes) if target == "saga" => Ok(bytes.clone()),
-                _ => Err(Error::QueryUnsupported),
-            }
+        async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
+            Err(Error::QueryUnsupported)
         }
         fn emit_msg(&mut self, msg: Msg) {
             self.msgs.push(msg);
@@ -1737,76 +1661,4 @@ mod tests {
         ));
     }
 
-    /// a `saga` `Get` reply carrying a Pending saga with the given assignee.
-    fn saga_reply_with_assignee(assignee: Option<Vec<u8>>) -> Vec<u8> {
-        use saga::{SagaStatus, SagaView, encode_reply as saga_encode_reply};
-        saga_encode_reply(&SagaReply::Saga(Some(SagaView {
-            origin: SagaOrigin::Module("dispatch".into()),
-            reply_to: Some("dispatch".into()),
-            reply_payload: Vec::new(),
-            spec: Vec::new(),
-            capability: Some("alpha".into()),
-            status: SagaStatus::Pending,
-            attempt: 0,
-            max_attempts: 2,
-            assignee,
-            pinned_assignee: None,
-            lease_views: Some(64),
-            lease_expires_at: Some(80),
-            deadline: Some(100),
-            result: None,
-            error: None,
-            created_at: 0,
-            updated_at: 40,
-        })))
-    }
-
-    fn query_dispatch(m: &DispatchModule, ctx: &CaptureCtx, key: &str) -> Option<DispatchView> {
-        let (receiver, dispatch_id) = key.split_once(SEP).expect("composite key");
-        let reply = block_on(m.query_with(
-            ctx,
-            &crate::encode_query(&DispatchQuery::Dispatch {
-                receiver: receiver.into(),
-                dispatch_id: dispatch_id.into(),
-            }),
-        ))
-        .unwrap();
-        match crate::decode_reply(&reply).unwrap() {
-            DispatchReply::Dispatch(v) => v,
-            other => panic!("expected Dispatch reply, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn query_with_surfaces_the_saga_assignee_while_awaiting_result() {
-        let mut m = module();
-        let key = registered_and_dispatched(&mut m, OutputContract::Text);
-        let ctx = CaptureCtx::new()
-            .with_saga_reply(saga_reply_with_assignee(Some(b"worker-key".to_vec())));
-        let view = query_dispatch(&m, &ctx, &key).expect("a dispatch view");
-        assert_eq!(view.assignee, Some(b"worker-key".to_vec()));
-        assert_eq!(view.attempt, Some(0));
-        assert_eq!(view.max_attempts, Some(2));
-        assert_eq!(view.lease_expires_at, Some(80));
-        assert_eq!(view.deadline, Some(100));
-        assert_eq!(view.lease_updated_at, Some(40));
-        assert_eq!(view.reassignable, Some(true));
-    }
-
-    #[test]
-    fn query_with_omits_the_assignee_once_the_run_is_terminal() {
-        let mut m = module();
-        let key = registered_and_dispatched(&mut m, OutputContract::Text);
-        // a Done callback moves the dispatch off AwaitingResult.
-        callback_for(&mut m, &key, SagaOutcome::Done(b"quack".to_vec())).unwrap();
-        commit(&mut m);
-        // even though the saga would still answer with an assignee, a
-        // non-AwaitingResult dispatch never calls saga and reports None.
-        let ctx = CaptureCtx::new()
-            .with_saga_reply(saga_reply_with_assignee(Some(b"worker-key".to_vec())));
-        let view = query_dispatch(&m, &ctx, &key).expect("a dispatch view");
-        assert_eq!(view.assignee, None);
-        assert_eq!(view.attempt, None);
-        assert_eq!(view.reassignable, None);
-    }
 }

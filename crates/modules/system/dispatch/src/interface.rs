@@ -136,24 +136,6 @@ pub struct DispatchView {
     /// the contract-checked outcome, present from `AwaitingDelivery` on.
     /// `Err` carries the saga failure or the contract violation.
     pub outcome: Option<Result<Vec<u8>, String>>,
-    /// the node key currently holding the run's execution lease (the saga
-    /// assignee), resolved at QUERY TIME by the read facade. `None` unless the
-    /// dispatch is `AwaitingResult` — a delivered run runs nowhere. VIEW-ONLY:
-    /// never committed state, never part of the app-hash.
-    pub assignee: Option<Vec<u8>>,
-    /// live saga lease metadata, populated only while awaiting a result.
-    #[serde(default)]
-    pub attempt: Option<u32>,
-    #[serde(default)]
-    pub max_attempts: Option<u32>,
-    #[serde(default)]
-    pub lease_expires_at: Option<u64>,
-    #[serde(default)]
-    pub deadline: Option<u64>,
-    #[serde(default)]
-    pub lease_updated_at: Option<u64>,
-    #[serde(default)]
-    pub reassignable: Option<bool>,
     pub created_at: u64,
     pub updated_at: u64,
 }

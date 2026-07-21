@@ -6,7 +6,6 @@
 
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
-use dispatch::DispatchModule;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use forge::Forge;
@@ -149,12 +148,7 @@ const GOVERNANCE_MODULE_ID: &str = "governance";
 /// paths reads staged-over-committed state, so the whole-state fold is
 /// behavior-identical (pinned by their parity proofs); their work-order
 /// events, P6 callbacks, registry hooks, and chat-hook probe reads all cross
-/// the wit seam unchanged. DISPATCH deliberately stays NATIVE: its read
-/// facade (`DispatchQuery::Dispatch`, `PendingDeliveries`) serves
-/// COMMITTED-ONLY state by design — runs' mid-block `lease_holder` read
-/// depends on it — and the adapter's staged-fold cannot represent a
-/// committed-only view (the same class of frozen-committed read that keeps
-/// lifecycle native).
+/// the wit seam unchanged.
 const SAGA_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/saga-wasm/component.wasm");
 const SAGA_MODULE_ID: &str = "saga";
@@ -165,6 +159,27 @@ const AUTOMATIONS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/automations-wasm/component.wasm");
 const AUTOMATIONS_MODULE_ID: &str = "automations";
 
+/// dispatch — the task plane's recipe-manifest + capability-routed delivery
+/// registry, adapter-ported like its saga collaborator (the native crate
+/// compiled into the guest; canonical snapshot persisted through the host-KV
+/// store). two things make its port shape distinct:
+///   * its schema break is TOTAL from genesis — the native empty encoding is
+///     four zero counts (recipes / dispatches / mailbox / next_seq) while the
+///     map-backed guest store is a lone count, so the wasm root differs from the
+///     native root before any write (revision 2, fenced by the schema preflight;
+///     flag day, no shim).
+///   * its query surface is COMMITTED-ONLY regardless of caller — the host's
+///     `PendingDeliveries` delivery injection and runs' `turn_taken` existence
+///     read must never see a same-block staged write — pinned by the genesis
+///     builder's `.with_committed_queries()` (the kernel lane Task 3 added).
+///     dispatch carries NO ctx-routed enrichment: the former `query_with`
+///     assignee facade was retired when runs' `lease_holder` moved onto saga,
+///     so the guest's ctx-less query is exactly faithful to the native surface.
+/// its saga collaborator id ("saga") is genesis-constant, compiled into the guest.
+const DISPATCH_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/guests/dispatch-wasm/component.wasm");
+const DISPATCH_MODULE_ID: &str = "dispatch";
+
 /// runs — the FINAL adapter-ported tenant: the collaboration loop's actor.
 /// every decision in its handle paths reads staged-over-committed (the
 /// watch/pending-entry/session accessors shadow the committed maps with the
@@ -172,11 +187,14 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 /// by `wasm_runs_parity`). its ten collaborator ids — chat, saga, tagging,
 /// dispatch, agent, tasks, plus the files/forge/pages builder chain —
 /// are genesis-constant and compiled into the guest (the exact production
-/// constructor these builders used to call natively). the dispatch reads it
-/// depends on (`turn_taken`'s permanent record, the session lane's
-/// `lease_holder`) are COMMITTED-ONLY by dispatch's design — dispatch stays
-/// native and answers committed-only regardless of caller, so the guest's
-/// host-routed queries read exactly what the native module read. the
+/// constructor these builders used to call natively). its two dispatch reads —
+/// `turn_taken`'s existence check and `lease_holder`'s `AwaitingResult { saga_id }`
+/// lookup — both read COMMITTED-ONLY dispatch fields, served faithfully by
+/// dispatch's own guest query lane (`with_committed_queries`), so the host-routed
+/// query reads exactly the committed record, never a same-block staged write.
+/// only the ASSIGNEE source moved off dispatch: `lease_holder` still reads the
+/// saga id FROM the dispatch view, then reads the live lease from saga directly
+/// (dispatch's retired `query_with` no longer relays it). the
 /// delivered-runs ring (`RecentRuns`) — derived per-node state outside the
 /// NATIVE root/snapshot — persists through the guest's own `__history` key
 /// (the app's runs client and the dogfood receipt lane read it), so it rides
@@ -267,6 +285,10 @@ fn seeded_lifecycle() -> Lifecycle {
         RUNS_MODULE_ID,
         sha2::Sha256::digest(RUNS_WASM_COMPONENT).to_vec(),
     );
+    reg.seed(
+        DISPATCH_MODULE_ID,
+        sha2::Sha256::digest(DISPATCH_WASM_COMPONENT).to_vec(),
+    );
     reg
 }
 
@@ -293,6 +315,7 @@ pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(AGENT_WASM_COMPONENT.to_vec());
     blobs.put_chunk(AUTOMATIONS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(DISPATCH_WASM_COMPONENT.to_vec());
 }
 
 /// the reference wasm module at its GENESIS code. restarted/synced nodes still
@@ -366,6 +389,19 @@ fn genesis_automations_wasm() -> WasmModule {
     WasmModule::from_bytes(AUTOMATIONS_MODULE_ID, AUTOMATIONS_WASM_COMPONENT)
         .expect("embedded automations component loads")
         .with_state_schema_revision(2)
+}
+
+/// dispatch at its GENESIS code (adapter-ported — see the component const's
+/// doc). revision 2: the native canonical snapshot persisted as one host-KV
+/// value, a TOTAL schema break from the native root. `.with_committed_queries()`
+/// pins the guest's query lane committed-only, preserving the native read
+/// facade's contract (the host's delivery injection + runs' `turn_taken` read);
+/// EXACTLY the wiring `wasm_dispatch_parity`'s `wasm_dispatch()` pins.
+fn genesis_dispatch_wasm() -> WasmModule {
+    WasmModule::from_bytes(DISPATCH_MODULE_ID, DISPATCH_WASM_COMPONENT)
+        .expect("embedded dispatch component loads")
+        .with_state_schema_revision(2)
+        .with_committed_queries()
 }
 
 /// runs at its GENESIS code (adapter-ported — see the component const's doc).
@@ -484,7 +520,7 @@ struct ProductionModules {
     hello_wasm: WasmModule,
     saga: WasmModule,
     capability: WasmModule,
-    dispatch: DispatchModule,
+    dispatch: WasmModule,
     tagging: WasmModule,
     tasks: WasmModule,
     identity: WasmModule,
@@ -603,7 +639,8 @@ pub(super) async fn genesis_host(
         capability: genesis_capability_wasm(),
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
-        dispatch: DispatchModule::new("dispatch", "saga"),
+        // adapter-ported; committed-only query lane, TOTAL rev-2 schema break.
+        dispatch: genesis_dispatch_wasm(),
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
         tagging: genesis_tagging_wasm(),
@@ -733,8 +770,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
 
-    let mut dispatch = DispatchModule::new("dispatch", "saga");
-    let (bytes, root) = snapshot_of("dispatch")?;
+    let mut dispatch = genesis_dispatch_wasm();
+    let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID)?;
     dispatch
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
@@ -1003,8 +1040,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("capability install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("dispatch").await?;
-    let mut dispatch = DispatchModule::new("dispatch", "saga");
+    let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID).await?;
+    let mut dispatch = genesis_dispatch_wasm();
     dispatch
         .install(&bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
