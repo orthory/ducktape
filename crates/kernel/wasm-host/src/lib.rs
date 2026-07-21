@@ -1272,8 +1272,12 @@ impl Module for WasmModule {
                 //    place the root moves (native `refs_store.save` + `adopt_refs`).
                 //    an empty stage leaves refs, and the root, untouched.
                 if let Some(overlay) = self.staged.remove(REFS_KEY) {
-                    let refs = overlay
-                        .expect("the refs lane stages a value, never a delete");
+                    // the refs lane only ever stages a value (`state-set`); a
+                    // staged delete is a guest bug — reject deterministically
+                    // (identical on every validator) rather than panic.
+                    let refs = overlay.ok_or_else(|| {
+                        SdkError::Module("files: refs lane staged a delete, never valid".into())
+                    })?;
                     backing.adopt_refs(&refs)?;
                 }
                 self.staged.clear();
