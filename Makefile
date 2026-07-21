@@ -273,6 +273,10 @@ wasm-modules:
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
+	cd crates/guests/object-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
+	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 	cd crates/guests/inbox-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/inbox-wasm/target/wasm32-unknown-unknown/release/inbox_wasm.wasm \
@@ -371,6 +375,13 @@ wasm-modules:
 	cp crates/guests/runs-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/runs.component.wasm
 
+	cd crates/guests/files-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/guests/files-wasm/target/wasm32-unknown-unknown/release/files_wasm.wasm \
+	  -o crates/guests/files-wasm/component.wasm
+	cp crates/guests/files-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/files.component.wasm
+
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (bin/node embeds the canonical artifact; the
 ## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
@@ -410,6 +421,8 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/automations.component.wasm
 	cmp crates/guests/runs-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/runs.component.wasm
+	cmp crates/guests/files-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/files.component.wasm
 	@echo "wasm module artifacts are mutually consistent"
 
 clean:

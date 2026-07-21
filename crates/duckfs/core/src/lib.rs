@@ -23,5 +23,8 @@ pub mod testkit;
 
 pub use fs::{Fs, Notification, StagedObjects};
 pub use objects::{Kind, ObjectId};
-pub use state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
+pub use state::{
+    PinEntry, Refs, Staged, decode_block_objects, decode_refs, encode_block_objects, encode_refs,
+    root_bytes,
+};
 pub use store::{MemStore, ObjectStore};

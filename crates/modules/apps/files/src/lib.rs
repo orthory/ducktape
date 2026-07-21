@@ -12,6 +12,25 @@ mod module;
 #[cfg(feature = "native")]
 pub use module::Files;
 
+// the host-side ODB substrate a wasm files tenant delegates its committed
+// surface to (`wasm_host::OdbBacking` over the SAME disk machinery as `Files`).
+// native-only: it depends on duckfs-disk + the kernel host, never the pure core.
+#[cfg(feature = "native")]
+mod backing;
+
+#[cfg(feature = "native")]
+pub use backing::FilesOdbBacking;
+
+// the wasm-guest port. compiled for the `guest` feature (the wasm build) and
+// under `test` (so the native suite can drive the pure `dispatch` seam against
+// an in-memory odb); ABSENT under the bare `--no-default-features` wasm-
+// readiness gate, keeping sdk/guest-adapter out of the pure core.
+#[cfg(any(feature = "guest", test))]
+mod guest;
+
+#[cfg(feature = "guest")]
+pub use guest::FilesGuest;
+
 #[cfg(not(feature = "native"))]
 pub use duckfs_core::testkit;
 

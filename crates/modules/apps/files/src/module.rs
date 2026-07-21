@@ -9,7 +9,7 @@ use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::state::Refs;
 use duckfs_core::store::ObjectStore as _;
 use duckfs_core::{
-    FilesMsg, GC_PERIOD_BLOCKS, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
+    FilesMsg, GC_PERIOD_BLOCKS, Kind, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
     decode_sync_req, encode_reply, encode_sync_resp,
 };
 use duckfs_disk::{DiskRefs, DiskStore};
@@ -24,6 +24,63 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle}
 /// trigger test can table-drive the boundary (re-exported via `testkit`).
 pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
     height / GC_PERIOD_BLOCKS > watermark / GC_PERIOD_BLOCKS
+}
+
+/// steps 2-3 of the durability ordering (the object side): flush the block's
+/// objects into the odb, then fsync the touched fanout dirs so every published
+/// object is durable BEFORE the refs commit point. shared verbatim by the native
+/// [`Files::commit_block`] and the wasm-tenant [`crate::backing::FilesOdbBacking`]'s
+/// `publish_block`, so the crash-safety contract is single-sourced (extract-and-
+/// share, not forked). objects are content-addressed + idempotent, so a re-put on
+/// replay is a cheap no-op.
+pub(crate) fn persist_objects(store: &mut DiskStore, objects: &[(Kind, Vec<u8>)]) -> Result<(), Error> {
+    for (kind, body) in objects {
+        store
+            .put(*kind, body)
+            .map_err(|e| Error::Module(format!("files: odb put: {e}")))?;
+    }
+    store
+        .sync_dirs()
+        .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
+    Ok(())
+}
+
+/// steps 4-6 of the durability ordering (the refs side): save the refs envelope
+/// (atomic rename + parent fsync — the commit point), adopt the new refs in core
+/// (the ONLY place the root moves), then run the consensus-neutral gc watermark
+/// trigger and re-save the advanced watermark. returns the (possibly advanced) gc
+/// watermark. shared verbatim by the native [`Files::commit_block`] and the
+/// wasm-tenant [`crate::backing::FilesOdbBacking`]'s `adopt_refs`.
+///
+/// the caller MUST have persisted the block's objects (via [`persist_objects`])
+/// first: the refs file names those objects, so a crash after this returns must
+/// never reach a refs image whose objects' dir-entries never hit disk.
+pub(crate) fn commit_refs(
+    fs: &mut Fs<DiskStore>,
+    refs_store: &mut DiskRefs,
+    refs: Refs,
+    height: u64,
+    gc_watermark: u64,
+) -> Result<u64, Error> {
+    // 4. the commit point: refs file durable (atomic rename + parent fsync).
+    refs_store
+        .save(&refs, height, gc_watermark)
+        .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
+    // 5. adopt — root advances only now that the refs file is durable.
+    fs.adopt_refs(refs);
+    // 6. gc watermark trigger — per-node bookkeeping, NOT consensus (the root
+    // covers refs only). run AFTER adopt so a gc crash can never lose committed
+    // state: the block is already durable above. the advanced watermark lives
+    // ONLY in the refs-file envelope (never the root), so re-save it here.
+    if !gc_due(height, gc_watermark) {
+        return Ok(gc_watermark);
+    }
+    fs.gc()
+        .map_err(|e| Error::Module(format!("files: gc: {e}")))?;
+    refs_store
+        .save(fs.refs(), height, height)
+        .map_err(|e| Error::Module(format!("files: refs save (gc watermark): {e}")))?;
+    Ok(height)
 }
 
 pub struct Files {
@@ -384,45 +441,15 @@ impl Module for Files {
         let Some((refs, height, objects)) = self.fs.commit_block() else {
             return Ok(()); // the block staged nothing
         };
-        {
-            let store = self.fs.store_mut();
-            // 2. flush objects; a failure aborts before adoption (no torn root).
-            for (kind, body) in &objects {
-                store
-                    .put(*kind, body)
-                    .map_err(|e| Error::Module(format!("files: odb put: {e}")))?;
-            }
-            // 3. object dir-entries durable BEFORE the refs commit point below.
-            store
-                .sync_dirs()
-                .map_err(|e| Error::Module(format!("files: odb sync: {e}")))?;
-        }
-        // 4. the commit point: refs file durable (atomic rename + parent fsync).
-        self.refs_store
-            .save(&refs, height, self.gc_watermark)
-            .map_err(|e| Error::Module(format!("files: refs save: {e}")))?;
-        // 5. adopt — root advances only now that the refs file is durable.
-        self.fs.adopt_refs(refs);
+        // 2-3. flush the block's objects and fsync their odb dirs BEFORE the refs
+        // commit point; a failure aborts before adoption (no torn root).
+        persist_objects(self.fs.store_mut(), &objects)?;
+        // 4-6. the commit point (refs save), adopt (root moves here), and the
+        // consensus-neutral gc watermark trigger — the ordering shared verbatim
+        // with the wasm-tenant backing's publish/adopt sequence.
+        self.gc_watermark =
+            commit_refs(&mut self.fs, &mut self.refs_store, refs, height, self.gc_watermark)?;
         self.durable_height = Some(height);
-
-        // 6. gc watermark trigger — per-node bookkeeping, NOT consensus (the root
-        // covers refs only, and unreachable-on-one-node is unreachable on every
-        // node). run AFTER adopt so a gc crash can never lose committed state: the
-        // block is already durable above, so any error here bricks the node loudly
-        // (corruption) without rolling the block back. the deterministic cadence
-        // is op-stream-driven — the first files-active block past each period
-        // boundary — so nodes may lag in wall time but never diverge in state. the
-        // advanced watermark lives ONLY in the refs-file envelope (never the root),
-        // so re-save it here.
-        if gc_due(height, self.gc_watermark) {
-            self.fs
-                .gc()
-                .map_err(|e| Error::Module(format!("files: gc: {e}")))?;
-            self.gc_watermark = height;
-            self.refs_store
-                .save(self.fs.refs(), height, self.gc_watermark)
-                .map_err(|e| Error::Module(format!("files: refs save (gc watermark): {e}")))?;
-        }
         Ok(())
     }
 

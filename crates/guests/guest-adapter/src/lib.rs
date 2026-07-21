@@ -231,6 +231,83 @@ impl MerkleStore for WitStore {
 }
 
 // ============================================================================
+// GuestOdb — duckfs_core::ObjectStore over the host object-plane imports
+// ============================================================================
+
+/// the [`duckfs_core::ObjectStore`] a files guest drives inside the wasm
+/// module: every method forwards to the `ducktape:module/host` object imports,
+/// so `duckfs_core::Fs<GuestOdb>` runs unmodified over the host-owned odb. the
+/// host owns the real disk store; this unit type is a pure 1:1 shim.
+///
+/// * [`put`](duckfs_core::ObjectStore::put) → `host::object_put` — the host
+///   computes and returns `sha256(kind ‖ body)`; the staged object is visible
+///   to same-block stats/gets and published/discarded at the block boundary.
+/// * [`get`](duckfs_core::ObjectStore::get) → `host::object_get` — the tagged
+///   body `kind ‖ body`, split back into `(Kind, body)`.
+/// * [`stat`](duckfs_core::ObjectStore::stat) → `host::object_stat` — metadata
+///   only `(Kind, len)`, NEVER a full body read (the consensus-path contract).
+/// * [`has`](duckfs_core::ObjectStore::has) = `stat().is_some()`.
+/// * [`remove`](duckfs_core::ObjectStore::remove) /
+///   [`list`](duckfs_core::ObjectStore::list) — UNREACHABLE in a guest: object
+///   removal (gc) and enumeration are HOST-side (the odb WIT surface is
+///   read+stage only, by design), so they fail deterministically rather than
+///   fabricate an answer.
+#[cfg(feature = "odb")]
+pub struct GuestOdb;
+
+#[cfg(feature = "odb")]
+impl duckfs_core::ObjectStore for GuestOdb {
+    fn put(
+        &mut self,
+        kind: duckfs_core::Kind,
+        body: &[u8],
+    ) -> Result<duckfs_core::ObjectId, String> {
+        let id = host::object_put(kind.tag(), body);
+        id.try_into()
+            .map_err(|_| "files: host object-put returned a non-32-byte id".to_string())
+    }
+
+    fn get(
+        &self,
+        id: &duckfs_core::ObjectId,
+    ) -> Result<Option<(duckfs_core::Kind, Vec<u8>)>, String> {
+        let Some(tagged) = host::object_get(id) else {
+            return Ok(None);
+        };
+        let (&tag, body) = tagged
+            .split_first()
+            .ok_or_else(|| "files: host object-get returned an empty tagged body".to_string())?;
+        let kind = duckfs_core::Kind::from_u8(tag)
+            .ok_or_else(|| "files: host object-get returned an unknown kind tag".to_string())?;
+        Ok(Some((kind, body.to_vec())))
+    }
+
+    fn has(&self, id: &duckfs_core::ObjectId) -> bool {
+        host::object_stat(id).is_some()
+    }
+
+    fn stat(
+        &self,
+        id: &duckfs_core::ObjectId,
+    ) -> Result<Option<(duckfs_core::Kind, u64)>, String> {
+        let Some((tag, len)) = host::object_stat(id) else {
+            return Ok(None);
+        };
+        let kind = duckfs_core::Kind::from_u8(tag)
+            .ok_or_else(|| "files: host object-stat returned an unknown kind tag".to_string())?;
+        Ok(Some((kind, len)))
+    }
+
+    fn remove(&mut self, _id: &duckfs_core::ObjectId) -> Result<(), String> {
+        Err("files: object removal is host-side — the guest odb is read+stage only".into())
+    }
+
+    fn list(&self) -> Result<Vec<duckfs_core::ObjectId>, String> {
+        Err("files: object enumeration is host-side — the guest odb is read+stage only".into())
+    }
+}
+
+// ============================================================================
 // block_on — the guest executor
 // ============================================================================
 

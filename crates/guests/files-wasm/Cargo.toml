@@ -1,0 +1,31 @@
+# The wasm port of the `files` module: compiles the NATIVE files crate's guest
+# surface (`FilesGuest`, `duckfs_core::Fs<GuestOdb>` over the WIT object plane)
+# to wasm32 and adapts it to the ducktape:module world through guest-adapter —
+# the op semantics stay single-sourced in `crates/modules/apps/files`. Standalone
+# workspace: guest crates build to `wasm32-unknown-unknown` and are componentized
+# by the module build target, never by the host workspace.
+#
+# `files` is pulled with `default-features = false, features = ["guest"]`: the
+# `native` feature (duckfs-disk, sdk::Module, the FilesOdbBacking host substrate)
+# is dropped, leaving only the pure `Fs` state machine + the `FilesGuest` adapter
+# entry, which the port forwards two `Guest` methods to.
+#
+# NO `[patch.crates-io]` block: the dep chain is duckfs-core + sdk + guest-adapter
+# (all pure Rust) — none of them pull commonware-cryptography, so neither blst nor
+# getrandom's js backend reaches the cdylib. (dispatch-wasm needs those stubs
+# because dispatch -> saga -> valset -> commonware; files does not.)
+[package]
+name = "files-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+guest-adapter = { path = "../guest-adapter" }
+files = { path = "../../modules/apps/files", default-features = false, features = ["guest"] }
+sdk = { path = "../../kernel/sdk" }
+
+[workspace]
