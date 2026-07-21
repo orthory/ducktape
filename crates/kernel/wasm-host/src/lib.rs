@@ -20,9 +20,16 @@
 //!     replay converges in (distinct reads + 1) rounds, bounded by
 //!     [`MAX_SIBLING_READS`].
 //!
-//! COMMITTED state has two backings ([`StateBacking`]):
+//! COMMITTED state has three backings ([`StateBacking`]):
 //!   * `Map` — the original host-KV `BTreeMap`, whose root is sha256 over the
 //!     canonical encoding and whose sync surface is installable snapshot bytes.
+//!   * `Odb` — a host-side duckfs substrate ([`OdbBacking`], the files port):
+//!     the committed state is a single refs image the guest sees through the
+//!     [`REFS_KEY`] state lane, `root()` is `sha256(refs_bytes())` (the refs
+//!     image, byte-identical to native files — NOT the KV encoding), and the
+//!     object plane, queries, and state-sync all delegate to the backing. at the
+//!     block boundary the kernel publishes the staged objects into the backing
+//!     BEFORE adopting the refs image (the duckfs crash-safety ordering).
 //!   * `Store` — a host-injected [`sdk::MerkleStore`] (qmdb in production, via
 //!     [`WasmModule::with_store`]): the root IS the store's merkle root and
 //!     sync is the store's resolver lane, so a native module already written
@@ -118,6 +125,59 @@ pub trait HostOdb {
     /// discarded at the block boundary by the backing.
     fn stage_put(&mut self, kind: u8, body: &[u8]) -> [u8; 32];
 }
+
+/// the host-side substrate a ROOT-CONTINUOUS files tenant ([`StateBacking::Odb`])
+/// delegates its committed surface to — a native duckfs `Fs` over its disk odb +
+/// durable refs file (Task 4), or the in-memory mock the kernel tests drive.
+///
+/// the crux is `root()` = `StateRoot(sha256(refs_bytes()))` — the canonical refs
+/// image, NOT the host-KV encoding — so a wasm files tenant's app-hash is
+/// byte-identical to native files' `sha256(encode_refs)` and the cutover moves
+/// no root. the guest sees the refs image through the ordinary `state-*` lane
+/// under [`REFS_KEY`] (state-get serves the committed image staged-over, state-set
+/// stages a new one); the object plane rides [`HostOdb`] (the supertrait). at the
+/// block boundary the kernel drives the two boundary hooks in the duckfs
+/// durability order — staged objects published FIRST, then the refs image adopted
+/// — the crash-safety contract Task 4 realizes on disk (native `module.rs:368-427`).
+pub trait OdbBacking: HostOdb {
+    /// the committed refs image — the `root()` preimage and the snapshot bytes.
+    /// byte-identical to native `Fs::snapshot_refs` / `encode_refs`.
+    fn refs_bytes(&self) -> Vec<u8>;
+    /// adopt a refs image as the new committed refs (the root moves here). the
+    /// image is consensus-validated (a committed block's staged refs) or
+    /// root-verified (an installed snapshot); the backing swaps + durably saves
+    /// it (native `Fs::adopt_refs` + `DiskRefs::save`). NOT trusted to verify —
+    /// [`WasmModule::install`] checks the root before calling this.
+    fn adopt_refs(&mut self, bytes: &[u8]) -> Result<(), SdkError>;
+    /// the objects-durable barrier of the block boundary: make the objects
+    /// received via [`HostOdb::stage_put`] this block durable (native
+    /// `store.sync_dirs`). the kernel calls this BEFORE `adopt_refs`, so the
+    /// refs commit point can never precede the objects it references.
+    fn publish_block(&mut self) -> Result<(), SdkError>;
+    /// drop this block's staged objects without publishing (native
+    /// `Fs::abort_block` drops the in-memory pending; a disk backing may also
+    /// sweep orphan object files). the committed refs + odb stay untouched.
+    fn discard_block(&mut self);
+    /// serve a committed-only query — the files read lane is HOST-side (never the
+    /// guest) so an in-block sibling `FilesQuery::Refs` reads committed refs+odb,
+    /// byte-identical to native `Fs::query` (`fs.rs:601-605`). off the execute
+    /// path, so disk body reads are fine here.
+    fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError>;
+    /// serve one committed-only state-sync request — the duckfs object-possession
+    /// protocol (native `Fs::serve_sync`). the delegation twin of a store-backed
+    /// tenant's `MerkleStore::serve_sync`.
+    fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, SdkError>;
+}
+
+/// the single reserved state-lane key an ODB-backed (files) tenant reads and
+/// writes its whole refs image under. the guest loads the committed refs via
+/// `state-get(REFS_KEY)` and stages a new image via `state-set(REFS_KEY, ..)`;
+/// the host seeds each execute round's committed view with exactly this one
+/// entry (= `backing.refs_bytes()`) and, at commit, adopts the staged value.
+/// reuses the `__state` single-value whole-state convention — but `root()` is
+/// `sha256(refs_bytes)`, NOT the KV encoding, so there is no `__root` twin. the
+/// files guest (Task 3) MUST read/write refs under this exact key.
+pub const REFS_KEY: &[u8] = b"__state";
 
 /// trap message for a read the memo cannot answer yet. never surfaces to
 /// consensus: the execute/query drivers intercept the run (via
@@ -389,6 +449,14 @@ enum StateBacking {
     /// wraps a fresh module around it, exactly like a native store-backed
     /// module.
     Store { store: Box<dyn MerkleStore> },
+    /// a host-side duckfs substrate ([`OdbBacking`]): root is
+    /// `sha256(refs_bytes())` (the refs image, NOT a KV encoding), the committed
+    /// state is a single refs image the guest sees through the [`REFS_KEY`]
+    /// state lane, and the object plane + queries + sync all delegate to the
+    /// backing. this is the ROOT-CONTINUOUS files port shape (native files'
+    /// `sha256(encode_refs)` root, verbatim). the boxed backing IS this tenant's
+    /// [`HostOdb`] too (`OdbBacking: HostOdb`), so object reads resolve against it.
+    Odb { backing: Box<dyn OdbBacking> },
 }
 
 /// A wasm module: a `ducktape:module` component plus its host-owned
@@ -404,12 +472,6 @@ pub struct WasmModule {
     code_hash: Vec<u8>,
     backing: StateBacking,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    /// the host-side content-addressed object store this tenant reads and
-    /// stages puts against. `None` in Task 1 (no backing wired): every object
-    /// read that misses the same-dispatch overlay resolves `None`. only the
-    /// files guest sets this; every other tenant leaves it `None` and never
-    /// touches the object plane.
-    odb: Option<Box<dyn HostOdb>>,
     /// this block's accumulated staged object puts (id → tagged body), across
     /// every dispatch since the last commit/abort — the object-plane twin of
     /// `staged`. seeds each dispatch's overlay; published (Task 2) or dropped at
@@ -444,7 +506,6 @@ impl WasmModule {
             code_hash: sha256(component_bytes),
             backing,
             staged: BTreeMap::new(),
-            odb: None,
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
             state_schema_revision: 1,
@@ -478,6 +539,21 @@ impl WasmModule {
         Self::load(id.into(), component_bytes, StateBacking::Store { store })
     }
 
+    /// Load a module from component bytes over a host-side duckfs substrate —
+    /// committed state is the backing's refs image, `root()` is
+    /// `sha256(refs_bytes())` (byte-identical to native files), queries and
+    /// state-sync delegate to the backing, and the object plane resolves against
+    /// it. this is the ROOT-CONTINUOUS files port: a native module written over
+    /// duckfs's disk odb + refs file cuts over with no root movement. the boxed
+    /// backing is both the committed refs owner and this tenant's [`HostOdb`].
+    pub fn with_odb(
+        id: impl Into<ModuleId>,
+        component_bytes: &[u8],
+        backing: Box<dyn OdbBacking>,
+    ) -> Result<Self, SdkError> {
+        Self::load(id.into(), component_bytes, StateBacking::Odb { backing })
+    }
+
     fn is_store_backed(&self) -> bool {
         matches!(self.backing, StateBacking::Store { .. })
     }
@@ -499,20 +575,25 @@ impl WasmModule {
         store.get(digest).await
     }
 
-    /// resolve one paused object-plane read against the odb backing and
-    /// memoize the answer. Task 1 wires no backing (`odb` is `None`), so every
-    /// read answers `None` — the stub surface that keeps existing tenants
-    /// byte-identical (they never call the object imports, so they never pause
-    /// here). Task 2 injects a `HostOdb` and these become real disk reads. the
-    /// answers are synchronous (no ctx, no await), like a map-backed state read.
+    /// resolve one paused object-plane read against the odb backing and memoize
+    /// the answer. only an [`StateBacking::Odb`] tenant has a backing; Map/Store
+    /// tenants never call the object imports, so they never pause here and their
+    /// `None` backing answers the (never-produced) read. the answers serve
+    /// COMMITTED objects only — the same-block staged puts are shadowed earlier,
+    /// by the [`HostData::object_puts`] overlay. synchronous (no ctx, no await),
+    /// like a map-backed state read.
     fn resolve_object_read(&self, read: PendingRead, memo: &mut SiblingMemo) {
+        let backing = match &self.backing {
+            StateBacking::Odb { backing } => Some(backing),
+            StateBacking::Map { .. } | StateBacking::Store { .. } => None,
+        };
         match read {
             PendingRead::ObjectStat(id) => {
-                let answer = self.odb.as_ref().and_then(|o| o.stat(&id));
+                let answer = backing.and_then(|b| b.stat(&id));
                 memo.object_stats.insert(id, answer);
             }
             PendingRead::ObjectGet(id) => {
-                let answer = self.odb.as_ref().and_then(|o| o.get(&id));
+                let answer = backing.and_then(|b| b.get(&id));
                 memo.object_gets.insert(id, answer);
             }
             PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::State(_) => {
@@ -578,6 +659,9 @@ impl WasmModule {
             StateBacking::Store { .. } => {
                 panic!("a store-backed wasm module has no byte snapshot — sync the store")
             }
+            // the refs image IS the snapshot (native `Fs::snapshot_refs`) — the
+            // exact `root()` preimage, shipped over the duckfs-odb resolver lane.
+            StateBacking::Odb { backing } => backing.refs_bytes(),
         }
     }
 
@@ -589,19 +673,32 @@ impl WasmModule {
     /// tenant adopts state by rebuilding its CONCRETE store (`sync_from`) and
     /// wrapping a fresh module around it, so install refuses.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), SdkError> {
-        let StateBacking::Map { committed } = &mut self.backing else {
-            return Err(SdkError::Module(
+        match &mut self.backing {
+            StateBacking::Map { committed } => {
+                let decoded = decode_state(bytes)?;
+                if Self::root_of(&decoded) != expected {
+                    return Err(SdkError::Module("snapshot root mismatch".into()));
+                }
+                *committed = decoded;
+                self.staged.clear();
+                Ok(())
+            }
+            StateBacking::Store { .. } => Err(SdkError::Module(
                 "a store-backed wasm module adopts state through its injected store, not install"
                     .into(),
-            ));
-        };
-        let decoded = decode_state(bytes)?;
-        if Self::root_of(&decoded) != expected {
-            return Err(SdkError::Module("snapshot root mismatch".into()));
+            )),
+            // verify-then-adopt the refs image (native `Fs::install_refs`): check
+            // the root here, then hand the verified bytes to the backing. the
+            // backing does not re-verify, so the root check is load-bearing.
+            StateBacking::Odb { backing } => {
+                if StateRoot(sha256_array(bytes)) != expected {
+                    return Err(SdkError::Module("snapshot root mismatch".into()));
+                }
+                backing.adopt_refs(bytes)?;
+                self.staged.clear();
+                Ok(())
+            }
         }
-        *committed = decoded;
-        self.staged.clear();
-        Ok(())
     }
 
     /// this round's copy of map-backed committed state. store-backed rounds
@@ -611,6 +708,13 @@ impl WasmModule {
         match &self.backing {
             StateBacking::Map { committed } => committed.clone(),
             StateBacking::Store { .. } => BTreeMap::new(),
+            // the refs image is the whole committed state, served under the one
+            // reserved key; the guest reads it staged-over via the state lane.
+            // (queries delegate to the backing, so this only feeds execute
+            // rounds — a query never instantiates the guest for this backing.)
+            StateBacking::Odb { backing } => {
+                BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
+            }
         }
     }
 
@@ -795,6 +899,12 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
+/// sha256 as a fixed `[u8; 32]` — the [`StateBacking::Odb`] root preimage hash
+/// (`sha256(refs_bytes)`), where a `StateRoot` needs the array, not a `Vec`.
+fn sha256_array(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
 #[async_trait::async_trait(?Send)]
 impl Module for WasmModule {
     fn id(&self) -> ModuleId {
@@ -808,6 +918,10 @@ impl Module for WasmModule {
         match &self.backing {
             StateBacking::Map { committed } => Self::root_of(committed),
             StateBacking::Store { store } => store.root(),
+            // the ROOT-CONTINUITY crux: sha256 over the canonical refs image,
+            // byte-identical to native files' `sha256(encode_refs)`. moves only
+            // when the backing adopts a new image (commit/install).
+            StateBacking::Odb { backing } => StateRoot(sha256_array(&backing.refs_bytes())),
         }
     }
 
@@ -829,6 +943,13 @@ impl Module for WasmModule {
                 backend: "qmdb".into(),
                 detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
             }),
+            // byte-identical to native files' handle: the joiner fetches the refs
+            // image then walks `missing_objects` -> `GetObjects` -> ingest over
+            // `serve_sync` to full possession — no qmdb op-range target.
+            StateBacking::Odb { .. } => Ok(StateSyncHandle::ResolverBacked {
+                backend: "duckfs-odb".into(),
+                detail: "refs image + GetObjects fetch to full object possession".into(),
+            }),
         }
     }
 
@@ -840,6 +961,9 @@ impl Module for WasmModule {
         match &self.backing {
             StateBacking::Map { .. } => Err(SdkError::SyncUnsupported),
             StateBacking::Store { store } => store.serve_sync(req).await,
+            // the duckfs object-possession serve lane (native `Fs::serve_sync`),
+            // committed-only, off the execute path.
+            StateBacking::Odb { backing } => backing.serve_sync(req),
         }
     }
 
@@ -847,6 +971,9 @@ impl Module for WasmModule {
         match &self.backing {
             StateBacking::Map { .. } => Err(SdkError::SyncUnsupported),
             StateBacking::Store { store } => store.sync_target().await,
+            // duckfs sync is object possession, not a qmdb op-range — native
+            // files declares no resolver target (the default `SyncUnsupported`).
+            StateBacking::Odb { .. } => Err(SdkError::SyncUnsupported),
         }
     }
 
@@ -882,6 +1009,13 @@ impl Module for WasmModule {
             let round_committed = match &mut self.backing {
                 StateBacking::Map { committed } => std::mem::take(committed),
                 StateBacking::Store { .. } => BTreeMap::new(),
+                // seed the round with the one refs entry; the guest reads it
+                // staged-over via the state lane. the backing keeps ownership of
+                // the committed refs (unlike Map's move-in/reclaim), so this
+                // round's copy is discarded after the call.
+                StateBacking::Odb { backing } => {
+                    BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
+                }
             };
             let data = HostData {
                 env: Some(env.clone()),
@@ -976,6 +1110,14 @@ impl Module for WasmModule {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
+        // an odb-backed (files) tenant answers queries HOST-side from committed
+        // refs+odb — the read lane NEVER instantiates the guest — so an in-block
+        // sibling `FilesQuery::Refs` reads committed-only, byte-identical to
+        // native `Fs::query`. every other backing runs the guest's query export.
+        match &self.backing {
+            StateBacking::Odb { backing } => return backing.query(req),
+            StateBacking::Map { .. } | StateBacking::Store { .. } => {}
+        }
         // ctx-less direct read: no SIBLING resolver, so module-root/query-module
         // answer the sealed stub surface (root `None`, query `unsupported`) —
         // host-routed reads go through `query_with` instead, which resolves
@@ -1012,6 +1154,12 @@ impl Module for WasmModule {
     }
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, SdkError> {
+        // odb-backed queries are host-side committed-only (see `query`); the
+        // ctx (sibling reads) is unused, matching native files' standalone query.
+        match &self.backing {
+            StateBacking::Odb { backing } => return backing.query(req),
+            StateBacking::Map { .. } | StateBacking::Store { .. } => {}
+        }
         let mut memo = SiblingMemo::default();
         while memo.within_budgets() {
             let (outcome, returned, pending) =
@@ -1035,15 +1183,11 @@ impl Module for WasmModule {
     }
 
     async fn commit_block(&mut self) -> Result<(), SdkError> {
-        // object plane: Task 1 wires no odb backing, so this block's staged
-        // puts have nowhere to publish — drop them. existing Map/Store tenants
-        // never stage objects, so this is a no-op for them (no root movement,
-        // no store touch). Task 2 replaces this with publish-to-backing (staged
-        // objects durable → refs save) BEFORE the state commit below, honoring
-        // duckfs's durability ordering.
-        self.staged_objects.clear();
         match &mut self.backing {
             StateBacking::Map { committed } => {
+                // Map/Store guests never stage objects; drop any (there are none)
+                // alongside the state publish — a no-op that keeps the invariant.
+                self.staged_objects.clear();
                 for (key, overlay) in std::mem::take(&mut self.staged) {
                     match overlay {
                         Some(value) => {
@@ -1055,7 +1199,40 @@ impl Module for WasmModule {
                     }
                 }
             }
+            StateBacking::Odb { backing } => {
+                // the duckfs durability ordering (native `module.rs:368-427`), as
+                // an ORDER OF BACKING CALLS — the crash-safety contract Task 4
+                // realizes on disk (objects fsync'd BEFORE the refs commit point,
+                // refs adopted LAST so the root never advances ahead of durable
+                // objects). the staged objects live in-memory (`staged_objects`)
+                // and the new refs image in the state stage (`staged[REFS_KEY]`),
+                // exactly like a native pending block; publish both here or drop
+                // both on abort.
+                //
+                // 1. flush the block's staged objects into the backing (native
+                //    `store.put` per object). `staged_objects` is id → tagged
+                //    body (`kind ‖ body`); split the tag back off for the put.
+                for tagged in std::mem::take(&mut self.staged_objects).into_values() {
+                    let (&kind, body) = tagged
+                        .split_first()
+                        .expect("a staged object always carries its kind tag");
+                    backing.stage_put(kind, body);
+                }
+                // 2. objects-durable barrier (native `store.sync_dirs`) — BEFORE
+                //    the refs commit point below.
+                backing.publish_block()?;
+                // 3. adopt the new refs image IFF the block staged one — the sole
+                //    place the root moves (native `refs_store.save` + `adopt_refs`).
+                //    an empty stage leaves refs, and the root, untouched.
+                if let Some(overlay) = self.staged.remove(REFS_KEY) {
+                    let refs = overlay
+                        .expect("the refs lane stages a value, never a delete");
+                    backing.adopt_refs(&refs)?;
+                }
+                self.staged.clear();
+            }
             StateBacking::Store { store } => {
+                self.staged_objects.clear();
                 // publish the whole block's staged writes in ONE store batch —
                 // exactly the native store-backed contract: no-op (and no root
                 // movement) when nothing staged, `None` ships as a delete. the
@@ -1090,6 +1267,15 @@ impl Module for WasmModule {
         self.staged.clear();
         // discard this block's staged object puts alongside the state stage.
         self.staged_objects.clear();
+        // tell an odb backing to drop any block-local pending too (native
+        // `Fs::abort_block`; a disk backing may sweep orphan object files). in
+        // the fatal-or-complete commit model the backing has no pending here
+        // unless a commit failed partway, so this is a forward-compat safety
+        // hook for Task 4's disk cleanup.
+        match &mut self.backing {
+            StateBacking::Odb { backing } => backing.discard_block(),
+            StateBacking::Map { .. } | StateBacking::Store { .. } => {}
+        }
         Ok(())
     }
 }

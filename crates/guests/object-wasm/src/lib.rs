@@ -1,9 +1,14 @@
-//! `object-wasm` — the object-plane reference guest: every op exercises the
-//! `object-put` / `object-stat` / `object-get` host surface, so the kernel
-//! tests can prove the object plumbing (same-dispatch put→stat/get overlay
-//! hits, absent-id `None` resolution, the object-read budget, and staged-put
-//! discard on abort). It calls the raw host imports directly (the `GuestOdb`
-//! ObjectStore wrapper in `guest-adapter` is proven separately by compile).
+//! `object-wasm` — the object-plane + odb-backing reference guest: every op
+//! exercises the `object-*` / `state-*` host surface, so the kernel tests can
+//! prove the object plumbing (same-dispatch put→stat/get overlay hits, absent-id
+//! `None` resolution, the object-read budget, staged-put discard on abort) AND
+//! the `StateBacking::Odb` seam (cross-dispatch overlay visibility via 'P', the
+//! refs state lane via 'r'). It calls the raw host imports directly (the
+//! `GuestOdb` ObjectStore wrapper in `guest-adapter` is proven separately by
+//! compile).
+//!
+//! ops: 'p' put+same-dispatch-check · 'a' assert-absent · 'P' assert-present ·
+//! 'b' budget-probe · 'r' stage-refs-image · 'i' query the last put id.
 
 wit_bindgen::generate!({
     world: "module",
@@ -69,6 +74,28 @@ impl Guest for Component {
                 if host::object_get(id).is_some() {
                     return Err(host::Error::Rejected("expected-absent id had a body".into()));
                 }
+                Ok(())
+            }
+            // 'P' id(32) — assert the id is PRESENT (stat AND get both Some):
+            // the cross-dispatch overlay hit and the post-publish backing hit
+            // are the same op — the mirror of 'a', for the odb-backing proof.
+            Some((b'P', id)) => {
+                if id.len() != 32 {
+                    return Err(host::Error::Rejected("present probe needs a 32-byte id".into()));
+                }
+                if host::object_stat(id).is_none() {
+                    return Err(host::Error::Rejected("expected-present id had no stat".into()));
+                }
+                if host::object_get(id).is_none() {
+                    return Err(host::Error::Rejected("expected-present id had no body".into()));
+                }
+                Ok(())
+            }
+            // 'r' bytes.. — stage a new refs image under the reserved state-lane
+            // key (the odb backing's single-value refs lane). the host adopts it
+            // at commit; `root()` becomes sha256(bytes).
+            Some((b'r', bytes)) => {
+                host::state_set(b"__state", bytes);
                 Ok(())
             }
             // 'b' + le-u64 count — perform `count` DISTINCT object stats: the
