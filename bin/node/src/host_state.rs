@@ -7,7 +7,7 @@
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
-use files::Files;
+use files::{Files, FilesOdbBacking};
 use forge::Forge;
 use host::Host;
 use lifecycle::Lifecycle;
@@ -219,6 +219,19 @@ const CHAT_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/chat-wasm/component.wasm");
 const CHAT_MODULE_ID: &str = "chat";
 
+/// files (duckfs) — the ROOT-CONTINUOUS wasm tenant: the guest runs pure
+/// `duckfs-core` over the WIT object plane while the HOST keeps the disk odb +
+/// durable refs file behind a [`FilesOdbBacking`] (`WasmModule::with_odb`). the
+/// module root is `sha256(encode_refs)` on BOTH runtimes, so — unlike the
+/// whole-state adapter ports — there is NO schema break: `("files", 1)` stays,
+/// pre-cutover workspaces reopen unchanged, and this is the only production
+/// tenant whose cutover moves no root (pinned by `wasm_files_parity`). NO
+/// `.with_state_schema_revision` call — revision 1 is the default, matching the
+/// parity harness and the native module exactly.
+const FILES_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/guests/files-wasm/component.wasm");
+const FILES_MODULE_ID: &str = "files";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -289,6 +302,10 @@ fn seeded_lifecycle() -> Lifecycle {
         DISPATCH_MODULE_ID,
         sha2::Sha256::digest(DISPATCH_WASM_COMPONENT).to_vec(),
     );
+    reg.seed(
+        FILES_MODULE_ID,
+        sha2::Sha256::digest(FILES_WASM_COMPONENT).to_vec(),
+    );
     reg
 }
 
@@ -316,6 +333,7 @@ pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(AUTOMATIONS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DISPATCH_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(FILES_WASM_COMPONENT.to_vec());
 }
 
 /// the reference wasm module at its GENESIS code. restarted/synced nodes still
@@ -433,6 +451,19 @@ fn chat_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
         .expect("embedded chat component loads")
 }
 
+/// files at its GENESIS code over a host-side duckfs substrate at `dir` — the
+/// disk odb + durable refs file the native `Files` module used to own directly,
+/// now behind a [`FilesOdbBacking`] the kernel drives. `open` recovers committed
+/// refs, durable height, and gc watermark from the on-disk envelope exactly as
+/// the native constructor did (a fresh dir yields empty refs), so genesis,
+/// restore, and the promoted state-sync dir all compose through this one builder.
+/// REVISION STAYS 1: `root()` is `sha256(refs_bytes)`, byte-identical across the
+/// cutover — no schema fence, no re-genesis (pinned by `wasm_files_parity`).
+fn files_wasm(dir: std::path::PathBuf) -> Result<WasmModule, sdk::Error> {
+    let backing = FilesOdbBacking::open(FILES_MODULE_ID, dir)?;
+    WasmModule::with_odb(FILES_MODULE_ID, FILES_WASM_COMPONENT, Box::new(backing))
+}
+
 /// a wasm tenant at its GENESIS code with a host-installed GENESIS-CONFIG
 /// store: the component loads, then adopts an initial snapshot whose one
 /// entry is the reserved `__config` key carrying the canonically-encoded
@@ -526,7 +557,7 @@ struct ProductionModules {
     identity: WasmModule,
     gateway: WasmModule,
     inbox: WasmModule,
-    files: Files,
+    files: WasmModule,
     agent: WasmModule,
     runs: WasmModule,
     directory: WasmModule,
@@ -659,7 +690,10 @@ pub(super) async fn genesis_host(
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         inbox: genesis_inbox_wasm(),
-        files: Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open"),
+        // the ROOT-CONTINUOUS files tenant: a wasm guest over the host-side
+        // duckfs odb + refs backing (`files_wasm`). `("files", 1)` stays and the
+        // cutover moves no root — pinned by `wasm_files_parity`.
+        files: files_wasm(duckfs_dir.to_path_buf()).expect("duckfs open"),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
         // adapter-ported; the saga dead-letter + runs hook ids are compiled
@@ -808,12 +842,13 @@ pub(super) async fn restore_host(
 
     // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
     // set (like the qmdb modules above, which `init` from their own on-disk
-    // stores). `Files::open` already recovers its committed refs, durable height,
-    // and objects from the on-disk odb/refs envelope, and recovery replays
-    // forward from that height — so a reboot needs no checkpoint bytes and no
-    // object fetch here.
-    let files =
-        Files::open("files", duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
+    // stores). `files_wasm`'s `FilesOdbBacking::open` recovers committed refs,
+    // durable height, and objects from the on-disk odb/refs envelope exactly as
+    // the native constructor did, and recovery replays forward from that height
+    // (the wasm tenant surfaces the same `durable_commit_height` cursor) — so a
+    // reboot needs no checkpoint bytes and no object fetch here. root-continuous:
+    // the reopened root is `sha256(encode_refs)`, byte-identical to pre-cutover.
+    let files = files_wasm(duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
 
     let mut agent = genesis_agent_wasm();
     let (bytes, root) = snapshot_of(AGENT_MODULE_ID)?;
@@ -1114,7 +1149,12 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     // after the composite app-hash gate below (#219).
     let files_scratch =
         SyncScratch::prepare(duckfs_dir, attempt).map_err(|e| format!("duckfs scratch: {e}"))?;
-    let mut files = Files::open("files", files_scratch.dir().to_path_buf())
+    // possession is node-local verification machinery, OFF consensus: drive it
+    // with the NATIVE `Files` exactly as before (the joiner methods — install /
+    // missing_objects / ingest / possession_complete — live on `Files`, not the
+    // odb backing). it installs the boundary refs (at the sync-target height) and
+    // ingests objects, all fsynced durably to the scratch dir.
+    let mut files_possession = Files::open("files", files_scratch.dir().to_path_buf())
         .map_err(|e| format!("duckfs open: {e}"))?;
     let files_root = entry_root("files")?;
     let files_lane = statesync::ClientModuleLane::new(client.clone(), manifest.boundary_id());
@@ -1123,11 +1163,20 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         "files",
         files_root,
         manifest.height,
-        &mut FilesOdb(&mut files),
+        &mut FilesOdb(&mut files_possession),
         duckfs_core::MAX_SYNC_IDS,
     )
     .await
     .map_err(|e| format!("files sync: {e}"))?;
+    // possession wrote the synced refs envelope + every object durably to the
+    // scratch dir, so drop that native handle and compose the ROOT-CONTINUOUS
+    // wasm files tenant over the SAME scratch dir for the composite app-hash gate
+    // below — `FilesOdbBacking::open` recovers exactly the possession-synced refs
+    // (and its `durable_commit_height` from the envelope), so `root() =
+    // sha256(refs_bytes)` certifies against the manifest's files root.
+    drop(files_possession);
+    let files = files_wasm(files_scratch.dir().to_path_buf())
+        .map_err(|e| format!("duckfs compose: {e}"))?;
 
     let (bytes, root) = snapshot_of(AGENT_MODULE_ID).await?;
     let mut agent = genesis_agent_wasm();
@@ -1208,8 +1257,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .promote(files_root.0)
         .map_err(|e| format!("duckfs promote: {e}"))?;
     host.register(Box::new(
-        Files::open("files", duckfs_dir.to_path_buf())
-            .map_err(|e| format!("duckfs reopen: {e}"))?,
+        files_wasm(duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs reopen: {e}"))?,
     ));
     // re-realize the boundary version over the swapped registry (idempotent),
     // then re-check THE property against the canonical-backed composition.

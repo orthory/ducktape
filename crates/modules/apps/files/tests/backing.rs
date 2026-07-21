@@ -167,6 +167,11 @@ fn reopen_recovers_refs_and_durable_height() {
     {
         let mut backing = open_backing(&d);
         assert_eq!(backing.durable_height(), 0, "a fresh dir has no durable commit");
+        assert_eq!(
+            backing.durable_commit_height(),
+            None,
+            "a fresh dir reports no cursor (native parity), NOT Some(0)",
+        );
 
         // drive the backing's OWN commit sequence at height 42 (the kernel order:
         // publish captures the height, adopt stamps + saves it).
@@ -181,6 +186,11 @@ fn reopen_recovers_refs_and_durable_height() {
         reopened.durable_height(),
         42,
         "the durable height survived the reopen (envelope recovery)",
+    );
+    assert_eq!(
+        reopened.durable_commit_height(),
+        Some(42),
+        "the recovery cursor survived the reopen — the trailing-block claim relies on it",
     );
     assert_eq!(
         reopened.refs_bytes(),

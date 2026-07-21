@@ -175,6 +175,15 @@ pub trait OdbBacking: HostOdb {
     /// protocol (native `Fs::serve_sync`). the delegation twin of a store-backed
     /// tenant's `MerkleStore::serve_sync`.
     fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, SdkError>;
+    /// the last block height whose committed refs are durable, or `None` on a
+    /// fresh substrate with no envelope yet — the per-commit recovery cursor
+    /// [`Module::durable_commit_height`] surfaces so trailing-block recovery can
+    /// verify a disk substrate that committed a block whose journal seal was lost
+    /// to a crash. byte-identical to native `Files::durable_commit_height`
+    /// (`module.rs`): dropping it would silently downgrade a wasm files tenant's
+    /// crash recovery from `SelectiveReplay` to `AssumeApplied`, so this rides the
+    /// backing to keep the cutover recovery-continuous, not just root-continuous.
+    fn durable_commit_height(&self) -> Option<u64>;
 }
 
 /// the single reserved state-lane key an ODB-backed (files) tenant reads and
@@ -947,6 +956,18 @@ impl Module for WasmModule {
 
     fn code_hash(&self) -> Option<Vec<u8>> {
         Some(self.code_hash.clone())
+    }
+
+    /// only an ODB substrate tracks a durable-commit cursor (the native files
+    /// recovery bookkeeping it inherits); Map/Store tenants self-durably commit
+    /// through their own stores and expose no cursor (the trait default `None`).
+    /// delegating this keeps the files cutover recovery-continuous — a trailing
+    /// unsealed files block still heals via `SelectiveReplay`, exactly as native.
+    fn durable_commit_height(&self) -> Option<u64> {
+        match &self.backing {
+            StateBacking::Map { .. } | StateBacking::Store { .. } => None,
+            StateBacking::Odb { backing } => backing.durable_commit_height(),
+        }
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, SdkError> {

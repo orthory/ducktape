@@ -195,6 +195,15 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // enrichment survives (the former assignee facade retired to saga). beta
     // re-genesis, no shim.
     ("dispatch", 2),
+    // 1 (UNCHANGED at the wasm cutover): files is the ROOT-CONTINUOUS port —
+    // the guest runs pure duckfs-core over the WIT object plane while the host
+    // keeps the disk odb + refs file behind a `FilesOdbBacking`
+    // (`WasmModule::with_odb`). the committed encoding is unchanged (the refs
+    // image) and `root() = sha256(encode_refs)` is byte-identical on both
+    // runtimes, so ONLY the executor moved into wasm — no schema fence and no
+    // re-genesis (pinned by `wasm_files_parity`; pre-cutover workspaces reopen
+    // unchanged). noded/simnode/demo keep composing the NATIVE `Files`, which is
+    // root-identical, so they never diverge.
     ("files", 1),
     ("forge", 1),
     // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;

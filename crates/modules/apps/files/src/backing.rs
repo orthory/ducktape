@@ -214,4 +214,13 @@ impl OdbBacking for FilesOdbBacking {
         let resp = self.fs.serve_sync(req).map_err(Error::Module)?;
         Ok(encode_sync_resp(&resp))
     }
+
+    /// the raw durable-height cursor (the `Option`, NOT the `unwrap_or(0)` glue
+    /// accessor): `None` on a fresh dir, `Some(h)` once an envelope exists —
+    /// byte-identical to native `Files::durable_commit_height` (`module.rs`), the
+    /// distinction the trailing-recovery claim relies on (height 0 is claimable
+    /// only by a module that really committed block 0).
+    fn durable_commit_height(&self) -> Option<u64> {
+        self.durable_height
+    }
 }

@@ -70,6 +70,12 @@ struct MockInner {
     query_answer: Vec<u8>,
     /// canned serve-sync answer (proves the sync lane delegates).
     sync_answer: Vec<u8>,
+    /// this block's height, captured at publish and stamped at adopt (native's
+    /// publish/adopt split — see [`FilesOdbBacking`]).
+    pending_height: u64,
+    /// the last durably-committed height, `None` until the first adopt — the
+    /// recovery cursor `durable_commit_height` surfaces.
+    durable_height: Option<u64>,
     log: Vec<Call>,
 }
 
@@ -127,11 +133,13 @@ impl OdbBacking for Mock {
         let mut inner = self.0.borrow_mut();
         inner.log.push(Call::AdoptRefs(bytes.to_vec()));
         inner.committed_refs = bytes.to_vec();
+        inner.durable_height = Some(inner.pending_height);
         Ok(())
     }
     fn publish_block(&mut self, height: u64) -> Result<(), Error> {
         let mut inner = self.0.borrow_mut();
         inner.log.push(Call::PublishBlock(height));
+        inner.pending_height = height;
         for (kind, body) in std::mem::take(&mut inner.pending_objects) {
             let id = object_id(kind, &body).to_vec();
             let mut tagged = Vec::with_capacity(1 + body.len());
@@ -155,6 +163,9 @@ impl OdbBacking for Mock {
         let mut inner = self.0.borrow_mut();
         inner.log.push(Call::ServeSync(req.to_vec()));
         Ok(inner.sync_answer.clone())
+    }
+    fn durable_commit_height(&self) -> Option<u64> {
+        self.0.borrow().durable_height
     }
 }
 
@@ -292,6 +303,29 @@ async fn sync_lane_delegates_to_the_backing() {
         m.resolver_sync_target().await,
         Err(Error::SyncUnsupported)
     ));
+}
+
+/// the recovery cursor rides the backing: a fresh substrate reports `None`
+/// (native parity — no durable commit to claim), and after a publish+adopt the
+/// module surfaces the backing's stamped height. dropping this delegation is
+/// what would silently downgrade a trailing files block from `SelectiveReplay`
+/// to `AssumeApplied` on the crash-recovery path.
+#[tokio::test]
+async fn durable_commit_height_delegates_to_the_backing() {
+    let mock = Mock::with_refs(b"REFS-V0");
+    let m = module(&mock);
+    assert_eq!(m.durable_commit_height(), None, "fresh backing: no durable commit cursor");
+
+    // stamp a committed height on the shared backing, in the kernel order
+    // (publish captures the height, adopt makes it durable).
+    let mut boundary = mock.clone();
+    boundary.publish_block(7).expect("publish");
+    boundary.adopt_refs(b"REFS-V1").expect("adopt");
+    assert_eq!(
+        m.durable_commit_height(),
+        Some(7),
+        "the module surfaces the backing's durable-commit cursor"
+    );
 }
 
 #[tokio::test]
