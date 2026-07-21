@@ -14,39 +14,19 @@ use agent::{
 };
 use futures::executor::block_on;
 use saga::SagaOrigin;
-use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Env, Error, Module, Msg, Origin, StateRoot};
 
-/// a minimal `Ctx`: drives `execute` with a controllable env; the registry
-/// queries nothing.
-struct TestCtx {
-    env: Env,
-}
-impl TestCtx {
-    fn new(height: u64, origin: Origin) -> Self {
-        Self {
-            env: Env {
-                protocol_version: 0,
-                height,
-                consensus_time: height,
-                origin,
-                me: "agent".into(),
-            },
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::UnknownModule(target.into()))
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: Event) {}
+use sdk_testkit::TestCtx;
+
+/// drives `execute` with a controllable env; the registry queries nothing.
+fn ctx(height: u64, origin: Origin) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height,
+        consensus_time: height,
+        origin,
+        me: "agent".into(),
+    })
 }
 
 fn module() -> AgentModule {
@@ -89,22 +69,22 @@ fn source() -> AgentModule {
     let mut m = module();
     exec(
         &mut m,
-        TestCtx::new(1, alice.clone()),
+        ctx(1, alice.clone()),
         &register("ext-bot", &[ACTION_CHAT_POST]),
     );
     exec(
         &mut m,
-        TestCtx::new(1, Origin::Module("orchestrator".into())),
+        ctx(1, Origin::Module("orchestrator".into())),
         &register("mod-bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE]),
     );
     exec(
         &mut m,
-        TestCtx::new(1, alice.clone()),
+        ctx(1, alice.clone()),
         &register("sleepy-bot", &[]),
     );
     exec(
         &mut m,
-        TestCtx::new(1, alice),
+        ctx(1, alice),
         &AgentMsg::PauseAgent {
             agent_id: "sleepy-bot".into(),
         },
@@ -135,7 +115,7 @@ fn installed_snapshot_reconstructs_root_and_reads() {
     let mut dst = module();
     exec(
         &mut dst,
-        TestCtx::new(0, Origin::External(b"bob".to_vec())),
+        ctx(0, Origin::External(b"bob".to_vec())),
         &register("staged-bot", &[]),
     );
 
@@ -171,7 +151,7 @@ fn tampered_snapshot_is_rejected_and_leaves_state_untouched() {
     let mut dst = module();
     exec(
         &mut dst,
-        TestCtx::new(0, Origin::External(b"bob".to_vec())),
+        ctx(0, Origin::External(b"bob".to_vec())),
         &register("local-bot", &[]),
     );
     commit(&mut dst);
@@ -255,7 +235,7 @@ fn minimal_snapshot() -> Vec<u8> {
     let mut m = module();
     exec(
         &mut m,
-        TestCtx::new(0, owner),
+        ctx(0, owner),
         &AgentMsg::RegisterAgent {
             agent_id: "a".into(),
             display_name: "A".into(),
@@ -310,7 +290,7 @@ fn non_ascending_or_duplicate_keys_are_rejected() {
     for id in ["a", "b"] {
         exec(
             &mut m,
-            TestCtx::new(0, owner.clone()),
+            ctx(0, owner.clone()),
             &AgentMsg::RegisterAgent {
                 agent_id: id.into(),
                 display_name: id.to_uppercase(),
