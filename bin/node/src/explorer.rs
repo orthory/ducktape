@@ -262,7 +262,7 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
     let staged: Result<usize, String> = async {
         // a retry of the promotion loop may have staged a partial set
         // already; start clean so attempts never interleave.
-        indexer::discard_staged(&index_base).map_err(|e| e.to_string())?;
+        indexer::discard_staged(&indexer::DiskFs, &index_base).map_err(|e| e.to_string())?;
         let entries = statesync::fetch_index_modules(client, boundary)
             .await
             .map_err(|e| e.to_string())?;
@@ -278,11 +278,12 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
                 .await
                 .map_err(|e| format!("{db}: {e}"))?;
             let files = statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
-            indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
+            indexer::stage_shipped_db(&indexer::DiskFs, &index_base, db, &files)
+                .map_err(|e| e.to_string())?;
             staged += 1;
         }
         if staged > 0 {
-            indexer::commit_staged(&index_base).map_err(|e| e.to_string())?;
+            indexer::commit_staged(&indexer::DiskFs, &index_base).map_err(|e| e.to_string())?;
         }
         Ok(staged)
     }
@@ -298,7 +299,7 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
                 "[node {label}] shipped index fetch failed: {e} — views heal from verified \
                  state instead"
             );
-            if let Err(e) = indexer::discard_staged(&index_base) {
+            if let Err(e) = indexer::discard_staged(&indexer::DiskFs, &index_base) {
                 eprintln!("[node {label}] shipped index staging cleanup failed: {e}");
             }
         }
