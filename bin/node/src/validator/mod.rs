@@ -375,3 +375,66 @@ type EpochChannels = (
     MeshChannel,
 );
 type ChannelBank = Vec<Option<EpochChannels>>;
+
+/// the mesh-carrier REAL arm: one epoch's pre-registered discovery channels
+/// (a [`ChannelBank`] slot) + the [`discovery::Oracle`] the resolver keys on.
+/// This is the `authenticated::discovery` network's per-spawn transport bundle —
+/// the discovery `Network` (`MeshHead`) registers the channels into the bank
+/// before start, and this bundles one slot with the oracle at the point
+/// [`engine`](self::engine) consumes it, feeding
+/// [`consensus::SimplexOrderer::spawn_with_carrier`] the identical values the
+/// loose-channel spawn took before the seam.
+pub(super) struct DiscoveryMesh {
+    vote: Option<MeshChannel>,
+    certificate: Option<MeshChannel>,
+    resolver: Option<MeshChannel>,
+    payload: Option<MeshChannel>,
+    fetch: Option<MeshChannel>,
+    oracle: discovery::Oracle<ed25519::PublicKey>,
+}
+
+impl DiscoveryMesh {
+    pub(super) fn new(
+        slot: EpochChannels,
+        oracle: discovery::Oracle<ed25519::PublicKey>,
+    ) -> Self {
+        let (vote, certificate, resolver, payload, fetch) = slot;
+        Self {
+            vote: Some(vote),
+            certificate: Some(certificate),
+            resolver: Some(resolver),
+            payload: Some(payload),
+            fetch: Some(fetch),
+            oracle,
+        }
+    }
+}
+
+impl consensus::MeshCarrier for DiscoveryMesh {
+    type Sender = MeshSender;
+    type Receiver = MeshReceiver;
+    type Provider = discovery::Oracle<ed25519::PublicKey>;
+    type Blocker = discovery::Oracle<ed25519::PublicKey>;
+
+    fn vote(&mut self) -> MeshChannel {
+        self.vote.take().expect("vote channel taken once")
+    }
+    fn certificate(&mut self) -> MeshChannel {
+        self.certificate.take().expect("certificate channel taken once")
+    }
+    fn resolver(&mut self) -> MeshChannel {
+        self.resolver.take().expect("resolver channel taken once")
+    }
+    fn payload(&mut self) -> MeshChannel {
+        self.payload.take().expect("payload channel taken once")
+    }
+    fn fetch(&mut self) -> MeshChannel {
+        self.fetch.take().expect("fetch channel taken once")
+    }
+    fn provider(&self) -> discovery::Oracle<ed25519::PublicKey> {
+        self.oracle.clone()
+    }
+    fn blocker(&self) -> discovery::Oracle<ed25519::PublicKey> {
+        self.oracle.clone()
+    }
+}
