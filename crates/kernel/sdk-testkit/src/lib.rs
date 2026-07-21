@@ -1,10 +1,13 @@
 //! dev-only shared test doubles for the sdk boundary traits — see Cargo.toml.
 //!
 //! - [`TestCtx`] — a programmable [`sdk::Ctx`]: an [`sdk::Env`] plus per-target
-//!   query handlers registered via [`TestCtx::on_query`], with emitted
+//!   query handlers registered via [`TestCtx::on_query`] and per-target snapshot
+//!   roots registered via [`TestCtx::with_module_root`], with emitted
 //!   msgs/events and `set_output` captured for assertions. Replaces the
 //!   hand-rolled `TestCtx`/`CaptureCtx` doubles whose `query` was hardwired to
-//!   [`sdk::Error::QueryUnsupported`], so sibling-read paths become testable.
+//!   [`sdk::Error::QueryUnsupported`] and whose `module_root` was hardwired to
+//!   `None`, so sibling-read and hook-target/reply-to resolution paths become
+//!   testable.
 //! - [`MemStore`] — an in-memory [`sdk::MerkleStore`] over a `BTreeMap`; `root`
 //!   is sha256 over the sorted `(key, value)` pairs, the same preimage shape as
 //!   `WasmModule`'s `StateBacking::Map`.
@@ -31,6 +34,10 @@ pub struct TestCtx {
     /// handler may reentrantly query a *different* sibling without a borrow
     /// conflict — `query` takes `&self`.
     handlers: BTreeMap<String, RefCell<QueryHandler>>,
+    /// target module id → its snapshot root, served by [`Ctx::module_root`].
+    /// built via [`TestCtx::with_module_root`]. an unregistered target is
+    /// `None` — i.e. "that module is not live".
+    module_roots: BTreeMap<String, StateRoot>,
     msgs: Vec<Msg>,
     events: Vec<Event>,
     output: Option<Vec<u8>>,
@@ -43,6 +50,7 @@ impl std::fmt::Debug for TestCtx {
         f.debug_struct("TestCtx")
             .field("env", &self.env)
             .field("handlers", &self.handlers.keys().collect::<Vec<_>>())
+            .field("module_roots", &self.module_roots)
             .field("msgs", &self.msgs)
             .field("events", &self.events)
             .field("output", &self.output)
@@ -69,6 +77,7 @@ impl TestCtx {
         Self {
             env,
             handlers: BTreeMap::new(),
+            module_roots: BTreeMap::new(),
             msgs: Vec::new(),
             events: Vec::new(),
             output: None,
@@ -85,6 +94,17 @@ impl TestCtx {
     ) -> Self {
         self.handlers
             .insert(target.to_string(), RefCell::new(Box::new(handler)));
+        self
+    }
+
+    /// register `root` as the snapshot [`Ctx::module_root`] of sibling `module`
+    /// — i.e. "that module is live at this root". Chainable. An unregistered
+    /// module stays `None`. Modules gate hook-target / reply-to / member
+    /// resolution on `module_root(target).is_some()`; use
+    /// [`sdk::StateRoot::ZERO`] when only liveness (not the root bytes) matters.
+    /// A later registration for the same `module` replaces the earlier one.
+    pub fn with_module_root(mut self, module: &str, root: StateRoot) -> Self {
+        self.module_roots.insert(module.to_string(), root);
         self
     }
 
@@ -110,8 +130,8 @@ impl Ctx for TestCtx {
         &self.env
     }
 
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
+    fn module_root(&self, target: &str) -> Option<StateRoot> {
+        self.module_roots.get(target).copied()
     }
 
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
@@ -247,6 +267,19 @@ mod tests {
         let ctx = TestCtx::at_height(0);
         let err = block_on(ctx.query("nobody", b"")).unwrap_err();
         assert!(matches!(err, sdk::Error::QueryUnsupported));
+    }
+
+    #[test]
+    fn with_module_root_serves_registered_and_none_for_the_rest() {
+        let root = StateRoot([0xAB; 32]);
+        let ctx = TestCtx::at_height(0)
+            .with_module_root("agent", root)
+            .with_module_root("valset", StateRoot::ZERO);
+        // a registered module reports its exact root — "that module is live".
+        assert_eq!(ctx.module_root("agent"), Some(root));
+        assert_eq!(ctx.module_root("valset"), Some(StateRoot::ZERO));
+        // an unregistered module stays None — "that module is not live".
+        assert_eq!(ctx.module_root("chat"), None);
     }
 
     #[test]
