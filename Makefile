@@ -235,6 +235,7 @@ stream-types: cef-env
 ## and the sim node staged so the provider scenario suite runs too.
 test: cef-env app/node_modules wasm-modules-check
 	$(CARGO) test --workspace
+	$(CARGO) test -p consensus --features sim
 	$(MAKE) stream-types
 	git diff --exit-code -- app/src/domain/stream.gen.ts
 	$(CARGO) build -p noded -p simnode
