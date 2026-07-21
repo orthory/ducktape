@@ -202,7 +202,12 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // image) and `root() = sha256(encode_refs)` is byte-identical on both
     // runtimes, so ONLY the executor moved into wasm — no schema fence and no
     // re-genesis (pinned by `wasm_files_parity`; pre-cutover workspaces reopen
-    // unchanged). noded/simnode/demo keep composing the NATIVE `Files`, which is
+    // unchanged). the per-commit distinct-object-read cap
+    // (`duckfs_core::MAX_OBJECT_READS_PER_OP`) is a FILES CONSENSUS RULE enforced
+    // in the shared core, so native `Files` and the wasm tenant reject the
+    // identical oversized commit — uniform across runtimes by construction (the
+    // guest hits it before the kernel's equal `wasm_host::MAX_OBJECT_READS`).
+    // noded/simnode/demo keep composing the NATIVE `Files`, which is
     // root-identical, so they never diverge.
     ("files", 1),
     ("forge", 1),

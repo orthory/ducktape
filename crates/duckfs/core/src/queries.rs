@@ -132,6 +132,9 @@ fn committed_view<'a, S: ObjectStore>(
     let store = Store {
         store: fs.store_ref(),
         pending: &[],
+        // the read/query lane is host-side and off the consensus execute path,
+        // so it never charges the object-read budget.
+        budget: None,
     };
     let root_tree = match head {
         Some(snap) => Some(snapshot_root_tree(&store, &snap)?),
@@ -404,6 +407,9 @@ fn grep<S: ObjectStore>(
     let store = Store {
         store: fs.store_ref(),
         pending: &[],
+        // the read/query lane is host-side and off the consensus execute path,
+        // so it never charges the object-read budget.
+        budget: None,
     };
     let Some(snap) = snapshot_id else {
         // empty filesystem: no head, nothing to scan.
@@ -560,6 +566,9 @@ fn history<S: ObjectStore>(fs: &Fs<S>, limit: u64) -> Result<FilesReply, String>
     let store = Store {
         store: fs.store_ref(),
         pending: &[],
+        // the read/query lane is host-side and off the consensus execute path,
+        // so it never charges the object-read budget.
+        budget: None,
     };
     let limit = limit.clamp(1, MAX_PAGE) as usize;
     let mut out = Vec::new();
@@ -605,6 +614,9 @@ fn diff<S: ObjectStore>(
     let store = Store {
         store: fs.store_ref(),
         pending: &[],
+        // the read/query lane is host-side and off the consensus execute path,
+        // so it never charges the object-read budget.
+        budget: None,
     };
     // Some(hex) resolves to Some(id) on success (the None branch is the no-head
     // read only), so the ok_or is defensive — an unresolvable id already errored.

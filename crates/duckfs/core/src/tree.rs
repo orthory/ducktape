@@ -16,11 +16,95 @@
 //! purity: no sdk, no `std::fs`, no async — this compiles under
 //! `--no-default-features` as part of the future wasm core.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::MAX_DIR_ENTRIES;
 use crate::objects::{EntryKind, Kind, ObjectId, SnapshotObj, TreeEntry, TreeObj, object_id};
 use crate::store::ObjectStore;
+
+/// the per-op DISTINCT committed-store read budget — the files consensus cap
+/// ([`MAX_OBJECT_READS_PER_OP`](crate::MAX_OBJECT_READS_PER_OP)) that makes the
+/// native `Files` module and the wasm files tenant reject the IDENTICAL
+/// oversized commit. it counts each distinct committed object a commit reads on
+/// the execute path that the block-local overlay does NOT answer, mirroring the
+/// wasm kernel's per-dispatch object-plane budget (`wasm_host::MAX_OBJECT_READS`)
+/// EXACTLY, so the two counts never drift:
+///
+///  * `gets` and `stats` are SEPARATE sets, like the kernel's `object_gets` /
+///    `object_stats` replay memos — a rare id read both ways (only the empty
+///    tree can be) counts twice on BOTH sides, so neither runtime out-counts the
+///    other by that phantom.
+///  * a read whose id is in the block-local object index (`block_index`:
+///    native's live `Pending::object_ids`, the guest's `__block_objects` re-seed)
+///    is NOT charged — the kernel serves it from the same-block object-put
+///    overlay WITHOUT pausing/counting, so it must not count here either. this
+///    also reconciles the two runtimes' `Store::pending`: native's holds the
+///    block bodies (so a block-local read returns before ever reaching the
+///    charge), while the guest's per-dispatch `pending` is empty (so the read
+///    reaches the charge and is skipped by `block_index` instead) — either way
+///    the identical set is charged.
+///
+/// a read is charged BEFORE it is issued, so when the (cap+1)th distinct read is
+/// reached the core rejects before the underlying `get`/`has` runs — and on the
+/// guest before the WIT `object-get`/`object-stat` is issued, so the kernel's
+/// own budget (equal constant) is never even reached. present only on the
+/// EXECUTE path ([`Fs::commit`](crate::fs::Fs::commit)); the host-side read/query
+/// path builds a [`Store`] with `budget: None` and never charges. `RefCell`
+/// because [`Store::get`] is `&self`.
+pub struct ReadBudget<'a> {
+    block_index: &'a BTreeMap<ObjectId, (Kind, u64)>,
+    cap: usize,
+    gets: RefCell<BTreeSet<ObjectId>>,
+    stats: RefCell<BTreeSet<ObjectId>>,
+}
+
+impl<'a> ReadBudget<'a> {
+    /// open a budget over this op's block-local object index and cap
+    /// (`MAX_OBJECT_READS_PER_OP` in production, shrunk by a `#[doc(hidden)]`
+    /// test seam).
+    pub fn new(block_index: &'a BTreeMap<ObjectId, (Kind, u64)>, cap: usize) -> Self {
+        Self {
+            block_index,
+            cap,
+            gets: RefCell::new(BTreeSet::new()),
+            stats: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    /// the deterministic rejection once a charge pushes the DISTINCT read count
+    /// past the cap — a stable snake-case-friendly reason carrying the
+    /// `object-read budget` needle the parity proof keys on (aligned with the
+    /// kernel's `object-read budget exceeded (…)`).
+    fn check(&self) -> Result<(), String> {
+        let charged = self.gets.borrow().len() + self.stats.borrow().len();
+        if charged > self.cap {
+            return Err(format!("files: object-read budget exceeded ({})", self.cap));
+        }
+        Ok(())
+    }
+
+    /// charge one committed `object-get` (a Tree/Snapshot/File body read). a
+    /// block-local id is served by the overlay and never charged.
+    fn charge_get(&self, id: &ObjectId) -> Result<(), String> {
+        if self.block_index.contains_key(id) {
+            return Ok(());
+        }
+        self.gets.borrow_mut().insert(*id);
+        self.check()
+    }
+
+    /// charge one committed `object-stat` (`stage_object`'s presence probe for a
+    /// newly-staged object). the block-local skip mirrors `charge_get`; the
+    /// callers already gate the probe on `!block_index`, so it is belt-and-braces.
+    fn charge_stat(&self, id: &ObjectId) -> Result<(), String> {
+        if self.block_index.contains_key(id) {
+            return Ok(());
+        }
+        self.stats.borrow_mut().insert(*id);
+        self.check()
+    }
+}
 
 /// the read view onto stored objects for a single edit: the backing object
 /// store plus the block's not-yet-flushed staged objects. `pending` is checked
@@ -35,6 +119,10 @@ use crate::store::ObjectStore;
 pub struct Store<'a> {
     pub store: &'a dyn ObjectStore,
     pub pending: &'a [(Kind, Vec<u8>)],
+    /// the execute-path committed-read budget, or `None` off the consensus
+    /// execute path (the host-side query/read lane never charges). see
+    /// [`ReadBudget`].
+    pub budget: Option<&'a ReadBudget<'a>>,
 }
 
 impl Store<'_> {
@@ -49,7 +137,24 @@ impl Store<'_> {
                 return Ok(Some((*kind, body.clone())));
             }
         }
+        // a committed-store read: charge the consensus object-read budget on the
+        // execute path (skipped for a block-local id and for the host-side read
+        // lane) BEFORE the read, so the guest rejects strictly before it reaches
+        // the kernel's equal-valued object-plane trap.
+        if let Some(budget) = self.budget {
+            budget.charge_get(id)?;
+        }
         self.store.get(id)
+    }
+
+    /// a committed-store presence probe (`object-stat`) that CHARGES the
+    /// execute-path budget, for the `stage_object` dedup path. off the execute
+    /// path (`budget: None`) it is a plain `has`.
+    pub(crate) fn has_committed(&self, id: &ObjectId) -> Result<bool, String> {
+        if let Some(budget) = self.budget {
+            budget.charge_stat(id)?;
+        }
+        Ok(self.store.has(id))
     }
 }
 

@@ -47,6 +47,17 @@ use wasm_host::{HostOdb, OdbBacking};
 
 use crate::module::{commit_refs, persist_objects};
 
+// the files object-read consensus cap is single-sourced in `duckfs-core` (the
+// guest runs that core), but "core rejects strictly before the kernel trap" only
+// holds while the core cap does not EXCEED the kernel's per-dispatch object-plane
+// budget. this crate is the one place that sees both constants — pin them equal
+// so a change to either fails the build here rather than silently letting the
+// kernel fire first (a native↔wasm interchange break).
+const _: () = assert!(
+    duckfs_core::MAX_OBJECT_READS_PER_OP <= wasm_host::MAX_OBJECT_READS,
+    "the core object-read cap must not exceed the wasm kernel's — else the kernel traps before the core rejects"
+);
+
 /// the disk-backed ODB substrate for a wasm files tenant. holds exactly what
 /// native [`Files`](crate::module::Files) holds — the pure `Fs` over the disk
 /// odb, the durable refs file, and the per-node recovery bookkeeping — plus the

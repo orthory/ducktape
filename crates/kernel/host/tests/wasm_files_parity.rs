@@ -21,8 +21,8 @@ use futures::executor::block_on;
 use files::objects::object_id;
 use files::{
     CHUNK_SIZE, Change, Content, Files, FilesMsg, FilesOdbBacking, FilesQuery, FilesReply,
-    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_READ_BYTES, encode_msg, encode_putblob,
-    encode_query, encode_sync_req, to_hex,
+    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_OBJECT_READS_PER_OP, MAX_READ_BYTES, encode_msg,
+    encode_putblob, encode_query, encode_sync_req, to_hex,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
@@ -581,6 +581,69 @@ fn rejections_match_and_leave_roots_and_odb_unmoved() {
     }
 }
 
+// ============================================================================
+// CASE 13: the per-op object-read consensus cap — REJECTED BY BOTH RUNTIMES
+// ============================================================================
+
+/// the distinct-object-read cap ([`MAX_OBJECT_READS_PER_OP`]) is a FILES CONSENSUS
+/// RULE single-sourced in `duckfs-core`, so both runtimes reject the identical
+/// oversized commit — closing the sole native↔wasm interchange gap (the wasm
+/// kernel's `MAX_OBJECT_READS` used to bound only the guest, letting native accept
+/// a commit wasm rejected). the cap counts distinct committed-store `object-get`
+/// (tree-walk) AND `object-stat` (`stage_object` presence probe) reads in ONE
+/// bound, mirroring the kernel.
+///
+/// this drives the STAT class at the REAL cap — the cheapest real-4096
+/// construction: a single genesis commit staging >4096 distinct new objects
+/// (~2080 distinct inline files, each a chunk + a fileobj probe = 2 distinct
+/// stats) with ZERO pre-existing state to walk. the GET class (pre-existing
+/// directories) is pinned cheaply at the `duckfs-core` unit level via the cap
+/// seam (`over_budget_commit_is_rejected_and_root_unmoved`). the guest core
+/// rejects BEFORE the kernel's equal-valued trap, so the wasm reason is the
+/// core's (`object-read budget`), byte-carrying the shared needle native emits.
+///
+/// SLOW LANE (`#[ignore]`, ~60s): the wasm side replays ~4096 memoized-read
+/// rounds (one per distinct stat) over a ~2080-change commit, an O(cap²)
+/// re-tread inherent to the real cap — there is no wasm-side test seam, and a
+/// seam would be inert against the include_bytes'd component. run it explicitly
+/// (`--ignored`) as the real-cap wasm proof; the fast both-directions coverage
+/// (native cap fires + is a real ceiling, not blanket refusal) is the
+/// `duckfs-core` `object_read_budget` unit suite.
+#[test]
+#[ignore = "slow: real-cap (4096) wasm replay is O(cap^2), ~60s — run in the slow lane"]
+fn object_read_cap_rejects_oversized_commit_on_both_runtimes() {
+    let dir_n = tempfile::tempdir().unwrap();
+    let dir_w = tempfile::tempdir().unwrap();
+    let mut native = native_host(&dir_n);
+    let mut wasm = wasm_host(&dir_w);
+
+    // genesis roots equal + unmoved is the invariant we re-assert after the
+    // rejection: a rejected block leaves the empty refs root untouched on both.
+    let genesis = all_roots(&native);
+    assert_eq!(genesis, all_roots(&wasm), "genesis roots diverge");
+
+    // one commit, base=None (no tree to walk), staging > cap distinct objects:
+    // each distinct-content inline file stages one chunk + one fileobj, so
+    // `2 * nfiles` distinct object-stat probes accrue against the cap.
+    let nfiles = MAX_OBJECT_READS_PER_OP / 2 + 32;
+    let changes: Vec<Change> = (0..nfiles)
+        .map(|i| put_inline(&format!("/f{i}"), format!("{i}").as_bytes()))
+        .collect();
+    let msg = commit_op(None, "object-read flood", changes);
+
+    let n_err = block_on(native.submit_at(block(1, Origin::System), msg.clone()))
+        .expect_err("native rejects the over-cap commit");
+    let w_err = block_on(wasm.submit_at(block(1, Origin::System), msg))
+        .expect_err("wasm rejects the over-cap commit");
+    assert_module_reject("native", 1, &n_err, "object-read budget");
+    assert_module_reject("wasm", 1, &w_err, "object-read budget");
+
+    // the aborted block moved nothing on either runtime.
+    assert_eq!(all_roots(&native), genesis, "native root moved on reject");
+    assert_eq!(all_roots(&wasm), genesis, "wasm root moved on reject");
+    assert_eq!(all_roots(&native), all_roots(&wasm), "post-reject roots diverge");
+}
+
 /// a deterministic module rejection whose reason CONTAINS `needle` — the wasm
 /// runtime wraps the reason in its wit-error rendering then unwraps it verbatim,
 /// so the parity claim is containment, not string equality (same as pages parity).
@@ -729,6 +792,10 @@ fn gc_after_window_slide_stays_root_equal() {
         );
         block_on(native.submit_at(block(height, Origin::System), msg.clone())).expect("native gc");
         block_on(wasm.submit_at(block(height, Origin::System), msg)).expect("wasm gc");
+        // per-block check narrows to files_root: only files moves in this lane (no
+        // watch fires, so recorder/probe stay put), and gc lives entirely inside
+        // files — so files_root is the sole signal, and folding all roots every one
+        // of 1030 blocks would only add cost. the full matrix is asserted once below.
         assert_eq!(
             files_root(&native),
             files_root(&wasm),

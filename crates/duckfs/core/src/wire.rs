@@ -21,6 +21,25 @@ pub const MAX_DEPTH: usize = 128;
 pub const MAX_DIR_ENTRIES: usize = 65_536;
 pub const MAX_INLINE_COMMIT_BYTES: usize = 256 * 1024;
 pub const MAX_CHANGES_PER_COMMIT: usize = 4096;
+/// per-op ceiling on DISTINCT committed-store object reads — a files CONSENSUS
+/// cap enforced in the pure core, so the native `Files` module and the wasm
+/// files tenant reject the IDENTICAL oversized commit. a commit walks the
+/// pre-existing tree spine of every touched path (base + effective-head trees
+/// and their snapshots — `object-get`) and probes the odb once per newly-staged
+/// object (`stage_object`'s `has` — `object-stat`); without a cap a commit
+/// touching files under enough distinct pre-existing directories (or staging
+/// enough new objects) reads unboundedly.
+///
+/// this MUST equal the wasm kernel's per-dispatch object-plane budget
+/// (`wasm_host::MAX_OBJECT_READS`, also 4096), and the core counts EXACTLY what
+/// the kernel counts: distinct `object-get` + distinct `object-stat` ids that
+/// MISS the same-block object overlay (the block-local object index here). the
+/// core charges a read BEFORE issuing it, so the guest — which runs this same
+/// core — trips this cap and rejects STRICTLY BEFORE it can reach the kernel
+/// trap, and native applies the same cap over `DiskStore`. a commit accepted by
+/// one runtime is therefore accepted by both (the `files` crate compile-asserts
+/// the two constants are equal). the `files` crate re-exports this const.
+pub const MAX_OBJECT_READS_PER_OP: usize = 4096;
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 pub const MAX_META_ENTRIES: usize = 16;
 pub const MAX_META_KEY_BYTES: usize = 64;
