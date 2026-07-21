@@ -70,7 +70,10 @@ use runs::{
     dispatch_id_for, encode_msg as runs_encode_msg, encode_query as runs_encode_query,
     job_run_id_for, reply_message_id, run_id_for,
 };
-use saga::{LeasePolicy, SagaMsg, decode_worker_request, encode_msg as saga_encode_msg};
+use saga::{
+    LeasePolicy, SagaMsg, SagaQuery, SagaReply, decode_reply as saga_decode_reply,
+    decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
+};
 use sdk::{Error, Event, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tagging::TaggingModule;
@@ -537,21 +540,17 @@ async fn dispatch_saga_id(h: &Host, run_id: &str) -> String {
     }
 }
 
-/// the run's committed lease-holder as the dispatch facade resolves it.
+/// the run's committed lease-holder — saga's `assignee`, read directly off the
+/// saga the dispatch names (identical on both hosts).
 async fn dispatch_assignee(h: &Host, run_id: &str) -> Option<Vec<u8>> {
+    let saga_id = dispatch_saga_id(h, run_id).await;
     let reply = h
-        .query(
-            "dispatch",
-            &dispatch_encode_query(&DispatchQuery::Dispatch {
-                receiver: "runs".into(),
-                dispatch_id: dispatch_id_for(run_id),
-            }),
-        )
+        .query("saga", &saga_encode_query(&SagaQuery::Get { saga_id }))
         .await
-        .expect("dispatch query");
-    match dispatch_decode_reply(&reply).expect("decode") {
-        DispatchReply::Dispatch(Some(view)) => view.assignee,
-        other => panic!("expected the run's dispatch, got {other:?}"),
+        .expect("saga query");
+    match saga_decode_reply(&reply).expect("decode") {
+        SagaReply::Saga(view) => view.and_then(|v| v.assignee),
+        other => panic!("expected the run's saga, got {other:?}"),
     }
 }
 

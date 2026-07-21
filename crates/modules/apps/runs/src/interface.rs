@@ -221,8 +221,8 @@ pub enum RunsMsg {
     /// it returns at the end.
     ///
     /// authorization is the run's own committed lease: the origin must be the
-    /// node that holds it (resolved through `DispatchView::assignee`, which the
-    /// dispatch read facade derives from saga's committed lease). that is
+    /// node that holds it (the `assignee` on the saga the run's dispatch names,
+    /// read directly from saga's committed lease). that is
     /// SELF-AUTHORIZING — no owner signature, so an automated issue-mention run
     /// works with nobody at a keyboard — and it is correct cross-node, because
     /// the lease names the node actually executing the run.

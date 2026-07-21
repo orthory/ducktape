@@ -327,6 +327,20 @@ async fn dispatch_saga_id(host: &Host, run_id: &str) -> String {
     }
 }
 
+/// the node holding a still-awaiting run's execution lease — saga's committed
+/// `assignee`, read directly (the source dispatch used to proxy).
+async fn saga_assignee(host: &Host, run_id: &str) -> Option<Vec<u8>> {
+    let saga_id = dispatch_saga_id(host, run_id).await;
+    let reply = host
+        .query("saga", &saga_encode_query(&SagaQuery::Get { saga_id }))
+        .await
+        .unwrap();
+    match saga_decode_reply(&reply).unwrap() {
+        SagaReply::Saga(view) => view.and_then(|v| v.assignee),
+        other => panic!("expected Saga reply, got {other:?}"),
+    }
+}
+
 async fn chat_message(host: &Host, message_id: &str) -> Option<chat::MessageView> {
     let reply = host
         .query(
@@ -1082,9 +1096,8 @@ async fn accept_lease(host: &mut Host, run_id: &str, node: &[u8], height: u64) -
     )
     .await
     .expect("accept block");
-    let assignee = agent_dispatch(host, run_id)
+    let assignee = saga_assignee(host, run_id)
         .await
-        .assignee
         .expect("the accepted attempt holds a committed lease");
     assert_eq!(assignee, node, "the accepting node holds the run's lease");
     assignee

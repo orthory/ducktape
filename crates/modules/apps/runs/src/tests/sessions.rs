@@ -403,6 +403,60 @@ fn the_lease_holder_binds_a_session_and_a_stranger_cannot() {
     assert_eq!(bound[0].actions, 0, "a fresh session has spent nothing");
 }
 
+/// a session ctx like [`session_ctx`] but WITHOUT a committed lease wired — the
+/// caller adds the dispatch/saga answer the lease lookup should resolve.
+fn leaseless_ctx(registry: &Registry, origin: Origin) -> CaptureCtx {
+    CaptureCtx::new()
+        .at(5)
+        .with_origin(origin)
+        .with_registry(registry)
+        .with_transcript("general", transcript(2))
+        .with_page("p1", page_blocks("p1", "Spec"))
+}
+
+#[test]
+fn opening_is_refused_when_the_run_has_no_dispatch_record() {
+    let (mut m, registry, run_id) = awaiting_session_run(&[ACTION_PAGES_COMMENT], &["p1"]);
+    // the run is in flight in runs' own state, but dispatch holds no record —
+    // the lease lookup has nothing to resolve.
+    let mut ctx = leaseless_ctx(&registry, Origin::External(ASSIGNEE.to_vec()));
+    let err = exec(&mut m, &mut ctx, &open(&run_id, &SESSION_KEY)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("dispatch record")),
+        "a run with no dispatch record cannot open a session: {err:?}"
+    );
+    assert!(sessions(&m).is_empty(), "a refused open stages nothing");
+}
+
+#[test]
+fn opening_is_refused_when_the_dispatch_is_already_delivered() {
+    let (mut m, registry, run_id) = awaiting_session_run(&[ACTION_PAGES_COMMENT], &["p1"]);
+    // a terminal (Delivered) dispatch runs nowhere — no live lease to hold.
+    let mut ctx = leaseless_ctx(&registry, Origin::External(ASSIGNEE.to_vec()))
+        .with_taken_dispatch(&dispatch_id_for(&run_id));
+    let err = exec(&mut m, &mut ctx, &open(&run_id, &SESSION_KEY)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease")),
+        "a delivered run holds no execution lease: {err:?}"
+    );
+    assert!(sessions(&m).is_empty(), "a refused open stages nothing");
+}
+
+#[test]
+fn opening_is_refused_when_the_saga_holds_no_lease() {
+    let (mut m, registry, run_id) = awaiting_session_run(&[ACTION_PAGES_COMMENT], &["p1"]);
+    // the dispatch still awaits its saga, but the saga carries no committed
+    // lease (its assignee is `None`) — nobody is executing this run.
+    let mut ctx = leaseless_ctx(&registry, Origin::External(ASSIGNEE.to_vec()))
+        .with_awaiting_but_no_lease(&run_id);
+    let err = exec(&mut m, &mut ctx, &open(&run_id, &SESSION_KEY)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease")),
+        "an unassigned saga holds no execution lease: {err:?}"
+    );
+    assert!(sessions(&m).is_empty(), "a refused open stages nothing");
+}
+
 #[test]
 fn a_session_key_of_the_wrong_length_is_refused() {
     let (mut m, registry, run_id) = awaiting_session_run(&[ACTION_PAGES_COMMENT], &["p1"]);

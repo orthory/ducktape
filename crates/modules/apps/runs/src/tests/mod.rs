@@ -45,10 +45,10 @@ struct CaptureCtx {
     /// dispatch ids the dispatch module already has a record for — the
     /// committed turn-claim layer the module probes.
     taken_dispatches: BTreeSet<String>,
-    /// dispatch id -> the node key holding the run's execution lease, served as
-    /// `DispatchView.assignee` (the session lane's authorization). a dispatch
-    /// listed here is AwaitingResult; one only in `taken_dispatches` is
-    /// delivered, and a delivered run runs nowhere (assignee `None`).
+    /// dispatch ids that are still AwaitingResult (their saga carries the live
+    /// lease the session lane authorizes against). one only in `taken_dispatches`
+    /// is delivered, and a delivered run runs nowhere. the value is the lease
+    /// holder, mirrored into `saga_assignees` by `with_lease_holder`.
     dispatch_assignees: BTreeMap<String, Vec<u8>>,
     /// job_id -> board record served by the jobs arm (finalize guard).
     jobs: BTreeMap<String, Job>,
@@ -221,12 +221,21 @@ impl CaptureCtx {
         self.taken_dispatches.insert(dispatch_id.into());
         self
     }
-    /// serve `key` as the node holding `run_id`'s execution lease — what the
-    /// dispatch read facade resolves from saga's committed lease, and the ONLY
+    /// serve `key` as the node holding `run_id`'s execution lease — an awaiting
+    /// dispatch (the "saga" Get resolves its committed lease to `key`), the ONLY
     /// origin the session lane lets open a session.
     fn with_lease_holder(mut self, run_id: &str, key: &[u8]) -> Self {
+        let dispatch_id = dispatch_id_for(run_id);
+        self.saga_assignees
+            .insert(crate::sink::saga_id_for_dispatch("runs", &dispatch_id), key.to_vec());
+        self.dispatch_assignees.insert(dispatch_id, key.to_vec());
+        self
+    }
+    /// serve `run_id` as an awaiting dispatch whose saga holds NO committed
+    /// lease (the "saga" Get answers `None`) — the missing-lease refusal path.
+    fn with_awaiting_but_no_lease(mut self, run_id: &str) -> Self {
         self.dispatch_assignees
-            .insert(dispatch_id_for(run_id), key.to_vec());
+            .insert(dispatch_id_for(run_id), Vec::new());
         self
     }
     /// a job the board holds as Processing, claimed by "runs" at `height`.
@@ -420,31 +429,26 @@ impl Ctx for CaptureCtx {
             },
             "dispatch" => match dispatch::decode_query(req).map_err(Error::Module)? {
                 DispatchQuery::Dispatch { dispatch_id, .. } => {
-                    // an assigned dispatch is still AwaitingResult (a lease is
-                    // held); a merely `taken` one already delivered.
-                    let assignee = self.dispatch_assignees.get(&dispatch_id).cloned();
-                    let awaiting = assignee.is_some();
+                    // an awaiting dispatch still names its saga (the lease lives
+                    // there); a merely `taken` one already delivered.
+                    let awaiting = self.dispatch_assignees.contains_key(&dispatch_id);
                     let view =
                         (awaiting || self.taken_dispatches.contains(&dispatch_id)).then(|| {
                             DispatchView {
-                                dispatch_id,
                                 recipe_id: "agent/x".into(),
                                 receiver: "runs".into(),
                                 status: if awaiting {
                                     DispatchStatus::AwaitingResult {
-                                        saga_id: "saga-1".into(),
+                                        saga_id: crate::sink::saga_id_for_dispatch(
+                                            "runs",
+                                            &dispatch_id,
+                                        ),
                                     }
                                 } else {
                                     DispatchStatus::Delivered
                                 },
                                 outcome: (!awaiting).then(|| Ok(Vec::new())),
-                                assignee,
-                                attempt: None,
-                                max_attempts: None,
-                                lease_expires_at: None,
-                                deadline: None,
-                                lease_updated_at: None,
-                                reassignable: None,
+                                dispatch_id,
                                 created_at: 0,
                                 updated_at: 0,
                             }
