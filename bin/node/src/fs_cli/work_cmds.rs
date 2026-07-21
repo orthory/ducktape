@@ -11,19 +11,20 @@ use duckfs_client::commit::{CommitError, CommitOptions, commit_with};
 use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
-use crate::fs_cli::args::{CliError, node_flag_or_env, parse_flags, resolve_node};
+use crate::fs_cli::args::{CliError, parse_flags, resolve_node, resolve_node_addr};
 
-/// resolve the node for a verb running inside `dir`: `--node` / `DUCKTAPE_NODE`
-/// first, else the `.duckfs` index's recorded node url.
+/// resolve the node for a verb running inside `dir`: the addressing chain
+/// (`--node` / `-n/--network` / `DUCKTAPE_NODE`) first, else the `.duckfs`
+/// index's recorded node url.
 fn node_for_dir(flags: &BTreeMap<String, String>, dir: &Path) -> Result<HttpNode, CliError> {
-    if let Some(url) = node_flag_or_env(flags) {
+    if let Some(url) = resolve_node_addr(flags)? {
         return Ok(HttpNode::new(url));
     }
     match Index::load(dir) {
         Ok(index) if !index.node.is_empty() => Ok(HttpNode::new(index.node)),
         _ => Err(CliError::usage(
-            "no node address: pass --node <http-url>, set DUCKTAPE_NODE, or run \
-             inside a checkout whose index records a node",
+            "no node address: pass --node <http-url>, -n/--network <id>, set \
+             DUCKTAPE_NODE, or run inside a checkout whose index records a node",
         )),
     }
 }

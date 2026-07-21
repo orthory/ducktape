@@ -21,14 +21,14 @@ ducktape fs — the duckfs working-copy CLI
 
 usage: ducktape fs <verb> [args...]
 
-read verbs (need --node <http-url> or the DUCKTAPE_NODE env):
+read verbs (need --node <http-url>, -n/--network <id>, or the DUCKTAPE_NODE env):
   ls <path> [--snapshot S] [--limit N]     list a directory
   cat <path> [--snapshot S]                stream a file to stdout
   stat <path> [--snapshot S]               print an entry's facts
   history [--limit N]                      the commit window, newest-first
   diff <from> <to> [--prefix P]            changed leaves between two snapshots
 
-working-copy verbs (the node comes from --node/DUCKTAPE_NODE or the .duckfs index):
+working-copy verbs (the node comes from --node/-n/DUCKTAPE_NODE or the .duckfs index):
   checkout <prefix> <dir> [--snapshot S]   materialize a subtree + .duckfs index
   status [dir]                             show A/M/D (exit 1 when dirty)
   commit [dir] --message <m> [--no-rebase] commit the working copy (exit 2 on conflict)

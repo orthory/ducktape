@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::config;
+
 /// a CLI failure carrying the process exit code. code 2 is a usage/verb error;
 /// code 1 is a general operational failure (and a dirty `status`). an EMPTY
 /// message prints nothing — `status` writes its own A/M/D lines and then exits
@@ -41,17 +43,22 @@ impl CliError {
     }
 }
 
-/// split `args` into positionals and `--key value` flags. a `--flag` consumes
-/// the next token as its value UNLESS that token is itself a `--flag`, in which
-/// case it is a value-less boolean (`--no-rebase`) recorded as an empty string —
-/// so `commit --no-rebase --message m` parses correctly (a duckfs path or value
-/// never starts with `--`).
+/// split `args` into positionals and `--key value` flags. `-n` is the one short
+/// alias, for `--network` (the workspace selector shared with the node family).
+/// a `--flag` consumes the next token as its value UNLESS that token is itself a
+/// `--flag`, in which case it is a value-less boolean (`--no-rebase`) recorded as
+/// an empty string — so `commit --no-rebase --message m` parses correctly (a
+/// duckfs path or value never starts with `--`).
 pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, String>), CliError> {
     let mut positional = Vec::new();
     let mut flags = BTreeMap::new();
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
-        if let Some(name) = a.strip_prefix("--") {
+        let name = match a.as_str() {
+            "-n" => Some("network"),
+            other => other.strip_prefix("--"),
+        };
+        if let Some(name) = name {
             let value = match it.peek() {
                 Some(next) if !next.starts_with("--") => it.next().cloned().unwrap_or_default(),
                 _ => String::new(),
@@ -64,25 +71,39 @@ pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, Str
     Ok((positional, flags))
 }
 
-/// the node http base from the `--node` flag or the `DUCKTAPE_NODE` env, or
-/// `None` if neither is set (worktree verbs fall back to the index from here).
-pub fn node_flag_or_env(flags: &BTreeMap<String, String>) -> Option<String> {
-    if let Some(url) = flags.get("node")
-        && !url.is_empty()
-    {
-        return Some(url.clone());
+/// resolve the node http base honoring the fs addressing precedence: an explicit
+/// `--node <url>` wins, then `-n/--network <id>` (registry → the workspace
+/// node.toml's `http_listen`), then the `DUCKTAPE_NODE` env. `None` only when
+/// NONE of the three is set — worktree verbs then fall back to the checkout
+/// index. a set-but-broken `--network` (unknown/ambiguous workspace, or one with
+/// no http listen) is a hard usage error, never a silent fall-through to env.
+pub fn resolve_node_addr(flags: &BTreeMap<String, String>) -> Result<Option<String>, CliError> {
+    if let Some(url) = flags.get("node").filter(|url| !url.is_empty()) {
+        return Ok(Some(url.clone()));
     }
-    std::env::var("DUCKTAPE_NODE")
+    if let Some(needle) = flags.get("network").filter(|needle| !needle.is_empty()) {
+        let (_dir, http) = config::resolve_network(needle).map_err(CliError::usage)?;
+        let base = http.ok_or_else(|| {
+            CliError::usage(format!(
+                "network {needle:?} resolves to a workspace with no http listen \
+                 (its node.toml sets no http_listen) — pass --node <http-url>"
+            ))
+        })?;
+        return Ok(Some(base));
+    }
+    Ok(std::env::var("DUCKTAPE_NODE")
         .ok()
-        .filter(|url| !url.is_empty())
+        .filter(|url| !url.is_empty()))
 }
 
-/// resolve the node http base for a read verb: `--node <url>` flag, else the
-/// `DUCKTAPE_NODE` env var. read verbs have no working-copy index to fall back
-/// to (worktree verbs add that fallback in `work_cmds`).
+/// resolve the node http base for a read verb: the addressing chain above, which
+/// read verbs require (they have no working-copy index to fall back to — worktree
+/// verbs add that fallback in `work_cmds`).
 pub fn resolve_node(flags: &BTreeMap<String, String>) -> Result<String, CliError> {
-    node_flag_or_env(flags).ok_or_else(|| {
-        CliError::usage("no node address: pass --node <http-url> or set DUCKTAPE_NODE")
+    resolve_node_addr(flags)?.ok_or_else(|| {
+        CliError::usage(
+            "no node address: pass --node <http-url>, -n/--network <id>, or set DUCKTAPE_NODE",
+        )
     })
 }
 
@@ -94,5 +115,38 @@ pub fn flag_u64(flags: &BTreeMap<String, String>, key: &str) -> Result<Option<u6
             .map(Some)
             .map_err(|_| CliError::usage(format!("--{key} must be a number"))),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn dash_n_maps_to_network_and_leaves_positionals() {
+        let (pos, f) = parse_flags(&["-n".into(), "ducktape".into(), "some/path".into()]).unwrap();
+        assert_eq!(f.get("network").map(String::as_str), Some("ducktape"));
+        assert_eq!(pos, vec!["some/path".to_string()]);
+    }
+
+    #[test]
+    fn explicit_node_wins_over_network_without_touching_the_registry() {
+        // --node short-circuits before any registry walk, so the bogus -n never
+        // errors: the explicit flag is the top of the precedence chain.
+        let f = flags(&[
+            ("node", "http://explicit:8844"),
+            ("network", "no-such-workspace"),
+        ]);
+        assert_eq!(
+            resolve_node_addr(&f).unwrap(),
+            Some("http://explicit:8844".to_string())
+        );
     }
 }
