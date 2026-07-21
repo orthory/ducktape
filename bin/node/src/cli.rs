@@ -656,14 +656,53 @@ fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `upgrade-status [--config node.toml]` — query the upgrade module Status over
-/// this node's local rpc and print `current_version`, the single pending upgrade,
-/// the readiness verdict (`ready_count` of `member_count`, `armed`), and the
-/// `max_supported` version this binary can execute. degrades gracefully on a net
+/// the `--json` projection of upgrade-status when the module IS present: the
+/// same facts the prose form prints, plus `binary_can_execute` — the inverse of
+/// the WARNING condition (false iff a pending upgrade targets a version this
+/// binary is too old to run). `pending` mirrors the prose `pending: none` as a
+/// JSON `null`. borrows the reply so no field is copied.
+#[derive(serde::Serialize)]
+struct UpgradeStatusJson<'a> {
+    current_version: u32,
+    max_supported: u32,
+    pending: Option<&'a lifecycle::ScheduledUpgrade>,
+    ready_count: u64,
+    member_count: u64,
+    armed: bool,
+    binary_can_execute: bool,
+}
+
+/// build the `--json` projection from the module reply. pure (no IO) so the
+/// shape is unit-testable without a live node.
+fn upgrade_status_json(status: &lifecycle::UpgradeStatus, max_supported: u32) -> UpgradeStatusJson<'_> {
+    // WARNING fires iff a pending upgrade targets a version above this binary's
+    // ceiling; `binary_can_execute` is its inverse (true when nothing pending).
+    let binary_can_execute = status
+        .pending
+        .as_ref()
+        .is_none_or(|up| up.to_version <= max_supported);
+    UpgradeStatusJson {
+        current_version: status.current_version,
+        max_supported,
+        pending: status.pending.as_ref(),
+        ready_count: status.ready_count,
+        member_count: status.member_count,
+        armed: status.armed,
+        binary_can_execute,
+    }
+}
+
+/// `upgrade-status [--config node.toml] [--json]` — query the upgrade module
+/// Status over this node's local rpc and print `current_version`, the single
+/// pending upgrade, the readiness verdict (`ready_count` of `member_count`,
+/// `armed`), and the `max_supported` version this binary can execute. `--json`
+/// emits the same facts as one machine-readable object (module-absent →
+/// `{"available":false,"max_supported":N}`). degrades gracefully on a net
 /// WITHOUT the module (pre-retrofit): the query errors and we report baseline.
 fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
     let (_, flags) = parse_flags(args)?;
+    let want_json = flags.contains_key("json");
     let cfg_path = config_path(&flags)?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
@@ -675,15 +714,27 @@ fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         // module absent (pre-retrofit) or unreachable: report the binary baseline
         // rather than failing — the CLI is inert on a net without the module.
         Err(e) => {
-            println!(
-                "upgrade module not available ({e}) — this binary supports up to protocol v{MAX_PROTOCOL_VERSION}"
-            );
+            if want_json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "available": false, "max_supported": MAX_PROTOCOL_VERSION })
+                );
+            } else {
+                println!(
+                    "upgrade module not available ({e}) — this binary supports up to protocol v{MAX_PROTOCOL_VERSION}"
+                );
+            }
             return Ok(());
         }
     };
     let LifecycleReply::UpgradeStatus(status) = decode_reply(&raw)? else {
         return Err("lifecycle returned an unexpected reply".into());
     };
+    if want_json {
+        let out = upgrade_status_json(&status, MAX_PROTOCOL_VERSION);
+        println!("{}", serde_json::to_string(&out).expect("serializable"));
+        return Ok(());
+    }
     println!("current_version: {}", status.current_version);
     println!("max_supported (this binary): {MAX_PROTOCOL_VERSION}");
     match &status.pending {
@@ -1208,12 +1259,15 @@ fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 // ---- member-status: is THIS node still in the validator set? ----------------
 
-/// `member-status [--config node.toml]` — read this node's OWN membership off
-/// its RUNNING node's rpc and print one machine-parseable line to stdout:
+/// `member-status [--config node.toml] [--json]` — read this node's OWN
+/// membership off its RUNNING node's rpc and print one machine-parseable line to
+/// stdout:
 ///
 /// ```text
 /// in-set=<true|false> validators=<count>
 /// ```
+///
+/// `--json` emits the same two facts as `{"in_set": <bool>, "validators": <n>}`.
 ///
 /// this is the read the desktop shell consults before FORGETTING a workspace
 /// (stop + delete): tearing a node down while it is still a current validator of
@@ -1236,7 +1290,15 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let me_bytes = resolved.signer.public_key().as_ref().to_vec();
     let members = read_members(&rpc_addr)?;
     let in_set = members.contains(&me_bytes);
-    println!("in-set={in_set} validators={}", members.len());
+    let validators = members.len();
+    if flags.contains_key("json") {
+        println!(
+            "{}",
+            serde_json::json!({ "in_set": in_set, "validators": validators })
+        );
+        return Ok(());
+    }
+    println!("in-set={in_set} validators={validators}");
     Ok(())
 }
 
@@ -1392,4 +1454,94 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{me_hex}");
     Ok(())
+}
+
+#[cfg(test)]
+mod json_output_tests {
+    use super::*;
+    use lifecycle::{ScheduledUpgrade, UpgradeStatus};
+
+    fn status(pending: Option<ScheduledUpgrade>, armed: bool) -> UpgradeStatus {
+        UpgradeStatus {
+            current_version: 1,
+            pending,
+            members: vec![vec![1u8; 32], vec![2u8; 32]],
+            ready: vec![vec![1u8; 32]],
+            member_count: 2,
+            ready_count: 1,
+            armed,
+        }
+    }
+
+    /// the `--json` upgrade-status object decodes and mirrors the prose facts,
+    /// with `binary_can_execute` true when the pending version is within reach.
+    #[test]
+    fn upgrade_status_json_pending_within_reach() {
+        let up = ScheduledUpgrade {
+            name: "forge-multi".into(),
+            activation_height: 100,
+            to_version: MAX_PROTOCOL_VERSION,
+        };
+        let st = status(Some(up), true);
+        let out = upgrade_status_json(&st, MAX_PROTOCOL_VERSION);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["current_version"], 1);
+        assert_eq!(v["max_supported"], MAX_PROTOCOL_VERSION);
+        assert_eq!(v["pending"]["name"], "forge-multi");
+        assert_eq!(v["pending"]["activation_height"], 100);
+        assert_eq!(v["pending"]["to_version"], MAX_PROTOCOL_VERSION);
+        assert_eq!(v["ready_count"], 1);
+        assert_eq!(v["member_count"], 2);
+        assert_eq!(v["armed"], true);
+        assert_eq!(v["binary_can_execute"], true);
+    }
+
+    /// a pending upgrade targeting a version above this binary's ceiling is the
+    /// WARNING condition — `binary_can_execute` is false.
+    #[test]
+    fn upgrade_status_json_pending_too_new_cannot_execute() {
+        let up = ScheduledUpgrade {
+            name: "future".into(),
+            activation_height: 5,
+            to_version: MAX_PROTOCOL_VERSION + 1,
+        };
+        let st = status(Some(up), false);
+        let out = upgrade_status_json(&st, MAX_PROTOCOL_VERSION);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["binary_can_execute"], false);
+        assert_eq!(v["to_version"], serde_json::Value::Null); // to_version lives under `pending`
+        assert_eq!(v["pending"]["to_version"], MAX_PROTOCOL_VERSION + 1);
+    }
+
+    /// no pending upgrade → `pending` is JSON null and the binary can execute.
+    #[test]
+    fn upgrade_status_json_no_pending_is_null() {
+        let st = status(None, false);
+        let out = upgrade_status_json(&st, MAX_PROTOCOL_VERSION);
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        assert_eq!(v["pending"], serde_json::Value::Null);
+        assert_eq!(v["binary_can_execute"], true);
+        assert_eq!(v["armed"], false);
+    }
+
+    /// the module-absent fallback shape the verb prints when the query errors.
+    #[test]
+    fn upgrade_status_json_module_absent_shape() {
+        let v = serde_json::json!({ "available": false, "max_supported": MAX_PROTOCOL_VERSION });
+        assert_eq!(v["available"], false);
+        assert_eq!(v["max_supported"], MAX_PROTOCOL_VERSION);
+    }
+
+    /// member-status `--json` carries the same two facts as the prose line.
+    #[test]
+    fn member_status_json_shape() {
+        let in_set = true;
+        let validators = 3usize;
+        let v = serde_json::json!({ "in_set": in_set, "validators": validators });
+        assert_eq!(v["in_set"], true);
+        assert_eq!(v["validators"], 3);
+    }
 }
