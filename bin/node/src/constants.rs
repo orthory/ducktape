@@ -187,10 +187,14 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
     ("chat", 1),
     ("directory", 1),
-    // 1 (UNCHANGED — dispatch stays NATIVE): its read facade serves
-    // COMMITTED-ONLY state by design (runs' mid-block lease_holder read
-    // depends on it), a view the wasm adapter's staged-fold cannot represent.
-    ("dispatch", 1),
+    // 2: the wasm adapter port — the native canonical snapshot persisted as one
+    // host-KV value, a TOTAL schema break from the native root (visible from
+    // genesis: native empties to four zero counts, the map-backed guest store to
+    // one). its query surface stays COMMITTED-ONLY regardless of caller via the
+    // kernel's committed-query lane (`with_committed_queries`) — no ctx-routed
+    // enrichment survives (the former assignee facade retired to saga). beta
+    // re-genesis, no shim.
+    ("dispatch", 2),
     ("files", 1),
     ("forge", 1),
     // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
