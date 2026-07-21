@@ -603,58 +603,18 @@ mod tests {
     use crate::{MAX_CLASS_LEN, MAX_TAG_LEN, encode_msg, encode_query};
     use valset::encode_reply as valset_encode_reply;
 
-    /// a minimal Ctx: origin-configurable, and (optionally) answers BOTH the
-    /// valset Validators and Residents queries so the member gate is testable
-    /// for either standing (mirrors identity's test stub).
-    struct TestCtx {
-        env: sdk::Env,
+    use sdk_testkit::TestCtx;
+
+    /// a valset-query responder over an optional member/resident set — answers
+    /// BOTH Validators and Residents so the member gate is testable for either
+    /// standing (mirrors identity's test stub).
+    fn valset_reads(
         members: Option<Vec<Vec<u8>>>,
         residents: Option<Vec<Vec<u8>>>,
-    }
-    impl TestCtx {
-        fn external(key: &[u8]) -> Self {
-            Self::with_origin(sdk::Origin::External(key.to_vec()))
-        }
-        fn with_origin(origin: sdk::Origin) -> Self {
-            Self {
-                env: sdk::Env {
-                    protocol_version: 0,
-                    height: 0,
-                    consensus_time: 0,
-                    origin,
-                    me: "capability".into(),
-                },
-                members: None,
-                residents: None,
-            }
-        }
-        fn gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> Self {
-            let mut ctx = Self::external(key);
-            ctx.members = Some(validators);
-            ctx.residents = Some(residents);
-            ctx
-        }
-        fn with_members(key: &[u8], members: Vec<Vec<u8>>) -> Self {
-            Self::gated(key, members, Vec::new())
-        }
-        fn with_residents(key: &[u8], residents: Vec<Vec<u8>>) -> Self {
-            Self::gated(key, Vec::new(), residents)
-        }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env {
-            &self.env
-        }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> {
-            None
-        }
-        async fn query(&self, t: &str, r: &[u8]) -> Result<Vec<u8>, Error> {
-            if t != "valset" {
-                return Err(Error::QueryUnsupported);
-            }
-            let q = valset::decode_query(r).map_err(Error::Module)?;
-            match (q, &self.members, &self.residents) {
+    ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+        move |req| {
+            let q = valset::decode_query(req).map_err(Error::Module)?;
+            match (q, &members, &residents) {
                 (ValsetQuery::Validators, Some(m), _) => {
                     Ok(valset_encode_reply(&ValsetReply::Validators(m.clone())))
                 }
@@ -664,8 +624,41 @@ mod tests {
                 _ => Err(Error::QueryUnsupported),
             }
         }
-        fn emit_msg(&mut self, _m: Msg) {}
-        fn emit_event(&mut self, _e: sdk::Event) {}
+    }
+
+    fn ctx_with(
+        origin: sdk::Origin,
+        members: Option<Vec<Vec<u8>>>,
+        residents: Option<Vec<Vec<u8>>>,
+    ) -> TestCtx {
+        TestCtx::with_env(sdk::Env {
+            protocol_version: 0,
+            height: 0,
+            consensus_time: 0,
+            origin,
+            me: "capability".into(),
+        })
+        .on_query("valset", valset_reads(members, residents))
+    }
+
+    fn ctx_origin(origin: sdk::Origin) -> TestCtx {
+        ctx_with(origin, None, None)
+    }
+    fn ctx_external(key: &[u8]) -> TestCtx {
+        ctx_origin(sdk::Origin::External(key.to_vec()))
+    }
+    fn ctx_gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> TestCtx {
+        ctx_with(
+            sdk::Origin::External(key.to_vec()),
+            Some(validators),
+            Some(residents),
+        )
+    }
+    fn ctx_with_members(key: &[u8], members: Vec<Vec<u8>>) -> TestCtx {
+        ctx_gated(key, members, Vec::new())
+    }
+    fn ctx_with_residents(key: &[u8], residents: Vec<Vec<u8>>) -> TestCtx {
+        ctx_gated(key, Vec::new(), residents)
     }
 
     fn announce_with(tags: &[&str], resources: &[(&str, u64)]) -> Msg {
@@ -729,7 +722,7 @@ mod tests {
         let mut src = ungated();
         let node = vec![42u8; 32];
         futures::executor::block_on(
-            src.execute(&mut TestCtx::external(&node), &announce(&["codex"])),
+            src.execute(&mut ctx_external(&node), &announce(&["codex"])),
         )
         .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
@@ -747,7 +740,7 @@ mod tests {
     fn announce_registers_and_moves_root_off_zero() {
         let mut c = ungated();
         let me = vec![1u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         assert_eq!(c.root(), StateRoot::ZERO, "genesis registry is empty");
 
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex", "claude"]))).unwrap();
@@ -769,7 +762,7 @@ mod tests {
     fn announce_is_a_declarative_replace() {
         let mut c = ungated();
         let me = vec![2u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
 
@@ -784,7 +777,7 @@ mod tests {
     fn empty_announce_removes_the_node() {
         let mut c = ungated();
         let me = vec![3u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_ne!(c.root(), StateRoot::ZERO);
@@ -799,7 +792,7 @@ mod tests {
     fn duplicate_tags_collapse() {
         let mut c = ungated();
         let me = vec![4u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex", "codex"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(node_tags(&c, &me), vec!["codex"], "set semantics");
@@ -809,7 +802,7 @@ mod tests {
     fn non_external_origins_are_rejected() {
         let mut c = ungated();
         for origin in [sdk::Origin::Module("agent".into()), sdk::Origin::System] {
-            let mut ctx = TestCtx::with_origin(origin);
+            let mut ctx = ctx_origin(origin);
             let err = futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"])))
                 .unwrap_err();
             assert!(
@@ -826,7 +819,7 @@ mod tests {
         // the same malformed-origin reject dispatch applies: an empty key is
         // never a registry entry.
         let mut c = ungated();
-        let mut ctx = TestCtx::external(&[]);
+        let mut ctx = ctx_external(&[]);
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap_err();
         assert!(
@@ -843,7 +836,7 @@ mod tests {
         let outsider = vec![6u8; 32];
         let mut c = CapabilityRegistry::new("capability", Some("valset".into()));
 
-        let mut ctx = TestCtx::with_members(&outsider, vec![member.clone()]);
+        let mut ctx = ctx_with_members(&outsider, vec![member.clone()]);
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap_err();
         assert!(
@@ -851,7 +844,7 @@ mod tests {
             "got {err:?}"
         );
 
-        let mut ctx = TestCtx::with_members(&member, vec![member.clone()]);
+        let mut ctx = ctx_with_members(&member, vec![member.clone()]);
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(providers(&c, "codex"), vec![member]);
@@ -866,14 +859,14 @@ mod tests {
 
         // a RESIDENT (joined, admitted, not promoted) announces: admitted —
         // the whole point of the resident-announce path.
-        let mut ctx = TestCtx::gated(&resident, vec![validator.clone()], vec![resident.clone()]);
+        let mut ctx = ctx_gated(&resident, vec![validator.clone()], vec![resident.clone()]);
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(providers(&c, "codex"), vec![resident.clone()]);
 
         // a key with NEITHER standing is still rejected, even alongside a
         // populated resident set.
-        let mut ctx = TestCtx::gated(&outsider, vec![validator.clone()], vec![resident.clone()]);
+        let mut ctx = ctx_gated(&outsider, vec![validator.clone()], vec![resident.clone()]);
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce(&["claude"]))).unwrap_err();
         assert!(
@@ -883,7 +876,7 @@ mod tests {
 
         // resident-only standing (no validator overlap) also admits — the
         // gate is a true union, not an intersection.
-        let mut ctx = TestCtx::with_residents(&resident, vec![resident.clone()]);
+        let mut ctx = ctx_with_residents(&resident, vec![resident.clone()]);
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["claude"]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         assert_eq!(providers(&c, "claude"), vec![resident]);
@@ -893,7 +886,7 @@ mod tests {
     fn malformed_tags_are_rejected() {
         let mut c = ungated();
         let me = vec![7u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         let too_long = "x".repeat(MAX_TAG_LEN + 1);
         let too_many: Vec<String> = (0..=MAX_CAPABILITIES).map(|i| format!("cap{i}")).collect();
         let too_many: Vec<&str> = too_many.iter().map(String::as_str).collect();
@@ -922,10 +915,10 @@ mod tests {
 
         let mut c1 = ungated();
         futures::executor::block_on(async {
-            c1.execute(&mut TestCtx::external(&a), &announce(&["codex"]))
+            c1.execute(&mut ctx_external(&a), &announce(&["codex"]))
                 .await
                 .unwrap();
-            c1.execute(&mut TestCtx::external(&b), &announce(&["claude"]))
+            c1.execute(&mut ctx_external(&b), &announce(&["claude"]))
                 .await
                 .unwrap();
             c1.commit_block().await.unwrap();
@@ -934,10 +927,10 @@ mod tests {
         // same registry contents, announced in the opposite order.
         let mut c2 = ungated();
         futures::executor::block_on(async {
-            c2.execute(&mut TestCtx::external(&b), &announce(&["claude"]))
+            c2.execute(&mut ctx_external(&b), &announce(&["claude"]))
                 .await
                 .unwrap();
-            c2.execute(&mut TestCtx::external(&a), &announce(&["codex"]))
+            c2.execute(&mut ctx_external(&a), &announce(&["codex"]))
                 .await
                 .unwrap();
             c2.commit_block().await.unwrap();
@@ -950,7 +943,7 @@ mod tests {
     fn atomicity_a_failed_block_rolls_back_the_stage() {
         let mut c = ungated();
         let me = vec![10u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         let before = c.root();
 
         futures::executor::block_on(c.execute(&mut ctx, &announce(&["codex"]))).unwrap();
@@ -971,10 +964,10 @@ mod tests {
         let mut src = ungated();
         let (a, b) = (vec![11u8; 32], vec![12u8; 32]);
         futures::executor::block_on(async {
-            src.execute(&mut TestCtx::external(&a), &announce(&["codex", "claude"]))
+            src.execute(&mut ctx_external(&a), &announce(&["codex", "claude"]))
                 .await
                 .unwrap();
-            src.execute(&mut TestCtx::external(&b), &announce(&["codex"]))
+            src.execute(&mut ctx_external(&b), &announce(&["codex"]))
                 .await
                 .unwrap();
             src.commit_block().await.unwrap();
@@ -991,7 +984,7 @@ mod tests {
         // must drop it, or the stale stage would leak into the new view.
         let mut dst = ungated();
         futures::executor::block_on(
-            dst.execute(&mut TestCtx::external(&[13u8; 32]), &announce(&["other"])),
+            dst.execute(&mut ctx_external(&[13u8; 32]), &announce(&["other"])),
         )
         .unwrap();
 
@@ -1008,7 +1001,7 @@ mod tests {
     fn tampered_snapshot_is_rejected_and_the_target_is_untouched() {
         let mut src = ungated();
         let a = vec![14u8; 32];
-        futures::executor::block_on(src.execute(&mut TestCtx::external(&a), &announce(&["codex"])))
+        futures::executor::block_on(src.execute(&mut ctx_external(&a), &announce(&["codex"])))
             .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
         let src_root = src.root();
@@ -1025,11 +1018,11 @@ mod tests {
         let mut dst = ungated();
         let b = vec![15u8; 32];
         futures::executor::block_on(
-            dst.execute(&mut TestCtx::external(&b), &announce(&["claude"])),
+            dst.execute(&mut ctx_external(&b), &announce(&["claude"])),
         )
         .unwrap();
         futures::executor::block_on(dst.commit_block()).unwrap();
-        futures::executor::block_on(dst.execute(&mut TestCtx::external(&b), &announce(&["other"])))
+        futures::executor::block_on(dst.execute(&mut ctx_external(&b), &announce(&["other"])))
             .unwrap();
         let pre_root = dst.root();
         let pre_view = node_tags(&dst, &b);
@@ -1044,7 +1037,7 @@ mod tests {
     fn truncated_trailing_or_forged_snapshots_are_rejected() {
         let mut src = ungated();
         futures::executor::block_on(
-            src.execute(&mut TestCtx::external(&[16u8; 32]), &announce(&["codex"])),
+            src.execute(&mut ctx_external(&[16u8; 32]), &announce(&["codex"])),
         )
         .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
@@ -1093,7 +1086,7 @@ mod tests {
     fn resources_are_stored_queryable_and_move_the_root() {
         let mut c = ungated();
         let me = vec![30u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         futures::executor::block_on(c.execute(&mut ctx, &announce_with(&["codex"], &[]))).unwrap();
         futures::executor::block_on(c.commit_block()).unwrap();
         let tags_only_root = c.root();
@@ -1135,7 +1128,7 @@ mod tests {
         }
     }
     fn module_ctx(id: &str) -> TestCtx {
-        TestCtx::with_origin(sdk::Origin::Module(id.into()))
+        ctx_origin(sdk::Origin::Module(id.into()))
     }
     fn class_owner(c: &CapabilityRegistry, class: &str) -> Option<ModuleId> {
         let reply =
@@ -1225,7 +1218,7 @@ mod tests {
             sdk::Origin::External(Vec::new()),
             sdk::Origin::System,
         ] {
-            let mut ctx = TestCtx::with_origin(origin);
+            let mut ctx = ctx_origin(origin);
             let err =
                 futures::executor::block_on(c.execute(&mut ctx, &claim("agent"))).unwrap_err();
             assert!(
@@ -1279,7 +1272,7 @@ mod tests {
         let mut src = ungated();
         let node = vec![30u8; 32];
         futures::executor::block_on(async {
-            src.execute(&mut TestCtx::external(&node), &announce(&["codex"]))
+            src.execute(&mut ctx_external(&node), &announce(&["codex"]))
                 .await
                 .unwrap();
             src.execute(&mut module_ctx("dispatch"), &claim("agent"))
@@ -1358,20 +1351,20 @@ mod tests {
         let bare = vec![33u8; 32];
         futures::executor::block_on(async {
             c.execute(
-                &mut TestCtx::external(&big),
+                &mut ctx_external(&big),
                 &announce_with(&["codex"], &[("cores", 16), ("mem_gb", 64)]),
             )
             .await
             .unwrap();
             c.execute(
-                &mut TestCtx::external(&small),
+                &mut ctx_external(&small),
                 &announce_with(&["codex"], &[("cores", 4), ("mem_gb", 8)]),
             )
             .await
             .unwrap();
             // tags-only node (direct mode): never matches ANY demand.
             c.execute(
-                &mut TestCtx::external(&bare),
+                &mut ctx_external(&bare),
                 &announce_with(&["codex"], &[]),
             )
             .await
@@ -1395,7 +1388,7 @@ mod tests {
     fn resources_without_capabilities_reject_and_malformed_resources_reject() {
         let mut c = ungated();
         let me = vec![34u8; 32];
-        let mut ctx = TestCtx::external(&me);
+        let mut ctx = ctx_external(&me);
         // capacity with nothing to execute is meaningless — reject loudly.
         let err =
             futures::executor::block_on(c.execute(&mut ctx, &announce_with(&[], &[("cores", 8)])))
@@ -1415,7 +1408,7 @@ mod tests {
         let mut src = ungated();
         let a = vec![35u8; 32];
         futures::executor::block_on(src.execute(
-            &mut TestCtx::external(&a),
+            &mut ctx_external(&a),
             &announce_with(&["codex"], &[("cores", 8)]),
         ))
         .unwrap();

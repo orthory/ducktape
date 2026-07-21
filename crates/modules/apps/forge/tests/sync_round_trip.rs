@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use forge::Forge;
 use forge::{ForgeMsg, encode_msg};
-use sdk::{Ctx, Error, Module, Msg, StateRoot};
+use sdk::{Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref install must (and may only) move.
 const MAIN_REF: &str = "refs/heads/main";
@@ -29,35 +29,17 @@ const OID_LEN: usize = 20;
 /// the default repo — its git dir is `base/default`.
 const DEFAULT_REPO: &str = "default";
 
-// a minimal Ctx so execute can read consensus_time without a full host.
-struct TestCtx {
-    env: sdk::Env,
-}
-impl TestCtx {
-    fn at(consensus_time: u64) -> Self {
-        Self {
-            env: sdk::Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin: sdk::Origin::System,
-                me: "forge".into(),
-            },
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: sdk::Event) {}
+use sdk_testkit::TestCtx;
+
+// forge's execute reads only env (consensus_time); me/height are cosmetic.
+fn at(consensus_time: u64) -> TestCtx {
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin: sdk::Origin::System,
+        me: "forge".into(),
+    })
 }
 
 fn tmp_base(tag: &str) -> PathBuf {
@@ -84,7 +66,7 @@ fn commit_one(forge: &mut Forge, t: u64, path: &str, content: &str, message: &st
             message: message.into(),
         }),
     };
-    futures::executor::block_on(forge.execute(&mut TestCtx::at(t), &msg)).unwrap();
+    futures::executor::block_on(forge.execute(&mut at(t), &msg)).unwrap();
     futures::executor::block_on(forge.commit_block()).unwrap();
 }
 

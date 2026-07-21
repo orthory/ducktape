@@ -7,7 +7,6 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::future::Future;
 
 use base64::Engine as _;
@@ -18,45 +17,20 @@ use duckfs_core::{
     SnapshotInfo, decode_reply, encode_msg, encode_putblob, encode_query,
 };
 use files::Files;
-use sdk::{Ctx, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
+use sdk::{Env, Error, Module as _, Msg, Origin};
 
-// ---- a deterministic Ctx (copied from the files harness) --------------------
+// ---- a deterministic Ctx (the shared sdk-testkit double) --------------------
 
-pub struct TestCtx {
-    env: Env,
-    emitted: VecDeque<Msg>,
-}
+use sdk_testkit::TestCtx;
 
-impl TestCtx {
-    fn new(origin: Origin, height: u64) -> Self {
-        Self {
-            env: Env {
-                protocol_version: 0,
-                height,
-                consensus_time: height,
-                origin,
-                me: "files".into(),
-            },
-            emitted: VecDeque::new(),
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, msg: Msg) {
-        self.emitted.push_back(msg);
-    }
-    fn emit_event(&mut self, _event: Event) {}
+fn ctx(origin: Origin, height: u64) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height,
+        consensus_time: height,
+        origin,
+        me: "files".into(),
+    })
 }
 
 // ---- the mock node ----------------------------------------------------------
@@ -103,7 +77,7 @@ impl ModuleNode {
     fn exec(&self, payload: Vec<u8>) -> Result<u64, ApiError> {
         let h = self.next_height();
         let mut f = self.files.borrow_mut();
-        let mut ctx = TestCtx::new(Origin::System, h);
+        let mut ctx = ctx(Origin::System, h);
         Self::block_on(f.execute(
             &mut ctx,
             &Msg {

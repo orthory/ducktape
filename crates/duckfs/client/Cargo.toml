@@ -26,3 +26,4 @@ sdk = { workspace = true }
 tempfile = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
+sdk-testkit = { workspace = true }

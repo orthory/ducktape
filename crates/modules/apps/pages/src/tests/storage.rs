@@ -43,7 +43,7 @@ fn staged_writes_and_deletes_roll_back_on_abort() {
 
         // stage a removal (a delete) AND an insert, then abort.
         p.execute(
-            &mut TestCtx::new(),
+            &mut TestCtx::at_height(0),
             &msg(&PageMsg::RemoveBlock {
                 block_id: "b2".into(),
             }),
@@ -51,7 +51,7 @@ fn staged_writes_and_deletes_roll_back_on_abort() {
         .await
         .unwrap();
         p.execute(
-            &mut TestCtx::new(),
+            &mut TestCtx::at_height(0),
             &msg(&PageMsg::InsertBlock {
                 parent: "p1".into(),
                 after: None,
@@ -86,7 +86,7 @@ fn staged_writes_are_visible_within_one_block() {
         // two inserts, NO commit between: the child hangs off a parent
         // that exists only in the overlay.
         p.execute(
-            &mut TestCtx::new(),
+            &mut TestCtx::at_height(0),
             &msg(&PageMsg::InsertBlock {
                 parent: "p1".into(),
                 after: None,
@@ -96,7 +96,7 @@ fn staged_writes_are_visible_within_one_block() {
         .await
         .unwrap();
         p.execute(
-            &mut TestCtx::new(),
+            &mut TestCtx::at_height(0),
             &msg(&PageMsg::InsertBlock {
                 parent: "b1".into(),
                 after: None,
@@ -108,7 +108,7 @@ fn staged_writes_are_visible_within_one_block() {
         // a staged delete is visible too: re-inserting the removed id in
         // the SAME block-height succeeds (absence through the overlay).
         p.execute(
-            &mut TestCtx::new(),
+            &mut TestCtx::at_height(0),
             &msg(&PageMsg::RemoveBlock {
                 block_id: "c1".into(),
             }),
@@ -116,7 +116,7 @@ fn staged_writes_are_visible_within_one_block() {
         .await
         .unwrap();
         p.execute(
-            &mut TestCtx::new(),
+            &mut TestCtx::at_height(0),
             &msg(&PageMsg::InsertBlock {
                 parent: "b1".into(),
                 after: None,

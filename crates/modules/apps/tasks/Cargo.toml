@@ -25,5 +25,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
+sdk-testkit = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }

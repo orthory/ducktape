@@ -9,7 +9,8 @@ use chat::{
     MAX_QUERY_LIMIT, Mark, PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use sdk::{Ctx, Error, Module, Msg, Origin, StateRoot};
+use sdk::{Error, Module, Msg, Origin, StateRoot};
+use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
 // build the module the way a host does: concrete store first, injected as
@@ -21,59 +22,21 @@ macro_rules! chat_on {
     };
 }
 
-struct TestCtx {
-    env: sdk::Env,
-    /// module ids `module_root` reports as registered (hook targets).
-    known_modules: Vec<String>,
-    /// follow-up msgs emitted during execute, in order.
-    emitted: Vec<Msg>,
+// build the ctx a host hands chat: env at block 0, a chosen consensus time and
+// origin, `me = "chat"`. `.with_module_root(id, StateRoot::ZERO)` marks a hook
+// target live — chat gates hook dispatch on `module_root(target).is_some()`.
+fn ctx_with_origin(consensus_time: u64, origin: Origin) -> TestCtx {
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin,
+        me: "chat".into(),
+    })
 }
 
-impl TestCtx {
-    fn with_origin(consensus_time: u64, origin: Origin) -> Self {
-        Self {
-            env: sdk::Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin,
-                me: "chat".into(),
-            },
-            known_modules: Vec::new(),
-            emitted: Vec::new(),
-        }
-    }
-
-    fn at(consensus_time: u64) -> Self {
-        Self::with_origin(consensus_time, Origin::System)
-    }
-
-    fn knowing(mut self, module_id: &str) -> Self {
-        self.known_modules.push(module_id.to_string());
-        self
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-
-    fn module_root(&self, target: &str) -> Option<StateRoot> {
-        self.known_modules
-            .iter()
-            .any(|m| m == target)
-            .then_some(StateRoot::ZERO)
-    }
-
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-
-    fn emit_msg(&mut self, msg: Msg) {
-        self.emitted.push(msg);
-    }
-    fn emit_event(&mut self, _ev: sdk::Event) {}
+fn ctx_at(consensus_time: u64) -> TestCtx {
+    ctx_with_origin(consensus_time, Origin::System)
 }
 
 fn user(byte: u8) -> Origin {
@@ -143,7 +106,7 @@ fn assigns_monotonic_sequences_from_the_channel_counter_across_blocks() {
         let root0 = module.root();
 
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         assert_eq!(
@@ -159,14 +122,14 @@ fn assigns_monotonic_sequences_from_the_channel_counter_across_blocks() {
         // from the persisted head_seq counter, gap-free.
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", "hello", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(2)),
+                &mut ctx_with_origin(20, user(2)),
                 &module_msg(post("general", "m2", "hi", None)),
             )
             .await
@@ -175,7 +138,7 @@ fn assigns_monotonic_sequences_from_the_channel_counter_across_blocks() {
         module.commit_block().await.unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(21, user(1)),
+                &mut ctx_with_origin(21, user(1)),
                 &module_msg(post("general", "m3", "again", None)),
             )
             .await
@@ -219,26 +182,26 @@ fn thread_replies_take_channel_sequences_and_update_the_root_summary() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", "root", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(30, user(2)),
+                &mut ctx_with_origin(30, user(2)),
                 &module_msg(post("general", "r1", "first reply", Some(1))),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(31, user(3)),
+                &mut ctx_with_origin(31, user(3)),
                 &module_msg(post("general", "r2", "second reply", Some(1))),
             )
             .await
@@ -270,7 +233,7 @@ fn thread_replies_take_channel_sequences_and_update_the_root_summary() {
         // a reply is not a thread root: no sub-threads, and Thread on it is None.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(32, user(1)),
+                &mut ctx_with_origin(32, user(1)),
                 &module_msg(post("general", "r3", "subthread", Some(2))),
             )
             .await
@@ -298,26 +261,26 @@ fn delete_tombstones_the_head_but_preserves_thread_integrity() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", "root", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(21, user(2)),
+                &mut ctx_with_origin(21, user(2)),
                 &module_msg(post("general", "r1", "reply", Some(1))),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(22, user(2)),
+                &mut ctx_with_origin(22, user(2)),
                 &module_msg(ChatMsg::AddReaction {
                     channel_id: "general".into(),
                     seq: 1,
@@ -330,7 +293,7 @@ fn delete_tombstones_the_head_but_preserves_thread_integrity() {
 
         module
             .execute(
-                &mut TestCtx::with_origin(30, user(1)),
+                &mut ctx_with_origin(30, user(1)),
                 &module_msg(ChatMsg::DeleteMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -367,7 +330,7 @@ fn delete_tombstones_the_head_but_preserves_thread_integrity() {
         // the sequence promise survives: the next post takes seq 3.
         module
             .execute(
-                &mut TestCtx::with_origin(40, user(2)),
+                &mut ctx_with_origin(40, user(2)),
                 &module_msg(post("general", "m2", "after delete", None)),
             )
             .await
@@ -386,7 +349,7 @@ fn delete_tombstones_the_head_but_preserves_thread_integrity() {
         // double delete and edits of a tombstone are rejected.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(41, user(1)),
+                &mut ctx_with_origin(41, user(1)),
                 &module_msg(ChatMsg::DeleteMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -398,7 +361,7 @@ fn delete_tombstones_the_head_but_preserves_thread_integrity() {
         module.abort_block().await.unwrap();
         let err = module
             .execute(
-                &mut TestCtx::with_origin(42, user(1)),
+                &mut ctx_with_origin(42, user(1)),
                 &module_msg(ChatMsg::EditMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -418,12 +381,12 @@ fn edits_append_revisions_keep_lww_heads_and_record_base_rev() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", "v0", None)),
             )
             .await
@@ -432,7 +395,7 @@ fn edits_append_revisions_keep_lww_heads_and_record_base_rev() {
 
         module
             .execute(
-                &mut TestCtx::with_origin(30, user(1)),
+                &mut ctx_with_origin(30, user(1)),
                 &module_msg(ChatMsg::EditMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -446,7 +409,7 @@ fn edits_append_revisions_keep_lww_heads_and_record_base_rev() {
         // the head is last-write-wins under the consensus total order.
         module
             .execute(
-                &mut TestCtx::with_origin(31, user(1)),
+                &mut ctx_with_origin(31, user(1)),
                 &module_msg(ChatMsg::EditMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -506,7 +469,7 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
         // the demo-default empty external origin never passes.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(10, Origin::External(Vec::new())),
+                &mut ctx_with_origin(10, Origin::External(Vec::new())),
                 &module_msg(create_channel("general")),
             )
             .await
@@ -516,19 +479,19 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
         assert_eq!(module.root(), root0);
 
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", "alice's message", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(21, Origin::Module("agent".into())),
+                &mut ctx_with_origin(21, Origin::Module("agent".into())),
                 &module_msg(post("general", "m2", "module message", None)),
             )
             .await
@@ -563,7 +526,7 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
             },
         ] {
             let err = module
-                .execute(&mut TestCtx::with_origin(30, user(2)), &module_msg(op))
+                .execute(&mut ctx_with_origin(30, user(2)), &module_msg(op))
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::Module(_)));
@@ -572,7 +535,7 @@ fn authorship_derives_from_origin_and_cannot_be_spoofed() {
         // and a module origin cannot touch a user's message either.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(31, Origin::Module("agent".into())),
+                &mut ctx_with_origin(31, Origin::Module("agent".into())),
                 &module_msg(ChatMsg::EditMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -605,7 +568,7 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -624,7 +587,7 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
         for origin in [user(1), Origin::System] {
             let err = module
                 .execute(
-                    &mut TestCtx::with_origin(20, origin),
+                    &mut ctx_with_origin(20, origin),
                     &module_msg(as_agent_post("m1")),
                 )
                 .await
@@ -637,7 +600,7 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
         // an empty agent id never passes, even from a module origin.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, Origin::Module("agent".into())),
+                &mut ctx_with_origin(20, Origin::Module("agent".into())),
                 &module_msg(ChatMsg::PostMessage {
                     channel_id: "general".into(),
                     message_id: "m1".into(),
@@ -655,7 +618,7 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
         // module half from the origin, agent half from the payload.
         module
             .execute(
-                &mut TestCtx::with_origin(21, Origin::Module("agent".into())),
+                &mut ctx_with_origin(21, Origin::Module("agent".into())),
                 &module_msg(as_agent_post("m1")),
             )
             .await
@@ -683,7 +646,7 @@ fn as_agent_is_honored_for_module_origins_and_rejected_for_everyone_else() {
         // a different author than its agent, so it cannot edit the agent post.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(22, Origin::Module("agent".into())),
+                &mut ctx_with_origin(22, Origin::Module("agent".into())),
                 &module_msg(ChatMsg::EditMessage {
                     channel_id: "general".into(),
                     seq: 1,
@@ -703,12 +666,12 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", "react to me", None)),
             )
             .await
@@ -721,7 +684,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
             emoji: "duck".into(),
         };
         module
-            .execute(&mut TestCtx::with_origin(21, user(2)), &module_msg(add()))
+            .execute(&mut ctx_with_origin(21, user(2)), &module_msg(add()))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -730,7 +693,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
         // add twice = once: the duplicate stages nothing, so the committed
         // qmdb op log — and the root — is byte-identical.
         module
-            .execute(&mut TestCtx::with_origin(22, user(2)), &module_msg(add()))
+            .execute(&mut ctx_with_origin(22, user(2)), &module_msg(add()))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -743,7 +706,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
         // exact remove: an author who never reacted is a no-op...
         module
             .execute(
-                &mut TestCtx::with_origin(23, user(3)),
+                &mut ctx_with_origin(23, user(3)),
                 &module_msg(ChatMsg::RemoveReaction {
                     channel_id: "general".into(),
                     seq: 1,
@@ -772,7 +735,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
         // ...and the reactor's own remove clears the record.
         module
             .execute(
-                &mut TestCtx::with_origin(24, user(2)),
+                &mut ctx_with_origin(24, user(2)),
                 &module_msg(ChatMsg::RemoveReaction {
                     channel_id: "general".into(),
                     seq: 1,
@@ -797,7 +760,7 @@ fn reactions_are_idempotent_sets_per_emoji_and_author() {
         // emoji byte cap is enforced at write time.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(25, user(2)),
+                &mut ctx_with_origin(25, user(2)),
                 &module_msg(ChatMsg::AddReaction {
                     channel_id: "general".into(),
                     seq: 1,
@@ -816,13 +779,13 @@ fn messages_around_windows_the_history_at_one_sequence() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         for i in 1..=12u64 {
             module
                 .execute(
-                    &mut TestCtx::with_origin(20 + i, user(1)),
+                    &mut ctx_with_origin(20 + i, user(1)),
                     &module_msg(post("general", &format!("m{i}"), "body", None)),
                 )
                 .await
@@ -832,7 +795,7 @@ fn messages_around_windows_the_history_at_one_sequence() {
         // jump-to projection has to match what `MessagesLatest` would return.
         module
             .execute(
-                &mut TestCtx::with_origin(40, user(1)),
+                &mut ctx_with_origin(40, user(1)),
                 &module_msg(ChatMsg::DeleteMessage {
                     channel_id: "general".into(),
                     seq: 6,
@@ -878,13 +841,13 @@ fn pagination_is_correct_at_the_boundaries() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         for i in 1..=5u64 {
             module
                 .execute(
-                    &mut TestCtx::with_origin(20 + i, user(1)),
+                    &mut ctx_with_origin(20 + i, user(1)),
                     &module_msg(post("general", &format!("m{i}"), "body", None)),
                 )
                 .await
@@ -918,7 +881,7 @@ fn pagination_is_correct_at_the_boundaries() {
         for i in 1..=3u64 {
             module
                 .execute(
-                    &mut TestCtx::with_origin(30 + i, user(2)),
+                    &mut ctx_with_origin(30 + i, user(2)),
                     &module_msg(post("general", &format!("r{i}"), "reply", Some(1))),
                 )
                 .await
@@ -951,7 +914,7 @@ fn oversized_writes_are_rejected_before_staging_anything() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -961,7 +924,7 @@ fn oversized_writes_are_rejected_before_staging_anything() {
         // cap is decode-only; committing it would poison every later read).
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("general", "m1", &"x".repeat(65 * 1024), None)),
             )
             .await
@@ -973,7 +936,7 @@ fn oversized_writes_are_rejected_before_staging_anything() {
         // the sequence counter did not advance: the next post takes seq 1.
         module
             .execute(
-                &mut TestCtx::with_origin(21, user(1)),
+                &mut ctx_with_origin(21, user(1)),
                 &module_msg(post("general", "m2", "small", None)),
             )
             .await
@@ -997,7 +960,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
         let mut module = chat_on!(context, "chat");
         module
             .execute(
-                &mut TestCtx::at(10),
+                &mut ctx_at(10),
                 &module_msg(ChatMsg::CreateChannel {
                     channel_id: "core".into(),
                     name: "Core".into(),
@@ -1011,7 +974,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
         // a non-member external user cannot post...
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("core", "m1", "let me in", None)),
             )
             .await
@@ -1022,7 +985,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
         // ...a module author always may (genesis-fixed trusted code)...
         module
             .execute(
-                &mut TestCtx::with_origin(21, Origin::Module("agent".into())),
+                &mut ctx_with_origin(21, Origin::Module("agent".into())),
                 &module_msg(post("core", "m1", "agent reply", None)),
             )
             .await
@@ -1033,7 +996,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
         // the user for posts and reactions alike.
         module
             .execute(
-                &mut TestCtx::with_origin(22, user(1)),
+                &mut ctx_with_origin(22, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
                     user: vec![1; 32],
@@ -1044,14 +1007,14 @@ fn members_only_channels_gate_external_posts_and_reactions() {
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(23, user(1)),
+                &mut ctx_with_origin(23, user(1)),
                 &module_msg(post("core", "m2", "member now", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(24, user(1)),
+                &mut ctx_with_origin(24, user(1)),
                 &module_msg(ChatMsg::AddReaction {
                     channel_id: "core".into(),
                     seq: 1,
@@ -1075,7 +1038,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
         // removal closes the door again.
         module
             .execute(
-                &mut TestCtx::with_origin(25, user(1)),
+                &mut ctx_with_origin(25, user(1)),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
                     user: vec![1; 32],
@@ -1087,7 +1050,7 @@ fn members_only_channels_gate_external_posts_and_reactions() {
         module.commit_block().await.unwrap();
         let err = module
             .execute(
-                &mut TestCtx::with_origin(26, user(1)),
+                &mut ctx_with_origin(26, user(1)),
                 &module_msg(post("core", "m3", "locked out", None)),
             )
             .await
@@ -1102,7 +1065,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1110,7 +1073,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
         // unknown target and self-hooks are rejected at registration time.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(11, user(1)),
+                &mut ctx_with_origin(11, user(1)),
                 &module_msg(ChatMsg::RegisterHook {
                     channel_id: "general".into(),
                     module_id: "ghost".into(),
@@ -1122,7 +1085,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
         module.abort_block().await.unwrap();
         let err = module
             .execute(
-                &mut TestCtx::with_origin(12, user(1)).knowing("chat"),
+                &mut ctx_with_origin(12, user(1)).with_module_root("chat", StateRoot::ZERO),
                 &module_msg(ChatMsg::RegisterHook {
                     channel_id: "general".into(),
                     module_id: "chat".into(),
@@ -1135,7 +1098,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
 
         module
             .execute(
-                &mut TestCtx::with_origin(13, user(1)).knowing("agent"),
+                &mut ctx_with_origin(13, user(1)).with_module_root("agent", StateRoot::ZERO),
                 &module_msg(ChatMsg::RegisterHook {
                     channel_id: "general".into(),
                     module_id: "agent".into(),
@@ -1146,7 +1109,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
         module.commit_block().await.unwrap();
 
         // a post emits exactly one follow-up per hook, carrying the event.
-        let mut ctx = TestCtx::with_origin(20, user(1));
+        let mut ctx = ctx_with_origin(20, user(1));
         module
             .execute(
                 &mut ctx,
@@ -1167,10 +1130,10 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
             .await
             .unwrap();
         module.commit_block().await.unwrap();
-        assert_eq!(ctx.emitted.len(), 1);
-        assert_eq!(ctx.emitted[0].target, "agent");
+        assert_eq!(ctx.msgs().len(), 1);
+        assert_eq!(ctx.msgs()[0].target, "agent");
         assert_eq!(
-            decode_event(&ctx.emitted[0].payload).unwrap(),
+            decode_event(&ctx.msgs()[0].payload).unwrap(),
             ChatEvent::MessagePosted {
                 channel_id: "general".into(),
                 seq: 1,
@@ -1185,7 +1148,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
             let hook = format!("hook{i}");
             module
                 .execute(
-                    &mut TestCtx::with_origin(30, user(1)).knowing(&hook),
+                    &mut ctx_with_origin(30, user(1)).with_module_root(&hook, StateRoot::ZERO),
                     &module_msg(ChatMsg::RegisterHook {
                         channel_id: "general".into(),
                         module_id: hook.clone(),
@@ -1196,7 +1159,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
         }
         let err = module
             .execute(
-                &mut TestCtx::with_origin(31, user(1)).knowing("overflow"),
+                &mut ctx_with_origin(31, user(1)).with_module_root("overflow", StateRoot::ZERO),
                 &module_msg(ChatMsg::RegisterHook {
                     channel_id: "general".into(),
                     module_id: "overflow".into(),
@@ -1210,7 +1173,7 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
         // unregistering stops the notifications.
         module
             .execute(
-                &mut TestCtx::with_origin(40, user(1)),
+                &mut ctx_with_origin(40, user(1)),
                 &module_msg(ChatMsg::UnregisterHook {
                     channel_id: "general".into(),
                     module_id: "agent".into(),
@@ -1218,13 +1181,13 @@ fn hooks_are_validated_capped_and_emit_one_notification_per_post() {
             )
             .await
             .unwrap();
-        let mut ctx = TestCtx::with_origin(41, user(1));
+        let mut ctx = ctx_with_origin(41, user(1));
         module
             .execute(&mut ctx, &module_msg(post("general", "m2", "quiet", None)))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
-        assert!(ctx.emitted.is_empty());
+        assert!(ctx.msgs().is_empty());
     });
 }
 
@@ -1233,16 +1196,16 @@ fn duplicate_message_ids_are_rejected_globally() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("a")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("a")))
             .await
             .unwrap();
         module
-            .execute(&mut TestCtx::at(11), &module_msg(create_channel("b")))
+            .execute(&mut ctx_at(11), &module_msg(create_channel("b")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("a", "m1", "first", None)),
             )
             .await
@@ -1252,7 +1215,7 @@ fn duplicate_message_ids_are_rejected_globally() {
         // the same message id in ANOTHER channel is still a duplicate.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(21, user(1)),
+                &mut ctx_with_origin(21, user(1)),
                 &module_msg(post("b", "m1", "second", None)),
             )
             .await
@@ -1283,37 +1246,37 @@ fn channel_scoped_keys_do_not_collide_when_ids_contain_separators() {
         // "a\0b" vs "a": a 0-byte-separator scheme would collide these once a
         // suffix follows; the length-prefixed components must not.
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("a\0b")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("a\0b")))
             .await
             .unwrap();
         module
-            .execute(&mut TestCtx::at(11), &module_msg(create_channel("a")))
+            .execute(&mut ctx_at(11), &module_msg(create_channel("a")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("a\0b", "m1", "first channel", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(21, user(2)),
+                &mut ctx_with_origin(21, user(2)),
                 &module_msg(post("a", "m2", "second channel", None)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(22, user(1)),
+                &mut ctx_with_origin(22, user(1)),
                 &module_msg(post("a\0b", "r1", "reply one", Some(1))),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(23, user(2)),
+                &mut ctx_with_origin(23, user(2)),
                 &module_msg(post("a", "r2", "reply two", Some(1))),
             )
             .await
@@ -1373,7 +1336,7 @@ fn rejects_posts_to_missing_channels_and_aborts_cleanly() {
 
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(post("ghost", "m1", "hello", None)),
             )
             .await
@@ -1450,13 +1413,13 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
         for block in blocks {
             for (at, origin, op) in block {
                 left.execute(
-                    &mut TestCtx::with_origin(at, origin.clone()),
+                    &mut ctx_with_origin(at, origin.clone()),
                     &module_msg(op.clone()),
                 )
                 .await
                 .unwrap();
                 right
-                    .execute(&mut TestCtx::with_origin(at, origin), &module_msg(op))
+                    .execute(&mut ctx_with_origin(at, origin), &module_msg(op))
                     .await
                     .unwrap();
             }
@@ -1477,7 +1440,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1487,11 +1450,11 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             node: vec![node_byte; 32],
         };
         module
-            .execute(&mut TestCtx::with_origin(20, user(1)), &module_msg(join(0xa1)))
+            .execute(&mut ctx_with_origin(20, user(1)), &module_msg(join(0xa1)))
             .await
             .unwrap();
         module
-            .execute(&mut TestCtx::with_origin(21, user(2)), &module_msg(join(0xa2)))
+            .execute(&mut ctx_with_origin(21, user(2)), &module_msg(join(0xa2)))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1516,7 +1479,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with the same node key is idempotent: root unchanged.
         let settled = module.root();
         module
-            .execute(&mut TestCtx::with_origin(30, user(1)), &module_msg(join(0xa1)))
+            .execute(&mut ctx_with_origin(30, user(1)), &module_msg(join(0xa1)))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1525,7 +1488,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with a NEW node key re-routes without duplicating the entry
         // or resetting join order.
         module
-            .execute(&mut TestCtx::with_origin(31, user(1)), &module_msg(join(0xb1)))
+            .execute(&mut ctx_with_origin(31, user(1)), &module_msg(join(0xb1)))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1547,7 +1510,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // leave removes exactly the leaver; the last leave empties the roster.
         module
             .execute(
-                &mut TestCtx::with_origin(40, user(1)),
+                &mut ctx_with_origin(40, user(1)),
                 &module_msg(ChatMsg::LeaveHuddle {
                     channel_id: "general".into(),
                 }),
@@ -1572,7 +1535,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         let settled = module.root();
         module
             .execute(
-                &mut TestCtx::with_origin(41, user(3)),
+                &mut ctx_with_origin(41, user(3)),
                 &module_msg(ChatMsg::LeaveHuddle {
                     channel_id: "general".into(),
                 }),
@@ -1589,7 +1552,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1598,7 +1561,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
         for origin in [Origin::Module("agent".into()), Origin::System] {
             let err = module
                 .execute(
-                    &mut TestCtx::with_origin(20, origin),
+                    &mut ctx_with_origin(20, origin),
                     &module_msg(ChatMsg::JoinHuddle {
                         channel_id: "general".into(),
                         node: vec![0xaa; 32],
@@ -1612,7 +1575,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
         // a node key that is not raw ed25519 bytes is rejected.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(ChatMsg::JoinHuddle {
                     channel_id: "general".into(),
                     node: vec![0xaa; 31],
@@ -1626,7 +1589,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
         for i in 0..chat::MAX_HUDDLE_MEMBERS {
             module
                 .execute(
-                    &mut TestCtx::with_origin(20, user(i as u8)),
+                    &mut ctx_with_origin(20, user(i as u8)),
                     &module_msg(ChatMsg::JoinHuddle {
                         channel_id: "general".into(),
                         node: vec![i as u8; 32],
@@ -1637,7 +1600,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
         }
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, user(200)),
+                &mut ctx_with_origin(20, user(200)),
                 &module_msg(ChatMsg::JoinHuddle {
                     channel_id: "general".into(),
                     node: vec![0xcc; 32],
@@ -1656,7 +1619,7 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
         let mut module = chat_on!(context, "chat");
         module
             .execute(
-                &mut TestCtx::at(10),
+                &mut ctx_at(10),
                 &module_msg(ChatMsg::CreateChannel {
                     channel_id: "core".into(),
                     name: "CORE".into(),
@@ -1667,7 +1630,7 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
             .unwrap();
         module
             .execute(
-                &mut TestCtx::at(10),
+                &mut ctx_at(10),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
                     user: vec![1u8; 32],
@@ -1684,13 +1647,13 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
         };
         // a non-member is turned away exactly like a non-member post.
         let err = module
-            .execute(&mut TestCtx::with_origin(20, user(2)), &module_msg(join.clone()))
+            .execute(&mut ctx_with_origin(20, user(2)), &module_msg(join.clone()))
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("members-only"));
         // the member joins fine.
         module
-            .execute(&mut TestCtx::with_origin(20, user(1)), &module_msg(join))
+            .execute(&mut ctx_with_origin(20, user(1)), &module_msg(join))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1713,12 +1676,12 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(20, user(1)),
+                &mut ctx_with_origin(20, user(1)),
                 &module_msg(ChatMsg::JoinHuddle {
                     channel_id: "general".into(),
                     node: vec![0xa1; 32],
@@ -1731,7 +1694,7 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
         // member B sweeps A's stale entry — A crashed and could not leave.
         module
             .execute(
-                &mut TestCtx::with_origin(30, user(2)),
+                &mut ctx_with_origin(30, user(2)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1756,7 +1719,7 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
         let settled = module.root();
         module
             .execute(
-                &mut TestCtx::with_origin(31, user(2)),
+                &mut ctx_with_origin(31, user(2)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1775,7 +1738,7 @@ fn sweep_huddle_gates_on_members_only_policy_like_posting() {
         let mut module = chat_on!(context, "chat");
         module
             .execute(
-                &mut TestCtx::at(10),
+                &mut ctx_at(10),
                 &module_msg(ChatMsg::CreateChannel {
                     channel_id: "core".into(),
                     name: "CORE".into(),
@@ -1786,7 +1749,7 @@ fn sweep_huddle_gates_on_members_only_policy_like_posting() {
             .unwrap();
         module
             .execute(
-                &mut TestCtx::at(10),
+                &mut ctx_at(10),
                 &module_msg(ChatMsg::SetMembership {
                     channel_id: "core".into(),
                     user: vec![1u8; 32],
@@ -1800,7 +1763,7 @@ fn sweep_huddle_gates_on_members_only_policy_like_posting() {
         // a non-member's sweep is turned away exactly like a non-member post.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, user(2)),
+                &mut ctx_with_origin(20, user(2)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "core".into(),
                     user: vec![1u8; 32],
@@ -1817,14 +1780,14 @@ fn sweep_huddle_rejects_module_origin() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
 
         let err = module
             .execute(
-                &mut TestCtx::with_origin(20, Origin::Module("agent".into())),
+                &mut ctx_with_origin(20, Origin::Module("agent".into())),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1844,7 +1807,7 @@ fn external_users_cannot_create_reserved_colon_channel_ids() {
         // ':' anywhere in the id is the module namespace — squatting rejected.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(10, user(1)),
+                &mut ctx_with_origin(10, user(1)),
                 &module_msg(create_channel("forge:demo:1")),
             )
             .await
@@ -1854,7 +1817,7 @@ fn external_users_cannot_create_reserved_colon_channel_ids() {
         // plain user channel ids keep working.
         module
             .execute(
-                &mut TestCtx::with_origin(11, user(1)),
+                &mut ctx_with_origin(11, user(1)),
                 &module_msg(create_channel("general")),
             )
             .await
@@ -1882,7 +1845,7 @@ fn module_channels_must_use_the_modules_own_prefix() {
         // forge minting under its own namespace is the supported shape.
         module
             .execute(
-                &mut TestCtx::with_origin(10, Origin::Module("forge".into())),
+                &mut ctx_with_origin(10, Origin::Module("forge".into())),
                 &module_msg(create_channel("forge:demo:1")),
             )
             .await
@@ -1903,7 +1866,7 @@ fn module_channels_must_use_the_modules_own_prefix() {
         // another module cannot mint inside forge's namespace...
         let err = module
             .execute(
-                &mut TestCtx::with_origin(11, Origin::Module("agent".into())),
+                &mut ctx_with_origin(11, Origin::Module("agent".into())),
                 &module_msg(create_channel("forge:demo:2")),
             )
             .await
@@ -1913,7 +1876,7 @@ fn module_channels_must_use_the_modules_own_prefix() {
         // ...a module cannot mint an unprefixed id in the user plane...
         let err = module
             .execute(
-                &mut TestCtx::with_origin(12, Origin::Module("forge".into())),
+                &mut ctx_with_origin(12, Origin::Module("forge".into())),
                 &module_msg(create_channel("announcements")),
             )
             .await
@@ -1924,7 +1887,7 @@ fn module_channels_must_use_the_modules_own_prefix() {
         // immediately follow the module's own id.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(13, Origin::Module("forge".into())),
+                &mut ctx_with_origin(13, Origin::Module("forge".into())),
                 &module_msg(create_channel("forgery:demo:1")),
             )
             .await
@@ -1933,7 +1896,7 @@ fn module_channels_must_use_the_modules_own_prefix() {
 
         // system origin stays unrestricted (genesis/system-internal writes).
         module
-            .execute(&mut TestCtx::at(14), &module_msg(create_channel("sys:ops")))
+            .execute(&mut ctx_at(14), &module_msg(create_channel("sys:ops")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1947,7 +1910,7 @@ fn rename_stamps_the_owner_at_create_and_gates_on_it() {
         // a user-created channel is owned by its creator.
         module
             .execute(
-                &mut TestCtx::with_origin(10, user(1)),
+                &mut ctx_with_origin(10, user(1)),
                 &module_msg(create_channel("general")),
             )
             .await
@@ -1969,7 +1932,7 @@ fn rename_stamps_the_owner_at_create_and_gates_on_it() {
         // a non-owner user cannot rename an owned channel.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(11, user(2)),
+                &mut ctx_with_origin(11, user(2)),
                 &module_msg(rename("general", "Hijacked")),
             )
             .await
@@ -1980,7 +1943,7 @@ fn rename_stamps_the_owner_at_create_and_gates_on_it() {
         // an empty name is rejected — the reused CreateChannel name validation.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(12, user(1)),
+                &mut ctx_with_origin(12, user(1)),
                 &module_msg(rename("general", "")),
             )
             .await
@@ -1991,7 +1954,7 @@ fn rename_stamps_the_owner_at_create_and_gates_on_it() {
         // the owner renames happily.
         module
             .execute(
-                &mut TestCtx::with_origin(13, user(1)),
+                &mut ctx_with_origin(13, user(1)),
                 &module_msg(rename("general", "General v2")),
             )
             .await
@@ -2017,14 +1980,14 @@ fn archived_channels_reject_writes_until_unarchived() {
         let mut module = chat_on!(context, "chat");
         module
             .execute(
-                &mut TestCtx::with_origin(10, user(1)),
+                &mut ctx_with_origin(10, user(1)),
                 &module_msg(create_channel("general")),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(11, user(1)),
+                &mut ctx_with_origin(11, user(1)),
                 &module_msg(post("general", "m1", "before archive", None)),
             )
             .await
@@ -2034,7 +1997,7 @@ fn archived_channels_reject_writes_until_unarchived() {
         // the owner archives the channel.
         module
             .execute(
-                &mut TestCtx::with_origin(12, user(1)),
+                &mut ctx_with_origin(12, user(1)),
                 &module_msg(set_archived("general", true)),
             )
             .await
@@ -2055,7 +2018,7 @@ fn archived_channels_reject_writes_until_unarchived() {
             },
         ] {
             let err = module
-                .execute(&mut TestCtx::with_origin(13, user(2)), &module_msg(op))
+                .execute(&mut ctx_with_origin(13, user(2)), &module_msg(op))
                 .await
                 .unwrap_err();
             assert!(format!("{err:?}").contains("archived"));
@@ -2065,14 +2028,14 @@ fn archived_channels_reject_writes_until_unarchived() {
         // unarchiving restores posting; the sequence promise survives the pause.
         module
             .execute(
-                &mut TestCtx::with_origin(14, user(1)),
+                &mut ctx_with_origin(14, user(1)),
                 &module_msg(set_archived("general", false)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(15, user(2)),
+                &mut ctx_with_origin(15, user(2)),
                 &module_msg(post("general", "m2", "after unarchive", None)),
             )
             .await
@@ -2096,7 +2059,7 @@ fn ownerless_channels_admit_any_user_for_rename_and_archive() {
         let mut module = chat_on!(context, "chat");
         // a system-minted channel has no owner (owner == None).
         module
-            .execute(&mut TestCtx::at(10), &module_msg(create_channel("general")))
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -2116,14 +2079,14 @@ fn ownerless_channels_admit_any_user_for_rename_and_archive() {
         // existing SetMembership permissiveness).
         module
             .execute(
-                &mut TestCtx::with_origin(11, user(7)),
+                &mut ctx_with_origin(11, user(7)),
                 &module_msg(rename("general", "Renamed")),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(12, user(9)),
+                &mut ctx_with_origin(12, user(9)),
                 &module_msg(set_archived("general", true)),
             )
             .await
@@ -2152,7 +2115,7 @@ fn users_cannot_archive_module_namespaced_channels() {
         // alone would admit ANY user — the ':' namespace gate is what keeps them out.
         module
             .execute(
-                &mut TestCtx::with_origin(10, Origin::Module("forge".into())),
+                &mut ctx_with_origin(10, Origin::Module("forge".into())),
                 &module_msg(create_channel("forge:demo:1")),
             )
             .await
@@ -2163,7 +2126,7 @@ fn users_cannot_archive_module_namespaced_channels() {
         // every posting author, the owning module included — a cross-principal DoS.
         let err = module
             .execute(
-                &mut TestCtx::with_origin(11, user(1)),
+                &mut ctx_with_origin(11, user(1)),
                 &module_msg(set_archived("forge:demo:1", true)),
             )
             .await
@@ -2175,7 +2138,7 @@ fn users_cannot_archive_module_namespaced_channels() {
         // owning module can still post to it.
         module
             .execute(
-                &mut TestCtx::with_origin(12, Origin::Module("forge".into())),
+                &mut ctx_with_origin(12, Origin::Module("forge".into())),
                 &module_msg(post("forge:demo:1", "m1", "still open", None)),
             )
             .await
@@ -2196,7 +2159,7 @@ fn users_cannot_archive_module_namespaced_channels() {
         // the owning module still administers its own channel: archive...
         module
             .execute(
-                &mut TestCtx::with_origin(13, Origin::Module("forge".into())),
+                &mut ctx_with_origin(13, Origin::Module("forge".into())),
                 &module_msg(set_archived("forge:demo:1", true)),
             )
             .await
@@ -2217,14 +2180,14 @@ fn users_cannot_archive_module_namespaced_channels() {
         // ...and unarchive, which restores posting.
         module
             .execute(
-                &mut TestCtx::with_origin(14, Origin::Module("forge".into())),
+                &mut ctx_with_origin(14, Origin::Module("forge".into())),
                 &module_msg(set_archived("forge:demo:1", false)),
             )
             .await
             .unwrap();
         module
             .execute(
-                &mut TestCtx::with_origin(15, Origin::Module("forge".into())),
+                &mut ctx_with_origin(15, Origin::Module("forge".into())),
                 &module_msg(post("forge:demo:1", "m2", "after unarchive", None)),
             )
             .await

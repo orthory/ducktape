@@ -17,42 +17,20 @@
 use chat::Chat;
 use chat::{Block, ChatMsg, ChatQuery, PostPolicy, encode_msg, encode_query};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use sdk::{Ctx, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
+use sdk::{MerkleStore as _, Module, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 
-struct TestCtx {
-    env: sdk::Env,
-}
+use sdk_testkit::TestCtx;
 
-impl TestCtx {
-    fn at(consensus_time: u64) -> Self {
-        Self {
-            env: sdk::Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin: Origin::System,
-                me: "chat".into(),
-            },
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
-    }
-
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-
-    fn emit_msg(&mut self, _msg: Msg) {}
-    fn emit_event(&mut self, _ev: sdk::Event) {}
+// chat's sync tests read only env (consensus_time); me/height are cosmetic.
+fn ctx_at(consensus_time: u64) -> TestCtx {
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin: Origin::System,
+        me: "chat".into(),
+    })
 }
 
 fn module_msg(payload: ChatMsg) -> Msg {
@@ -64,7 +42,7 @@ fn module_msg(payload: ChatMsg) -> Msg {
 
 async fn apply_commit(module: &mut Chat, at: u64, payload: ChatMsg) {
     module
-        .execute(&mut TestCtx::at(at), &module_msg(payload))
+        .execute(&mut ctx_at(at), &module_msg(payload))
         .await
         .unwrap();
     module.commit_block().await.unwrap();

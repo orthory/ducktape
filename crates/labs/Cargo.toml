@@ -30,6 +30,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 host = { path = "../kernel/host" }
+sdk-testkit = { path = "../kernel/sdk-testkit" }
 # the tests drive the EVM module the way a host does: construct the concrete
 # QmdbStore on the deterministic runtime and inject it as `Box<dyn MerkleStore>`.
 statesync = { path = "../kernel/statesync" }
