@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use forge::Forge;
 use forge::{ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, decode_reply, encode_msg, encode_query};
-use sdk::{Ctx, Error, Module, Msg, StateRoot};
+use sdk::{Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref a materialized push moves.
 const MAIN_REF: &str = "refs/heads/main";
@@ -25,35 +25,17 @@ const OID_LEN: usize = 20;
 /// every op here targets the default repo, whose git dir is `base/default`.
 const DEFAULT_REPO: &str = "default";
 
-// a minimal Ctx so execute can read consensus_time without a full host.
-struct TestCtx {
-    env: sdk::Env,
-}
-impl TestCtx {
-    fn at(consensus_time: u64) -> Self {
-        Self {
-            env: sdk::Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin: sdk::Origin::System,
-                me: "forge".into(),
-            },
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: sdk::Event) {}
+use sdk_testkit::TestCtx;
+
+// forge's execute reads only env (consensus_time); me/height are cosmetic.
+fn at(consensus_time: u64) -> TestCtx {
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin: sdk::Origin::System,
+        me: "forge".into(),
+    })
 }
 
 fn tmp_repo(tag: &str) -> PathBuf {
@@ -117,7 +99,7 @@ fn commit_one(forge: &mut Forge, t: u64, path: &str, content: &str, message: &st
             message: message.into(),
         }),
     };
-    futures::executor::block_on(forge.execute(&mut TestCtx::at(t), &msg)).unwrap();
+    futures::executor::block_on(forge.execute(&mut at(t), &msg)).unwrap();
     futures::executor::block_on(forge.commit_block()).unwrap();
 }
 
@@ -183,7 +165,7 @@ fn push_msg(prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
 
 /// execute a Push and publish the block — the happy path.
 fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
-    futures::executor::block_on(forge.execute(&mut TestCtx::at(0), &push_msg(prev, new, digest)))
+    futures::executor::block_on(forge.execute(&mut at(0), &push_msg(prev, new, digest)))
         .unwrap();
     futures::executor::block_on(forge.commit_block()).unwrap();
 }
@@ -196,7 +178,7 @@ fn try_push(
     new: &[u8],
     digest: &[u8],
 ) -> Result<(), Error> {
-    futures::executor::block_on(forge.execute(&mut TestCtx::at(0), &push_msg(prev, new, digest)))
+    futures::executor::block_on(forge.execute(&mut at(0), &push_msg(prev, new, digest)))
 }
 
 /// every `(name, head)` pair `query(ListRepos)` reports.
@@ -525,7 +507,7 @@ fn list_repos_reports_the_integration_head() {
 
     // dev born at c1 (≠ main's c2): the integration branch owns the listing.
     futures::executor::block_on(dst.execute(
-        &mut TestCtx::at(3),
+        &mut at(3),
         &push_branch_msg("dev", None, &c1.head, &d1),
     ))
     .unwrap();

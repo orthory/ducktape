@@ -911,44 +911,21 @@ mod tests {
     use super::*;
     use crate::{decode_reply, encode_msg, encode_query};
 
-    // a minimal Ctx so execute can read consensus_time / origin and CAPTURE
-    // emitted follow-ups without a full host.
-    struct TestCtx {
-        env: sdk::Env,
-        emitted: Vec<Msg>,
+    use sdk_testkit::TestCtx;
+
+    // forge's execute reads only env (consensus_time / origin) and CAPTURES
+    // emitted follow-ups; the shared TestCtx captures them (read via `msgs()`).
+    fn ctx_at(consensus_time: u64) -> TestCtx {
+        ctx_with_origin(consensus_time, sdk::Origin::System)
     }
-    impl TestCtx {
-        fn at(consensus_time: u64) -> Self {
-            Self::with_origin(consensus_time, sdk::Origin::System)
-        }
-        fn with_origin(consensus_time: u64, origin: sdk::Origin) -> Self {
-            Self {
-                env: sdk::Env {
-                    protocol_version: 0,
-                    height: 0,
-                    consensus_time,
-                    origin,
-                    me: "forge".into(),
-                },
-                emitted: Vec::new(),
-            }
-        }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env {
-            &self.env
-        }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> {
-            None
-        }
-        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-            Err(Error::QueryUnsupported)
-        }
-        fn emit_msg(&mut self, m: Msg) {
-            self.emitted.push(m);
-        }
-        fn emit_event(&mut self, _e: sdk::Event) {}
+    fn ctx_with_origin(consensus_time: u64, origin: sdk::Origin) -> TestCtx {
+        TestCtx::with_env(sdk::Env {
+            protocol_version: 0,
+            height: 0,
+            consensus_time,
+            origin,
+            me: "forge".into(),
+        })
     }
 
     fn tmp_base(tag: &str) -> PathBuf {
@@ -985,7 +962,7 @@ mod tests {
 
     fn commit(forge: &mut Forge, t: u64, repo: &str, path: &str, content: &str, message: &str) {
         futures::executor::block_on(forge.execute(
-            &mut TestCtx::at(t),
+            &mut ctx_at(t),
             &commit_msg(repo, path, content, message),
         ))
         .unwrap();
@@ -1030,7 +1007,7 @@ mod tests {
         state.refs.insert("dev".into(), target);
         state.refs.insert("feature".into(), source);
 
-        let mut ctx = TestCtx::with_origin(3, user_origin(1));
+        let mut ctx = ctx_with_origin(3, user_origin(1));
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1464,7 +1441,7 @@ mod tests {
     fn pr_diff_rejects_an_issue_before_reading_git_objects() {
         let base = tmp_base("issue-diff");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let mut ctx = TestCtx::with_origin(1, user_origin(1));
+        let mut ctx = ctx_with_origin(1, user_origin(1));
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1569,7 +1546,7 @@ mod tests {
         let digest = vec![7u8; 32];
 
         // birth main + a feature branch in ONE atomic push.
-        let mut ctx = TestCtx::at(1);
+        let mut ctx = ctx_at(1);
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1608,7 +1585,7 @@ mod tests {
         );
 
         // stale CAS rejects; fresh CAS force-moves the feature branch.
-        let mut ctx = TestCtx::at(2);
+        let mut ctx = ctx_at(2);
         assert!(exec(
             &mut forge,
             &mut ctx,
@@ -1625,7 +1602,7 @@ mod tests {
         .is_err());
         futures::executor::block_on(forge.abort_block()).unwrap();
 
-        let mut ctx = TestCtx::at(3);
+        let mut ctx = ctx_at(3);
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1643,7 +1620,7 @@ mod tests {
 
         // deleting main is refused; deleting the feature branch works and is
         // pack-free.
-        let mut ctx = TestCtx::at(4);
+        let mut ctx = ctx_at(4);
         assert!(exec(
             &mut forge,
             &mut ctx,
@@ -1660,7 +1637,7 @@ mod tests {
         .is_err());
         futures::executor::block_on(forge.abort_block()).unwrap();
 
-        let mut ctx = TestCtx::at(5);
+        let mut ctx = ctx_at(5);
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1698,7 +1675,7 @@ mod tests {
 
         // seed a repo with release main, integration dev, and a feature branch
         // (fabricated oids — packs never gate consensus).
-        let mut ctx = TestCtx::at(1);
+        let mut ctx = ctx_at(1);
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1726,7 +1703,7 @@ mod tests {
         );
 
         // an issue: number 1, channel follow-up emitted.
-        let mut ctx = TestCtx::with_origin(2, user_origin(1));
+        let mut ctx = ctx_with_origin(2, user_origin(1));
         exec(
             &mut forge,
             &mut ctx,
@@ -1738,10 +1715,10 @@ mod tests {
         )
         .unwrap();
         futures::executor::block_on(forge.commit_block()).unwrap();
-        assert_eq!(ctx.emitted.len(), 1);
-        assert_eq!(ctx.emitted[0].target, "chat");
+        assert_eq!(ctx.msgs().len(), 1);
+        assert_eq!(ctx.msgs()[0].target, "chat");
         let chat::ChatMsg::CreateChannel { channel_id, name, .. } =
-            chat::decode_msg(&ctx.emitted[0].payload).unwrap()
+            chat::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("expected CreateChannel")
         };
@@ -1749,7 +1726,7 @@ mod tests {
         assert_eq!(name, "demo#1");
 
         // a PR from the born feature branch: shares the number space (#2).
-        let mut ctx = TestCtx::with_origin(3, user_origin(2));
+        let mut ctx = ctx_with_origin(3, user_origin(2));
         exec(
             &mut forge,
             &mut ctx,
@@ -1763,10 +1740,10 @@ mod tests {
         )
         .unwrap();
         futures::executor::block_on(forge.commit_block()).unwrap();
-        assert_eq!(ctx.emitted.len(), 1, "channel follow-up for the PR");
+        assert_eq!(ctx.msgs().len(), 1, "channel follow-up for the PR");
 
         // a PR from an unborn branch rejects.
-        let mut ctx = TestCtx::with_origin(4, user_origin(2));
+        let mut ctx = ctx_with_origin(4, user_origin(2));
         assert!(exec(
             &mut forge,
             &mut ctx,
@@ -1782,7 +1759,7 @@ mod tests {
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         // review with a line comment + approval system line.
-        let mut ctx = TestCtx::with_origin(5, user_origin(3));
+        let mut ctx = ctx_with_origin(5, user_origin(3));
         exec(
             &mut forge,
             &mut ctx,
@@ -1802,11 +1779,11 @@ mod tests {
         )
         .unwrap();
         futures::executor::block_on(forge.commit_block()).unwrap();
-        assert_eq!(ctx.emitted.len(), 1, "approval line emitted");
+        assert_eq!(ctx.msgs().len(), 1, "approval line emitted");
 
         // merge: stale target CAS rejects; the real one moves dev AND marks
         // the PR merged in one block.
-        let mut ctx = TestCtx::with_origin(6, user_origin(2));
+        let mut ctx = ctx_with_origin(6, user_origin(2));
         assert!(exec(
             &mut forge,
             &mut ctx,
@@ -1822,7 +1799,7 @@ mod tests {
         .is_err());
         futures::executor::block_on(forge.abort_block()).unwrap();
 
-        let mut ctx = TestCtx::with_origin(7, user_origin(2));
+        let mut ctx = ctx_with_origin(7, user_origin(2));
         exec(
             &mut forge,
             &mut ctx,
@@ -1837,7 +1814,7 @@ mod tests {
         )
         .unwrap();
         futures::executor::block_on(forge.commit_block()).unwrap();
-        assert_eq!(ctx.emitted.len(), 1, "merged line emitted");
+        assert_eq!(ctx.msgs().len(), 1, "merged line emitted");
 
         // committed state: release main stays put, dev advances, and the PR is
         // merged with its review recorded.
@@ -1871,7 +1848,7 @@ mod tests {
         assert_eq!(item.channel_id, "forge:demo:2");
 
         // a merged PR cannot merge/close again.
-        let mut ctx = TestCtx::with_origin(8, user_origin(2));
+        let mut ctx = ctx_with_origin(8, user_origin(2));
         assert!(exec(
             &mut forge,
             &mut ctx,
@@ -1908,7 +1885,7 @@ mod tests {
         let run = |tag: &str| {
             let base = tmp_base(tag);
             let mut forge = Forge::init("forge", base.clone()).unwrap().with_chat("chat");
-            let mut ctx = TestCtx::at(1);
+            let mut ctx = ctx_at(1);
             exec_commit(
                 &mut forge,
                 &mut ctx,
@@ -1922,7 +1899,7 @@ mod tests {
                     pack_digest: Some(vec![1u8; 32]),
                 },
             );
-            let mut ctx = TestCtx::with_origin(2, user_origin(9));
+            let mut ctx = ctx_with_origin(2, user_origin(9));
             exec(
                 &mut forge,
                 &mut ctx,
@@ -1977,7 +1954,7 @@ mod tests {
         // the SAME oid — its objects exist, so the snapshot pack closes.
         commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
         let head = git_head_oid(&base, "demo");
-        let mut ctx = TestCtx::at(2);
+        let mut ctx = ctx_at(2);
         exec_commit(
             &mut forge,
             &mut ctx,
@@ -1991,7 +1968,7 @@ mod tests {
                 pack_digest: Some(vec![3u8; 32]),
             },
         );
-        let mut ctx = TestCtx::with_origin(3, user_origin(4));
+        let mut ctx = ctx_with_origin(3, user_origin(4));
         exec(
             &mut forge,
             &mut ctx,

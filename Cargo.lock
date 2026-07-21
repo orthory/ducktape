@@ -2551,6 +2551,7 @@ dependencies = [
  "git2",
  "host",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",

@@ -20,40 +20,22 @@ use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, RefUpdate, RepoHead, decode_reply, encode_msg, encode_query,
 };
 use futures::executor::block_on;
-use sdk::{Ctx, Error, Module, Msg, StateRoot};
+use sdk::{Error, Module, Msg, StateRoot};
 
 const MAIN_REF: &str = "refs/heads/main";
 const OID_LEN: usize = 20;
 
-// a minimal Ctx so execute can read consensus_time without a full host.
-struct TestCtx {
-    env: sdk::Env,
-}
-impl TestCtx {
-    fn at(consensus_time: u64) -> Self {
-        Self {
-            env: sdk::Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin: sdk::Origin::System,
-                me: "forge".into(),
-            },
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: sdk::Event) {}
+use sdk_testkit::TestCtx;
+
+// forge's execute reads only env (consensus_time); me/height are cosmetic.
+fn at(consensus_time: u64) -> TestCtx {
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin: sdk::Origin::System,
+        me: "forge".into(),
+    })
 }
 
 fn tmp_base(tag: &str) -> PathBuf {
@@ -133,7 +115,7 @@ fn push_msg(repo: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
 /// commit one file to a named repo (execute + publish).
 fn commit_named(forge: &mut Forge, t: u64, repo: &str, path: &str, content: &str, message: &str) {
     block_on(forge.execute(
-        &mut TestCtx::at(t),
+        &mut at(t),
         &commit_msg(repo, path, content, message),
     ))
     .unwrap();
@@ -142,7 +124,7 @@ fn commit_named(forge: &mut Forge, t: u64, repo: &str, path: &str, content: &str
 
 /// push a captured head to a named repo (execute + publish).
 fn push(forge: &mut Forge, repo: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
-    block_on(forge.execute(&mut TestCtx::at(0), &push_msg(repo, prev, new, digest))).unwrap();
+    block_on(forge.execute(&mut at(0), &push_msg(repo, prev, new, digest))).unwrap();
     block_on(forge.commit_block()).unwrap();
 }
 
@@ -154,7 +136,7 @@ fn try_push(
     new: &[u8],
     digest: &[u8],
 ) -> Result<(), Error> {
-    block_on(forge.execute(&mut TestCtx::at(0), &push_msg(repo, prev, new, digest)))
+    block_on(forge.execute(&mut at(0), &push_msg(repo, prev, new, digest)))
 }
 
 fn head_query(forge: &Forge) -> Option<String> {
@@ -298,7 +280,7 @@ fn empty_repo_targets_default_and_is_addressable() {
         target: "forge".into(),
         payload: wire.to_vec(),
     };
-    block_on(f.execute(&mut TestCtx::at(5), &msg)).unwrap();
+    block_on(f.execute(&mut at(5), &msg)).unwrap();
     block_on(f.commit_block()).unwrap();
 
     // the unit Head query answers the default repo.
@@ -337,7 +319,7 @@ fn head_of_reads_named_repos_and_bad_slugs_are_rejected() {
     // a bad slug in a write is rejected DETERMINISTICALLY at execute.
     for bad in ["BAD", "a/b", "..", "with space"] {
         let err =
-            block_on(f.execute(&mut TestCtx::at(2), &commit_msg(bad, "x", "y", "z"))).unwrap_err();
+            block_on(f.execute(&mut at(2), &commit_msg(bad, "x", "y", "z"))).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{bad:?} must reject");
     }
     // a bad slug in a HeadOf query also errs (never a silent None).
