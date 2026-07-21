@@ -24,40 +24,9 @@ use pages::{
     Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, ThreadView, decode_reply,
     encode_msg, encode_query,
 };
-use sdk::{Ctx, Error, MerkleStore as _, Module, Msg, StateRoot};
+use sdk::{MerkleStore as _, Module, Msg, StateRoot};
+use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
-
-// a minimal Ctx so execute can be driven without a full host.
-struct TestCtx {
-    env: sdk::Env,
-}
-impl TestCtx {
-    fn new() -> Self {
-        Self {
-            env: sdk::Env {
-                protocol_version: 0,
-                height: 0,
-                consensus_time: 0,
-                origin: sdk::Origin::System,
-                me: "pages".into(),
-            },
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: sdk::Event) {}
-}
 
 fn para(id: &str, text: &str) -> NewBlock {
     NewBlock {
@@ -75,7 +44,7 @@ async fn apply_commit(p: &mut Pages, m: &PageMsg) {
         target: "pages".into(),
         payload: encode_msg(m),
     };
-    p.execute(&mut TestCtx::new(), &msg).await.unwrap();
+    p.execute(&mut TestCtx::at_height(0), &msg).await.unwrap();
     p.commit_block().await.unwrap();
 }
 

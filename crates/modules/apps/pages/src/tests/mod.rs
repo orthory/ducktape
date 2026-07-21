@@ -33,52 +33,18 @@ fn msg(m: &PageMsg) -> Msg {
     }
 }
 
-// a minimal Ctx so execute can be driven without a full host.
-struct TestCtx {
-    env: sdk::Env,
-    msgs: Vec<Msg>,
-}
-impl TestCtx {
-    fn new() -> Self {
-        Self {
-            env: sdk::Env {
-                protocol_version: 0,
-                height: 0,
-                consensus_time: 0,
-                origin: sdk::Origin::System,
-                me: "pages".into(),
-            },
-            msgs: Vec::new(),
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, m: Msg) {
-        self.msgs.push(m);
-    }
-    fn emit_event(&mut self, _e: sdk::Event) {}
-}
+use sdk_testkit::TestCtx;
 
 // drive one op through execute + commit_block (one op per block-height).
 async fn apply_commit(p: &mut Pages, m: &PageMsg) {
-    p.execute(&mut TestCtx::new(), &msg(m)).await.unwrap();
+    p.execute(&mut TestCtx::at_height(0), &msg(m)).await.unwrap();
     p.commit_block().await.unwrap();
 }
 
 // an op that must FAIL, followed by the host's abort.
 async fn apply_expect_err(p: &mut Pages, m: &PageMsg, needle: &str) {
     let err = p
-        .execute(&mut TestCtx::new(), &msg(m))
+        .execute(&mut TestCtx::at_height(0), &msg(m))
         .await
         .expect_err("op must be rejected");
     assert!(
@@ -132,16 +98,13 @@ fn user(name: &str) -> sdk::Origin {
     sdk::Origin::External(name.as_bytes().to_vec())
 }
 fn ctx_as(origin: sdk::Origin) -> TestCtx {
-    TestCtx {
-        env: sdk::Env {
-            protocol_version: 0,
-            height: 0,
-            consensus_time: 7,
-            origin,
-            me: "pages".into(),
-        },
-        msgs: Vec::new(),
-    }
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time: 7,
+        origin,
+        me: "pages".into(),
+    })
 }
 async fn apply_commit_as(p: &mut Pages, m: &PageMsg, origin: sdk::Origin) {
     p.execute(&mut ctx_as(origin), &msg(m)).await.unwrap();

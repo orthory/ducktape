@@ -4392,6 +4392,7 @@ dependencies = [
  "host",
  "indexer",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
