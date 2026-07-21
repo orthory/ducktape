@@ -387,40 +387,22 @@ mod tests {
     use commonware_cryptography::Signer as _;
     use commonware_cryptography::ed25519::PrivateKey;
 
-    // a minimal Ctx — valset's execute reads only env (origin + protocol_version).
-    struct TestCtx {
-        env: sdk::Env,
+    use sdk_testkit::TestCtx;
+
+    // valset's execute reads only env (origin + protocol_version); me/height are
+    // cosmetic, so the shared TestCtx's defaults stand in.
+    fn sys_ctx() -> TestCtx {
+        TestCtx::at_height(0)
     }
-    impl TestCtx {
-        fn new() -> Self {
-            Self::at_version(0)
-        }
-        /// a ctx whose block runs at `protocol_version`.
-        fn at_version(protocol_version: u32) -> Self {
-            Self {
-                env: sdk::Env {
-                    protocol_version,
-                    height: 0,
-                    consensus_time: 0,
-                    origin: sdk::Origin::System,
-                    me: "valset".into(),
-                },
-            }
-        }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env {
-            &self.env
-        }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> {
-            None
-        }
-        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-            Err(Error::QueryUnsupported)
-        }
-        fn emit_msg(&mut self, _m: Msg) {}
-        fn emit_event(&mut self, _e: sdk::Event) {}
+    /// a ctx whose block runs at `protocol_version`.
+    fn ctx_at_version(protocol_version: u32) -> TestCtx {
+        TestCtx::with_env(sdk::Env {
+            protocol_version,
+            height: 0,
+            consensus_time: 0,
+            origin: sdk::Origin::System,
+            me: "valset".into(),
+        })
     }
 
     // a deterministic, VALID 32-byte ed25519 public key: any 32 bytes is a valid
@@ -475,7 +457,7 @@ mod tests {
     #[test]
     fn join_adds_a_validator_and_moves_root_off_zero() {
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         assert_eq!(v.root(), StateRoot::ZERO, "genesis set is empty -> ZERO");
 
         let k = valid_key(1);
@@ -503,7 +485,7 @@ mod tests {
         // last-validator guard never fires. (removing the last validator is a
         // refused no-op; see `leaving_the_last_validator_is_refused`.)
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         let (keep, drop) = (valid_key(2), valid_key(3));
         futures::executor::block_on(v.execute(&mut ctx, &join(&keep))).unwrap();
         futures::executor::block_on(v.execute(&mut ctx, &join(&drop))).unwrap();
@@ -523,7 +505,7 @@ mod tests {
         // validators hits commonware `quorum(0)`, which panics. removing the
         // SOLE validator is refused deterministically, and the set is untouched.
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         let solo = valid_key(7);
         futures::executor::block_on(v.execute(&mut ctx, &join(&solo))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
@@ -547,7 +529,7 @@ mod tests {
         // would empty the set within the same block's read-your-writes view and
         // is refused — the guard reads the EFFECTIVE (staged-over-committed) set.
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         let (a, b) = (valid_key(4), valid_key(5));
         futures::executor::block_on(v.execute(&mut ctx, &join(&a))).unwrap();
         futures::executor::block_on(v.execute(&mut ctx, &join(&b))).unwrap();
@@ -564,7 +546,7 @@ mod tests {
     #[test]
     fn malformed_key_is_rejected() {
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         // wrong length is the deterministic malformed input: ~half of all 32-byte
         // strings are valid curve points (ZIP215 accepts non-canonical), so a
         // wrong-LENGTH key is the reliable reject path.
@@ -582,7 +564,7 @@ mod tests {
     #[test]
     fn permissionless_any_valid_key_joins() {
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         // no authorization, no gating: three unrelated valid keys all join.
         for b in [10u8, 20, 30] {
             futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
@@ -601,14 +583,14 @@ mod tests {
         let b = valid_key(4);
 
         let mut v1 = Valset::new("valset");
-        let mut c1 = TestCtx::new();
+        let mut c1 = sys_ctx();
         futures::executor::block_on(v1.execute(&mut c1, &join(&a))).unwrap();
         futures::executor::block_on(v1.execute(&mut c1, &join(&b))).unwrap();
         futures::executor::block_on(v1.commit_block()).unwrap();
 
         // same two validators, joined in the OPPOSITE order.
         let mut v2 = Valset::new("valset");
-        let mut c2 = TestCtx::new();
+        let mut c2 = sys_ctx();
         futures::executor::block_on(v2.execute(&mut c2, &join(&b))).unwrap();
         futures::executor::block_on(v2.execute(&mut c2, &join(&a))).unwrap();
         futures::executor::block_on(v2.commit_block()).unwrap();
@@ -622,7 +604,7 @@ mod tests {
         // fails -> abort_block drops the stage. no validator is added, root is
         // byte-identical to its pre-block value.
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         let before = v.root();
 
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(5)))).unwrap();
@@ -642,7 +624,7 @@ mod tests {
         // SOURCE: three validators through the real execute(Join)+commit_block
         // path, so the snapshot ships state that consensus actually committed.
         let mut src = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         for b in [1u8, 2, 3] {
             futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
         }
@@ -659,7 +641,7 @@ mod tests {
         // TARGET: a fresh set with an unrelated join STAGED — install must drop
         // it, or the stale stage would leak into the post-install view.
         let mut dst = Valset::new("valset");
-        let mut dctx = TestCtx::new();
+        let mut dctx = sys_ctx();
         futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
 
         dst.install(&bytes, src_root).unwrap();
@@ -678,7 +660,7 @@ mod tests {
     #[test]
     fn tampered_snapshot_is_rejected_and_the_target_is_untouched() {
         let mut src = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         for b in [4u8, 5] {
             futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
         }
@@ -696,7 +678,7 @@ mod tests {
         // failed install must leave every layer untouched, not merely "still
         // empty" — a cleared-on-err bug is invisible against an empty target.
         let mut dst = Valset::new("valset");
-        let mut dctx = TestCtx::new();
+        let mut dctx = sys_ctx();
         futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(8)))).unwrap();
         futures::executor::block_on(dst.commit_block()).unwrap();
         futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
@@ -723,7 +705,7 @@ mod tests {
     #[test]
     fn truncated_or_trailing_bytes_are_rejected_and_leave_state_intact() {
         let mut src = Valset::new("valset");
-        let mut ctx = TestCtx::new();
+        let mut ctx = sys_ctx();
         for b in [6u8, 7] {
             futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(b)))).unwrap();
         }
@@ -735,7 +717,7 @@ mod tests {
         // failed install must leave both exactly as they were, a stronger claim
         // than "empty stays empty".
         let mut dst = Valset::new("valset");
-        let mut dctx = TestCtx::new();
+        let mut dctx = sys_ctx();
         futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(8)))).unwrap();
         futures::executor::block_on(dst.commit_block()).unwrap();
         futures::executor::block_on(dst.execute(&mut dctx, &join(&valid_key(9)))).unwrap();
@@ -788,7 +770,7 @@ mod tests {
         // founded (v0) network with no upgrade. before this change these ops
         // rejected below protocol version 3.
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::new(); // protocol_version 0
+        let mut ctx = sys_ctx(); // protocol_version 0
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
 
@@ -817,7 +799,7 @@ mod tests {
         // the last resident returns it BYTE-IDENTICAL to the validators-only
         // root and snapshot.
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::at_version(3);
+        let mut ctx = ctx_at_version(3);
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
         let validators_only = v.root();
@@ -851,7 +833,7 @@ mod tests {
     #[test]
     fn join_promotes_a_resident_out_of_the_tier() {
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::at_version(3);
+        let mut ctx = ctx_at_version(3);
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         let obs = valid_key(2);
         futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
@@ -869,7 +851,7 @@ mod tests {
     #[test]
     fn granting_a_current_validator_is_refused() {
         let mut v = Valset::new("valset");
-        let mut ctx = TestCtx::at_version(3);
+        let mut ctx = ctx_at_version(3);
         let k = valid_key(1);
         futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
@@ -885,7 +867,7 @@ mod tests {
     #[test]
     fn snapshot_with_residents_round_trips_and_rejects_forgeries() {
         let mut src = Valset::new("valset");
-        let mut ctx = TestCtx::at_version(3);
+        let mut ctx = ctx_at_version(3);
         futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(src.execute(&mut ctx, &grant(&valid_key(2)))).unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
@@ -905,7 +887,7 @@ mod tests {
         // bytes past the resident section are trailing garbage — reject them
         // (single-encoding invariant).
         let mut two_encodings = Valset::new("valset");
-        let mut c2 = TestCtx::new();
+        let mut c2 = sys_ctx();
         futures::executor::block_on(two_encodings.execute(&mut c2, &join(&valid_key(3)))).unwrap();
         futures::executor::block_on(two_encodings.commit_block()).unwrap();
         let mut padded = two_encodings.snapshot();
