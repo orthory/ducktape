@@ -6,6 +6,11 @@ version.workspace = true
 # the daemon's node-local op-receipt blob store: op payloads staged at submit
 # time and served back over the http blob route. shared by noded, the files
 # module, and forge — never consensus state, never in any root.
+[features]
+# exposes the in-memory `MemBlobs` sim arm to non-test consumers (data-plane
+# `sim`-feature precedent). always on under `cfg(test)`.
+sim = []
+
 [dependencies]
 sha2 = { workspace = true }
 

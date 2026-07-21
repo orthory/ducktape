@@ -50,7 +50,7 @@ struct ResidentFanout {
 }
 
 pub(crate) struct ResidentRelay {
-    blobs: blobstore::BlobHandle,
+    blobs: std::sync::Arc<dyn blobstore::Blobs>,
     seq_file: PathBuf,
     seq: u64,
     round: usize,
@@ -59,7 +59,7 @@ pub(crate) struct ResidentRelay {
 }
 
 impl ResidentRelay {
-    pub(crate) fn new(seq_file: PathBuf, blobs: blobstore::BlobHandle) -> Self {
+    pub(crate) fn new(seq_file: PathBuf, blobs: std::sync::Arc<dyn blobstore::Blobs>) -> Self {
         let seq = std::fs::read_to_string(&seq_file)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -364,13 +364,13 @@ pub(crate) enum ValidatorAction {
 }
 
 pub(crate) struct ValidatorRelay {
-    blobs: blobstore::BlobHandle,
+    blobs: std::sync::Arc<dyn blobstore::Blobs>,
     local_fanouts: HashMap<node::FrameId, LocalFanout>,
     incoming: HashMap<node::FrameId, IncomingBlob>,
 }
 
 impl ValidatorRelay {
-    pub(crate) fn new(blobs: blobstore::BlobHandle) -> Self {
+    pub(crate) fn new(blobs: std::sync::Arc<dyn blobstore::Blobs>) -> Self {
         Self {
             blobs,
             local_fanouts: HashMap::new(),
@@ -759,7 +759,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay-submit-seq");
         std::fs::write(&path, "41").unwrap();
-        let relay = ResidentRelay::new(path.clone(), blobstore::BlobHandle::default());
+        let relay =
+            ResidentRelay::new(path.clone(), std::sync::Arc::new(blobstore::BlobHandle::default()));
         assert_eq!(relay.seq, 41);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "41");
     }

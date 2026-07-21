@@ -18,7 +18,7 @@ use crate::util::hex;
 /// in-memory, so the live drain's staging dies with the process and this is
 /// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
 pub(crate) fn explorer_root_op(
-    blobs: &blobstore::BlobHandle,
+    blobs: &dyn blobstore::Blobs,
     origin: &sdk::Origin,
     target: &str,
     payload: &[u8],
@@ -48,7 +48,7 @@ pub(crate) fn explorer_root_op(
 /// heartbeat nop is the deliberately-empty block the explorer hides, and a
 /// discarded frame is never journaled (the arm keeps this total anyway).
 pub(crate) fn sealed_frame_block_row(
-    blobs: &blobstore::BlobHandle,
+    blobs: &dyn blobstore::Blobs,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
     // the sealed frame is a BATCH: decode its members (either codec, exactly
@@ -133,12 +133,15 @@ pub(crate) fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
 /// `GET /v1/blocks` loses those heights for good.
 pub(crate) struct IndexFold<'a> {
     index: &'a indexer::IndexStore,
-    blobs: blobstore::BlobHandle,
+    blobs: std::sync::Arc<dyn blobstore::Blobs>,
     stopped: bool,
 }
 
 impl<'a> IndexFold<'a> {
-    pub(crate) fn new(index: &'a indexer::IndexStore, blobs: blobstore::BlobHandle) -> Self {
+    pub(crate) fn new(
+        index: &'a indexer::IndexStore,
+        blobs: std::sync::Arc<dyn blobstore::Blobs>,
+    ) -> Self {
         Self {
             index,
             blobs,
@@ -168,7 +171,7 @@ impl recovery::ReplaySink for IndexFold<'_> {
         }
         let height = block.height;
         let ops = indexer::BlockOps {
-            record: sealed_frame_block_row(&self.blobs, block),
+            record: sealed_frame_block_row(&*self.blobs, block),
             // the validator's consensus time IS the height (see BlockContext).
             ..noded::index_block_ops(height, height, block.dispatches)
         };
