@@ -187,11 +187,14 @@ const DISPATCH_MODULE_ID: &str = "dispatch";
 /// by `wasm_runs_parity`). its ten collaborator ids — chat, saga, tagging,
 /// dispatch, agent, tasks, plus the files/forge/pages builder chain —
 /// are genesis-constant and compiled into the guest (the exact production
-/// constructor these builders used to call natively). its remaining dispatch
-/// read — `turn_taken`'s committed existence check (the lease-holder read moved
-/// onto saga directly) — is served COMMITTED-ONLY by dispatch's own guest query
-/// lane (`with_committed_queries`), so the host-routed query reads exactly the
-/// committed record, never a same-block staged write. the
+/// constructor these builders used to call natively). its two dispatch reads —
+/// `turn_taken`'s existence check and `lease_holder`'s `AwaitingResult { saga_id }`
+/// lookup — both read COMMITTED-ONLY dispatch fields, served faithfully by
+/// dispatch's own guest query lane (`with_committed_queries`), so the host-routed
+/// query reads exactly the committed record, never a same-block staged write.
+/// only the ASSIGNEE source moved off dispatch: `lease_holder` still reads the
+/// saga id FROM the dispatch view, then reads the live lease from saga directly
+/// (dispatch's retired `query_with` no longer relays it). the
 /// delivered-runs ring (`RecentRuns`) — derived per-node state outside the
 /// NATIVE root/snapshot — persists through the guest's own `__history` key
 /// (the app's runs client and the dogfood receipt lane read it), so it rides
