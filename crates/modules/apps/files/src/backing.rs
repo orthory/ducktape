@@ -38,6 +38,10 @@ use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::objects::object_id;
 use duckfs_core::state::Refs;
 use duckfs_core::store::ObjectStore as _;
+// integration merge #715×#723: #715 moved DiskRefs::load/save into the RefsStore
+// trait, so the trait must be in scope for the inherent-looking `refs_store.load()`
+// below to resolve — mirrors the `ObjectStore as _` import already here.
+use duckfs_core::store::RefsStore as _;
 use duckfs_core::{
     Kind, ObjectId, decode_query, decode_refs, decode_sync_req, encode_reply, encode_sync_resp,
 };

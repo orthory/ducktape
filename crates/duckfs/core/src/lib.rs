@@ -27,4 +27,4 @@ pub use state::{
     PinEntry, Refs, Staged, decode_block_objects, decode_refs, encode_block_objects, encode_refs,
     root_bytes,
 };
-pub use store::{MemStore, ObjectStore};
+pub use store::{MemRefs, MemStore, ObjectStore, RefsStore};
