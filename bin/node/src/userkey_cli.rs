@@ -74,6 +74,82 @@ fn read_stdin_line(stdin: &mut impl std::io::BufRead, field: &str) -> Result<Str
     Ok(line)
 }
 
+/// True when this process's stdin is an interactive terminal. Only then do we
+/// prompt / mask — a pipe stays byte-for-byte the old plain-stdin contract.
+fn stdin_is_tty() -> bool {
+    // SAFETY: isatty only queries a descriptor's mode; no memory is touched.
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+/// A field name that implies key material — echo is masked when it's typed at a
+/// terminal. `payload-hex` is NOT a secret (it's a public op body) and is not
+/// masked.
+fn field_is_secret(field: &str) -> bool {
+    field.contains("password") || field.contains("mnemonic")
+}
+
+/// RAII guard that disables terminal echo on stdin and restores it on Drop —
+/// including panic unwind and early-return error paths. `engage` returns `None`
+/// when stdin has no termios (restore is then a no-op), so the caller reads
+/// unmasked rather than failing.
+struct EchoOff {
+    saved: libc::termios,
+}
+
+impl EchoOff {
+    fn engage() -> Option<Self> {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY: termios is a plain C struct of integers/arrays; tcgetattr
+        // fills the zeroed value before we read it.
+        let mut term: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut term) } != 0 {
+            return None;
+        }
+        let saved = term;
+        term.c_lflag &= !libc::ECHO;
+        // SAFETY: term is a valid termios we just read back and edited.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+            return None;
+        }
+        Some(Self { saved })
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: `saved` is the termios we captured; best-effort restore.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) };
+    }
+}
+
+/// Run `read` to consume one stdin field. When `is_tty`, first prompt
+/// `<field>: ` to stderr and — for secret fields — mask echo for the read
+/// (restoring on the way out and emitting the newline the mask swallowed).
+/// When not a tty this is exactly `read()`: no prompt, no termios, so piped
+/// stdin is unchanged. `is_tty` is a parameter so the non-tty path is unit
+/// testable without a controlling terminal.
+fn with_prompt<T>(field: &str, is_tty: bool, read: impl FnOnce() -> T) -> T {
+    if !is_tty {
+        return read();
+    }
+    eprint!("{field}: ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let secret = field_is_secret(field);
+    let _echo_off = if secret { EchoOff::engage() } else { None };
+    let out = read();
+    if secret {
+        // masked echo swallowed the user's Enter — supply the missing newline.
+        eprintln!();
+    }
+    out
+}
+
+/// [`read_stdin_line`] fronted by the tty prompt/mask wrapper — the entry point
+/// every secret-bearing verb reads its fields through.
+fn prompt_stdin_line(stdin: &mut impl std::io::BufRead, field: &str) -> Result<String, String> {
+    with_prompt(field, stdin_is_tty(), || read_stdin_line(stdin, field))
+}
+
 /// the design spec's floor for NEW passwords (`init`/`restore`/`encrypt`),
 /// enforced before any file is touched. counts scalar chars, not bytes, so a
 /// multi-byte-but-short password isn't laundered past the floor.
@@ -112,7 +188,7 @@ fn load_user_signer(
     if let Ok(text) = std::fs::read_to_string(key_path)
         && text.trim().starts_with(userkey::USER_KEY_V2_PREFIX)
     {
-        let password = read_stdin_line(stdin, "password")?;
+        let password = prompt_stdin_line(stdin, "password")?;
         return Ok(userkey::open_user_key(text.trim(), &password)?);
     }
     let (user, generated) = config::load_or_generate_identity(key_path)?;
@@ -133,7 +209,7 @@ fn user_key_init(
         return Err(format!("unexpected args: {pos:?}").into());
     }
     let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
-    let password = read_stdin_line(stdin, "password")?;
+    let password = prompt_stdin_line(stdin, "password")?;
     check_password_len(&password)?;
 
     let mut seed = [0u8; 32];
@@ -170,8 +246,8 @@ fn user_key_restore(
         return Err(format!("unexpected args: {pos:?}").into());
     }
     let out = PathBuf::from(flags.get("out").map(String::as_str).unwrap_or("user.key"));
-    let mnemonic = read_stdin_line(stdin, "mnemonic")?;
-    let password = read_stdin_line(stdin, "password")?;
+    let mnemonic = prompt_stdin_line(stdin, "mnemonic")?;
+    let password = prompt_stdin_line(stdin, "password")?;
     check_password_len(&password)?;
 
     let seed = userkey::seed_of_mnemonic(&mnemonic)?;
@@ -208,7 +284,7 @@ fn user_key_unlock(
             .get("key")
             .ok_or("user-key unlock needs --key <path>")?,
     );
-    let password = read_stdin_line(stdin, "password")?;
+    let password = prompt_stdin_line(stdin, "password")?;
 
     let key = match userkey::read_user_key_file(&key_path)? {
         userkey::UserKeyFile::Plaintext(key) => key,
@@ -248,12 +324,17 @@ fn user_key_reveal(
 
     // legacy plaintext tolerates an absent/empty password line; only an
     // encrypted file actually needs one. read leniently (empty on EOF) so a
-    // caller revealing a legacy key doesn't have to pipe an unused line.
-    let mut password = String::new();
-    let _ = stdin.read_line(&mut password);
-    while password.ends_with('\n') || password.ends_with('\r') {
-        password.pop();
-    }
+    // caller revealing a legacy key doesn't have to pipe an unused line — hence
+    // the raw read here rather than the EOF-erroring `read_stdin_line`, still
+    // fronted by the tty prompt/mask wrapper.
+    let password = with_prompt("password", stdin_is_tty(), || {
+        let mut password = String::new();
+        let _ = stdin.read_line(&mut password);
+        while password.ends_with('\n') || password.ends_with('\r') {
+            password.pop();
+        }
+        password
+    });
 
     let key = match userkey::read_user_key_file(&key_path)? {
         userkey::UserKeyFile::Plaintext(key) => key,
@@ -296,7 +377,7 @@ fn user_key_encrypt(
             .get("key")
             .ok_or("user-key encrypt needs --key <path>")?,
     );
-    let password = read_stdin_line(stdin, "password")?;
+    let password = prompt_stdin_line(stdin, "password")?;
     check_password_len(&password)?;
 
     let key = match userkey::read_user_key_file(&key_path)? {
@@ -595,7 +676,7 @@ fn user_sign_frame(
     // line. the payload is not a secret; it rides stdin because a 1 MiB chunk
     // frame would blow past OS argv limits.
     let user = load_user_signer(&key_path, stdin)?;
-    let payload_hex = read_stdin_line(stdin, "payload-hex")?;
+    let payload_hex = prompt_stdin_line(stdin, "payload-hex")?;
     let payload = config::unhex(&payload_hex).map_err(|e| format!("payload hex: {e}"))?;
 
     let frame = node::encode_frame(&user, seq, &sdk::Msg { target, payload });
@@ -1811,6 +1892,28 @@ mod userkey_verb_tests {
                 &mut stdin,
             )
             .is_err()
+        );
+    }
+
+    /// The tty wrapper's non-tty path must be a transparent pass-through: no
+    /// prompt, no termios, and it forwards the inner read's value AND its EOF
+    /// error verbatim — the piped-stdin contract the sign/key verbs rely on.
+    /// (The tty path toggles the real terminal and is untestable headless.)
+    #[test]
+    fn with_prompt_non_tty_is_a_bare_read() {
+        let mut piped = stdin_of(&["hunter2duck"]);
+        let got =
+            with_prompt("password", false, || read_stdin_line(&mut piped, "password")).unwrap();
+        assert_eq!(got, "hunter2duck");
+
+        // a secret field name doesn't change the non-tty behavior either.
+        assert!(field_is_secret("password") && field_is_secret("mnemonic"));
+        assert!(!field_is_secret("payload-hex"));
+
+        // EOF still errors, exactly as a bare read_stdin_line would.
+        let mut empty = empty_stdin();
+        assert!(
+            with_prompt("password", false, || read_stdin_line(&mut empty, "password")).is_err()
         );
     }
 }
