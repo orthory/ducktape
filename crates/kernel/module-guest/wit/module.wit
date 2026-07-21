@@ -46,6 +46,40 @@ interface host {
   /// live, read-only, host-routed read of a sibling module.
   query-module: func(target: string, req: list<u8>) -> result<list<u8>, error>;
 
+  // ---- object plane -------------------------------------------------------
+  // a content-addressed object store the host owns beside this module's own
+  // state (duckfs's odb behind the host boundary — NOT a shared byte plane;
+  // duckfs-private in intent even though the surface is world-level). the
+  // determinism envelope is BY OMISSION, exactly like the rest of this world:
+  //   * READS (`object-stat` / `object-get`) resolve ONLY refs-reachable
+  //     structural objects — consensus-uniform bytes every honest validator
+  //     possesses — plus this block's own staged puts. an id no validator can
+  //     reach answers `none` identically everywhere (never a per-node fork).
+  //   * WRITES (`object-put`) are STAGED effects: visible to same-block
+  //     stat/get immediately, published (or discarded) at the real block
+  //     boundary with duckfs's durability ordering (objects → sync → refs).
+  // an id is `sha256(kind-tag ‖ body)`, so a put's answer is a pure function of
+  // its inputs — the same on every validator, which is what lets a staged put
+  // feed the same-dispatch read overlay without a consensus round.
+
+  /// metadata-only read: `(kind-tag, body-byte-length)` of a refs-reachable
+  /// object (or this block's staged put), or `none` if absent. answered from
+  /// metadata alone — NEVER a full body read on the consensus path (the duckfs
+  /// stat contract). a memo miss pauses the run for the host to resolve.
+  object-stat: func(id: list<u8>) -> option<tuple<u8, u64>>;
+  /// full read: the TAGGED body `kind-tag ‖ body` of a refs-reachable object
+  /// (or this block's staged put), or `none` if absent. a memo miss pauses the
+  /// run for the host to resolve against the committed object store.
+  object-get: func(id: list<u8>) -> option<list<u8>>;
+  /// stage a put and return its 32-byte id. the host computes
+  /// `id = sha256(kind-tag ‖ body)` and returns the id ALONE — a hash mismatch
+  /// is impossible when the host computes it, so this cannot fail here; the
+  /// fail-closed verification belongs where a STAGED put is later PUBLISHED
+  /// against an id (the disk backing's block-boundary publish). the staged put
+  /// is visible to same-block `object-stat` / `object-get` and is discarded if
+  /// the block aborts.
+  object-put: func(kind: u8, body: list<u8>) -> list<u8>;
+
   /// emit a write intent — re-dispatched as a follow-up op, never reentrant.
   emit-msg: func(target: string, payload: list<u8>);
   /// emit an observability event — leaves the state machine.

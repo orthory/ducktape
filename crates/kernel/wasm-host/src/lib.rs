@@ -56,6 +56,12 @@ mod bindings {
             "ducktape:module/host.state-get": trappable,
             "ducktape:module/host.module-root": trappable,
             "ducktape:module/host.query-module": trappable,
+            // object reads pause on a memo miss exactly like the sibling reads:
+            // the driver resolves them against the odb backing and replays.
+            // `object-put` is NOT trappable — the host computes the id purely
+            // and returns it, so it can never fail.
+            "ducktape:module/host.object-stat": trappable,
+            "ducktape:module/host.object-get": trappable,
         },
     });
 }
@@ -83,6 +89,36 @@ pub const MAX_SIBLING_READS: usize = 64;
 /// bound is store-mode-only.
 pub const MAX_STORE_READS: usize = 4096;
 
+/// per-dispatch bound on DISTINCT object-plane reads (`object-stat` +
+/// `object-get` misses of the same-dispatch put overlay). mirrors
+/// [`MAX_STORE_READS`]: a content-addressed op walks many objects (a file's
+/// chunks, a tree's entries), so object reads carry the same larger budget as
+/// own-state reads. a protocol constant — an op that needs more is rejected
+/// identically on every validator. only tenants that call the object imports
+/// (the files guest) ever accrue against it; every other tenant leaves it at 0.
+pub const MAX_OBJECT_READS: usize = 4096;
+
+/// the host-side content-addressed object store a wasm files tenant reads from
+/// and stages puts against. Task 1 ships only the trait + the plumbing that
+/// routes the object imports here; NO backing is wired (`WasmModule::odb` is
+/// `None`), so every read that misses the same-dispatch put overlay answers
+/// `None`. Task 2 implements this over `DiskStore`/`DiskRefs` and injects it via
+/// a builder. Existing Map/Store tenants never call the object imports, so they
+/// never reach a resolver that would consult it — the plane is inert for them.
+pub trait HostOdb {
+    /// metadata-only: `(kind-tag, body-byte-length)` of a refs-reachable
+    /// object, or `None` if absent. answered from metadata alone (map lookup /
+    /// file stat), never a full body read on the consensus path.
+    fn stat(&self, id: &[u8]) -> Option<(u8, u64)>;
+    /// the TAGGED body (`kind-tag ‖ body`) of a refs-reachable object, or
+    /// `None` if absent — the exact bytes the guest's `object-get` returns.
+    fn get(&self, id: &[u8]) -> Option<Vec<u8>>;
+    /// stage a put; the host computes `id = sha256(kind-tag ‖ body)`. the
+    /// staged object is visible to same-block stats/gets and published or
+    /// discarded at the block boundary by the backing.
+    fn stage_put(&mut self, kind: u8, body: &[u8]) -> [u8; 32];
+}
+
 /// trap message for a read the memo cannot answer yet. never surfaces to
 /// consensus: the execute/query drivers intercept the run (via
 /// [`HostData::pending`]) and replay with the answer resolved.
@@ -102,6 +138,13 @@ enum PendingRead {
     /// the driver resolves it against the injected [`MerkleStore`] — no ctx
     /// needed, so even the ctx-less [`Module::query`] path replays these.
     State(Vec<u8>),
+    /// an `object-stat` miss of the same-dispatch put overlay: the driver
+    /// resolves it against the odb backing (`None` until Task 2 wires one) and
+    /// replays. own-state-shaped, so it resolves without a ctx like `State`.
+    ObjectStat(Vec<u8>),
+    /// an `object-get` miss of the same-dispatch put overlay: resolved against
+    /// the odb backing, exactly like [`PendingRead::ObjectStat`].
+    ObjectGet(Vec<u8>),
 }
 
 /// resolved read answers, accumulated across the replay rounds of ONE
@@ -117,18 +160,32 @@ struct SiblingMemo {
     /// committed-store answers for store-backed modules. staged writes shadow
     /// these at `state-get` (overlay first), so a stale entry is unreachable.
     states: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// odb-backing answers for object reads. the same-dispatch put overlay
+    /// shadows these at `object-stat`/`object-get` (overlay first), so a stale
+    /// entry is unreachable. counted together against [`MAX_OBJECT_READS`].
+    object_stats: BTreeMap<Vec<u8>, Option<(u8, u64)>>,
+    object_gets: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl SiblingMemo {
     /// DISTINCT sibling reads so far (the [`MAX_SIBLING_READS`] budget); the
-    /// store-read budget is tracked separately over `states`.
+    /// store-read and object-read budgets are tracked separately.
     fn len(&self) -> usize {
         self.roots.len() + self.queries.len()
     }
 
-    /// both replay budgets still hold — the loop guard every driver shares.
+    /// DISTINCT object-plane reads so far (the [`MAX_OBJECT_READS`] budget):
+    /// stats and gets share one budget, like roots and queries share the
+    /// sibling budget.
+    fn object_len(&self) -> usize {
+        self.object_stats.len() + self.object_gets.len()
+    }
+
+    /// every replay budget still holds — the loop guard every driver shares.
     fn within_budgets(&self) -> bool {
-        self.len() <= MAX_SIBLING_READS && self.states.len() <= MAX_STORE_READS
+        self.len() <= MAX_SIBLING_READS
+            && self.states.len() <= MAX_STORE_READS
+            && self.object_len() <= MAX_OBJECT_READS
     }
 
     /// the deterministic rejection for a blown replay budget.
@@ -137,8 +194,10 @@ impl SiblingMemo {
             SdkError::Module(format!(
                 "sibling-read budget exceeded ({MAX_SIBLING_READS})"
             ))
-        } else {
+        } else if self.states.len() > MAX_STORE_READS {
             SdkError::Module(format!("store-read budget exceeded ({MAX_STORE_READS})"))
+        } else {
+            SdkError::Module(format!("object-read budget exceeded ({MAX_OBJECT_READS})"))
         }
     }
 
@@ -159,6 +218,9 @@ impl SiblingMemo {
             }
             PendingRead::State(_) => {
                 unreachable!("state reads resolve against the injected store, never the ctx")
+            }
+            PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_) => {
+                unreachable!("object reads resolve against the odb backing, never the ctx")
             }
         }
     }
@@ -184,6 +246,13 @@ struct HostData {
     /// a `state-get` miss (staged, then memo) pauses the run for the driver to
     /// resolve `store.get` and replay. `committed` stays empty in this mode.
     store_backed: bool,
+    /// this dispatch's staged object puts, keyed by id → the TAGGED body
+    /// (`kind ‖ body`). seeded from the block-level accumulator each round and
+    /// grown by `object-put`; read BEFORE the memo/backing so a just-put id
+    /// answers `object-stat`/`object-get` without a pause (read-your-writes
+    /// within the block). a clean dispatch promotes it back to the block
+    /// accumulator; an aborted dispatch drops it.
+    object_puts: BTreeMap<Vec<u8>, Vec<u8>>,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
 }
@@ -238,6 +307,45 @@ impl host::Host for HostData {
         }
         self.pending = Some(PendingRead::Query(key.0, key.1));
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+    }
+    /// overlay-over-backing metadata read: this dispatch's staged puts first
+    /// (kind = tag byte, len = body length), then the memo, else pause for the
+    /// driver to resolve against the odb backing. never sealed — the object
+    /// store is this module's own state, resolvable ctx or not, like `state`.
+    fn object_stat(&mut self, id: Vec<u8>) -> wasmtime::Result<Option<(u8, u64)>> {
+        if let Some(tagged) = self.object_puts.get(&id) {
+            // a staged put always carries at least its kind tag byte.
+            return Ok(Some((tagged[0], (tagged.len() - 1) as u64)));
+        }
+        if let Some(answer) = self.memo.object_stats.get(&id) {
+            return Ok(*answer);
+        }
+        self.pending = Some(PendingRead::ObjectStat(id));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+    }
+    /// overlay-over-backing full read: staged puts (the tagged body verbatim)
+    /// first, then the memo, else pause for the driver.
+    fn object_get(&mut self, id: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
+        if let Some(tagged) = self.object_puts.get(&id) {
+            return Ok(Some(tagged.clone()));
+        }
+        if let Some(answer) = self.memo.object_gets.get(&id) {
+            return Ok(answer.clone());
+        }
+        self.pending = Some(PendingRead::ObjectGet(id));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+    }
+    /// stage a put: the host computes `id = sha256(kind ‖ body)` and returns it
+    /// ALONE (a hash mismatch is impossible here — the fail-closed publish check
+    /// rides the disk backing's staged→published seam). the tagged body lands
+    /// in this round's overlay so a later stat/get of `id` answers immediately.
+    fn object_put(&mut self, kind: u8, body: Vec<u8>) -> Vec<u8> {
+        let mut tagged = Vec::with_capacity(1 + body.len());
+        tagged.push(kind);
+        tagged.extend_from_slice(&body);
+        let id = sha256(&tagged);
+        self.object_puts.insert(id.clone(), tagged);
+        id
     }
     fn emit_msg(&mut self, target: String, payload: Vec<u8>) {
         self.out_msgs.push((target, payload));
@@ -296,6 +404,17 @@ pub struct WasmModule {
     code_hash: Vec<u8>,
     backing: StateBacking,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// the host-side content-addressed object store this tenant reads and
+    /// stages puts against. `None` in Task 1 (no backing wired): every object
+    /// read that misses the same-dispatch overlay resolves `None`. only the
+    /// files guest sets this; every other tenant leaves it `None` and never
+    /// touches the object plane.
+    odb: Option<Box<dyn HostOdb>>,
+    /// this block's accumulated staged object puts (id → tagged body), across
+    /// every dispatch since the last commit/abort — the object-plane twin of
+    /// `staged`. seeds each dispatch's overlay; published (Task 2) or dropped at
+    /// the block boundary. always empty for non-object tenants.
+    staged_objects: BTreeMap<Vec<u8>, Vec<u8>>,
     fuel: u64,
     /// the canonical committed-state revision this tenant declares (see
     /// [`Module::state_schema_revision`]). a byte-compatible port keeps the
@@ -325,6 +444,8 @@ impl WasmModule {
             code_hash: sha256(component_bytes),
             backing,
             staged: BTreeMap::new(),
+            odb: None,
+            staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
             state_schema_revision: 1,
             committed_queries: false,
@@ -376,6 +497,28 @@ impl WasmModule {
             ))
         })?;
         store.get(digest).await
+    }
+
+    /// resolve one paused object-plane read against the odb backing and
+    /// memoize the answer. Task 1 wires no backing (`odb` is `None`), so every
+    /// read answers `None` — the stub surface that keeps existing tenants
+    /// byte-identical (they never call the object imports, so they never pause
+    /// here). Task 2 injects a `HostOdb` and these become real disk reads. the
+    /// answers are synchronous (no ctx, no await), like a map-backed state read.
+    fn resolve_object_read(&self, read: PendingRead, memo: &mut SiblingMemo) {
+        match read {
+            PendingRead::ObjectStat(id) => {
+                let answer = self.odb.as_ref().and_then(|o| o.stat(&id));
+                memo.object_stats.insert(id, answer);
+            }
+            PendingRead::ObjectGet(id) => {
+                let answer = self.odb.as_ref().and_then(|o| o.get(&id));
+                memo.object_gets.insert(id, answer);
+            }
+            PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::State(_) => {
+                unreachable!("resolve_object_read only handles object-plane reads")
+            }
+        }
     }
 
     /// declare a non-default canonical-state revision (the recovery/state-sync
@@ -501,6 +644,10 @@ impl WasmModule {
             pending: None,
             sealed,
             store_backed: self.is_store_backed(),
+            // a query never stages puts; its object reads answer from the
+            // committed backing alone (the files query lane is host-side per
+            // Task 2, so the guest query never reaches the object plane).
+            object_puts: BTreeMap::new(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
         };
@@ -713,6 +860,7 @@ impl Module for WasmModule {
         self.component = component;
         self.code_hash = sha256(component_bytes);
         self.staged.clear();
+        self.staged_objects.clear();
         Ok(())
     }
 
@@ -722,6 +870,10 @@ impl Module for WasmModule {
         // stage: an aborted round's writes must not leak into the next, or a
         // replay could observe (e.g. double-apply) its own discarded effects.
         let staged0 = std::mem::take(&mut self.staged);
+        // the object-plane twin of `staged0`: this block's staged puts so far.
+        // each round re-seeds its overlay from this and the pure guest re-issues
+        // its puts on top, so the overlay is identical across replay rounds.
+        let staged_objects0 = std::mem::take(&mut self.staged_objects);
         let mut memo = SiblingMemo::default();
         while memo.within_budgets() {
             // move map-backed committed + memo into owned per-round data;
@@ -739,6 +891,7 @@ impl Module for WasmModule {
                 pending: None,
                 sealed: false,
                 store_backed: self.is_store_backed(),
+                object_puts: staged_objects0.clone(),
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
             };
@@ -761,7 +914,8 @@ impl Module for WasmModule {
             }
             memo = data.memo;
 
-            // a paused run: resolve the read (own store, or host ctx) and replay.
+            // a paused run: resolve the read (own store, odb backing, or host
+            // ctx) and replay.
             if let Some(read) = data.pending {
                 match read {
                     PendingRead::State(key) => match self.resolve_state_read(&key).await {
@@ -772,10 +926,16 @@ impl Module for WasmModule {
                         // a deterministic rejection of the whole op.
                         Err(e) => {
                             self.staged = staged0;
+                            self.staged_objects = staged_objects0;
                             return Err(e);
                         }
                     },
-                    read => memo.resolve(&*ctx, read).await,
+                    read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
+                        self.resolve_object_read(read, &mut memo);
+                    }
+                    read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
+                        memo.resolve(&*ctx, read).await;
+                    }
                 }
                 continue;
             }
@@ -783,6 +943,9 @@ impl Module for WasmModule {
             return match call {
                 Ok(Ok(())) => {
                     self.staged = data.staged;
+                    // a clean dispatch promotes its staged puts into the block
+                    // accumulator (this dispatch's puts on top of the block's).
+                    self.staged_objects = data.object_puts;
                     // only a clean execute publishes its intents; a rejection leaks nothing.
                     for (target, payload) in data.out_msgs {
                         ctx.emit_msg(Msg { target, payload });
@@ -792,20 +955,23 @@ impl Module for WasmModule {
                     }
                     Ok(())
                 }
-                // a rejected op stages nothing: the pre-dispatch overlay is
+                // a rejected op stages nothing: the pre-dispatch overlays are
                 // restored (the host aborts the whole block on any execute
                 // error, so this only keeps the module-local invariant clean).
                 Ok(Err(e)) => {
                     self.staged = staged0;
+                    self.staged_objects = staged_objects0;
                     Err(wit_err(e))
                 }
                 Err(e) => {
                     self.staged = staged0;
+                    self.staged_objects = staged_objects0;
                     Err(e)
                 }
             };
         }
         self.staged = staged0;
+        self.staged_objects = staged_objects0;
         Err(memo.budget_error())
     }
 
@@ -832,7 +998,14 @@ impl Module for WasmModule {
                     let answer = self.resolve_state_read(&key).await?;
                     memo.states.insert(key, answer);
                 }
-                Some(_) => unreachable!("sealed runs never pause on sibling reads"),
+                // object reads are the module's own state (not sibling reads),
+                // so they resolve against the backing even ctx-less, like State.
+                Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
+                    self.resolve_object_read(read, &mut memo);
+                }
+                Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
+                    unreachable!("sealed runs never pause on sibling reads")
+                }
             }
         }
         Err(memo.budget_error())
@@ -850,13 +1023,25 @@ impl Module for WasmModule {
                     let answer = self.resolve_state_read(&key).await?;
                     memo.states.insert(key, answer);
                 }
-                Some(read) => memo.resolve(ctx, read).await,
+                Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
+                    self.resolve_object_read(read, &mut memo);
+                }
+                Some(read @ (PendingRead::Root(_) | PendingRead::Query(_, _))) => {
+                    memo.resolve(ctx, read).await;
+                }
             }
         }
         Err(memo.budget_error())
     }
 
     async fn commit_block(&mut self) -> Result<(), SdkError> {
+        // object plane: Task 1 wires no odb backing, so this block's staged
+        // puts have nowhere to publish — drop them. existing Map/Store tenants
+        // never stage objects, so this is a no-op for them (no root movement,
+        // no store touch). Task 2 replaces this with publish-to-backing (staged
+        // objects durable → refs save) BEFORE the state commit below, honoring
+        // duckfs's durability ordering.
+        self.staged_objects.clear();
         match &mut self.backing {
             StateBacking::Map { committed } => {
                 for (key, overlay) in std::mem::take(&mut self.staged) {
@@ -903,6 +1088,8 @@ impl Module for WasmModule {
 
     async fn abort_block(&mut self) -> Result<(), SdkError> {
         self.staged.clear();
+        // discard this block's staged object puts alongside the state stage.
+        self.staged_objects.clear();
         Ok(())
     }
 }

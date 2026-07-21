@@ -10,9 +10,16 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[features]
+# the duckfs object-store adapter (`GuestOdb`). non-default so the ~20 guests
+# that never touch the object plane don't compile `duckfs-core`; the files
+# guest enables it.
+odb = ["dep:duckfs-core"]
+
 [dependencies]
 wit-bindgen = "0.57"
 sdk = { path = "../../kernel/sdk" }
 async-trait = "0.1"
+duckfs-core = { path = "../../duckfs/core", optional = true }
 
 [workspace]

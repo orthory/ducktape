@@ -273,6 +273,10 @@ wasm-modules:
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
+	cd crates/guests/object-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
+	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 	cd crates/guests/inbox-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/inbox-wasm/target/wasm32-unknown-unknown/release/inbox_wasm.wasm \
