@@ -5,9 +5,8 @@ use inbox::{
     InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS,
     MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
 };
-use sdk::{
-    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
-};
+use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk_testkit::TestCtx;
 
 const INBOX: &str = "inbox";
 
@@ -95,43 +94,20 @@ async fn host_list(host: &Host, member: &str) -> Vec<Notification> {
     }
 }
 
-struct TestCtx {
-    env: Env,
+// inbox's execute reads only env (origin + consensus_time); me/height are
+// cosmetic, so the shared TestCtx stands in behind two thin constructors.
+fn ctx(origin: Origin, consensus_time: u64) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin,
+        me: INBOX.into(),
+    })
 }
 
-impl TestCtx {
-    fn new(origin: Origin, consensus_time: u64) -> Self {
-        Self {
-            env: Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin,
-                me: INBOX.into(),
-            },
-        }
-    }
-
-    fn system(consensus_time: u64) -> Self {
-        Self::new(Origin::System, consensus_time)
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
-    }
-
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-
-    fn emit_msg(&mut self, _msg: Msg) {}
-    fn emit_event(&mut self, _event: Event) {}
+fn sys(consensus_time: u64) -> TestCtx {
+    ctx(Origin::System, consensus_time)
 }
 
 #[test]
@@ -140,15 +116,15 @@ fn deliver_assigns_per_member_sequence() {
         let mut inbox = Inbox::new(INBOX);
 
         inbox
-            .execute(&mut TestCtx::system(10), &deliver("alice", "mention", "hi"))
+            .execute(&mut sys(10), &deliver("alice", "mention", "hi"))
             .await
             .expect("deliver a1");
         inbox
-            .execute(&mut TestCtx::system(11), &deliver("alice", "reply", "yo"))
+            .execute(&mut sys(11), &deliver("alice", "reply", "yo"))
             .await
             .expect("deliver a2");
         inbox
-            .execute(&mut TestCtx::system(12), &deliver("bob", "mention", "sup"))
+            .execute(&mut sys(12), &deliver("bob", "mention", "sup"))
             .await
             .expect("deliver b1");
         inbox.commit_block().await.expect("commit");
@@ -175,25 +151,25 @@ fn source_is_derived_from_origin() {
 
         inbox
             .execute(
-                &mut TestCtx::new(Origin::Module("chat".into()), 1),
+                &mut ctx(Origin::Module("chat".into()), 1),
                 &deliver("m", "k", "from module"),
             )
             .await
             .expect("module deliver");
         inbox
             .execute(
-                &mut TestCtx::new(Origin::External(vec![0xde, 0xad, 0xbe, 0xef]), 2),
+                &mut ctx(Origin::External(vec![0xde, 0xad, 0xbe, 0xef]), 2),
                 &deliver("m", "k", "from external"),
             )
             .await
             .expect("external deliver");
         inbox
-            .execute(&mut TestCtx::system(3), &deliver("m", "k", "from system"))
+            .execute(&mut sys(3), &deliver("m", "k", "from system"))
             .await
             .expect("system deliver");
         inbox
             .execute(
-                &mut TestCtx::new(Origin::External(Vec::new()), 4),
+                &mut ctx(Origin::External(Vec::new()), 4),
                 &deliver("m", "k", "from anonymous external"),
             )
             .await
@@ -220,25 +196,25 @@ fn caps_reject_oversized_and_leave_root_unchanged() {
 
         let big_body = "x".repeat(16 * 1024 + 1);
         let err = inbox
-            .execute(&mut TestCtx::system(1), &deliver("alice", "k", &big_body))
+            .execute(&mut sys(1), &deliver("alice", "k", &big_body))
             .await
             .expect_err("oversized body must be rejected");
         assert!(matches!(err, Error::Module(ref m) if m.contains("body exceeds")));
 
         let big_kind = "k".repeat(65);
         inbox
-            .execute(&mut TestCtx::system(1), &deliver("alice", &big_kind, "b"))
+            .execute(&mut sys(1), &deliver("alice", &big_kind, "b"))
             .await
             .expect_err("oversized kind must be rejected");
 
         inbox
-            .execute(&mut TestCtx::system(1), &deliver("", "k", "b"))
+            .execute(&mut sys(1), &deliver("", "k", "b"))
             .await
             .expect_err("empty member must be rejected");
 
         let big_member = "m".repeat(257);
         inbox
-            .execute(&mut TestCtx::system(1), &deliver(&big_member, "k", "b"))
+            .execute(&mut sys(1), &deliver(&big_member, "k", "b"))
             .await
             .expect_err("oversized member must be rejected");
 
@@ -262,7 +238,7 @@ fn queue_overflow_drops_oldest_item() {
         // one over the per-member cap, all in a single block.
         for i in 0..(MAX_ITEMS_PER_MEMBER as u64 + 1) {
             inbox
-                .execute(&mut TestCtx::system(i), &deliver("alice", "k", "b"))
+                .execute(&mut sys(i), &deliver("alice", "k", "b"))
                 .await
                 .expect("deliver");
         }
@@ -303,21 +279,21 @@ fn member_cap_rejects_new_member() {
         for i in 0..MAX_MEMBERS as u64 {
             let member = format!("m{i}");
             inbox
-                .execute(&mut TestCtx::system(0), &deliver(&member, "k", ""))
+                .execute(&mut sys(0), &deliver(&member, "k", ""))
                 .await
                 .expect("deliver to fresh member");
         }
 
         // a NEW member beyond the cap is rejected...
         let err = inbox
-            .execute(&mut TestCtx::system(0), &deliver("overflow", "k", ""))
+            .execute(&mut sys(0), &deliver("overflow", "k", ""))
             .await
             .expect_err("new member beyond cap must be rejected");
         assert!(matches!(err, Error::Module(ref m) if m.contains("member capacity")));
 
         // ...but delivering to an EXISTING member still works.
         inbox
-            .execute(&mut TestCtx::system(0), &deliver("m0", "k", "again"))
+            .execute(&mut sys(0), &deliver("m0", "k", "again"))
             .await
             .expect("existing member still accepts deliveries");
     });
@@ -329,7 +305,7 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         let mut inbox = Inbox::new(INBOX);
         for _ in 0..3 {
             inbox
-                .execute(&mut TestCtx::system(1), &deliver("alice", "k", "b"))
+                .execute(&mut sys(1), &deliver("alice", "k", "b"))
                 .await
                 .expect("deliver");
         }
@@ -338,11 +314,11 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
 
         // MarkRead up to seq 2, twice — idempotent.
         inbox
-            .execute(&mut TestCtx::system(2), &mark_read("alice", 2))
+            .execute(&mut sys(2), &mark_read("alice", 2))
             .await
             .expect("mark read");
         inbox
-            .execute(&mut TestCtx::system(2), &mark_read("alice", 2))
+            .execute(&mut sys(2), &mark_read("alice", 2))
             .await
             .expect("mark read again");
         inbox.commit_block().await.expect("commit mark read");
@@ -352,11 +328,11 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         // move the root.
         let root_before = inbox.root();
         inbox
-            .execute(&mut TestCtx::system(3), &mark_read("nobody", 99))
+            .execute(&mut sys(3), &mark_read("nobody", 99))
             .await
             .expect("mark read unknown member is a no-op");
         inbox
-            .execute(&mut TestCtx::system(3), &clear("nobody", 99))
+            .execute(&mut sys(3), &clear("nobody", 99))
             .await
             .expect("clear unknown member is a no-op");
         inbox.commit_block().await.expect("commit no-ops");
@@ -369,12 +345,12 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         // Clear removes items but never rewinds next_seq: the next delivery
         // gets seq 4, not a reused low seq.
         inbox
-            .execute(&mut TestCtx::system(4), &clear("alice", 2))
+            .execute(&mut sys(4), &clear("alice", 2))
             .await
             .expect("clear up to 2");
         inbox
             .execute(
-                &mut TestCtx::system(5),
+                &mut sys(5),
                 &deliver("alice", "k", "after clear"),
             )
             .await
@@ -393,7 +369,7 @@ fn list_pagination_and_unread_count() {
         let mut inbox = Inbox::new(INBOX);
         for i in 0..10 {
             inbox
-                .execute(&mut TestCtx::system(i), &deliver("alice", "k", "b"))
+                .execute(&mut sys(i), &deliver("alice", "k", "b"))
                 .await
                 .expect("deliver");
         }
@@ -414,7 +390,7 @@ fn list_pagination_and_unread_count() {
 
         assert_eq!(unread(&inbox, "alice").await, 10);
         inbox
-            .execute(&mut TestCtx::system(11), &mark_read("alice", 7))
+            .execute(&mut sys(11), &mark_read("alice", 7))
             .await
             .expect("mark read");
         inbox.commit_block().await.expect("commit");
@@ -429,7 +405,7 @@ fn root_moves_only_on_commit_and_abort_is_byte_identical() {
         let root0 = inbox.root();
 
         inbox
-            .execute(&mut TestCtx::system(1), &deliver("alice", "k", "b"))
+            .execute(&mut sys(1), &deliver("alice", "k", "b"))
             .await
             .expect("stage deliver");
         assert_eq!(inbox.root(), root0, "staged writes do not move the root");
@@ -444,7 +420,7 @@ fn root_moves_only_on_commit_and_abort_is_byte_identical() {
         assert_ne!(root1, root0, "commit moves the root");
 
         inbox
-            .execute(&mut TestCtx::system(2), &deliver("alice", "k", "b2"))
+            .execute(&mut sys(2), &deliver("alice", "k", "b2"))
             .await
             .expect("stage another");
         assert_eq!(inbox.root(), root1, "root is committed-state only");
@@ -468,27 +444,27 @@ fn snapshot_install_round_trips() {
         let mut source = Inbox::new(INBOX);
         source
             .execute(
-                &mut TestCtx::new(Origin::Module("chat".into()), 5),
+                &mut ctx(Origin::Module("chat".into()), 5),
                 &deliver("alice", "mention", "hi"),
             )
             .await
             .expect("deliver");
         source
-            .execute(&mut TestCtx::system(6), &deliver("alice", "k", "second"))
+            .execute(&mut sys(6), &deliver("alice", "k", "second"))
             .await
             .expect("deliver");
         source
-            .execute(&mut TestCtx::system(7), &deliver("bob", "k", "solo"))
+            .execute(&mut sys(7), &deliver("bob", "k", "solo"))
             .await
             .expect("deliver");
         source.commit_block().await.expect("commit");
         // exercise read flags + a clear so the snapshot carries every field.
         source
-            .execute(&mut TestCtx::system(8), &mark_read("alice", 1))
+            .execute(&mut sys(8), &mark_read("alice", 1))
             .await
             .expect("mark read");
         source
-            .execute(&mut TestCtx::system(9), &clear("bob", 1))
+            .execute(&mut sys(9), &clear("bob", 1))
             .await
             .expect("clear bob (leaves empty queue, next_seq preserved)");
         source.commit_block().await.expect("commit");
@@ -527,7 +503,7 @@ fn snapshot_install_round_trips() {
         // next delivery to the cleared member resumes at the preserved next_seq.
         target
             .execute(
-                &mut TestCtx::system(10),
+                &mut sys(10),
                 &deliver("bob", "k", "after clear"),
             )
             .await
@@ -746,7 +722,7 @@ fn seq_exhaustion_rejects_deterministically() {
         // deterministically, before any mutation — never panic or wrap.
         let err = inbox
             .execute(
-                &mut TestCtx::system(1),
+                &mut sys(1),
                 &deliver("alice", "k", "one too many"),
             )
             .await
@@ -759,7 +735,7 @@ fn seq_exhaustion_rejects_deterministically() {
         // other members are unaffected, and the rejection left no trace.
         inbox
             .execute(
-                &mut TestCtx::system(1),
+                &mut sys(1),
                 &deliver("bob", "k", "fresh member"),
             )
             .await
