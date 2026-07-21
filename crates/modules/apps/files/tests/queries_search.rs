@@ -49,7 +49,7 @@ fn commit_as(
             changes,
         }),
     };
-    block_on(f.execute(&mut TestCtx::new(origin, h), &msg))
+    block_on(f.execute(&mut test_ctx(origin, h), &msg))
 }
 
 fn commit(
@@ -63,7 +63,7 @@ fn commit(
 
 fn putblob(f: &mut files::Files, h: u64, bytes: &[u8]) {
     block_on(f.execute(
-        &mut TestCtx::new(sdk::Origin::System, h),
+        &mut test_ctx(sdk::Origin::System, h),
         &sdk::Msg {
             target: "files".into(),
             payload: encode_putblob(bytes),

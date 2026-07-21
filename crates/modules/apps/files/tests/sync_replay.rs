@@ -60,14 +60,14 @@ fn commit(
     changes: Vec<Change>,
 ) -> Result<(), sdk::Error> {
     block_on(f.execute(
-        &mut TestCtx::new(origin, h),
+        &mut test_ctx(origin, h),
         &commit_op(base, "commit", changes),
     ))
 }
 
 fn exec_op(f: &mut files::Files, origin: Origin, h: u64, op: FilesMsg) -> Result<(), sdk::Error> {
     block_on(f.execute(
-        &mut TestCtx::new(origin, h),
+        &mut test_ctx(origin, h),
         &sdk::Msg {
             target: "files".into(),
             payload: encode_msg(&op),
@@ -77,7 +77,7 @@ fn exec_op(f: &mut files::Files, origin: Origin, h: u64, op: FilesMsg) -> Result
 
 fn putblob(f: &mut files::Files, h: u64, bytes: &[u8]) {
     block_on(f.execute(
-        &mut TestCtx::new(Origin::System, h),
+        &mut test_ctx(Origin::System, h),
         &sdk::Msg {
             target: "files".into(),
             payload: encode_putblob(bytes),

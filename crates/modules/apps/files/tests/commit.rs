@@ -54,7 +54,7 @@ fn commit_with_message(
     message: &str,
     changes: Vec<Change>,
 ) -> Result<TestCtx, sdk::Error> {
-    let mut ctx = TestCtx::new(origin, h);
+    let mut ctx = test_ctx(origin, h);
     futures::executor::block_on(f.execute(&mut ctx, &commit_op(base, message, changes)))?;
     Ok(ctx)
 }
@@ -74,7 +74,7 @@ fn putblob(
     bytes: &[u8],
 ) -> Result<(), sdk::Error> {
     futures::executor::block_on(f.execute(
-        &mut TestCtx::new(origin, h),
+        &mut test_ctx(origin, h),
         &sdk::Msg {
             target: "files".into(),
             payload: encode_putblob(bytes),
@@ -578,8 +578,8 @@ fn case12_watch_fan_out_emits_notification() {
     .expect("commit");
     commit_block(&mut f);
     let head = f.committed_head_for_test().expect("head");
-    assert_eq!(ctx.emitted.len(), 1, "exactly one watch hit");
-    let msg = &ctx.emitted[0];
+    assert_eq!(ctx.msgs().len(), 1, "exactly one watch hit");
+    let msg = &ctx.msgs()[0];
     assert_eq!(
         msg.target, "indexer",
         "notification targets the watching module"
@@ -607,7 +607,7 @@ fn case12_watch_outside_prefix_does_not_notify() {
     .expect("commit");
     commit_block(&mut f);
     assert!(
-        ctx.emitted.is_empty(),
+        ctx.msgs().is_empty(),
         "a path outside the prefix emits nothing"
     );
 }

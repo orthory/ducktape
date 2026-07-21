@@ -36,6 +36,20 @@ pub struct TestCtx {
     output: Option<Vec<u8>>,
 }
 
+impl std::fmt::Debug for TestCtx {
+    // the query handlers are closures (not `Debug`); summarize instead, so a
+    // consumer's `Result<TestCtx, _>::unwrap_err()` can still format the Ok arm.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestCtx")
+            .field("env", &self.env)
+            .field("handlers", &self.handlers.keys().collect::<Vec<_>>())
+            .field("msgs", &self.msgs)
+            .field("events", &self.events)
+            .field("output", &self.output)
+            .finish()
+    }
+}
+
 impl TestCtx {
     /// a ctx at block `height`, `consensus_time == height` (the convention),
     /// `origin = System`. Tests needing a specific `origin`/`me` use
