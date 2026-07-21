@@ -14,7 +14,7 @@
 //! module directly (its `serve_sync` future is `?Send`); the kernel
 //! SyncClient/mesh transport wiring is covered by the P2T5 cluster e2e.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -24,7 +24,7 @@ use duckfs_core::{
     encode_putblob, encode_query, to_hex,
 };
 use files::Files;
-use sdk::{Ctx, Env, Error, Event, Module as _, Msg, Origin, StateRoot};
+use sdk::{Env, Error, Module as _, Msg, Origin, StateRoot};
 use statesync::{ModuleLane, ObjectFetch, SyncError, sync_object_possession};
 
 // ---- drivers ----------------------------------------------------------------
@@ -37,47 +37,22 @@ fn open_files(dir: &tempfile::TempDir) -> Files {
     Files::open("files", dir.path().to_path_buf()).expect("open")
 }
 
+use sdk_testkit::TestCtx;
+
 /// a minimal deterministic `Ctx` — enough to drive source commits/pins.
-struct TestCtx {
-    env: Env,
-    emitted: VecDeque<Msg>,
-}
-
-impl TestCtx {
-    fn new(origin: Origin, height: u64) -> Self {
-        Self {
-            env: Env {
-                protocol_version: 0,
-                height,
-                consensus_time: height,
-                origin,
-                me: "files".into(),
-            },
-            emitted: VecDeque::new(),
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, msg: Msg) {
-        self.emitted.push_back(msg);
-    }
-    fn emit_event(&mut self, _ev: Event) {}
+fn ctx(origin: Origin, height: u64) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height,
+        consensus_time: height,
+        origin,
+        me: "files".into(),
+    })
 }
 
 fn exec(f: &mut Files, origin: Origin, h: u64, op: FilesMsg) -> Result<(), Error> {
     block_on(f.execute(
-        &mut TestCtx::new(origin, h),
+        &mut ctx(origin, h),
         &Msg {
             target: "files".into(),
             payload: encode_msg(&op),
@@ -87,7 +62,7 @@ fn exec(f: &mut Files, origin: Origin, h: u64, op: FilesMsg) -> Result<(), Error
 
 fn putblob(f: &mut Files, h: u64, bytes: &[u8]) {
     block_on(f.execute(
-        &mut TestCtx::new(Origin::System, h),
+        &mut ctx(Origin::System, h),
         &Msg {
             target: "files".into(),
             payload: encode_putblob(bytes),
