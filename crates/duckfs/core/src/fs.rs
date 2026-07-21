@@ -596,6 +596,40 @@ impl<S: ObjectStore> Fs<S> {
         self.pending = None;
     }
 
+    /// seed this block's object index into a fresh pending BEFORE an op is
+    /// applied — the wasm-guest's reconstruction of the block-local
+    /// [`Pending::object_ids`] the native module keeps in-memory across a whole
+    /// block. an adapter guest is rebuilt per dispatch, so it re-seeds this each
+    /// dispatch (from its staged-only `__block_objects` state key) so a later
+    /// same-block op's availability/dedup ([`chunk_stat`], putblob's dedup) sees
+    /// an earlier dispatch's staged objects EXACTLY as native does — the
+    /// root-continuity fix for same-block inline-chunk references.
+    ///
+    /// ADDITIVE: the native module NEVER calls this (it keeps its live
+    /// `pending` alive across the block), so no decision logic changes and the
+    /// native path is byte-for-byte unaffected. reuses [`require_pending`] to
+    /// build the pending (refs forked from committed, empty objects), then
+    /// overwrites only the index — the ONE field the guest must carry.
+    pub fn seed_block_objects(&mut self, height: u64, index: BTreeMap<ObjectId, (Kind, u64)>) {
+        self.require_pending(height);
+        self.pending
+            .as_mut()
+            .expect("require_pending set the pending")
+            .object_ids = index;
+    }
+
+    /// this block's accumulated object index (prior-dispatch objects seeded via
+    /// [`seed_block_objects`] plus everything the just-applied op staged), for
+    /// the guest to persist under `__block_objects`. empty when no op staged a
+    /// pending. clones the map the guest round-trips; it never enters the root
+    /// or the wire.
+    pub fn block_objects(&self) -> BTreeMap<ObjectId, (Kind, u64)> {
+        self.pending
+            .as_ref()
+            .map(|p| p.object_ids.clone())
+            .unwrap_or_default()
+    }
+
     // ---- read + sync surface (tasks 11/12/14) --------------------------------
 
     /// committed state only — never the pending overlay. delegates to the pure
