@@ -61,6 +61,17 @@
 
 pub mod search;
 
+mod disk;
+pub use disk::{DiskEntry, DiskFs, IndexDisk};
+
+// the mem arm of the disk seam — behind `sim` (and always in test) so it never
+// ships in a release build. the fluent31-backed read models cannot run on it
+// (they own their IO); it drives the shipping lane's staging with no tempdir.
+#[cfg(any(test, feature = "sim"))]
+mod mem;
+#[cfg(any(test, feature = "sim"))]
+pub use mem::MemDisk;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -562,6 +573,10 @@ pub struct IndexStore {
     /// set on the first apply failure; writes refuse from then on. reads stay
     /// available — stale-but-consistent beats unavailable for a derived tier.
     poisoned: AtomicBool,
+    /// the filesystem the shipping lane ([`IndexStore::checkpoint_files`] and
+    /// the staged-install adoption at open) reads and writes through. defaults
+    /// to [`DiskFs`]; a mem arm exists for driving the staging lane in tests.
+    disk: Box<dyn IndexDisk>,
 }
 
 impl IndexStore {
@@ -574,7 +589,8 @@ impl IndexStore {
     /// discarded, falling back to whatever the databases already hold.
     pub fn open<S: AsRef<str>>(base: impl AsRef<Path>, module_ids: &[S]) -> Result<Self> {
         let base = base.as_ref().to_path_buf();
-        adopt_staged(&base)?;
+        let disk: Box<dyn IndexDisk> = Box::new(DiskFs);
+        adopt_staged(disk.as_ref(), &base)?;
         let opts = Options {
             sync: SyncMode::Periodic { every: SYNC_EVERY },
             // portable positioned IO: the index shares its box with the node's
@@ -595,6 +611,7 @@ impl IndexStore {
             blocks,
             mappers: BTreeMap::new(),
             poisoned: AtomicBool::new(false),
+            disk,
         })
     }
 
@@ -956,14 +973,12 @@ impl IndexStore {
         let info = handle.checkpoint(SHIP_CHECKPOINT)?;
         let read = (|| -> std::io::Result<Vec<(String, Vec<u8>)>> {
             let mut files = Vec::new();
-            for entry in std::fs::read_dir(&info.path)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                if name == "LOCK" {
+            for entry in self.disk.read_dir(&info.path)? {
+                if entry.name == "LOCK" {
                     continue; // never present in an archive; skip defensively
                 }
-                files.push((name.to_string(), std::fs::read(entry.path())?));
+                let bytes = self.disk.read(&info.path.join(&entry.name))?;
+                files.push((entry.name, bytes));
             }
             files.sort_by(|(a, _), (b, _)| a.cmp(b));
             Ok(files)
@@ -982,7 +997,9 @@ impl IndexStore {
 // watermark FIRST so interruption re-triggers; staging writes its marker
 // LAST so interruption discards. free functions, not methods — the writer (a
 // syncing joiner) stages against a base whose store is still open elsewhere
-// in the process, and never needs a handle of its own.
+// in the process, and never needs a handle of its own. they take the
+// [`IndexDisk`] to write through (production passes [`DiskFs`]); the mem arm
+// drives this whole sequence with no tempdir.
 // ============================================================================
 
 /// one path component: non-empty, no separators or traversal, no hidden
@@ -1002,7 +1019,12 @@ fn valid_component(name: &str) -> bool {
 /// return — the completion marker ([`commit_staged`]) must never become
 /// durable ahead of the bytes it vouches for, or a crash could adopt garbage
 /// and turn the next open into a boot failure.
-pub fn stage_shipped_db(base: &Path, db: &str, files: &[(String, Vec<u8>)]) -> Result<()> {
+pub fn stage_shipped_db(
+    disk: &dyn IndexDisk,
+    base: &Path,
+    db: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<()> {
     if !valid_component(db) || db == STAGING_DIR {
         return Err(Error::Shipping(format!("invalid shipped db name {db:?}")));
     }
@@ -1013,16 +1035,11 @@ pub fn stage_shipped_db(base: &Path, db: &str, files: &[(String, Vec<u8>)]) -> R
     }
     let dir = base.join(STAGING_DIR).join(db);
     (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
+        disk.create_dir_all(&dir)?;
         for (name, bytes) in files {
-            let file = std::fs::File::create(dir.join(name)).and_then(|mut f| {
-                use std::io::Write as _;
-                f.write_all(bytes)?;
-                Ok(f)
-            })?;
-            file.sync_all()?;
+            disk.write(&dir.join(name), bytes)?;
         }
-        std::fs::File::open(&dir)?.sync_all()?;
+        disk.sync_dir(&dir)?;
         Ok(())
     })()
     .map_err(|e| Error::Shipping(format!("stage {db}: {e}")))
@@ -1030,11 +1047,11 @@ pub fn stage_shipped_db(base: &Path, db: &str, files: &[(String, Vec<u8>)]) -> R
 
 /// mark a staged install complete. written LAST: only a marked staging
 /// directory is adopted; everything else is discarded as a torn fetch.
-pub fn commit_staged(base: &Path) -> Result<()> {
+pub fn commit_staged(disk: &dyn IndexDisk, base: &Path) -> Result<()> {
     let staging = base.join(STAGING_DIR);
     (|| -> std::io::Result<()> {
-        std::fs::write(staging.join(STAGING_COMPLETE), b"")?;
-        std::fs::File::open(&staging)?.sync_all()?;
+        disk.write(&staging.join(STAGING_COMPLETE), b"")?;
+        disk.sync_dir(&staging)?;
         Ok(())
     })()
     .map_err(|e| Error::Shipping(format!("commit staged install: {e}")))
@@ -1043,12 +1060,12 @@ pub fn commit_staged(base: &Path) -> Result<()> {
 /// drop any staged install — the fetch failed partway and lane 1's heal is
 /// the fallback. missing staging is a no-op, so callers can clean
 /// unconditionally.
-pub fn discard_staged(base: &Path) -> Result<()> {
+pub fn discard_staged(disk: &dyn IndexDisk, base: &Path) -> Result<()> {
     let staging = base.join(STAGING_DIR);
-    if !staging.exists() {
+    if !disk.exists(&staging) {
         return Ok(());
     }
-    std::fs::remove_dir_all(&staging)
+    disk.remove_dir_all(&staging)
         .map_err(|e| Error::Shipping(format!("discard staged install: {e}")))
 }
 
@@ -1057,27 +1074,26 @@ pub fn discard_staged(base: &Path) -> Result<()> {
 /// across crashes — each directory rename is atomic, an interrupted sweep
 /// leaves the marker and the not-yet-adopted remainder for the next open,
 /// and a marker-less staging directory is discarded wholesale.
-fn adopt_staged(base: &Path) -> Result<()> {
+fn adopt_staged(disk: &dyn IndexDisk, base: &Path) -> Result<()> {
     let staging = base.join(STAGING_DIR);
-    if !staging.exists() {
+    if !disk.exists(&staging) {
         return Ok(());
     }
-    if !staging.join(STAGING_COMPLETE).exists() {
-        return discard_staged(base);
+    if !disk.exists(&staging.join(STAGING_COMPLETE)) {
+        return discard_staged(disk, base);
     }
     (|| -> std::io::Result<()> {
-        for entry in std::fs::read_dir(&staging)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        for entry in disk.read_dir(&staging)? {
+            if !entry.is_dir {
                 continue; // the marker file
             }
-            let dest = base.join(entry.file_name());
-            if dest.exists() {
-                std::fs::remove_dir_all(&dest)?;
+            let dest = base.join(&entry.name);
+            if disk.exists(&dest) {
+                disk.remove_dir_all(&dest)?;
             }
-            std::fs::rename(entry.path(), &dest)?;
+            disk.rename(&staging.join(&entry.name), &dest)?;
         }
-        std::fs::remove_dir_all(&staging)?;
+        disk.remove_dir_all(&staging)?;
         Ok(())
     })()
     .map_err(|e| Error::Shipping(format!("adopt staged install: {e}")))
@@ -1794,9 +1810,9 @@ mod tests {
         for db in ["chat", "tasks", BLOCKS_DB_ID] {
             let files = source.checkpoint_files(db).expect("cut");
             assert!(!files.is_empty(), "{db} archive has files");
-            stage_shipped_db(dest.path(), db, &files).expect("stage");
+            stage_shipped_db(&DiskFs, dest.path(), db, &files).expect("stage");
         }
-        commit_staged(dest.path()).expect("commit");
+        commit_staged(&DiskFs, dest.path()).expect("commit");
         // the archive is transient: cut, read, deleted.
         assert!(!src.path().join("chat/archive").join(SHIP_CHECKPOINT).exists());
 
@@ -1827,7 +1843,7 @@ mod tests {
         }
         // a torn fetch: staged bytes, no completion marker → swept at open,
         // the database the node already had stays live.
-        stage_shipped_db(dir.path(), "chat", &[("torn.tbl".into(), vec![1, 2, 3])]).unwrap();
+        stage_shipped_db(&DiskFs, dir.path(), "chat", &[("torn.tbl".into(), vec![1, 2, 3])]).unwrap();
         {
             let s = store(dir.path());
             assert_eq!(s.applied_height("chat").unwrap(), 5, "existing db kept");
@@ -1841,8 +1857,8 @@ mod tests {
             donor.apply_block(&block(h, vec![chat_op(b"{}")])).unwrap();
         }
         let files = donor.checkpoint_files("chat").unwrap();
-        stage_shipped_db(dir.path(), "chat", &files).unwrap();
-        commit_staged(dir.path()).unwrap();
+        stage_shipped_db(&DiskFs, dir.path(), "chat", &files).unwrap();
+        commit_staged(&DiskFs, dir.path()).unwrap();
         let s = store(dir.path());
         assert_eq!(s.applied_height("chat").unwrap(), 7, "staged content adopted");
         assert_eq!(s.applied_height("tasks").unwrap(), 5, "unstaged db untouched");
@@ -1852,7 +1868,7 @@ mod tests {
     fn stage_refuses_hostile_names() {
         let dir = tempfile::tempdir().unwrap();
         let put = |db: &str, file: &str| {
-            stage_shipped_db(dir.path(), db, &[(file.to_string(), vec![0])])
+            stage_shipped_db(&DiskFs, dir.path(), db, &[(file.to_string(), vec![0])])
         };
         assert!(matches!(put("../evil", "a.tbl"), Err(Error::Shipping(_))));
         assert!(matches!(put("a/b", "a.tbl"), Err(Error::Shipping(_))));
@@ -1890,6 +1906,74 @@ mod tests {
             store.checkpoint_files("chat"),
             Err(Error::Poisoned)
         ));
+    }
+
+    // ------------------------------------------------------------------------
+    // the disk seam: the staging lane drives on the mem arm, no tempdir
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn staging_round_trips_on_the_mem_disk() {
+        // the whole stage → commit → adopt sequence on a mock filesystem: no
+        // tempdir, no fluent31. what the disk seam makes drivable.
+        let disk = MemDisk::default();
+        let base = Path::new("/idx");
+
+        stage_shipped_db(
+            &disk,
+            base,
+            "chat",
+            &[("a.tbl".into(), vec![1, 2, 3]), ("b.tbl".into(), vec![4])],
+        )
+        .unwrap();
+        stage_shipped_db(&disk, base, BLOCKS_DB_ID, &[("c.tbl".into(), vec![9])]).unwrap();
+        commit_staged(&disk, base).unwrap();
+        adopt_staged(&disk, base).unwrap();
+
+        // each staged database landed at its top-level path, byte for byte.
+        assert_eq!(disk.read(&base.join("chat/a.tbl")).unwrap(), vec![1, 2, 3]);
+        assert_eq!(disk.read(&base.join("chat/b.tbl")).unwrap(), vec![4]);
+        assert_eq!(
+            disk.read(&base.join(format!("{BLOCKS_DB_ID}/c.tbl")))
+                .unwrap(),
+            vec![9]
+        );
+        // staging is consumed — marker and subtree both gone.
+        assert!(!disk.exists(&base.join(STAGING_DIR)), "staging consumed");
+    }
+
+    #[test]
+    fn torn_staging_is_discarded_on_the_mem_disk() {
+        // staged bytes but no completion marker: adoption sweeps it and the
+        // destination is never created — the marker-last crash story, on mem.
+        let disk = MemDisk::default();
+        let base = Path::new("/idx");
+        stage_shipped_db(&disk, base, "chat", &[("torn.tbl".into(), vec![1, 2, 3])]).unwrap();
+
+        adopt_staged(&disk, base).unwrap();
+
+        assert!(!disk.exists(&base.join(STAGING_DIR)), "torn staging swept");
+        assert!(!disk.exists(&base.join("chat")), "dest never created");
+    }
+
+    #[test]
+    fn committed_staging_replaces_an_existing_dir_on_the_mem_disk() {
+        // a pre-existing destination is removed before the staged copy renames
+        // into place — the adopt path's remove-then-rename, exercised on mem.
+        let disk = MemDisk::default();
+        let base = Path::new("/idx");
+        // an already-installed db with a file the new copy will not carry.
+        disk.write(&base.join("chat/stale.tbl"), b"old").unwrap();
+
+        stage_shipped_db(&disk, base, "chat", &[("fresh.tbl".into(), vec![7])]).unwrap();
+        commit_staged(&disk, base).unwrap();
+        adopt_staged(&disk, base).unwrap();
+
+        assert_eq!(disk.read(&base.join("chat/fresh.tbl")).unwrap(), vec![7]);
+        assert!(
+            disk.read(&base.join("chat/stale.tbl")).is_err(),
+            "the stale db was replaced wholesale, not merged"
+        );
     }
 
     #[test]
