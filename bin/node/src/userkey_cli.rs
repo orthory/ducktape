@@ -700,6 +700,29 @@ fn cmd_user_sign_frame(
     Ok(())
 }
 
+/// resolve the member node's HTTP base for `redeem-invite`: an explicit
+/// `--node <url>` wins, else `-n/--network <id>` resolves through the registry
+/// to the workspace node.toml's `http_listen`. a set-but-broken `--network`
+/// (unknown/ambiguous workspace, or one with no http listen) is a loud error.
+fn redeem_node(
+    flags: &std::collections::BTreeMap<String, String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(url) = flags.get("node").filter(|url| !url.is_empty()) {
+        return Ok(url.trim_end_matches('/').to_string());
+    }
+    if let Some(needle) = flags.get("network").filter(|needle| !needle.is_empty()) {
+        let (_dir, http) = config::resolve_network(needle)?;
+        let base = http.ok_or_else(|| {
+            format!(
+                "network {needle:?} resolves to a workspace with no http listen \
+                 (its node.toml sets no http_listen) — pass --node <http-url>"
+            )
+        })?;
+        return Ok(base.trim_end_matches('/').to_string());
+    }
+    Err("user-redeem-invite needs --node <http-base, e.g. http://host:port> or -n/--network <id>".into())
+}
+
 /// `user-redeem-invite` core — see [`cmd_user_redeem_invite`].
 ///
 /// redeems a CLIENT invite as this user key over a member node's frameless
@@ -718,11 +741,7 @@ fn user_redeem_invite(
     let [blob] = pos.as_slice() else {
         return Err("user-redeem-invite needs exactly one <invite blob>".into());
     };
-    let node = flags
-        .get("node")
-        .ok_or("user-redeem-invite needs --node <http-base, e.g. http://host:port>")?
-        .trim_end_matches('/')
-        .to_string();
+    let node = redeem_node(&flags)?;
     let key_path = PathBuf::from(
         flags
             .get("key")
@@ -773,9 +792,9 @@ fn user_redeem_invite(
     Err(format!("redemption rejected ({status}): {body}").into())
 }
 
-/// `user-redeem-invite <blob> --node <http-base> --key <path>` — stdin:
-/// [password line when the key is v2-encrypted; a fresh path mints a plain
-/// identity]. redeems a CLIENT invite (bearer or targeted) as this user key
+/// `user-redeem-invite <blob> (--node <http-base> | -n/--network <id>) --key <path>`
+/// — stdin: [password line when the key is v2-encrypted; a fresh path mints a
+/// plain identity]. redeems a CLIENT invite (bearer or targeted) as this user key
 /// and prints the consensus verdict; the key then submits via
 /// `/v1/submit/frame` under its own signature.
 fn cmd_user_redeem_invite(
@@ -1317,6 +1336,21 @@ mod userkey_verb_tests {
             mesh_port: 52200,
         };
         config::encode_invite(&d, &token, &wg, &[], issuer).expect("encode blob")
+    }
+
+    #[test]
+    fn redeem_node_prefers_explicit_node_over_network() {
+        // --node short-circuits before the registry, so a bogus -n never
+        // resolves; the trailing slash is trimmed.
+        let flags = parse_flags(&args_of(&[
+            "--node",
+            "http://explicit:8844/",
+            "-n",
+            "no-such-workspace",
+        ]))
+        .unwrap()
+        .1;
+        assert_eq!(redeem_node(&flags).unwrap(), "http://explicit:8844");
     }
 
     #[test]

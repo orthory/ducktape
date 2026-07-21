@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_flags::parse_flags;
+use crate::config;
 
 pub const FILE_NAME: &str = "gateway-routes.json";
 const FORMAT_VERSION: u8 = 1;
@@ -115,11 +116,18 @@ fn save(workspace: &Path, routes: &LocalRoutes) -> Result<(), String> {
     Ok(())
 }
 
+/// the workspace directory holding `gateway-routes.json`: an explicit
+/// `--workspace <dir>` wins, else `-n/--network <id>` resolves through the
+/// registry to the workspace's directory (its node.toml's parent).
 fn workspace(flags: &std::collections::BTreeMap<String, String>) -> Result<PathBuf, String> {
-    flags
-        .get("workspace")
-        .map(PathBuf::from)
-        .ok_or_else(|| "gateway route command needs --workspace <dir>".into())
+    if let Some(dir) = flags.get("workspace").filter(|dir| !dir.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(needle) = flags.get("network").filter(|needle| !needle.is_empty()) {
+        let (dir, _http) = config::resolve_network(needle)?;
+        return Ok(dir);
+    }
+    Err("gateway route command needs --workspace <dir> or -n/--network <id>".into())
 }
 
 fn name(flags: &std::collections::BTreeMap<String, String>) -> Result<gateway::RouteName, String> {
@@ -131,7 +139,8 @@ fn name(flags: &std::collections::BTreeMap<String, String>) -> Result<gateway::R
     Ok(name)
 }
 
-const USAGE: &str = "usage: ducktape gateway <verb> — bind | unbind | list";
+const USAGE: &str =
+    "usage: ducktape gateway <verb> [--workspace <dir> | -n/--network <id>] — bind | unbind | list";
 
 /// Run one verb of the `ducktape gateway` family.
 pub fn run(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -266,6 +275,27 @@ mod tests {
                 "1",
             ]))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_workspace_wins_over_network() {
+        // --workspace short-circuits before the registry, so a bogus -n never
+        // resolves: the route lands in the explicit dir.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy();
+        bind(&args(&[
+            "--workspace",
+            &root,
+            "-n",
+            "no-such-workspace",
+            "--port",
+            "3000",
+        ]))
+        .unwrap();
+        assert_eq!(
+            load(dir.path()).unwrap().port(&gateway::RouteName::apex()),
+            Some(3000)
         );
     }
 }
