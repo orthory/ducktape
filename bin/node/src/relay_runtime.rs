@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use commonware_cryptography::ed25519;
 use commonware_p2p::{Recipients, Sender as P2pSender};
@@ -339,14 +339,14 @@ struct LocalFanout {
     frame: Vec<u8>,
     digest: [u8; 32],
     awaiting: Vec<ed25519::PublicKey>,
-    deadline: Instant,
+    deadline: SystemTime,
 }
 
 struct IncomingBlob {
     peer: ed25519::PublicKey,
     digest: [u8; 32],
     assembly: relay::BlobAssembly,
-    deadline: Instant,
+    deadline: SystemTime,
 }
 
 pub(crate) enum ValidatorAction {
@@ -359,7 +359,7 @@ pub(crate) enum ValidatorAction {
         frame_id: node::FrameId,
         frame: Vec<u8>,
         reply: HttpReply,
-        deadline: Instant,
+        deadline: SystemTime,
     },
 }
 
@@ -383,6 +383,7 @@ impl ValidatorRelay {
     /// pending until every peer acknowledges the pack.
     pub(crate) fn prepare_local<S>(
         &mut self,
+        now: SystemTime,
         frame: Vec<u8>,
         reply: HttpReply,
         peers: Vec<ed25519::PublicKey>,
@@ -392,7 +393,7 @@ impl ValidatorRelay {
         S: P2pSender<PublicKey = ed25519::PublicKey>,
     {
         let frame_id = node::frame_id(&frame);
-        let deadline = Instant::now() + SUBMIT_HOLD;
+        let deadline = now + SUBMIT_HOLD;
         let Some(digest) = relay::required_blob_digest(&frame) else {
             return Ok(Some(ValidatorAction::SubmitLocal {
                 frame_id,
@@ -431,8 +432,10 @@ impl ValidatorRelay {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_message<S>(
         &mut self,
+        now: SystemTime,
         peer: ed25519::PublicKey,
         msg: relay::RelayMsg,
         members: &[Vec<u8>],
@@ -478,7 +481,7 @@ impl ValidatorRelay {
                                 peer,
                                 digest,
                                 assembly,
-                                deadline: Instant::now() + SUBMIT_HOLD,
+                                deadline: now + SUBMIT_HOLD,
                             },
                         );
                     }
@@ -588,7 +591,7 @@ impl ValidatorRelay {
         }
     }
 
-    pub(crate) fn expire<S>(&mut self, now: Instant, relay_tx: &mut S)
+    pub(crate) fn expire<S>(&mut self, now: SystemTime, relay_tx: &mut S)
     where
         S: P2pSender<PublicKey = ed25519::PublicKey>,
     {

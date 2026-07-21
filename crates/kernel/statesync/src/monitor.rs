@@ -28,7 +28,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
+
+use commonware_runtime::Clock;
 
 use crate::SyncResponse;
 
@@ -72,8 +74,8 @@ pub struct PeerServeReport {
 }
 
 struct PeerEntry {
-    first_active: Instant,
-    last_active: Instant,
+    first_active: SystemTime,
+    last_active: SystemTime,
     bytes_tx: u64,
     frames_served: u64,
     boundary_height: Option<u64>,
@@ -85,17 +87,37 @@ struct PeerEntry {
 /// the registry of recently served peers. cloneable handle; the serve loop
 /// `record`s, observers `snapshot`. entries expire by idleness — see the
 /// module doc.
-#[derive(Clone, Default)]
+///
+/// time is read through the node's `Clock` seam (`context.current()`), captured
+/// at construction, so recency/expiry can be advanced by a controlled clock in
+/// tests instead of the wall clock.
+#[derive(Clone)]
 pub struct ServeMonitor {
     peers: Arc<Mutex<HashMap<String, PeerEntry>>>,
+    now: Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 impl ServeMonitor {
+    /// build a monitor reading wall time from the node's runtime `clock` (the
+    /// commonware context the serve loop already owns).
+    pub fn new<C: Clock>(clock: C) -> Self {
+        Self::with_now(move || clock.current())
+    }
+
+    /// build a monitor over an explicit time source. crate-internal so unit
+    /// tests can pin time without a runtime; production goes through [`new`].
+    fn with_now(now: impl Fn() -> SystemTime + Send + Sync + 'static) -> Self {
+        Self {
+            peers: Arc::default(),
+            now: Arc::new(now),
+        }
+    }
+
     /// record one answered request: `kind` is the REQUEST's kind (an Error
     /// response still counts against what was asked), `response` is what was
     /// served, `wire_bytes` the framed bytes that went out for it.
     pub fn record(&self, peer: &str, kind: &'static str, response: &SyncResponse, wire_bytes: u64) {
-        let now = Instant::now();
+        let now = (self.now)();
         let mut peers = self.peers.lock().expect("serve monitor lock");
         let entry = peers.entry(peer.to_string()).or_insert_with(|| PeerEntry {
             first_active: now,
@@ -125,15 +147,17 @@ impl ServeMonitor {
     /// report every recently served peer, pruning entries idle past
     /// [`SERVE_EXPIRE`]. sorted by peer for a stable exposition order.
     pub fn snapshot(&self) -> Vec<PeerServeReport> {
-        let now = Instant::now();
+        let now = (self.now)();
         let mut peers = self.peers.lock().expect("serve monitor lock");
-        peers.retain(|_, entry| now.duration_since(entry.last_active) < SERVE_EXPIRE);
+        peers.retain(|_, entry| {
+            now.duration_since(entry.last_active).unwrap_or_default() < SERVE_EXPIRE
+        });
         let mut reports: Vec<PeerServeReport> = peers
             .iter()
             .map(|(peer, entry)| PeerServeReport {
                 peer: peer.clone(),
-                age: now.duration_since(entry.first_active),
-                idle: now.duration_since(entry.last_active),
+                age: now.duration_since(entry.first_active).unwrap_or_default(),
+                idle: now.duration_since(entry.last_active).unwrap_or_default(),
                 bytes_tx: entry.bytes_tx,
                 frames_served: entry.frames_served,
                 boundary_height: entry.boundary_height,
@@ -194,7 +218,7 @@ mod tests {
     /// adds bytes and a kind-labeled request count.
     #[test]
     fn conversation_accumulates_progress() {
-        let monitor = ServeMonitor::default();
+        let monitor = ServeMonitor::with_now(|| SystemTime::UNIX_EPOCH);
         let manifest = SyncResponse::Manifest(manifest_at(100));
         monitor.record("aa", SyncRequest::Manifest.kind_name(), &manifest, 512);
         let batch = SyncResponse::Frames {
@@ -225,7 +249,7 @@ mod tests {
     /// heights against the advancing chain.
     #[test]
     fn parked_resident_flips_last_kind_without_touching_heights() {
-        let monitor = ServeMonitor::default();
+        let monitor = ServeMonitor::with_now(|| SystemTime::UNIX_EPOCH);
         let manifest = SyncResponse::Manifest(manifest_at(180));
         monitor.record("aa", SyncRequest::Manifest.kind_name(), &manifest, 512);
         let batch = SyncResponse::Frames {
@@ -255,7 +279,7 @@ mod tests {
     /// a tip poller never gains progression fields — only utilization.
     #[test]
     fn tip_polling_reports_no_heights() {
-        let monitor = ServeMonitor::default();
+        let monitor = ServeMonitor::with_now(|| SystemTime::UNIX_EPOCH);
         let coords = SyncResponse::TipCoords(TipCoords {
             height: 42,
             app_hash: StateRoot([1u8; 32]),
@@ -276,7 +300,7 @@ mod tests {
     /// peers are independent entries, snapshot-sorted by label.
     #[test]
     fn peers_are_isolated_and_sorted() {
-        let monitor = ServeMonitor::default();
+        let monitor = ServeMonitor::with_now(|| SystemTime::UNIX_EPOCH);
         let resp = SyncResponse::Error("not ready".into());
         monitor.record("zz", "manifest", &resp, 64);
         monitor.record("aa", "manifest", &resp, 32);

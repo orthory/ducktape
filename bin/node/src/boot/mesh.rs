@@ -76,7 +76,7 @@ pub(crate) fn build(
     // series: statesync rides the mesh carrier (never a data plane), so the
     // monitor above can't see it — the validator's serve task records every
     // answered request here instead, per requesting peer.
-    let sync_monitor = statesync::monitor::ServeMonitor::default();
+    let sync_monitor = statesync::monitor::ServeMonitor::new(context.child("statesync_monitor"));
     let sync_metrics = crate::sync::metrics::SyncServeMetrics::register(&context, &sync_monitor);
 
     // the authorized MESH set, SORTED — what discovery tracks. the
