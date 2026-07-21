@@ -220,6 +220,7 @@ mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     use host::global_root;
+    use sdk_testkit::TestCtx;
     use statesync::qmdb::QmdbStore;
 
     // a fixed-root stand-in module, so we can prove the kv root composes into the
@@ -314,38 +315,6 @@ mod tests {
         assert!(fails.is_empty(), "lost write / None on seeds: {:?}", fails);
     }
 
-    // a minimal Ctx so execute can be driven without a full host.
-    struct TestCtx {
-        env: sdk::Env,
-    }
-    impl TestCtx {
-        fn new() -> Self {
-            Self {
-                env: sdk::Env {
-                    protocol_version: 0,
-                    height: 0,
-                    consensus_time: 0,
-                    origin: sdk::Origin::System,
-                    me: "kv".into(),
-                },
-            }
-        }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for TestCtx {
-        fn env(&self) -> &sdk::Env {
-            &self.env
-        }
-        fn module_root(&self, _t: &str) -> Option<StateRoot> {
-            None
-        }
-        async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-            Err(Error::QueryUnsupported)
-        }
-        fn emit_msg(&mut self, _m: Msg) {}
-        fn emit_event(&mut self, _e: sdk::Event) {}
-    }
-
     // the poison-pill guard: an over-cap set is rejected at WRITE time — never
     // staged, never committed, root unchanged — instead of committing fine and
     // panicking every later decode of that key on every validator.
@@ -362,7 +331,7 @@ mod tests {
             });
             let err = kv
                 .execute(
-                    &mut TestCtx::new(),
+                    &mut TestCtx::at_height(0),
                     &Msg {
                         target: "kv".into(),
                         payload: huge_value,
@@ -382,7 +351,7 @@ mod tests {
             });
             let err = kv
                 .execute(
-                    &mut TestCtx::new(),
+                    &mut TestCtx::at_height(0),
                     &Msg {
                         target: "kv".into(),
                         payload: huge_key,

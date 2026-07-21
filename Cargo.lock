@@ -3576,6 +3576,7 @@ dependencies = [
  "commonware-runtime",
  "host",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
