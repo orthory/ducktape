@@ -70,7 +70,11 @@ impl<'a> EpochSpawner<'a> {
                  ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
             );
         });
-        let (vote, certificate, resolver, payload, fetch) = slot;
+        // bundle this epoch's discovery channel slot + the oracle behind the mesh
+        // carrier seam — the swap point where the sim arm substitutes an
+        // in-process `simulated::Network` (crates/kernel/consensus/tests/
+        // in_process_cluster.rs) for this real encrypted-TCP transport.
+        let carrier = super::DiscoveryMesh::new(slot, self.oracle.clone());
         // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
         // rekey/respawn contract for what a scheme migration would take.
         let scheme =
@@ -97,11 +101,10 @@ impl<'a> EpochSpawner<'a> {
         // silently drop that op's slot and wedge/fork the node. the
         // resolver fetches missing bytes by digest from the tracked mesh
         // (the oracle is provider AND blocker) and fills the ordered slot.
-        SimplexOrderer::spawn_with_resolver(
+        SimplexOrderer::spawn_with_carrier(
             self.context.child(label),
             scheme,
-            self.oracle.clone(),
-            self.oracle.clone(),
+            carrier,
             self.signer.public_key(),
             format!("{}-e{epoch}", self.signer.public_key()),
             Epoch::new(epoch),
@@ -111,11 +114,6 @@ impl<'a> EpochSpawner<'a> {
             // down epoch die with it (in-flight ops are resubmitted). a
             // RESTART's store arrives pre-seeded from the recovery journal.
             store,
-            vote,
-            certificate,
-            resolver,
-            payload,
-            fetch,
             false,
         )
     }
