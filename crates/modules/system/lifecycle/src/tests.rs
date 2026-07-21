@@ -3,65 +3,56 @@
 //! plus the combined-root and shared-`Advance` guarantees the merge introduces.
 
 use super::*;
+use sdk_testkit::TestCtx;
 
-/// a Ctx that answers the valset Validators query with a configurable member
-/// set (the only host-routed read) and carries a settable origin/height, plus a
-/// set of module ids the stubbed host reports as live (`module_root = Some`).
-struct TestCtx {
-    env: sdk::Env,
-    members: Vec<Vec<u8>>,
-    live: Vec<String>,
-}
-impl TestCtx {
-    fn new(origin: Origin, height: u64) -> Self {
-        Self {
-            env: sdk::Env {
-                protocol_version: 0,
-                height,
-                consensus_time: 0,
-                origin,
-                me: "lifecycle".into(),
-            },
-            members: vec![member(1)],
-            live: Vec::new(),
-        }
-    }
-    fn with_members(mut self, members: Vec<Vec<u8>>) -> Self {
-        self.members = members;
-        self
-    }
-    fn at_admission_version(mut self) -> Self {
-        self.env.protocol_version = ADMISSION_ACTIVATION_VERSION;
-        self
-    }
-    fn with_live(mut self, id: &str) -> Self {
-        self.live.push(id.into());
-        self
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, t: &str) -> Option<StateRoot> {
-        self.live.iter().any(|id| id == t).then_some(StateRoot([0; 32]))
-    }
-    async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
-        if target == "valset"
-            && matches!(
-                valset::decode_query(req),
-                Ok(valset::ValsetQuery::Validators)
-            )
-        {
+/// the sole host-routed read lifecycle makes: answers the valset `Validators`
+/// query with `members`, every other query unsupported.
+fn validators(members: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+    move |req| {
+        let is_validators = matches!(
+            valset::decode_query(req),
+            Ok(valset::ValsetQuery::Validators)
+        );
+        if is_validators {
             return Ok(valset::encode_reply(&valset::ValsetReply::Validators(
-                self.members.clone(),
+                members.clone(),
             )));
         }
         Err(Error::QueryUnsupported)
     }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: sdk::Event) {}
+}
+
+fn env_at(origin: Origin, height: u64, protocol_version: u32) -> sdk::Env {
+    sdk::Env {
+        protocol_version,
+        height,
+        consensus_time: 0,
+        origin,
+        me: "lifecycle".into(),
+    }
+}
+
+/// a ctx over `origin`/`height` at protocol v0, valset defaulting to a single
+/// member — the shape the old `TestCtx::new` produced.
+fn ctx(origin: Origin, height: u64) -> TestCtx {
+    TestCtx::with_env(env_at(origin, height, 0)).on_query("valset", validators(vec![member(1)]))
+}
+
+/// `ctx` at the protocol version where module admission is active.
+fn ctx_at_admission(origin: Origin, height: u64) -> TestCtx {
+    TestCtx::with_env(env_at(origin, height, ADMISSION_ACTIVATION_VERSION))
+        .on_query("valset", validators(vec![member(1)]))
+}
+
+/// lifecycle-domain verb kept as a call-site method so the `.with_members`
+/// sites read unchanged after the swap: it re-keys the valset reply.
+trait WithMembers {
+    fn with_members(self, members: Vec<Vec<u8>>) -> Self;
+}
+impl WithMembers for TestCtx {
+    fn with_members(self, members: Vec<Vec<u8>>) -> Self {
+        self.on_query("valset", validators(members))
+    }
 }
 
 fn member(seed: u8) -> Vec<u8> {
@@ -125,7 +116,7 @@ fn upgrade_status(lc: &Lifecycle, ctx: &TestCtx) -> UpgradeStatus {
 // ---- module-code path helpers -----------------------------------------------
 
 fn register_module(lc: &mut Lifecycle, module_id: &str, code: u8) {
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(
         lc,
         &mut sys,
@@ -167,13 +158,13 @@ fn swap_ready(module_id: &str, name: &str) -> Msg {
 }
 /// drive the full single-member readiness latch for a pending swap.
 fn make_swap_ready(lc: &mut Lifecycle, module_id: &str, name: &str) {
-    let mut ext = TestCtx::new(Origin::External(member(1)), 0);
+    let mut ext = ctx(Origin::External(member(1)), 0);
     run(lc, &mut ext, &swap_ready(module_id, name)).unwrap();
     commit(lc);
 }
 fn module_status(lc: &Lifecycle) -> Vec<ModuleCode> {
     let bytes = futures::executor::block_on(
-        lc.query_with(&TestCtx::new(Origin::System, 0), &encode_query(&LifecycleQuery::ModuleStatus)),
+        lc.query_with(&ctx(Origin::System, 0), &encode_query(&LifecycleQuery::ModuleStatus)),
     )
     .unwrap();
     match decode_reply(&bytes).unwrap() {
@@ -183,7 +174,7 @@ fn module_status(lc: &Lifecycle) -> Vec<ModuleCode> {
 }
 fn armed_at(lc: &Lifecycle, height: u64) -> Vec<ArmedSwap> {
     let bytes = futures::executor::block_on(lc.query_with(
-        &TestCtx::new(Origin::System, 0),
+        &ctx(Origin::System, 0),
         &encode_query(&LifecycleQuery::ArmedAt { height }),
     ))
     .unwrap();
@@ -200,16 +191,16 @@ fn armed_at(lc: &Lifecycle, height: u64) -> Vec<ArmedSwap> {
 #[test]
 fn upgrade_schedule_and_cancel_origin_gate() {
     let mut lc = fresh();
-    let mut ext = TestCtx::new(Origin::External(member(1)), 0);
+    let mut ext = ctx(Origin::External(member(1)), 0);
     assert!(matches!(
         run(&mut lc, &mut ext, &schedule_upgrade("a", 10, 2)),
         Err(Error::Module(_))
     ));
-    let mut gov = TestCtx::new(Origin::Module("governance".into()), 0);
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
     run(&mut lc, &mut gov, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
     assert!(lc.committed.pending_upgrade.is_some());
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &cancel_upgrade("a")).unwrap();
     commit(&mut lc);
     assert!(lc.committed.pending_upgrade.is_none());
@@ -218,7 +209,7 @@ fn upgrade_schedule_and_cancel_origin_gate() {
 #[test]
 fn upgrade_ready_origin_gate() {
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
     // module/system rejected.
@@ -227,13 +218,13 @@ fn upgrade_ready_origin_gate() {
         Err(Error::Module(_))
     ));
     // non-member rejected.
-    let mut bad = TestCtx::new(Origin::External(member(9)), 0);
+    let mut bad = ctx(Origin::External(member(9)), 0);
     assert!(matches!(
         run(&mut lc, &mut bad, &upgrade_ready("a", 2)),
         Err(Error::Module(_))
     ));
     // member accepted.
-    let mut good = TestCtx::new(Origin::External(member(1)), 0);
+    let mut good = ctx(Origin::External(member(1)), 0);
     run(&mut lc, &mut good, &upgrade_ready("a", 2)).unwrap();
     commit(&mut lc);
     assert!(lc.committed.upgrade_readiness.contains_key(&member(1)));
@@ -242,7 +233,7 @@ fn upgrade_ready_origin_gate() {
 #[test]
 fn upgrade_schedule_monotonic_min_lead_one_pending() {
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     // to_version 0 !> current 0.
     assert!(run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 0)).is_err());
     // min lead: height 0 + 3 -> activation must be > 3.
@@ -258,15 +249,15 @@ fn upgrade_advance_arm_and_abort() {
     let members = vec![member(1), member(2)];
     // ARM: both members signal.
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let mut sys = ctx(Origin::System, 0).with_members(members.clone());
     run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
     for m in &members {
-        let mut c = TestCtx::new(Origin::External(m.clone()), 0).with_members(members.clone());
+        let mut c = ctx(Origin::External(m.clone()), 0).with_members(members.clone());
         run(&mut lc, &mut c, &upgrade_ready("a", 2)).unwrap();
         commit(&mut lc);
     }
-    let mut boundary = TestCtx::new(Origin::System, 10).with_members(members.clone());
+    let mut boundary = ctx(Origin::System, 10).with_members(members.clone());
     run(&mut lc, &mut boundary, &advance()).unwrap();
     commit(&mut lc);
     assert_eq!(lc.committed.current_version, 2, "armed flips version");
@@ -277,7 +268,7 @@ fn upgrade_advance_arm_and_abort() {
     let mut lc = fresh();
     run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
-    let mut c1 = TestCtx::new(Origin::External(members[0].clone()), 0).with_members(members.clone());
+    let mut c1 = ctx(Origin::External(members[0].clone()), 0).with_members(members.clone());
     run(&mut lc, &mut c1, &upgrade_ready("a", 2)).unwrap();
     commit(&mut lc);
     run(&mut lc, &mut boundary, &advance()).unwrap();
@@ -293,18 +284,18 @@ fn upgrade_advance_arm_and_abort() {
 fn upgrade_same_block_late_signal_aborts_not_arms() {
     let members = vec![member(1), member(2)];
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let mut sys = ctx(Origin::System, 0).with_members(members.clone());
     run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
-    let mut c0 = TestCtx::new(Origin::External(members[0].clone()), 1).with_members(members.clone());
+    let mut c0 = ctx(Origin::External(members[0].clone()), 1).with_members(members.clone());
     run(&mut lc, &mut c0, &upgrade_ready("a", 2)).unwrap();
     commit(&mut lc);
     assert_eq!(lc.committed.upgrade_readiness.len(), 1);
 
     // block H: m1's signal stages readiness=n, Advance runs in the SAME drain.
-    let mut c1 = TestCtx::new(Origin::External(members[1].clone()), 10).with_members(members.clone());
+    let mut c1 = ctx(Origin::External(members[1].clone()), 10).with_members(members.clone());
     run(&mut lc, &mut c1, &upgrade_ready("a", 2)).unwrap();
-    let mut sysh = TestCtx::new(Origin::System, 10).with_members(members);
+    let mut sysh = ctx(Origin::System, 10).with_members(members);
     run(&mut lc, &mut sysh, &advance()).unwrap();
     commit(&mut lc);
     assert_eq!(
@@ -319,10 +310,10 @@ fn upgrade_commitment_bound_ignores_wrong_artifacts() {
     let members = vec![member(1)];
     let name = "commit:clients-route-a";
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let mut sys = ctx(Origin::System, 0).with_members(members.clone());
     run(&mut lc, &mut sys, &schedule_upgrade(name, 10, 1)).unwrap();
     commit(&mut lc);
-    let mut v = TestCtx::new(Origin::External(member(1)), 0).with_members(members.clone());
+    let mut v = ctx(Origin::External(member(1)), 0).with_members(members.clone());
     // wrong-route commitment: stored but not counted / not armable.
     run(
         &mut lc,
@@ -331,7 +322,7 @@ fn upgrade_commitment_bound_ignores_wrong_artifacts() {
     )
     .unwrap();
     commit(&mut lc);
-    let ctx = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let ctx = ctx(Origin::System, 0).with_members(members.clone());
     assert_eq!(upgrade_status(&lc, &ctx).ready_count, 0);
     assert!(!upgrade_status(&lc, &ctx).armed);
     // exact route commitment arms.
@@ -350,11 +341,11 @@ fn upgrade_commitment_bound_ignores_wrong_artifacts() {
 fn effective_version_only_when_armed() {
     let members = vec![member(1), member(2)];
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let mut sys = ctx(Origin::System, 0).with_members(members.clone());
     run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
     for m in &members {
-        let mut c = TestCtx::new(Origin::External(m.clone()), 0).with_members(members.clone());
+        let mut c = ctx(Origin::External(m.clone()), 0).with_members(members.clone());
         run(&mut lc, &mut c, &upgrade_ready("a", 2)).unwrap();
         commit(&mut lc);
     }
@@ -379,7 +370,7 @@ fn effective_version_only_when_armed() {
 #[test]
 fn register_and_schedule_origin_gate() {
     let mut lc = fresh();
-    let mut ext = TestCtx::new(Origin::External(member(1)), 0);
+    let mut ext = ctx(Origin::External(member(1)), 0);
     assert!(matches!(
         run(
             &mut lc,
@@ -391,7 +382,7 @@ fn register_and_schedule_origin_gate() {
         ),
         Err(Error::Module(_))
     ));
-    let mut gov = TestCtx::new(Origin::Module("governance".into()), 0);
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
     run(
         &mut lc,
         &mut gov,
@@ -416,7 +407,7 @@ fn register_and_schedule_origin_gate() {
 fn advance_is_system_only() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut gov = TestCtx::new(Origin::Module("governance".into()), 10);
+    let mut gov = ctx(Origin::Module("governance".into()), 10);
     assert!(matches!(
         run(&mut lc, &mut gov, &advance()),
         Err(Error::Module(_))
@@ -427,7 +418,7 @@ fn advance_is_system_only() {
 fn register_rejects_reregistration_and_bad_hash() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     assert!(run(
         &mut lc,
         &mut sys,
@@ -452,7 +443,7 @@ fn register_rejects_reregistration_and_bad_hash() {
 fn schedule_swap_validation() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     // unregistered module.
     assert!(run(&mut lc, &mut sys, &schedule_swap("ghost", "v2", 10, 2)).is_err());
     // min lead.
@@ -469,21 +460,21 @@ fn schedule_swap_validation() {
 fn swap_advance_activates_at_height_and_frees_slot() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
     commit(&mut lc);
     make_swap_ready(&mut lc, "hello", "v2");
 
     // below activation: no-op.
     let root_before = lc.root();
-    let mut below = TestCtx::new(Origin::System, 9);
+    let mut below = ctx(Origin::System, 9);
     run(&mut lc, &mut below, &advance()).unwrap();
     commit(&mut lc);
     assert_eq!(lc.root(), root_before);
     assert_eq!(module_status(&lc)[0].active_code_hash, hash(1));
 
     // at activation.
-    let mut at = TestCtx::new(Origin::System, 10);
+    let mut at = ctx(Origin::System, 10);
     run(&mut lc, &mut at, &advance()).unwrap();
     commit(&mut lc);
     assert_eq!(module_status(&lc)[0].active_code_hash, hash(2));
@@ -494,20 +485,20 @@ fn swap_advance_activates_at_height_and_frees_slot() {
 fn swap_readiness_gate() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
     commit(&mut lc);
     // no readiness: never arms.
     assert!(armed_at(&lc, u64::MAX).is_empty());
 
     let two = vec![member(1), member(2)];
-    let mut m1 = TestCtx::new(Origin::External(member(1)), 0).with_members(two.clone());
+    let mut m1 = ctx(Origin::External(member(1)), 0).with_members(two.clone());
     run(&mut lc, &mut m1, &swap_ready("hello", "v2")).unwrap();
     commit(&mut lc);
     assert!(!module_status(&lc)[0].pending.clone().unwrap().ready);
     assert!(armed_at(&lc, 10).is_empty());
 
-    let mut m2 = TestCtx::new(Origin::External(member(2)), 0).with_members(two);
+    let mut m2 = ctx(Origin::External(member(2)), 0).with_members(two);
     run(&mut lc, &mut m2, &swap_ready("hello", "v2")).unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].pending.clone().unwrap().ready);
@@ -518,13 +509,13 @@ fn swap_readiness_gate() {
 fn swap_signal_gates_origin_and_identity() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
     commit(&mut lc);
     assert!(run(&mut lc, &mut sys, &swap_ready("hello", "v2")).is_err());
-    let mut stranger = TestCtx::new(Origin::External(member(9)), 0);
+    let mut stranger = ctx(Origin::External(member(9)), 0);
     assert!(run(&mut lc, &mut stranger, &swap_ready("hello", "v2")).is_err());
-    let mut m1 = TestCtx::new(Origin::External(member(1)), 0);
+    let mut m1 = ctx(Origin::External(member(1)), 0);
     assert!(run(&mut lc, &mut m1, &swap_ready("hello", "vX")).is_err());
 }
 
@@ -532,11 +523,11 @@ fn swap_signal_gates_origin_and_identity() {
 fn swap_cancel_guards_and_clears() {
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_swap("hello", "v2", 10, 2)).unwrap();
     commit(&mut lc);
     assert!(run(&mut lc, &mut sys, &cancel_swap("hello", "vX")).is_err());
-    let mut late = TestCtx::new(Origin::System, 10);
+    let mut late = ctx(Origin::System, 10);
     assert!(run(&mut lc, &mut late, &cancel_swap("hello", "v2")).is_err());
     run(&mut lc, &mut sys, &cancel_swap("hello", "v2")).unwrap();
     commit(&mut lc);
@@ -549,14 +540,14 @@ fn swap_cancel_guards_and_clears() {
 #[test]
 fn admission_realizes_and_refuses_bad_inputs() {
     let mut lc = fresh();
-    let mut gov = TestCtx::new(Origin::Module("governance".into()), 0).at_admission_version();
+    let mut gov = ctx_at_admission(Origin::Module("governance".into()), 0);
     run(&mut lc, &mut gov, &schedule_register("kanban", "v1", 10, 5)).unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].active_code_hash.is_empty());
     assert!(armed_at(&lc, 10).is_empty(), "not armed until ready");
     make_swap_ready(&mut lc, "kanban", "v1");
     assert_eq!(armed_at(&lc, 10)[0].code_hash, hash(5));
-    let mut at = TestCtx::new(Origin::System, 10);
+    let mut at = ctx(Origin::System, 10);
     run(&mut lc, &mut at, &advance()).unwrap();
     commit(&mut lc);
     assert_eq!(module_status(&lc)[0].active_code_hash, hash(5));
@@ -565,24 +556,23 @@ fn admission_realizes_and_refuses_bad_inputs() {
     // refuses an existing id, short lead, external origin, live host id.
     let mut lc = fresh();
     register_module(&mut lc, "hello", 1);
-    let mut sys = TestCtx::new(Origin::System, 0).at_admission_version();
+    let mut sys = ctx_at_admission(Origin::System, 0);
     assert!(run(&mut lc, &mut sys, &schedule_register("hello", "v1", 10, 5)).is_err());
     assert!(run(&mut lc, &mut sys, &schedule_register("kanban", "v1", MIN_SWAP_LEAD, 5)).is_err());
-    let mut ext = TestCtx::new(Origin::External(member(1)), 0).at_admission_version();
+    let mut ext = ctx_at_admission(Origin::External(member(1)), 0);
     assert!(run(&mut lc, &mut ext, &schedule_register("kanban", "v1", 10, 5)).is_err());
-    let mut live = TestCtx::new(Origin::System, 0)
-        .at_admission_version()
-        .with_live("valset");
+    let mut live =
+        ctx_at_admission(Origin::System, 0).with_module_root("valset", StateRoot::ZERO);
     assert!(run(&mut lc, &mut live, &schedule_register("valset", "v1", 10, 5)).is_err());
     // below the activation version.
-    let mut old = TestCtx::new(Origin::System, 0);
+    let mut old = ctx(Origin::System, 0);
     assert!(run(&mut lc, &mut old, &schedule_register("kanban", "v1", 10, 5)).is_err());
 }
 
 #[test]
 fn cancelled_admission_removes_entry() {
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).at_admission_version();
+    let mut sys = ctx_at_admission(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
     commit(&mut lc);
     run(&mut lc, &mut sys, &cancel_swap("kanban", "v1")).unwrap();
@@ -599,7 +589,7 @@ fn root_zero_fresh_then_each_half_moves_it() {
     let mut lc = fresh();
     assert_eq!(lc.root(), StateRoot::ZERO);
     // the upgrade half alone moves root off ZERO.
-    let mut sys = TestCtx::new(Origin::System, 0);
+    let mut sys = ctx(Origin::System, 0);
     run(&mut lc, &mut sys, &schedule_upgrade("a", 10, 2)).unwrap();
     commit(&mut lc);
     let after_upgrade = lc.root();
@@ -613,12 +603,12 @@ fn root_zero_fresh_then_each_half_moves_it() {
 fn combined_snapshot_round_trips_both_halves() {
     let members = vec![member(1)];
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let mut sys = ctx(Origin::System, 0).with_members(members.clone());
     // populate BOTH halves: a pending upgrade with a signal, a module with an
     // active hash and a pending, ready swap.
     run(&mut lc, &mut sys, &schedule_upgrade("up", 10, 2)).unwrap();
     commit(&mut lc);
-    let mut v = TestCtx::new(Origin::External(member(1)), 0).with_members(members.clone());
+    let mut v = ctx(Origin::External(member(1)), 0).with_members(members.clone());
     run(&mut lc, &mut v, &upgrade_ready("up", 2)).unwrap();
     commit(&mut lc);
     register_module(&mut lc, "hello", 1);
@@ -655,10 +645,10 @@ fn combined_snapshot_round_trips_both_halves() {
 fn one_advance_ticks_both_halves() {
     let members = vec![member(1)];
     let mut lc = fresh();
-    let mut sys = TestCtx::new(Origin::System, 0).with_members(members.clone());
+    let mut sys = ctx(Origin::System, 0).with_members(members.clone());
     run(&mut lc, &mut sys, &schedule_upgrade("up", 10, 2)).unwrap();
     commit(&mut lc);
-    let mut v = TestCtx::new(Origin::External(member(1)), 0).with_members(members.clone());
+    let mut v = ctx(Origin::External(member(1)), 0).with_members(members.clone());
     run(&mut lc, &mut v, &upgrade_ready("up", 2)).unwrap();
     commit(&mut lc);
     register_module(&mut lc, "hello", 1);
@@ -666,7 +656,7 @@ fn one_advance_ticks_both_halves() {
     commit(&mut lc);
     make_swap_ready(&mut lc, "hello", "v2");
 
-    let mut boundary = TestCtx::new(Origin::System, 10).with_members(members);
+    let mut boundary = ctx(Origin::System, 10).with_members(members);
     run(&mut lc, &mut boundary, &advance()).unwrap();
     commit(&mut lc);
     assert_eq!(lc.committed.current_version, 2, "upgrade armed");
