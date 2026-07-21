@@ -24,7 +24,7 @@ use sha2::{Digest as _, Sha256};
 
 use duckfs_core::objects::{Kind, ObjectId, object_id};
 use duckfs_core::state::{Refs, decode_refs, encode_refs};
-use duckfs_core::store::ObjectStore;
+use duckfs_core::store::{ObjectStore, RefsStore};
 use duckfs_core::{from_hex_32, to_hex};
 
 /// content-addressed object database over `dir/<aa>/<hex[2..]>` files. each file
@@ -49,30 +49,6 @@ impl DiskStore {
             dir,
             dirty: BTreeSet::new(),
         })
-    }
-
-    /// fsync every fanout dir that received an object since the last call, plus
-    /// the odb root (so a freshly-created `<aa>/` dir-entry is itself durable).
-    /// the block glue calls this AFTER flushing the block's objects and BEFORE
-    /// persisting the refs file, so a crash after the refs commit point can
-    /// never reference an object whose directory entry never reached disk.
-    ///
-    /// why not just fsync the odb root: fsync of a directory persists only THAT
-    /// directory's own name→inode entries, not its children's — so the object
-    /// files inside `<aa>/` need `<aa>/` itself fsynced. we fsync each touched
-    /// fanout dir for the file entries, then the root for the fanout-dir entries.
-    /// the reverse gap (objects durable, refs not) is harmless: objects are
-    /// content-addressed and idempotently re-put on replay.
-    pub fn sync_dirs(&mut self) -> Result<(), String> {
-        if self.dirty.is_empty() {
-            return Ok(()); // nothing was published this block
-        }
-        for dir in &self.dirty {
-            fsync_dir(dir)?;
-        }
-        fsync_dir(&self.dir)?;
-        self.dirty.clear();
-        Ok(())
     }
 
     /// the on-disk path for an id: `dir/<aa>/<hex[2..]>`. returned with the hex
@@ -302,6 +278,30 @@ impl ObjectStore for DiskStore {
         out.sort();
         Ok(out)
     }
+
+    /// fsync every fanout dir that received an object since the last call, plus
+    /// the odb root (so a freshly-created `<aa>/` dir-entry is itself durable).
+    /// the block glue calls this AFTER flushing the block's objects and BEFORE
+    /// persisting the refs file, so a crash after the refs commit point can
+    /// never reference an object whose directory entry never reached disk.
+    ///
+    /// why not just fsync the odb root: fsync of a directory persists only THAT
+    /// directory's own name→inode entries, not its children's — so the object
+    /// files inside `<aa>/` need `<aa>/` itself fsynced. we fsync each touched
+    /// fanout dir for the file entries, then the root for the fanout-dir entries.
+    /// the reverse gap (objects durable, refs not) is harmless: objects are
+    /// content-addressed and idempotently re-put on replay.
+    fn sync_dirs(&mut self) -> Result<(), String> {
+        if self.dirty.is_empty() {
+            return Ok(()); // nothing was published this block
+        }
+        for dir in &self.dirty {
+            fsync_dir(dir)?;
+        }
+        fsync_dir(&self.dir)?;
+        self.dirty.clear();
+        Ok(())
+    }
 }
 
 /// the durable refs file — the module's commit point — at `dir/refs`.
@@ -362,9 +362,9 @@ impl DiskRefs {
     }
 }
 
-impl DiskRefs {
+impl RefsStore for DiskRefs {
     /// `None` = fresh dir. `Ok(Some((refs, height, gc_watermark)))` otherwise.
-    pub fn load(&self) -> Result<Option<(Refs, u64, u64)>, String> {
+    fn load(&self) -> Result<Option<(Refs, u64, u64)>, String> {
         let path = self.refs_path();
         let raw = match std::fs::read(&path) {
             Ok(raw) => raw,
@@ -405,7 +405,7 @@ impl DiskRefs {
         Ok(Some((refs, height, gc_watermark)))
     }
 
-    pub fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String> {
+    fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String> {
         let payload = encode_refs(refs);
         let mut buf = Vec::with_capacity(REFS_FIXED_LEN + payload.len());
         buf.extend_from_slice(REFS_MAGIC);

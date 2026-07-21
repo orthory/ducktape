@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::state::Refs;
-use duckfs_core::store::ObjectStore as _;
+use duckfs_core::store::{MemRefs, MemStore, ObjectStore, RefsStore};
 use duckfs_core::{
     FilesMsg, GC_PERIOD_BLOCKS, Kind, ObjectId, PUTBLOB_FRAME_TAG, decode_msg, decode_query,
     decode_sync_req, encode_reply, encode_sync_resp,
@@ -33,7 +33,16 @@ pub(crate) fn gc_due(height: u64, watermark: u64) -> bool {
 /// `publish_block`, so the crash-safety contract is single-sourced (extract-and-
 /// share, not forked). objects are content-addressed + idempotent, so a re-put on
 /// replay is a cheap no-op.
-pub(crate) fn persist_objects(store: &mut DiskStore, objects: &[(Kind, Vec<u8>)]) -> Result<(), Error> {
+///
+/// generic over the object store `S` (integration merge #715×#723): the native
+/// module is now `Files<S, R>`, so this shared helper widens from the concrete
+/// `DiskStore` to any [`ObjectStore`]. the wasm-tenant backing still passes its
+/// concrete `DiskStore`, which satisfies the bound unchanged — the single-source
+/// contract is preserved.
+pub(crate) fn persist_objects<S: ObjectStore>(
+    store: &mut S,
+    objects: &[(Kind, Vec<u8>)],
+) -> Result<(), Error> {
     for (kind, body) in objects {
         store
             .put(*kind, body)
@@ -55,9 +64,14 @@ pub(crate) fn persist_objects(store: &mut DiskStore, objects: &[(Kind, Vec<u8>)]
 /// the caller MUST have persisted the block's objects (via [`persist_objects`])
 /// first: the refs file names those objects, so a crash after this returns must
 /// never reach a refs image whose objects' dir-entries never hit disk.
-pub(crate) fn commit_refs(
-    fs: &mut Fs<DiskStore>,
-    refs_store: &mut DiskRefs,
+///
+/// generic over the stores `S`/`R` (integration merge #715×#723): widened from
+/// the concrete `Fs<DiskStore>`/`DiskRefs` so the native `Files<S, R>` commit path
+/// can share it; the wasm-tenant backing passes its concrete disk stores, still
+/// satisfying the bounds.
+pub(crate) fn commit_refs<S: ObjectStore, R: RefsStore>(
+    fs: &mut Fs<S>,
+    refs_store: &mut R,
     refs: Refs,
     height: u64,
     gc_watermark: u64,
@@ -83,12 +97,19 @@ pub(crate) fn commit_refs(
     Ok(height)
 }
 
-pub struct Files {
+/// the native module glue over the pure [`Fs`] core. generic over the two
+/// persistence seams — the object store `S` and the refs store `R` — so the same
+/// module stands up on disk ([`Files::open`], the default `DiskStore`/`DiskRefs`
+/// arms) or entirely in memory ([`Files::in_mem`], `MemStore`/`MemRefs`). host
+/// registration boxes the disk arm as `Box<dyn Module>`, so the generics never
+/// leak past this crate.
+pub struct Files<S: ObjectStore = DiskStore, R: RefsStore = DiskRefs> {
     id: ModuleId,
-    /// the pure state machine over the disk odb at `<dir>/objects`.
-    fs: Fs<DiskStore>,
-    /// the durable refs file at `<dir>/refs` — the block commit point.
-    refs_store: DiskRefs,
+    /// the pure state machine over the odb (`<dir>/objects` on disk, memory on
+    /// the mem arm).
+    fs: Fs<S>,
+    /// the durable refs commit point (`<dir>/refs` on disk, memory on the mem arm).
+    refs_store: R,
     /// last block height whose refs are durable; per-node recovery bookkeeping,
     /// persisted in the refs-file envelope, never in the root preimage. `None`
     /// until a refs envelope exists (a fresh dir that has never committed or
@@ -126,7 +147,26 @@ impl Files {
             gc_watermark,
         })
     }
+}
 
+impl Files<MemStore, MemRefs> {
+    /// stand the module up entirely in memory — no filesystem, no tempdir. the
+    /// odb and the refs commit point are both in-process (`MemStore`/`MemRefs`),
+    /// so a fresh `in_mem` starts from empty refs with no durable height. this is
+    /// the injectable arm the sim/test layers drive; production always uses
+    /// [`Files::open`].
+    pub fn in_mem() -> Self {
+        Self {
+            id: "files".into(),
+            fs: Fs::new(MemStore::new(), Refs::default()),
+            refs_store: MemRefs::new(),
+            durable_height: None,
+            gc_watermark: 0,
+        }
+    }
+}
+
+impl<S: ObjectStore, R: RefsStore> Files<S, R> {
     /// the exact `root()` preimage — the refs image the snapshot lane ships.
     pub fn snapshot(&self) -> Vec<u8> {
         self.fs.snapshot_refs()
@@ -302,7 +342,7 @@ impl Files {
 }
 
 #[async_trait::async_trait(?Send)]
-impl Module for Files {
+impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }

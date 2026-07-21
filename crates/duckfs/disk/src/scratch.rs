@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 use crate::disk::{DiskRefs, fsync_dir};
 use duckfs_core::state::root_bytes;
+use duckfs_core::store::RefsStore as _;
 use duckfs_core::{from_hex_32, to_hex};
 
 /// an attempt-scoped scratch dir for the files statesync lane: sync into
