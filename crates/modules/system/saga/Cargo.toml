@@ -28,4 +28,5 @@ indexer = { workspace = true, optional = true }
 [dev-dependencies]
 futures = { workspace = true }
 host = { workspace = true }
+sdk-testkit = { workspace = true }
 tempfile = "3"

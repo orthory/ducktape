@@ -14,46 +14,35 @@ use saga::{
     SagaMsg, SagaOrigin, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, encode_msg,
     encode_query,
 };
-use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Env, Error, Module, Msg, Origin, StateRoot};
+use sdk_testkit::TestCtx;
 use valset::{ValsetReply, encode_reply as valset_encode_reply};
 
-/// a minimal `Ctx`: drives `execute` with a controllable env, resolves a
-/// known module for reply_to validation, and serves a canned validator set
-/// (the worker half is out of scope — oracle results re-enter as hand-built
-/// ops).
-struct TestCtx {
-    env: Env,
-    validators: Vec<Vec<u8>>,
+/// the canned validator set saga's lease-holder pool resolves against — served
+/// for whichever assigned target (valset/capability) saga queries, mirroring
+/// the old double that returned it for any target.
+fn validators_query(_req: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(valset_encode_reply(&ValsetReply::Validators(vec![
+        vec![7u8; 32],
+        vec![9u8; 32],
+    ])))
 }
-impl TestCtx {
-    fn new(height: u64, origin: Origin) -> Self {
-        Self {
-            env: Env {
-                protocol_version: 0,
-                height,
-                consensus_time: height,
-                origin,
-                me: "saga".into(),
-            },
-            validators: vec![vec![7u8; 32], vec![9u8; 32]],
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-    fn module_root(&self, target: &str) -> Option<StateRoot> {
-        (target == "agent").then_some(StateRoot::ZERO)
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Ok(valset_encode_reply(&ValsetReply::Validators(
-            self.validators.clone(),
-        )))
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: Event) {}
+
+/// the ctx a host hands saga: env at `height`, `me = "saga"`, the "agent"
+/// module live via `module_root` (reply_to validation gates on it), and the
+/// canned validator set. The worker half is out of scope — oracle results
+/// re-enter as hand-built ops.
+fn ctx(height: u64, origin: Origin) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height,
+        consensus_time: height,
+        origin,
+        me: "saga".into(),
+    })
+    .with_module_root("agent", StateRoot::ZERO)
+    .on_query("valset", validators_query)
+    .on_query("capability", validators_query)
 }
 
 fn exec(m: &mut SagaModule, height: u64, origin: Origin, op: &SagaMsg) {
@@ -61,7 +50,7 @@ fn exec(m: &mut SagaModule, height: u64, origin: Origin, op: &SagaMsg) {
         target: "saga".into(),
         payload: encode_msg(op),
     };
-    block_on(m.execute(&mut TestCtx::new(height, origin), &msg)).unwrap();
+    block_on(m.execute(&mut ctx(height, origin), &msg)).unwrap();
 }
 
 fn get(m: &SagaModule, id: &str) -> Option<SagaView> {
