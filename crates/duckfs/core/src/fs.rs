@@ -217,6 +217,17 @@ impl<S: ObjectStore> Fs<S> {
         &self.refs
     }
 
+    /// read-only access to the object store — the `&self` twin of
+    /// [`Fs::store_mut`]. the host-side odb backing ([`files::FilesOdbBacking`])
+    /// serves its `HostOdb::stat`/`get` (a `&self` surface) by reading committed
+    /// object bodies straight off the concrete `S`, reusing the store's verified
+    /// read rather than forking the disk-read logic. glue/test plumbing, not the
+    /// semantic surface (all consensus reads/writes go through the typed methods).
+    #[doc(hidden)]
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
     /// direct access to the object store — the native glue (`module.rs`) needs
     /// the concrete `S` after [`Fs::commit_block`] to flush the block's objects
     /// and fsync their odb dirs, and by-hand durability tests drive the same

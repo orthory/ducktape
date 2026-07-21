@@ -153,7 +153,15 @@ pub trait OdbBacking: HostOdb {
     /// received via [`HostOdb::stage_put`] this block durable (native
     /// `store.sync_dirs`). the kernel calls this BEFORE `adopt_refs`, so the
     /// refs commit point can never precede the objects it references.
-    fn publish_block(&mut self) -> Result<(), SdkError>;
+    ///
+    /// `height` is the committing block's height, captured by the kernel during
+    /// `execute` (a committed block always ran at least one dispatch). the
+    /// backing records it here and stamps it into the refs envelope at
+    /// [`OdbBacking::adopt_refs`] — native saves refs+height in one
+    /// `DiskRefs::save`, the kernel splits publish from adopt so the backing
+    /// recombines them. a disk backing needs it for the durable-height recovery
+    /// bookkeeping; the in-memory mock ignores it.
+    fn publish_block(&mut self, height: u64) -> Result<(), SdkError>;
     /// drop this block's staged objects without publishing (native
     /// `Fs::abort_block` drops the in-memory pending; a disk backing may also
     /// sweep orphan object files). the committed refs + odb stay untouched.
@@ -489,6 +497,13 @@ pub struct WasmModule {
     /// same-block staged write). off by default: every other tenant keeps the
     /// read-your-writes query surface.
     committed_queries: bool,
+    /// the height of the block currently staging, captured each `execute` and
+    /// consumed at the block boundary. only [`StateBacking::Odb`] reads it — it
+    /// threads to [`OdbBacking::publish_block`] so a disk backing can stamp the
+    /// durable-height into its refs envelope (the recovery bookkeeping the native
+    /// module records atomically with the refs). `None` between blocks / when no
+    /// dispatch has run this block.
+    block_height: Option<u64>,
 }
 
 impl WasmModule {
@@ -510,6 +525,7 @@ impl WasmModule {
             fuel: DEFAULT_FUEL,
             state_schema_revision: 1,
             committed_queries: false,
+            block_height: None,
         })
     }
 
@@ -993,6 +1009,10 @@ impl Module for WasmModule {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), SdkError> {
         let env = to_wit_env(ctx.env());
+        // capture the block height for the boundary: an Odb backing stamps it into
+        // its durable-height envelope at commit. every dispatch this block carries
+        // the same height, so re-setting it per dispatch is idempotent.
+        self.block_height = Some(env.height);
         // every replay round re-runs the pure guest over the SAME pre-dispatch
         // stage: an aborted round's writes must not leak into the next, or a
         // replay could observe (e.g. double-apply) its own discarded effects.
@@ -1183,6 +1203,11 @@ impl Module for WasmModule {
     }
 
     async fn commit_block(&mut self) -> Result<(), SdkError> {
+        // the committing block's height, captured during execute; consumed here.
+        // `0` only if no dispatch ran this block — impossible for a touched (=
+        // committing) module, and inert regardless (nothing staged → the Odb arm
+        // never reaches `adopt_refs`, so the height is never persisted).
+        let height = self.block_height.take().unwrap_or(0);
         match &mut self.backing {
             StateBacking::Map { committed } => {
                 // Map/Store guests never stage objects; drop any (there are none)
@@ -1219,8 +1244,9 @@ impl Module for WasmModule {
                     backing.stage_put(kind, body);
                 }
                 // 2. objects-durable barrier (native `store.sync_dirs`) — BEFORE
-                //    the refs commit point below.
-                backing.publish_block()?;
+                //    the refs commit point below. threads the block height so the
+                //    backing can stamp its durable-height envelope at adopt.
+                backing.publish_block(height)?;
                 // 3. adopt the new refs image IFF the block staged one — the sole
                 //    place the root moves (native `refs_store.save` + `adopt_refs`).
                 //    an empty stage leaves refs, and the root, untouched.
@@ -1267,6 +1293,8 @@ impl Module for WasmModule {
         self.staged.clear();
         // discard this block's staged object puts alongside the state stage.
         self.staged_objects.clear();
+        // the aborted block's captured height is void — the next block recaptures.
+        self.block_height = None;
         // tell an odb backing to drop any block-local pending too (native
         // `Fs::abort_block`; a disk backing may sweep orphan object files). in
         // the fatal-or-complete commit model the backing has no pending here

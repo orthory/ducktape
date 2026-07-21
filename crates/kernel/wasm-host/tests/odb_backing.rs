@@ -51,7 +51,7 @@ fn object_id(kind: u8, body: &[u8]) -> [u8; 32] {
 #[derive(Debug, Clone, PartialEq)]
 enum Call {
     StagePut(u8, Vec<u8>),
-    PublishBlock,
+    PublishBlock(u64),
     AdoptRefs(Vec<u8>),
     DiscardBlock,
     Query(Vec<u8>),
@@ -129,9 +129,9 @@ impl OdbBacking for Mock {
         inner.committed_refs = bytes.to_vec();
         Ok(())
     }
-    fn publish_block(&mut self) -> Result<(), Error> {
+    fn publish_block(&mut self, height: u64) -> Result<(), Error> {
         let mut inner = self.0.borrow_mut();
-        inner.log.push(Call::PublishBlock);
+        inner.log.push(Call::PublishBlock(height));
         for (kind, body) in std::mem::take(&mut inner.pending_objects) {
             let id = object_id(kind, &body).to_vec();
             let mut tagged = Vec::with_capacity(1 + body.len());
@@ -355,12 +355,14 @@ async fn publish_flushes_objects_before_adopting_refs() {
 
     // the crash-safety ordering: objects flushed (stage_put + publish_block)
     // BEFORE the refs adopt — the disk backing (Task 4) fsyncs the odb before
-    // the refs commit point for exactly this reason.
+    // the refs commit point for exactly this reason. publish_block carries the
+    // block height (MockCtx dispatches at height 7), which the disk backing
+    // stamps into its refs envelope at adopt.
     assert_eq!(
         mock.log(),
         vec![
             Call::StagePut(2, b"tree-body".to_vec()),
-            Call::PublishBlock,
+            Call::PublishBlock(7),
             Call::AdoptRefs(b"REFS-V1".to_vec()),
         ],
         "staged objects publish, THEN refs adopt"

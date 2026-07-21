@@ -8,7 +8,7 @@ version.workspace = true
 # consensus module id and SDK capability glue, plus a compatibility re-export.
 [features]
 default = ["native"]
-native = ["dep:duckfs-disk", "dep:sdk", "dep:async-trait", "dep:serde_json"]
+native = ["dep:duckfs-disk", "dep:sdk", "dep:async-trait", "dep:serde_json", "dep:wasm-host"]
 # the wasm-guest port: `FilesGuest` runs `duckfs_core::Fs<GuestOdb>` over the
 # WIT object plane, single-sourcing the op semantics with `native`. non-default
 # and wasm-only (the guest-adapter bindings compile only for
@@ -18,6 +18,10 @@ guest = ["dep:guest-adapter", "dep:sdk", "dep:serde_json"]
 [dependencies]
 duckfs-core = { workspace = true }
 duckfs-disk = { workspace = true, optional = true }
+# the kernel host: `FilesOdbBacking` implements its `OdbBacking` trait. native
+# feature only (the disk-backed odb substrate); no cycle — wasm-host has no files
+# dep. the pure `--no-default-features` core never pulls it.
+wasm-host = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sdk = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
