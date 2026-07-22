@@ -1,11 +1,14 @@
-//! the persistence seam. the pure core only ever sees `ObjectStore`; `MemStore`
-//! beside it backs tests, and the disk pair (duckfs-disk) lives behind the
-//! `native` feature. refs persistence is duckfs-disk's `DiskRefs` — the core
-//! never abstracts over it.
+//! the persistence seam. the pure core only ever sees [`ObjectStore`] for
+//! objects and [`RefsStore`] for the durable refs image; the mem pair
+//! ([`MemStore`], [`MemRefs`]) beside them backs tests and the mem-arm `files`
+//! module, and the disk pair (duckfs-disk's `DiskStore`/`DiskRefs`) lives behind
+//! the `native` feature. genericizing over BOTH seams is what lets the `files`
+//! module stand up entirely in memory (`Files::in_mem`) with zero filesystem.
 
 use std::collections::BTreeMap;
 
 use crate::objects::{Kind, ObjectId, object_id};
+use crate::state::Refs;
 
 pub trait ObjectStore {
     fn put(&mut self, kind: Kind, body: &[u8]) -> Result<ObjectId, String>;
@@ -31,6 +34,55 @@ pub trait ObjectStore {
     fn stat(&self, id: &ObjectId) -> Result<Option<(Kind, u64)>, String>;
     fn remove(&mut self, id: &ObjectId) -> Result<(), String>;
     fn list(&self) -> Result<Vec<ObjectId>, String>;
+    /// flush any directory entries published since the last call so freshly
+    /// `put` objects are fully durable — the object-side durability barrier the
+    /// block glue runs BEFORE the refs commit point. the default is a no-op: an
+    /// in-memory store has no directory entries to fsync (its bytes are durable
+    /// the instant `put` returns). a disk-backed store overrides to fsync the
+    /// fanout dirs it touched.
+    fn sync_dirs(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// the durable refs seam — the block commit point. the pure core abstracts over
+/// it exactly as it does [`ObjectStore`]: [`MemRefs`] backs mem-arm tests, the
+/// disk arm (duckfs-disk's `DiskRefs`) writes the atomic refs-file envelope.
+/// `load`/`save` carry the per-node recovery bookkeeping (block height + gc
+/// watermark) alongside the refs image — bookkeeping that lives ONLY here, never
+/// in the module root preimage.
+pub trait RefsStore {
+    /// `Ok(None)` = fresh (never saved); `Ok(Some((refs, height, gc_watermark)))`
+    /// otherwise. a corrupt durable store errors rather than defaulting.
+    fn load(&self) -> Result<Option<(Refs, u64, u64)>, String>;
+    /// persist the refs image with its recovery bookkeeping. `&mut self` matches
+    /// the disk arm, whose atomic tmp→rename→fsync writes through the handle.
+    fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String>;
+}
+
+/// in-memory refs store — the mem-arm commit point. holds the last saved triple
+/// (or `None` when never saved), so it round-trips the [`RefsStore`] contract
+/// without touching disk. per-process only; dropped with the module.
+#[derive(Default)]
+pub struct MemRefs {
+    saved: Option<(Refs, u64, u64)>,
+}
+
+impl MemRefs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl RefsStore for MemRefs {
+    fn load(&self) -> Result<Option<(Refs, u64, u64)>, String> {
+        Ok(self.saved.clone())
+    }
+
+    fn save(&mut self, refs: &Refs, height: u64, gc_watermark: u64) -> Result<(), String> {
+        self.saved = Some((refs.clone(), height, gc_watermark));
+        Ok(())
+    }
 }
 
 /// in-memory object store — tests and the phase-1 glue.
@@ -140,5 +192,18 @@ mod tests {
         assert_eq!(s.list().unwrap(), want);
         // removing an absent id is a no-op, not an error.
         s.remove(&object_id(Kind::Chunk, b"absent")).unwrap();
+    }
+
+    #[test]
+    fn mem_refs_round_trips_save_then_load_fresh_is_none() {
+        let mut refs = MemRefs::new();
+        // fresh = never saved = the disk arm's fresh-dir Ok(None).
+        assert_eq!(refs.load().unwrap(), None);
+        let r = Refs {
+            head: Some([7; 32]),
+            ..Default::default()
+        };
+        refs.save(&r, 42, 9).unwrap();
+        assert_eq!(refs.load().unwrap(), Some((r, 42, 9)));
     }
 }
