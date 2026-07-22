@@ -76,7 +76,7 @@ fn wasm_governance() -> WasmModule {
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
 fn native_governance() -> Governance {
-    Governance::new("governance", "valset", "lifecycle", "identity")
+    Governance::new("governance", "valset", "identity")
         .with_invite_binding(INVITE)
         .with_code_registry("lifecycle")
 }
@@ -220,7 +220,6 @@ fn block(height: u64, origin: Origin) -> BlockContext {
         height,
         consensus_time: 1_000 + height,
         origin,
-        protocol_version: 0,
     }
 }
 
@@ -479,41 +478,6 @@ async fn same_ops_inner() {
     )
     .await;
 
-    // ---- ScheduleUpgrade: a passing authorization emits into the native
-    // upgrade sibling.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &ids,
-        9,
-        Origin::External(a_pub.clone()),
-        propose(
-            "p-upg",
-            GovAction::ScheduleUpgrade {
-                name: "v2".into(),
-                activation_height: 400,
-                to_version: 1,
-            },
-            500,
-        ),
-        true,
-        &[],
-    )
-    .await;
-    roundtrip(&mut native, &mut wasm, &ids, 10, Origin::External(a_pub.clone()), vote("p-upg", true), true, &[]).await;
-    roundtrip(&mut native, &mut wasm, &ids, 11, Origin::External(b_pub.clone()), vote("p-upg", true), true, &[]).await;
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &ids,
-        12,
-        Origin::External(a_pub.clone()),
-        execute("p-upg"),
-        true,
-        &["lifecycle"],
-    )
-    .await;
-
     // ---- UpdateModule: a WASM governance drives the CODE REGISTRY — the
     // passing authorization emits LifecycleMsg::ScheduleSwap into the native lifecycle
     // sibling, scheduling a height-gated code swap for the "hello" tenant.
@@ -681,19 +645,6 @@ async fn rejections_inner() {
             Origin::External(a_pub.clone()),
             propose("p2", GovAction::AddValidator { key: vec![1; 8] }, 5),
             "32-byte ed25519",
-        ),
-        (
-            Origin::External(a_pub.clone()),
-            propose(
-                "p2",
-                GovAction::ScheduleUpgrade {
-                    name: String::new(),
-                    activation_height: 400,
-                    to_version: 1,
-                },
-                5,
-            ),
-            "upgrade name must not be empty",
         ),
         (
             Origin::External(a_pub.clone()),

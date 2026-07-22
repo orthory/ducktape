@@ -109,7 +109,6 @@ fn env_from_wit(env: host::Env) -> Env {
             host::Origin::System => Origin::System,
         },
         me: env.me,
-        protocol_version: env.protocol_version,
     }
 }
 

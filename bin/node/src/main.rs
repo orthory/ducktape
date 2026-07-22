@@ -97,7 +97,6 @@ mod validator;
 mod voice;
 mod voice_plane;
 use config::Resolved;
-use constants::*;
 #[cfg(test)]
 use explorer::sealed_frame_block_row;
 #[cfg(test)]
@@ -113,9 +112,6 @@ use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_fram
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
 use util::hex;
-#[cfg(test)]
-use validator::announce::ReadinessSignaller;
-
 #[cfg(test)]
 use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use crate::util::fatal;
@@ -161,13 +157,9 @@ fn hold_macos_activity() {
     std::mem::forget(token);
 }
 
-/// `ducktape version` — the binary name, its crate version, and the highest
-/// protocol version this binary can execute.
+/// `ducktape version` — the binary name and its crate version.
 fn version_line() -> String {
-    format!(
-        "ducktape {} (protocol v{MAX_PROTOCOL_VERSION})",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("ducktape {}", env!("CARGO_PKG_VERSION"))
 }
 
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
@@ -178,7 +170,7 @@ fn version_line() -> String {
     about = "one workspace-network node and its operator tools",
     // clap prints "<name> <version>", so the version string must NOT repeat
     // the binary name the way `version_line()` (the `version` verb) does.
-    version = &*format!("{} (protocol v{MAX_PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION")).leak(),
+    version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {

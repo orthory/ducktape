@@ -17,15 +17,14 @@ use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{CutoverTrigger, EpochActions};
 use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
-    read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
-    read_valset_residents, upgrade_operations,
+    read_valset_members, read_valset_residents,
 };
 use crate::{lobby, relay};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_drain(&mut self) {
-        let operation_metrics = self.metrics.clone();
+
         let Self {
             context,
             node,
@@ -157,7 +156,7 @@ impl ValidatorRuntime<'_> {
             if d.disposition == node::Disposition::Discarded {
                 continue;
             }
-            // resolve a HELD JOIN GATE (ADR §3.2 / Join v2 §4): the joiner's
+            // resolve a HELD JOIN GATE (ADR §3.2 / join ADR §4): the joiner's
             // outcome was held against this Redeem frame — now the drain knows
             // its consensus fate. Applied ⇒ the AUTHORITATIVE Admitted at the
             // committed height (carrying the coord cap); Rejected ⇒ map the
@@ -446,7 +445,6 @@ impl ValidatorRuntime<'_> {
             && let Some(f) = node.finalized()
         {
             let pos = node.sink_mut().oplog_pos().await;
-            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
             let captured = Manifest::capture(
                 node.host(),
                 Some(f.height),
@@ -455,8 +453,6 @@ impl ValidatorRuntime<'_> {
                 participant_bytes(orchestrator),
                 resident_bytes(orchestrator),
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                cv,
-                pu,
                 pos,
                 *next_seq,
             );
@@ -580,28 +576,7 @@ impl ValidatorRuntime<'_> {
                 );
                 node.set_view_ceiling(cutover.cutover_view());
             }
-            // a pending upgrade arms the SAME single cutover slot at its
-            // activation height (design §"One boundary carries both
-            // concerns") — never a competing arm: when a membership
-            // cutover already holds the slot `observe_upgrade` returns
-            // Pending and the version flip rides that boundary via the
-            // boundary read in `respawn_if_due`. inert until the module is
-            // registered (`read_upgrade_state` returns baseline/no-pending).
-            let boundary_upgrade = read_upgrade_state(node.host()).await;
-            if let Some(CutoverTrigger::Upgrade {
-                cutover,
-                name,
-                activation_height,
-            }) = actions.observe_upgrade(&boundary_upgrade)
-            {
-                println!(
-                    "[node {label}] upgrade '{name}' armed — cutover to epoch {} at view {} (activation height {activation_height})",
-                    cutover.next_epoch(),
-                    cutover.cutover_view()
-                );
-                node.set_view_ceiling(cutover.cutover_view());
-            }
-            if let Some(plan) = actions.respawn(boundary_upgrade) {
+            if let Some(plan) = actions.respawn() {
                 let members = plan.valset().consensus_members();
                 let member_bytes: Vec<Vec<u8>> =
                     members.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -700,57 +675,11 @@ impl ValidatorRuntime<'_> {
                         fatal!(label, "{e} — halting");
                     }
                 }
-                // ACTIVATION (design §4): realize the agreed boundary
-                // protocol version into every dual-path module's
-                // active_version (branch selector) at H. driven ONLY by
-                // the agreed `plan.boundary_version()` — deterministic,
-                // non-hashed. the upgrade module's OWN committed
-                // reconciliation (current_version flip + pending clear on
-                // ARM, clear-only on ABORT) is NOT done here: it rides the
-                // single in-block System `Advance` the host drain injects
-                // at the same finalized view (Task 6.3), so both concerns
-                // land at ONE boundary and every node agrees. do NOT branch
-                // a separate abort-only follow-up — the one Advance owns both.
-                node.host_mut().set_active_version(plan.boundary_version());
-                match plan.upgrade_verdict() {
-                    consensus::UpgradeVerdict::Armed { name, to_version } => {
-                        tracing::info!(
-                            event = "node_upgrade_activated",
-                            node = %label,
-                            name = %name,
-                            to_version,
-                            height = plan.cutover_app_height()
-                        );
-                        println!(
-                            "[node {label}] upgrade activated name={name} version={to_version} at height {}",
-                            plan.cutover_app_height()
-                        );
-                    }
-                    consensus::UpgradeVerdict::Abort { name } => {
-                        tracing::warn!(
-                            event = "node_upgrade_aborted",
-                            node = %label,
-                            name = %name,
-                            height = plan.cutover_app_height(),
-                            current_version = plan.boundary_version()
-                        );
-                        println!(
-                            "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
-                            plan.cutover_app_height(),
-                            plan.boundary_version()
-                        );
-                    }
-                    consensus::UpgradeVerdict::None => {}
-                }
                 // checkpoint IMMEDIATELY: the manifest must record
                 // the new epoch's participant set (the journal's
                 // cutover record alone covers only the crash
                 // window until this write lands).
                 let pos = node.sink_mut().oplog_pos().await;
-                // post-boundary committed version fields: after an armed
-                // Advance the module holds `current_version = to_version`
-                // + no pending, so this checkpoint stamps the new baseline.
-                let (cv, pu) = read_upgrade_version_fields(node.host()).await;
                 let captured = Manifest::capture(
                     node.host(),
                     node.finalized().map(|f| f.height),
@@ -759,8 +688,6 @@ impl ValidatorRuntime<'_> {
                     participant_bytes(orchestrator),
                     resident_bytes(orchestrator),
                     None,
-                    cv,
-                    pu,
                     pos,
                     *next_seq,
                 );
@@ -790,10 +717,9 @@ impl ValidatorRuntime<'_> {
         }
 
         // the state-driven pumps, each its own method below: block
-        // cadence/heartbeat, upgrade readiness, capability announce,
+        // cadence/heartbeat, code readiness, capability announce,
         // saga crank, dispatch delivery nudge.
         self.pump_heartbeat().await;
-        self.pump_readiness_signal().await;
         self.pump_code_readiness().await;
         self.pump_capability_announce().await;
         self.pump_saga_crank().await;
@@ -809,57 +735,10 @@ impl ValidatorRuntime<'_> {
             applied,
             converged,
             workers,
-            upgrade_armed_latch,
-            upgrade_pending_seen,
             ..
         } = self;
         let dev_demo = *dev_demo;
         let expected = *expected;
-
-        // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
-        // the greppable proof surface the e2e keys on. `armed` is the
-        // module's own R==n verdict (pending set, boundary non-empty,
-        // every current member signaled), so this fires exactly when
-        // readiness first reaches the full set — before H is crossed.
-        if let Some(st) = read_upgrade_status_raw(node.host()).await {
-            let local_key = signer.public_key();
-            operation_metrics.update_upgrade(upgrade_operations(&st, Some(&local_key)));
-            match &st.pending {
-                Some(up) => {
-                    *upgrade_pending_seen = Some(up.name.clone());
-                    let key = (up.name.clone(), up.to_version);
-                    if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
-                        tracing::info!(
-                            event = "node_upgrade_armed",
-                            node = %label,
-                            name = %up.name,
-                            to_version = up.to_version,
-                            activation_height = up.activation_height,
-                            ready_validators = st.ready_count,
-                            required_validators = st.member_count
-                        );
-                        println!(
-                            "[node {label}] upgrade armed name={} to_version={} height={}",
-                            up.name, up.to_version, up.activation_height
-                        );
-                        *upgrade_armed_latch = Some(key);
-                    }
-                }
-                None => {
-                    if let Some(name) = upgrade_pending_seen.take() {
-                        // the boundary Advance reconciled the pending
-                        // (ARM flip or ABORT clear) — the slot is free.
-                        tracing::info!(
-                            event = "node_upgrade_cleared",
-                            node = %label,
-                            name = %name
-                        );
-                        println!("[node {label}] upgrade cleared name={name}");
-                        *upgrade_armed_latch = None;
-                    }
-                }
-            }
-        }
 
         // the reactor seam: offer each finalized block's events to
         // the host-owned workers; a claiming worker's follow-up op
@@ -982,50 +861,14 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    // READINESS SIGNAL (design §3 / plan Task 7.1): a current
-    // boundary member whose binary can execute the pending upgrade
-    // self-submits ONE `SignalReady`. gated to a current member (the
-    // R = n readiness denominator); the signaller's own committed
-    // read + local latch keep it idempotent. inert on a baseline net.
-    async fn pump_readiness_signal(&mut self) {
-        let Self {
-            node,
-            orchestrator,
-            next_seq,
-            signer,
-            label,
-            signaller,
-            ..
-        } = self;
-        if orchestrator
-            .current_members()
-            .contains(&signer.public_key())
-            && let Some((msg, name, to_version)) = signaller.maybe_signal(node.host()).await
-        {
-            let seq = *next_seq;
-            *next_seq += 1;
-            match node.submit(signer, seq, msg).await {
-                Ok(_) => {
-                    println!("[node {label}] signaled ready name={name} to_version={to_version}")
-                }
-                Err(e) => {
-                    // un-latch so a transient submit failure retries on
-                    // the next tick (the module stays idempotent).
-                    signaller.signaled = None;
-                    eprintln!("[node {label}] readiness signal submit failed: {e}");
-                }
-            }
-        }
-    }
-
     // CODE READINESS: the byte-receipt half of a pending modreg swap.
     // a current boundary member checks the committed pending swaps against
     // its LOCAL blob store: verified-resident bytes earn one truthful
     // validator-origin `SignalReady` (the covering signal latches the swap
     // `ready` in consensus); missing bytes spawn one ranged mesh fetch
     // (the custodian's data-plane push normally lands first — this heals a
-    // node the push missed). state-driven and idempotent like the upgrade
-    // signaller above; inert while nothing is pending.
+    // node the push missed). state-driven and idempotent; inert while
+    // nothing is pending.
     async fn pump_code_readiness(&mut self) {
         let Self {
             node,

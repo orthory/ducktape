@@ -14,12 +14,11 @@ use super::{
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
 /// network re-mints invites on a format change, and a stale paste fails loudly
-/// at decode — the old `ducktape:` / `ducktape-invite-v*:` prefixes no longer
-/// decode at all.
+/// at decode.
 const INVITE_PREFIX: &str = "🦆";
 
-/// Join Protocol v2: the WireGuard/overlay plane is MANDATORY, so an invite
-/// always brings up the joiner's reachability plane. Kept as a named predicate
+/// the WireGuard/overlay plane is MANDATORY, so an invite always brings up
+/// the joiner's reachability plane. Kept as a named predicate
 /// (call sites read as intent) rather than inlining a bare `true`.
 pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
     true
@@ -43,7 +42,7 @@ pub use governance::invite::{
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
 /// namespace), with `role` and `expires_unix_secs`: fresh OS randomness for the
 /// nonce, signed by this member's identity. minting IS the admission decision —
-/// there is no target (기명 dropped in Join Protocol v2); whoever presents a
+/// there is no target (기명 dropped — see the join ADR); whoever presents a
 /// valid join proof for the nonce first redeems it, single-use.
 pub fn mint_invite_token(
     signer: &ed25519::PrivateKey,
@@ -285,8 +284,7 @@ pub fn load_invite_fronts(dir: &Path) -> Result<Vec<Front>, String> {
 // the invite blob — the whole join credential packed into one signed line.
 //
 // ONE format, unversioned (bootstrapping posture — a format change re-mints
-// invites; the older `ducktape-invite-v*:` generations no longer decode). the
-// blob is a CAPABILITY, not a doorbell: it carries the descriptor (chain-id +
+// invites). the blob is a CAPABILITY, not a doorbell: it carries the descriptor (chain-id +
 // genesis validators + typed reach hints), the inviter's WireGuard bootstrap
 // (when the inviter runs the reachability plane), an expiry, and the invite
 // token whose mint IS the admission decision. the whole envelope is signed by
@@ -445,11 +443,7 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
         .trim()
         .strip_prefix(INVITE_PREFIX)
         .ok_or_else(|| {
-            format!(
-                "not a ducktape invite (expected {INVITE_PREFIX}...); an older \
-                 ducktape:/ducktape-invite-v*: blob no longer decodes — ask for a \
-                 fresh invite"
-            )
+            format!("not a ducktape invite (expected {INVITE_PREFIX}...) — ask for a fresh invite")
         })?;
     let bytes = INVITE_B64
         .decode(body)
@@ -1194,9 +1188,8 @@ mod tests {
         let outsider = ed25519::PrivateKey::from_seed(8);
         assert!(encode_invite(&d, &token, &coordinated_test_wg(), &[], &outsider).is_err());
 
-        // the old versioned prefixes are gone: a stale paste fails loudly
-        // with re-mint guidance.
-        let err = decode_invite_at("ducktape-invite-v2:AAAA", 0).expect_err("stale prefix");
+        // a non-invite paste fails loudly with re-mint guidance.
+        let err = decode_invite_at("not-an-invite:AAAA", 0).expect_err("bad prefix");
         assert!(err.contains("fresh invite"), "{err}");
     }
 

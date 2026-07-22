@@ -34,7 +34,6 @@ use sdk_testkit::TestCtx;
 // forge's execute reads only env (consensus_time); me/height are cosmetic.
 fn at(consensus_time: u64) -> TestCtx {
     TestCtx::with_env(sdk::Env {
-        protocol_version: 0,
         height: 0,
         consensus_time,
         origin: sdk::Origin::System,
@@ -97,9 +96,9 @@ fn first_pack_offset(bytes: &[u8]) -> usize {
 }
 
 /// assemble a one-repo, one-branch (`main`) container with an EMPTY tracker
-/// section: `FGv2 [count=1][name][ref_count=1]["main" oid][pack_len pack][tracker]`.
+/// section: `FGv1 [count=1][name][ref_count=1]["main" oid][pack_len pack][tracker]`.
 fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
-    let mut out = b"FGv2".to_vec();
+    let mut out = b"FGv1".to_vec();
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&(name.len() as u32).to_le_bytes());
     out.extend_from_slice(name.as_bytes());
@@ -266,7 +265,7 @@ fn empty_snapshot_round_trips_the_unborn_state() {
     let src_base = tmp_base("empty-src");
     let src = Forge::init("forge", src_base.clone()).unwrap();
     let bytes = src.snapshot().unwrap();
-    let mut expected = b"FGv2".to_vec();
+    let mut expected = b"FGv1".to_vec();
     expected.extend_from_slice(&[0u8; 4]); // zero repo count
     expected.extend_from_slice(&empty_tracker_section());
     assert_eq!(

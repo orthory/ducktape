@@ -158,7 +158,6 @@ fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
         Box::new(Governance::new(
             "governance",
             "valset",
-            "upgrade",
             "identity",
         )),
         Box::new(identity),
@@ -170,7 +169,6 @@ fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
 async fn submit(host: &mut Host, node: &[u8], at: u64, msg: GovMsg) -> Result<(), SubmitError> {
     host.submit_at(
         BlockContext {
-            protocol_version: 0,
             height: at,
             consensus_time: at,
             origin: Origin::External(node.to_vec()),
@@ -490,7 +488,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         else {
             panic!("snapshot bytes")
         };
-        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
+        let mut rebuilt = Governance::new("governance", "valset", "identity");
         rebuilt
             .install(&bytes, root)
             .expect("install shares snapshot");
@@ -559,7 +557,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         else {
             panic!("snapshot bytes")
         };
-        let mut inactive_rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
+        let mut inactive_rebuilt = Governance::new("governance", "valset", "identity");
         inactive_rebuilt
             .install(&inactive_bytes, inactive_root)
             .expect("install inactive shares snapshot");
@@ -903,7 +901,7 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
         }
         let mut host = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "upgrade", "identity")),
+            Box::new(Governance::new("governance", "valset", "identity")),
             Box::new(identity),
         ])
         .expect("genesis");

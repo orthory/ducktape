@@ -105,6 +105,35 @@ pub struct Notification {
     pub snapshot: String,
 }
 
+impl Notification {
+    /// the `duckfs_notify` follow-up payload bytes. TYPED serialization on
+    /// purpose: a `serde_json::json!` map's key order depends on the build's
+    /// serde_json features (`preserve_order` keeps insertion order, default
+    /// sorts), and these bytes land in a sibling module's app-hashed state —
+    /// the native module and the wasm guest must emit byte-identical wire
+    /// regardless of how each build resolved serde_json.
+    pub fn payload(&self) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            prefix: &'a str,
+            path: &'a str,
+            snapshot: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Envelope<'a> {
+            duckfs_notify: Body<'a>,
+        }
+        serde_json::to_vec(&Envelope {
+            duckfs_notify: Body {
+                prefix: &self.prefix,
+                path: &self.path,
+                snapshot: &self.snapshot,
+            },
+        })
+        .expect("a notification serializes")
+    }
+}
+
 /// remove every staging entry whose ttl has elapsed at `height`. the condition
 /// is `expires_at <= height` (encoded as the `> height` retain predicate): a
 /// chunk staged at block h with ttl T (so `expires_at = h + T`) is swept the

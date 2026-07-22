@@ -68,7 +68,7 @@ use std::collections::BTreeMap;
 
 use commonware_codec::DecodeExt as _;
 use host::{FinalizedBlock, Host};
-use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle, UpgradeCoords};
+use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle};
 
 pub mod dataplane;
 pub mod monitor;
@@ -275,18 +275,6 @@ pub struct Manifest {
     /// the epoch has not finalized past its base — the joiner then spawns on
     /// the epoch's genesis floor instead).
     pub floor_cert: Option<Vec<u8>>,
-    /// the agreed protocol version active at `height`. an UNAUTHENTICATED
-    /// serving hint under the untrusted-server model — a lying value can at
-    /// worst mis-preflight a joiner (refuse-to-boot, or boot-then-halt at the
-    /// app-hash), never fork.
-    pub current_version: u32,
-    /// the single upgrade armed but not yet activated at `height`, if any.
-    /// same trust caveat as `current_version`.
-    pub pending_upgrade: Option<UpgradeCoords>,
-    /// the highest protocol version any block at or after `height` needs — the
-    /// joiner's boot preflight fence (`to_version` once `height >=
-    /// pending.activation_height`, else `current_version`).
-    pub required_min_version: u32,
     /// Canonical ordered module/state-schema fingerprint of the serving
     /// binary. A joiner checks this before opening any destination substrate.
     pub state_schema: [u8; 32],
@@ -303,15 +291,6 @@ impl Manifest {
             height: self.height,
             app_hash: self.app_hash,
         }
-    }
-
-    /// boot preflight: fail loud when the local build's `max_supported`
-    /// protocol version is below this boundary's `required_min_version`. an
-    /// early, actionable refusal instead of an opaque post-rebuild app-hash
-    /// mismatch. wired into every join lane (park, sync-only boot, validator
-    /// recovery).
-    pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
-        sdk::check_required_version(self.required_min_version, max_supported)
     }
 }
 
@@ -629,20 +608,6 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 }
                 None => out.push(0),
             }
-            // version fields (wire-format bump — see decode). placed before the
-            // trailing entries so the entries forged-count guard sees an
-            // accurate remaining-buffer bound.
-            out.extend_from_slice(&m.current_version.to_le_bytes());
-            match &m.pending_upgrade {
-                Some(u) => {
-                    out.push(1);
-                    wire::put_str(&mut out, &u.name);
-                    out.extend_from_slice(&u.activation_height.to_le_bytes());
-                    out.extend_from_slice(&u.to_version.to_le_bytes());
-                }
-                None => out.push(0),
-            }
-            out.extend_from_slice(&m.required_min_version.to_le_bytes());
             out.extend_from_slice(&m.state_schema);
             out.extend_from_slice(&(m.entries.len() as u64).to_le_bytes());
             for e in &m.entries {
@@ -785,17 +750,6 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
                 t => return Err(WireError::BadTag("floor_cert", t)),
             };
-            let current_version = wire::take_u32(&mut buf)?;
-            let pending_upgrade = match wire::take_u8(&mut buf)? {
-                0 => None,
-                1 => Some(UpgradeCoords {
-                    name: wire::take_str(&mut buf)?,
-                    activation_height: wire::take_u64(&mut buf)?,
-                    to_version: wire::take_u32(&mut buf)?,
-                }),
-                t => return Err(WireError::BadTag("pending_upgrade", t)),
-            };
-            let required_min_version = wire::take_u32(&mut buf)?;
             let state_schema = wire::take_array::<32>(&mut buf)?;
             let n = wire::take_u64(&mut buf)?;
             // each entry costs at least its id length prefix + root + kind, so
@@ -853,9 +807,6 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 participants,
                 residents,
                 floor_cert,
-                current_version,
-                pending_upgrade,
-                required_min_version,
                 state_schema,
                 entries,
             })
@@ -1119,11 +1070,6 @@ pub struct BoundaryCoords {
     pub participants: Vec<Vec<u8>>,
     pub residents: Vec<Vec<u8>>,
     pub floor_cert: Option<Vec<u8>>,
-    /// the agreed protocol version active at the served boundary. the caller
-    /// stamps it from live upgrade-module state, like `epoch`/`view_base`.
-    pub current_version: u32,
-    /// the single upgrade armed but not yet activated at the served boundary.
-    pub pending_upgrade: Option<UpgradeCoords>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1332,11 +1278,6 @@ impl SyncServer {
             .captures
             .get(&id)
             .ok_or_else(|| format!("no capture at boundary {} (refetch manifest)", id.height))?;
-        let required_min_version = sdk::required_min_version(
-            capture.coords.current_version,
-            capture.coords.pending_upgrade.as_ref(),
-            id.height,
-        );
         Ok(SyncResponse::Manifest(Manifest {
             height: id.height,
             app_hash: capture.app_hash,
@@ -1345,9 +1286,6 @@ impl SyncServer {
             participants: capture.coords.participants.clone(),
             residents: capture.coords.residents.clone(),
             floor_cert: capture.coords.floor_cert.clone(),
-            current_version: capture.coords.current_version,
-            pending_upgrade: capture.coords.pending_upgrade.clone(),
-            required_min_version,
             state_schema: capture.state_schema,
             entries: capture
                 .modules
@@ -2130,14 +2068,6 @@ mod tests {
                 // non-empty: exercises the additive resident wire tail.
                 residents: vec![vec![5u8; 32]],
                 floor_cert: Some(vec![0xCC; 96]),
-                // a pending upgrade set: exercise the Some arm of the tail.
-                current_version: 3,
-                pending_upgrade: Some(UpgradeCoords {
-                    name: "v4".into(),
-                    activation_height: 100,
-                    to_version: 4,
-                }),
-                required_min_version: 3,
                 state_schema: [0xAB; 32],
                 entries: vec![
                     ManifestEntry {
@@ -2160,7 +2090,6 @@ mod tests {
             }),
             // a fresh-epoch boundary: no finalization past the base yet, so
             // no floor certificate — the joiner spawns on the genesis floor.
-            // version tail at defaults (no upgrade scheduled).
             SyncResponse::Manifest(Manifest {
                 height: 12,
                 app_hash: StateRoot([8u8; ROOT_LEN]),
@@ -2169,9 +2098,6 @@ mod tests {
                 participants: vec![vec![3u8; 32]],
                 residents: vec![],
                 floor_cert: None,
-                current_version: 0,
-                pending_upgrade: None,
-                required_min_version: 0,
                 state_schema: [0xAB; 32],
                 entries: vec![],
             }),
@@ -2305,9 +2231,8 @@ mod tests {
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
 
-        // same header, zero participants + no floor cert + default version
-        // tail (current_version, pending tag None, required_min), then a
-        // forged ENTRY count.
+        // same header, zero participants + no floor cert, then a forged
+        // ENTRY count.
         let mut bytes = vec![0u8];
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&[0u8; ROOT_LEN]);
@@ -2315,18 +2240,15 @@ mod tests {
         bytes.extend_from_slice(&3u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.push(0); // floor_cert: None
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // current_version
-        bytes.push(0); // pending_upgrade: None
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // required_min_version
         bytes.extend_from_slice(&[0xAB; 32]); // state_schema
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
     }
 
     #[test]
-    fn decode_response_rejects_truncated_version_tail() {
-        // a manifest frame whose version tail is cut mid-field must fail
-        // cleanly (no panic), not silently default.
+    fn decode_response_rejects_truncated_manifest_tail() {
+        // a manifest frame cut mid-field must fail cleanly (no panic), not
+        // silently default.
         let resp = SyncResponse::Manifest(Manifest {
             height: 7,
             app_hash: StateRoot([9u8; ROOT_LEN]),
@@ -2335,16 +2257,12 @@ mod tests {
             participants: vec![],
             residents: vec![],
             floor_cert: None,
-            current_version: 3,
-            pending_upgrade: None,
-            required_min_version: 3,
             state_schema: [0xAB; 32],
             entries: vec![],
         });
         let bytes = encode_response(&resp);
-        // drop the trailing residents-count and entries-count u64s + the
-        // required_min u32 + part of the pending tag, landing inside the
-        // version tail.
+        // drop the trailing residents-count and entries-count u64s + part of
+        // the state schema, landing inside the manifest tail.
         for cut in 1..=21 {
             let torn = &bytes[..bytes.len() - cut];
             assert!(
@@ -2352,28 +2270,5 @@ mod tests {
                 "truncation at -{cut} must reject"
             );
         }
-    }
-
-    #[test]
-    fn manifest_preflight_gates_on_required_min() {
-        let m = Manifest {
-            height: 7,
-            app_hash: StateRoot([0u8; ROOT_LEN]),
-            epoch: 0,
-            view_base: 0,
-            participants: vec![],
-            residents: vec![],
-            floor_cert: None,
-            current_version: 3,
-            pending_upgrade: None,
-            required_min_version: 3,
-            state_schema: [0xAB; 32],
-            entries: vec![],
-        };
-        assert!(m.preflight(3).is_ok());
-        assert!(m.preflight(4).is_ok());
-        let err = m.preflight(2).expect_err("under-versioned joiner");
-        assert_eq!(err.required_min, 3);
-        assert_eq!(err.max_supported, 2);
     }
 }

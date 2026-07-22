@@ -132,14 +132,7 @@ fn apply_op<S: ObjectStore>(
                 // watching module (the task-9 `duckfs_notify` JSON shape),
                 // re-dispatched after execute returns — identical to native.
                 for n in notifications {
-                    let payload = serde_json::to_vec(&serde_json::json!({
-                        "duckfs_notify": {
-                            "prefix": n.prefix,
-                            "path": n.path,
-                            "snapshot": n.snapshot,
-                        }
-                    }))
-                    .expect("serde_json::Value serializes");
+                    let payload = n.payload();
                     ctx.emit_msg(Msg {
                         target: n.module_id,
                         payload,
@@ -373,7 +366,6 @@ mod tests {
                 consensus_time: time,
                 origin: Origin::System,
                 me: "files".into(),
-                protocol_version: 0,
             },
             msgs: Vec::new(),
         }

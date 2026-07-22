@@ -12,9 +12,10 @@ audience: human
   module root의 order-independent app-hash 합성을 소유한다.
 - `node`는 host application과 transport 또는 ordered delivery를 연결한다.
 - `consensus`에는 commonware Simplex-backed orderer가 있다.
-- `upgrade`는 node module set에 등록되어 있다. governance가 height-gated protocol
-  upgrade를 schedule/cancel하고, validator는 readiness를 self-signal하며, node는
-  activation boundary에서 committed upgrade state로부터 `protocol_version`을 stamp한다.
+- `lifecycle`은 node module set에 등록된 module code registry다. module wasm
+  code를 등록하고 height-gated code swap을 schedule하며, validator는 swap
+  readiness를 self-signal한다. protocol versioning은 없다 — live network가 없는
+  동안 breaking change는 re-genesis로 처리한다.
 - `host::worker`는 non-deterministic worker boundary를 닫는다. worker가 effect를
   claim하고 그 result는 일반 message로 다시 들어오며, drive loop는 각 binary가
   직접 돈다.

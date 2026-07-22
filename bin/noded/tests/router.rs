@@ -53,14 +53,14 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 // the frameless arm above uses.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((sdk::Origin::External(key), msg)) => {
+                        Ok((sdk::Origin::External(key), msg, _cont)) => {
                             assert_eq!(msg.target, "chat");
                             Ok(BlockSummary {
                                 height: 11,
                                 app_hash: noded::hex_bytes(&key),
                             })
                         }
-                        Ok((origin, _)) => Err(format!("a frame cannot carry {origin:?}")),
+                        Ok((origin, ..)) => Err(format!("a frame cannot carry {origin:?}")),
                         Err(err) => Err(err.to_string()),
                     };
                     let _ = reply.send(result);
@@ -198,7 +198,7 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let frame = node::encode_frame(&signer, 1, &chat_op());
+    let frame = node::encode_frame(&signer, 1, &chat_op(), None);
     let response = noded::router(handle)
         .oneshot(post_frame(frame))
         .await
@@ -227,7 +227,7 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let mut frame = node::encode_frame(&signer, 1, &chat_op());
+    let mut frame = node::encode_frame(&signer, 1, &chat_op(), None);
     // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
     // payload), so the frame no longer verifies — and the actor never sees it.
     let last = frame.len() - 65;
@@ -257,7 +257,7 @@ async fn a_frame_cannot_claim_another_keys_origin() {
     // signed preimage, so B's key cannot be swapped in without breaking it.
     let a = commonware_cryptography::ed25519::PrivateKey::from_seed(1);
     let b = commonware_cryptography::ed25519::PrivateKey::from_seed(2);
-    let mut frame = node::encode_frame(&a, 1, &chat_op());
+    let mut frame = node::encode_frame(&a, 1, &chat_op(), None);
     let b_key = b.public_key();
     // the origin is the first length-prefixed field: 8 bytes of length, then the
     // 32 key bytes.

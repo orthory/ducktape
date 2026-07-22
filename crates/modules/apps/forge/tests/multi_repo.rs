@@ -30,7 +30,6 @@ use sdk_testkit::TestCtx;
 // forge's execute reads only env (consensus_time); me/height are cosmetic.
 fn at(consensus_time: u64) -> TestCtx {
     TestCtx::with_env(sdk::Env {
-        protocol_version: 0,
         height: 0,
         consensus_time,
         origin: sdk::Origin::System,
@@ -58,7 +57,7 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
         *p += 4;
         v
     }
-    let mut p = 4; // skip the 4-byte "FGv2" container magic
+    let mut p = 4; // skip the 4-byte "FGv1" container magic
     let count = u32_at(bytes, &mut p);
     let mut out = Vec::new();
     for _ in 0..count {

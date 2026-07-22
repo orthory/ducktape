@@ -64,6 +64,7 @@ fn a_signed_frame_commits_under_its_verified_signer() {
         &signer,
         1,
         &chat_frame_op(create_channel("general", "General")),
+        None,
     );
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "a valid frame commits: {receipt}");
@@ -104,6 +105,7 @@ fn a_tampered_frame_is_refused_with_no_block() {
         &signer,
         1,
         &chat_frame_op(create_channel("general", "General")),
+        None,
     );
     // flip one PAYLOAD byte (the signature is the trailing 64): the signature
     // binds (origin, seq, target, payload), so it no longer verifies.
@@ -135,7 +137,7 @@ fn a_files_commit_over_a_frame_is_authored_by_the_verified_key() {
 
     // a user-signed commit: the signer key authors it.
     let signer = Ed::from_seed(11);
-    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "signed"));
+    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "signed"), None);
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "the files frame commits: {receipt}");
 
@@ -188,7 +190,7 @@ fn a_byte_identical_frame_resubmit_is_stopped_by_the_files_cas_not_a_consensus_s
     let sim = Sim::spawn(storage.path(), &["--auto"]);
 
     let signer = Ed::from_seed(13);
-    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "once"));
+    let frame = node::encode_frame(&signer, 1, &files_mkdir_commit("/shared/proj", "once"), None);
 
     let (code, receipt) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "the first commit lands: {receipt}");
@@ -457,7 +459,7 @@ fn create_page(id: &str) -> serde_json::Value {
     serde_json::json!({ "create_page": { "page_id": id, "title": id, "parent": null } })
 }
 fn create_task(id: &str) -> serde_json::Value {
-    serde_json::json!({ "create_task": { "task_id": id, "title": id } })
+    serde_json::json!({ "task": { "create_task": { "task_id": id, "title": id } } })
 }
 fn deliver(member: &str, body: &str) -> serde_json::Value {
     serde_json::json!({ "deliver": { "member": member, "kind": "note", "body": body } })
@@ -625,11 +627,11 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     // the timestamp-stamping modules converge once the block-dependent stamp is
     // stripped: the SAME entities exist in both runs, only their created_at differs.
     let tasks_a = strip(
-        &sim_a.query("tasks", serde_json::json!("list"))["tasks"],
+        &sim_a.query("tasks", serde_json::json!({ "task": "list" }))["task"]["tasks"],
         &["created_at", "updated_at"],
     );
     let tasks_b = strip(
-        &sim_b.query("tasks", serde_json::json!("list"))["tasks"],
+        &sim_b.query("tasks", serde_json::json!({ "task": "list" }))["task"]["tasks"],
         &["created_at", "updated_at"],
     );
     assert_eq!(

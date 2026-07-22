@@ -23,7 +23,7 @@ pub(crate) fn sealed_frame_block_row(
     blobs: &dyn blobstore::Blobs,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
-    // the sealed frame is a BATCH: decode its members (either codec, exactly
+    // the sealed frame is a BATCH: decode its members (exactly
     // like the live drain) and show each as a block op. per-member
     // dispositions/traces are not carried in the fold (recovery folds the
     // block-level disposition + aggregate trace), so a replayed op shows the
@@ -51,7 +51,7 @@ pub(crate) fn sealed_frame_block_row(
             &[],
             disposition,
         ));
-        // a v3 envelope's released continuation is its own op row, right after
+        // an envelope's released continuation is its own op row, right after
         // its parent — the live drain's row order (`noded::projection`).
         if let Some(cont) = op.continuation {
             ops.push(project_root_op(

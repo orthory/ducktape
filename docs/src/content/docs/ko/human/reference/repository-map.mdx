@@ -42,8 +42,8 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
   hole punch, WireGuard mesh orchestrator, off-consensus byte transport,
   overlay seam.
-- `crates/system/upgrade`, `capability`, `dispatch`, `tagging`: upgrade state,
-  executor capability, capability-routed dispatch, engagement routing.
+- `crates/system/lifecycle`, `capability`, `dispatch`, `tagging`: module code
+  registry, executor capability, capability-routed dispatch, engagement routing.
 - `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local blob
   store, `.duck` gateway route state, host-side dispatch worker.
 - wire surface: 각 module이 types-only payload와 query shape를 crate root(`src/interface.rs`)에 공개한다.

@@ -421,14 +421,7 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
                     // (never a reentrant call). the payload is the task-9
                     // `duckfs_notify` JSON shape.
                     for n in notifications {
-                        let payload = serde_json::to_vec(&serde_json::json!({
-                            "duckfs_notify": {
-                                "prefix": n.prefix,
-                                "path": n.path,
-                                "snapshot": n.snapshot,
-                            }
-                        }))
-                        .expect("serde_json::Value serializes");
+                        let payload = n.payload();
                         ctx.emit_msg(Msg {
                             target: n.module_id,
                             payload,

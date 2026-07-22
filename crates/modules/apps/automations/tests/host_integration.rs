@@ -47,7 +47,6 @@ impl Module for RelayChat {
 fn from_user(payload: Msg) -> (BlockContext, Msg) {
     (
         BlockContext {
-            protocol_version: 0,
             height: 1,
             consensus_time: 100,
             origin: Origin::External(b"operator".to_vec()),
@@ -141,7 +140,6 @@ fn user_post_fires_rule_and_creates_task_atomically() {
         let out = host
             .submit_at(
                 BlockContext {
-                    protocol_version: 0,
                     height: 2,
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),
@@ -185,7 +183,6 @@ fn module_authored_post_does_not_fire() {
         // a module-authored post (loop-prevention target) must not fire.
         host.submit_at(
             BlockContext {
-                protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"poster".to_vec()),
@@ -224,7 +221,6 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
         // probe, tasks would reject the duplicate and abort the posting block.
         host.submit_at(
             BlockContext {
-                protocol_version: 0,
                 height: 2,
                 consensus_time: 200,
                 origin: Origin::External(b"squatter".to_vec()),
@@ -243,7 +239,6 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
         // the fire is downgraded to a run record; the user's post commits.
         host.submit_at(
             BlockContext {
-                protocol_version: 0,
                 height: 3,
                 consensus_time: 300,
                 origin: Origin::External(b"poster".to_vec()),
@@ -289,7 +284,6 @@ fn post_probe_collision_still_aborts_the_block() {
         let err = host
             .submit_at(
                 BlockContext {
-                    protocol_version: 0,
                     height: 2,
                     consensus_time: 200,
                     origin: Origin::External(b"poster".to_vec()),

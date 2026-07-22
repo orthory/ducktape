@@ -28,7 +28,7 @@ dispatch = { workspace = true }
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 # the live-code-update proof stands a real wasm module on the host and swaps its
-# component across a code-registry activation boundary (modreg is a normal dep).
+# component across a code-registry activation boundary (lifecycle is a normal dep).
 wasm-host = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
@@ -47,7 +47,7 @@ capability = { workspace = true }
 duckdns = { workspace = true }
 identity = { workspace = true }
 # the gateway/governance parity proofs stand the native modules (and their
-# native identity/valset/upgrade/modreg siblings) beside the wasm ports.
+# native identity/valset/lifecycle siblings) beside the wasm ports.
 gateway = { workspace = true }
 governance = { workspace = true }
 greeter = { workspace = true }
@@ -56,7 +56,7 @@ greeter = { workspace = true }
 # randomness inside a consensus proof).
 p256 = { workspace = true }
 base64 = { workspace = true }
-# the deterministic-activation drain-injection test stands the real upgrade +
+# the deterministic-activation drain-injection test stands the real lifecycle +
 # valset modules on the host and drives a block across an activation boundary.
 valset = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
@@ -68,7 +68,7 @@ agent = { workspace = true }
 automations = { workspace = true }
 # the runs adapter-port parity proof drives the REAL collaboration loop —
 # chat-over-QmdbStore, pages-over-QmdbStore, tagging, saga, dispatch (native
-# by design), agent, tasks, jobs, files — through the native runs module and
+# by design), agent, tasks, files — through the native runs module and
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
 runs = { workspace = true }
 files = { workspace = true }

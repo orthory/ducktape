@@ -209,9 +209,9 @@ export function Landing() {
           Runs, dispatch, and a deterministic saga seam let coding agents act as
           first-class participants in the same consensus loop as people.
         </Feature>
-        <Feature icon="upgrade" title="No-downtime upgrades">
-          Height-gated, validator-by-validator node upgrades cut the network to a new
-          binary with app-hash continuity across the boundary.
+        <Feature icon="upgrade" title="Live module code swap">
+          A consensus-governed code registry swaps a module&apos;s wasm at an agreed
+          height, so module logic evolves without stopping the network.
         </Feature>
         <Feature icon="network" title="Self-hosted networking">
           NAT traversal, a userspace WireGuard overlay, and a rendezvous coordinator

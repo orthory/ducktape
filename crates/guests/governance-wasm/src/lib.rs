@@ -38,9 +38,9 @@ use sdk::genesis_config;
 const MODULE_ID: &str = "governance";
 /// the sibling ids this instance reads/authorizes through — EXACTLY the
 /// production wiring (`bin/node/src/host_state.rs`): valset for membership
-/// (reads + emitted membership ops), the lifecycle module for scheduled node
-/// upgrades AND wasm-module code swaps ("lifecycle" == `host::LIFECYCLE_MODULE_ID`),
-/// and identity for account-share resolution.
+/// (reads + emitted membership ops), the lifecycle module for wasm-module
+/// code swaps ("lifecycle" == `host::LIFECYCLE_MODULE_ID`), and identity for
+/// account-share resolution.
 const VALSET_ID: &str = "valset";
 const LIFECYCLE_ID: &str = "lifecycle";
 const IDENTITY_ID: &str = "identity";
@@ -71,7 +71,7 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 guest_adapter::snapshot_guest! {
     id: MODULE_ID,
     module: Governance,
-    new: Governance::new(MODULE_ID, VALSET_ID, LIFECYCLE_ID, IDENTITY_ID)
+    new: Governance::new(MODULE_ID, VALSET_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
         // redeem-time client grants ride an `IdentityMsg::GrantClient` follow-up
         // into identity (already wired for account-share). no separate module.

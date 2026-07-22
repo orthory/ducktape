@@ -30,8 +30,10 @@ ops.
   the node e2e suite proves joiners can rebuild over the live state-sync wire and
   land on the source app-hash.
 - Dynamic valset wiring, live admission, restart recovery, video huddles, and
-  the no-downtime upgrade module are implemented. The remaining work is mostly
-  product depth, demotion behavior, replay nonces, and WireGuard runtime wiring.
+  the module code-swap registry are implemented. There is no protocol
+  versioning: with no live network yet, breaking changes re-genesis. The
+  remaining work is mostly product depth, demotion behavior, replay nonces, and
+  WireGuard runtime wiring.
 
 ## Read Next
 

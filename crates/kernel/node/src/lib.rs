@@ -88,11 +88,12 @@ use sdk::{Continuation, Origin};
 
 /// the signing domain for op frames. domain-separated so an op signature can
 /// never double as a consensus vote, an endpoint advertisement, or any other
-/// signed artifact in the system. v2 = the binary frame codec: the preimage
-/// gained a payload length prefix, and the bump keeps a v1-era signature from
-/// ever verifying under the new parse (an old payload's first 8 bytes would
-/// otherwise be reinterpretable as the length prefix of a different op).
-const FRAME_NS: &[u8] = b"ducktape:op-frame:v2";
+/// signed artifact in the system. the ONE codec: length-prefixed fields plus a
+/// trailing continuation section (`cont_flag(u8)`, then `[len target][target]
+/// [len payload][payload]` when the flag is `1`). BOTH arms are inside the
+/// signed preimage: the signature binds the continuation to its parent op, so
+/// nobody can graft one onto (or strip one off) someone else's transaction.
+const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 
 /// the content address of an encoded frame — sha256 over the exact bytes the
 /// orderer carries. computed identically at submit and at drain, so a caller
@@ -148,24 +149,6 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 /// compile-time assert there pins the relationship.
 pub const MAX_FRAME_BYTES: usize = (1 << 20) + (16 << 10);
 
-/// the signed preimage AND the frame's wire prefix: length-prefixed fields so
-/// no two (seq, target, payload) triples can collide across a moving
-/// boundary. a frame is exactly these bytes with the signature appended, so
-/// [`decode_frame`] verifies against the received prefix without rebuilding
-/// anything.
-fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
-    let target = msg.target.as_bytes();
-    let mut out = Vec::with_capacity(8 * 4 + origin.len() + target.len() + msg.payload.len());
-    out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
-    out.extend_from_slice(origin);
-    out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(&(target.len() as u64).to_le_bytes());
-    out.extend_from_slice(target);
-    out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
-    out.extend_from_slice(&msg.payload);
-    out
-}
-
 /// read a little-endian u64 off the front of `buf`.
 fn take_u64(buf: &mut &[u8]) -> Option<u64> {
     let (head, rest) = buf.split_at_checked(8)?;
@@ -183,84 +166,6 @@ fn take_slice<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(head)
 }
 
-/// split raw frame bytes into borrowed fields + the preimage length (the
-/// signature is the trailing rest). shared by [`decode_frame`] (which
-/// verifies) and [`frame_origin_seq`] (which deliberately does not).
-#[allow(clippy::type_complexity)]
-fn split_frame(bytes: &[u8]) -> Option<(&[u8], u64, &str, &[u8], &[u8], usize)> {
-    let mut buf = bytes;
-    let origin = take_slice(&mut buf)?;
-    let seq = take_u64(&mut buf)?;
-    let target = std::str::from_utf8(take_slice(&mut buf)?).ok()?;
-    let payload = take_slice(&mut buf)?;
-    let preimage_len = bytes.len() - buf.len();
-    Some((origin, seq, target, payload, buf, preimage_len))
-}
-
-/// frame and SIGN a locally-originated msg for the ordered lane. the signer's
-/// public key becomes the frame's origin; the frame bytes are the signed
-/// preimage with the signature appended.
-pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
-    let origin = signer.public_key();
-    let mut frame = frame_preimage(origin.as_ref(), seq, msg);
-    let sig = signer.sign(FRAME_NS, &frame);
-    frame.extend_from_slice(sig.as_ref());
-    frame
-}
-
-/// decode a delivered frame back to a `(Origin, Msg)` the host can submit —
-/// VERIFYING the signature first. a frame that does not parse, whose origin
-/// is not a valid ed25519 key, or whose signature does not bind (origin, seq,
-/// target, payload) errors, and the ordered drain treats that as a
-/// deterministic no-op: every honest validator rejects the identical forged
-/// frame identically. the verified `origin` becomes the block's root
-/// `Origin::External(pubkey)` — authorship a module can trust; the `seq` is
-/// ordering/replay metadata, not surfaced.
-pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
-    let (origin, _seq, target, payload, sig, preimage_len) = split_frame(bytes)
-        .ok_or_else(|| Error::Host(sdk::Error::Module("frame does not parse".into())))?;
-    let pubkey = PublicKey::decode(origin)
-        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
-    let sig = Signature::decode(sig)
-        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
-    if !pubkey.verify(FRAME_NS, &bytes[..preimage_len], &sig) {
-        return Err(Error::Host(sdk::Error::Module(
-            "frame signature does not bind this op to its origin".into(),
-        )));
-    }
-    Ok((
-        Origin::External(origin.to_vec()),
-        Msg {
-            target: target.to_string(),
-            payload: payload.to_vec(),
-        },
-    ))
-}
-
-/// a frame's `(origin, seq)` submitter coordinates, without verifying the
-/// signature — recovery metadata only (a restarted node scans its retained
-/// frames to advance its local sequence past everything it may have framed).
-/// `None` for bytes that are not a frame.
-pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let (origin, seq, ..) = split_frame(bytes)?;
-    Some((origin.to_vec(), seq))
-}
-
-// ---- op-frame v3: the continuation-capable envelope --------------------------
-
-/// the signing domain for op-frame v3 — the v2 preimage plus a trailing
-/// continuation section (`cont_flag(u8)`, then `[len target][target]
-/// [len payload][payload]` when the flag is `1`). BOTH arms are inside the
-/// signed preimage: the signature binds the continuation to its parent op, so
-/// nobody can graft one onto (or strip one off) someone else's transaction.
-/// domain-separated from v2 so neither codec's signature can ever verify
-/// under the other's parse — a v2-era signature is structurally dead under
-/// v3 and vice versa. the ordered lane accepts BOTH codecs side by side
-/// ([`decode_member`]): there is no live network yet, so everything still runs
-/// protocol v0 and v3 needs no activation gate — the spec's upgrade-module
-/// flag-day gating (rollout section) arrives together with a real network.
-pub const FRAME_NS_V3: &[u8] = b"ducktape:op-frame:v3";
-
 /// read one byte off the front of `buf`.
 fn take_byte(buf: &mut &[u8]) -> Option<u8> {
     let (head, rest) = buf.split_at_checked(1)?;
@@ -268,12 +173,23 @@ fn take_byte(buf: &mut &[u8]) -> Option<u8> {
     Some(head[0])
 }
 
-/// the v3 signed preimage AND wire prefix: the v2 preimage with the
-/// continuation section appended. depth 1 is BY SHAPE — the continuation
-/// section has no continuation slot of its own, so a nested continuation is
-/// unrepresentable rather than merely validated.
-fn frame_preimage_v3(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation>) -> Vec<u8> {
-    let mut out = frame_preimage(origin, seq, msg);
+/// the signed preimage AND the frame's wire prefix: length-prefixed fields so
+/// no two (seq, target, payload) triples can collide across a moving
+/// boundary, plus the trailing continuation section. depth 1 is BY SHAPE —
+/// the continuation section has no continuation slot of its own, so a nested
+/// continuation is unrepresentable rather than merely validated. a frame is
+/// exactly these bytes with the signature appended, so [`decode_frame`]
+/// verifies against the received prefix without rebuilding anything.
+fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation>) -> Vec<u8> {
+    let target = msg.target.as_bytes();
+    let mut out = Vec::with_capacity(8 * 4 + 1 + origin.len() + target.len() + msg.payload.len());
+    out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
+    out.extend_from_slice(origin);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&(target.len() as u64).to_le_bytes());
+    out.extend_from_slice(target);
+    out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&msg.payload);
     match cont {
         None => out.push(0),
         Some(c) => {
@@ -288,32 +204,38 @@ fn frame_preimage_v3(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuat
     out
 }
 
-/// frame and SIGN a locally-originated msg with an optional envelope
-/// continuation, under the v3 domain. the v3 twin of [`encode_frame`].
-pub fn encode_frame_v3(
+/// frame and SIGN a locally-originated msg for the ordered lane, with an
+/// optional envelope continuation. the signer's public key becomes the
+/// frame's origin; the frame bytes are the signed preimage with the signature
+/// appended.
+pub fn encode_frame(
     signer: &PrivateKey,
     seq: u64,
     msg: &Msg,
     cont: Option<&Continuation>,
 ) -> Vec<u8> {
     let origin = signer.public_key();
-    let mut frame = frame_preimage_v3(origin.as_ref(), seq, msg, cont);
-    let sig = signer.sign(FRAME_NS_V3, &frame);
+    let mut frame = frame_preimage(origin.as_ref(), seq, msg, cont);
+    let sig = signer.sign(FRAME_NS, &frame);
     frame.extend_from_slice(sig.as_ref());
     frame
 }
 
-/// decode a v3 frame back to `(Origin, Msg, Option<Continuation>)`, VERIFYING
-/// the signature under the v3 domain first. rejects deterministically on: a
-/// parse failure, a `cont_flag` outside `{0, 1}` (exactly one valid encoding
-/// per frame), a signature that does not bind the WHOLE preimage
-/// (continuation included), or a continuation payload over
-/// [`sdk::MAX_CONTINUATION_BYTES`].
-pub fn decode_frame_v3(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
-    let parse_err = || Error::Host(sdk::Error::Module("v3 frame does not parse".into()));
+/// decode a delivered frame back to `(Origin, Msg, Option<Continuation>)`,
+/// VERIFYING the signature first. rejects deterministically on: a parse
+/// failure, a `cont_flag` outside `{0, 1}` (exactly one valid encoding per
+/// frame), an origin that is not a valid ed25519 key, a signature that does
+/// not bind the WHOLE preimage (continuation included), or a continuation
+/// payload over [`sdk::MAX_CONTINUATION_BYTES`]. the ordered drain treats any
+/// rejection as a deterministic no-op: every honest validator rejects the
+/// identical forged frame identically. the verified `origin` becomes the
+/// block's root `Origin::External(pubkey)` — authorship a module can trust;
+/// the `seq` is ordering/replay metadata, not surfaced.
+pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
+    let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
     let mut buf = bytes;
     let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
-    // seq is ordering/replay metadata, consumed but not surfaced (v2 parity).
+    // seq is ordering/replay metadata, consumed but not surfaced.
     let Some(_seq) = take_u64(&mut buf) else {
         return Err(parse_err());
     };
@@ -333,18 +255,18 @@ pub fn decode_frame_v3(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation
         }
         flag => {
             return Err(Error::Host(sdk::Error::Module(format!(
-                "v3 frame cont_flag {flag} is not 0|1"
+                "frame cont_flag {flag} is not 0|1"
             ))));
         }
     };
     let preimage_len = bytes.len() - buf.len();
     let pubkey = PublicKey::decode(origin)
-        .map_err(|e| Error::Host(sdk::Error::Module(format!("v3 frame origin: {e}"))))?;
+        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
     let sig = Signature::decode(buf)
-        .map_err(|e| Error::Host(sdk::Error::Module(format!("v3 frame signature: {e}"))))?;
-    if !pubkey.verify(FRAME_NS_V3, &bytes[..preimage_len], &sig) {
+        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
+    if !pubkey.verify(FRAME_NS, &bytes[..preimage_len], &sig) {
         return Err(Error::Host(sdk::Error::Module(
-            "v3 frame signature does not bind this op (and continuation) to its origin".into(),
+            "frame signature does not bind this op (and continuation) to its origin".into(),
         )));
     }
     if let Some(c) = &cont
@@ -366,28 +288,26 @@ pub fn decode_frame_v3(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation
     ))
 }
 
-/// decode a frame under WHICHEVER codec its signature verifies against — v2
-/// first (the dominant lane), then v3. the codecs are mutually exclusive by
-/// construction (domain-separated signatures, incompatible trailing shapes),
-/// so at most one arm can succeed. both failing returns the v2 error. serves
-/// the policy doors (the relay's standing checks, blob-digest extraction),
-/// which need only the verified `(origin, msg)`.
-pub fn decode_frame_any(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
-    match decode_frame(bytes) {
-        Ok((origin, msg)) => Ok((origin, msg, None)),
-        Err(v2_err) => decode_frame_v3(bytes).map_err(|_| v2_err),
-    }
+/// a frame's `(origin, seq)` submitter coordinates, without verifying the
+/// signature — recovery metadata only (a restarted node scans its retained
+/// frames to advance its local sequence past everything it may have framed).
+/// `None` for bytes that are not a frame.
+pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let mut buf = bytes;
+    let origin = take_slice(&mut buf)?;
+    let seq = take_u64(&mut buf)?;
+    Some((origin.to_vec(), seq))
 }
 
-/// decode ONE batch member into the [`host::BlockOp`] the block applies —
-/// either codec, a v3 envelope carrying its continuation onto the op.
+/// decode ONE batch member into the [`host::BlockOp`] the block applies — the
+/// envelope carrying its continuation (if any) onto the op.
 ///
 /// stamps `frame` with the member's content id HERE — the relay slot's
 /// `parent_frame` is consensus input a module may commit to state, so live
 /// drain, recovery replay, and suffix catch-up must all derive it from the ONE
 /// definition rather than each stamping (or forgetting) it at the call site.
 pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
-    let (origin, msg, continuation) = decode_frame_any(bytes)?;
+    let (origin, msg, continuation) = decode_frame(bytes)?;
     Ok(host::BlockOp {
         origin,
         msg,
@@ -874,13 +794,13 @@ pub struct DrainedOp {
     /// per node.
     pub latency_us: u64,
     /// the envelope continuation this frame carried and its released outcome
-    /// (op-frame v3 only). the continuation ALWAYS fires — a rejected parent
+    /// (envelope frames only). the continuation ALWAYS fires — a rejected parent
     /// still releases it with the `Err` relay — so this is present iff the
     /// FRAME carried one, independent of the parent's own disposition.
     pub continuation: Option<DrainedContinuation>,
 }
 
-/// the released continuation of one drained v3 frame: the envelope's
+/// the released continuation of one drained envelope frame: the
 /// `continue` body plus how the derived unit landed. its dispatches are part
 /// of the block's op stream exactly like a member's (the index consumer
 /// appends them right after the parent's — the [`host::BatchOutcome`] event
@@ -1389,7 +1309,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         seq: u64,
         msg: Msg,
     ) -> Result<FrameId, Error> {
-        let frame = encode_frame(signer, seq, &msg);
+        let frame = encode_frame(signer, seq, &msg, None);
         self.submit_frame(frame).await
     }
 
@@ -1626,10 +1546,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     continue;
                 }
             };
-            // stamp the block's dispatch version as the PURE derivation
-            // effective_version(height) — never the raw stored current_version —
-            // so dispatch and hashing agree on the version for block `height`.
-            let protocol_version = self.host.effective_version(height).await;
             // decode each member into the ops the block applies. no per-member
             // dedup here on purpose: in honest operation a signed frame lives in
             // exactly ONE proposer's mempool (relays fan to one validator,
@@ -1683,7 +1599,6 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         height,
                         consensus_time: self.time_policy.stamp(height),
                         origin: Origin::System,
-                        protocol_version,
                     },
                     ops,
                 )

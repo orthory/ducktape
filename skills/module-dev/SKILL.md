@@ -16,10 +16,11 @@ External/third-party authoring rides `ducktape-quack`, not this path.
 ## Decide first: genesis registration is an app-hash break
 
 A module in `MODULE_IDS` joins the genesis set: every existing workspace fails
-closed, dev networks re-genesis. The height-gated upgrade path flips
-`protocol_version` only — it CANNOT add a module (`bin/node/src/constants.rs:141`).
-Post-genesis admission (modreg `ScheduleRegister`) exists but is version-gated
-dormant. A new module today ⇒ a new genesis — get that agreed before wiring.
+closed, dev networks re-genesis. Post-genesis admission (lifecycle
+`ScheduleRegister`) exists, but the recovery/state-sync composers still
+enumerate a fixed module set, so restore past an admitted module's first
+checkpoint fails closed. A new module today ⇒ a new genesis — get that agreed
+before wiring.
 Experiments that shouldn't pay this cost live unwired in `crates/labs`.
 
 ## 1. Native crate — `crates/modules/{apps|system}/<id>`
@@ -51,7 +52,7 @@ component new`); if kernel tests pin a fixture, also the `cp` into
 
 | Bin | Runs | What to touch |
 |---|---|---|
-| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` + `MODULE_STATE_SCHEMAS` (bump the `[..; N]` literals). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_modreg`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
+| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` + `MODULE_STATE_SCHEMAS` (bump the `[..; N]` literals). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
 | `bin/demo` | in-process walkthrough | same shape |

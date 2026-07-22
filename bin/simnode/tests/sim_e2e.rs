@@ -63,7 +63,7 @@ fn same_script_same_app_hash() {
             ("chat", post_message("general", "m-1", "hello determinism")),
             (
                 "tasks",
-                serde_json::json!({ "create_task": { "task_id": "t-1", "title": "repeatable" } }),
+                serde_json::json!({ "task": { "create_task": { "task_id": "t-1", "title": "repeatable" } } }),
             ),
         ] {
             let pending = sim.submit_in_background(target, payload, None);
@@ -165,7 +165,7 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
             ("chat", post_message("general", "m-1", "hello determinism")),
             (
                 "tasks",
-                serde_json::json!({ "create_task": { "task_id": "t-1", "title": "repeatable" } }),
+                serde_json::json!({ "task": { "create_task": { "task_id": "t-1", "title": "repeatable" } } }),
             ),
         ]
     };

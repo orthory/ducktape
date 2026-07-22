@@ -61,7 +61,6 @@ async fn host_tasks(host: &Host) -> Vec<tasks::Task> {
 // the shared TestCtx stands in behind a thin System-origin constructor.
 fn at(consensus_time: u64) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height: 0,
         consensus_time,
         origin: Origin::System,
@@ -213,7 +212,7 @@ fn app_hash_changes_when_task_state_changes() {
 
         let created = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
                     height: 1,
                     consensus_time: 3,
                     origin: Origin::External(b"tester".to_vec()),
@@ -230,7 +229,7 @@ fn app_hash_changes_when_task_state_changes() {
 
         let updated = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
                     height: 2,
                     consensus_time: 4,
                     origin: Origin::External(b"tester".to_vec()),

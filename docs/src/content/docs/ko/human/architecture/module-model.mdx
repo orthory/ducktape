@@ -29,8 +29,9 @@ shape는 CosmWasm과 비슷하지만, 현재 구현은 Wasm이 아니라 native 
 
 module lifecycle은 genesis registration에서 committed state transition까지 이어지는
 host-owned 경로다. Ducktape에는 아직 runtime install/enable/disable row가 없다.
-genesis에 등록된 module은 모두 active이고, module set 변경은 새 genesis 또는
-coordinated upgrade의 영역이다.
+genesis에 등록된 module은 모두 active이고, module set 변경은 새 genesis의
+영역이다. 등록된 module의 wasm code를 제자리에서 swap하는 것은 별개이며,
+lifecycle code registry가 agreed height에 스케줄한다.
 
 <ModuleLifecycle client:visible />
 

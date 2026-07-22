@@ -9,7 +9,6 @@ use sdk::StateRoot;
 use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::CUTOVER_DELAY;
-use crate::host_reads::read_upgrade_version_fields;
 use crate::util::{fatal, hex};
 
 pub(crate) fn assert_floor_binds_view(
@@ -252,10 +251,6 @@ where
         floor_present = floor.is_some(),
         "checkpoint captured"
     );
-    // stamp the real committed version fields so the captured checkpoint
-    // carries the same `required_min_version` a live checkpoint would; the
-    // next boot then preflights against them like any restart.
-    let (cv, pu) = read_upgrade_version_fields(host).await;
     let ckpt = match Manifest::capture(
         host,
         Some(boundary.height),
@@ -264,8 +259,6 @@ where
         boundary.participants.clone(),
         boundary.residents.clone(),
         None,
-        cv,
-        pu,
         pos,
         1,
     ) {

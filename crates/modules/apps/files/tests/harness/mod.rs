@@ -14,7 +14,6 @@ pub use sdk_testkit::TestCtx;
 /// captured follow-up msgs are read back via [`TestCtx::msgs`].
 pub fn test_ctx(origin: Origin, height: u64) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height,
         consensus_time: height,
         origin,

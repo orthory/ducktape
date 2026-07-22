@@ -37,8 +37,6 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
   coordinator (see `coordinator/README.md`).
 - `wg-smoke/` — WireGuard smoke, interop, and bench harnesses.
-- `callbed/` — containerized huddle/call end-to-end harness (see
-  `callbed/README.md`).
 
 ## Worktree cleanup
 

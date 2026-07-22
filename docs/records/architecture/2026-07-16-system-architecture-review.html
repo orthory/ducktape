@@ -214,7 +214,7 @@ flowchart TB
   A targeted single-use token redeems automatically through
   <code>governance::Governance::handle_redeem</code> and grants <em>resident</em> standing
   (mesh + statesync + submit relay, no quorum seat). A validator seat is a separate
-  governance act. Join Protocol v1 (<code>docs/adr/2026-07-13-join-protocol.mdx</code>)
+  governance act. The join protocol (<code>docs/adr/2026-07-17-join-protocol.mdx</code>)
   is fully implemented: <code>bin/node/src/lobby.rs::GateMsg</code>,
   <code>bin/node/src/validator/run/ingress.rs::on_lobby</code>,
   <code>bin/node/src/replica/park.rs</code>.</p>
@@ -668,9 +668,6 @@ flowchart TD
     <li><b><code>README.md</code> layout table is stale</b> — names <code>crates/kernel/state</code>,
       <code>reactor</code>, <code>wireguard-upgrade</code>, <code>document</code>, <code>memory</code>;
       none exist. The Run-The-App section predates the join gate.</li>
-    <li><b><code>docs/adr/2026-07-13-join-protocol.mdx:3-8</code> status line is stale</b> — says
-      "lands as campaign PR4"; <code>bin/node/src/lobby.rs::GateMsg</code>,
-      <code>ingress.rs::on_lobby</code>, and the <code>join-state</code> RPC are merged.</li>
     <li><b><code>docs/records/admission/validator-onboarding.md</code> and
       <code>invitation-protocol-deep-dive.md</code></b> describe the retired
       advisory-announce flow.</li>

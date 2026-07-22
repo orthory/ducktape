@@ -365,7 +365,7 @@ where
     E: recovery::Context + BufferPooler + Supervisor,
 {
     let pos = node.sink_mut().inner.oplog_pos().await;
-    let manifest = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+    let manifest = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
         .expect("capture genesis manifest");
     node.sink_mut()
         .inner

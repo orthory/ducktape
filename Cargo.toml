@@ -15,8 +15,8 @@
 #                      (wireguard, nat-traversal, reachability, data-plane,
 #                      overlay-net) — owns no consensus module
 #   crates/modules/system/ — system modules: consensus infrastructure (kv,
-#                      valset, clients, governance, identity, upgrade, saga,
-#                      capability, dispatch, tagging, modreg, gateway + its
+#                      valset, governance, identity, lifecycle, saga,
+#                      capability, dispatch, tagging, gateway + its
 #                      absorbed duckdns naming library) and their host-side
 #                      counterparts (blobstore, dispatch-oracle, capability-host)
 #   crates/modules/apps/   — application modules, the product features (forge,

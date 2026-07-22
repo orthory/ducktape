@@ -28,10 +28,10 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
   payload memory (pinned own submissions, FIFO-capped peer cache) and the
   `ValsetOrchestrator` for epoch scheduling — cutovers armed at the changing
   block's view, the next participant set read from state at the boundary.
-- `upgrade` is registered in the node module set. Governance can schedule and
-  cancel height-gated protocol upgrades, validators self-signal readiness, and
-  the node stamps `protocol_version` from committed upgrade state at activation
-  boundaries.
+- `lifecycle` is registered in the node module set as the module code registry:
+  it registers module wasm code and schedules height-gated code swaps, with
+  validators self-signaling swap readiness. There is no protocol versioning —
+  while no live network exists, breaking changes re-genesis.
 - `statesync` defines the network state-sync wire protocol (manifest with the
   boundary's consensus coordinates and finalization floor, chunked snapshots,
   remote qmdb resolver) and the p2p transport binding.
@@ -50,7 +50,7 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
   before install.
 - Snapshot-style modules use canonical bytes where that fits the module: valset,
   saga, tasks, directory, governance, vaults, inbox, automations, files/duckfs,
-  jobs, upgrade, identity, DuckDNS, agent, and runs.
+  jobs, identity, DuckDNS, agent, and runs.
 - System governance gates the validator set (member-only proposals, deterministic
   tally, follow-up membership ops); valset rejects external membership writes.
 - Vaults replicate opaque secret ciphertext with owner-gated write integrity.

@@ -31,7 +31,7 @@ use crate::workspace_source::WireWorkspace;
 
 /// the ONLY envelope version this worker assembles: the portable
 /// duckfs/forge-workspace runner contract.
-pub const RUN_ENVELOPE_VERSION: u64 = 3;
+pub const RUN_ENVELOPE_VERSION: u64 = 1;
 /// the runner-result wrapper version — the SINGLE owner across this crate. the
 /// provisioning wrapper's [`crate::provision::assemble_runner_result`] stamps
 /// it, the v3 accept slice validates the envelope requests it, and `runs`
@@ -137,7 +137,7 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
     if version != RUN_ENVELOPE_VERSION {
         return Err(format!(
             "run envelope version {version} is not supported by this worker \
-             (understands {RUN_ENVELOPE_VERSION} only; v2/legacy envelopes are \
+             (understands {RUN_ENVELOPE_VERSION} only; other envelope versions are \
              unsupported); upgrade or recompose"
         ));
     }
@@ -275,13 +275,13 @@ mod tests {
     /// [`crate::provision::WorkspaceSpec::consensus_run_id`].
     const CONSENSUS_RUN_ID: &str = "chat\u{1f}general\u{1f}7\u{1f}bot";
 
-    /// a duckfs-sourced v3 envelope — the byte shape the runs composer emits
+    /// a duckfs-sourced portable envelope — the byte shape the runs composer emits
     /// for every non-forge run. it carries NO prompt pin: the persona is a
     /// curated skill now (`always`), assembled into the run's context document
     /// by the provisioner, never resolved from a blob here.
     fn envelope_json() -> String {
         serde_json::json!({
-            "ducktape_run": 3,
+            "ducktape_run": 1,
             "agent_id": "bot",
             "run_id": CONSENSUS_RUN_ID,
             "agent_display_name": "BOT",
@@ -307,7 +307,7 @@ mod tests {
     /// `conversation`, requested-Pr sink WITHOUT title/body keys.
     fn forge_envelope_json() -> String {
         serde_json::json!({
-            "ducktape_run": 3,
+            "ducktape_run": 1,
             "agent_id": "bot",
             "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
             "agent_display_name": "BOT",
@@ -357,13 +357,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_envelopes_are_rejected() {
-        // the second half of the flag day: the v2 tolerance is gone.
+    fn other_envelope_versions_are_rejected() {
+        // exactly one envelope version exists; anything else is refused loud.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["ducktape_run"] = serde_json::json!(2);
         let err = prepare(&v.to_string()).unwrap_err();
         assert!(err.contains("version 2"), "got {err:?}");
-        assert!(err.contains("understands 3"), "got {err:?}");
+        assert!(err.contains("understands 1"), "got {err:?}");
     }
 
     #[test]
@@ -398,11 +398,11 @@ mod tests {
         assert!(err.contains("version 99"), "got {err:?}");
 
         // a non-integer marker.
-        let err = prepare(r#"{"ducktape_run":"3"}"#).unwrap_err();
+        let err = prepare(r#"{"ducktape_run":"1"}"#).unwrap_err();
         assert!(err.contains("not an integer"), "got {err:?}");
 
-        // v3 with required fields missing.
-        let err = prepare(r#"{"ducktape_run":3,"agent_id":"bot"}"#).unwrap_err();
+        // the right version with required fields missing.
+        let err = prepare(r#"{"ducktape_run":1,"agent_id":"bot"}"#).unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
     }
 

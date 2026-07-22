@@ -12,7 +12,6 @@ audience: human
 
 | Record | File | 유지 이유 |
 |---|---|---|
-| No-downtime node upgrades | [Node Upgrades](/ko/human/network/node-upgrades), [agent upgrade operations](/ko/agent/network/node-upgrades), `skills/upgrade/SKILL.md` | 유지되는 height-gated upgrade policy와 operator runbook. |
 | Quack packaged modules | `docs/adr/2026-07-07-quack-packaged-modules.mdx` | shareable module, agent, action, harness의 package boundary. |
 | Secure private messaging | `docs/adr/2026-07-06-private-team-messaging.mdx` | deterministic group crypto 전까지 deferred된 accepted direction. |
 | Video calls | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx` | ADR과 shipped WebSocket bridge, huddle op, video lane, 남은 gap. |
@@ -39,9 +38,6 @@ fleet-isolation finding만 prune한다. durable fact는
   jobs, module wave.
 - [Implementation Status](/ko/human/reference/implementation-status): checked-in
   code와 test.
-- [Node Upgrades](/ko/human/network/node-upgrades)와
-  [agent upgrade operations](/ko/agent/network/node-upgrades): upgrade policy와
-  runbook.
 - 위 ADR들: implementation branch보다 오래 살아야 하는 decision.
 - `docs/superpowers/README.md`: reviewed working-record retention policy.
 

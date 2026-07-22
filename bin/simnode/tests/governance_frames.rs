@@ -64,6 +64,7 @@ fn gov_frame_ok(sim: &Sim, signer: &Ed, seq: u64, msg: &GovMsg) {
             target: "governance".into(),
             payload: gov_encode(msg),
         },
+        None,
     );
     let (code, reply) = sim.submit_frame(&frame);
     assert_eq!(code, 200, "governance frame must commit: {reply}");
@@ -181,6 +182,7 @@ fn a_frame_from_a_key_without_standing_is_refused() {
                 voting_period: 20,
             }),
         },
+        None,
     );
     let (code, reply) = sim.submit_frame(&frame);
     assert_eq!(code, 400, "a signer without standing must be refused: {reply}");

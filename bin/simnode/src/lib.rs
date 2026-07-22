@@ -840,7 +840,7 @@ fn run_sim(
             // a redeemed role=Client invite records a key in identity's client
             // ACL (governance emits an `IdentityMsg::GrantClient` follow-up);
             // identity is already in the default module set above.
-            let governance = Governance::new("governance", "valset", "lifecycle", "identity")
+            let governance = Governance::new("governance", "valset", "identity")
                 .with_invite_binding(invite_binding);
             let lifecycle = Lifecycle::new("lifecycle", "valset");
             modules.push(Box::new(kv));
@@ -938,7 +938,16 @@ fn run_sim(
                     // already refused it, and this decode is the second wall.
                     Some(NodeCommand::SubmitFrame { frame, reply }) => {
                         match node::decode_frame(&frame) {
-                            Ok((origin, msg)) => {
+                            // the sim's single-op lane has no batch path to
+                            // release a continuation on — refuse loudly rather
+                            // than silently strip it off a signed frame.
+                            Ok((_origin, _msg, Some(_cont))) => {
+                                let _ = reply.send(Err(
+                                    "continuation envelopes are not supported on the sim frame lane"
+                                        .to_string(),
+                                ));
+                            }
+                            Ok((origin, msg, None)) => {
                                 sim.handle_submit(origin, msg, reply).await;
                             }
                             Err(err) => {

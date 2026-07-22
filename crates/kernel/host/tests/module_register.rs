@@ -78,8 +78,6 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
         height,
         consensus_time: height,
         origin,
-        // admission ops are version-gated; the whole proof runs past the boundary.
-        protocol_version: lifecycle::ADMISSION_ACTIVATION_VERSION,
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }

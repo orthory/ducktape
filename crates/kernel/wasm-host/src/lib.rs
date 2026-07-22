@@ -891,7 +891,6 @@ fn to_wit_env(env: &SdkEnv) -> WitEnv {
     WitEnv {
         height: env.height,
         consensus_time: env.consensus_time,
-        protocol_version: env.protocol_version,
         me: env.me.clone(),
         origin: match &env.origin {
             SdkOrigin::External(id) => WitOrigin::External(id.clone()),
@@ -1161,7 +1160,6 @@ impl Module for WasmModule {
         let env = WitEnv {
             height: 0,
             consensus_time: 0,
-            protocol_version: 0,
             me: self.id.clone(),
             origin: WitOrigin::System,
         };

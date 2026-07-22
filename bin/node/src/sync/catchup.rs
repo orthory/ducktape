@@ -17,8 +17,6 @@ pub(crate) async fn apply_verified_suffix_frame(
     code_source: &dyn host::CodeSource,
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
-    let protocol_version = host.effective_version(served.height).await;
-    host.set_active_version(protocol_version);
     // CODE-SWAP REALIZATION, mirroring the live drain and recovery replay: a
     // frame sealed after a code-registry swap executed on the NEW component, so
     // catch-up must swap before re-applying or the served roots cannot
@@ -26,7 +24,7 @@ pub(crate) async fn apply_verified_suffix_frame(
     host.realize_module_swaps(served.height, code_source)
         .await
         .map_err(|e| format!("code-swap realization at height {}: {e}", served.height))?;
-    // the served frame is a BATCH: decode its members (a v3 envelope
+    // the served frame is a BATCH: decode its members (an envelope
     // re-applies WITH its continuation) and apply as ONE block, exactly like
     // the live drain and recovery replay, so the disposition, roots, and
     // app-hash reproduce what the peer served. disposition is DRAIN-based
@@ -41,7 +39,6 @@ pub(crate) async fn apply_verified_suffix_frame(
                 }
             }
             let ctx = host::BlockContext {
-                protocol_version,
                 height: served.height,
                 consensus_time: served.height,
                 origin: sdk::Origin::System,
@@ -240,8 +237,6 @@ where
         target.participants.clone(),
         target.residents.clone(),
         pending_cutover_view,
-        target.current_version,
-        target.pending_upgrade.clone(),
         pos,
         next_seq,
     )

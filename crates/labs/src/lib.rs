@@ -4,8 +4,7 @@
 //!
 //! A module registered at genesis is in the app-hash. Every node on the network
 //! must then run it, agree on its state root at every height, and keep doing so
-//! forever: the height-gated upgrade path flips `protocol_version` only — it
-//! cannot change the module SET. So putting an experiment in the production
+//! forever. So putting an experiment in the production
 //! genesis registry is not a small thing. It commits the whole network to
 //! carrying it, and a bug in it forks the chain.
 //!

@@ -118,7 +118,7 @@ The load-bearing facts:
 (`bin/node/src/host_state.rs:589-616`, mirrored in
 `bin/node/src/constants.rs:145-172`); `noded` composes **16**
 (`bin/noded/src/main.rs:59-76`) — it omits the consensus tier (kv, valset,
-clients, governance, upgrade, modreg, capability, vaults, directory, …)
+clients, governance, lifecycle, capability, vaults, directory, …)
 because a single-writer daemon has no membership to govern. `simnode` uses
 noded's 16, with `--with-valset` appending the governance tier
 (`bin/simnode/src/main.rs:166-171`).
@@ -137,7 +137,7 @@ The workspace `Cargo.toml:1-27` header is the canonical tier map:
 crates/kernel/    the platform: sdk, host, node, consensus, statesync,
                   recovery, indexer, wasm-host (+ module-guest WIT)
 crates/modules/system/    consensus modules (kv, valset, clients, governance, identity,
-                  upgrade, saga, capability, dispatch, tagging, modreg,
+                  lifecycle, saga, capability, dispatch, tagging,
                   duckdns, gateway) and off-consensus infra (blobstore,
                   dispatch-oracle, capability-host, wireguard, nat-traversal,
                   reachability, data-plane, overlay-net)
@@ -161,7 +161,7 @@ Rules that keep the graph honest (verified in the 2026-07-12 review):
   nested-cycle rejected); cross-module *writes* are `Ctx::emit_msg` intents the
   host re-dispatches as follow-up ops. No system→apps edges; all apps→apps
   edges are wire-types-only.
-- **The kernel obeys its own rule**: `host` reads `upgrade`/`dispatch`/`modreg`
+- **The kernel obeys its own rule**: `host` reads `lifecycle`/`dispatch`
   through wire-types-only deps it never constructs (`crates/kernel/host/Cargo.toml`).
 - **`indexer` is structurally fenced**: it may not depend on `sdk`, `host`, or
   any module crate — the derived read-model tier is kept incapable of leaking
@@ -196,7 +196,7 @@ async, but every `.await` must be on a deterministic resource — the
 across the await.
 
 `sdk::Ctx` (`lib.rs:329-352`) is the whole dispatch surface: `env()`
-(agreed height/time/origin/protocol_version), `module_root(target)`
+(agreed height/time/origin), `module_root(target)`
 (start-of-dispatch snapshot), `query(target, req)` (live host-routed read),
 `emit_msg` (write intent), `emit_event` (leaves the machine). `sdk::codec` is
 the one length-prefixed codec toolkit; its `Cursor` treats all input as
@@ -234,8 +234,8 @@ async functions — a caller invokes them per block.
   deterministic drain. A worker never receives a module handle; its only path
   back is the `Msg` it returns, submitted as its own block ("oracle-as-op").
   `MAX_WORKER_ROUNDS = 256`.
-- **System-injected ops**: at most one each per block of upgrade `Advance`,
-  modreg `Advance`, and dispatch `DeliverPending`, keyed purely on committed
+- **System-injected ops**: at most one each per block of lifecycle `Advance`
+  and dispatch `DeliverPending`, keyed purely on committed
   state so live execution, recovery replay, and statesync reconstruct
   byte-for-byte (`lib.rs:695,724,760`).
 
@@ -269,10 +269,10 @@ gossips proposed bytes eagerly and a lazy resolver fetch backstops misses).
 It holds three `commonware_runtime::Handle`s — engine, resolver-fetch,
 payload-drain — all aborted by `Drop`, which is what makes epoch-cutover
 teardown real. `ValsetOrchestrator` (`valset_orchestrator.rs`) is the
-deterministic cutover state machine: observe membership/upgrade changes, arm a
+deterministic cutover state machine: observe membership changes, arm a
 boundary the *old* engine finalizes first, emit a `RespawnPlan` consumed by
-`OrderedNode::cutover`. One mechanism serves scheme migration, dynamic valset,
-and protocol-version upgrades.
+`OrderedNode::cutover`. One mechanism serves scheme migration and dynamic
+valset cutover.
 
 ### 4.5 `statesync`, `recovery`, `indexer`
 
@@ -328,7 +328,7 @@ the doc, so per-loop refs are exact.
 
 | Loop | Where | Driver | Owns |
 |---|---|---|---|
-| Validator drain arm | `validator/run.rs:495-497` → `run/drain.rs` | `DRAIN_TICK = 100ms` absolute deadline (`constants.rs:92`) — a floor, so ingress can delay one drain but never starve it | `OrderedNode::drain_delivered` apply; block cadence + `consensus.nop` heartbeat (`pump_heartbeat`, `drain.rs:947-982`); upgrade-readiness, capability announce, saga crank, dispatch nudge pumps; gate-reply settlement (`drain.rs:183-211`) |
+| Validator drain arm | `validator/run.rs:495-497` → `run/drain.rs` | `DRAIN_TICK = 100ms` absolute deadline (`constants.rs:92`) — a floor, so ingress can delay one drain but never starve it | `OrderedNode::drain_delivered` apply; block cadence + `consensus.nop` heartbeat (`pump_heartbeat`, `drain.rs:947-982`); code-swap readiness, capability announce, saga crank, dispatch nudge pumps; gate-reply settlement (`drain.rs:183-211`) |
 | Ingress arm | `validator/run/ingress.rs` | same `select_biased!` loop: RPC jobs, http commands, lobby/statesync/relay channel messages | join-gate checklist V1–V9 (`ingress.rs:179-413`), submit-relay custody, RPC replies (incl. `JoinState`) |
 | Consensus engine tasks | `consensus/src/lib.rs:1124-1159` | commonware runtime | simplex voting/finalization; resolver fetch; payload drain. Torn down by `Drop` at epoch cutover |
 | Statesync serve | `sync/serve.rs` | requests on `CHANNEL_STATE_SYNC = 4`, answered *between* drains from the latest finalized boundary | manifest/chunk/module/frames service; fail-closed real-key standing check (ADR §5.1) |
@@ -475,7 +475,7 @@ The flagship flow. Orientation: **minting an invite IS the admission
 decision** — a targeted, single-use token redeems automatically through
 governance and grants **resident** standing (mesh + statesync + relay, no
 quorum seat). A **validator** seat is a separate deliberate governance act.
-The synchronous Join Protocol v1 gate (ADR `2026-07-13-join-protocol.mdx`) is
+The synchronous join gate (ADR `2026-07-17-join-protocol.mdx`) is
 fully implemented; the older advisory-announce flow in
 `docs/records/admission/*` is historical.
 
@@ -603,9 +603,9 @@ saga/dispatch/oracle async engine. §5 lists the loops this rides.
 
 1. **Submit.** A client POSTs `/v1/submit` (trusted-origin *string* lane) or
    `/v1/submit/frame` (the authenticated lane: an ed25519 signature over
-   `(origin, seq, target, payload)` under `FRAME_NS = "ducktape:op-frame:v2"`,
-   decoded by the same `node::decode_frame` everywhere —
-   `crates/kernel/node/src/lib.rs:95,203,219`). The trust split is deliberate:
+   `(origin, seq, target, payload[, continuation])` under
+   `FRAME_NS = "ducktape:op-frame:v1"`, decoded by the same
+   `node::decode_frame` everywhere — `crates/kernel/node/src/lib.rs`). The trust split is deliberate:
    the local daemon honors the caller's origin string
    (`bin/noded/src/main.rs:392`), a **validator discards it** and the frame
    lane's origin is the verified signer — authentication is by frame
@@ -616,16 +616,13 @@ saga/dispatch/oracle async engine. §5 lists the loops this rides.
    standing — the relay grants **no authority**, a member-gated op from a
    non-member still finalizes Rejected (`bin/node/src/relay.rs`).
 
-   > **Update (2026-07-18):** an op-frame **v3** codec landed with the
-   > continuation-envelope work (phases 0+1 of
-   > `docs/superpowers/specs/2026-07-17-continuation-transactions-design.md`).
-   > The signed preimage gains an optional `continue` section under a new
-   > signing domain (`FRAME_NS_V3 = "ducktape:op-frame:v3"`) — the signature
-   > binds the continuation to its parent op — alongside
+   > The frame codec is continuation-capable: the signed preimage carries an
+   > optional `continue` section (the continuation-envelope work,
+   > `docs/superpowers/specs/2026-07-17-continuation-transactions-design.md`)
+   > — the signature binds the continuation to its parent op — alongside
    > `sdk::{Continuation, Relay}` + `Ctx::{relay, set_output, author_origin}`
-   > and the host's inline release lane (`Host::submit_block_ops`). The live
-   > wire still speaks v2 (the v2/v3 decoders structurally reject each other);
-   > nothing activates until drain wiring + protocol-version gating land.
+   > and the host's inline release lane (`Host::submit_block_ops`). ONE codec,
+   > ungated — there is no protocol versioning while no live network exists.
 
 2. **Order.** There is **no mempool**: custody is two in-memory structures on
    `OrderedNode` — `outstanding: HashMap<FrameId, (seq, frame)>` and the
@@ -643,7 +640,7 @@ saga/dispatch/oracle async engine. §5 lists the loops this rides.
    does not exist in the trait yet.)
 3. **Execute.** `drain_delivered` computes `height = view_base + view`,
    realizes any committed module-code swap first, then
-   `host.submit_block(BlockContext { height, consensus_time, origin, protocol_version }, ops)`:
+   `host.submit_block(BlockContext { height, consensus_time, origin }, ops)`:
    the host drains each op plus its same-block follow-up messages
    (`Ctx::emit_msg` intents, the only cross-module write path), commits every
    touched module in registry order, and recomposes the app-hash. The whole
@@ -724,12 +721,11 @@ node (26), **D** = noded daemon (16).
 | `clients` | P | submit-only ACL — deliberately separate from valset so a client can never gain statesync standing |
 | `governance` | P | propose/vote/execute over membership; invite redemption (`handle_redeem`); emits `ValsetMsg`/`ClientsMsg` follow-ups |
 | `identity` | P+D | account registry: founding key, multi-scheme member keys (ed25519 / WebAuthn-P256 / native P-256), bound nodes, display name |
-| `upgrade` | P | height-gated binary upgrades; R=n readiness gate; activation is a pure derivation, never a stored flip |
 | `saga` | P+D | deterministic async continuations (§8.2) |
 | `capability` | P | replicated registry of node capability tags + class claims |
 | `dispatch` | P+D | the task plane: recipes, saga triggers, contract validation, next-block delivery |
 | `tagging` | P+D | cross-module engagement router (mentions → `EngagementEvent`s); policy lives in recipients |
-| `modreg` | P | per-module active code hash + one scheduled swap; the host's `realize_module_swaps` reconciles running code fail-closed |
+| `lifecycle` | P | the module code registry: per-module active code hash + one scheduled swap; the host's `realize_module_swaps` reconciles running code fail-closed |
 | `duckdns` | P+D | `.duck` account naming; resolution stops at a stable `AccountId` |
 | `gateway` | P+D | signed `.duck` routes (account → duck_fs manifest or loopback_http target); stores no addresses or content |
 
@@ -838,20 +834,16 @@ Doc-vs-code drift found while writing this (each verified in code):
    `reactor`, `wireguard-upgrade`, `document`, `memory` — none exist in the
    workspace today. The "Run The App" section also predates the join gate
    (describes park→admit via Settings polling).
-2. **Join-protocol ADR status line is stale**
-   (`docs/adr/2026-07-13-join-protocol.mdx:3-8`): says implementation "lands
-   as campaign PR4," but `GateMsg`, the member gate, the joiner FSM, and the
-   `join-state` RPC are merged (`lobby.rs`, `ingress.rs`, `park.rs`).
-3. **`docs/records/admission/*` describe the retired flow** (advisory
+2. **`docs/records/admission/*` describe the retired flow** (advisory
    announce + human approval); both carry HISTORICAL banners but remain the
    top search hits for "invitation."
-4. **Observers→Residents naming drift**: a leftover
+3. **Observers→Residents naming drift**: a leftover
    `ValsetReply::Residents` match arm still panics with `"expected Observers"`
    (`crates/modules/system/governance/tests/invite_redemption.rs:155`).
-5. **`user-node-identity-split` plan predates the implemented v2 account
+4. **`user-node-identity-split` plan predates the implemented v2 account
    format** (multi-scheme `MemberAuth`, WebAuthn-P256) — the plan reads as an
    earlier design point.
-6. **The workspace `Cargo.toml` header comment is stale on `evm`**: it says
+5. **The workspace `Cargo.toml` header comment is stale on `evm`**: it says
    "evm (experimental; genesis-registered in the daemons)" under
    `crates/examples/`, but `evm` now lives in `crates/labs` and nothing
    registers it.

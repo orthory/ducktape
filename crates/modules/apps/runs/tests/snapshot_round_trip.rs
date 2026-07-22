@@ -43,7 +43,6 @@ impl TestCtx {
     fn new(height: u64, origin: Origin) -> Self {
         Self {
             env: Env {
-                protocol_version: 0,
                 height,
                 consensus_time: height,
                 origin,

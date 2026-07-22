@@ -592,7 +592,6 @@ mod tests {
         residents: Option<Vec<Vec<u8>>>,
     ) -> TestCtx {
         TestCtx::with_env(sdk::Env {
-            protocol_version: 0,
             height: 0,
             consensus_time: 0,
             origin,

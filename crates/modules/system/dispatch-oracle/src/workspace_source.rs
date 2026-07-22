@@ -76,7 +76,7 @@ impl WorkspaceSource {
     }
 }
 
-/// the wire decode of a v3 envelope's `workspace` block (contract §1). every
+/// the wire decode of a portable envelope's `workspace` block (contract §1). every
 /// field — source coordinates, the `forge_push` verdict, and the `item_title`
 /// — is required at the serde step (a malformed envelope fails to parse —
 /// acceptance IS validation). [`WireWorkspace::validate`] adds the per-field

@@ -40,9 +40,6 @@ pub enum OpCmd {
     /// consensus-quorum membership
     #[command(subcommand)]
     Member(MemberCmd),
-    /// coordinated network upgrades
-    #[command(subcommand)]
-    Upgrade(UpgradeCmd),
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -62,12 +59,6 @@ pub enum MemberCmd {
     /// this node drives its own removal
     Leave(SelectorArgs),
     /// print in-set + validator count for this node
-    Status(StatusArgs),
-}
-
-#[derive(Debug, clap::Subcommand)]
-pub enum UpgradeCmd {
-    /// pending upgrade + readiness verdict
     Status(StatusArgs),
 }
 
@@ -196,7 +187,7 @@ pub struct InviteArgs {
     pub ttl_days: Option<u64>,
     #[command(flatten)]
     pub selector: Selector,
-    /// removed in Join v2 — kept only to refuse loudly with the migration hint
+    /// removed in the join protocol — kept only to refuse loudly with the migration hint
     #[arg(long, hide = true, value_name = "HEX-PUBKEY")]
     pub target: Option<String>,
 }

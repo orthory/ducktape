@@ -149,7 +149,9 @@ pub fn run_actor(
                 // forged/tampered frame is a rejection, not a block.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg)) => commit(&mut host, &mut height, origin, msg).await,
+                        Ok((origin, msg, _cont)) => {
+                            commit(&mut host, &mut height, origin, msg).await
+                        }
                         Err(err) => Err(err.to_string()),
                     };
                     let _ = reply.send(result);
@@ -195,7 +197,6 @@ async fn commit(
 ) -> Result<BlockSummary, String> {
     let next = *height + 1;
     let ctx = BlockContext {
-        protocol_version: 0,
         height: next,
         consensus_time: next,
         origin,

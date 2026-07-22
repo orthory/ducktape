@@ -1,4 +1,4 @@
-//! the join-gate wire format (Join Protocol v2, ADR §4) — how a not-yet-
+//! the join-gate wire format (the join protocol, ADR §4) — how a not-yet-
 //! admitted joiner asks to join, and how a gating member answers
 //! AUTHORITATIVELY.
 //!
@@ -29,21 +29,21 @@ use crate::config::{INVITE_NONCE_LEN, InviteRole, InviteToken};
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectCode {
-    /// V1: the request did not decode / was not well-formed.
+    /// the request did not decode / was not well-formed.
     BadEncoding,
-    /// V2: the token signature does not verify for this network's binding.
+    /// the token signature does not verify for this network's binding.
     BadToken,
-    /// V4: the invite expired against the member's wall clock.
+    /// the invite expired against the member's wall clock.
     Expired,
-    /// V5: the joiner's proof-of-possession does not verify.
+    /// the joiner's proof-of-possession does not verify.
     BadProof,
-    /// V6 (or a consensus race): the invite nonce is already redeemed.
+    /// the invite nonce is already redeemed (or lost a consensus race).
     Spent,
-    /// V7: the issuer is not in this member's committed valset. NON-TERMINAL —
+    /// the issuer is not in this member's committed valset. NON-TERMINAL —
     /// a lagging view cannot tell removed from not-yet-seen; the joiner fails
     /// over to another member.
     IssuerUnknown,
-    /// V8: the token's role does not redeem over the LOBBY GATE. a `Client`
+    /// the token's role does not redeem over the LOBBY GATE. a `Client`
     /// token grants submit-only standing and redeems via `user-redeem-invite`
     /// (`/v1/submit`) — a node join has nothing to gain from it.
     RoleUnsupported,
@@ -54,7 +54,7 @@ pub enum RejectCode {
 
 /// the verified-request carrier [`verify_join_request`] consumes (and
 /// [`verify_intro`] builds internally). NO LONGER A WIRE TYPE: the mesh
-/// `CHANNEL_LOBBY` lane it once rode is retired (Join v2 §4) — the fields now
+/// `CHANNEL_LOBBY` lane it once rode is retired (join ADR §4) — the fields now
 /// only ever travel inside a sealed [`IntroRequest`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum GateMsg {
@@ -76,7 +76,7 @@ pub enum GateMsg {
 
 /// build the gate request for `token` as `joiner` — the proof binds the
 /// announced key to its secret holder. TEST-ONLY since the mesh gate lane
-/// retired (Join v2 §4): production requests only ever travel inside an
+/// retired (join ADR §4): production requests only ever travel inside an
 /// [`intro_request`]; the tests keep this to exercise [`verify_join_request`]
 /// without re-deriving the proof signing by hand.
 #[cfg(test)]
@@ -109,11 +109,11 @@ pub fn gate_request(
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn verify_reject_code(err: &str) -> RejectCode {
     if err.contains("does not verify for this network") {
-        RejectCode::BadToken // V2
+        RejectCode::BadToken
     } else if err.contains("proof-of-possession") {
-        RejectCode::BadProof // V5
+        RejectCode::BadProof
     } else {
-        RejectCode::BadEncoding // V1: malformed key/nonce/role/signature bytes
+        RejectCode::BadEncoding // malformed key/nonce/role/signature bytes
     }
 }
 
@@ -246,8 +246,8 @@ pub struct IntroRequest {
     pub wg_sig: Vec<u8>,
 }
 
-/// what a member tells a joiner in answer to a first-contact intro (Join
-/// Protocol v2 §4): the sealed intro IS the gate request, so a member installs
+/// what a member tells a joiner in answer to a first-contact intro (the join
+/// ADR §4): the sealed intro IS the gate request, so a member installs
 /// the tunnel and forwards the request into consensus. The first ack reports
 /// the tunnel is up while the gate settles (`Installed`); a later ack — once
 /// `Redeem` commits or is refused — carries the AUTHORITATIVE outcome.
@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn an_admitted_intro_ack_roundtrips() {
-        // the gate outcome rides the intro-ack wire now (Join v2 §4).
+        // the gate outcome rides the intro-ack wire now (join ADR §4).
         let ack = IntroAck {
             nonce: vec![7u8; INVITE_NONCE_LEN],
             reply: IntroReply::Admitted {

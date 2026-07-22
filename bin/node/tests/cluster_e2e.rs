@@ -363,8 +363,6 @@ fn cluster_lifecycle() {
         "ducktape_last_finalized_timestamp_seconds ",
         r#"ducktape_ops_outcome_total{outcome="applied"}"#,
         r#"ducktape_index_height{module="directory"}"#,
-        "ducktape_upgrade_current_version ",
-        "ducktape_upgrade_max_supported_version ",
     ] {
         assert!(
             exposition.contains(sample),
@@ -427,13 +425,6 @@ fn cluster_lifecycle() {
     );
     assert_eq!(http_status["operations"]["role"], "validator");
     assert_eq!(http_status["operations"]["phase"], "validating");
-    assert!(
-        http_status["operations"]["upgrade"]["maxSupportedVersion"]
-            .as_u64()
-            .zip(http_status["operations"]["upgrade"]["currentVersion"].as_u64())
-            .is_some_and(|(supported, current)| supported >= current),
-        "running binary supports the active protocol: {http_status}"
-    );
     assert!(
         http_status["operations"]["consensus"]["validators"]
             .as_u64()

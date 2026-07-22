@@ -111,7 +111,6 @@ fn actor(id: &str) -> String {
 // shared TestCtx stands in behind a thin constructor.
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height,
         consensus_time: 0,
         origin,
@@ -1274,7 +1273,7 @@ fn commit_and_abort_staging_including_prune_tombstones() {
 // ============================================================================
 
 fn as_origin(height: u64, origin: Origin) -> BlockContext {
-    BlockContext { protocol_version: 0,
+    BlockContext {
         height,
         consensus_time: 0,
         origin,

@@ -196,7 +196,7 @@ fn main() {
             .public_key()
             .as_ref()
             .to_vec();
-        let as_demo_user = || BlockContext { protocol_version: 0,
+        let as_demo_user = || BlockContext {
             height: 0,
             consensus_time: 0,
             origin: Origin::External(demo_user.clone()),
@@ -311,7 +311,7 @@ fn main() {
         // orchestration lane genesis seeding uses.
         let out = host
             .submit_at(
-                host::BlockContext { protocol_version: 0,
+                host::BlockContext {
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,
@@ -489,7 +489,7 @@ fn main() {
         // path (no external push service). the queue holds it as consensus state.
         let out = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
                     height: 0,
                     consensus_time: 9,
                     // the submitter's id — the inbox derives `source` from this

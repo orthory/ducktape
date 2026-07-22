@@ -250,9 +250,8 @@ display, authorship resolution을 위해 node를 account에 매핑할 뿐 consen
 weight를 합치지 않는다.
 
 identity가 없던 network에 이를 추가하는 것은 다른 module-set 변경과
-마찬가지다: genesis app-hash가 옮겨가므로, 이미 돌고 있는 network가 이를
-적용하려면 coordinated rebuild — rolling이 아닌, 모든 validator에 걸친
-lockstep upgrade — 가 필요하다.
+마찬가지다: genesis app-hash가 옮겨가므로, 이미 돌고 있는 network는
+re-genesis로 적용한다 — protocol versioning이나 rolling upgrade 경로는 없다.
 
 이 module은 public membership과 binding state만 저장한다. private member key의
 custody는 그 위에 얹힌 desktop-app의 관심사이며 `bin/node`의 `user-key` verb를

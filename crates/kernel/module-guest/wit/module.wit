@@ -11,7 +11,6 @@ interface host {
   record env {
     height: u64,
     consensus-time: u64,
-    protocol-version: u32,
     me: string,
     origin: origin,
   }

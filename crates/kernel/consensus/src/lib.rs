@@ -65,8 +65,7 @@ use commonware_resolver::{Consumer as ResolverConsumer, Delivery, Resolver as _}
 
 mod valset_orchestrator;
 pub use valset_orchestrator::{
-    BoundaryUpgrade, EpochMembership, ObservationOutcome, PendingUpgrade, RespawnPlan,
-    ScheduledCutover, UpgradeVerdict, ValsetOrchestrator,
+    EpochMembership, ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchestrator,
 };
 
 /// the concrete digest the consensus lane orders over: a sha256 of the frame

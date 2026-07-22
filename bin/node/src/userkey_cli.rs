@@ -170,7 +170,7 @@ fn check_password_len(password: &str) -> Result<(), String> {
 
 /// `path`'s raw trimmed line — the exact text [`userkey::open_user_key`]
 /// parses, as opposed to [`userkey::read_user_key_file`]'s already-decoded
-/// shape. verbs that must hand a v2 line to `open_user_key` read it via this.
+/// shape. verbs that must hand an encrypted line to `open_user_key` read it via this.
 fn read_key_line(path: &std::path::Path) -> Result<String, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let line = text.trim();
@@ -180,7 +180,7 @@ fn read_key_line(path: &std::path::Path) -> Result<String, String> {
     Ok(line.to_string())
 }
 
-/// resolve the USER signer at `key_path` for the sign verbs: a v2
+/// resolve the USER signer at `key_path` for the sign verbs: an encrypted
 /// (encrypted) file decrypts with a password read as the FIRST stdin line;
 /// anything else (legacy plaintext, or absent — freshly generated) falls
 /// through to [`config::load_or_generate_identity`] UNCHANGED, reading no
@@ -190,7 +190,7 @@ fn load_user_signer(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
     if let Ok(text) = std::fs::read_to_string(key_path)
-        && text.trim().starts_with(userkey::USER_KEY_V2_PREFIX)
+        && text.trim().starts_with(userkey::USER_KEY_ENCRYPTED_PREFIX)
     {
         let password = prompt_stdin_line(stdin, "password")?;
         return Ok(userkey::open_user_key(text.trim(), &password)?);
@@ -227,7 +227,7 @@ fn user_key_init(
 }
 
 /// `user-key init --out <path>` — stdin: password. Generates a fresh seed,
-/// writes v2 (refuses to overwrite via `create_new`), and prints the 24-word
+/// writes the encrypted shape (refuses to overwrite via `create_new`), and prints the 24-word
 /// mnemonic line THEN the pubkey-hex line — pubkey is the LAST stdout line
 /// (the `run_verb`/`last_line` contract), mnemonic is the line before it.
 fn cmd_user_key_init(
@@ -264,7 +264,7 @@ fn user_key_restore(
 }
 
 /// `user-key restore --out <path>` — stdin: mnemonic line, then password
-/// line. Validates the BIP39 checksum, writes v2 (refuses to overwrite),
+/// line. Validates the BIP39 checksum, writes the encrypted shape (refuses to overwrite),
 /// prints the pubkey (the only stdout line).
 fn cmd_user_key_restore(
     args: &[String],
@@ -356,7 +356,7 @@ fn user_key_reveal(
 }
 
 /// `user-key reveal --key <path>` — stdin: password (empty/absent tolerated
-/// for legacy plaintext, required to decrypt v2). Prints the 24-word
+/// for plaintext, required to decrypt an encrypted file). Prints the 24-word
 /// mnemonic — the SAME encoding `init`/`restore` use, so it round-trips
 /// through `user-key restore` to the identical pubkey.
 fn cmd_user_key_reveal(
@@ -402,7 +402,7 @@ fn user_key_encrypt(
 
 /// `user-key encrypt --key <path>` — stdin: password. Migrates a legacy v1
 /// plaintext file to v2 in place (temp file + rename, the same atomicity as
-/// every other in-place rewrite); errors (no-op) if the file is already v2.
+/// every other in-place rewrite); errors (no-op) if the file is already encrypted.
 /// Prints the pubkey (unchanged by the migration).
 fn cmd_user_key_encrypt(
     args: &[String],
@@ -476,7 +476,7 @@ fn cmd_user_key(
 /// identity), a bare hex ed25519 seed file under the same load-or-generate
 /// discipline. pubkey on stdout (scriptable — the desktop shell's `run_verb`
 /// takes the LAST stdout line as the value), provenance on stderr. the
-/// legacy v1 shape (#205), kept working verbatim; `init` is the v2
+/// bare-hex shape (#205), kept working verbatim; `init` is the encrypted
 /// replacement `cmd_user_key` dispatches to instead.
 fn cmd_user_key_generate_legacy(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
@@ -675,7 +675,7 @@ fn user_sign_frame(
         .parse()
         .map_err(|e| format!("--seq is not a valid u64: {e}"))?;
 
-    // stdin order: password FIRST (only when the key file is v2-encrypted —
+    // stdin order: password FIRST (only when the key file is encrypted —
     // load_user_signer reads nothing otherwise), then the payload as ONE hex
     // line. the payload is not a secret; it rides stdin because a 1 MiB chunk
     // frame would blow past OS argv limits.
@@ -683,12 +683,12 @@ fn user_sign_frame(
     let payload_hex = prompt_stdin_line(stdin, "payload-hex")?;
     let payload = config::unhex(&payload_hex).map_err(|e| format!("payload hex: {e}"))?;
 
-    let frame = node::encode_frame(&user, seq, &sdk::Msg { target, payload });
+    let frame = node::encode_frame(&user, seq, &sdk::Msg { target, payload }, None);
     Ok(hex_bytes(&frame))
 }
 
 /// `user-sign-frame --key <path> --target <module> --seq <n>` — stdin:
-/// [password line when the key is v2-encrypted], then one payload-hex line.
+/// [password line when the key is encrypted], then one payload-hex line.
 /// Wraps the payload in a `node` op frame signed by the user key and prints
 /// the frame as hex (the only stdout line). POSTed raw to `/v1/submit/frame`,
 /// the frame's verified signer becomes the op's `Origin::External` — the
@@ -757,7 +757,7 @@ fn user_redeem_invite(
     if invite.token.role != config::InviteRole::Client {
         return Err("this is a node (resident) invite — use `ducktape node join`".into());
     }
-    // every invite is bearer (기명 dropped in v2): no target lock — this user
+    // every invite is bearer (기명 dropped — see the join ADR): no target lock — this user
     // key redeems the client invite directly, bound by the join proof below and
     // made single-use by the nonce.
     let user = load_user_signer(&key_path, stdin)?;
@@ -1845,7 +1845,7 @@ mod userkey_verb_tests {
         )
         .unwrap();
 
-        let (origin, msg) =
+        let (origin, msg, _cont) =
             node::decode_frame(&config::unhex(&frame_hex).unwrap()).expect("frame verifies");
         let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
         assert_eq!(origin, sdk::Origin::External(signer.public_key().as_ref().to_vec()));

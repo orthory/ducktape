@@ -42,7 +42,6 @@ use sdk_testkit::TestCtx;
 /// a minimal deterministic `Ctx` — enough to drive source commits/pins.
 fn ctx(origin: Origin, height: u64) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height,
         consensus_time: height,
         origin,

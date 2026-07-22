@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BASELINE_VERSION, BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID};
+use host::{BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID};
 use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
@@ -90,7 +90,6 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
         height,
         consensus_time: height,
         origin,
-        protocol_version: BASELINE_VERSION,
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }

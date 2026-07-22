@@ -99,7 +99,6 @@ fn user(name: &str) -> sdk::Origin {
 }
 fn ctx_as(origin: sdk::Origin) -> TestCtx {
     TestCtx::with_env(sdk::Env {
-        protocol_version: 0,
         height: 0,
         consensus_time: 7,
         origin,

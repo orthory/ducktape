@@ -34,7 +34,6 @@ fn validators_query(_req: &[u8]) -> Result<Vec<u8>, Error> {
 /// re-enter as hand-built ops.
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height,
         consensus_time: height,
         origin,

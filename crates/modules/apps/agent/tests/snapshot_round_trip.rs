@@ -21,7 +21,6 @@ use sdk_testkit::TestCtx;
 /// drives `execute` with a controllable env; the registry queries nothing.
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height,
         consensus_time: height,
         origin,
