@@ -2257,14 +2257,9 @@ checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 name = "duckdns"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "futures",
- "identity",
- "sdk",
  "serde",
  "serde_json",
  "sha2",
- "valset",
 ]
 
 [[package]]
