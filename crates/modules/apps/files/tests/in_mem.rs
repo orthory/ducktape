@@ -4,7 +4,7 @@
 //! test stops compiling (no tempfile import) or the odb/refs land nowhere.
 
 mod harness;
-use harness::TestCtx;
+use harness::test_ctx;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -42,7 +42,7 @@ fn in_mem_commit_then_read_with_zero_disk() {
             }],
         }),
     };
-    block_on(f.execute(&mut TestCtx::new(Origin::System, 1), &op)).expect("commit ok");
+    block_on(f.execute(&mut test_ctx(Origin::System, 1), &op)).expect("commit ok");
     block_on(f.commit_block()).expect("commit_block ok");
 
     // the matching query serves the committed bytes back — the full op → commit

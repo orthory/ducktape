@@ -49,7 +49,7 @@ fn native_commit_inline(dir: &tempfile::TempDir, height: u64, path: &str, body: 
             }],
         }),
     };
-    let mut ctx = TestCtx::new(sdk::Origin::System, height);
+    let mut ctx = test_ctx(sdk::Origin::System, height);
     futures::executor::block_on(f.execute(&mut ctx, &op)).expect("commit executes");
     futures::executor::block_on(f.commit_block()).expect("commit_block persists");
     f
