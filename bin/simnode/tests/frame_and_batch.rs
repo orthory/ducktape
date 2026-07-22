@@ -107,9 +107,12 @@ fn a_tampered_frame_is_refused_with_no_block() {
         &chat_frame_op(create_channel("general", "General")),
         None,
     );
-    // flip one PAYLOAD byte (the signature is the trailing 64): the signature
-    // binds (origin, seq, target, payload), so it no longer verifies.
-    let last = frame.len() - 65;
+    // flip one PAYLOAD byte: the trailing bytes are cont_flag (1) + signature
+    // (64), so the payload's last byte sits at len - 66. the signature binds
+    // (origin, seq, target, payload, cont), so it no longer verifies — and the
+    // tamper stays INSIDE the payload, so it is the signature check that
+    // refuses, not the frame parser.
+    let last = frame.len() - 66;
     frame[last] ^= 0x01;
 
     let (code, body) = sim.submit_frame(&frame);

@@ -966,6 +966,19 @@ fn run_sim(
                     Some(NodeCommand::Status { reply }) => {
                         let _ = reply.send(sim.status());
                     }
+                    Some(NodeCommand::Peers { reply }) => {
+                        // the sim has no mesh: its exposition carries no peer
+                        // families, so this parses to the honest empty sample
+                        // (same shape as the embedded daemon).
+                        let sampled_at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("system clock is past the epoch")
+                            .as_millis() as u64;
+                        let _ = reply.send(noded::peers::peers_from_exposition(
+                            &context.encode(),
+                            sampled_at_ms,
+                        ));
+                    }
                     Some(NodeCommand::Metrics { reply }) => {
                         let _ = reply.send(context.encode());
                     }
