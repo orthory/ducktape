@@ -80,7 +80,11 @@ where
             // in-flight result is lost with the process, exactly like a
             // crash mid-run — the saga's lease timeout re-leases it.
             if tx.send(msg).await.is_err() {
-                eprintln!("[oracle] result lane closed; dropping an oracle result");
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "result_lane_closed",
+                    "oracle result dropped"
+                );
             }
         })
     });

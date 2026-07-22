@@ -98,15 +98,28 @@ where
             if cmds.send(cmd).await.is_err() {
                 // the actor is gone (shutdown): the in-flight result dies
                 // with the process, exactly like a crash mid-run.
-                eprintln!("[noded] command lane closed; dropping an oracle result");
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "command_lane_closed",
+                    "oracle result dropped"
+                );
                 return;
             }
             match done.await {
                 Ok(Ok(_block)) => {}
                 // a rejected result is a deterministic verdict (e.g. the
                 // saga already settled the attempt) — log, never retry.
-                Ok(Err(e)) => eprintln!("[noded] oracle result rejected: {e}"),
-                Err(_) => eprintln!("[noded] oracle result reply dropped"),
+                Ok(Err(e)) => tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "oracle_result_rejected",
+                    error = %e,
+                    "oracle result dropped"
+                ),
+                Err(_) => tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "oracle_result_reply_dropped",
+                    "oracle result dropped"
+                ),
             }
         })
     });

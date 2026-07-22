@@ -208,11 +208,21 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
             Err(error) => {
-                eprintln!("[node {label}] gateway plane register failed: {error}");
+                tracing::error!(
+                    target: "ducktape::gateway",
+                    node = %label,
+                    error = %error,
+                    "gateway plane register failed"
+                );
                 return;
             }
         };
-        println!("[node {label}] gateway plane: overlay stream bound on {own}");
+        tracing::info!(
+            target: "ducktape::gateway",
+            node = %label,
+            own = %own,
+            "gateway plane: overlay stream bound"
+        );
         planes.register("gateway", Service::Gateway, plane.watch());
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;

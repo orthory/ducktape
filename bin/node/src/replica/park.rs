@@ -127,10 +127,12 @@ pub(super) async fn park(
     } = channels;
     metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);
     tracing::info!(
+        target: "ducktape::join",
         event = "node_phase_transition",
         role = "resident",
         phase = "joining",
-        node = %label
+        node = %label,
+        "joining: awaiting redemption"
     );
     let media_peers = if wireguard_listen.is_some()
     {
@@ -173,9 +175,11 @@ pub(super) async fn park(
         );
         Some(tracked)
     } else {
-        eprintln!(
-            "[node {label}] realtime sessions are DISABLED on this node: the mesh overlay \
-             is unavailable (wireguard_listen unset)"
+        tracing::warn!(
+            target: "ducktape::voice",
+            node = %label,
+            reason = "overlay_unavailable",
+            "realtime sessions disabled"
         );
         drop(voice_requests);
         None
@@ -205,14 +209,12 @@ pub(super) async fn park(
         metrics.record_sync_failure(error);
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Halted);
         tracing::error!(
+            target: "ducktape::statesync",
             event = "node_sync_failed",
             role = "resident",
             node = %label,
-            error
-        );
-        eprintln!(
-            "[node {label}] no statesync source: no validator other than this node \
-             is available to serve (only validators answer the statesync channel)"
+            error,
+            "FATAL: no validator state-sync source is available"
         );
         std::process::exit(1);
     }
@@ -263,9 +265,15 @@ pub(super) async fn park(
     // path.
     let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
     if let Some(listener) = rpc_listener {
-        println!(
-            "[node {label}] rpc listening on {}",
-            listener.local_addr().map(|a| a.to_string()).unwrap_or_default()
+        let listen = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            %listen,
+            "rpc listening on {listen}"
         );
         spawn_rpc_listener(listener, rpc_tx);
     } else {
@@ -430,25 +438,25 @@ pub(super) async fn park(
             .residents
             .iter()
             .any(|k| k.as_slice() == me_bytes.as_slice());
-        println!(
-            "[node {label}] replica: restart replayed the journal to {} \
-             (epoch {}, replayed {}, already-on-disk {}{}, app_hash={})",
-            tip,
-            rec.epoch,
-            rec.applied,
-            rec.skipped,
-            if rec.rolled_forward {
-                ", rolled 1 forward"
-            } else {
-                ""
-            },
-            hex(&root)
+        tracing::info!(
+            target: "ducktape::recovery",
+            node = %label,
+            height = tip,
+            epoch = rec.epoch,
+            replayed = rec.applied,
+            already_on_disk = rec.skipped,
+            rolled_forward = rec.rolled_forward,
+            app_hash = %hex(&root),
+            "replica: restart replayed the journal"
         );
         // the e2e / operator serve marker, truthful here too: the
         // node serves a verified boundary — the recovered tip.
-        println!(
-            "[node {label}] resident: pre-synced boundary {tip} app_hash={}",
-            hex(&root)
+        tracing::info!(
+            target: "ducktape::statesync",
+            node = %label,
+            height = tip,
+            app_hash = %hex(&root),
+            "resident: pre-synced boundary {tip} app_hash={}", hex(&root)
         );
         heal_index(&index, node_r.host(), tip, &label).await;
         last_indexed_root = Some(root);
@@ -559,9 +567,10 @@ pub(super) async fn park(
     let (boundary, host, floor) = loop {
         attempt += 1;
         if !resident_standing && admitted.load(std::sync::atomic::Ordering::Acquire) {
-            println!(
-                "[node {label}] admission confirmed by first contact — standing is \
-                 committed; syncing the boundary"
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                "admission confirmed by first contact; syncing the boundary"
             );
             resident_standing = true;
         }
@@ -709,8 +718,10 @@ pub(super) async fn park(
                                 // a resident writes no checkpoint — nothing to
                                 // flush; a restart parks straight back here.
                                 let _ = reply.send(RpcReply::ok());
-                                println!(
-                                    "[node {label}] shutdown requested via rpc — exiting"
+                                tracing::info!(
+                                    target: "ducktape::node",
+                                    node = %label,
+                                    "shutdown requested via rpc; exiting"
                                 );
                                 std::process::exit(0);
                             }
@@ -868,29 +879,42 @@ pub(super) async fn park(
                             matches!(outcome, relay::RelayOutcome::Applied { .. });
                         if let Some(ok) = resident_announcer.on_reply(&frame_id, applied) {
                             if ok {
-                                println!(
-                                    "[node {label}] resident: announced capabilities {:?}",
-                                    resident_announcer.capabilities()
+                                tracing::info!(
+                                    target: "ducktape::modules",
+                                    node = %label,
+                                    capabilities = ?resident_announcer.capabilities(),
+                                    "resident: announced capabilities"
                                 );
                             } else {
-                                eprintln!(
-                                    "[node {label}] resident: capability announce did not \
-                                     apply ({outcome:?}) - will retry"
+                                tracing::warn!(
+                                    target: "ducktape::modules",
+                                    node = %label,
+                                    outcome = ?outcome,
+                                    reason = "capability_announce_rejected",
+                                    "resident capability announce did not apply; retrying"
                                 );
                             }
                         } else if let Some((saga_id, attempt)) =
                             resident_dispatch.on_reply(&frame_id, applied)
                         {
                             if applied {
-                                println!(
-                                    "[node {label}] resident: dispatch result for saga \
-                                     {saga_id} attempt {attempt} applied"
+                                tracing::info!(
+                                    target: "ducktape::saga",
+                                    node = %label,
+                                    saga_id,
+                                    attempt,
+                                    "resident: dispatch result for saga {saga_id} attempt \
+                                     {attempt} applied"
                                 );
                             } else {
-                                eprintln!(
-                                    "[node {label}] resident: dispatch result for saga \
-                                     {saga_id} attempt {attempt} did not apply \
-                                     ({outcome:?}) - will retry while leased"
+                                tracing::warn!(
+                                    target: "ducktape::saga",
+                                    node = %label,
+                                    saga_id,
+                                    attempt,
+                                    outcome = ?outcome,
+                                    reason = "dispatch_result_rejected",
+                                    "resident dispatch result did not apply; retrying while leased"
                                 );
                             }
                         }
@@ -958,11 +982,14 @@ pub(super) async fn park(
                                     // epoch-cutover branch, so the fallback poll
                                     // re-ascends at a fresh boundary instead of
                                     // retrying the impossible range forever.
-                                    println!(
-                                        "[node {label}] replica: backfill ({after_view}, \
-                                         {up_to_view}] pruned at the source ({}) — \
-                                         re-syncing at a fresh boundary",
-                                        e.detail
+                                    tracing::warn!(
+                                        target: "ducktape::statesync",
+                                        node = %label,
+                                        after_view,
+                                        up_to_view,
+                                        error = %e.detail,
+                                        reason = "range_pruned",
+                                        "replica backfill pruned; re-syncing at a fresh boundary"
                                     );
                                     serving = None;
                                     metrics.record_sync_failure(e.detail.clone());
@@ -984,11 +1011,13 @@ pub(super) async fn park(
                                     noded::NodeRole::Resident,
                                     noded::NodePhase::Serving,
                                 );
-                                println!(
-                                    "[node {label}] replica: backfill ({after_view}, \
-                                     {up_to_view}] unavailable: {} — retrying on the \
-                                     next certificate",
-                                    e.detail
+                                tracing::debug!(
+                                    target: "ducktape::statesync",
+                                    node = %label,
+                                    after_view,
+                                    up_to_view,
+                                    error = %e.detail,
+                                    "replica backfill unavailable; retrying on the next certificate"
                                 );
                                 break;
                             }
@@ -1034,11 +1063,14 @@ pub(super) async fn park(
                                         // same escalation as the gap branch
                                         // above: a pruned range cannot heal
                                         // by waiting.
-                                        println!(
-                                            "[node {label}] replica: unresolvable view \
-                                             {view} pruned at the source ({}) — \
-                                             re-syncing at a fresh boundary",
-                                            e.detail
+                                        tracing::warn!(
+                                            target: "ducktape::statesync",
+                                            node = %label,
+                                            view,
+                                            error = %e.detail,
+                                            reason = "range_pruned",
+                                            "unresolvable replica view pruned; re-syncing at a \
+                                             fresh boundary"
                                         );
                                         serving = None;
                                         metrics.record_sync_failure(e.detail.clone());
@@ -1064,11 +1096,13 @@ pub(super) async fn park(
                                         noded::NodeRole::Resident,
                                         noded::NodePhase::Serving,
                                     );
-                                    println!(
-                                        "[node {label}] replica: unresolvable view \
-                                         {view} backfill failed: {} — retrying on \
-                                         the next certificate",
-                                        e.detail
+                                    tracing::debug!(
+                                        target: "ducktape::statesync",
+                                        node = %label,
+                                        view,
+                                        error = %e.detail,
+                                        "unresolvable replica view backfill failed; retrying on \
+                                         the next certificate"
                                     );
                                 }
                                 break;
@@ -1076,8 +1110,12 @@ pub(super) async fn park(
                             Err(e) => {
                                 // quorum verification failed: a lying
                                 // certificate source. drop it loudly.
-                                eprintln!(
-                                    "[node {label}] replica: certificate refused: {e}"
+                                tracing::warn!(
+                                    target: "ducktape::consensus",
+                                    node = %label,
+                                    error = %e,
+                                    reason = "certificate_invalid",
+                                    "replica certificate refused"
                                 );
                                 continue;
                             }
@@ -1137,11 +1175,13 @@ pub(super) async fn park(
                     for (module, served_root) in &served_roots {
                         let ours = node_r.host().module_root(module);
                         if ours.as_ref() != Some(served_root) {
-                            eprintln!(
-                                "[node {label}] replica: diverged module={module} \
-                                 served={} ours={}",
-                                hex(served_root),
-                                ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into())
+                            tracing::error!(
+                                target: "ducktape::consensus",
+                                node = %label,
+                                module,
+                                served = %hex(served_root),
+                                ours = %ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into()),
+                                "replica module diverged"
                             );
                         }
                     }
@@ -1156,15 +1196,13 @@ pub(super) async fn park(
                 };
                 if let Err(err) = index.apply_block(&ops) {
                     tracing::error!(
+                        target: "ducktape::modules",
                         event = "node_index_poisoned",
                         node = %label,
                         role = "resident",
                         height,
-                        error = %err
-                    );
-                    eprintln!(
-                        "[node {label}] replica index apply failed at height \
-                         {height}: {err} — wipe <storage>/index to rebuild"
+                        error = %err,
+                        "replica index apply failed; wipe <storage>/index to rebuild"
                     );
                 }
                 if let Some(root) = sealed_hash {
@@ -1208,12 +1246,13 @@ pub(super) async fn park(
                 let mut actions =
                     EpochActions::new(orch, folded_view, observed, observed_residents);
                 if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
-                    println!(
-                        "[node {label}] replica: membership change observed at view {} \
-                         — cutover to epoch {} at view {}",
-                        cutover.observed_view(),
-                        cutover.next_epoch(),
-                        cutover.cutover_view()
+                    tracing::info!(
+                        target: "ducktape::consensus",
+                        node = %label,
+                        observed_view = cutover.observed_view(),
+                        next_epoch = cutover.next_epoch(),
+                        cutover_view = cutover.cutover_view(),
+                        "replica membership change observed"
                     );
                     node_r.set_view_ceiling(cutover.cutover_view());
                 }
@@ -1270,11 +1309,12 @@ pub(super) async fn park(
                     // validator writes one immediately post-cutover
                     // for the same restart-boundary reason.
                     blocks_since_checkpoint = checkpoint_blocks;
-                    println!(
-                        "[node {label}] replica: epoch cutover to {} at base {} — \
-                         follower swapped in-loop",
-                        plan.epoch(),
-                        plan.cutover_app_height()
+                    tracing::info!(
+                        target: "ducktape::consensus",
+                        node = %label,
+                        epoch = plan.epoch(),
+                        base_height = plan.cutover_app_height(),
+                        "replica epoch cutover; follower swapped in-loop"
                     );
                 }
             }
@@ -1299,9 +1339,12 @@ pub(super) async fn park(
                     };
                     match node_r.sink_mut().write_floor_cert(&fc).await {
                         Ok(()) => last_cert_height = Some(height),
-                        Err(e) => eprintln!(
-                            "[node {label}] replica floor cert write failed \
-                             (will retry): {e}"
+                        Err(e) => tracing::warn!(
+                            target: "ducktape::recovery",
+                            node = %label,
+                            height,
+                            error = %e,
+                            "replica floor cert write failed; retrying"
                         ),
                     }
                 }
@@ -1350,26 +1393,31 @@ pub(super) async fn park(
                                         .is_none_or(|h| fc.height >= h)
                             );
                             if floor_passed
-                                && let Err(e) = node_r
-                                    .sink_mut()
-                                    .prune_oplog(replica_prev_ckpt.1)
-                                    .await
+                                && let Err(e) =
+                                    node_r.sink_mut().prune_oplog(replica_prev_ckpt.1).await
                             {
-                                eprintln!(
-                                    "[node {label}] replica oplog prune failed: {e}"
+                                tracing::warn!(
+                                    target: "ducktape::recovery",
+                                    node = %label,
+                                    error = %e,
+                                    "replica oplog prune failed"
                                 );
                             }
                             replica_prev_ckpt = (ckpt.height, pos);
                             blocks_since_checkpoint = 0;
                         }
-                        Err(e) => eprintln!(
-                            "[node {label}] replica checkpoint write failed \
-                             (will retry): {e}"
+                        Err(e) => tracing::warn!(
+                            target: "ducktape::recovery",
+                            node = %label,
+                            error = %e,
+                            "replica checkpoint write failed; retrying"
                         ),
                     },
-                    Err(e) => eprintln!(
-                        "[node {label}] replica checkpoint capture failed \
-                         (will retry): {e}"
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::recovery",
+                        node = %label,
+                        error = %e,
+                        "replica checkpoint capture failed; retrying"
                     ),
                 }
             }
@@ -1400,7 +1448,12 @@ pub(super) async fn park(
                 // done.
                 let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                 metrics.record_sync_retry(e.to_string());
-                println!("{}", retry.log_line);
+                tracing::debug!(
+                    target: "ducktape::statesync",
+                    attempts = attempt,
+                    announce = retry.announce,
+                    "{}", retry.log_line
+                );
                 continue;
             }
         };
@@ -1410,11 +1463,13 @@ pub(super) async fn park(
         // promotion re-derives everything from verified state.
         if tip.epoch > last_tracked {
             if tip.epoch >= EPOCH_CHANNEL_BANK {
-                println!(
-                    "[node {label}] warning: the network is at epoch {} — beyond this \
-                     process's pre-registered channel bank ({EPOCH_CHANNEL_BANK}); \
-                     expect reconnect churn while parked",
-                    tip.epoch
+                tracing::warn!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    epoch = tip.epoch,
+                    channel_bank = EPOCH_CHANNEL_BANK,
+                    reason = "epoch_outside_channel_bank",
+                    "expect reconnect churn while parked"
                 );
             }
             let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
@@ -1499,9 +1554,12 @@ pub(super) async fn park(
                 // boundary below. the in-loop follower swap
                 // (node.cutover, no re-bootstrap) is the promotion
                 // collapse's concern (phase 3).
-                println!(
-                    "[node {label}] replica: epoch cutover {} -> {} — re-ascending",
-                    replica_epoch, tip.epoch
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    from_epoch = replica_epoch,
+                    to_epoch = tip.epoch,
+                    "replica epoch cutover; re-ascending"
                 );
                 serving = None;
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
@@ -1513,9 +1571,11 @@ pub(super) async fn park(
             if tip.residents.iter().any(|k| k == &me_bytes) {
                 if !resident_standing {
                     resident_standing = true;
-                    println!(
-                        "[node {label}] resident: standing granted — following \
-                         boundaries and serving local reads"
+                    tracing::info!(
+                        target: "ducktape::join",
+                        node = %label,
+                        "resident: standing granted; following boundaries and serving local \
+                         reads"
                     );
                 }
                 // RESIDENT standing (staged admission): granted, so
@@ -1542,12 +1602,21 @@ pub(super) async fn park(
                                 resident_standing,
                                 &e,
                             );
-                            println!("{}", retry.log_line);
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                attempts = attempt,
+                                announce = retry.announce,
+                                "{}", retry.log_line
+                            );
                             continue;
                         }
                     };
-                    println!(
-                        "[node {label}] replica: bootstrapping at boundary {} ({} modules)",
+                    tracing::info!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        height = m.height,
+                        modules = m.entries.len(),
+                        "replica: bootstrapping at boundary {} ({} modules)",
                         m.height,
                         m.entries.len()
                     );
@@ -1590,10 +1659,12 @@ pub(super) async fn park(
                                 }),
                                 Err(e) => {
                                     metrics.record_sync_retry(e.to_string());
-                                    println!(
-                                        "[node {label}] replica: boundary {} floor \
-                                         refused ({e}) — retrying",
-                                        m.height
+                                    tracing::debug!(
+                                        target: "ducktape::statesync",
+                                        node = %label,
+                                        height = m.height,
+                                        error = %e,
+                                        "replica boundary floor refused; retrying"
                                     );
                                     continue;
                                 }
@@ -1643,10 +1714,12 @@ pub(super) async fn park(
                                 }
                                 Err(e) => {
                                     metrics.record_sync_retry(format!("{e:?}"));
-                                    println!(
-                                        "[node {label}] replica: suffix fold at \
-                                         boundary {} unavailable ({e:?}) — re-bootstrapping",
-                                        m.height
+                                    tracing::warn!(
+                                        target: "ducktape::statesync",
+                                        node = %label,
+                                        height = m.height,
+                                        error = ?e,
+                                        "replica suffix fold unavailable; re-bootstrapping"
                                     );
                                     recovery_slot = Some(recovery);
                                     continue;
@@ -1703,18 +1776,20 @@ pub(super) async fn park(
                             // the e2e suite (and operators) key on,
                             // truthful under both the old re-install
                             // model and the fold pipeline.
-                            println!(
-                                "[node {label}] resident: pre-synced boundary {} \
-                                 app_hash={}",
-                                tip,
-                                hex(&root)
+                            tracing::info!(
+                                target: "ducktape::statesync",
+                                node = %label,
+                                height = tip,
+                                app_hash = %hex(&root),
+                                "resident: pre-synced boundary {tip} app_hash={}", hex(&root)
                             );
-                            println!(
-                                "[node {label}] replica: following the head from {} \
-                                 (epoch {}, app_hash={})",
-                                tip,
-                                m.epoch,
-                                hex(&root)
+                            tracing::info!(
+                                target: "ducktape::consensus",
+                                node = %label,
+                                height = tip,
+                                epoch = m.epoch,
+                                app_hash = %hex(&root),
+                                "replica: following the head from {tip}"
                             );
                             // the derived tier starts exact at the
                             // ascension tip; per-block folds keep it
@@ -1725,9 +1800,12 @@ pub(super) async fn park(
                                     tip,
                                     boundary_block_row(tip, &root),
                                 ) {
-                                    eprintln!(
-                                        "[node {label}] replica: explorer row at \
-                                         ascension tip {tip} refused: {err}"
+                                    tracing::warn!(
+                                        target: "ducktape::modules",
+                                        node = %label,
+                                        height = tip,
+                                        error = %err,
+                                        "replica explorer row refused"
                                     );
                                 }
                                 stream_hub.publish_block(tip, hex(&root));
@@ -1749,15 +1827,13 @@ pub(super) async fn park(
                         Err(e) => {
                             metrics.record_sync_failure(e.to_string());
                             tracing::warn!(
+                                target: "ducktape::statesync",
                                 event = "node_sync_failed",
                                 role = "resident",
                                 node = %label,
                                 target_height = m.height,
-                                error = %e
-                            );
-                            println!(
-                                "[node {label}] replica bootstrap at boundary {} failed: {e}",
-                                m.height
+                                error = %e,
+                                "replica bootstrap failed"
                             );
                         }
                     }
@@ -1790,17 +1866,21 @@ pub(super) async fn park(
                         ) {
                             Ok(id) => {
                                 resident_announcer.sent(id, now);
-                                println!(
-                                    "[node {label}] resident: capability announce \
-                                     relayed ({:?})",
-                                    resident_announcer.capabilities()
+                                tracing::info!(
+                                    target: "ducktape::modules",
+                                    node = %label,
+                                    capabilities = ?resident_announcer.capabilities(),
+                                    "resident: capability announce relayed"
                                 );
                             }
                             Err(e) => {
                                 resident_announcer.send_failed();
-                                eprintln!(
-                                    "[node {label}] resident: capability announce \
-                                     relay failed: {e}"
+                                tracing::warn!(
+                                    target: "ducktape::modules",
+                                    node = %label,
+                                    error = %e,
+                                    reason = "capability_announce_relay_failed",
+                                    "resident capability announce relay failed"
                                 );
                             }
                         }
@@ -1825,16 +1905,24 @@ pub(super) async fn park(
                         ) {
                             Ok(id) => {
                                 resident_dispatch.sent(&key, id, now);
-                                println!(
-                                    "[node {label}] resident: dispatch result for \
-                                     saga {} attempt {} relayed",
-                                    key.0, key.1
+                                tracing::info!(
+                                    target: "ducktape::saga",
+                                    node = %label,
+                                    saga_id = key.0,
+                                    attempt = key.1,
+                                    "resident: dispatch result for saga {} attempt {} relayed",
+                                    key.0,
+                                    key.1
                                 );
                             }
-                            Err(e) => eprintln!(
-                                "[node {label}] resident: dispatch result relay \
-                                 failed for saga {} attempt {}: {e}",
-                                key.0, key.1
+                            Err(e) => tracing::warn!(
+                                target: "ducktape::saga",
+                                node = %label,
+                                saga_id = key.0,
+                                attempt = key.1,
+                                error = %e,
+                                reason = "dispatch_result_relay_failed",
+                                "resident dispatch result relay failed"
                             ),
                         }
                     }
@@ -1845,11 +1933,6 @@ pub(super) async fn park(
             // grant (`invite-accept`/`promote`): the tokened join gate already
             // ran to completion above, so there is nothing to re-announce here
             // — just keep polling for the grant to land.
-            println!(
-                "[node {label}] joining: awaiting redemption (epoch {} has {} validators)",
-                tip.epoch,
-                tip.participants.len()
-            );
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);
             continue;
         }
@@ -1861,7 +1944,12 @@ pub(super) async fn park(
             Err(e) => {
                 metrics.record_sync_retry(e.to_string());
                 let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
-                println!("{}", retry.log_line);
+                tracing::debug!(
+                    target: "ducktape::statesync",
+                    attempts = attempt,
+                    announce = retry.announce,
+                    "{}", retry.log_line
+                );
                 continue;
             }
         };
@@ -1870,15 +1958,21 @@ pub(super) async fn park(
         // engine would re-deliver history the synced state already
         // contains — retry until the source's floor catches up.
         if m.height > m.view_base && m.floor_cert.is_none() {
-            println!(
-                "[node {label}] admitted; boundary {} lacks its finalization floor \
-                 yet — retrying",
-                m.height
+            tracing::debug!(
+                target: "ducktape::statesync",
+                node = %label,
+                height = m.height,
+                "admitted boundary lacks its finalization floor; retrying"
             );
             continue;
         }
-        println!(
-            "[node {label}] admitted at epoch {} boundary {} — syncing {} modules",
+        tracing::info!(
+            target: "ducktape::join",
+            node = %label,
+            epoch = m.epoch,
+            height = m.height,
+            modules = m.entries.len(),
+            "admitted at epoch {} boundary {}; syncing {} modules",
             m.epoch,
             m.height,
             m.entries.len()
@@ -1929,9 +2023,14 @@ pub(super) async fn park(
                 "replica_promotion_checkpoint",
             )
             .await;
-            println!(
-                "[node {label}] promoted: validator at epoch {} boundary {} — rebooting",
-                base.epoch, base.height
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                epoch = base.epoch,
+                height = base.height,
+                "promoted: validator at epoch {} boundary {}; rebooting",
+                base.epoch,
+                base.height
             );
             if let Some(cmd) = &reach_cmd {
                 let _ = cmd.try_send(reachability::ReachabilityCommand::Shutdown);
@@ -1983,10 +2082,12 @@ pub(super) async fn park(
                     Ok(latest) => latest,
                     Err(e) => {
                         metrics.record_sync_retry(e.to_string());
-                        println!(
-                            "[node {label}] synced boundary {} but could not revalidate \
-                             latest manifest ({e}); retrying",
-                            m.height
+                        tracing::debug!(
+                            target: "ducktape::join",
+                            node = %label,
+                            height = m.height,
+                            error = %e,
+                            "synced boundary could not revalidate the latest manifest; retrying"
                         );
                         continue;
                     }
@@ -2040,28 +2141,33 @@ pub(super) async fn park(
                     }
                     PromotionBoundary::Retry => {}
                 }
-                println!(
-                    "[node {label}] boundary {} drifted during sync ({} -> latest {}); \
-                     discarding scratch and retrying",
-                    m.height,
-                    hex(&m.app_hash),
-                    hex(&latest.app_hash)
+                tracing::debug!(
+                    target: "ducktape::join",
+                    node = %label,
+                    height = m.height,
+                    synced_hash = %hex(&m.app_hash),
+                    latest_hash = %hex(&latest.app_hash),
+                    "boundary drifted during sync; discarding scratch and retrying"
                 );
             }
             Err(e) => {
                 metrics.record_sync_failure(e.to_string());
                 tracing::warn!(
+                    target: "ducktape::statesync",
                     event = "node_sync_failed",
                     role = "resident",
                     node = %label,
                     target_height = m.height,
-                    error = %e
+                    error = %e,
+                    "resident boundary sync failed"
                 );
-                println!("[node {label}] sync at boundary {} failed: {e}", m.height);
             }
         }
     };
-    println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
+    tracing::info!(
+        target: "ducktape::statesync",
+        "node={label} synced app_hash={}", hex(&host.app_hash())
+    );
 
     // the optional shipped-index warm start rides the same sync
     // connection, staged BEFORE the promotion checkpoint lands: a
@@ -2113,9 +2219,14 @@ pub(super) async fn park(
             context.sleep(Duration::from_millis(20)).await;
         }
     }
-    println!(
-        "[node {label}] promoted: validator at epoch {} boundary {} — rebooting",
-        boundary.epoch, boundary.height
+    tracing::info!(
+        target: "ducktape::join",
+        node = %label,
+        epoch = boundary.epoch,
+        height = boundary.height,
+        "promoted: validator at epoch {} boundary {}; rebooting",
+        boundary.epoch,
+        boundary.height
     );
     reboot_self();
 }

@@ -533,9 +533,12 @@ async fn direct_attempt(
         Ok(Ok(())) => {}
         // a failed install is not fatal to THIS attempt — WireGuard roaming can
         // still pin the tunnel once the intro reaches the peer; log and press on.
-        Ok(Err(e)) => eprintln!(
-            "[node {label}] first-contact: direct peer {endpoint_addr} not installed ({e}) — \
-             announcing anyway"
+        Ok(Err(e)) => tracing::warn!(
+            target: "ducktape::join",
+            node = %label,
+            endpoint = %endpoint_addr,
+            error = %e,
+            "first-contact direct peer not installed; announcing anyway"
         ),
         Err(_) => return AttemptResult::Failed("install reply dropped".into()),
     }

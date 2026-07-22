@@ -149,7 +149,11 @@ impl ValidatorRuntime<'_> {
                 // SAME sequence as the signal arm (shared macro).
                 graceful_checkpoint(node, orchestrator, *next_seq).await;
                 let _ = reply.send(RpcReply::ok());
-                println!("[node {label}] shutdown requested via rpc — exiting");
+                tracing::info!(
+                    target: "ducktape::node",
+                    node = %label,
+                    "shutdown requested via rpc; exiting"
+                );
                 std::process::exit(0);
             }
         };
@@ -172,7 +176,13 @@ impl ValidatorRuntime<'_> {
         let seq = *next_seq;
         *next_seq += 1;
         if let Err(e) = node.submit(signer, seq, msg).await {
-            eprintln!("[node {label}] oracle result submit failed: {e}");
+            tracing::warn!(
+                target: "ducktape::saga",
+                node = %label,
+                error = %e,
+                reason = "oracle_result_submit_failed",
+                "oracle result dropped"
+            );
         }
     }
 
@@ -212,13 +222,14 @@ impl ValidatorRuntime<'_> {
             .iter()
             .find(|r| r.nonce == fwd.nonce && r.joiner != joiner_bytes)
         {
-            println!(
-                "[node {label}] gate: {} presented an ALREADY-REDEEMED invite \
-                         (spent by {} at height {}) — refusing permanently; an invite \
-                         admits exactly one person, mint a fresh one per joiner",
-                hex_bytes(&joiner_bytes[..4.min(joiner_bytes.len())]),
-                hex_bytes(&spent.joiner[..4.min(spent.joiner.len())]),
-                spent.height,
+            tracing::warn!(
+                target: "ducktape::join",
+                node = %label,
+                peer = %hex_bytes(&joiner_bytes[..4.min(joiner_bytes.len())]),
+                spent_by = %hex_bytes(&spent.joiner[..4.min(spent.joiner.len())]),
+                height = spent.height,
+                reason = "invite_already_redeemed",
+                "gate: peer presented an ALREADY-REDEEMED invite; refusing permanently"
             );
             super::settle_gate(
                 gate_outcomes,
@@ -338,11 +349,15 @@ impl ValidatorRuntime<'_> {
             .await
         {
             Ok(frame_id) => {
-                println!(
-                    "[node {label}] gate: redemption submitted for {} (invited by {}) — \
-                             awaiting consensus before answering Admitted",
-                    hex_bytes(&joiner_bytes),
-                    hex_bytes(&issuer_bytes)
+                tracing::info!(
+                    target: "ducktape::join",
+                    node = %label,
+                    peer = %hex_bytes(&joiner_bytes[..4.min(joiner_bytes.len())]),
+                    issuer = %hex_bytes(&issuer_bytes[..4.min(issuer_bytes.len())]),
+                    frame = %hex_bytes(&frame_id),
+                    "gate: redemption submitted for {}; awaiting consensus before answering \
+                     Admitted",
+                    hex_bytes(&joiner_bytes[..4.min(joiner_bytes.len())])
                 );
                 let now = unix_ms();
                 join_requests

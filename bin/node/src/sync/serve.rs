@@ -154,10 +154,13 @@ where
             permanent: matches!(e, SyncError::RangePruned { .. }),
             detail: e.to_string(),
         })?;
-    println!(
-        "[node {label}] replica: backfilling {} committed frame(s) in views ({after_view}, \
-         {up_to_view}]",
-        frames.len()
+    tracing::debug!(
+        target: "ducktape::statesync",
+        node = %label,
+        frames = frames.len(),
+        after_view,
+        up_to_view,
+        "replica backfill"
     );
     for f in frames {
         let view = f.height.saturating_sub(view_base);

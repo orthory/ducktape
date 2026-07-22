@@ -253,10 +253,12 @@ fn gateway_can_start(
     // a configured gateway suppressed ONLY by a non-loopback app surface is a
     // silent degradation — say why, or the operator debugs a dead listener.
     if !sync_only && gateway_listen.is_some() && !api_is_loopback && http_listen.is_some() {
-        eprintln!(
-            "gateway disabled: http_listen {:?} is not loopback — the browser gateway only \
-             starts when the node API binds a loopback address",
-            http_listen.unwrap_or_default()
+        tracing::warn!(
+            target: "ducktape::gateway",
+            http_listen = http_listen.unwrap_or_default(),
+            reason = "api_not_loopback",
+            "gateway disabled; the browser gateway only starts when the node API binds a \
+             loopback address"
         );
     }
     !sync_only
@@ -469,9 +471,11 @@ fn run_node(
         // breadcrumb between the surface binds and the mesh/plane wiring: a
         // long journal replay is silent local disk io, and a boot log that
         // ends at "rpc listening" is otherwise indistinguishable from a hang.
-        println!(
-            "[node {label}] recovery store open (checkpoint: {})",
-            if manifest.is_some() { "present" } else { "none" }
+        tracing::info!(
+            target: "ducktape::recovery",
+            node = %label,
+            checkpoint = if manifest.is_some() { "present" } else { "none" },
+            "recovery store open"
         );
         let forge_repo = storage_for_sync.join("forge-repo");
         let duckfs_dir = storage_for_sync.join("duckfs");

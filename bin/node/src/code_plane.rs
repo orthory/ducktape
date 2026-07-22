@@ -134,11 +134,21 @@ pub(crate) fn spawn(
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
             Err(error) => {
-                eprintln!("[node {label}] module-code plane register failed: {error}");
+                tracing::error!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    error = %error,
+                    "module-code plane register failed"
+                );
                 return;
             }
         };
-        println!("[node {label}] module-code plane: overlay stream bound on {own}");
+        tracing::info!(
+            target: "ducktape::modules",
+            node = %label,
+            own = %own,
+            "module-code plane: overlay stream bound"
+        );
         planes.register("module-code", Service::ModuleCode, plane.watch());
         let _plane = plane;
         tokio::select! {

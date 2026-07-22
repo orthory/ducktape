@@ -972,7 +972,7 @@ fn run_sim(
                         // (same shape as the embedded daemon).
                         let sampled_at_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .expect("system clock is past the epoch")
+                            .unwrap_or_default()
                             .as_millis() as u64;
                         let _ = reply.send(noded::peers::peers_from_exposition(
                             &context.encode(),
