@@ -328,80 +328,71 @@ fn derive_coordinator_relay(primary_coordinator: &str) -> String {
     format!("{host}:443")
 }
 
+/// the column trailing notes start in — wide enough for the typical
+/// `key = value`; longer assignments just push their note right.
+const NOTE_COLUMN: usize = 36;
+
+/// one live `key = value  # note` line, notes column-aligned so the file
+/// reads as its own reference sheet.
+fn keyline(s: &mut String, key: &str, value: std::fmt::Arguments<'_>, note: &str) {
+    let assignment = format!("{key} = {value}");
+    if assignment.len() < NOTE_COLUMN {
+        let _ = writeln!(s, "{assignment:<NOTE_COLUMN$}# {note}");
+    } else {
+        let _ = writeln!(s, "{assignment}  # {note}");
+    }
+}
+
 /// write the network-shape node.toml (init/join): the COMPLETE key set,
-/// every line live — the parser requires every key, so there is nothing
-/// optional to document away. trailing comments carry the sentinel
-/// meanings. the file references its siblings relatively, so the whole dir
-/// is relocatable.
+/// every line live with a brief note — the parser requires every key, so
+/// the file IS the reference: what each key does, and what its sentinel
+/// values mean. the file references its siblings relatively, so the whole
+/// dir is relocatable.
 pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     let mut s = String::from(
         "# ducktape node config (network shape) — see network.toml for the network.\n\
-         # every key is required and printed; edit values, don't delete lines.\n\
-         network = \"network.toml\"\n\
-         key_file = \"identity.key\"\n",
+         # every key is required; edit values, don't delete lines (rewrites re-fill).\n",
     );
-    let _ = writeln!(s, "listen = \"{}\"", p.listen);
-    let _ = writeln!(
-        s,
-        "advertised = \"{}\"  # \"overlay\" = the chain-derived ULA, or a dialable address",
-        p.advertised
-    );
-    let _ = writeln!(s, "storage_dir = '{}'", p.storage_dir);
-    let _ = writeln!(s, "http_listen = \"{}\"", p.http_listen);
-    let _ = writeln!(
-        s,
-        "gateway_listen = \"{}\"  # loopback only; port 0 = pick a free port",
-        p.gateway_listen
-    );
-    let _ = writeln!(s, "rpc_listen = \"{}\"", p.rpc_listen);
-    let _ = writeln!(s, "wireguard_listen = \"{}\"", p.wireguard_listen);
-    let _ = writeln!(
-        s,
-        "invite_listen = \"{}\"  # the invite intro listener",
-        p.invite_listen
-    );
-    let _ = writeln!(
-        s,
-        "wireguard_advertised = \"{}\"  # \"auto\" = derive from wireguard_listen",
-        p.wireguard_advertised
-    );
-    let _ = writeln!(
-        s,
-        "primary_coordinator = \"{}\"  # \"none\" = no ambient rendezvous",
-        p.primary_coordinator
-    );
-    let _ = writeln!(
-        s,
-        "coordinator_relay = \"{}\"  # TCP first-contact fallback; \"none\" disables",
-        p.coordinator_relay
-    );
-    let _ = writeln!(
-        s,
-        "checkpoint_blocks = {}  # sealed blocks between recovery checkpoints",
-        p.checkpoint_blocks
-    );
-    let _ = writeln!(
-        s,
-        "sync_index = {}  # opt-in UNVERIFIABLE shipped-index warm start on join",
-        p.sync_index
-    );
-    let _ = writeln!(
-        s,
-        "announce_capabilities = {}  # true: publish this node's provider set",
-        p.announce_capabilities
-    );
-    let _ = writeln!(
-        s,
-        "sandbox = \"{}\"  # provider run isolation: \"direct\", \"podman\", or \"tart\"",
-        p.sandbox
-    );
-    let _ = writeln!(s, "sandbox_image = \"{}\"", p.sandbox_image);
-    let _ = writeln!(s, "sandbox_cores = {}  # 0 = probe the host", p.sandbox_cores);
-    let _ = writeln!(
-        s,
-        "sandbox_mem_gb = {}  # 0 = probe the host",
-        p.sandbox_mem_gb
-    );
+    keyline(&mut s, "network", format_args!("\"network.toml\""),
+        "the network descriptor, beside this file");
+    keyline(&mut s, "key_file", format_args!("\"identity.key\""),
+        "this node's identity secret, beside this file");
+    keyline(&mut s, "listen", format_args!("\"{}\"", p.listen),
+        "p2p mesh listener (dual-stack)");
+    keyline(&mut s, "advertised", format_args!("\"{}\"", p.advertised),
+        "what peers dial: \"overlay\" = the chain ULA, or host:port");
+    keyline(&mut s, "storage_dir", format_args!("'{}'", p.storage_dir),
+        "chain + module state, beside this file");
+    keyline(&mut s, "http_listen", format_args!("\"{}\"", p.http_listen),
+        "HTTP app API (keep loopback)");
+    keyline(&mut s, "gateway_listen", format_args!("\"{}\"", p.gateway_listen),
+        "browser gateway; loopback only, port 0 = pick free");
+    keyline(&mut s, "rpc_listen", format_args!("\"{}\"", p.rpc_listen),
+        "local admin RPC (keep loopback)");
+    keyline(&mut s, "wireguard_listen", format_args!("\"{}\"", p.wireguard_listen),
+        "the WireGuard tunnel plane (UDP)");
+    keyline(&mut s, "invite_listen", format_args!("\"{}\"", p.invite_listen),
+        "invite intro listener (UDP; convention: wireguard port + 1)");
+    keyline(&mut s, "wireguard_advertised", format_args!("\"{}\"", p.wireguard_advertised),
+        "tunnel endpoint peers dial; \"auto\" = derive from wireguard_listen");
+    keyline(&mut s, "primary_coordinator", format_args!("\"{}\"", p.primary_coordinator),
+        "ambient rendezvous coordinator; \"none\" disables");
+    keyline(&mut s, "coordinator_relay", format_args!("\"{}\"", p.coordinator_relay),
+        "TCP first-contact fallback; \"none\" disables");
+    keyline(&mut s, "checkpoint_blocks", format_args!("{}", p.checkpoint_blocks),
+        "sealed blocks between recovery checkpoints");
+    keyline(&mut s, "sync_index", format_args!("{}", p.sync_index),
+        "true: UNVERIFIABLE shipped-index warm start on join");
+    keyline(&mut s, "announce_capabilities", format_args!("{}", p.announce_capabilities),
+        "true: publish this node's provider set");
+    keyline(&mut s, "sandbox", format_args!("\"{}\"", p.sandbox),
+        "provider run isolation: \"direct\" | \"podman\" | \"tart\"");
+    keyline(&mut s, "sandbox_image", format_args!("\"{}\"", p.sandbox_image),
+        "provider image (podman/tart; unused for direct)");
+    keyline(&mut s, "sandbox_cores", format_args!("{}", p.sandbox_cores),
+        "announced capacity; 0 = probe the host");
+    keyline(&mut s, "sandbox_mem_gb", format_args!("{}", p.sandbox_mem_gb),
+        "announced capacity (GiB); 0 = probe the host");
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
