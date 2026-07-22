@@ -1,84 +1,48 @@
-//! an in-process duckfs node for the CLI e2e: a REAL `host::Host::genesis` with
-//! ONLY the files module on a dedicated thread pumping `NodeCommand`s (the shape
-//! of `bin/noded/src/main.rs`'s actor loop, minus the oracle/index/metrics
-//! machinery a files-only node has no use for), fronted by `noded::router` on a
-//! local tokio listener. the CLI subprocess (`env!(CARGO_BIN_EXE_ducktape fs)`)
-//! drives it over http exactly as it would a real daemon.
+//! an in-process duckfs node for the CLI e2e, over noded's shared in-proc
+//! daemon testkit: a REAL `host::Host::genesis` with ONLY the files module,
+//! fronted by noded's router on a loopback listener. the CLI subprocess
+//! (`env!(CARGO_BIN_EXE_ducktape) fs`) drives it over http exactly as it would
+//! a real daemon.
 //!
-//! shut down cleanly on drop (POST /v1/admin/shutdown → serve returns → the handle
-//! drops → the actor's command channel closes → both threads join) so the
-//! tempdir is deleted only once the host's qmdb handles are closed.
+//! the `NodeCommand` actor this used to hand-mirror now lives ONCE in
+//! `noded::testkit`; this harness just builds the host and hands it over.
 #![allow(dead_code)]
 
-use std::io::{Read as _, Write as _};
-use std::net::TcpStream;
 use std::process::Command;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
-use futures::StreamExt as _;
-use futures::channel::mpsc;
-use host::{BlockContext, Host};
-use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
-use sdk::{Msg, Origin};
+use host::Host;
+use noded::testkit::InProcDaemon;
 
 /// a running in-process node plus the CLI-under-test's path.
 pub struct Harness {
-    port: u16,
-    dir: Option<tempfile::TempDir>,
-    server: Option<JoinHandle<()>>,
-    actor: Option<JoinHandle<()>>,
+    // dropped BEFORE `dir` (fields drop in declaration order): the daemon's Drop
+    // joins the actor, closing qmdb, so the tempdir is removed only afterward.
+    daemon: InProcDaemon,
+    dir: tempfile::TempDir,
 }
 
 impl Harness {
-    /// stand up the node: genesis the files module on the actor thread, serve the
-    /// router on the server thread, and block until `/v1/status` answers.
+    /// stand up the node: genesis the files module on the testkit's actor thread
+    /// and block until `/v1/status` answers.
     pub fn start() -> Self {
         let dir = tempfile::Builder::new()
             .prefix("ducktape fs-e2e")
             .tempdir()
             .expect("harness tempdir");
         let duckfs_dir = dir.path().join("duckfs");
-        let port = free_port();
-
-        let (handle, cmd_rx, _events) = NodeHandle::channel();
-
-        // the actor thread: owns the host, drains commands one block per submit.
-        let actor = std::thread::Builder::new()
-            .name("fs-e2e-actor".into())
-            .spawn(move || run_actor(duckfs_dir, cmd_rx))
-            .expect("spawn actor");
-
-        // the server thread: serves the client surface on its own tokio runtime.
-        let server = std::thread::Builder::new()
-            .name("fs-e2e-server".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("server runtime");
-                rt.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                        .await
-                        .expect("bind harness listener");
-                    let _ = noded::serve(listener, handle).await;
-                });
-            })
-            .expect("spawn server");
-
-        let harness = Harness {
-            port,
-            dir: Some(dir),
-            server: Some(server),
-            actor: Some(actor),
-        };
-        harness.await_ready();
-        harness
+        let daemon = InProcDaemon::start(
+            move || {
+                let files = files::Files::open("files", duckfs_dir).expect("open files");
+                Host::genesis(vec![Box::new(files)]).expect("genesis")
+            },
+            vec!["files".into()],
+        );
+        Harness { daemon, dir }
     }
 
     /// the http base the CLI's `--node` flag takes.
     pub fn node_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        self.daemon.node_url()
     }
 
     /// a `ducktape fs` invocation pre-pointed at this node via `--node`.
@@ -95,151 +59,4 @@ impl Harness {
         cmd.arg("fs").args(args);
         cmd
     }
-
-    fn await_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if http_status(self.port, "GET", "/v1/status") == Some(200) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "harness node never answered /v1/status on port {}",
-                self.port
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        // graceful shutdown: the serve future returns, the router (and its handle)
-        // drop, the command channel closes, both threads end — so the tempdir is
-        // removed only after qmdb is closed.
-        let _ = http_status(self.port, "POST", "/v1/admin/shutdown");
-        if let Some(s) = self.server.take() {
-            let _ = s.join();
-        }
-        if let Some(a) = self.actor.take() {
-            let _ = a.join();
-        }
-        drop(self.dir.take());
-    }
-}
-
-/// the files-only actor loop: one block per submit, queries answered inline.
-fn run_actor(duckfs_dir: std::path::PathBuf, mut cmd_rx: mpsc::Receiver<NodeCommand>) {
-    let files = files::Files::open("files", duckfs_dir).expect("open files");
-    let mut host = Host::genesis(vec![Box::new(files)]).expect("genesis");
-    let mut height: u64 = 0;
-    futures::executor::block_on(async move {
-        while let Some(cmd) = cmd_rx.next().await {
-            match cmd {
-                NodeCommand::Submit {
-                    target,
-                    payload,
-                    origin,
-                    reply,
-                } => {
-                    // a rejected op is NOT a block: the height only advances on a
-                    // clean commit (mirrors the noded actor).
-                    let next = height + 1;
-                    let ctx = BlockContext {
-                        protocol_version: 0,
-                        height: next,
-                        consensus_time: next,
-                        origin: Origin::External(origin),
-                    };
-                    let result = match host.submit_at(ctx, Msg { target, payload }).await {
-                        Ok(out) => {
-                            height = next;
-                            Ok(BlockSummary {
-                                height,
-                                app_hash: noded::hex_root(&out.app_hash),
-                            })
-                        }
-                        Err(err) => Err(err.to_string()),
-                    };
-                    let _ = reply.send(result);
-                }
-                // the signed-frame lane, FAITHFUL to the real daemon's actor
-                // arm: the origin is the frame's VERIFIED signer, never a
-                // caller claim. this is the lane the desktop app's user-signed
-                // files commits ride (signed_frame_e2e drives it end to end).
-                NodeCommand::SubmitFrame { frame, reply } => {
-                    let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg)) => {
-                            let next = height + 1;
-                            let ctx = BlockContext {
-                                protocol_version: 0,
-                                height: next,
-                                consensus_time: next,
-                                origin,
-                            };
-                            match host.submit_at(ctx, msg).await {
-                                Ok(out) => {
-                                    height = next;
-                                    Ok(BlockSummary {
-                                        height,
-                                        app_hash: noded::hex_root(&out.app_hash),
-                                    })
-                                }
-                                Err(err) => Err(err.to_string()),
-                            }
-                        }
-                        Err(err) => Err(err.to_string()),
-                    };
-                    let _ = reply.send(result);
-                }
-                NodeCommand::Query { target, req, reply } => {
-                    let result = host.query(&target, &req).await.map_err(|e| e.to_string());
-                    let _ = reply.send(result);
-                }
-                NodeCommand::Status { reply } => {
-                    let _ = reply.send(NodeStatus {
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        app_hash: noded::hex_root(&host.app_hash()),
-                        height,
-                        modules: vec![ModuleStatus {
-                            id: "files".into(),
-                            root: host
-                                .module_root("files")
-                                .map(|r| noded::hex_root(&r))
-                                .unwrap_or_default(),
-                            category: ModuleCategory::of("files"),
-                        }],
-                        public_key: String::new(),
-                        operations: Default::default(),
-                    });
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(String::new());
-                }
-            }
-        }
-    });
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind port probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
-}
-
-/// a minimal raw-http request that returns just the status code (or `None` if
-/// the node is not up yet) — enough to poll readiness and post the shutdown.
-fn http_status(port: u16, method: &str, path: &str) -> Option<u16> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).ok()?;
-    let text = String::from_utf8_lossy(&raw);
-    text.split_whitespace().nth(1).and_then(|s| s.parse().ok())
 }

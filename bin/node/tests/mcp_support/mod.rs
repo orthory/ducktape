@@ -1,8 +1,8 @@
-//! an in-process node for the MCP e2e: a REAL `host::Host::genesis` with the
-//! agent registry, saga (the registry's declared collaborator) and tasks, on a
-//! dedicated actor thread, fronted by `noded::router` on a local listener —
-//! the same shape as `bin/fs`'s harness, minus the files module and plus the
-//! two the tool plane's gate is built on.
+//! an in-process node for the MCP e2e, over noded's shared in-proc daemon
+//! testkit: a REAL `host::Host::genesis` with the agent registry, saga (the
+//! registry's declared collaborator) and tasks, fronted by `noded::router` on a
+//! local listener — the same shape as `bin/fs`'s harness, plus the modules the
+//! tool plane's gate is built on.
 //!
 //! chat and pages are deliberately ABSENT. both need a commonware runtime
 //! context to `init`, which would drag a deterministic runner into a test whose
@@ -11,19 +11,16 @@
 //! unit tests against the modules' own types. what only an e2e can prove is
 //! that the CAP GATE and the SUBMIT path are real, and `tasks` proves both: a
 //! granted write reaches consensus, a denied one never leaves the process.
+//!
+//! the `NodeCommand` actor this used to hand-mirror now lives ONCE in
+//! `noded::testkit`; this harness just builds the host and hands it over.
 #![allow(dead_code)]
 
-use std::io::{BufRead, BufReader, Read as _, Write as _};
-use std::net::TcpStream;
+use std::io::{BufRead, BufReader, Write as _};
 use std::process::{Child, Command, Stdio};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
-use futures::StreamExt as _;
-use futures::channel::mpsc;
-use host::{BlockContext, Host};
-use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
-use sdk::{Msg, Origin};
+use host::Host;
+use noded::testkit::InProcDaemon;
 use serde_json::{Value, json};
 
 /// the agent every test registers, and the owner it is registered under. the
@@ -34,10 +31,11 @@ pub const AGENT_ID: &str = "quackbot";
 pub const OWNER: &str = "eddy";
 
 pub struct Harness {
-    port: u16,
-    dir: Option<tempfile::TempDir>,
-    server: Option<JoinHandle<()>>,
-    actor: Option<JoinHandle<()>>,
+    // dropped BEFORE `dir` (fields drop in declaration order): the daemon's Drop
+    // joins the actor, closing the host's forge/qmdb handles, so the tempdir is
+    // removed only afterward.
+    daemon: InProcDaemon,
+    dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -53,44 +51,40 @@ impl Harness {
             .prefix("ducktape mcp-e2e")
             .tempdir()
             .expect("harness tempdir");
-        let port = free_port();
         let forge_base = dir.path().join("forge");
 
-        let (handle, cmd_rx, _events) = NodeHandle::channel();
-        let actor = std::thread::Builder::new()
-            .name("mcp-e2e-actor".into())
-            .spawn(move || run_actor(cmd_rx, forge_base))
-            .expect("spawn actor");
+        let daemon = InProcDaemon::start(
+            move || {
+                Host::genesis(vec![
+                    Box::new(agent::AgentModule::new("agent", "saga", None)),
+                    Box::new(saga::SagaModule::new("saga")),
+                    Box::new(tasks::Tasks::new("tasks")),
+                    Box::new(dispatch::DispatchModule::new("dispatch", "saga")),
+                    Box::new(tagging::TaggingModule::new("tagging")),
+                    Box::new(forge::Forge::init("forge", forge_base).expect("forge module")),
+                    Box::new(runs::RunsModule::new(
+                        "runs",
+                        "chat",
+                        "saga",
+                        "tagging",
+                        "dispatch",
+                        "agent",
+                        Some("tasks".into()),
+                        None,
+                    )),
+                ])
+                .expect("genesis")
+            },
+            vec!["agent".into()],
+        );
 
-        let server = std::thread::Builder::new()
-            .name("mcp-e2e-server".into())
-            .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("server runtime");
-                rt.block_on(async move {
-                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                        .await
-                        .expect("bind harness listener");
-                    let _ = noded::serve(listener, handle).await;
-                });
-            })
-            .expect("spawn server");
-
-        let harness = Harness {
-            port,
-            dir: Some(dir),
-            server: Some(server),
-            actor: Some(actor),
-        };
-        harness.await_ready();
+        let harness = Harness { daemon, dir };
         harness.register_agent(allowed_actions, forge_read);
         harness
     }
 
     pub fn node_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        self.daemon.node_url()
     }
 
     /// register the agent under `OWNER` with the given grant. submitted with the
@@ -268,171 +262,8 @@ impl Harness {
     }
 
     fn post(&self, path: &str, body: &Value) -> Value {
-        let body = body.to_string();
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        let req = format!(
-            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
-             content-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(req.as_bytes()).expect("write request");
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("read response");
-        let text = String::from_utf8_lossy(&raw);
-        let payload = text
-            .split_once("\r\n\r\n")
-            .map(|(_, b)| b)
-            .unwrap_or_default();
-        serde_json::from_str(payload).unwrap_or(Value::Null)
+        nettest::http_json(self.daemon.port(), "POST", path, Some(body)).1
     }
-
-    fn await_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if http_status(self.port, "GET", "/v1/status") == Some(200) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "harness node never answered /v1/status on port {}",
-                self.port
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = http_status(self.port, "POST", "/v1/admin/shutdown");
-        if let Some(s) = self.server.take() {
-            let _ = s.join();
-        }
-        if let Some(a) = self.actor.take() {
-            let _ = a.join();
-        }
-        drop(self.dir.take());
-    }
-}
-
-/// the actor loop: one block per submit, queries answered inline.
-fn run_actor(mut cmd_rx: mpsc::Receiver<NodeCommand>, forge_base: std::path::PathBuf) {
-    // `runs` is here so a WRITE from the tool server reaches the module that
-    // actually gates it. no run is ever dispatched in this harness — driving the
-    // full engagement loop needs chat + a deterministic runtime context, and
-    // `runs`'s own collaboration_loop e2e already does exactly that against a
-    // REAL lease. what this harness proves is the other half: that a signed
-    // AgentAction leaves the tool server, crosses the router, reaches `runs`, and
-    // is refused BY CONSENSUS rather than by anything in the binary under test.
-    let mut host = Host::genesis(vec![
-        Box::new(agent::AgentModule::new("agent", "saga", None)),
-        Box::new(saga::SagaModule::new("saga")),
-        Box::new(tasks::Tasks::new("tasks")),
-        Box::new(dispatch::DispatchModule::new("dispatch", "saga")),
-        Box::new(tagging::TaggingModule::new("tagging")),
-        Box::new(forge::Forge::init("forge", forge_base).expect("forge module")),
-        Box::new(runs::RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            None,
-        )),
-    ])
-    .expect("genesis");
-    let mut height: u64 = 0;
-    futures::executor::block_on(async move {
-        while let Some(cmd) = cmd_rx.next().await {
-            match cmd {
-                NodeCommand::Submit {
-                    target,
-                    payload,
-                    origin,
-                    reply,
-                } => {
-                    let next = height + 1;
-                    let ctx = BlockContext {
-                        protocol_version: 0,
-                        height: next,
-                        consensus_time: next,
-                        origin: Origin::External(origin),
-                    };
-                    let result = match host.submit_at(ctx, Msg { target, payload }).await {
-                        Ok(out) => {
-                            height = next;
-                            Ok(BlockSummary {
-                                height,
-                                app_hash: noded::hex_root(&out.app_hash),
-                            })
-                        }
-                        Err(err) => Err(err.to_string()),
-                    };
-                    let _ = reply.send(result);
-                }
-                // the signed-frame lane, FAITHFUL to both real binaries: the
-                // origin is the frame's verified signer, never a caller string.
-                // a stub that stamped a claimed origin here would reproduce the
-                // exact defect this lane closes — an e2e passing on attribution
-                // production cannot produce.
-                NodeCommand::SubmitFrame { frame, reply } => {
-                    let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg)) => {
-                            let next = height + 1;
-                            let ctx = BlockContext {
-                                protocol_version: 0,
-                                height: next,
-                                consensus_time: next,
-                                origin,
-                            };
-                            match host.submit_at(ctx, msg).await {
-                                Ok(out) => {
-                                    height = next;
-                                    Ok(BlockSummary {
-                                        height,
-                                        app_hash: noded::hex_root(&out.app_hash),
-                                    })
-                                }
-                                Err(err) => Err(err.to_string()),
-                            }
-                        }
-                        // a forged/tampered frame is a rejection, not a block.
-                        Err(err) => Err(err.to_string()),
-                    };
-                    let _ = reply.send(result);
-                }
-                NodeCommand::Query { target, req, reply } => {
-                    let result = host.query(&target, &req).await.map_err(|e| e.to_string());
-                    let _ = reply.send(result);
-                }
-                NodeCommand::Status { reply } => {
-                    let _ = reply.send(NodeStatus {
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        app_hash: noded::hex_root(&host.app_hash()),
-                        height,
-                        modules: vec![ModuleStatus {
-                            id: "agent".into(),
-                            root: host
-                                .module_root("agent")
-                                .map(|r| noded::hex_root(&r))
-                                .unwrap_or_default(),
-                            category: ModuleCategory::of("agent"),
-                        }],
-                        public_key: String::new(),
-                        operations: Default::default(),
-                    });
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(String::new());
-                }
-            }
-        }
-    });
 }
 
 /// the text a `tools/call` result carries, and whether it was a refusal.
@@ -447,25 +278,4 @@ pub fn payload(result: &Value) -> Value {
     let (is_error, text) = content(result);
     assert!(!is_error, "expected a success, got a refusal: {text}");
     serde_json::from_str(&text).expect("a successful tool result carries json")
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind port probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
-}
-
-fn http_status(port: u16, method: &str, path: &str) -> Option<u16> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).ok()?;
-    let text = String::from_utf8_lossy(&raw);
-    text.split_whitespace().nth(1).and_then(|s| s.parse().ok())
 }

@@ -15,7 +15,16 @@ version.workspace = true
 name = "ducktape-noded"
 path = "src/main.rs"
 
+[features]
+# the in-process daemon testkit (`noded::testkit`): a real Host + router on
+# loopback threads, for e2e harnesses. dev-only — consumers enable it as a
+# dev-dependency feature, so it never compiles into the shipping node.
+testkit = ["dep:nettest"]
+
 [dependencies]
+# the shared raw-http/port/poll test client — only pulled by the `testkit`
+# feature (the in-proc daemon's readiness probe), never in a normal build.
+nettest = { path = "../../crates/nettest", optional = true }
 # streamed gateway response bodies (GatewayBody chunks + Body::from_stream relay).
 bytes = "1"
 tokio-stream = "0.1"
