@@ -1,0 +1,55 @@
+---
+title: "Network and Membership"
+audience: human
+---
+
+import { NetworkTopology } from '../../../../../components/diagram/NetworkTopology.client'
+
+<NetworkTopology client:visible />
+
+repo에는 현재 세 가지 network 및 membership concern이 분리되어 있다. message
+propagation, ordered consensus delivery, validator membership state다.
+
+## Propagation Seam
+
+`crates/kernel/node`는 byte-oriented transport seam과 in-process loopback 구현을
+정의한다. loopback path는 deterministic local convergence test를 위한 것이다.
+outbound message는 local apply 후 encode되어 peer에게 전달되고, inbound message는
+apply되지만 re-broadcast되지 않는다.
+
+이 path는 node/host boundary test에 유용하지만, order-dependent root를 위한 live
+consensus path는 아니다.
+
+## Ordered Consensus Path
+
+`OrderedNode`는 `Orderer`에서 finalized operation을 apply한다. commonware
+Simplex-backed orderer는 `crates/kernel/consensus`에 있고, `bin/node`가 이를
+real-socket validator process에 연결한다.
+
+ordered path는 load-bearing이다. QMDB root가 operation order에 의존하기 때문이다.
+validator는 transport가 우연히 전달한 순서가 아니라 shared finalized sequence를
+apply해야 한다.
+
+## Valset State
+
+`crates/system/valset`은 validator membership을 module state로 저장한다.
+valset의 crate-root wire type을 통해 typed message와 query를 노출하며, demo는 ed25519 public
+key가 담긴 join message를 apply한다.
+
+consensus epoch 주변 live orchestration도 구현되어 있다. repo에는 respawn behavior
+test와, finalized valset state를 watch하고 cutover point를 결정하는 test된
+deterministic cutover state machine(`ValsetOrchestrator`)이 있다. live loop는 그
+결정에 따라 old orderer를 stop하고 new epoch를 start하며 transport readiness를
+정렬한다.
+
+## Membership 위의 Identity
+
+membership과 quorum은 여전히 node identity로 key된다: `valset`의 validator/
+observer set과 그 위의 epoch machinery는 node key를 사람으로 절대 resolve하지
+않는다. `crates/system/identity`는 그 한 층 위에 있는 별도의 replicated
+module이다 — node key를 user key에 매핑해서, 한 사람이 여러 node를 굴려도
+(각 node는 자기 membership standing, 자기 vote, 자기 quorum weight를 그대로
+유지한 채) app과 다른 모든 consumer에게는 하나의 user로 렌더링되게 한다. node를
+user에 bind하는 것은 그 자체로 origin과 user-signature로 gate된 별개의
+operation이며, `valset`의 state나 위에서 설명한 cutover path를 절대 건드리지
+않는다.

@@ -111,8 +111,8 @@ duckfs already implements the disk-cohort durability ordering internally (Phase-
 ### Task 6: Docs + hygiene fold-ins
 
 **Files:**
-- Modify: `docs/pages/en/human/modules/product-modules.mdx` + the `ko` mirror (rewrite the Files section for the real FS; DELETE the Memory section)
-- Modify: `docs/pages/.../roadmap/*` (mark duckfs Phase 1–2 shipped; memory removed)
+- Modify: `docs/src/content/docs/en/human/modules/product-modules.mdx` + the `ko` mirror (rewrite the Files section for the real FS; DELETE the Memory section)
+- Modify: `docs/src/content/docs/.../roadmap/*` (mark duckfs Phase 1–2 shipped; memory removed)
 - Fold in the Phase-1 whole-branch backlog: unify the `"files: "` error prefix (putblob's neighbors omit it); dedupe the `state.rs`/`objects.rs` cursor codecs into a shared pure `codec` submodule; the clippy `--no-deps` reconciliation note for host/dispatch/saga (either a workspace-hygiene sweep or documenting the `--no-deps` gate form).
 
 - [ ] Steps: docs rewrite → hygiene commits (each its own commit) → `feat(duckfs): docs for the real filesystem + phase-1 hygiene fold-ins`.

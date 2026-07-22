@@ -1,0 +1,103 @@
+---
+title: "Module Model"
+audience: human
+---
+
+import { ArchitectureStack } from '../../../../../components/diagram/ArchitectureStack.client'
+import { ModuleLifecycle } from '../../../../../components/diagram/ModuleLifecycle.client'
+
+A module is an isolated state machine behind a small contract. The pattern
+borrows the isolation shape of CosmWasm; a module runs either as native Rust or
+as a Wasm component on the module runtime (the cutover is underway — directory
+is the first production Wasm tenant, and most modules are still native Rust).
+
+<ArchitectureStack client:visible />
+
+Related: [Platform Invariants](/en/human/architecture/platform-invariants)
+names the promises, [Consensus and Node](/en/human/architecture/consensus-and-node)
+explains ordered delivery, [State Sync](/en/human/architecture/state-sync)
+covers rebuild surfaces, [Determinism Contract](/en/agent/architecture/determinism-contract)
+is the edit checklist, and [Repository Map](/en/human/reference/repository-map)
+locates crates.
+
+## Contract
+
+`sdk` defines the shared surface:
+
+- `ModuleId` names a module in genesis state.
+- `StateRoot` is the 32-byte authenticated commitment exposed to the host.
+- `Msg` is a write intent targeted at a module.
+- `Event` leaves the state machine for observability.
+- `Effect` asks the host-owned worker seam to perform non-deterministic work.
+- `Env` carries agreed height, agreed time, origin, and the active module id.
+- `Ctx` exposes host-routed reads and intent emission.
+- `Module` provides `id`, `root`, `execute`, read projections, `commit_block`,
+  and `abort_block`.
+
+## Lifecycle
+
+A module's lifecycle is the host-owned path from genesis registration to
+committed state transitions. Ducktape does not currently have runtime
+install/enable/disable rows for modules: every registered genesis module is
+active, and changing the module set is a new genesis or coordinated upgrade
+concern.
+
+<ModuleLifecycle client:visible />
+
+The operational lifecycle is:
+
+1. **Register.** Genesis wires a module instance under its stable `ModuleId`.
+   Its initial `root()` becomes part of the first global app-hash.
+2. **Read committed state.** Between blocks, `query`, `query_with`,
+   `serve_sync`, and `state_sync_handle` describe or read committed state only.
+   They must not observe staged writes.
+3. **Execute and stage.** For each agreed `Msg`, the host calls `execute` with
+   deterministic `Env` and `Ctx`. The module validates the payload, reads its own
+   substrate, may ask the host for read-only projections, and stages any durable
+   writes in its private overlay.
+4. **Drain follow-ups.** Any emitted `Msg` is queued by the host and dispatched
+   later in the same block as a local follow-up. This is the only write path
+   across module boundaries.
+5. **Close the block.** If the drain finishes cleanly, the host calls
+   `commit_block` once for every touched module, in registry order. After it
+   returns, `root()` must include the staged writes. If any dispatch rejects or
+   the dispatch budget is exceeded, the host calls `abort_block` for touched
+   modules and the failed block leaves roots unchanged.
+6. **Serve finalized state.** At finalized boundaries the node may capture or
+   serve each module's committed sync surface. Snapshot modules export
+   installable bytes; resolver-backed modules expose a verified backend-specific
+   path anchored by the committed root.
+
+A failure inside `commit_block` or `abort_block` is not a deterministic rejected
+operation. It is a node-local boundary fault: the node must stop applying blocks
+because its registry may no longer match its peers.
+
+## State Ownership
+
+Each module chooses the state substrate that fits it:
+
+- QMDB-backed modules store authenticated key-value state.
+- Forge stores git objects and exposes a root derived from the git head.
+- Snapshot-style modules can commit canonical bytes.
+
+The host does not inspect those internal schemas. It asks for a root and folds
+that root into the global app-hash.
+
+## Cross-Module Interaction
+
+Interface crates are the legal cross-module vocabulary. A module can emit a
+typed payload for another module, but the host treats the bytes opaquely and
+routes only by target module id.
+
+Read paths are synchronous from the state-machine point of view: a module can
+ask the host for another module's read projection, but it cannot mutate the
+target directly. This keeps module boundaries reviewable and makes follow-up
+messages the only write crossing.
+
+## Native Rust Boundary
+
+The current module boundary is native Rust. That keeps the platform tractable
+while the host, consensus, state-sync, and product seams are still moving. A
+future sandbox boundary would need to preserve the same contract: typed
+interfaces, no implementation references across modules, and deterministic
+execution under the host.

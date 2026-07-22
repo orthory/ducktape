@@ -1,0 +1,268 @@
+/* Ducktape docs — interactive diagram surface.
+ * Built on Nimbus theme tokens so every diagram follows the site accent and
+ * the light/dark toggle automatically.
+ * Categorical tones use light-dark() with hand-tuned OKLCH so node families
+ * stay legible and harmonious on both schemes. */
+
+.dt-diagram {
+  --dt-radius: 14px;
+  --dt-surface: light-dark(#fcfcfd, #0e0f12);
+  --dt-surface-2: light-dark(#ffffff, #16181d);
+  --dt-grid: light-dark(rgba(15, 18, 26, 0.06), rgba(255, 255, 255, 0.05));
+  --dt-hairline: var(--nb-border);
+  --dt-text: var(--nb-foreground);
+  --dt-text-muted: var(--nb-muted-foreground);
+
+  /* categorical tones: [fill, border, accent-bar, text] */
+  --tone-kernel: light-dark(#eef0ff, #171a2e);
+  --tone-kernel-bd: light-dark(#c7ccf5, #34406e);
+  --tone-kernel-ac: light-dark(#5b63d3, #8b93f0);
+
+  --tone-system: light-dark(#e8f6f4, #10231f);
+  --tone-system-bd: light-dark(#b3ddd6, #2c5049);
+  --tone-system-ac: light-dark(#1c9c86, #4fd0b6);
+
+  --tone-app: light-dark(#fbf1e0, #251c0e);
+  --tone-app-bd: light-dark(#e6cf9f, #574119);
+  --tone-app-ac: light-dark(#c9821a, #e6a94a);
+
+  --tone-external: light-dark(#eef1f5, #171b22);
+  --tone-external-bd: light-dark(#d3d9e2, #313742);
+  --tone-external-ac: light-dark(#6b7280, #9aa4b2);
+
+  --tone-actor: light-dark(#eaf3fb, #101d2b);
+  --tone-actor-bd: light-dark(#bcd8ef, #274a68);
+  --tone-actor-ac: light-dark(#2f7fc4, #67ade6);
+
+  --tone-store: light-dark(#f6ecf6, #201421);
+  --tone-store-bd: light-dark(#e0c3e0, #4f2f4f);
+  --tone-store-ac: light-dark(#a3459e, #d986d2);
+
+  --tone-duckfs: light-dark(#e6f4fb, #0d1f2a);
+  --tone-duckfs-bd: light-dark(#b6dcef, #234a60);
+  --tone-duckfs-ac: light-dark(#1785b8, #56bde8);
+
+  --tone-network: light-dark(#eeeefb, #16172b);
+  --tone-network-bd: light-dark(#cccdf0, #303466);
+  --tone-network-ac: light-dark(#6366d8, #9a9df0);
+
+  --tone-accent: color-mix(in oklch, var(--nb-primary) 12%, transparent);
+  --tone-accent-bd: color-mix(in oklch, var(--nb-primary) 30%, transparent);
+  --tone-accent-ac: var(--nb-primary);
+
+  margin: 2rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.dt-diagram__canvas {
+  position: relative;
+  width: 100%;
+  border: 1px solid var(--dt-hairline);
+  border-radius: var(--dt-radius);
+  overflow: hidden;
+  background:
+    radial-gradient(120% 120% at 50% 0%, var(--dt-surface-2), var(--dt-surface) 70%);
+  box-shadow:
+    0 1px 0 0 light-dark(rgba(255, 255, 255, 0.6), rgba(255, 255, 255, 0.02)) inset,
+    0 12px 32px -18px light-dark(rgba(15, 18, 26, 0.28), rgba(0, 0, 0, 0.6));
+}
+
+.dt-diagram__skeleton {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    light-dark(rgba(15, 18, 26, 0.035), rgba(255, 255, 255, 0.04)) 50%,
+    transparent 80%
+  );
+  background-size: 200% 100%;
+  animation: dt-shimmer 1.4s ease-in-out infinite;
+}
+
+@keyframes dt-shimmer {
+  0% { background-position: 180% 0; }
+  100% { background-position: -80% 0; }
+}
+
+/* ------------------------------- node cards ------------------------------- */
+
+.dt-node {
+  --fill: var(--tone-system);
+  --bd: var(--tone-system-bd);
+  --ac: var(--tone-system-ac);
+  position: relative;
+  min-width: 128px;
+  max-width: 240px;
+  padding: 10px 14px 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--fill);
+  border: 1px solid var(--bd);
+  border-radius: 11px;
+  box-shadow: 0 1px 2px light-dark(rgba(15, 18, 26, 0.06), rgba(0, 0, 0, 0.35));
+  font-family: var(--nb-font-sans);
+  transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+}
+
+.dt-node::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--ac);
+}
+
+.dt-node:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px -8px light-dark(rgba(15, 18, 26, 0.25), rgba(0, 0, 0, 0.6));
+  border-color: var(--ac);
+}
+
+.dt-node--kernel   { --fill: var(--tone-kernel);   --bd: var(--tone-kernel-bd);   --ac: var(--tone-kernel-ac); }
+.dt-node--system   { --fill: var(--tone-system);   --bd: var(--tone-system-bd);   --ac: var(--tone-system-ac); }
+.dt-node--app      { --fill: var(--tone-app);      --bd: var(--tone-app-bd);      --ac: var(--tone-app-ac); }
+.dt-node--external { --fill: var(--tone-external); --bd: var(--tone-external-bd); --ac: var(--tone-external-ac); }
+.dt-node--actor    { --fill: var(--tone-actor);    --bd: var(--tone-actor-bd);    --ac: var(--tone-actor-ac); }
+.dt-node--store    { --fill: var(--tone-store);    --bd: var(--tone-store-bd);    --ac: var(--tone-store-ac); }
+.dt-node--duckfs   { --fill: var(--tone-duckfs);   --bd: var(--tone-duckfs-bd);   --ac: var(--tone-duckfs-ac); }
+.dt-node--network  { --fill: var(--tone-network);  --bd: var(--tone-network-bd);  --ac: var(--tone-network-ac); }
+.dt-node--accent   { --fill: var(--tone-accent);   --bd: var(--tone-accent-bd);   --ac: var(--tone-accent-ac); }
+.dt-node--muted    { --fill: var(--dt-surface-2);  --bd: var(--dt-hairline);      --ac: var(--dt-text-muted); }
+
+.dt-node__label {
+  font-size: 13px;
+  font-weight: 560;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--dt-text);
+}
+
+.dt-node__sub {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--dt-text-muted);
+}
+
+/* --------------------------------- groups --------------------------------- */
+
+.dt-group {
+  width: 100%;
+  height: 100%;
+  border: 1px dashed var(--tone-external-bd);
+  border-radius: 14px;
+  background: light-dark(rgba(15, 18, 26, 0.015), rgba(255, 255, 255, 0.015));
+}
+
+.dt-group__label {
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dt-text-muted);
+}
+
+.dt-group--kernel   { border-color: var(--tone-kernel-bd);   background: light-dark(rgba(91, 99, 211, 0.04), rgba(139, 147, 240, 0.05)); }
+.dt-group--system   { border-color: var(--tone-system-bd);   background: light-dark(rgba(28, 156, 134, 0.04), rgba(79, 208, 182, 0.05)); }
+.dt-group--app      { border-color: var(--tone-app-bd);      background: light-dark(rgba(201, 130, 26, 0.05), rgba(230, 169, 74, 0.05)); }
+.dt-group--accent   { border-color: var(--tone-accent-bd);   background: color-mix(in oklch, var(--nb-primary) 8%, transparent); }
+
+/* --------------------------------- edges ---------------------------------- */
+
+.dt-diagram .react-flow__edge-path {
+  stroke: var(--nb-border-strong);
+  stroke-width: 1.5;
+}
+.dt-diagram .react-flow__edge.animated .react-flow__edge-path {
+  stroke: var(--tone-accent-ac);
+}
+.dt-diagram .react-flow__edge-text {
+  fill: var(--dt-text-muted);
+  font-size: 10px;
+  font-weight: 500;
+}
+.dt-diagram .react-flow__edge-textbg {
+  fill: var(--dt-surface);
+}
+.dt-diagram .react-flow__arrowhead * {
+  fill: var(--nb-border-strong);
+  stroke: none;
+}
+
+.dt-handle {
+  width: 5px;
+  height: 5px;
+  background: var(--dt-text-muted);
+  border: none;
+  opacity: 0;
+}
+
+/* ---------------------------- controls + bg ------------------------------- */
+
+.dt-diagram .react-flow__background { color: var(--dt-grid); }
+
+.dt-diagram .react-flow__controls {
+  box-shadow: 0 4px 14px -6px light-dark(rgba(15, 18, 26, 0.3), rgba(0, 0, 0, 0.7));
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--dt-hairline);
+}
+.dt-diagram .react-flow__controls-button {
+  background: var(--dt-surface-2);
+  border-bottom: 1px solid var(--dt-hairline);
+  color: var(--dt-text);
+  width: 26px;
+  height: 26px;
+}
+.dt-diagram .react-flow__controls-button:hover {
+  background: var(--nb-muted);
+}
+.dt-diagram .react-flow__controls-button svg { fill: var(--dt-text-muted); }
+
+.dt-diagram .react-flow__attribution {
+  background: transparent;
+  font-size: 9px;
+}
+.dt-diagram .react-flow__attribution a { color: var(--dt-text-muted); opacity: 0.55; }
+
+/* --------------------------- legend + caption ----------------------------- */
+
+.dt-legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+.dt-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--dt-text-muted);
+}
+.dt-legend__swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px light-dark(rgba(15, 18, 26, 0.12), rgba(255, 255, 255, 0.14)) inset;
+}
+
+.dt-diagram__caption {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--dt-text-muted);
+  text-align: center;
+  max-width: 60ch;
+  margin: 0 auto;
+}

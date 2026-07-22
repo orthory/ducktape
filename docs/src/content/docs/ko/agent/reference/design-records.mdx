@@ -1,0 +1,44 @@
+---
+title: "Design Records"
+---
+
+non-page doc을 읽을지, 수정할지, prune할지 판단하기 위한 page다. 유지되는 reader
+doc은 `docs/src/content/docs`에 둔다. `docs/superpowers`는 아직 reader doc, ADR, runbook,
+test, code로 접히지 않은 reviewed active design record, approved spec, live
+execution plan을 위한 위치다.
+
+## Read These First
+
+| Need | Authoritative record |
+|---|---|
+| node upgrade를 실행하거나 수정 | [Node Upgrades](/ko/agent/network/node-upgrades), [human upgrade overview](/ko/human/network/node-upgrades), `skills/upgrade/SKILL.md`. |
+| package/module sharing 변경 | `docs/adr/2026-07-07-quack-packaged-modules.mdx`. |
+| dispatch, saga, agent run, no-fail intake 변경 | `docs/records/architecture/agent-collaboration-design.md`. |
+| capability provider spec 변경 | `docs/records/specs/capability-spec.md`, `crates/system/capability-host/src/spec.rs`. |
+| QMDB search/index projection 변경 | `docs/records/specs/indexable-spec.md`, `crates/kernel/indexer/src/lib.rs`. |
+| invite/join/admit 또는 admission state sync 변경 | `docs/records/admission/validator-onboarding.md`, `docs/records/admission/invitation-protocol-deep-dive.md`, [State Sync Contract](/ko/agent/architecture/state-sync-contract), `bin/node/tests/invite_e2e.rs`. |
+| WireGuard tunnel plan 변경 | `docs/records/protocols/wireguard-tunnel-upgrade.md`, `crates/system/wireguard`. |
+| sentry/coordinator/private cutover 변경 | `docs/deploy/sentry-deployment.md`, `docs/deploy/*`, `ops/coordinator/*`. |
+| video huddle 변경 | `docs/adr/2026-07-06-video-call-module.mdx`, `bin/node/src/voice.rs`, `app/src/console/views/chat/Huddle.tsx`. |
+| dated use-case research 확인 | `docs/records/research/use-case-research.md`, roadmap commitment가 아닌 dated market/product research. |
+| working design/planning record audit | `docs/superpowers/README.md`, 그다음 관련 `docs/superpowers/specs/*` 또는 `docs/superpowers/plans/*` file. |
+
+## Pruning Test
+
+temporary plan이나 spec을 prune하기 전에 네 가지를 확인한다.
+
+1. operator가 아직 이 절차를 실행하는가?
+2. future implementer에게 unresolved decision이 필요한가?
+3. code, skill, ADR에서 참조하는가?
+4. behavior가 이미 checked-in test로 증명되고 Nimbus에 요약되어 있는가?
+
+네 번째만 해당하면 durable summary를 Nimbus로 옮기고 plan은 삭제한다. code comment가
+plan을 가리키면 이제 그 사실을 소유하는 ADR, test, runbook, code owner, Nimbus page로
+retarget한다.
+
+## Current Reviewed Prune Set
+
+현재 reviewed prune set은 의도적으로 좁다: 완료된 sentry phase-1 implementation
+plan, 명시적으로 historical인 coordinator-relay-era plan 세 개, 해결된
+fleet-isolation finding만 prune한다. 파일별 이유는
+`docs/superpowers/README.md`에 둔다.

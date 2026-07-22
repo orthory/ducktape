@@ -10,7 +10,7 @@ rendezvous coordinator) and reuses the invite-token signing machinery in
 ## As-built amendments (2026-07-07)
 
 Two corrections landed during implementation; where this document and the code
-disagree, the code (and the operator guide `docs/pages/en/human/network/coordination.mdx`)
+disagree, the code (and the operator guide `docs/src/content/docs/en/human/network/coordination.mdx`)
 are authoritative.
 
 - **The authenticator binds an explicit `caller`, not the inner request's key.**

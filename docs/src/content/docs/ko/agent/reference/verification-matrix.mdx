@@ -1,0 +1,42 @@
+---
+title: "Verification Matrix"
+---
+
+touched surface를 증명하는 가장 좁은 command set을 사용한다.
+
+## Docs Only
+
+```sh
+cd docs
+bun run docs:check
+```
+
+추가로 실행한다.
+
+```sh
+git diff --check origin/dev...HEAD
+```
+
+`docs/docs`가 없고 authored docs에 draft marker가 없는지 확인한다.
+
+## Platform Code
+
+```sh
+cargo test --workspace
+```
+
+특정 module을 바꿀 때 focused test를 실행할 수 있다. 다만 사용자가 narrow run을
+명시하지 않았다면 workspace gate를 narrow test로 대체하지 않는다.
+
+## Demos and State Sync
+
+```sh
+cargo run -p demo
+cargo test -p demo --test network_joiner_full
+cargo test -p node-bin --test cluster_e2e
+```
+
+multi-module convergence, joiner rebuild, real-socket ordered node behavior를 claim할
+때 이 command를 사용한다. `bin/node/examples/demo-invite.sh`는 human-runnable
+invite/join/admit ceremony이고, `cluster_e2e`는 기존 bash assertion spec의
+automated gate다.

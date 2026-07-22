@@ -1,6 +1,6 @@
 # No-Downtime Node Upgrade — Design of Record
 
-Status: Design of record. This pass produces artifacts only (spec + vocs docs +
+Status: Design of record. This pass produces artifacts only (spec + Nimbus docs +
 skill). It does NOT implement the Rust consensus changes.
 Date: 2026-07-04
 

@@ -9,7 +9,7 @@ two flagship flows (invitation/join, transaction lifecycle). Written to be
 
 Companion records: `2026-07-12-crate-architecture-review.md` covers crate
 *hygiene* (tier integrity, dependency edges) and is not repeated here; the
-`docs/pages/en/human/architecture/*` pages carry the narrative invariants.
+`docs/src/content/docs/en/human/architecture/*` pages carry the narrative invariants.
 This document is the runtime view: processes, loops, and flows, with
 `file:line` evidence.
 
@@ -24,7 +24,7 @@ authenticated state substrate and exposes exactly one 32-byte
 into a global app-hash that consensus commits. Two nodes that agree on the
 app-hash agree on every module's state.
 
-Five invariants govern everything (`docs/pages/en/human/architecture/platform-invariants.mdx`):
+Five invariants govern everything (`docs/src/content/docs/en/human/architecture/platform-invariants.mdx`):
 
 1. **Isolation** — a module implements `sdk::Module`, depends only on `sdk`
    plus the *types-only* interface surface of modules it addresses, and never

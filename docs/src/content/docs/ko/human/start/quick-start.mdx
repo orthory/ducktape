@@ -1,0 +1,85 @@
+---
+title: "Quick Start"
+audience: human
+---
+
+이 저장소는 Rust workspace다. 문서는 `docs/` 아래의 별도 Nimbus project이며,
+Rust 검증과 docs 검증은 분리되어 있다.
+
+## First Run
+
+desktop app를 처음 실행하면 두 개의 gate를 순서대로 지난다: identity, 그다음
+workspace다.
+
+**identity를 만든다.** password를 설정한다 — 이 device의 identity key를 at
+rest 상태로 암호화할 뿐, key derivation에는 전혀 관여하지 않는다 — 그러면
+app이 24-word recovery phrase를 생성해서 딱 한 번 보여준다. 단어를 순서대로
+적어두고, 무작위로 골라진 세 단어를 다시 입력해 저장했음을 확인해야 다음
+단계로 넘어간다 — confirmation을 건너뛰는 옵션은 없다.
+
+**identity를 복구한다.** 새 device에서, 또는 identity file을 잃어버렸다면,
+새 identity를 만드는 대신 24-word phrase를 붙여넣고 이 device를 위한 새
+password를 설정한다.
+
+**phrase가 복구하는 것.** mnemonic은 identity의 key material을 그대로
+encoding한 것이라, 여기서 복구하면 동일한 identity가 byte 단위로 재현되고
+workspace에 연결되는 순간 on-chain display name도 자동으로 돌아온다
+(`identity` module의 user record — [Product
+Modules](/ko/human/modules/product-modules) 참고). 이 device의 node key는
+복구되지 **않는다**: node key는 의도적으로 disposable하게 설계되어서, device를
+잃어버리면 그냥 unbind하고 새 node key로 다시 join하면 된다.
+
+**password를 잊었다면?** password reset은 없다 — 24-word phrase로 복구하고
+새 password를 설정한다. phrase가 유일한 backup이다; phrase와 identity file을
+둘 다 잃으면 identity를 영구히 잃는다.
+
+identity가 설정되면 이전과 같이 새 workspace를 만들거나 invite로 기존
+workspace에 join한다.
+
+## Platform Checks
+
+workspace test를 실행한다.
+
+```sh
+cargo test --workspace
+```
+
+in-process super-app demo를 실행한다.
+
+```sh
+cargo run -p demo
+```
+
+invite/join/admit real-socket node demo를 실행한다.
+
+```sh
+cd bin/node
+./examples/demo-invite.sh
+```
+
+joiner state-sync proof를 직접 실행한다.
+
+```sh
+cargo test -p demo --test network_joiner_full
+```
+
+## Docs Checks
+
+docs dependency를 설치하고 docs gate를 실행한다.
+
+```sh
+cd docs
+bun install
+bun run docs:check
+```
+
+Nimbus dev server를 시작한다.
+
+```sh
+cd docs
+bun run dev
+```
+
+docs project는 의도적으로 `docs/`를 root로 쓰고 `srcDir: "."`를 유지한다.
+routed page file은 `docs/src/content/docs` 아래에 두고, landing page는
+`docs/src/pages`에 둔다.

@@ -1,0 +1,40 @@
+---
+title: "Gotchas"
+audience: human
+---
+
+이미 시간을 소모한 constraint들이다. 계속 visible해야 한다.
+
+## QMDB Root Semantics
+
+QMDB root는 operation log에 commit한다. 같은 최종 key-value state도 write order가
+다르면 다른 root가 될 수 있다. 코드를 보기 좋게 만들기 위해 write를 reorder하지
+말아야 한다. QMDB를 작은 global head map으로 쓰지 않는다. global app-hash는
+state-based이고 idempotent해야 한다.
+
+## Fixed-Width Sync Keys
+
+commonware streaming QMDB resolver는 fixed-width key를 요구한다. 새 QMDB module은
+`kv`, `pages`, `chat`처럼 seam에서 logical key를 hash해야 한다.
+
+## Storage Partitions
+
+하나의 deterministic runner 안에서 child context가 storage partition을 자동으로
+namespace하지 않는다. module과 test rebuild는 distinct partition id가 필요하다.
+
+## Forge Pack Verification
+
+libgit2는 partial pack도 index할 수 있다. missing object 위의 matching head는 실제
+failure mode이므로 forge install은 ref를 옮기기 전에 object closure를 verify해야
+한다.
+
+## Runtime Boundaries
+
+commonware authenticated discovery와 real transport test는 Tokio에 둔다. consensus
+logic test는 deterministic simulation에 둔다. 이 runtime model을 섞으면 deadlock이
+생기거나 schedule bug가 숨을 수 있다.
+
+## Deterministic Seeds
+
+`deterministic::Runner::default()`는 seed 42를 사용한다. scheduler-sensitive risk가
+있을 때는 seeded run을 sweep한다.

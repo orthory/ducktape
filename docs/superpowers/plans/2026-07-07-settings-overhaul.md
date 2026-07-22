@@ -13,7 +13,7 @@
 - Branch `feat/settings-overhaul`, PR targets `dev` (never `main`).
 - Mono-file mandate: no new file over ~600 lines.
 - All test/typecheck commands run from `app/`: `bun run test` (vitest run), `bun run typecheck` (tsc).
-- The working tree has unrelated uncommitted docs changes (`docs/adr/...quack...`, `docs/pages/...module-model...`) and an untracked spec — NEVER `git add -A`; always add exact paths.
+- The working tree has unrelated uncommitted docs changes (`docs/adr/...quack...`, `docs/src/content/docs/...module-model...`) and an untracked spec — NEVER `git add -A`; always add exact paths.
 - Views only touch the store facade: `useDucktape()` → `{state, actions}` — never reach around it.
 - Copy style: sentence-case labels, mono uppercase section labels (`WORKSPACE`, `PREFERENCES`).
 

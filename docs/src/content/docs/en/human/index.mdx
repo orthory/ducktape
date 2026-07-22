@@ -1,0 +1,42 @@
+---
+title: "Ducktape"
+audience: human
+---
+
+import { ModuleMap } from '../../../../components/diagram/ModuleMap.client'
+
+Ducktape is a consensus-based workplace super-app: a single BFT-replicated state
+machine that hosts isolated product modules such as pages, forge, chat, and
+agent workflows. Each module owns its authenticated state substrate and exposes
+only a 32-byte root to the host. The host composes those module roots into the
+global app-hash that consensus commits.
+
+<ModuleMap client:visible />
+
+The core rule is simple: modules do not link to each other's implementation
+crates. They depend on `sdk` and on types-only interface crates for the modules
+they need to address. Cross-module reads go through host-routed queries;
+cross-module writes are emitted as messages that the host drains as follow-up
+ops.
+
+## Current Status
+
+- The module contract, host registry, global app-hash, ordered node path,
+  commonware Simplex orderer, saga/worker async seam, and several root-backed
+  product modules exist in the repository.
+- The demo registers the platform modules and product modules together, then
+  shows their roots moving under one composed app-hash.
+- State sync exists for QMDB-backed modules, forge, and snapshot-style modules;
+  the node e2e suite proves joiners can rebuild over the live state-sync wire and
+  land on the source app-hash.
+- Dynamic valset wiring, live admission, restart recovery, video huddles, and
+  the no-downtime upgrade module are implemented. The remaining work is mostly
+  product depth, demotion behavior, replay nonces, and WireGuard runtime wiring.
+
+## Read Next
+
+- [Quick Start](/en/human/start/quick-start) for the commands that prove the current
+  platform.
+- [Platform Invariants](/en/human/architecture/platform-invariants) for the rules that
+  keep the state machine deterministic.
+- [What Is Left](/en/human/roadmap/what-is-left) for the implementation frontier.
