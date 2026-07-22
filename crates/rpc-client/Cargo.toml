@@ -1,0 +1,11 @@
+[package]
+name = "ducktape-rpc"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+futures.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
