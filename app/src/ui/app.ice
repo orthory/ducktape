@@ -137,7 +137,7 @@ component EmptyState(title:str, detail:str)
       text title size=18.0 @font-bold text-foreground
       text detail size=13.0 @text-muted
 
-component WorkspaceTabs(status:str, loading:bool, syncing:bool)
+component WorkspaceTabs(status:str, loading:bool)
   state
     tab = "chat"
   on select_tab(next)
@@ -183,9 +183,7 @@ component WorkspaceTabs(status:str, loading:bool, syncing:bool)
         space width=fill
         if loading
           text "Working…" size=12.0 @text-primary
-        if !loading && syncing
-          text "Syncing…" size=12.0 @text-primary
-        if !loading && !syncing
+        if !loading
           text status size=12.0 @text-muted
     slot notice
     col width=fill height=fill padding=18.0
@@ -200,7 +198,8 @@ on mount
   run connect(rpc) -> workspace_connected _ | failed _
 
 on reconnect
-  return if loading || sync_phase != "idle"
+  return if loading
+  sync_phase = "idle"
   loading = true
   connected = false
   error = ""
@@ -225,6 +224,8 @@ on workspace_connected(next)
   error = ""
 
 on workspace_refreshed(next)
+  return if sync_phase != "refreshing"
+  sync_phase = "idle"
   status = next.status
   block_height = next.height
   channels = next.channels
@@ -233,17 +234,15 @@ on workspace_refreshed(next)
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
-  connected = true
-  loading = false
-  sync_phase = "idle"
   error = ""
 
 on poll_tip
   return if loading || sync_phase != "idle"
   sync_phase = "polling"
-  run block_tip(connected_rpc) -> tip_polled _ | refresh_failed _
+  run block_tip(connected_rpc) -> tip_polled _ | poll_failed _
 
 on tip_polled(next)
+  return if sync_phase != "polling"
   sync_phase = "idle"
   status = next.status
   error = ""
@@ -251,13 +250,14 @@ on tip_polled(next)
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page) -> workspace_refreshed _ | refresh_failed _
 
-on refresh_now
-  return if loading || sync_phase != "idle" || !connected
-  sync_phase = "refreshing"
-  error = ""
-  run refresh(connected_rpc, active_channel, active_page) -> workspace_refreshed _ | refresh_failed _
+on poll_failed(cause)
+  return if sync_phase != "polling"
+  sync_phase = "idle"
+  status = "Sync delayed"
+  error = cause.message
 
 on refresh_failed(cause)
+  return if sync_phase != "refreshing"
   sync_phase = "idle"
   status = "Sync delayed"
   error = cause.message
@@ -266,19 +266,22 @@ subscribe
   every 1s when connected -> poll_tip
 
 on choose_channel(id)
-  return if loading || sync_phase == "refreshing"
+  return if loading
+  sync_phase = "idle"
   loading = true
   error = ""
   run load_chat(connected_rpc, id) -> chat_updated _ | failed _
 
 on create_channel_submit
-  return if loading || sync_phase == "refreshing" || empty(trim(channel_draft))
+  return if loading || empty(trim(channel_draft))
+  sync_phase = "idle"
   loading = true
   error = ""
   run create_channel(connected_rpc, password, trim(channel_draft)) -> chat_updated _ | failed _
 
 on send_message_submit
-  return if loading || sync_phase == "refreshing" || empty(active_channel) || empty(trim(message_draft))
+  return if loading || empty(active_channel) || empty(trim(message_draft))
+  sync_phase = "idle"
   loading = true
   error = ""
   run send_message(connected_rpc, password, active_channel, trim(message_draft)) -> chat_updated _ | failed _
@@ -292,25 +295,29 @@ on chat_updated(next)
   loading = false
 
 on choose_page(id)
-  return if loading || sync_phase == "refreshing"
+  return if loading
+  sync_phase = "idle"
   loading = true
   error = ""
   run load_page(connected_rpc, id) -> pages_updated _ | failed _
 
 on create_page_submit
-  return if loading || sync_phase == "refreshing" || empty(trim(page_draft))
+  return if loading || empty(trim(page_draft))
+  sync_phase = "idle"
   loading = true
   error = ""
   run create_page(connected_rpc, password, trim(page_draft)) -> pages_updated _ | failed _
 
 on rename_page_submit
-  return if loading || sync_phase == "refreshing" || empty(active_page) || empty(trim(active_page_title))
+  return if loading || empty(active_page) || empty(trim(active_page_title))
+  sync_phase = "idle"
   loading = true
   error = ""
   run rename_page(connected_rpc, password, active_page, trim(active_page_title)) -> pages_updated _ | failed _
 
 on add_paragraph_submit
-  return if loading || sync_phase == "refreshing" || empty(active_page) || empty(trim(paragraph_draft))
+  return if loading || empty(active_page) || empty(trim(paragraph_draft))
+  sync_phase = "idle"
   loading = true
   error = ""
   run add_paragraph(connected_rpc, password, active_page, trim(paragraph_draft)) -> pages_updated _ | failed _
@@ -350,9 +357,9 @@ view
           hovered border=primary
           focused border=primary border-width=2.0
           disabled background=subtle value=muted
-        button "Connect" disabled=(loading || sync_phase == "refreshing") height=40.0 padding=10.0 style=primary -> reconnect
+        button "Connect" disabled=loading height=40.0 padding=10.0 style=primary -> reconnect
 
-    WorkspaceTabs status=status loading=loading syncing=(sync_phase == "refreshing") #workspace-tabs
+    WorkspaceTabs status=status loading=loading #workspace-tabs
       notice:
         col width=fill
           if error != ""
@@ -374,15 +381,13 @@ view
                     ChannelButton channel=channel selected=(channel.id == active_channel)
               flex width=fill gap=7.0 align-items=flex-end
                 input "Channel name" label="New channel name" <-> channel_draft hint="New channel" disabled=(loading || !connected) submit=create_channel_submit width=fill padding=9.0 @bg-background border border-border rounded-lg
-                button "+" label="Create channel" disabled=(loading || sync_phase == "refreshing" || !connected || empty(trim(channel_draft))) height=38.0 padding=9.0 style=primary -> create_channel_submit
+                button "+" label="Create channel" disabled=(loading || !connected || empty(trim(channel_draft))) height=38.0 padding=9.0 style=primary -> create_channel_submit
 
           col width=fill height=fill padding=16.0 @bg-surface border border-border rounded-lg
             col width=fill height=fill spacing=13.0
-              row width=fill align=center
-                col width=fill spacing=2.0
-                  text "Chat" size=21.0 @font-bold text-foreground
-                  text "Local-key signed messages" size=12.0 @text-muted
-                button "Refresh" disabled=(loading || sync_phase != "idle" || !connected) padding=8.0 style=secondary -> refresh_now
+              col width=fill spacing=2.0
+                text "Chat" size=21.0 @font-bold text-foreground
+                text "Local-key signed messages" size=12.0 @text-muted
               if empty(messages)
                 EmptyState title="No messages yet" detail="Create a channel or start the conversation."
               if !empty(messages)
@@ -392,7 +397,7 @@ view
                       MessageCard message=message
               flex width=fill gap=9.0 align-items=flex-end
                 input "Message" #message label="Message" <-> message_draft hint="Write a message…" disabled=(loading || !connected || empty(active_channel)) submit=send_message_submit width=fill padding=12.0 @bg-background border border-border rounded-lg
-                button "Send" disabled=(loading || sync_phase == "refreshing" || !connected || empty(active_channel) || empty(trim(message_draft))) height=44.0 padding=12.0 style=primary -> send_message_submit
+                button "Send" disabled=(loading || !connected || empty(active_channel) || empty(trim(message_draft))) height=44.0 padding=12.0 style=primary -> send_message_submit
       pages:
         row width=fill height=fill spacing=14.0
           container width=270.0 height=fill padding=12.0 background=surface border=border border-width=1.0 radius=14.0
@@ -406,7 +411,7 @@ view
                     PageButton page=page selected=(page.id == active_page)
               flex width=fill gap=7.0 align-items=flex-end
                 input "Page title" label="New page title" <-> page_draft hint="New page" disabled=(loading || !connected) submit=create_page_submit width=fill padding=9.0 @bg-background border border-border rounded-lg
-                button "+" label="Create page" disabled=(loading || sync_phase == "refreshing" || !connected || empty(trim(page_draft))) height=38.0 padding=9.0 style=primary -> create_page_submit
+                button "+" label="Create page" disabled=(loading || !connected || empty(trim(page_draft))) height=38.0 padding=9.0 style=primary -> create_page_submit
 
           col width=fill height=fill padding=16.0 @bg-surface border border-border rounded-lg
             if empty(active_page)
@@ -415,7 +420,7 @@ view
               col width=fill height=fill spacing=13.0
                 flex width=fill gap=9.0 align-items=flex-end
                   input "Page title" #page-title label="Page title" <-> active_page_title disabled=(loading || !connected) submit=rename_page_submit width=fill padding=11.0 text-size=20.0 @bg-background border border-border rounded-lg
-                  button "Save title" disabled=(loading || sync_phase == "refreshing" || !connected || empty(trim(active_page_title))) height=48.0 padding=11.0 style=secondary -> rename_page_submit
+                  button "Save title" disabled=(loading || !connected || empty(trim(active_page_title))) height=48.0 padding=11.0 style=secondary -> rename_page_submit
                 text "Every edit is a signed Pages transaction." size=12.0 @text-muted
                 if empty(blocks)
                   EmptyState title="An empty page" detail="Add the first paragraph below."
@@ -426,4 +431,4 @@ view
                         BlockCard block=block
                 flex width=fill gap=9.0 align-items=flex-end
                   input "Paragraph" #paragraph label="New paragraph" <-> paragraph_draft hint="Add a paragraph…" disabled=(loading || !connected) submit=add_paragraph_submit width=fill padding=12.0 @bg-background border border-border rounded-lg
-                  button "Add" disabled=(loading || sync_phase == "refreshing" || !connected || empty(trim(paragraph_draft))) height=44.0 padding=12.0 style=primary -> add_paragraph_submit
+                  button "Add" disabled=(loading || !connected || empty(trim(paragraph_draft))) height=44.0 padding=12.0 style=primary -> add_paragraph_submit
