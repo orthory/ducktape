@@ -169,6 +169,13 @@ struct ValidatorRuntime<'a> {
     /// every epoch cutover's fresh orderer so event-driven draining survives
     /// the engine respawn.
     delivery_wake_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// whether our un-finalized proposals include REAL ops (a parked idle nop
+    /// never sets this) — the condition for the leader-nudge escort. set at
+    /// eager flush and cutover carry, cleared when the orderer FIFO drains.
+    real_work_parked: bool,
+    /// the last locally-estimated view a leader nudge was sent for — one
+    /// nudge per view; every finalized block moves the estimate and re-arms.
+    last_nudged_view: Option<u64>,
     last_crank: std::time::SystemTime,
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
@@ -467,6 +474,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         pending_retarget,
         heartbeat_disabled,
         delivery_wake_tx,
+        real_work_parked: false,
+        last_nudged_view: None,
         last_crank,
         last_nudge,
         workers,
@@ -557,6 +566,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // the delivery wake turns the loop again. no interval anywhere: the
         // network's own agreement speed is the pacer.
         runtime.pump_eager_flush().await;
+        // ...and while that real work waits on OUR leadership turn, escort it:
+        // nudge the current view's leader to close its idle view now, so
+        // rotation reaches us at network speed instead of the 1s idle beat.
+        runtime.pump_leader_nudge().await;
     }
 }
 

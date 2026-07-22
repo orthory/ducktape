@@ -394,6 +394,16 @@ impl ValidatorRuntime<'_> {
     }
 
     pub(super) async fn on_relay(&mut self, peer: ed25519::PublicKey, bytes: Vec<u8>) {
+        let Ok(msg) = relay::decode_msg(&bytes) else {
+            return;
+        };
+        // the leader nudge is not part of the relay submit protocol — it
+        // carries no frame, needs no standing read, and touches no relay
+        // state — so it dispatches BEFORE the protocol machine.
+        if matches!(msg, relay::RelayMsg::Nudge) {
+            self.on_leader_nudge(&peer).await;
+            return;
+        }
         let Self {
             context,
             node,
@@ -405,9 +415,6 @@ impl ValidatorRuntime<'_> {
         } = self;
         let now = context.current();
 
-        let Ok(msg) = relay::decode_msg(&bytes) else {
-            return;
-        };
         let needs_standing = matches!(
             msg,
             relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }

@@ -1378,6 +1378,19 @@ impl SimplexOrderer {
         self.inbox.min_unreleased_view()
     }
 
+    /// the newest RETAINED finalization's engine view (`None` before this
+    /// engine's first finalization) — a validator's best LOCAL read of the
+    /// chain tip, e.g. to estimate the current view (tip + 1) when aiming a
+    /// leader nudge at whoever holds it open.
+    pub fn newest_finalized_view(&self) -> Option<u64> {
+        self.retained
+            .lock()
+            .expect("retained finalizations poisoned")
+            .keys()
+            .next_back()
+            .copied()
+    }
+
     /// depth of this node's pending FIFO — delegates to the shared
     /// [`ConsensusHandle`]. the node's heartbeat reads it to gate idle-nop
     /// injection on an empty queue, so a nop is only ever pushed when nothing

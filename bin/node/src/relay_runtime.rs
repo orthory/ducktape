@@ -588,6 +588,9 @@ impl ValidatorRelay {
                 })
             }
             relay::RelayMsg::Reply { .. } => None,
+            // dispatched in `on_relay` BEFORE the protocol machine (it carries
+            // no frame and touches no relay state) — never reaches here.
+            relay::RelayMsg::Nudge => None,
         }
     }
 
@@ -710,6 +713,15 @@ fn send_blob_result<S>(
             error,
         },
     );
+}
+
+/// fire a leader nudge at `peer` — best-effort, no reply expected: a lost or
+/// mis-aimed nudge costs at most one idle beat of latency, never correctness.
+pub(crate) fn send_nudge<S>(relay_tx: &mut S, peer: &ed25519::PublicKey)
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+{
+    let _ = send(relay_tx, peer, relay::RelayMsg::Nudge);
 }
 
 fn send<S>(relay_tx: &mut S, peer: &ed25519::PublicKey, msg: relay::RelayMsg) -> bool

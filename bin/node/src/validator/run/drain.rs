@@ -62,6 +62,7 @@ impl ValidatorRuntime<'_> {
             pending_retarget,
             next_drain,
             delivery_wake_tx,
+            real_work_parked,
             ..
         } = self;
         let context = *context;
@@ -685,13 +686,18 @@ impl ValidatorRuntime<'_> {
                     // every locally-accepted op the old epoch
                     // never resolved was re-proposed into the
                     // new engine.
-                    Ok(carried) if carried > 0 => tracing::info!(
-                        target: "ducktape::consensus",
-                        node = %label,
-                        carried,
-                        epoch = plan.epoch(),
-                        "accepted ops carried across the cutover"
-                    ),
+                    Ok(carried) if carried > 0 => {
+                        // carried ops are real parked work in the fresh
+                        // engine — keep the leader-nudge escort walking them.
+                        *real_work_parked = true;
+                        tracing::info!(
+                            target: "ducktape::consensus",
+                            node = %label,
+                            carried,
+                            epoch = plan.epoch(),
+                            "accepted ops carried across the cutover"
+                        );
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         fatal!(label, "{e} — halting");
@@ -893,7 +899,86 @@ impl ValidatorRuntime<'_> {
         let orderer_idle = self.node.orderer().pending_len() == 0;
         if eager_flush_due(self.heartbeat_disabled, ops_pending, orderer_idle) {
             let now = self.context.current();
-            self.flush_window(now).await;
+            let flushed = self.flush_window(now).await;
+            // these batches carry REAL ops (the idle nop flushes via
+            // `beat_nop`, never here) — they are what the leader-nudge
+            // escort walks through other validators' idle views.
+            if flushed > 0 {
+                self.real_work_parked = true;
+            }
+        }
+    }
+
+    /// escort parked REAL work through other validators' idle views: while
+    /// our un-finalized proposals include real ops and the (locally
+    /// estimated) current view's leader is someone else, nudge that leader to
+    /// close its view now. one nudge per estimated view — every finalized
+    /// block moves the estimate and re-arms the next — so the escort advances
+    /// at network speed and goes silent the moment nothing real is parked. a
+    /// mis-aimed nudge (stale tip estimate, mid-cutover membership) costs at
+    /// most one deterministic nop on the receiver; correctness never depends
+    /// on the aim. a parked idle NOP is deliberately not escorted — the 1s
+    /// beat owns that pace.
+    pub(super) async fn pump_leader_nudge(&mut self) {
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        if orderer_idle {
+            // nothing of ours awaits finalization — the escort stands down.
+            self.real_work_parked = false;
+            self.last_nudged_view = None;
+            return;
+        }
+        if !self.real_work_parked {
+            return;
+        }
+        let current_view = self
+            .node
+            .orderer()
+            .newest_finalized_view()
+            .map_or(1, |tip| tip + 1);
+        if self.last_nudged_view == Some(current_view) {
+            return;
+        }
+        let epoch = self.orchestrator.epoch();
+        let members = self.orchestrator.current_members();
+        let Some(leader) = round_robin_leader(epoch, current_view, members) else {
+            return;
+        };
+        if *leader == self.signer.public_key() {
+            // our own view: propose serves our queue by itself.
+            return;
+        }
+        let leader = leader.clone();
+        self.last_nudged_view = Some(current_view);
+        crate::relay_runtime::send_nudge(&mut self.relay_tx, &leader);
+        tracing::debug!(
+            target: "ducktape::consensus",
+            node = %self.label,
+            view = current_view,
+            "leader nudge sent"
+        );
+    }
+
+    /// a peer validator holds real parked proposals and (by its local
+    /// estimate) we lead the current view: close it NOW by beating the idle
+    /// nop early, so rotation reaches the parked work at network speed
+    /// instead of the 1s idle beat. gated exactly like the beat — quiet chain
+    /// only — so a nudge can never pile a nop behind real work or an
+    /// in-flight batch, and repeated nudges self-limit (the parked nop keeps
+    /// the orderer non-idle until it finalizes). only a CURRENT validator's
+    /// transport identity is honored: the nudge is harmless by construction,
+    /// but nobody else gets to tick our view clock.
+    pub(super) async fn on_leader_nudge(&mut self, peer: &ed25519::PublicKey) {
+        let from_current_validator = self.orchestrator.current_members().contains(peer);
+        if !from_current_validator {
+            return;
+        }
+        let ops_pending = self.node.pending_batch_len() > 0;
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        let beat_now =
+            heartbeat_action(self.heartbeat_disabled, ops_pending, true, orderer_idle)
+                == HeartbeatAction::BeatNop;
+        if beat_now {
+            self.beat_nop(self.context.current()).await;
         }
     }
 
@@ -931,16 +1016,21 @@ impl ValidatorRuntime<'_> {
 
     /// restart the beat grid, then flush the window: no-op when
     /// `pending_batch` is empty (idle with a batch already in flight — wait
-    /// for it).
-    async fn flush_window(&mut self, now: std::time::SystemTime) {
+    /// for it). returns the number of batches proposed (0 on a no-op or a
+    /// failed flush).
+    async fn flush_window(&mut self, now: std::time::SystemTime) -> usize {
         self.last_flush = now;
-        if let Err(e) = self.node.flush_batch().await {
-            tracing::debug!(
-                target: "ducktape::submit",
-                node = %self.label,
-                error = %e,
-                "batch flush failed"
-            );
+        match self.node.flush_batch().await {
+            Ok(batches) => batches,
+            Err(e) => {
+                tracing::debug!(
+                    target: "ducktape::submit",
+                    node = %self.label,
+                    error = %e,
+                    "batch flush failed"
+                );
+                0
+            }
         }
     }
 
@@ -1242,6 +1332,24 @@ fn eager_flush_due(disabled: bool, ops_pending: bool, orderer_idle: bool) -> boo
     !disabled && ops_pending && orderer_idle
 }
 
+/// the round-robin leader for `view`, MIRRORING the engine's elector
+/// (`RoundRobin::<Sha256>::default()` — UNSHUFFLED, so the permutation is the
+/// identity over the sorted participant set and the index is
+/// `(epoch + view) % n`). a drifted mirror only mis-aims a nudge — the nudged
+/// peer beats at most one harmless nop — so consensus never depends on this
+/// staying in sync with the engine.
+fn round_robin_leader(
+    epoch: u64,
+    view: u64,
+    participants: &std::collections::BTreeSet<ed25519::PublicKey>,
+) -> Option<&ed25519::PublicKey> {
+    if participants.is_empty() {
+        return None;
+    }
+    let index = epoch.wrapping_add(view) as usize % participants.len();
+    participants.iter().nth(index)
+}
+
 #[cfg(test)]
 mod block_cadence_tests {
     use super::{HeartbeatAction, eager_flush_due, heartbeat_action};
@@ -1296,6 +1404,37 @@ mod block_cadence_tests {
             heartbeat_action(false, true, true, false),
             HeartbeatAction::Restamp
         );
+    }
+
+    #[test]
+    fn round_robin_leader_mirrors_the_unshuffled_elector() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        // three sorted participants: the leader index is (epoch + view) % 3
+        // over the SORTED set — the identity permutation the engine's
+        // unshuffled RoundRobin elector uses.
+        let keys: std::collections::BTreeSet<ed25519::PublicKey> = (0..3u64)
+            .map(|seed| ed25519::PrivateKey::from_seed(seed).public_key())
+            .collect();
+        let sorted: Vec<&ed25519::PublicKey> = keys.iter().collect();
+        for view in 0..7u64 {
+            let expected = sorted[(5u64.wrapping_add(view)) as usize % 3];
+            assert_eq!(
+                super::round_robin_leader(5, view, &keys),
+                Some(expected),
+                "view {view}"
+            );
+        }
+        // rotation advances by exactly one participant per view.
+        assert_ne!(
+            super::round_robin_leader(5, 1, &keys),
+            super::round_robin_leader(5, 2, &keys)
+        );
+    }
+
+    #[test]
+    fn no_participants_elects_no_leader() {
+        let empty = std::collections::BTreeSet::new();
+        assert_eq!(super::round_robin_leader(1, 1, &empty), None);
     }
 
     #[test]
