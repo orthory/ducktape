@@ -196,9 +196,6 @@ pub struct InviteArgs {
     pub ttl_days: Option<u64>,
     #[command(flatten)]
     pub selector: Selector,
-    /// removed in Join v2 — kept only to refuse loudly with the migration hint
-    #[arg(long, hide = true, value_name = "HEX-PUBKEY")]
-    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]

@@ -1,14 +1,14 @@
-//! hand-rolled arg parsing + node-address resolution (the `bin/node` shape — no
-//! clap anywhere in the workspace).
-
-use std::collections::BTreeMap;
+//! the CLI error type, the shared node-addressing flags, and node-address
+//! resolution. clap owns the parsing now; this file only turns the typed
+//! addressing flags into an http base.
 
 use crate::config;
 
-/// a CLI failure carrying the process exit code. code 2 is a usage/verb error;
-/// code 1 is a general operational failure (and a dirty `status`). an EMPTY
-/// message prints nothing — `status` writes its own A/M/D lines and then exits
-/// non-zero without a redundant error line.
+/// a CLI failure carrying the process exit code. code 2 is a usage error (an
+/// unresolved node) and a commit conflict; code 1 is a general operational
+/// failure (and a dirty `status`). an EMPTY message prints nothing — `status`
+/// writes its own A/M/D lines and then exits non-zero without a redundant error
+/// line.
 #[derive(Debug)]
 pub struct CliError {
     pub code: u8,
@@ -16,7 +16,7 @@ pub struct CliError {
 }
 
 impl CliError {
-    /// a usage error (exit 2): a bad verb, a missing arg, an unresolved node.
+    /// a usage error (exit 2): an unresolved node address.
     pub fn usage(m: impl Into<String>) -> Self {
         CliError {
             code: 2,
@@ -43,51 +43,16 @@ impl CliError {
     }
 }
 
-/// the flag this token names, if any: the one short alias `-n` (→ `network`,
-/// the workspace selector shared with the node family) or any `--long` flag. a
-/// positional (a duckfs path, a flag's value) names none. the flag test must
-/// recognize `-n` too, else a `-n` sitting right after a value-less flag is
-/// silently eaten as its ignored value and the network is dropped (a value never
-/// begins with `-`).
-fn flag_name(tok: &str) -> Option<&str> {
-    match tok {
-        "-n" => Some("network"),
-        other => other.strip_prefix("--"),
-    }
-}
-
-/// flags that take NO value — a bare presence is the whole signal, so they never
-/// consume the following token even when it is a positional (`ls --json <path>`
-/// keeps `<path>` positional, `commit --no-rebase <dir>` keeps `<dir>`
-/// positional). every other flag consumes the next token unless that token is
-/// itself a flag.
-const BOOL_FLAGS: &[&str] = &["json", "no-rebase"];
-
-/// split `args` into positionals and `--key value` flags. a flag consumes the
-/// next token as its value UNLESS the flag is a known valueless boolean
-/// ([`BOOL_FLAGS`]) or the next token is itself a flag (recognized via
-/// [`flag_name`], so `-n` counts), in which case the value is an empty string —
-/// so `commit --no-rebase --message m`, `commit --no-rebase -n net`, `commit
-/// --no-rebase <dir>`, and `ls --json <path>` all parse correctly.
-pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, String>), CliError> {
-    let mut positional = Vec::new();
-    let mut flags = BTreeMap::new();
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        let Some(name) = flag_name(a) else {
-            positional.push(a.clone());
-            continue;
-        };
-        let is_bool_flag = BOOL_FLAGS.contains(&name);
-        let next_is_value = it.peek().is_some_and(|next| flag_name(next).is_none());
-        let value = if !is_bool_flag && next_is_value {
-            it.next().cloned().unwrap_or_default()
-        } else {
-            String::new()
-        };
-        flags.insert(name.to_string(), value);
-    }
-    Ok((positional, flags))
+/// the node-addressing flags every verb but `status` shares. `-n` is the short
+/// alias for `--network`, the workspace selector shared with the node family.
+#[derive(Debug, clap::Args)]
+pub struct NodeAddr {
+    /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
+    #[arg(long, value_name = "HTTP-URL")]
+    pub node: Option<String>,
+    /// a registered workspace's chain id — resolves to its node.toml http_listen
+    #[arg(short = 'n', long, value_name = "CHAIN-ID")]
+    pub network: Option<String>,
 }
 
 /// resolve the node http base honoring the fs addressing precedence: an explicit
@@ -96,11 +61,11 @@ pub fn parse_flags(args: &[String]) -> Result<(Vec<String>, BTreeMap<String, Str
 /// NONE of the three is set — worktree verbs then fall back to the checkout
 /// index. a set-but-broken `--network` (unknown/ambiguous workspace, or one with
 /// no http listen) is a hard usage error, never a silent fall-through to env.
-pub fn resolve_node_addr(flags: &BTreeMap<String, String>) -> Result<Option<String>, CliError> {
-    if let Some(url) = flags.get("node").filter(|url| !url.is_empty()) {
-        return Ok(Some(url.clone()));
+pub fn resolve_node_addr(addr: &NodeAddr) -> Result<Option<String>, CliError> {
+    if let Some(url) = addr.node.as_deref().filter(|url| !url.is_empty()) {
+        return Ok(Some(url.to_string()));
     }
-    if let Some(needle) = flags.get("network").filter(|needle| !needle.is_empty()) {
+    if let Some(needle) = addr.network.as_deref().filter(|needle| !needle.is_empty()) {
         let (_dir, http) = config::resolve_network(needle).map_err(CliError::usage)?;
         let base = http.ok_or_else(|| {
             CliError::usage(format!(
@@ -118,115 +83,96 @@ pub fn resolve_node_addr(flags: &BTreeMap<String, String>) -> Result<Option<Stri
 /// resolve the node http base for a read verb: the addressing chain above, which
 /// read verbs require (they have no working-copy index to fall back to — worktree
 /// verbs add that fallback in `work_cmds`).
-pub fn resolve_node(flags: &BTreeMap<String, String>) -> Result<String, CliError> {
-    resolve_node_addr(flags)?.ok_or_else(|| {
+pub fn resolve_node(addr: &NodeAddr) -> Result<String, CliError> {
+    resolve_node_addr(addr)?.ok_or_else(|| {
         CliError::usage(
             "no node address: pass --node <http-url>, -n/--network <id>, or set DUCKTAPE_NODE",
         )
     })
 }
 
-/// parse an optional numeric flag, naming it on a bad value.
-pub fn flag_u64(flags: &BTreeMap<String, String>, key: &str) -> Result<Option<u64>, CliError> {
-    match flags.get(key) {
-        Some(v) => v
-            .parse()
-            .map(Some)
-            .map_err(|_| CliError::usage(format!("--{key} must be a number"))),
-        None => Ok(None),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
     use super::*;
+    use crate::fs_cli::FsCmd;
 
-    fn flags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    /// a top-level `Parser` wrapper so the tests can drive clap over `FsCmd`
+    /// (a `Subcommand` can't be parsed on its own).
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: FsCmd,
     }
 
-    fn args(xs: &[&str]) -> Vec<String> {
-        xs.iter().map(|s| s.to_string()).collect()
+    fn parse(argv: &[&str]) -> Result<FsCmd, clap::Error> {
+        // argv[0] is the binary name clap discards.
+        TestCli::try_parse_from(std::iter::once("ducktape").chain(argv.iter().copied()))
+            .map(|c| c.cmd)
     }
 
+    /// `ls --json <path>` — the valueless `--json` must NOT swallow the path,
+    /// which stays positional.
     #[test]
-    fn dash_n_maps_to_network_and_leaves_positionals() {
-        let (pos, f) = parse_flags(&["-n".into(), "ducktape".into(), "some/path".into()]).unwrap();
-        assert_eq!(f.get("network").map(String::as_str), Some("ducktape"));
-        assert_eq!(pos, vec!["some/path".to_string()]);
+    fn ls_json_keeps_path_positional() {
+        let FsCmd::Ls(a) = parse(&["ls", "--json", "/dir"]).unwrap() else {
+            panic!("expected ls");
+        };
+        assert!(a.json);
+        assert_eq!(a.path, "/dir");
     }
 
+    /// `commit --no-rebase <dir>` — the valueless `--no-rebase` leaves `<dir>`
+    /// positional; `--message` still binds its value.
     #[test]
-    fn dash_n_after_value_less_boolean_is_not_swallowed() {
-        // `--no-rebase` is a value-less boolean; a `-n` directly after it must be
-        // recognized as its own flag, not eaten as --no-rebase's ignored value.
-        let (pos, f) = parse_flags(&[
-            "wt/dir".into(),
-            "--no-rebase".into(),
-            "-n".into(),
-            "mynet".into(),
-            "--message".into(),
-            "m".into(),
-        ])
-        .unwrap();
-        assert_eq!(f.get("no-rebase").map(String::as_str), Some(""));
-        assert_eq!(f.get("network").map(String::as_str), Some("mynet"));
-        assert_eq!(f.get("message").map(String::as_str), Some("m"));
-        assert_eq!(pos, vec!["wt/dir".to_string()]);
+    fn commit_no_rebase_keeps_dir_positional() {
+        let FsCmd::Commit(a) = parse(&["commit", "--no-rebase", "wt/dir", "--message", "m"]).unwrap()
+        else {
+            panic!("expected commit");
+        };
+        assert!(a.no_rebase);
+        assert_eq!(a.dir.as_deref(), Some("wt/dir"));
+        assert_eq!(a.message, "m");
     }
 
+    /// `-n` is the short alias for `--network` and does not eat the positional.
+    #[test]
+    fn dash_n_maps_to_network_and_leaves_path() {
+        let FsCmd::Ls(a) = parse(&["ls", "-n", "ducktape", "some/path"]).unwrap() else {
+            panic!("expected ls");
+        };
+        assert_eq!(a.addr.network.as_deref(), Some("ducktape"));
+        assert_eq!(a.path, "some/path");
+    }
+
+    /// a value flag binds the following token as its value.
+    #[test]
+    fn snapshot_flag_binds_its_value() {
+        let FsCmd::Ls(a) = parse(&["ls", "/p", "--snapshot", "s1"]).unwrap() else {
+            panic!("expected ls");
+        };
+        assert_eq!(a.path, "/p");
+        assert_eq!(a.snapshot.as_deref(), Some("s1"));
+    }
+
+    /// clap validates the numeric flag: a non-number is a parse error (exit 2).
+    #[test]
+    fn limit_rejects_a_non_number() {
+        assert!(parse(&["ls", "/p", "--limit", "abc"]).is_err());
+    }
+
+    /// --node short-circuits before any registry walk, so a bogus -n never
+    /// errors: the explicit flag is the top of the precedence chain.
     #[test]
     fn explicit_node_wins_over_network_without_touching_the_registry() {
-        // --node short-circuits before any registry walk, so the bogus -n never
-        // errors: the explicit flag is the top of the precedence chain.
-        let f = flags(&[
-            ("node", "http://explicit:8844"),
-            ("network", "no-such-workspace"),
-        ]);
+        let addr = NodeAddr {
+            node: Some("http://explicit:8844".into()),
+            network: Some("no-such-workspace".into()),
+        };
         assert_eq!(
-            resolve_node_addr(&f).unwrap(),
+            resolve_node_addr(&addr).unwrap(),
             Some("http://explicit:8844".to_string())
         );
-    }
-
-    #[test]
-    fn value_flag_consumes_next_token() {
-        let (pos, flags) = parse_flags(&args(&["/p", "--snapshot", "s1"])).unwrap();
-        assert_eq!(pos, vec!["/p".to_string()]);
-        assert_eq!(flags.get("snapshot").map(String::as_str), Some("s1"));
-    }
-
-    #[test]
-    fn json_before_positional_does_not_eat_it() {
-        // `ls --json <path>` — --json must NOT swallow the path.
-        let (pos, flags) = parse_flags(&args(&["--json", "/dir"])).unwrap();
-        assert!(flags.contains_key("json"));
-        assert_eq!(pos, vec!["/dir".to_string()]);
-    }
-
-    #[test]
-    fn json_as_last_arg() {
-        let (pos, flags) = parse_flags(&args(&["/dir", "--json"])).unwrap();
-        assert!(flags.contains_key("json"));
-        assert_eq!(pos, vec!["/dir".to_string()]);
-    }
-
-    #[test]
-    fn no_rebase_before_positional_does_not_eat_it() {
-        // `commit --no-rebase <dir>` — --no-rebase is valueless, <dir> stays positional.
-        let (pos, flags) = parse_flags(&args(&["--no-rebase", "mydir"])).unwrap();
-        assert!(flags.contains_key("no-rebase"));
-        assert_eq!(pos, vec!["mydir".to_string()]);
-    }
-
-    #[test]
-    fn no_rebase_between_value_flags() {
-        let (pos, flags) = parse_flags(&args(&["--no-rebase", "--message", "hi"])).unwrap();
-        assert!(pos.is_empty());
-        assert!(flags.contains_key("no-rebase"));
-        assert_eq!(flags.get("message").map(String::as_str), Some("hi"));
     }
 }
