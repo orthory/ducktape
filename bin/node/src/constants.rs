@@ -38,7 +38,10 @@ pub(crate) const PEER_SET: u64 = 0;
 /// armed cutover boundary forever, and never ticking the height the console
 /// shows. the frame finalizes, rejects deterministically on every node (unknown
 /// module), advances the engine clock, and leaves no state.
-pub(crate) const NOP_TARGET: &str = "consensus.nop";
+// single source: the block projection filters this exact target to hide nop-only
+// blocks, and this heartbeat must submit the same string — so the value lives in
+// `noded::projection` and both sides read it here.
+pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // block cadence is a single knob: `consensus::BLOCK_TIME` (1s). the idle
 // heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
 // (its height keeps ticking) and any pending cutover still crosses — paced to

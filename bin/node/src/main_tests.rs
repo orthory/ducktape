@@ -866,7 +866,7 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
         height: 7,
         hash: noded::hex_bytes(&node::frame_id(&frame)),
         commit_hash: hex(&app_hash),
-        ops: vec![explorer_root_op(
+        ops: vec![project_root_op(
             &drain_blobs,
             &origin,
             &decoded.target,

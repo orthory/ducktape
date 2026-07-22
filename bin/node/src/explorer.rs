@@ -1,4 +1,5 @@
 use host::Host;
+use noded::projection::project_root_op;
 use sdk::StateRoot;
 
 use crate::constants::{MODULE_IDS, NOP_TARGET};
@@ -7,39 +8,10 @@ use crate::util::hex;
 // ---------------------------------------------------------------------------
 // the derived-index boot fold. consensus never depends on it: fold errors
 // poison the store and log, heal errors log — recovery and the drain proceed
-// identically with or without the index.
+// identically with or without the index. the live drain's row construction
+// (`project_root_op`) now lives in `noded::projection`; the fold below re-runs
+// the SAME seam over journal-replayed frames so both writers stay byte-identical.
 // ---------------------------------------------------------------------------
-
-/// build one explorer row ([`noded::BlockRecord`] json) from a block's
-/// decoded parts — THE row construction seam, shared by the live drain and
-/// the boot fold so both writers produce byte-identical rows. staging the
-/// payload IS computing `op_hash` (put_chunk keys the blob by sha256), and
-/// on the fold path the re-staging is load-bearing: the blob store is
-/// in-memory, so the live drain's staging dies with the process and this is
-/// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
-pub(crate) fn explorer_root_op(
-    blobs: &dyn blobstore::Blobs,
-    origin: &sdk::Origin,
-    target: &str,
-    payload: &[u8],
-    dispatches: &[host::DispatchRecord],
-    disposition: noded::BlockDisposition,
-) -> noded::RootOp {
-    noded::RootOp {
-        proposer: match origin {
-            sdk::Origin::External(key) => noded::hex_bytes(key),
-            // frames only carry verified External authorship; label the
-            // impossible rest.
-            sdk::Origin::Module(id) => format!("module:{id}"),
-            sdk::Origin::System => "system".into(),
-        },
-        disposition,
-        target: target.to_string(),
-        operations: dispatches.iter().map(noded::DispatchInfo::from).collect(),
-        payload: noded::payload_preview(payload),
-        op_hash: noded::hex_bytes(&blobs.put_chunk(payload.to_vec())),
-    }
-}
 
 /// rebuild the explorer row for a replayed sealed frame — the boot fold's
 /// equivalent of the drain's row construction, fed from the journal instead
@@ -71,7 +43,7 @@ pub(crate) fn sealed_frame_block_row(
         if op.msg.target == NOP_TARGET {
             continue;
         }
-        ops.push(explorer_root_op(
+        ops.push(project_root_op(
             blobs,
             &op.origin,
             &op.msg.target,
@@ -80,9 +52,9 @@ pub(crate) fn sealed_frame_block_row(
             disposition,
         ));
         // a v3 envelope's released continuation is its own op row, right after
-        // its parent — the live drain's row order (`drain_actions`).
+        // its parent — the live drain's row order (`noded::projection`).
         if let Some(cont) = op.continuation {
-            ops.push(explorer_root_op(
+            ops.push(project_root_op(
                 blobs,
                 &sdk::Origin::Module(op.msg.target),
                 &cont.target,

@@ -99,9 +99,9 @@ mod voice_plane;
 use config::Resolved;
 use constants::*;
 #[cfg(test)]
-use explorer::explorer_root_op;
-#[cfg(test)]
 use explorer::sealed_frame_block_row;
+#[cfg(test)]
+use noded::projection::project_root_op;
 #[cfg(test)]
 use replica::promotion::{
     PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,

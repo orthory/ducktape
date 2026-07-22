@@ -19,8 +19,9 @@ use recovery::{Manifest, Recovery};
 
 use crate::config::{self, hex_bytes, unhex};
 use crate::constants::*;
-use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
+use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
+use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
     joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
     read_valset_residents, upgrade_operations,
@@ -1081,8 +1082,8 @@ pub(super) async fn park(
             let drained = node_r.take_drained();
             // The same projection the validator consumes; this loop retains
             // replica-only seal verification, streaming, and checkpoints.
-            for action in block_actions(&drained, node_r.take_system_dispatches(), &blobs) {
-                let BlockAction {
+            for projection in project_block(&drained, node_r.take_system_dispatches(), &blobs) {
+                let BlockProjection {
                     height,
                     dispatches,
                     record,
@@ -1092,7 +1093,7 @@ pub(super) async fn park(
                     applied_ops,
                     rejected_ops,
                     ..
-                } = action;
+                } = projection;
                 if applied {
                     metrics.record_block(height, latency_us, &dispatches);
                 } else {

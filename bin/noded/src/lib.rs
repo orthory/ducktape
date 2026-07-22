@@ -94,6 +94,11 @@ pub use index::{
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
 pub use metrics::NodeMetrics;
+// the block-projection seam: RootOp assembly + explorer-row bytes, shared by
+// the validator drain, the replica park loop, and (as later tasks adopt it) the
+// noded submit lane and simnode. One row shape, pinned by a golden test.
+pub mod projection;
+pub use projection::{BlockProjection, NOP_TARGET, project_block, project_root_op};
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;

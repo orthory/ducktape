@@ -14,7 +14,8 @@ use sdk::Msg;
 use super::super::announce::{dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
+use crate::drain_actions::{CutoverTrigger, EpochActions};
+use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
     read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
     read_valset_residents, upgrade_operations,
@@ -120,8 +121,8 @@ impl ValidatorRuntime<'_> {
             .len() as u64;
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
-        for action in block_actions(&drained, node.take_system_dispatches(), blobs) {
-            let BlockAction {
+        for projection in project_block(&drained, node.take_system_dispatches(), blobs) {
+            let BlockProjection {
                 height,
                 dispatches,
                 record,
@@ -130,7 +131,7 @@ impl ValidatorRuntime<'_> {
                 applied_ops,
                 rejected_ops,
                 ..
-            } = action;
+            } = projection;
             // one block per height: an APPLIED block records fully
             // (count, this node's summed apply latency, per-module
             // dispatch counters); an all-rejected block (the idle nop
