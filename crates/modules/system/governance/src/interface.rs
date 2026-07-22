@@ -24,19 +24,6 @@ pub enum GovAction {
     RemoveValidator { key: Vec<u8> },
     /// a binding signal with no on-chain effect beyond its recorded outcome.
     Signal { text: String },
-    /// AUTHORIZE a pending node upgrade: emits `LifecycleMsg::ScheduleUpgrade {
-    /// name, activation_height, to_version }` on execution. governance only SCHEDULES
-    /// (authorizes) — it never ARMS: arming additionally requires the `R = n`
-    /// readiness quorum evaluated by the lifecycle module, and the lifecycle module
-    /// is the sole authority for the monotonicity / min-lead / at-most-one gates.
-    ScheduleUpgrade {
-        name: String,
-        activation_height: u64,
-        to_version: u32,
-    },
-    /// AUTHORIZE clearing a pending upgrade before its boundary: emits
-    /// `LifecycleMsg::CancelUpgrade { name }` on execution.
-    CancelUpgrade { name: String },
     /// grant RESIDENT standing (mesh + statesync, no quorum seat — the
     /// staged-admission tier): emits `ValsetMsg::Grant { key }` on execution.
     AddResident { key: Vec<u8> },
@@ -150,7 +137,7 @@ pub enum GovMsg {
         /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
         /// redeem grants valset resident standing; a `Client` redeem grants
         /// submit-only client standing in the identity module. EVERY invite
-        /// is bearer (기명 dropped in Join Protocol v2): no `target` — the
+        /// is bearer (기명 dropped — see the join ADR): no `target` — the
         /// `proof` binds the redemption to whichever key presents it and the
         /// nonce set makes that exactly-once.
         role: u8,

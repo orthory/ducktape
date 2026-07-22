@@ -107,7 +107,7 @@ pub(crate) fn build(
     // or a reverse tunnel then.
     //
     // TRANSPORT IDENTITY: every node — a parked joiner included — connects
-    // under its REAL key (Join v2 §4; the derived lobby identity is retired).
+    // under its REAL key (join ADR §4; the derived lobby identity is retired).
     // a fresh joiner's key is untracked on every member until its `Redeem`
     // grant, when the members' drains re-track it onto the mesh immediately
     // (ahead of the epoch cutover) — pre-admission it needs no mesh at all:

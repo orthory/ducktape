@@ -19,7 +19,6 @@ use crate::blob_fetch;
 use crate::config;
 use crate::constants::*;
 use crate::explorer::heal_index;
-use crate::host_reads::read_upgrade_state;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::lobby;
 use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
@@ -41,7 +40,7 @@ pub(super) struct PreWiring {
     pub(super) relay_rx: super::MeshReceiver,
     pub(super) media_peers: Option<Arc<voice_plane::MediaPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    /// the join GATE's loop end (Join v2 §4): forwarded requests arrive here…
+    /// the join GATE's loop end (join ADR §4): forwarded requests arrive here…
     pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
     /// …kept open by this never-sending clone even when no plane was wired…
     pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
@@ -160,25 +159,9 @@ pub(super) async fn finish(
                 .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
-    let mut pending_boot = recovery_manifest_for_resume
+    let pending_boot = recovery_manifest_for_resume
         .zip(resumed.as_ref())
         .and_then(|(manifest, rec)| derive_pending_boot(manifest, rec));
-    // If no membership cutover already claimed the resume slot, re-arm a
-    // pending upgrade at the same deterministic activation boundary an
-    // uninterrupted node would use. This runs after post-reboot catch-up, so
-    // it reads the freshest recovered host/record.
-    if pending_boot.is_none()
-        && let Some(rec) = resumed.as_ref()
-    {
-        pending_boot = read_upgrade_state(host).await.pending.and_then(|p| {
-            let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
-            if crossed {
-                None
-            } else {
-                p.activation_height.checked_sub(rec.view_base)
-            }
-        });
-    }
 
     // the statesync INGRESS task: owns the channel receiver and loops a
     // clean `recv().await`, forwarding frames into a local bounded queue.
@@ -681,7 +664,7 @@ pub(super) async fn wire(
     let (reach_p2p_tx, mut reach_p2p_rx) =
         network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
     // the join GATE's two connectors between the intro doorbell (the plane's
-    // thread) and the validator run loop (Join v2 §4): verified gate requests
+    // thread) and the validator run loop (join ADR §4): verified gate requests
     // forward in over the channel; resolved outcomes ride back through the
     // shared map. created whether or not the plane runs — the loop's select
     // arm stays wired either way (the keepalive sender keeps it pending, not

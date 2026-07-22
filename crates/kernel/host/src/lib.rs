@@ -93,11 +93,10 @@ pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, 
 pub const MAX_DISPATCHES: u32 = 1024;
 
 /// the genesis-constant module id the `lifecycle` module registers under. read
-/// by [`Host::effective_version`] to derive the block's protocol version, by the
-/// boundary code-swap realization ([`Host::realize_module_swaps`]), and by the
-/// drain's [`Host::pending_lifecycle_advance`] injection; absent before the
-/// coordinated retrofit, in which case the version derivation falls back to
-/// [`BASELINE_VERSION`] and no swap is ever realized or injected.
+/// by the boundary code-swap realization ([`Host::realize_module_swaps`]) and by
+/// the drain's [`Host::pending_lifecycle_advance`] injection; absent on a host
+/// without the module (e.g. a test registry), in which case no swap is ever
+/// realized or injected.
 pub const LIFECYCLE_MODULE_ID: &str = lifecycle::DEFAULT_LIFECYCLE_ID;
 
 /// the genesis-constant module id the `dispatch` module registers under. read
@@ -169,31 +168,16 @@ pub struct BlockContext {
     pub consensus_time: u64,
     /// the root op's real submitter. follow-ups override with `Origin::Module`.
     pub origin: Origin,
-    /// the effective protocol version for this block — `effective_version(height)`
-    /// derived from committed lifecycle-module upgrade state and stamped by the node layer
-    /// (see [`Host::effective_version`]). copied verbatim into every dispatch's
-    /// [`Env::protocol_version`]. a read-only dispatch input: it is NEVER folded
-    /// into any module `root()` preimage, op/wire encoding, or the app-hash
-    /// composition. defaults to [`BASELINE_VERSION`].
-    pub protocol_version: u32,
 }
 
-/// the baseline protocol version — the version every node runs before any upgrade
-/// activates, and the graceful fallback when the `lifecycle` module is not yet
-/// registered (a host without the module, e.g. a test registry). Matches the `lifecycle` module's uninitialized
-/// `current_version == 0`, so a fresh module and a module-absent host agree.
-pub const BASELINE_VERSION: u32 = 0;
-
 impl Default for BlockContext {
-    /// the pre-consensus default: height/time 0, an empty external origin, and the
-    /// baseline protocol version, so [`Host::submit`] is byte-for-byte the old
-    /// hardcoded behavior.
+    /// the pre-consensus default: height/time 0 and an empty external origin,
+    /// so [`Host::submit`] is byte-for-byte the old hardcoded behavior.
     fn default() -> Self {
         Self {
             height: 0,
             consensus_time: 0,
             origin: Origin::External(Vec::new()),
-            protocol_version: BASELINE_VERSION,
         }
     }
 }
@@ -317,7 +301,7 @@ pub enum MemberOutcome {
 /// `(Origin, Msg)` pair always carried, plus the envelope's optional
 /// continuation and its content id. [`Host::submit_block`] wraps bare pairs
 /// into continuation-free `BlockOp`s, so pre-envelope callers are untouched;
-/// the node's frame drain builds these directly once the v3 wiring lands.
+/// the node's frame drain builds these directly.
 #[derive(Clone, Debug)]
 pub struct BlockOp {
     /// the frame's verified authorship — the envelope AUTHOR, threaded into
@@ -560,15 +544,6 @@ impl std::error::Error for SnapshotError {}
 pub struct Host {
     /// deterministic iteration order is load-bearing for snapshot + app-hash.
     registry: BTreeMap<ModuleId, Box<dyn Module>>,
-    /// Modules carried by a legacy workspace but excluded from every host
-    /// surface until an agreed protocol boundary activates them. Keeping them
-    /// outside `registry` makes pre-boundary query/dispatch/root/snapshot
-    /// behavior byte-for-byte identical to the old binary.
-    dormant: BTreeMap<ModuleId, Box<dyn Module>>,
-    /// Per-module activation threshold for the one harder upgrade class that
-    /// changes the registry itself. Empty for ordinary/fresh hosts.
-    activation_versions: BTreeMap<ModuleId, u32>,
-    active_version: u32,
     /// instantiates post-genesis ADMISSIONS at the activation boundary.
     /// `None` fails closed the moment an admission arms — never before.
     module_factory: Option<Box<dyn ModuleFactory>>,
@@ -578,9 +553,6 @@ impl Host {
     pub fn new() -> Self {
         Self {
             registry: BTreeMap::new(),
-            dormant: BTreeMap::new(),
-            activation_versions: BTreeMap::new(),
-            active_version: BASELINE_VERSION,
             module_factory: None,
         }
     }
@@ -594,31 +566,6 @@ impl Host {
     /// register a module under its own [`Module::id`]. genesis-time wiring.
     pub fn register(&mut self, module: Box<dyn Module>) {
         self.registry.insert(module.id(), module);
-    }
-
-    /// Keep one already-registered module invisible until `version` is active.
-    /// This is intentionally explicit and narrow: unknown module-set changes
-    /// remain incompatible instead of acquiring a generic migration escape
-    /// hatch.
-    pub fn defer_module_until(&mut self, id: &str, version: u32) -> Result<(), Error> {
-        if version <= self.active_version {
-            return Err(Error::Module(format!(
-                "module {id} activation version {version} is not above active version {}",
-                self.active_version
-            )));
-        }
-        if self.activation_versions.contains_key(id) {
-            return Err(Error::Module(format!(
-                "module {id} already has an activation version"
-            )));
-        }
-        let module = self
-            .registry
-            .remove(id)
-            .ok_or_else(|| Error::UnknownModule(id.to_string()))?;
-        self.activation_versions.insert(id.to_string(), version);
-        self.dormant.insert(id.to_string(), module);
-        Ok(())
     }
 
     /// Sorted module ids and their canonical-state revisions.
@@ -666,9 +613,6 @@ impl Host {
                         consensus_time: 0,
                         origin: Origin::System,
                         me: target.clone(),
-                        // an out-of-block external read has no block version; it
-                        // reads committed state under the baseline format.
-                        protocol_version: BASELINE_VERSION,
                     },
                     snapshot: &snapshot,
                     registry: &self.registry,
@@ -699,117 +643,22 @@ impl Host {
         }
     }
 
-    /// the effective protocol version governing block `height`, derived from the
-    /// committed `upgrade`-module state (the pure `effective_version` derivation,
-    /// not the raw stored `current_version`). the node layer stamps this onto
-    /// [`BlockContext::protocol_version`] so dispatch and hashing agree that block
-    /// `height` runs one version.
-    ///
-    /// this is a read-only, out-of-block committed read (routed like any external
-    /// [`Host::query`]). the `lifecycle` module is a genesis constant on an upgraded
-    /// net, but is ABSENT before the coordinated retrofit — so a missing module,
-    /// an undecodable reply, or any query error gracefully falls back to
-    /// [`BASELINE_VERSION`] rather than panicking or erroring. behavior is
-    /// therefore unchanged until the module is registered and a pending upgrade
-    /// arms at its activation height.
-    pub async fn effective_version(&self, height: u64) -> u32 {
-        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus);
-        match self.query(LIFECYCLE_MODULE_ID, &req).await {
-            Ok(bytes) => match lifecycle::decode_reply(&bytes) {
-                Ok(lifecycle::LifecycleReply::UpgradeStatus(s)) => {
-                    // the ONE shared predicate — the host stamps EXACTLY what the
-                    // module's Advance arm check computes (both route through
-                    // lifecycle::effective_version), so dispatch and hashing
-                    // can never diverge at the boundary (risk R4).
-                    lifecycle::effective_version(
-                        height,
-                        s.current_version,
-                        s.pending.as_ref(),
-                        &s.members,
-                        |member| {
-                            s.ready
-                                .binary_search_by(|ready| ready.as_slice().cmp(member))
-                                .is_ok()
-                        },
-                    )
-                }
-                // module present but reply unreadable — never fork on a decode slip.
-                _ => BASELINE_VERSION,
-            },
-            // module absent or unreadable — baseline, never error.
-            Err(_) => BASELINE_VERSION,
-        }
-    }
-
-    /// drive the agreed boundary protocol version into EVERY registered module at
-    /// the finalized activation boundary (design §4). the version is read from
-    /// frozen boundary state (the orchestrator's `RespawnPlan::boundary_version`),
-    /// identical on every honest node, so this is a deterministic self-transition —
-    /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
-    /// [`Module::set_active_version`] (only dual-path modules do), and
-    /// `version` itself is a NON-hashed branch selector — it never enters any
-    /// `root()` preimage. Ordinary dual-path modules therefore leave the current
-    /// root unmoved by this call alone. A module explicitly registered through
-    /// [`Host::defer_module_until`] is the narrow exception: it joins/leaves the
-    /// registry (and app-hash) exactly when its version threshold is crossed.
-    /// The upgrade module's own `current_version` still reconciles through the
-    /// in-block System `Advance` injected at the same height.
-    pub fn set_active_version(&mut self, version: u32) {
-        for m in self.registry.values_mut() {
-            m.set_active_version(version);
-        }
-        for m in self.dormant.values_mut() {
-            m.set_active_version(version);
-        }
-        let activate: Vec<ModuleId> = self
-            .activation_versions
-            .iter()
-            .filter(|(id, threshold)| version >= **threshold && self.dormant.contains_key(*id))
-            .map(|(id, _)| id.clone())
-            .collect();
-        let deactivate: Vec<ModuleId> = self
-            .activation_versions
-            .iter()
-            .filter(|(id, threshold)| version < **threshold && self.registry.contains_key(*id))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in activate {
-            let module = self.dormant.remove(&id).expect("activation source checked");
-            self.registry.insert(id, module);
-        }
-        for id in deactivate {
-            let module = self
-                .registry
-                .remove(&id)
-                .expect("deactivation source checked");
-            self.dormant.insert(id, module);
-        }
-        self.active_version = version;
-    }
-
     /// the SYSTEM-ORIGIN lifecycle `Advance` the drain injects in-block at a
-    /// finalized activation boundary, or `None` when there is nothing to
-    /// reconcile on EITHER lifecycle half.
+    /// finalized code-swap boundary, or `None` when there is nothing to
+    /// reconcile.
     ///
-    /// this is the replay-safe realization of the design's "arm/abort is a
-    /// deterministic self-transition evaluated exactly once at `H`": because it
-    /// rides the SAME [`Host::submit_at`] drain that recovery-replay and
-    /// state-sync-install also run, the `current_version` flip + pending-upgrade
-    /// clear AND the committed active-hash flip + pending-swap clear reconstruct
-    /// byte-for-byte on every node (never a respawn side-effect, invisible to
-    /// replay). keyed purely on committed lifecycle state + `height`: injected
-    /// iff the committed module holds a pending upgrade whose `activation_height`
-    /// has been reached OR an armed swap (ready + height reached). the single
-    /// `Advance` reconciles BOTH halves. idempotent — the first block at/after
-    /// `H` clears both, so later blocks inject nothing. ABSENT until the module
-    /// is registered (both queries error → `None`), so the drain is
+    /// this is the replay-safe realization of "arm/abort is a deterministic
+    /// self-transition evaluated exactly once at `H`": because it rides the
+    /// SAME [`Host::submit_at`] drain that recovery-replay and
+    /// state-sync-install also run, the committed active-hash flip +
+    /// pending-swap clear reconstruct byte-for-byte on every node (never a
+    /// respawn side-effect, invisible to replay). keyed purely on committed
+    /// lifecycle state + `height`: injected iff the committed module holds an
+    /// armed swap (ready + height reached). idempotent — the first block
+    /// at/after `H` clears it, so later blocks inject nothing. ABSENT until
+    /// the module is registered (the query errors → `None`), so the drain is
     /// byte-identical on a net without the module.
     async fn pending_lifecycle_advance(&self, height: u64) -> Option<Msg> {
-        let upgrade_reached = self
-            .lifecycle_upgrade_status()
-            .await
-            .and_then(|s| s.pending)
-            .is_some_and(|pending| height >= pending.activation_height);
         let swap_armed = self.lifecycle_module_status().await.is_some_and(|modules| {
             modules.iter().any(|m| {
                 m.pending
@@ -817,23 +666,10 @@ impl Host {
                     .is_some_and(|p| p.ready && height >= p.activation_height)
             })
         });
-        (upgrade_reached || swap_armed).then(|| Msg {
+        swap_armed.then(|| Msg {
             target: LIFECYCLE_MODULE_ID.into(),
             payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::Advance),
         })
-    }
-
-    /// the lifecycle module's committed upgrade-status projection, or `None` when
-    /// the module is absent / its reply is unreadable — the shared out-of-block
-    /// committed read behind [`Host::pending_lifecycle_advance`] (mirrors
-    /// [`Host::effective_version`]'s graceful fallback).
-    async fn lifecycle_upgrade_status(&self) -> Option<lifecycle::UpgradeStatus> {
-        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus);
-        let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
-        match lifecycle::decode_reply(&bytes).ok()? {
-            lifecycle::LifecycleReply::UpgradeStatus(s) => Some(s),
-            _ => None,
-        }
     }
 
     /// the SYSTEM-ORIGIN `DeliverPending` the drain injects when the
@@ -877,8 +713,8 @@ impl Host {
     /// the lifecycle module's committed per-module code state, or `None` when the
     /// module is absent / its reply is unreadable — the shared out-of-block
     /// committed read behind [`Host::pending_lifecycle_advance`] and
-    /// [`Host::realize_module_swaps`] (mirrors [`Host::effective_version`]'s
-    /// graceful fallback: a missing registry is never an error, just nothing to do).
+    /// [`Host::realize_module_swaps`] (a missing registry is never an error,
+    /// just nothing to do).
     async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
         let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
         let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
@@ -948,17 +784,17 @@ impl Host {
             // only reconcile a module this node actually runs AS a hot-swappable
             // component: a native module (no `code_hash`) is nothing to realize —
             // its registry entry is a genesis concern. an id absent from the
-            // registry (and not dormant) whose committed target is NON-empty is
-            // a post-genesis ADMISSION this boundary must realize by
-            // instantiating the module from its verified bytes; an empty target
-            // is an admission not yet armed.
+            // registry whose committed target is NON-empty is a post-genesis
+            // ADMISSION this boundary must realize by instantiating the module
+            // from its verified bytes; an empty target is an admission not yet
+            // armed.
             let current = match self.registry.get(&m.module_id) {
                 Some(module) => match module.code_hash() {
                     Some(current) => Some(current),
                     None => continue, // native module — genesis concern.
                 },
                 None => {
-                    if target.is_empty() || self.dormant.contains_key(&m.module_id) {
+                    if target.is_empty() {
                         continue;
                     }
                     None // admission to realize below.
@@ -1151,7 +987,6 @@ impl Host {
         ctx: BlockContext,
         msg: Msg,
     ) -> Result<BlockOutcome, SubmitError> {
-        self.set_active_version(ctx.protocol_version);
         // every module dispatched this block, in deterministic order — the set
         // the host commits or aborts at the boundary.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
@@ -1256,7 +1091,7 @@ impl Host {
     /// but whose in-memory cohort was rolled back to the checkpoint; replay re-runs
     /// the frame and commits ONLY the at-pre cohort, aborting the durable substrate
     /// (re-committing it would move its op-log root and fork). NOT the live path.
-    /// takes full [`BlockOp`]s: a journaled v3 frame's continuation must re-run
+    /// takes full [`BlockOp`]s: a journaled envelope frame's continuation must re-run
     /// on the heal exactly as it ran live, or the sealed roots cannot reproduce.
     pub async fn submit_block_committing(
         &mut self,
@@ -1280,15 +1115,13 @@ impl Host {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
-        let protocol_version = ctx.protocol_version;
-        self.set_active_version(protocol_version);
 
         // 1. the once-per-block System injections, computed ONCE against PRE-batch
         // committed state — the "results staged by this very block are invisible
         // here" invariant, evaluated BEFORE any member stages. same order as the
-        // single-op drain: the lifecycle `Advance` (one tick reconciling BOTH the
-        // protocol-version arm/abort AND every armed code swap), then
-        // `DeliverPending`. drained once, after every member, below (step 4).
+        // single-op drain: the lifecycle `Advance` (one tick reconciling every
+        // armed code swap), then `DeliverPending`. drained once, after every
+        // member, below (step 4).
         let mut injections: VecDeque<(Origin, Msg)> = VecDeque::new();
         if let Some(advance) = self.pending_lifecycle_advance(height).await {
             injections.push_back((Origin::System, advance));
@@ -1332,7 +1165,6 @@ impl Host {
                 .drain_queue(
                     height,
                     consensus_time,
-                    protocol_version,
                     queue,
                     None,
                     &mut touched,
@@ -1366,7 +1198,6 @@ impl Host {
                     self.replay_accepted(
                         height,
                         consensus_time,
-                        protocol_version,
                         &mut accepted,
                         &mut touched,
                     )
@@ -1402,7 +1233,6 @@ impl Host {
                 .drain_queue(
                     height,
                     consensus_time,
-                    protocol_version,
                     cqueue,
                     Some(relay.clone()),
                     &mut touched,
@@ -1435,7 +1265,6 @@ impl Host {
                     self.replay_accepted(
                         height,
                         consensus_time,
-                        protocol_version,
                         &mut accepted,
                         &mut touched,
                     )
@@ -1475,7 +1304,6 @@ impl Host {
             .drain_queue(
                 height,
                 consensus_time,
-                protocol_version,
                 injections,
                 None,
                 &mut touched,
@@ -1573,7 +1401,6 @@ impl Host {
         &mut self,
         height: u64,
         consensus_time: u64,
-        protocol_version: u32,
         accepted: &mut [AcceptedUnit],
         touched: &mut BTreeSet<ModuleId>,
     ) -> Result<(), SubmitError> {
@@ -1585,7 +1412,6 @@ impl Host {
             self.drain_queue(
                 height,
                 consensus_time,
-                protocol_version,
                 rq,
                 unit.relay.clone(),
                 touched,
@@ -1638,27 +1464,20 @@ impl Host {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
-        // effective_version(height) for this block — stamped constant across the
-        // root op and every FIFO follow-up; a read-only dispatch input, NEVER hashed.
-        let protocol_version = ctx.protocol_version;
 
         // the root op carries the real submitter's origin; follow-ups override.
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
 
-        // DETERMINISTIC ACTIVATION INJECTION (design §4 / plan Task 6.3). at a
-        // finalized boundary where the committed `lifecycle` module holds a
-        // pending upgrade that has reached its activation height OR an armed code
-        // swap, append EXACTLY ONE System-origin `Advance` so the module
-        // reconciles its own app-hashed state in-block: the upgrade half (ARM:
-        // `current_version = to_version` + clear pending/readiness; ABORT: clear
-        // only) AND the code-swap half (flip every armed active hash — the
+        // DETERMINISTIC ACTIVATION INJECTION. at a finalized boundary where the
+        // committed `lifecycle` module holds an armed code swap, append EXACTLY
+        // ONE System-origin `Advance` so the module reconciles its own
+        // app-hashed state in-block (flip every armed active hash — the
         // consensus commitment to the new code; the actual component swap is
-        // realized out-of-block by `realize_module_swaps`). one tick reconciles
-        // BOTH at the SAME finalized view on every node. it rides this drain (not
-        // the respawn side-path), so live, recovery-replay, and state-sync nodes
-        // all reconstruct it byte-for-byte, and it frees the at-most-one-pending
-        // slots after activation. INERT until the module is registered —
-        // `pending_lifecycle_advance` returns `None` when the module is absent.
+        // realized out-of-block by `realize_module_swaps`). it rides this drain
+        // (not the respawn side-path), so live, recovery-replay, and state-sync
+        // nodes all reconstruct it byte-for-byte, and it frees the
+        // at-most-one-pending slot after activation. INERT until the module is
+        // registered — `pending_lifecycle_advance` returns `None` when absent.
         if let Some(advance) = self.pending_lifecycle_advance(height).await {
             queue.push_back((Origin::System, advance));
         }
@@ -1681,7 +1500,6 @@ impl Host {
         self.drain_queue(
             height,
             consensus_time,
-            protocol_version,
             queue,
             None,
             touched,
@@ -1714,7 +1532,6 @@ impl Host {
         &mut self,
         height: u64,
         consensus_time: u64,
-        protocol_version: u32,
         mut queue: VecDeque<(Origin, Msg)>,
         mut relay: Option<Relay>,
         touched: &mut BTreeSet<ModuleId>,
@@ -1757,7 +1574,6 @@ impl Host {
                     consensus_time,
                     origin: trigger.clone(),
                     me: msg.target.clone(),
-                    protocol_version,
                 },
                 snapshot,
                 registry: &self.registry, // the rest — for query routing
@@ -1864,7 +1680,6 @@ impl Ctx for HostCtx<'_> {
                         consensus_time: self.env.consensus_time,
                         origin: self.env.origin.clone(),
                         me: target.clone(),
-                        protocol_version: self.env.protocol_version,
                     },
                     snapshot: &self.snapshot,
                     registry: self.registry,
@@ -1930,7 +1745,6 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
                         consensus_time: self.env.consensus_time,
                         origin: self.env.origin.clone(),
                         me: target,
-                        protocol_version: self.env.protocol_version,
                     },
                     snapshot: self.snapshot,
                     registry: self.registry,

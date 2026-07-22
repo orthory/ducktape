@@ -136,10 +136,6 @@ pub struct Governance {
     /// the id of the valset module this governance instance gates. genesis
     /// wiring — identical on every node.
     valset_id: ModuleId,
-    /// the id of the lifecycle module a passing `ScheduleUpgrade`/`CancelUpgrade`
-    /// authorizes (the protocol-version path). genesis wiring — identical on
-    /// every node.
-    lifecycle_id: ModuleId,
     /// the id of the lifecycle module a passing `UpdateModule`/`CancelModuleUpdate`
     /// authorizes (the code-registry path — the same module, gated separately).
     /// genesis wiring — identical on every node; `None` (a net without the code
@@ -150,9 +146,6 @@ pub struct Governance {
     /// `IdentityMsg::GrantClient` follow-up here (identity is always wired, so
     /// Client redemption needs no separate module gate).
     identity_id: ModuleId,
-    /// Current deterministic protocol selector supplied by the host. This is
-    /// deliberately not snapshot state: replay derives it from the block.
-    active_version: u32,
     /// the network binding invite tokens sign over (the genesis namespace).
     /// genesis wiring — identical on every node of the same network. `None`
     /// (a shape without a descriptor) refuses every `Redeem` with a clear
@@ -182,16 +175,13 @@ impl Governance {
     pub fn new(
         id: impl Into<ModuleId>,
         valset_id: impl Into<ModuleId>,
-        lifecycle_id: impl Into<ModuleId>,
         identity_id: impl Into<ModuleId>,
     ) -> Self {
         Self {
             id: id.into(),
             valset_id: valset_id.into(),
-            lifecycle_id: lifecycle_id.into(),
             code_registry_id: None,
             identity_id: identity_id.into(),
-            active_version: 0,
             invite_binding: None,
             proposals: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -207,8 +197,7 @@ impl Governance {
     /// enable the code-registry path (`UpdateModule`/`CancelModuleUpdate`) on the
     /// lifecycle module. genesis wiring — every node of a network must wire the
     /// same id (or none), or nodes diverge on whether those proposals are
-    /// accepted. `id` is the lifecycle module id (the same module the version
-    /// path targets).
+    /// accepted.
     pub fn with_code_registry(mut self, id: impl Into<ModuleId>) -> Self {
         self.code_registry_id = Some(id.into());
         self
@@ -531,30 +520,16 @@ impl Governance {
                     out.push(2);
                     push_bytes(&mut out, text.as_bytes());
                 }
-                GovAction::ScheduleUpgrade {
-                    name,
-                    activation_height,
-                    to_version,
-                } => {
-                    out.push(3);
-                    push_bytes(&mut out, name.as_bytes());
-                    out.extend_from_slice(&activation_height.to_le_bytes());
-                    out.extend_from_slice(&to_version.to_le_bytes());
-                }
-                GovAction::CancelUpgrade { name } => {
-                    out.push(4);
-                    push_bytes(&mut out, name.as_bytes());
-                }
                 GovAction::AddResident { key } => {
-                    out.push(5);
+                    out.push(3);
                     push_bytes(&mut out, key);
                 }
                 GovAction::RemoveResident { key } => {
-                    out.push(6);
+                    out.push(4);
                     push_bytes(&mut out, key);
                 }
                 GovAction::AdoptShares { allocations } => {
-                    out.push(7);
+                    out.push(5);
                     out.extend_from_slice(&(allocations.len() as u64).to_le_bytes());
                     for allocation in allocations {
                         push_bytes(&mut out, &allocation.account_id);
@@ -562,12 +537,12 @@ impl Governance {
                     }
                 }
                 GovAction::SetShares { account_id, shares } => {
-                    out.push(8);
+                    out.push(6);
                     push_bytes(&mut out, account_id);
                     out.extend_from_slice(&shares.to_le_bytes());
                 }
                 GovAction::SetShareMode { enabled } => {
-                    out.push(9);
+                    out.push(7);
                     out.push(u8::from(*enabled));
                 }
                 GovAction::UpdateModule {
@@ -576,14 +551,14 @@ impl Governance {
                     activation_height,
                     code_hash,
                 } => {
-                    out.push(10);
+                    out.push(8);
                     push_bytes(&mut out, name.as_bytes());
                     push_bytes(&mut out, module_id.as_bytes());
                     out.extend_from_slice(&activation_height.to_le_bytes());
                     push_bytes(&mut out, code_hash);
                 }
                 GovAction::CancelModuleUpdate { name, module_id } => {
-                    out.push(11);
+                    out.push(9);
                     push_bytes(&mut out, name.as_bytes());
                     push_bytes(&mut out, module_id.as_bytes());
                 }
@@ -593,7 +568,7 @@ impl Governance {
                     activation_height,
                     code_hash,
                 } => {
-                    out.push(12);
+                    out.push(10);
                     push_bytes(&mut out, name.as_bytes());
                     push_bytes(&mut out, module_id.as_bytes());
                     out.extend_from_slice(&activation_height.to_le_bytes());
@@ -824,15 +799,6 @@ impl Governance {
                 ));
             }
         }
-        // upgrade authorizations must name a non-empty upgrade — an unnamed
-        // proposal can never match a real pending, so reject it at the door.
-        // monotonicity / min-lead / at-most-one are NOT checked here: those are
-        // the upgrade module's sole authority at ingest (do not duplicate).
-        if let GovAction::ScheduleUpgrade { name, .. } | GovAction::CancelUpgrade { name } = &action
-            && name.is_empty()
-        {
-            return Err(Error::Module("upgrade name must not be empty".into()));
-        }
         // module-update authorizations: shape-checked at the door (a proposal
         // that can never execute is rejected here, not at tally time); the code
         // registry's min-lead / at-most-one / no-op gates are NOT duplicated —
@@ -863,18 +829,6 @@ impl Governance {
             return Err(Error::Module(format!(
                 "code_hash must be {} bytes (sha256 of the component)",
                 lifecycle::CODE_HASH_LEN
-            )));
-        }
-        // admission is protocol-version gated (the registry enforces the same
-        // constant at execution; this door-check fails the proposal early,
-        // before an electorate wastes a ballot on it).
-        if matches!(&action, GovAction::RegisterModule { .. })
-            && self.active_version < lifecycle::ADMISSION_ACTIVATION_VERSION
-        {
-            return Err(Error::Module(format!(
-                "module admission activates at protocol v{} (network is at v{})",
-                lifecycle::ADMISSION_ACTIVATION_VERSION,
-                self.active_version
             )));
         }
         if self.get(&proposal_id).is_some() {
@@ -1033,28 +987,6 @@ impl Governance {
                         });
                     }
                 }
-                // a passing upgrade authorization is PERFORMED the same way: emit
-                // the upgrade op as a follow-up. the host drains it in this same
-                // block and the upgrade module accepts it because the origin is
-                // Module(governance). governance only authorizes; the upgrade
-                // module's deterministic gates (monotonicity, min-lead,
-                // at-most-one) and the R=n readiness quorum are what ARM it.
-                GovAction::ScheduleUpgrade {
-                    name,
-                    activation_height,
-                    to_version,
-                } => ctx.emit_msg(Msg {
-                    target: self.lifecycle_id.clone(),
-                    payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleUpgrade {
-                        name: name.clone(),
-                        activation_height: *activation_height,
-                        to_version: *to_version,
-                    }),
-                }),
-                GovAction::CancelUpgrade { name } => ctx.emit_msg(Msg {
-                    target: self.lifecycle_id.clone(),
-                    payload: lifecycle_encode_msg(&LifecycleMsg::CancelUpgrade { name: name.clone() }),
-                }),
                 // a passing module-update authorization is PERFORMED the same
                 // way: emit the modreg op as a follow-up, accepted because the
                 // origin is Module(governance). governance only authorizes; the
@@ -1215,7 +1147,7 @@ impl Governance {
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
         let role = invite::InviteRole::from_u8(role).map_err(Error::Module)?;
-        // EVERY invite is bearer (기명 dropped in Join Protocol v2): there is
+        // EVERY invite is bearer (기명 dropped — see the join ADR): there is
         // no target lock. The join proof below binds the redemption to
         // whichever key presents it, and the nonce set makes that
         // exactly-once — that is the whole containment story.
@@ -1318,10 +1250,6 @@ impl Governance {
 impl Module for Governance {
     fn id(&self) -> ModuleId {
         self.id.clone()
-    }
-
-    fn set_active_version(&mut self, version: u32) {
-        self.active_version = version;
     }
 
     /// sha256 over the canonical encoding of COMMITTED proposals and
@@ -1480,21 +1408,13 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             2 => GovAction::Signal {
                 text: cur.string("snapshot signal text")?,
             },
-            3 => GovAction::ScheduleUpgrade {
-                name: cur.string("snapshot upgrade name")?,
-                activation_height: cur.u64("snapshot activation height")?,
-                to_version: cur.u32("snapshot to_version")?,
-            },
-            4 => GovAction::CancelUpgrade {
-                name: cur.string("snapshot upgrade name")?,
-            },
-            5 => GovAction::AddResident {
+            3 => GovAction::AddResident {
                 key: cur.bytes("snapshot key")?.to_vec(),
             },
-            6 => GovAction::RemoveResident {
+            4 => GovAction::RemoveResident {
                 key: cur.bytes("snapshot key")?.to_vec(),
             },
-            7 => {
+            5 => {
                 let allocation_count = cur.u64("snapshot allocation count")?;
                 if allocation_count == 0 || allocation_count > MAX_SHARE_ACCOUNTS as u64 {
                     return Err(Error::Module(
@@ -1524,24 +1444,24 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
                 Governance::total_power(&powers)?;
                 GovAction::AdoptShares { allocations }
             }
-            8 => GovAction::SetShares {
+            6 => GovAction::SetShares {
                 account_id: cur.bytes("snapshot account id")?.to_vec(),
                 shares: cur.u64("snapshot shares")?,
             },
-            9 => GovAction::SetShareMode {
+            7 => GovAction::SetShareMode {
                 enabled: cur.bool("snapshot share-mode action")?,
             },
-            10 => GovAction::UpdateModule {
+            8 => GovAction::UpdateModule {
                 name: cur.string("snapshot module update name")?,
                 module_id: cur.string("snapshot module id")?,
                 activation_height: cur.u64("snapshot activation height")?,
                 code_hash: cur.bytes("snapshot code hash")?.to_vec(),
             },
-            11 => GovAction::CancelModuleUpdate {
+            9 => GovAction::CancelModuleUpdate {
                 name: cur.string("snapshot module update name")?,
                 module_id: cur.string("snapshot module id")?,
             },
-            12 => GovAction::RegisterModule {
+            10 => GovAction::RegisterModule {
                 name: cur.string("snapshot module update name")?,
                 module_id: cur.string("snapshot module id")?,
                 activation_height: cur.u64("snapshot activation height")?,

@@ -42,7 +42,7 @@ pub(crate) struct BootEnv {
     /// site so a bad value degrades there instead of aborting boot.
     pub(crate) primary_coordinator: Option<String>,
     /// the TCP relay override (`node.toml coordinator_relay`), raw — consumed
-    /// by the joiner's first-contact wiring (Join v2 item 2); `None` derives
+    /// by the joiner's first-contact wiring (join ADR item 2); `None` derives
     /// the relay from the ambient coordinator there.
     pub(crate) coordinator_relay: Option<String>,
     /// the WireGuard bind/advertise split (`node.toml wireguard_advertised`),

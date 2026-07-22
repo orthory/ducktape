@@ -929,7 +929,6 @@ mod tests {
             consensus_time: height,
             origin,
             me: "dispatch".into(),
-            protocol_version: 0,
         })
     }
 

@@ -133,7 +133,6 @@ fn fixture(seed: u64) -> (Vec<u8>, ed25519::PrivateKey, AccountView, TestCtx, Ga
             consensus_time: 1,
             origin: Origin::External(node.clone()),
             me: "gateway".into(),
-            protocol_version: 0,
         },
         validators: vec![node.clone()],
         residents: vec![],

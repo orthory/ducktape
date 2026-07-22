@@ -208,7 +208,6 @@ fn block(height: u64, origin: Origin) -> BlockContext {
         height,
         consensus_time: height,
         origin,
-        protocol_version: 0,
     }
 }
 

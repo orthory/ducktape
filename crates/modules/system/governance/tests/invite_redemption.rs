@@ -3,7 +3,7 @@
 //! joiner's proof-of-possession grants standing with no ballot — and the
 //! redeemed-nonce set makes every token single-use.
 //!
-//! Join Protocol v2: EVERY invite is bearer (무기명). There is no target lock;
+//! the join protocol: EVERY invite is bearer (무기명). There is no target lock;
 //! whoever presents a valid join proof for the nonce first wins the grant, and
 //! single-use bounds it. The role (`Resident`/`Client`) selects which standing
 //! plane the grant lands in.
@@ -96,7 +96,7 @@ fn gov_host() -> Host {
         Box::new(valset),
         Box::new(Identity::new("identity", None, "testnet".into())),
         Box::new(
-            Governance::new("governance", "valset", "upgrade", "identity")
+            Governance::new("governance", "valset", "identity")
                 .with_invite_binding(BINDING),
         ),
     ])
@@ -109,19 +109,8 @@ async fn submit_as(
     at: u64,
     payload: Vec<u8>,
 ) -> Result<(), SubmitError> {
-    submit_as_version(host, who, at, 0, payload).await
-}
-
-async fn submit_as_version(
-    host: &mut Host,
-    who: &[u8],
-    at: u64,
-    protocol_version: u32,
-    payload: Vec<u8>,
-) -> Result<(), SubmitError> {
     host.submit_at(
         BlockContext {
-            protocol_version,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -248,7 +237,7 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
         }) else {
             panic!("governance must advertise snapshot bytes");
         };
-        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity")
+        let mut rebuilt = Governance::new("governance", "valset", "identity")
             .with_invite_binding(BINDING);
         rebuilt.install(&bytes, expected_root).expect("install");
         assert_eq!(rebuilt.root(), expected_root, "round-trip root");
@@ -316,7 +305,6 @@ fn a_network_without_a_binding_refuses_redemption() {
             Box::new(Governance::new(
                 "governance",
                 "valset",
-                "upgrade",
                 "identity",
             )),
         ])

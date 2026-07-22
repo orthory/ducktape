@@ -62,10 +62,11 @@ pub struct NetworkDescriptor {
     /// first reachable entry that is not themselves.
     #[serde(default)]
     pub bootstrap: Vec<String>,
-    /// typed reach hints (v3), canonical strings like `direct:<hex>@host:port`.
+    /// typed reach hints, canonical strings like `direct:<hex>@host:port`.
     /// advisory and EXCLUDED from the genesis fingerprint, exactly like
-    /// `bootstrap`. empty for v2/legacy descriptors — then [`NetworkDescriptor::reach_hints`]
-    /// synthesises all-`Direct` hints from `bootstrap`.
+    /// `bootstrap`. empty for bootstrap-only descriptors — then
+    /// [`NetworkDescriptor::reach_hints`] synthesises all-`Direct` hints from
+    /// `bootstrap`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
     /// Coordination privacy for the reachability plane. `None` => `Private`
@@ -202,12 +203,12 @@ impl NetworkDescriptor {
         self.bootstrap.sort();
     }
 
-    /// the reach hints, typed. if the descriptor carries explicit v3 `reach`
+    /// the reach hints, typed. if the descriptor carries explicit `reach`
     /// entries they parse to those; otherwise every `bootstrap` entry is a
-    /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
-    /// no data duplicated and no double-dial).
+    /// `Direct` hint (so a bootstrap-only descriptor yields all-`Direct`
+    /// hints with no data duplicated and no double-dial).
     pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
-        // the UNION of typed `reach` and legacy `bootstrap`: explicit typed
+        // the UNION of typed `reach` and untyped `bootstrap`: explicit typed
         // hints win over bootstrap-synthesised Direct hints for the same
         // member, but typed entries are a route set, not a per-key map. A
         // node may need both a rendezvous route and a tunnel-overlay route for

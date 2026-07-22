@@ -2,9 +2,25 @@
 
 # Repository Instructions
 
+## No Legacy, No Compat (until a live network exists)
+
+- There are ZERO live ducktape networks. Nothing deployed needs backward
+  compatibility, wire-format tolerance, or an upgrade path from older behavior.
+- Keep ONLY the latest-spec implementation of every module and protocol. When a
+  spec or format changes, replace the old code — never keep a legacy decoder, a
+  versioned enum arm, a compat shim, or a config alias "just in case". Dual-path
+  code is a defect, not prudence.
+- Version numbering is reset to v1 and stays there: no protocol-version bumps,
+  no v2/v3 names, no admission gates keyed on a version number. The
+  invitation/join flow in particular is v1 — a "v2" hint anywhere in it is a
+  bug.
+- This holds until a real network is live. Re-introducing versioning, upgrade
+  gating, or migration machinery is an explicit, user-requested decision —
+  never a side effect of a task.
+
 ## Internal Skills
 
-- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`, `upgrade`).
+- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`).
 - `.claude/skills` and `.codex/skills` both point to the shared `skills/` directory.
 - Keep assistant-facing repository guidance in this file; `CLAUDE.md` links here so both assistants read the same instructions.
 - Workflow helpers are user-global, not repo-tracked; the branching and

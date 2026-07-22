@@ -313,7 +313,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // tasks
         (
             "tasks",
-            json!({ "create_task": { "task_id": "t1", "title": "sweep" } }),
+            json!({ "task": { "create_task": { "task_id": "t1", "title": "sweep" } } }),
             Some("owner".into()),
         ),
         // inbox
@@ -322,10 +322,10 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "deliver": { "member": "eddy", "kind": "note", "body": "hi" } }),
             Some("courier".into()),
         ),
-        // jobs
+        // the job board (the merged tasks module's `job` arm)
         (
-            "jobs",
-            json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } }),
+            "tasks",
+            json!({ "job": { "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } } }),
             Some("poster".into()),
         ),
         // automations — a rule whose trigger no later post matches (and no hook

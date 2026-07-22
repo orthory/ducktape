@@ -43,7 +43,6 @@ fn gov_host() -> Host {
         Box::new(Governance::new(
             "governance",
             "valset",
-            "upgrade",
             "identity",
         )),
     ])
@@ -60,7 +59,6 @@ async fn submit_as(
 ) -> Result<(), SubmitError> {
     host.submit_at(
         BlockContext {
-            protocol_version: 0,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -258,7 +256,7 @@ fn an_add_resident_proposal_grants_resident_standing_at_v0() {
         assert_eq!(
             residents(&host).await,
             vec![friend],
-            "resident standing granted at protocol_version 0"
+            "resident standing granted from genesis"
         );
         assert_eq!(
             validators(&host).await.len(),
@@ -467,7 +465,6 @@ fn a_single_member_ballot_is_a_deciding_majority() {
             Box::new(Governance::new(
                 "governance",
                 "valset",
-                "upgrade",
                 "identity",
             )),
         ])
@@ -558,7 +555,6 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
             Box::new(Governance::new(
                 "governance",
                 "valset",
-                "upgrade",
                 "identity",
             )),
         ])
@@ -638,7 +634,6 @@ fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
         let err = host
             .submit_at(
                 BlockContext {
-                    protocol_version: 0,
                     height: 1,
                     consensus_time: 1,
                     origin: Origin::System,
@@ -893,7 +888,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
             panic!("governance must advertise snapshot bytes");
         };
 
-        let mut rebuilt = Governance::new("governance", "valset", "upgrade", "identity");
+        let mut rebuilt = Governance::new("governance", "valset", "identity");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(
             rebuilt.root(),
@@ -905,7 +900,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
         let mut tampered = bytes.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        let mut fresh = Governance::new("governance", "valset", "upgrade", "identity");
+        let mut fresh = Governance::new("governance", "valset", "identity");
         assert!(
             fresh.install(&tampered, root).is_err(),
             "tampered snapshot refused"

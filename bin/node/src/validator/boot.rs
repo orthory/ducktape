@@ -11,10 +11,8 @@ use commonware_runtime::Clock;
 use host::Host;
 use recovery::{Manifest, Recovery};
 
-use crate::constants::MAX_PROTOCOL_VERSION;
 use crate::constants::{POST_REBOOT_CATCHUP_MAX_ATTEMPTS, POST_REBOOT_CATCHUP_MAX_ITERS};
 use crate::explorer::{IndexFold, heal_index};
-use crate::host_reads::read_upgrade_version_fields;
 use crate::host_state::{NetworkBindings, genesis_host, preflight_recovery_schema, restore_host};
 use crate::host_state::{SyncSubstrates, sync_all_modules};
 use crate::sync::catchup::{
@@ -73,7 +71,6 @@ pub(super) async fn restore(
             let genesis_participants: Vec<Vec<u8>> =
                 validators.iter().map(|k| k.as_ref().to_vec()).collect();
             // seq 0 is the dev demo op's; real submits start at 1.
-            let (cv, pu) = read_upgrade_version_fields(&host).await;
             let genesis_manifest = match Manifest::capture(
                 &host,
                 None,
@@ -82,8 +79,6 @@ pub(super) async fn restore(
                 genesis_participants,
                 Vec::new(),
                 None,
-                cv,
-                pu,
                 pos,
                 1,
             ) {
@@ -98,16 +93,6 @@ pub(super) async fn restore(
             (host, None, 1, (None, pos), None)
         }
         Some(manifest) => {
-            // BOOT PREFLIGHT (design §5 / plan Task 7.3): fail loud EARLY when
-            // this binary is too old to apply the blocks at/after the recovered
-            // boundary, instead of falling through to an opaque post-replay
-            // `AppHashMismatch`. inert on a baseline checkpoint (required_min ==
-            // baseline always passes).
-            if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
-                fatal!(label, "cannot recover — {e} (recovered boundary needs \
-                 protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                    manifest.required_min_version);
-            }
             if let Err(e) = preflight_recovery_schema(&manifest) {
                 fatal!(label, "cannot recover — {e}");
             }
@@ -406,8 +391,6 @@ pub(super) async fn post_reboot_catchup<'a>(
                                 target.participants.clone(),
                                 target.residents.clone(),
                                 None,
-                                target.current_version,
-                                target.pending_upgrade.clone(),
                                 pos,
                                 *next_seq,
                             ) {

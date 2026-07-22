@@ -62,6 +62,7 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
             target: "files".into(),
             payload,
         },
+        None,
     );
     let (status, body) = http(port, "POST", "/v1/submit/frame", "application/octet-stream", &frame);
     assert_eq!(
@@ -116,6 +117,7 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
             target: "files".into(),
             payload: commit_payload(&home, "pre-tamper", b"a"),
         },
+        None,
     );
     let n = tampered.len();
     tampered[n - 70] ^= 0x01; // flip a payload byte behind the signature

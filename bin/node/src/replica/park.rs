@@ -23,8 +23,7 @@ use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
 use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
-    joiner_epoch_mesh, read_upgrade_state, read_upgrade_version_fields, read_valset_members,
-    read_valset_residents, upgrade_operations,
+    joiner_epoch_mesh, read_valset_members, read_valset_residents,
 };
 use crate::host_state::{NetworkBindings, SyncSubstrates, restore_host, sync_all_modules};
 use crate::oracle_pool;
@@ -330,11 +329,6 @@ pub(super) async fn park(
     // the Frames lane the moment the first certificate's parent
     // linkage names it.
     if let Some(ckpt) = manifest.as_ref() {
-        if let Err(e) = ckpt.preflight(MAX_PROTOCOL_VERSION) {
-            fatal!(label, "cannot recover — {e} (recovered boundary needs \
-                 protocol v{}, this binary supports up to v{MAX_PROTOCOL_VERSION})",
-                ckpt.required_min_version);
-        }
         if let Err(e) = crate::host_state::preflight_recovery_schema(ckpt) {
             fatal!(label, "cannot recover — {e}");
         }
@@ -529,7 +523,7 @@ pub(super) async fn park(
         me_bytes.clone(),
     );
 
-    // ── THE JOIN GATE rides first contact now (Join v2 §4) ────────────────
+    // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
     // a fresh TOKENED joiner's sealed intro IS its gate request: the wiring
     // phase's first-contact race announces it to every candidate member's
     // doorbell, and the settled outcome comes back over the same tunnel —
@@ -765,12 +759,6 @@ pub(super) async fn park(
                                         )
                                     }),
                                 );
-                                if let Some((_, node_r)) = &serving
-                                    && let Some(status) =
-                                        crate::host_reads::read_upgrade_status_raw(node_r.host()).await
-                                {
-                                    metrics.update_upgrade(upgrade_operations(&status, None));
-                                }
                                 // pre-first-sync the surface still answers (the
                                 // app's liveness heartbeat): a zeroed status is
                                 // honest — no boundary is served yet.
@@ -814,12 +802,6 @@ pub(super) async fn park(
                                         )
                                     }),
                                 );
-                                if let Some((_, node_r)) = &serving
-                                    && let Some(status) =
-                                        crate::host_reads::read_upgrade_status_raw(node_r.host()).await
-                                {
-                                    metrics.update_upgrade(upgrade_operations(&status, None));
-                                }
                                 let _ = reply.send(context.encode());
                             }
                         }
@@ -1190,22 +1172,7 @@ pub(super) async fn park(
                     );
                     node_r.set_view_ceiling(cutover.cutover_view());
                 }
-                let boundary_upgrade = read_upgrade_state(node_r.host()).await;
-                if let Some(CutoverTrigger::Upgrade {
-                    cutover,
-                    name,
-                    activation_height,
-                }) = actions.observe_upgrade(&boundary_upgrade)
-                {
-                    println!(
-                        "[node {label}] replica: upgrade '{name}' armed — cutover to epoch \
-                         {} at view {} (activation height {activation_height})",
-                        cutover.next_epoch(),
-                        cutover.cutover_view()
-                    );
-                    node_r.set_view_ceiling(cutover.cutover_view());
-                }
-                if let Some(plan) = actions.respawn(boundary_upgrade) {
+                if let Some(plan) = actions.respawn() {
                     let members = plan.valset().consensus_members();
                     let member_bytes: Vec<Vec<u8>> =
                         members.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -1248,7 +1215,6 @@ pub(super) async fn park(
                     {
                         fatal!(label, "replica cutover journal write: {e}");
                     }
-                    node_r.host_mut().set_active_version(plan.boundary_version());
                     replica_scheme =
                         Some(replica_verifier(&namespace, &member_bytes));
                     replica_epoch = plan.epoch();
@@ -1306,7 +1272,6 @@ pub(super) async fn park(
                 && let Some(f) = node_r.finalized()
             {
                 let pos = node_r.sink_mut().oplog_pos().await;
-                let (cv, pu) = read_upgrade_version_fields(node_r.host()).await;
                 let members = read_valset_members(node_r.host()).await;
                 let residents = read_valset_residents(node_r.host()).await;
                 let captured = Manifest::capture(
@@ -1317,8 +1282,6 @@ pub(super) async fn park(
                     members,
                     residents,
                     None,
-                    cv,
-                    pu,
                     pos,
                     1,
                 );
@@ -1537,9 +1500,6 @@ pub(super) async fn park(
                             continue;
                         }
                     };
-                    if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
-                        fatal!(label, "cannot observe this network — {e}");
-                    }
                     println!(
                         "[node {label}] replica: bootstrapping at boundary {} ({} modules)",
                         m.height,
@@ -1877,13 +1837,6 @@ pub(super) async fn park(
             m.height,
             m.entries.len()
         );
-        // BOOT PREFLIGHT (design §5 / plan Task 7.3): refuse an
-        // under-versioned binary against the served boundary before
-        // install/replay — a clear early refusal, not a post-sync app-hash
-        // mismatch. inert on a baseline manifest.
-        if let Err(e) = m.preflight(MAX_PROTOCOL_VERSION) {
-            fatal!(label, "cannot promote — {e}");
-        }
         // THE PROMOTION COLLAPSE for a FOLDING replica: it is already
         // at head with a journal that proved every block it folded —
         // checkpoint OUR OWN state as the validator boot base and

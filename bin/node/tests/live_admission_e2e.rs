@@ -429,14 +429,9 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
 ///      post-re-grant write becomes readable through its surface);
 ///   7. `promote` then seats a WARM validator through the normal path.
 ///
-/// resident ops are no longer version-gated, so admission works at v0; this
-/// leg still runs the v3 upgrade ceremony first (schedule → auto-signal →
-/// activate) as incidental upgrade-path coverage, not as a precondition for
-/// the resident grant below.
 #[test]
 fn staged_admission_resident_presyncs_then_promotes_warm() {
     use directory::{DirMsg, DirQuery, DirReply};
-    use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
     use valset::{ValsetQuery, ValsetReply};
 
     let _serial = serial();
@@ -447,20 +442,6 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
-    // ---- protocol v3: schedule → auto-signal (solo R==n) → activate --------
-    let proposal_status = |cluster: &NetworkShapeCluster, id: &str| -> Option<ProposalStatus> {
-        let reply = cluster.query(
-            0,
-            "governance",
-            &governance::encode_query(&GovQuery::Proposal {
-                proposal_id: id.into(),
-            }),
-        )?;
-        match governance::decode_reply(&reply).ok()? {
-            GovReply::Proposal(Some(view)) => Some(view.status),
-            _ => None,
-        }
-    };
     let poll = |what: &str, mut pred: Box<dyn FnMut() -> bool + '_>| {
         let deadline = std::time::Instant::now() + CONVERGE;
         while !pred() {
@@ -471,87 +452,6 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             std::thread::sleep(Duration::from_millis(300));
         }
     };
-    // self-correcting lead against the (slow, nop-gated) block rate: retry
-    // with a doubled lead if the min-lead gate aborted the execute.
-    let mut lead = 30u64;
-    let mut activation = 0u64;
-    for attempt in 0..4u32 {
-        let base = cluster.status(0)["height"].as_u64().unwrap_or(0);
-        activation = base + lead;
-        let pid = format!("resident-tier-a{attempt}");
-        cluster.submit(
-            0,
-            "governance",
-            &governance::encode_msg(&GovMsg::Propose {
-                proposal_id: pid.clone(),
-                action: GovAction::ScheduleUpgrade {
-                    name: "resident-tier".into(),
-                    activation_height: activation,
-                    to_version: 3,
-                },
-                voting_period: 600_000,
-            }),
-        );
-        poll("the v3 proposal to open", Box::new(|| {
-            proposal_status(&cluster, &pid).is_some()
-        }));
-        cluster.submit(
-            0,
-            "governance",
-            &governance::encode_msg(&GovMsg::Vote {
-                proposal_id: pid.clone(),
-                approve: true,
-            }),
-        );
-        // a passing tally never auto-executes — the deciding voter drives the
-        // explicit Execute (same-origin submits finalize in seq order, so the
-        // ballot lands first).
-        cluster.submit(
-            0,
-            "governance",
-            &governance::encode_msg(&GovMsg::Execute {
-                proposal_id: pid.clone(),
-            }),
-        );
-        poll("the solo ballot to pass", Box::new(|| {
-            proposal_status(&cluster, &pid)
-                .is_some_and(|s| s != ProposalStatus::Open)
-        }));
-        // did the schedule take? (a min-lead abort leaves no pending slot.)
-        let took = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                let pending = cluster
-                    .query(
-                        0,
-                        "lifecycle",
-                        &lifecycle::encode_query(&lifecycle::LifecycleQuery::UpgradeStatus),
-                    )
-                    .and_then(|raw| lifecycle::decode_reply(&raw).ok())
-                    .and_then(|reply| match reply {
-                        lifecycle::LifecycleReply::UpgradeStatus(st) => Some(st.pending.is_some()),
-                        _ => None,
-                    })
-                    .unwrap_or(false);
-                if pending {
-                    break true;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(300));
-            }
-        };
-        if took {
-            break;
-        }
-        lead *= 2;
-        assert!(attempt < 3, "could not schedule the v3 upgrade (lead {lead})");
-    }
-    cluster.wait_marker(0, "signaled ready name=resident-tier", CONVERGE);
-    cluster.wait_marker(0, "upgrade armed name=resident-tier to_version=3", CONVERGE);
-    cluster.wait_marker(0, "upgrade activated name=resident-tier version=3", CONVERGE);
-    let _ = activation;
 
     // ---- invite → park → resident grant ------------------------------------
     let invite = cluster.invite();

@@ -30,7 +30,7 @@ use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::Host;
 use node::{Disposition, OrderedNode, RoundOrderer};
 use recovery::{Manifest, Recovery};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle, UpgradeCoords};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
 // ---- a tiny deterministic codec shared by both doubles ---------------------
@@ -306,7 +306,7 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         // GENESIS manifest (height None): records preF/preD roots and fanout's
         // snapshot bytes (diskish is resolver-backed → no snapshot stored).
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
             .expect("capture");
         assert!(
             manifest0.snapshot("fanout").is_some(),
@@ -485,11 +485,8 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             vec![],
             vec![],
             None,
-            0,
-            None,
             pos,
-            1,
-        )
+            1,)
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -588,7 +585,7 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         // GENESIS checkpoint only (height None) — nothing checkpointed after.
         let pos = node.sink_mut().oplog_pos().await;
         let manifest0 =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
                 .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
@@ -666,7 +663,7 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
         let pos = node.sink_mut().oplog_pos().await;
         let manifest0 =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
                 .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
@@ -815,7 +812,7 @@ fn a_multi_disk_torn_block_fail_stops() {
         // genesis manifest: fanout's snapshot rides it; both disks are
         // resolver-backed (no snapshot).
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
             .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
@@ -880,353 +877,6 @@ fn a_multi_disk_torn_block_fail_stops() {
             cell_b.borrow().counter,
             1,
             "diskB untouched by the refused replay"
-        );
-    });
-}
-
-// ---- boundary × torn: a dual-path in-memory cohort torn AT an activation H ---
-//
-// the pieces above are single-path (their `root()` ignores the protocol
-// version). the fork-critical seam the rebase had to preserve is a torn block
-// that lands EXACTLY at an activation boundary H, where the rolled-back
-// in-memory cohort module is DUAL-PATH — its `root()` branches on a non-hashed
-// `active_version`, so the SAME committed state renders a different root under
-// the pre-activation version vs the post. the two doubles below reproduce it.
-
-/// a static armed `upgrade` module (mirrors the one in `version_aware_replay`):
-/// reports a fixed pending upgrade at `activation_height` with its sole member
-/// already ready, so `effective_version(height)` returns `to_version` at/after H
-/// and baseline (0) below it. `root()` is constant (the config never mutates).
-struct StaticUpgrade {
-    name: String,
-    activation_height: u64,
-    to_version: u32,
-    member: Vec<u8>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl Module for StaticUpgrade {
-    fn id(&self) -> ModuleId {
-        "lifecycle".into()
-    }
-    fn root(&self) -> StateRoot {
-        digest(&[
-            b"static-upgrade",
-            self.name.as_bytes(),
-            &self.activation_height.to_le_bytes(),
-            &self.to_version.to_le_bytes(),
-        ])
-    }
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        // recreated identically on restore; no bytes to transfer.
-        Ok(StateSyncHandle::Stateless)
-    }
-    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // the host injects exactly one System-origin `Advance` at each block >= H;
-        // accept it as a no-op (this mock arms purely by height).
-        match lifecycle::decode_msg(&msg.payload).map_err(Error::Module)? {
-            lifecycle::LifecycleMsg::Advance => Ok(()),
-            other => Err(Error::Module(format!("static lifecycle got {other:?}"))),
-        }
-    }
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let lifecycle::LifecycleQuery::UpgradeStatus =
-            lifecycle::decode_query(req).map_err(Error::Module)?
-        else {
-            return Err(Error::QueryUnsupported);
-        };
-        let status = lifecycle::UpgradeStatus {
-            current_version: 0,
-            pending: Some(lifecycle::ScheduledUpgrade {
-                name: self.name.clone(),
-                activation_height: self.activation_height,
-                to_version: self.to_version,
-            }),
-            members: vec![self.member.clone()],
-            ready: vec![self.member.clone()],
-            member_count: 1,
-            ready_count: 1,
-            armed: true,
-        };
-        Ok(lifecycle::encode_reply(
-            &lifecycle::LifecycleReply::UpgradeStatus(status),
-        ))
-    }
-}
-
-fn upgrade_mock(member: &[u8], h: u64, v: u32) -> StaticUpgrade {
-    StaticUpgrade {
-        name: "forge-v2".into(),
-        activation_height: h,
-        to_version: v,
-        member: member.to_vec(),
-    }
-}
-
-/// like [`Fanout`], but its `root()` folds a NON-hashed `active_version` branch
-/// selector — the shape of a forge-like module whose root FORMAT switches at an
-/// activation boundary. a `Set` bumps its own committed counter AND fans the
-/// write out to a disk substrate, so ONE block touches both a dual-path
-/// in-memory module and a per-block-durable disk. a non-`Set` op bumps the
-/// counter only (no fanout), used to advance the chain below H.
-struct DualFanout {
-    id: ModuleId,
-    counter: u64,
-    pending: Option<u64>,
-    active_version: u32,
-    disk: ModuleId,
-}
-
-impl DualFanout {
-    fn new(id: &str, disk: &str) -> Self {
-        Self {
-            id: id.into(),
-            counter: 0,
-            pending: None,
-            active_version: 0,
-            disk: disk.into(),
-        }
-    }
-    /// the version-branched root: v0 and v1 hash differently for the SAME
-    /// committed counter — the whole point of a root()-changing upgrade.
-    fn root_of(counter: u64, active_version: u32) -> StateRoot {
-        digest(&[
-            b"dualfanout",
-            &counter.to_le_bytes(),
-            &active_version.to_le_bytes(),
-        ])
-    }
-    /// restore the committed counter from a checkpoint snapshot AT a given
-    /// version (the branch selector is never serialized, mirroring forge).
-    fn install(bytes: &[u8], active_version: u32) -> Self {
-        let counter = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        Self {
-            id: "dual".into(),
-            counter,
-            pending: None,
-            active_version,
-            disk: "diskish".into(),
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Module for DualFanout {
-    fn id(&self) -> ModuleId {
-        self.id.clone()
-    }
-    fn root(&self) -> StateRoot {
-        DualFanout::root_of(self.counter, self.active_version)
-    }
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        // committed state ONLY (the counter); active_version is never persisted.
-        Ok(StateSyncHandle::SnapshotBytes(
-            self.counter.to_le_bytes().to_vec(),
-        ))
-    }
-    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        self.pending = Some(self.counter + 1); // stage our own bump
-        if let Some((k, v)) = parse_set(&msg.payload) {
-            // a Set fans out to the disk substrate, so one block touches both.
-            ctx.emit_msg(set(self.disk.as_str(), &k, &v));
-        }
-        Ok(())
-    }
-    async fn commit_block(&mut self) -> Result<(), Error> {
-        if let Some(v) = self.pending.take() {
-            self.counter = v;
-        }
-        Ok(())
-    }
-    async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending = None;
-        Ok(())
-    }
-    fn set_active_version(&mut self, version: u32) {
-        self.active_version = version;
-    }
-}
-
-/// FORK-CRITICAL boundary × torn seam. a torn SEALED block AT an activation
-/// boundary H whose rolled-back in-memory cohort module is DUAL-PATH. the torn
-/// classifier must read "still at pre" under the PREVIOUS height's version
-/// (`pre_version`) and "already at post" under THIS block's (`protocol_version`)
-/// — the same split selectors the sealed loop's bulk at_pre/at_post use. a
-/// single-selector classifier would render the rolled-back module's PRE state
-/// under the POST version, match NEITHER pre nor post, and brick the node with a
-/// FALSE `Error::Torn`. this pins that the heal is version-aware.
-#[test]
-fn a_boundary_torn_block_heals_under_the_pre_activation_version() {
-    const H: u64 = 1; // activation height — the torn block sits exactly at H
-    const V: u32 = 1; // to_version
-
-    // the dual-path root MUST be version-sensitive or the test proves nothing.
-    assert_ne!(
-        DualFanout::root_of(1, 0),
-        DualFanout::root_of(1, 1),
-        "the dual module's root must branch on active_version"
-    );
-
-    let executor = deterministic::Runner::default();
-    executor.start(|context| async move {
-        let signer = sk(1);
-        let me = {
-            use commonware_cryptography::Signer as _;
-            signer.public_key().as_ref().to_vec()
-        };
-
-        // the durable disk survives the "crash" through this clone.
-        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
-
-        // ---- live run: seal one v0 block below H + checkpoint, then one torn
-        // v1 block AT H that fans out to the disk. ----
-        let recovery = Recovery::open(context.child("r1"))
-            .await
-            .expect("open recovery");
-        let host = Host::genesis(vec![
-            Box::new(DualFanout::new("dual", "diskish")),
-            Box::new(Diskish::open("diskish", cell.clone())),
-            Box::new(upgrade_mock(&me, H, V)),
-        ])
-        .expect("genesis");
-        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
-
-        // block 0 (height 0, below H): a non-Set op bumps ONLY the dual (no disk
-        // fanout). runs at baseline v0.
-        node.submit(
-            &signer,
-            0,
-            Msg {
-                target: "dual".into(),
-                payload: b"bump".to_vec(),
-            },
-        )
-        .await
-        .expect("submit below H");
-        node.flush_batch().await.expect("flush");
-        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
-        let checkpoint_height = node.finalized().expect("boundary").height;
-        assert!(checkpoint_height < H, "checkpoint sits below H");
-        assert_eq!(cell.borrow().counter, 0, "the disk is untouched below H");
-        let hash_below = node.app_hash();
-
-        // checkpoint below H: dual's snapshot rides it (counter, v0 root); the
-        // disk is resolver-backed (no snapshot); a pending upgrade arms at H.
-        let pos = node.sink_mut().oplog_pos().await;
-        let manifest = Manifest::capture(
-            node.host(),
-            Some(checkpoint_height),
-            0,
-            0,
-            vec![],
-            vec![],
-            None,
-            0,
-            Some(UpgradeCoords {
-                name: "forge-v2".into(),
-                activation_height: H,
-                to_version: V,
-            }),
-            pos,
-            1,
-        )
-        .expect("capture");
-        node.sink_mut()
-            .write_manifest(&manifest)
-            .await
-            .expect("write manifest");
-
-        // ACTIVATION at H (what the driver does): flip the dual branch selector
-        // so the H block seals a v1 root.
-        node.host_mut().set_active_version(V);
-        assert_ne!(
-            hash_below,
-            node.app_hash(),
-            "the flip changes the dual root — the boundary is real"
-        );
-
-        // block 1 (height 1 == H): a Set bumps the dual AND fans out to the disk,
-        // which commits durably (counter 0 -> 1). runs at v1. THIS is the block
-        // that will be torn.
-        node.submit(&signer, 1, set("dual", "k", "v"))
-            .await
-            .expect("submit at H");
-        node.flush_batch().await.expect("flush");
-        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
-        let tip = node.finalized().expect("boundary");
-        assert_eq!(
-            tip.height, H,
-            "the torn block sits at the activation boundary"
-        );
-        assert_eq!(
-            cell.borrow().counter,
-            1,
-            "the disk committed at the H block"
-        );
-        let tip_hash = node.app_hash();
-
-        // graceful WAL barrier, then the "crash": drop memory, KEEP the disk cell.
-        node.sink_mut().sync().await.expect("sync");
-        drop(node);
-
-        // ---- boot: reconstruct the TORN layout at H ------------------------
-        // the dual restores to its checkpoint PRE state at the CHECKPOINT version
-        // (0, below H); the disk reopens the survived cell at its POST root.
-        let mut recovery = Recovery::open(context.child("r2"))
-            .await
-            .expect("reopen recovery");
-        let manifest = recovery.manifest().expect("decodes").expect("present");
-        assert_eq!(manifest.height, Some(checkpoint_height));
-
-        let dual = DualFanout::install(manifest.snapshot("dual").expect("dual snapshot"), 0);
-        let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host = Host::genesis(vec![
-            Box::new(dual),
-            Box::new(diskish),
-            Box::new(upgrade_mock(&me, H, V)),
-        ])
-        .expect("genesis");
-
-        // the layout IS torn AND version-branched: the dual is at its v0 PRE root
-        // (read under the boot baseline version), the disk raced ahead to POST.
-        assert_eq!(
-            host.module_root("dual"),
-            manifest.root("dual"),
-            "the dual is at its v0 checkpoint pre root"
-        );
-        assert_ne!(
-            host.module_root("diskish"),
-            manifest.root("diskish"),
-            "the disk raced ahead to its post root"
-        );
-
-        // ---- the property: version-aware selective replay HEALS the boundary
-        // torn block. a single-selector classifier would false-Torn here (the
-        // rolled-back dual's PRE state read under v1 matches neither pre nor
-        // post). ----
-        let recovered = recovery
-            .recover(&mut host, &manifest)
-            .await
-            .expect("boundary torn block heals under the pre-activation version");
-
-        assert_eq!(recovered.height, Some(H));
-        assert_eq!(recovered.applied, 1, "the torn H block was replayed");
-        assert_eq!(
-            recovered.app_hash, tip_hash,
-            "recomposed app-hash is the byte-identical v1 sealed tip"
-        );
-        assert_eq!(host.app_hash(), tip_hash);
-        assert_eq!(
-            host.module_root("dual"),
-            Some(DualFanout::root_of(2, V)),
-            "the healed dual stands at its v1 post root"
-        );
-        // the disk substrate was NOT re-committed: counter unchanged, no op-log
-        // root move, no fork.
-        assert_eq!(
-            cell.borrow().counter,
-            1,
-            "the durable disk was left alone (no re-commit)"
         );
     });
 }

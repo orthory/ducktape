@@ -31,7 +31,6 @@ fn valset_reads(validators: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>
 
 fn ctx(who: &[u8], validators: Vec<Vec<u8>>) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height: 1,
         consensus_time: 1_000,
         origin: Origin::External(who.to_vec()),

@@ -6,7 +6,6 @@ use host::Host;
 use recovery::Manifest;
 use sdk::{Ctx, Error, Module, StateSyncHandle};
 use std::sync::{Arc, Mutex};
-use lifecycle::{ScheduledUpgrade, UpgradeStatus};
 
 #[test]
 fn gateway_requires_a_loopback_node_api_and_real_overlay() {
@@ -62,9 +61,6 @@ fn test_manifest(
         participants: vec![test_me()],
         residents: vec![],
         floor_cert,
-        current_version: host::BASELINE_VERSION,
-        pending_upgrade: None,
-        required_min_version: host::BASELINE_VERSION,
         state_schema: crate::constants::current_state_schema_fingerprint(),
         entries: vec![],
     }
@@ -325,14 +321,13 @@ async fn served_directory_frame(
     seq: u64,
     msg: Msg,
 ) -> statesync::FinalizedFrame {
-    let frame = node::encode_frame(signer, seq, &msg);
-    let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+    let frame = node::encode_frame(signer, seq, &msg, None);
+    let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
     // a block is a BATCH super-frame: apply the single member via the batch
     // API and serve the batch bytes, so the catch-up replay reproduces this.
     expected
         .submit_block(
             host::BlockContext {
-                protocol_version: host::BASELINE_VERSION,
                 height,
                 consensus_time: height,
                 origin: origin.clone(),
@@ -364,15 +359,15 @@ async fn served_mixed_frame(
             target: "disk".into(),
             payload: vec![value],
         },
+        None,
     );
-    let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+    let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
     // a block is a BATCH super-frame: apply the single member through the
     // batch API so the served app-hash matches what recovery reproduces on
     // replay (which decodes the frame as a batch), and serve the batch bytes.
     expected
         .submit_block(
             host::BlockContext {
-                protocol_version: host::BASELINE_VERSION,
                 height,
                 consensus_time: height,
                 origin: origin.clone(),
@@ -487,15 +482,14 @@ fn suffix_installer_rejects_mismatched_served_seal() {
                 value: "v".into(),
             }),
         };
-        let frame = node::encode_frame(&signer, 0, &msg);
+        let frame = node::encode_frame(&signer, 0, &msg, None);
 
         let mut expected_host =
             Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
-        let (origin, msg) = node::decode_frame(&frame).expect("decode frame");
+        let (origin, msg, _cont) = node::decode_frame(&frame).expect("decode frame");
         expected_host
             .submit_at(
                 host::BlockContext {
-                    protocol_version: host::BASELINE_VERSION,
                     height: 1,
                     consensus_time: 1,
                     origin,
@@ -572,11 +566,8 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             vec![test_me()],
             vec![],
             None,
-            host::BASELINE_VERSION,
-            None,
             0,
-            1,
-        )
+            1,)
         .expect("base manifest");
 
         let mut expected = mixed_durability_host(TestDiskStore::default(), 0);
@@ -589,9 +580,6 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             participants: vec![test_me()],
             residents: vec![],
             floor_cert: Some(vec![1, 2, 3]),
-            current_version: host::BASELINE_VERSION,
-            pending_upgrade: None,
-            required_min_version: host::BASELINE_VERSION,
             state_schema: crate::constants::current_state_schema_fingerprint(),
             entries: vec![],
         };
@@ -711,119 +699,6 @@ fn post_reboot_catchup_is_noop_when_there_is_no_gap() {
     });
 }
 
-fn status(pending: Option<(&str, u64, u32)>, members: &[&[u8]], ready: &[&[u8]]) -> UpgradeStatus {
-    let members: Vec<Vec<u8>> = members.iter().map(|m| m.to_vec()).collect();
-    let ready: Vec<Vec<u8>> = ready.iter().map(|m| m.to_vec()).collect();
-    UpgradeStatus {
-        current_version: 0,
-        pending: pending.map(|(name, activation_height, to_version)| ScheduledUpgrade {
-            name: name.into(),
-            activation_height,
-            to_version,
-        }),
-        member_count: members.len() as u64,
-        ready_count: ready.len() as u64,
-        armed: false,
-        members,
-        ready,
-    }
-}
-
-// ReadinessSignaller emits EXACTLY ONCE for a pending upgrade this binary can
-// execute when self is a current boundary member, and stays silent thereafter
-// (the latch), matching the module's own idempotence.
-#[test]
-fn readiness_signaller_emits_exactly_once_when_member_and_supported() {
-    let me = vec![7u8; 32];
-    let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
-    // to_version == MAX (<= MAX): supported, self a member, not yet in ready.
-    let st = status(Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)), &[&me], &[]);
-    assert_eq!(
-        s.decide(&st),
-        Some(("forge-v2".to_string(), MAX_PROTOCOL_VERSION, None)),
-        "the first tick signals"
-    );
-    // a second identical tick is a no-op (in-flight latch) — never spam.
-    assert_eq!(s.decide(&st), None, "the latch suppresses re-emission");
-    // once the module records our signal, still silent even if the latch reset.
-    s.signaled = None;
-    let st_ready = status(
-        Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
-        &[&me],
-        &[&me],
-    );
-    assert_eq!(s.decide(&st_ready), None, "module already holds our signal");
-}
-
-#[test]
-fn readiness_signaller_refuses_a_commitment_route() {
-    // named routes carrying a required readiness commitment (the retired
-    // dormant-registry migration mechanism) are attested by NO compiled route
-    // anymore: the signaller stays silent so the boundary cleanly aborts rather
-    // than arming onto a binary that cannot honor the route. plain numeric
-    // upgrades (no commitment prefix) are still attested — see the test above.
-    let me = vec![7u8; 32];
-    let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
-    let commit_route = status(Some(("commit:some-route", 100, 1)), &[&me], &[]);
-    assert_eq!(
-        s.decide(&commit_route),
-        None,
-        "a commitment-required named route is attested by no compiled route",
-    );
-}
-
-#[test]
-fn readiness_signaller_silent_when_under_versioned() {
-    let me = vec![7u8; 32];
-    let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
-    // to_version beyond what this binary can execute: never lie about readiness.
-    let st = status(
-        Some(("forge-v3", 100, MAX_PROTOCOL_VERSION + 1)),
-        &[&me],
-        &[],
-    );
-    assert_eq!(s.decide(&st), None);
-}
-
-#[test]
-fn readiness_signaller_silent_when_not_a_member() {
-    let me = vec![7u8; 32];
-    let other = vec![9u8; 32];
-    let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me);
-    // self is not in the boundary member set (not in the R = n denominator).
-    let st = status(
-        Some(("forge-v2", 100, MAX_PROTOCOL_VERSION)),
-        &[&other],
-        &[],
-    );
-    assert_eq!(s.decide(&st), None);
-}
-
-#[test]
-fn readiness_signaller_silent_when_no_pending() {
-    let me = vec![7u8; 32];
-    let mut s = ReadinessSignaller::new(MAX_PROTOCOL_VERSION, me.clone());
-    assert_eq!(s.decide(&status(None, &[&me], &[])), None);
-}
-
-// the boot preflight gate: a boundary whose required_min_version exceeds this
-// binary's MAX_PROTOCOL_VERSION is refused (both recovery-resume and
-// state-sync-join call `Manifest::preflight`, which delegates here); an equal
-// or lower requirement boots. this is the fail-loud-early contract Task 7.3
-// wires onto both boot paths.
-#[test]
-fn boot_preflight_refuses_under_versioned_binary() {
-    // a boundary needing one version beyond this build must be refused.
-    assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION + 1, MAX_PROTOCOL_VERSION).is_err());
-    // exactly at the build ceiling, and below it, boots.
-    assert!(sdk::check_required_version(MAX_PROTOCOL_VERSION, MAX_PROTOCOL_VERSION).is_ok());
-    if MAX_PROTOCOL_VERSION > 0 {
-        assert!(
-            sdk::check_required_version(MAX_PROTOCOL_VERSION - 1, MAX_PROTOCOL_VERSION).is_ok()
-        );
-    }
-}
-
 // ---- explorer-row rebuild (boot fold == live drain) ---------------------
 
 fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRecord> {
@@ -851,8 +726,8 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
         target: "directory".into(),
         payload: payload.clone(),
     };
-    let frame = node::encode_frame(&signer, 1, &msg);
-    let (origin, decoded) = node::decode_frame(&frame).expect("frame decodes");
+    let frame = node::encode_frame(&signer, 1, &msg, None);
+    let (origin, decoded, _cont) = node::decode_frame(&frame).expect("frame decodes");
     let dispatches = row_dispatches(&payload, &origin);
     let app_hash = test_root(9);
 
@@ -920,9 +795,10 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
         &signer,
         1,
         &Msg {
-            target: NOP_TARGET.into(),
+            target: crate::constants::NOP_TARGET.into(),
             payload: Vec::new(),
         },
+        None,
     );
     for frame in [nop.as_slice(), b"not a frame".as_slice()] {
         assert!(
@@ -954,6 +830,7 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
             target: "directory".into(),
             payload: b"garbage-the-module-rejects".to_vec(),
         },
+        None,
     );
     let batch = node::encode_batch(&[frame]);
     let row = sealed_frame_block_row(

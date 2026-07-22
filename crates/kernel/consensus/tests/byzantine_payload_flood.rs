@@ -113,7 +113,7 @@ fn sentinel_garbage() -> Vec<u8> {
 ///   stores it under `digest_of(frame)`, which is never finalized (never proposed),
 ///   so it is never delivered — isolating the defense from mere frame-validity.
 fn unproposed_valid_frame() -> Vec<u8> {
-    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"))
+    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"), None)
 }
 
 /// the N=5 relay convergence scenario. `flood`: when true, validator `BYZ` spawns

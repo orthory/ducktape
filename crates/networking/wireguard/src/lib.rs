@@ -22,10 +22,10 @@ use commonware_cryptography::{Signer, Verifier, ed25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-// v2: the signed record layout gained `wireguard_public_key` — a layout
-// change under a signature domain always bumps the domain, so v1 and v2
+// the signed record layout carries `wireguard_public_key`; a layout
+// change under a signature domain always bumps the domain, so old and new
 // blobs can never cross-verify.
-const ENDPOINT_NS: &[u8] = b"ducktape:wireguard-endpoint:v2";
+const ENDPOINT_NS: &[u8] = b"ducktape:wireguard-endpoint:v1";
 const ENDPOINT_RECORD_NS: &[u8] = b"ducktape:wireguard-endpoint-record:v1";
 const UPGRADE_REQUEST_NS: &[u8] = b"ducktape:wireguard-upgrade-request:v1";
 const UPGRADE_RESPONSE_NS: &[u8] = b"ducktape:wireguard-upgrade-response:v1";
@@ -458,9 +458,9 @@ impl MeshView {
     }
 }
 
-/// the documented v2 preimage (docs/records/protocols/wireguard-tunnel-upgrade.md "Mesh
+/// the documented preimage (docs/records/protocols/wireguard-tunnel-upgrade.md "Mesh
 /// Version"): HASH(domain || namespace || epoch || valset_root ||
-/// admission_root || SORT_ASC(endpoint_record_hashes)). v2 differs from v1
+/// admission_root || SORT_ASC(endpoint_record_hashes)). this layout differs from the retired one
 /// only in each record hash now covering `wireguard_public_key` (and the
 /// bumped domain string). the epoch tuple is hashed at the TOP LEVEL — not
 /// only inside each record hash — exactly as the doc specifies, so an
@@ -497,7 +497,7 @@ pub fn compute_mesh_version(records: &[EndpointRecord]) -> Result<MeshVersion, U
         .collect();
     hashes.sort();
     let mut out = Vec::new();
-    put_str(&mut out, "ducktape:validator-mesh-version:v2");
+    put_str(&mut out, "ducktape:validator-mesh-version:v1");
     put_str(&mut out, &first.namespace);
     put_u64(&mut out, first.epoch);
     put_root(&mut out, first.valset_root);

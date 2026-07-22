@@ -295,7 +295,7 @@ impl ResidentRelay {
         self.seq += 1;
         std::fs::write(&self.seq_file, self.seq.to_string())
             .map_err(|e| format!("cannot persist the submit seq: {e}"))?;
-        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload });
+        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload }, None);
         let frame_id = node::frame_id(&frame);
         Ok((frame_id, frame, custodian))
     }

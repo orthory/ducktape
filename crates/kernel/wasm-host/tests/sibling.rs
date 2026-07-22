@@ -33,7 +33,6 @@ impl MockCtx {
                 consensus_time: 0,
                 origin: Origin::System,
                 me: me.into(),
-                protocol_version: 0,
             },
             queries: RefCell::new(Vec::new()),
             msgs: Vec::new(),

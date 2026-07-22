@@ -176,9 +176,6 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         participants: vec![vec![3u8; 32]],
         residents: vec![],
         floor_cert: Some(vec![0xCC; 96]),
-        current_version: host::BASELINE_VERSION,
-        pending_upgrade: None,
-        required_min_version: host::BASELINE_VERSION,
         state_schema: [0xAB; 32],
         entries: vec![ManifestEntry {
             module_id: "kv".into(),

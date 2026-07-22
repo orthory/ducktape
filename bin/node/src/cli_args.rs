@@ -40,9 +40,6 @@ pub enum OpCmd {
     /// consensus-quorum membership
     #[command(subcommand)]
     Member(MemberCmd),
-    /// coordinated network upgrades
-    #[command(subcommand)]
-    Upgrade(UpgradeCmd),
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -62,12 +59,6 @@ pub enum MemberCmd {
     /// this node drives its own removal
     Leave(SelectorArgs),
     /// print in-set + validator count for this node
-    Status(StatusArgs),
-}
-
-#[derive(Debug, clap::Subcommand)]
-pub enum UpgradeCmd {
-    /// pending upgrade + readiness verdict
     Status(StatusArgs),
 }
 

@@ -45,7 +45,6 @@ fn block(height: u64, who: &[u8]) -> BlockContext {
         height,
         consensus_time: 1_000 + height,
         origin: Origin::External(who.to_vec()),
-        protocol_version: 0,
     }
 }
 

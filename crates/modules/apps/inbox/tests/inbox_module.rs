@@ -98,7 +98,6 @@ async fn host_list(host: &Host, member: &str) -> Vec<Notification> {
 // cosmetic, so the shared TestCtx stands in behind two thin constructors.
 fn ctx(origin: Origin, consensus_time: u64) -> TestCtx {
     TestCtx::with_env(Env {
-        protocol_version: 0,
         height: 0,
         consensus_time,
         origin,
@@ -545,7 +544,7 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
 
         let out = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
                     height: 1,
                     consensus_time: 42,
                     origin: Origin::External(b"tester".to_vec()),
@@ -602,7 +601,7 @@ fn noop_ack_follow_up_does_not_abort_the_block() {
             .expect("genesis");
 
         host.submit_at(
-            BlockContext { protocol_version: 0,
+            BlockContext {
                 height: 1,
                 consensus_time: 7,
                 origin: Origin::System,

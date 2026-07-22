@@ -184,13 +184,11 @@ pub fn norm_repo(repo: &str) -> Result<String, Error> {
 }
 
 /// the domain tag forge's root preimage is separated under — a fixed constant
-/// hashed over the folded preimage in [`compose_state_root`]. (historical note:
-/// the `.v2` in the bytes is the retired dual-path era's version tag, kept
-/// verbatim so the constant is self-describing on the wire.)
-const FORGE_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v2\x00";
+/// hashed over the folded preimage in [`compose_state_root`].
+const FORGE_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v1\x00";
 
 /// the 4-byte magic every forge snapshot container leads with.
-pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv2";
+pub(crate) const FORGE_SNAPSHOT_MAGIC: &[u8; 4] = b"FGv1";
 
 /// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
 /// deterministic module error on any other length.
@@ -566,6 +564,12 @@ impl Module for Forge {
         self.id.clone()
     }
 
+    /// 2: the root domain + snapshot magic reset to v1 tags with the
+    /// no-versioning sweep — same layout, different preimage bytes.
+    fn state_schema_revision(&self) -> u32 {
+        2
+    }
+
     /// the composed state root — pure, no IO. see the composition invariant.
     fn root(&self) -> StateRoot {
         let entries = self.repos.iter().map(|(n, s)| (n.as_str(), &s.refs));
@@ -920,7 +924,6 @@ mod tests {
     }
     fn ctx_with_origin(consensus_time: u64, origin: sdk::Origin) -> TestCtx {
         TestCtx::with_env(sdk::Env {
-            protocol_version: 0,
             height: 0,
             consensus_time,
             origin,

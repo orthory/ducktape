@@ -399,7 +399,14 @@ fn run_node(
                     // would never produce. it decodes exactly as the validator's
                     // ordered drain does instead.
                     let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg)) => {
+                        // the embedded daemon's single-op lane has no batch
+                        // path to release a continuation on — refuse loudly
+                        // rather than silently strip it off a signed frame.
+                        Ok((_origin, _msg, Some(_cont))) => Err(
+                            "continuation envelopes are not supported on the embedded daemon lane"
+                                .to_string(),
+                        ),
+                        Ok((origin, msg, None)) => {
                             submit_and_drain(
                                 &mut host,
                                 &workers,
@@ -606,7 +613,6 @@ async fn submit_one(
     let target = msg.target.clone();
     let payload = msg.payload.clone();
     let ctx = BlockContext {
-        protocol_version: 0,
         height: *height + 1,
         consensus_time,
         origin: origin.clone(),

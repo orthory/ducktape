@@ -44,14 +44,13 @@ async fn gov_host_with_modreg() -> Host {
     valset.insert(member_key(2));
     let mut host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "lifecycle", "identity").with_code_registry("lifecycle")),
+        Box::new(Governance::new("governance", "valset", "identity").with_code_registry("lifecycle")),
         Box::new(Lifecycle::new("lifecycle", "valset")),
     ])
     .expect("genesis");
     // genesis-bootstrap the swappable module's initial code (System origin).
     host.submit_at(
         BlockContext {
-            protocol_version: 0,
             height: 0,
             consensus_time: 0,
             origin: Origin::System,
@@ -77,10 +76,6 @@ async fn submit_as(
 ) -> Result<(), SubmitError> {
     host.submit_at(
         BlockContext {
-            // the admission version: UpdateModule/Cancel are ungated, and the
-            // admission flavors below need both the block env and the module
-            // branch selector past the boundary.
-            protocol_version: lifecycle::ADMISSION_ACTIVATION_VERSION,
             height: at,
             consensus_time: at,
             origin: Origin::External(who.to_vec()),
@@ -324,7 +319,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         valset.insert(member_key(1));
         let mut unwired = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "lifecycle", "identity")),
+            Box::new(Governance::new("governance", "valset", "identity")),
         ])
         .expect("genesis");
         let err = submit_as(
@@ -407,7 +402,7 @@ fn snapshot_install_round_trips_module_update_proposals() {
         };
 
         let mut rebuilt =
-            Governance::new("governance", "valset", "lifecycle", "identity").with_code_registry("lifecycle");
+            Governance::new("governance", "valset", "identity").with_code_registry("lifecycle");
         rebuilt.install(&bytes, root).expect("install");
         assert_eq!(rebuilt.root(), root, "installed root equals the source root");
 
@@ -587,39 +582,3 @@ fn register_module_of_an_existing_id_fails_execute_atomically() {
     });
 }
 
-/// below the activation version the door refuses a RegisterModule proposal
-/// outright — the mixed-binary window produces identical rejections on both
-/// old binaries (decode failure) and new ones (this gate).
-#[test]
-fn register_module_is_door_refused_below_the_activation_version() {
-    block_on(async {
-        let mut host = gov_host_with_modreg().await;
-        // a block BELOW the admission boundary: submit_at realizes the block's
-        // protocol_version into every module, so the door sees the low version.
-        let refused = host
-            .submit_at(
-                BlockContext {
-                    protocol_version: lifecycle::ADMISSION_ACTIVATION_VERSION - 1,
-                    height: 1,
-                    consensus_time: 1,
-                    origin: Origin::External(member_key(1)),
-                },
-                Msg {
-                    target: "governance".into(),
-                    payload: gov_encode(&GovMsg::Propose {
-                        proposal_id: "adm-early".into(),
-                        action: GovAction::RegisterModule {
-                            name: "kanban-v1".into(),
-                            module_id: "kanban".into(),
-                            activation_height: 500,
-                            code_hash: hash(7),
-                        },
-                        voting_period: 100,
-                    }),
-                },
-            )
-            .await;
-        assert!(refused.is_err(), "door must refuse below the boundary");
-        assert!(proposal_status(&host, "adm-early").await.is_none());
-    });
-}

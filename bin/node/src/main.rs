@@ -96,7 +96,6 @@ mod validator;
 mod voice;
 mod voice_plane;
 use config::Resolved;
-use constants::*;
 #[cfg(test)]
 use explorer::sealed_frame_block_row;
 #[cfg(test)]
@@ -112,9 +111,6 @@ use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_fram
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
 use util::hex;
-#[cfg(test)]
-use validator::announce::ReadinessSignaller;
-
 #[cfg(test)]
 use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use crate::util::fatal;
@@ -168,7 +164,7 @@ fn hold_macos_activity() {
     about = "one workspace-network node and its operator tools",
     // clap prints "<name> <version>", so the version string must NOT repeat
     // the binary name the way `version_line()` (the `version` verb) does.
-    version = &*format!("{} (protocol v{MAX_PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION")).leak(),
+    version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help = true
 )]
 pub(crate) struct Cli {

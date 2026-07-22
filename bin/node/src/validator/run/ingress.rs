@@ -10,8 +10,7 @@ use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
 use crate::host_reads::{
-    read_clients, read_redemptions_from_host, read_upgrade_status_raw, read_valset_members,
-    read_valset_residents, upgrade_operations,
+    read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
 };
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -41,11 +40,6 @@ impl ValidatorRuntime<'_> {
                 )
             }),
         );
-        if let Some(status) = read_upgrade_status_raw(self.node.host()).await {
-            let local_key = self.signer.public_key();
-            self.metrics
-                .update_upgrade(upgrade_operations(&status, Some(&local_key)));
-        }
     }
 
     pub(super) async fn on_rpc(&mut self, (req, reply): RpcJob) {
@@ -169,7 +163,7 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    /// the join gate (Join v2 §4), arriving over the WireGuard-tunnel
+    /// the join gate (join ADR §4), arriving over the WireGuard-tunnel
     /// doorbell: the reachability plane already OPENED and VERIFIED the sealed
     /// intro (V1–V5 crypto, V4 expiry, V8 role) and installed the tunnel —
     /// what reaches this loop is a verified request. this runs the
@@ -526,7 +520,7 @@ impl ValidatorRuntime<'_> {
             } => {
                 let seq = self.next_seq;
                 self.next_seq += 1;
-                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload });
+                let frame = node::encode_frame(&self.signer, seq, &Msg { target, payload }, None);
                 self.submit_local_frame(frame, reply).await;
             }
             // an ALREADY-SIGNED frame: submitted VERBATIM, never re-signed and

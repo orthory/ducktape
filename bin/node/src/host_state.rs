@@ -35,7 +35,7 @@ pub(super) fn preflight_recovery_schema(manifest: &Manifest) -> Result<(), Strin
 /// the state-sync twin of [`preflight_recovery_schema`]: a peer can only offer
 /// state for the exact schema this joiner runs.
 pub(super) fn preflight_sync_schema(manifest: &statesync::Manifest) -> Result<(), String> {
-    recovery::check_state_schema(Some(manifest.state_schema), current_state_schema_fingerprint())
+    recovery::check_state_schema(manifest.state_schema, current_state_schema_fingerprint())
         .map_err(|error| error.to_string())
 }
 
@@ -1233,12 +1233,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     }
     .compose()
     .map_err(|e| format!("compose synced host: {e}"))?;
-    // realize the served boundary version into EVERY dual-path module's branch
-    // selector so `root()` (and with it the app-hash check below) recomputes over
-    // the boundary's format — the state-sync analogue of the activation hook the
-    // live/recovery paths run. NON-hashed; idempotent for forge (set pre-install
-    // above); baseline no-op before Phase 9.
-    host.set_active_version(manifest.current_version);
     if host.app_hash() != manifest.app_hash {
         return Err(format!(
             "composed {} != manifest {}",
@@ -1260,9 +1254,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     host.register(Box::new(
         files_wasm(duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs reopen: {e}"))?,
     ));
-    // re-realize the boundary version over the swapped registry (idempotent),
-    // then re-check THE property against the canonical-backed composition.
-    host.set_active_version(manifest.current_version);
+    // re-check THE property against the canonical-backed composition.
     if host.app_hash() != manifest.app_hash {
         return Err(format!(
             "canonical duckfs reopen composed {} != manifest {}",
@@ -1360,12 +1352,10 @@ mod tests {
                 Vec::new(),
                 None,
                 0,
-                None,
-                0,
                 1,
             )
             .expect("capture");
-            manifest.state_schema = Some([0xFF; 32]);
+            manifest.state_schema = [0xFF; 32];
 
             let error = match restore_host(
                 &context,

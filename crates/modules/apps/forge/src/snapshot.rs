@@ -5,7 +5,7 @@
 //! container:
 //!
 //! ```text
-//! "FGv2"                                    # 4-byte magic
+//! "FGv1"                                    # 4-byte magic
 //! u32-LE(repo_count)
 //! per BORN repo, sorted by name:            # born == at least one branch
 //!   u32-LE(name_len) name
@@ -82,7 +82,7 @@ impl Forge {
         let body = bytes
             .strip_prefix(FORGE_SNAPSHOT_MAGIC.as_slice())
             .ok_or_else(|| {
-                Error::Module("forge snapshot: missing the FGv2 container magic".into())
+                Error::Module("forge snapshot: missing the FGv1 container magic".into())
             })?;
         // ---- PHASE 1: parse (no writes) -------------------------------------
         let mut r = Reader::new(body);

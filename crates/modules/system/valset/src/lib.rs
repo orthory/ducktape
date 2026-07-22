@@ -421,20 +421,10 @@ mod tests {
 
     use sdk_testkit::TestCtx;
 
-    // valset's execute reads only env (origin + protocol_version); me/height are
-    // cosmetic, so the shared TestCtx's defaults stand in.
+    // valset's execute reads only env (origin); me/height are cosmetic, so
+    // the shared TestCtx's defaults stand in.
     fn sys_ctx() -> TestCtx {
         TestCtx::at_height(0)
-    }
-    /// a ctx whose block runs at `protocol_version`.
-    fn ctx_at_version(protocol_version: u32) -> TestCtx {
-        TestCtx::with_env(sdk::Env {
-            protocol_version,
-            height: 0,
-            consensus_time: 0,
-            origin: sdk::Origin::System,
-            me: "valset".into(),
-        })
     }
 
     // a deterministic, VALID 32-byte ed25519 public key: any 32 bytes is a valid
@@ -796,33 +786,22 @@ mod tests {
     // ---- residents (staged admission) --------------------------------------
 
     #[test]
-    fn resident_ops_apply_at_any_protocol_version() {
-        // version gating is disregarded: Grant/Revoke apply regardless of the
-        // block's protocol_version, so resident admission works on a freshly
-        // founded (v0) network with no upgrade. before this change these ops
-        // rejected below protocol version 3.
+    fn resident_ops_apply_from_genesis() {
         let mut v = Valset::new("valset");
-        let mut ctx = sys_ctx(); // protocol_version 0
+        let mut ctx = sys_ctx();
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
 
-        // grant lands at v0 and confers resident standing.
+        // grant confers resident standing on a freshly founded network.
         let obs = valid_key(2);
         futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert_eq!(
-            residents(&v),
-            vec![obs.clone()],
-            "grant applied at protocol_version 0"
-        );
+        assert_eq!(residents(&v), vec![obs.clone()], "grant applied");
 
-        // revoke lands at v0 and clears it.
+        // revoke clears it.
         futures::executor::block_on(v.execute(&mut ctx, &revoke(&obs))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
-        assert!(
-            residents(&v).is_empty(),
-            "revoke applied at protocol_version 0"
-        );
+        assert!(residents(&v).is_empty(), "revoke applied");
     }
 
     #[test]
@@ -831,7 +810,7 @@ mod tests {
         // the last resident returns it BYTE-IDENTICAL to the validators-only
         // root and snapshot.
         let mut v = Valset::new("valset");
-        let mut ctx = ctx_at_version(3);
+        let mut ctx = sys_ctx();
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
         let validators_only = v.root();
@@ -865,7 +844,7 @@ mod tests {
     #[test]
     fn join_promotes_a_resident_out_of_the_tier() {
         let mut v = Valset::new("valset");
-        let mut ctx = ctx_at_version(3);
+        let mut ctx = sys_ctx();
         futures::executor::block_on(v.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         let obs = valid_key(2);
         futures::executor::block_on(v.execute(&mut ctx, &grant(&obs))).unwrap();
@@ -883,7 +862,7 @@ mod tests {
     #[test]
     fn granting_a_current_validator_is_refused() {
         let mut v = Valset::new("valset");
-        let mut ctx = ctx_at_version(3);
+        let mut ctx = sys_ctx();
         let k = valid_key(1);
         futures::executor::block_on(v.execute(&mut ctx, &join(&k))).unwrap();
         futures::executor::block_on(v.commit_block()).unwrap();
@@ -899,7 +878,7 @@ mod tests {
     #[test]
     fn snapshot_with_residents_round_trips_and_rejects_forgeries() {
         let mut src = Valset::new("valset");
-        let mut ctx = ctx_at_version(3);
+        let mut ctx = sys_ctx();
         futures::executor::block_on(src.execute(&mut ctx, &join(&valid_key(1)))).unwrap();
         futures::executor::block_on(src.execute(&mut ctx, &grant(&valid_key(2)))).unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();

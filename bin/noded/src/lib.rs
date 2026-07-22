@@ -353,7 +353,6 @@ pub struct OperationalStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncOperationalStatus>,
     pub storage: StorageOperationalStatus,
-    pub upgrade: UpgradeOperationalStatus,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,26 +398,6 @@ pub struct StorageOperationalStatus {
 pub struct IndexOperationalStatus {
     pub module: String,
     pub applied_height: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpgradeOperationalStatus {
-    pub current_version: u64,
-    /// Highest protocol version this running binary can execute.
-    pub max_supported_version: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pending_version: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activation_height: Option<u64>,
-    pub ready_validators: u64,
-    pub required_validators: u64,
-    /// Present only when this node is a validator in the boundary set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub locally_ready: Option<bool>,
-    pub armed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -755,7 +734,7 @@ async fn submit_frame(
         // the origin is DELIBERATELY dropped here: the http layer never tells an
         // actor who signed — the actor re-derives that from the bytes (or, on
         // the validator, `submit_frame` does). one authority on authorship.
-        Ok((_origin, msg)) => msg.payload,
+        Ok((_origin, msg, _cont)) => msg.payload,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err.to_string()),
     };
     let (reply, rx) = oneshot::channel();
@@ -1019,9 +998,7 @@ mod tests {
         for id in ["forge", "agent"] {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
-        for id in ["automations"] {
-            assert_eq!(ModuleCategory::of(id), Automation, "{id}");
-        }
+        assert_eq!(ModuleCategory::of("automations"), Automation);
         // infra + internals fall to the System bucket — including ids only the
         // full `node` binary registers (kv/valset/governance/directory)
         // and anything unknown, so the view never breaks on a new module.

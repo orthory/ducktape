@@ -27,7 +27,6 @@ macro_rules! chat_on {
 // target live — chat gates hook dispatch on `module_root(target).is_some()`.
 fn ctx_with_origin(consensus_time: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(sdk::Env {
-        protocol_version: 0,
         height: 0,
         consensus_time,
         origin,

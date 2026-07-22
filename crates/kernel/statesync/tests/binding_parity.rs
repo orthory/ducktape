@@ -138,9 +138,6 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             participants: vec![vec![1u8; 32]],
             residents: vec![vec![2u8; 32]],
             floor_cert: Some(vec![0xAB; 8]),
-            current_version: 1,
-            pending_upgrade: None,
-            required_min_version: 1,
             state_schema: [0xAB; 32],
             entries: vec![ManifestEntry {
                 module_id: "kv".into(),

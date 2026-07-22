@@ -5,7 +5,7 @@
 //! inviter meshes with (the invite's `fronts`). This module turns that set into
 //! ONE candidate list (`{inviter} ∪ {fronts}`), races first contact across the
 //! whole union, and stops at the first candidate whose doorbell SETTLES THE
-//! GATE (Join v2 §4: the sealed intro is the gate request, and the acked
+//! GATE (join ADR §4: the sealed intro is the gate request, and the acked
 //! `Admitted`/terminal `Rejected` is the authoritative outcome) — cancelling
 //! the rest. If every path is exhausted it returns an HONEST terminal (a
 //! distinct, mode-naming failure the caller surfaces loudly and exits on),
@@ -105,7 +105,7 @@ impl std::fmt::Display for ContactVia {
 }
 
 /// the outcome of a single candidate's attempt. the sealed intro IS the gate
-/// request (Join v2 §4), so an attempt no longer succeeds at "tunnel up" — it
+/// request (join ADR §4), so an attempt no longer succeeds at "tunnel up" — it
 /// resolves when the member's doorbell answers the GATE.
 #[derive(Debug, PartialEq)]
 pub enum AttemptResult {
@@ -581,7 +581,7 @@ async fn direct_attempt(
 /// async runtime): re-send the intro every [`RETRY_INTERVAL`] until the gate
 /// resolves, the window is exhausted, or the stop flag trips. an `Installed`
 /// ack means "the gate is settling in consensus" — keep sending; a later
-/// retransmit's ack carries the settled outcome (Join v2 §4).
+/// retransmit's ack carries the settled outcome (join ADR §4).
 fn run_direct_announcer(
     intro: &[u8],
     token_nonce: &[u8],

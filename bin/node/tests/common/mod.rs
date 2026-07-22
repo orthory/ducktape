@@ -148,7 +148,7 @@ impl NetworkShapeCluster {
     }
 
     pub fn init_founder(&self, name: &str) -> String {
-        // Join v2 refuses to mint an invite from a member with no reachability
+        // the join protocol refuses to mint an invite from a member with no reachability
         // plane, and this harness is deliberately coordinator-free — so every
         // founder carries a distinct-port WireGuard listen.
         let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
@@ -204,7 +204,7 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// mint a bearer invite (Join v2: single-use, sealed to whoever redeems it
+    /// mint a bearer invite (the join protocol: single-use, sealed to whoever redeems it
     /// at first contact). Still pre-generates the friend identity so
     /// `join_friend` reuses one stable key across the ceremony.
     pub fn invite(&self) -> String {
@@ -482,7 +482,7 @@ impl NetworkShapeCluster {
         }
     }
 
-    /// wait until node `idx` has COMMITTED STANDING as a member. Join v2 has
+    /// wait until node `idx` has COMMITTED STANDING as a member. the join protocol has
     /// two legitimate admission paths and which one lands first is a race:
     /// direct first contact prints "standing is committed" (replica/wiring),
     /// the announce-redeem park path prints "resident: standing granted".

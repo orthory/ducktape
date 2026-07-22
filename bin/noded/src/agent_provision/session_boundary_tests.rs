@@ -108,7 +108,6 @@ format = "text"
 
 fn at(height: u64, origin: Origin) -> BlockContext {
     BlockContext {
-        protocol_version: 0,
         height,
         consensus_time: height,
         origin,

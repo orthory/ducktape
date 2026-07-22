@@ -32,7 +32,7 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
 
-    // the joiner reaches the founder on its own (Join v2 first contact or the
+    // the joiner reaches the founder on its own (the join protocol first contact or the
     // announce fallback), and the founder redeems it — NO verb runs anywhere
     // in this window.
     cluster.wait_admitted(1, Duration::from_secs(90));
@@ -108,7 +108,7 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     });
 
     // second redeemer: the SAME blob under a FRESH identity — the shared-blob
-    // mistake. a bearer invite (Join v2) mints the workspace locally without
+    // mistake. a bearer invite (join ADR) mints the workspace locally without
     // complaint — there is no targeted key for the CLI to check — and the
     // single-use invariant lands TERMINALLY at first contact: the founder's
     // gate sees the spent nonce and refuses permanently, and the joiner stops

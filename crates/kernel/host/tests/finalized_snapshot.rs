@@ -43,7 +43,7 @@ impl Module for BytesModule {
             return Err(Error::Module("missing staged byte".into()));
         };
         self.staged = Some(next);
-        if rest == [b'!'] {
+        if rest == *b"!" {
             ctx.emit_msg(Msg {
                 target: "missing".into(),
                 payload: Vec::new(),
@@ -94,7 +94,7 @@ fn block(height: u64, app_hash: StateRoot) -> FinalizedBlock {
 }
 
 fn ctx(height: u64) -> BlockContext {
-    BlockContext { protocol_version: 0,
+    BlockContext {
         height,
         consensus_time: height * 10,
         origin: Origin::System,

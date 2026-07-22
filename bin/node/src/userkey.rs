@@ -1,4 +1,4 @@
-//! `user.key` v2 codec: argon2id-derived KEK + XChaCha20-Poly1305 at rest,
+//! the encrypted `user.key` codec: argon2id-derived KEK + XChaCha20-Poly1305 at rest,
 //! and the BIP39 mnemonic <-> 32-byte-seed encoding used to reveal/restore
 //! the user's ed25519 identity. Mirrors `config::load_or_generate_identity`'s
 //! file discipline (0600, `create_new`, temp+rename for in-place rewrites)
@@ -19,18 +19,18 @@
 //!   (argon2id -> XChaCha20-Poly1305 KEK), so a forgotten password is
 //!   recoverable via the mnemonic (restore, then set a new password).
 //!
-//! ## v2 line format
-//! `ducktape-user-key-v2:<base64(salt(16) || argon2-params(12) ||
+//! ## encrypted line format
+//! `ducktape-user-key-v1:<base64(salt(16) || argon2-params(12) ||
 //! nonce(24) || pubkey(32) || ciphertext(32+16))>`
 //! - `argon2-params` = `m_kib, t, p` as little-endian `u32`s (default
 //!   65536 KiB / 3 / 1), encoded explicitly so they can be raised later
 //!   without breaking old files.
 //! - `pubkey` rides in the clear — it's public data, and it lets `status`
 //!   report identity while locked, without a password.
-//! - the version prefix ([`USER_KEY_V2_PREFIX`]) is bound as the AEAD
-//!   associated data, so ciphertext minted under one version can never be
+//! - the format prefix ([`USER_KEY_ENCRYPTED_PREFIX`]) is bound as the AEAD
+//!   associated data, so ciphertext minted under one format tag can never be
 //!   replayed as another.
-//! - legacy v1 stays a bare 64-lowercase-hex seed (unchanged, see
+//! - the plaintext shape stays a bare 64-lowercase-hex seed (see
 //!   `config::load_or_generate_identity`).
 //!
 //! this module's CLI wiring (`user-key init/restore/unlock/reveal/encrypt/
@@ -49,9 +49,9 @@ use zeroize::Zeroizing;
 
 use crate::config::unhex;
 
-/// the v2 line prefix — also the literal AEAD associated data bound to the
+/// the encrypted line prefix — also the literal AEAD associated data bound to the
 /// ciphertext (see module docs).
-pub const USER_KEY_V2_PREFIX: &str = "ducktape-user-key-v2:";
+pub const USER_KEY_ENCRYPTED_PREFIX: &str = "ducktape-user-key-v1:";
 
 /// the error `open_user_key` returns for any AEAD failure — a bad password
 /// and a tampered/corrupted file are cryptographically indistinguishable, so
@@ -90,14 +90,14 @@ const P_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=8;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// a `user.key` file's contents, sniffed by shape: 64 lowercase hex chars
-/// (v1, plaintext) vs the [`USER_KEY_V2_PREFIX`] (v2, encrypted).
+/// (plaintext) vs the [`USER_KEY_ENCRYPTED_PREFIX`] (encrypted).
 #[derive(Debug)]
 pub enum UserKeyFile {
     Plaintext(ed25519::PrivateKey),
     Encrypted(EncryptedUserKey),
 }
 
-/// a parsed v2 blob. `pubkey` rides in the clear (public data — lets
+/// a parsed encrypted blob. `pubkey` rides in the clear (public data — lets
 /// `status` report identity without a password); everything needed to
 /// decrypt is held privately, exercised only through [`open_user_key`] (one
 /// parse path, not two).
@@ -156,17 +156,17 @@ fn derive_kek(
     Ok(kek)
 }
 
-/// parse a v2 line into its fields, without touching the password/crypto.
-fn parse_v2(line: &str) -> Result<EncryptedUserKey, String> {
+/// parse an encrypted line into its fields, without touching the password/crypto.
+fn parse_encrypted(line: &str) -> Result<EncryptedUserKey, String> {
     let body = line
-        .strip_prefix(USER_KEY_V2_PREFIX)
-        .ok_or_else(|| "not a v2 user-key line".to_string())?;
+        .strip_prefix(USER_KEY_ENCRYPTED_PREFIX)
+        .ok_or_else(|| "not an encrypted user-key line".to_string())?;
     let blob = B64
         .decode(body.trim_end())
-        .map_err(|e| format!("v2 line is not valid base64: {e}"))?;
+        .map_err(|e| format!("encrypted line is not valid base64: {e}"))?;
     if blob.len() != BLOB_LEN {
         return Err(format!(
-            "v2 blob has wrong length: {} (want {BLOB_LEN})",
+            "encrypted blob has wrong length: {} (want {BLOB_LEN})",
             blob.len()
         ));
     }
@@ -203,7 +203,7 @@ fn parse_v2(line: &str) -> Result<EncryptedUserKey, String> {
     })
 }
 
-/// decrypt a parsed v2 blob's seed under `password`, binding `aad` (the
+/// decrypt a parsed encrypted blob's seed under `password`, binding `aad` (the
 /// declared version prefix) as associated data. split out from
 /// [`open_user_key`] so the AAD-binding property (a blob sealed under one
 /// prefix must not open under another) is directly testable.
@@ -259,7 +259,7 @@ fn seal_with(
     t_cost: u32,
     p_cost: u32,
 ) -> Result<String, String> {
-    // the same bounds parse_v2 enforces — sealing outside them would mint a
+    // the same bounds parse_encrypted enforces — sealing outside them would mint a
     // file that can never be opened (a future DEFAULT_* bump beyond the
     // ranges fails loudly here, in tests, instead of in the field).
     check_params(m_kib, t_cost, p_cost)?;
@@ -276,7 +276,7 @@ fn seal_with(
             nonce,
             Payload {
                 msg: seed.as_slice(),
-                aad: USER_KEY_V2_PREFIX.as_bytes(),
+                aad: USER_KEY_ENCRYPTED_PREFIX.as_bytes(),
             },
         )
         .map_err(|e| format!("encryption failed: {e}"))?;
@@ -291,11 +291,11 @@ fn seal_with(
     blob.extend_from_slice(&ciphertext);
     debug_assert_eq!(blob.len(), BLOB_LEN);
 
-    Ok(format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob)))
+    Ok(format!("{USER_KEY_ENCRYPTED_PREFIX}{}", B64.encode(blob)))
 }
 
 /// encrypt `seed` under `password` (argon2id defaults + fresh random
-/// salt/nonce) and return the full v2 line, ready to write to disk.
+/// salt/nonce) and return the full encrypted line, ready to write to disk.
 pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> {
     let mut salt = [0u8; SALT_LEN];
     rand::rngs::OsRng.fill_bytes(&mut salt);
@@ -312,7 +312,7 @@ pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> 
     )
 }
 
-/// decrypt a v2 line under `password`, returning the seed as a ready-to-use
+/// decrypt an encrypted line under `password`, returning the seed as a ready-to-use
 /// signer. any AEAD failure (wrong password OR a tampered/corrupted file —
 /// the two are indistinguishable) returns the exact string
 /// `"corrupt or wrong password"`, as does a clear-pubkey field that doesn't
@@ -320,8 +320,8 @@ pub fn seal_user_key(seed: &[u8; 32], password: &str) -> Result<String, String> 
 /// prefix is AAD — so a swapped pubkey wouldn't otherwise be caught, and a
 /// caller trusting the parsed `EncryptedUserKey::pubkey` could be lied to).
 pub fn open_user_key(line: &str, password: &str) -> Result<ed25519::PrivateKey, String> {
-    let enc = parse_v2(line)?;
-    let seed = decrypt_seed(&enc, password, USER_KEY_V2_PREFIX.as_bytes())?;
+    let enc = parse_encrypted(line)?;
+    let seed = decrypt_seed(&enc, password, USER_KEY_ENCRYPTED_PREFIX.as_bytes())?;
     let key = ed25519::PrivateKey::decode(seed.as_slice())
         .map_err(|e| format!("decrypted seed is not a valid ed25519 secret: {e}"))?;
     if key.public_key().as_ref() != enc.pubkey.as_slice() {
@@ -330,17 +330,17 @@ pub fn open_user_key(line: &str, password: &str) -> Result<ed25519::PrivateKey, 
     Ok(key)
 }
 
-/// sniff `path`'s contents: a v2 line (encrypted), a bare 64-hex seed (v1,
-/// legacy plaintext — see `config::load_or_generate_identity`), or an error
-/// (absent file, or content that's neither shape).
+/// sniff `path`'s contents: an encrypted line, a bare 64-hex seed (plaintext
+/// — see `config::load_or_generate_identity`), or an error (absent file, or
+/// content that's neither shape).
 pub fn read_user_key_file(path: &Path) -> Result<UserKeyFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let line = text.trim();
     if line.is_empty() {
         return Err(format!("{path:?} is empty"));
     }
-    if line.starts_with(USER_KEY_V2_PREFIX) {
-        return Ok(UserKeyFile::Encrypted(parse_v2(line)?));
+    if line.starts_with(USER_KEY_ENCRYPTED_PREFIX) {
+        return Ok(UserKeyFile::Encrypted(parse_encrypted(line)?));
     }
     let raw = unhex(line).map_err(|e| format!("{path:?}: {e}"))?;
     let key = ed25519::PrivateKey::decode(raw.as_slice())
@@ -371,7 +371,7 @@ pub fn seed_of_mnemonic(words: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("mnemonic encodes {len} bytes of entropy, want 32"))
 }
 
-/// write a fresh v2 (or legacy v1) line to `path`. born 0600 (no
+/// write a fresh encrypted (or plaintext) line to `path`. born 0600 (no
 /// write-then-chmod window), and `create_new` so a concurrent init can't
 /// clobber an existing identity.
 pub fn write_user_key_new(path: &Path, line: &str) -> Result<(), String> {
@@ -399,7 +399,7 @@ pub fn write_user_key_new(path: &Path, line: &str) -> Result<(), String> {
 
 /// replace `path`'s content with `line` atomically: write a temp file in
 /// the SAME directory (so the rename is same-filesystem, hence atomic),
-/// then rename over the target. used for in-place migrations (v1 -> v2,
+/// then rename over the target. used for in-place rewrites (encrypt,
 /// password rotation) where the identity file must never observably not
 /// exist.
 pub fn rewrite_user_key(path: &Path, line: &str) -> Result<(), String> {
@@ -454,22 +454,22 @@ mod tests {
         s
     }
 
-    /// re-splice the argon2 params field of a sealed v2 line (offsets per
+    /// re-splice the argon2 params field of a sealed encrypted line (offsets per
     /// the wire spec: three LE u32s right after the 16-byte salt).
     fn respliced_params(line: &str, m_kib: u32, t_cost: u32, p_cost: u32) -> String {
-        let body = line.strip_prefix(USER_KEY_V2_PREFIX).unwrap();
+        let body = line.strip_prefix(USER_KEY_ENCRYPTED_PREFIX).unwrap();
         let mut blob = B64.decode(body).unwrap();
         blob[SALT_LEN..SALT_LEN + 4].copy_from_slice(&m_kib.to_le_bytes());
         blob[SALT_LEN + 4..SALT_LEN + 8].copy_from_slice(&t_cost.to_le_bytes());
         blob[SALT_LEN + 8..SALT_LEN + 12].copy_from_slice(&p_cost.to_le_bytes());
-        format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob))
+        format!("{USER_KEY_ENCRYPTED_PREFIX}{}", B64.encode(blob))
     }
 
     #[test]
     fn seal_open_round_trip() {
         let seed = [1u8; 32];
         let line = seal_user_key(&seed, "correct horse battery staple").unwrap();
-        assert!(line.starts_with(USER_KEY_V2_PREFIX));
+        assert!(line.starts_with(USER_KEY_ENCRYPTED_PREFIX));
         let key = open_user_key(&line, "correct horse battery staple").unwrap();
         let expected = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
         assert_eq!(key.public_key(), expected.public_key());
@@ -487,11 +487,11 @@ mod tests {
     fn open_tampered_ciphertext_fails_with_exact_message() {
         let seed = [3u8; 32];
         let line = seal_user_key(&seed, "pw").unwrap();
-        let body = line.strip_prefix(USER_KEY_V2_PREFIX).unwrap();
+        let body = line.strip_prefix(USER_KEY_ENCRYPTED_PREFIX).unwrap();
         let mut blob = B64.decode(body).unwrap();
         let last = blob.len() - 1;
         blob[last] ^= 0xff; // flip a byte inside the AEAD tag/ciphertext
-        let tampered = format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob));
+        let tampered = format!("{USER_KEY_ENCRYPTED_PREFIX}{}", B64.encode(blob));
         let err = open_user_key(&tampered, "pw").unwrap_err();
         assert_eq!(err, "corrupt or wrong password");
     }
@@ -503,13 +503,13 @@ mod tests {
         // under a different one, even with the right password.
         let seed = [4u8; 32];
         let line = seal_user_key(&seed, "pw").unwrap();
-        let enc = parse_v2(&line).unwrap();
+        let enc = parse_encrypted(&line).unwrap();
         let err = decrypt_seed(&enc, "pw", b"ducktape-user-key-v3:").unwrap_err();
         assert_eq!(err, "corrupt or wrong password");
     }
 
     #[test]
-    fn v2_line_parses_to_encrypted_with_clear_pubkey() {
+    fn encrypted_line_parses_with_clear_pubkey() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("user.key");
         let seed = [5u8; 32];
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_hex_parses_to_plaintext_with_matching_pubkey() {
+    fn bare_hex_parses_to_plaintext_with_matching_pubkey() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("user.key");
         let seed = [6u8; 32];
@@ -551,7 +551,7 @@ mod tests {
     fn junk_content_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("user.key");
-        write_user_key_new(&path, "not a hex seed and not a v2 line").unwrap();
+        write_user_key_new(&path, "not a hex seed and not an encrypted line").unwrap();
         assert!(read_user_key_file(&path).is_err());
     }
 
@@ -589,7 +589,7 @@ mod tests {
     fn argon2_params_round_trip_through_encoded_line() {
         let seed = [9u8; 32];
         let line = seal_user_key(&seed, "pw").unwrap();
-        let enc = parse_v2(&line).unwrap();
+        let enc = parse_encrypted(&line).unwrap();
         assert_eq!(enc.m_kib, 65536);
         assert_eq!(enc.t_cost, 3);
         assert_eq!(enc.p_cost, 1);
@@ -629,15 +629,15 @@ mod tests {
         // oversized memory must be rejected at PARSE time, before any argon2
         // attempt — u32::MAX KiB would be a ~4 TiB allocation (instant DoS,
         // or an abort on infallible-alloc failure), not a clean error.
-        assert!(parse_v2(&respliced_params(&line, u32::MAX, 3, 1)).is_err());
+        assert!(parse_encrypted(&respliced_params(&line, u32::MAX, 3, 1)).is_err());
         // below the floor (8 MiB)
-        assert!(parse_v2(&respliced_params(&line, 8_191, 3, 1)).is_err());
+        assert!(parse_encrypted(&respliced_params(&line, 8_191, 3, 1)).is_err());
         // zero / oversized passes
-        assert!(parse_v2(&respliced_params(&line, 65_536, 0, 1)).is_err());
-        assert!(parse_v2(&respliced_params(&line, 65_536, 65, 1)).is_err());
+        assert!(parse_encrypted(&respliced_params(&line, 65_536, 0, 1)).is_err());
+        assert!(parse_encrypted(&respliced_params(&line, 65_536, 65, 1)).is_err());
         // zero / oversized parallelism
-        assert!(parse_v2(&respliced_params(&line, 65_536, 3, 0)).is_err());
-        assert!(parse_v2(&respliced_params(&line, 65_536, 3, 9)).is_err());
+        assert!(parse_encrypted(&respliced_params(&line, 65_536, 3, 0)).is_err());
+        assert!(parse_encrypted(&respliced_params(&line, 65_536, 3, 9)).is_err());
         // open_user_key surfaces the same rejection (it parses first, so it
         // never reaches derivation). NOTE: keep this AFTER the parse asserts
         // above — if the bounds regress, they fail the test before this line
@@ -651,8 +651,8 @@ mod tests {
         // both ends of every accepted range parse cleanly (decryption would
         // still fail — splicing params changes the KEK — but that's the
         // AEAD's job, not the parser's).
-        assert!(parse_v2(&respliced_params(&line, 8_192, 1, 1)).is_ok());
-        assert!(parse_v2(&respliced_params(&line, 1_048_576, 64, 8)).is_ok());
+        assert!(parse_encrypted(&respliced_params(&line, 8_192, 1, 1)).is_ok());
+        assert!(parse_encrypted(&respliced_params(&line, 1_048_576, 64, 8)).is_ok());
     }
 
     #[test]
@@ -665,18 +665,18 @@ mod tests {
         let other = ed25519::PrivateKey::decode([11u8; 32].as_slice())
             .unwrap()
             .public_key();
-        let body = line.strip_prefix(USER_KEY_V2_PREFIX).unwrap();
+        let body = line.strip_prefix(USER_KEY_ENCRYPTED_PREFIX).unwrap();
         let mut blob = B64.decode(body).unwrap();
         let start = SALT_LEN + PARAMS_LEN + NONCE_LEN;
         blob[start..start + PUBKEY_LEN].copy_from_slice(other.as_ref());
-        let swapped = format!("{USER_KEY_V2_PREFIX}{}", B64.encode(blob));
+        let swapped = format!("{USER_KEY_ENCRYPTED_PREFIX}{}", B64.encode(blob));
         let err = open_user_key(&swapped, "pw").unwrap_err();
         assert_eq!(err, "corrupt or wrong password");
     }
 
     #[test]
     fn golden_vector_pins_wire_format() {
-        // the full v2 line for a fixed seed/password/salt/nonce/params. this
+        // the full encrypted line for a fixed seed/password/salt/nonce/params. this
         // pins EVERYTHING at once — argon2id KDF output, XChaCha ciphertext,
         // field order, LE param encoding, base64 alphabet (url-safe, no
         // pad), and the prefix — independently of the encoder. if this test
@@ -689,9 +689,9 @@ mod tests {
         let line = seal_with(&seed, "correct horse", &salt, &nonce, 65_536, 3, 1).unwrap();
         assert_eq!(
             line,
-            "ducktape-user-key-v2:oaGhoaGhoaGhoaGhoaGhoQAAAQADAAAAAQAAALKysrKysrKysrKysrKysrKy\
+            "ducktape-user-key-v1:oaGhoaGhoaGhoaGhoaGhoQAAAQADAAAAAQAAALKysrKysrKysrKysrKysrKy\
              srKysrKysupKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs-WYt2Z5Ws4TMsmxhtzpnlBqRi2VR\
-             UEmVhQ-Q-_HPf4sq32atxpNTFbA0YVrPCwgU"
+             UEmVhQ-Q-_HPf4sbBBeGxf-D0HioE8ivI0Fe"
         );
         // and the pinned line opens with the right password.
         let key = open_user_key(&line, "correct horse").unwrap();
@@ -703,14 +703,14 @@ mod tests {
     fn wire_offsets_match_spec() {
         // slice the decoded payload at the SPEC's byte offsets (literals,
         // not the module's consts) and assert each field lands where
-        // parse_v2 reads it: salt 0..16, params 16..28 (three LE u32),
+        // parse_encrypted reads it: salt 0..16, params 16..28 (three LE u32),
         // nonce 28..52, pubkey 52..84, ciphertext 84..132.
         let seed = [14u8; 32];
         let salt = [0xC3u8; SALT_LEN];
         let nonce = [0xD4u8; NONCE_LEN];
         let line = seal_with(&seed, "pw", &salt, &nonce, 65_536, 3, 1).unwrap();
         let blob = B64
-            .decode(line.strip_prefix(USER_KEY_V2_PREFIX).unwrap())
+            .decode(line.strip_prefix(USER_KEY_ENCRYPTED_PREFIX).unwrap())
             .unwrap();
         assert_eq!(blob.len(), 132);
         assert_eq!(&blob[0..16], &salt);
@@ -723,8 +723,8 @@ mod tests {
             .public_key();
         assert_eq!(&blob[52..84], expected_pub.as_ref());
 
-        // parse_v2 reads each field from exactly these offsets.
-        let enc = parse_v2(&line).unwrap();
+        // parse_encrypted reads each field from exactly these offsets.
+        let enc = parse_encrypted(&line).unwrap();
         assert_eq!(enc.salt, salt);
         assert_eq!(enc.m_kib, 65_536);
         assert_eq!(enc.t_cost, 3);

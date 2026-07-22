@@ -25,7 +25,6 @@ use sdk_testkit::TestCtx;
 // chat's sync tests read only env (consensus_time); me/height are cosmetic.
 fn ctx_at(consensus_time: u64) -> TestCtx {
     TestCtx::with_env(sdk::Env {
-        protocol_version: 0,
         height: 0,
         consensus_time,
         origin: Origin::System,

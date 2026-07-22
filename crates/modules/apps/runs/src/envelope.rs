@@ -7,8 +7,8 @@
 //! conversation, and the portable workspace plan ([`PortableInputs`]) — whose
 //! skill list now states, per skill, whether it loads `always`. the host-side
 //! worker routes on the `ducktape_run` marker and assembles the final model
-//! input. every run composes the portable v3 envelope; the flat-string and v2
-//! tolerances are gone (flag day — in-flight legacy runs are unsupported).
+//! input. every run composes the ONE portable envelope shape; there are no
+//! legacy flat-string or older envelope tolerances.
 //!
 //! the agent's PERSONA is no longer in here. it was a `prompt_hash` the host
 //! resolved from the blob store; it is now an `always` skill, whose body the
@@ -38,9 +38,9 @@ use crate::hex;
 /// the envelope marker the host worker routes on: the portable envelope shape
 /// (workspace source pin + skill refs + result contract). bumping it is a
 /// payload flag day for the worker, not for consensus state.
-pub(crate) const RUN_ENVELOPE_VERSION: u32 = 3;
+pub(crate) const RUN_ENVELOPE_VERSION: u32 = 1;
 
-/// the result-wrapper version a portable (`v3`) provider returns. carried in
+/// the result-wrapper version a portable provider returns. carried in
 /// the envelope's `result_contract` so the worker refuses a runner-result
 /// version it cannot unwrap; the `runs` delivery path reads it back as `1`.
 pub(crate) const RUNNER_RESULT_VERSION: u32 = 1;
@@ -597,7 +597,7 @@ mod tests {
 
         // field order is part of the committed bytes — assert the layout, not
         // just the values.
-        assert!(payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#));
+        assert!(payload.starts_with(r#"{"ducktape_run":1,"agent_id":"bot","run_id":"#));
         assert!(
             payload.contains(r#","agent_display_name":"BOT","thread_key":"#),
             "the thread key now follows the display name directly: {payload}"
@@ -1030,7 +1030,7 @@ mod tests {
 
         // field order is stable — the marker leads.
         assert!(
-            payload.starts_with(r#"{"ducktape_run":3,"agent_id":"bot","run_id":"#),
+            payload.starts_with(r#"{"ducktape_run":1,"agent_id":"bot","run_id":"#),
             "the marker leads with a stable field order: {payload}"
         );
         assert!(

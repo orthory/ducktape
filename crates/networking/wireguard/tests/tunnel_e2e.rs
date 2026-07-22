@@ -368,9 +368,9 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
 /// through a signature crate — so an independent implementation can reproduce
 /// the vector from this file alone, and no dependency bump can move it.
 #[test]
-fn mesh_version_v2_fixed_vector() {
-    const MESH_VERSION_V2_VECTOR: &str =
-        "e4f824ced12474c98e3e1c1ce77b50bb2d0851887ead9117c29be15b75d63f75";
+fn mesh_version_fixed_vector() {
+    const MESH_VERSION_VECTOR: &str =
+        "3763f34945c44cc6593466ff5f6707d8dc5b8df0b8314817369ce8da44184b09";
 
     let policy = PortPolicy::production();
     let literal_record = |identity_byte: u8, host_octet: u8| EndpointRecord {
@@ -401,11 +401,11 @@ fn mesh_version_v2_fixed_vector() {
     let version = compute_mesh_version(&records).unwrap();
     assert_eq!(
         hex32(version.0),
-        MESH_VERSION_V2_VECTOR,
-        "the mesh-version v2 preimage changed — if this is deliberate, update the vector"
+        MESH_VERSION_VECTOR,
+        "the mesh-version preimage changed — if this is deliberate, update the vector"
     );
 
-    // v2-specific sensitivity: rotating one validator's wireguard key moves
+    // key sensitivity: rotating one validator's wireguard key moves
     // the version — the mesh commits to the key set, not just endpoints.
     let rekeyed = {
         let mut r = records.clone();

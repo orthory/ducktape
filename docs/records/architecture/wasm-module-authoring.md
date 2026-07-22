@@ -45,7 +45,7 @@ Implement the two exports:
   native module's query serves; out of block the overlay is empty).
 
 And use the imports deliberately: `get-env` for the deterministic block env
-(`height`, `consensus-time`, `protocol-version`, `origin`, `me`); `state-*` for
+(`height`, `consensus-time`, `origin`, `me`); `state-*` for
 durable state; `emit-msg` for write intents at sibling modules (drained as
 follow-up ops, never reentrant); `emit-event` for observability records.
 

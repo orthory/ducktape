@@ -60,26 +60,21 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
 /// a far-future expiry for tokens whose test is not about expiry.
 const FAR_FUTURE: u64 = 4_102_444_800; // 2100-01-01
 
-/// mint an invite token locked to `target`: the issuer's signature over the
-/// grant preimage `binding ‖ nonce ‖ kind[‖ target] ‖ role ‖ expiry`
-/// (kind 1 = targeted) in the grant namespace — minting IS the admission
-/// decision FOR THAT KEY. the preimage is deliberately RE-STATED here rather
-/// than calling into governance: if the signed shape ever drifts, this suite
-/// fails instead of following along.
+/// mint a BEARER invite token: the issuer's signature over the grant
+/// preimage `binding ‖ nonce ‖ role ‖ expiry` in the grant namespace —
+/// minting IS the admission decision. the preimage is deliberately RE-STATED
+/// here rather than calling into governance: if the signed shape ever
+/// drifts, this suite fails instead of following along.
 fn mint_as(
     issuer: &Ed,
     binding: &[u8],
     nonce: [u8; INVITE_NONCE_LEN],
-    target: &Ed,
     role: InviteRole,
     expires_unix_secs: u64,
 ) -> InviteToken {
-    let target = target.public_key();
     let msg = [
         binding,
         nonce.as_slice(),
-        &[1u8],
-        target.as_ref(),
         &[role.as_u8()],
         &expires_unix_secs.to_le_bytes(),
     ]
@@ -87,49 +82,18 @@ fn mint_as(
     InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        target: Some(target),
         role,
         expires_unix_secs,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
 }
 
-/// mint a BEARER token: preimage kind 0x00, NO target bytes — the first
-/// valid join proof takes the grant. role is the caller's so the
-/// client-only rule can be pinned from the outside. re-stated on purpose,
-/// like `mint_as`.
-fn mint_bearer(
-    issuer: &Ed,
-    binding: &[u8],
-    nonce: [u8; INVITE_NONCE_LEN],
-    role: InviteRole,
-    expires_unix_secs: u64,
-) -> InviteToken {
-    let msg = [
-        binding,
-        nonce.as_slice(),
-        &[0u8],
-        &[role.as_u8()],
-        &expires_unix_secs.to_le_bytes(),
-    ]
-    .concat();
-    InviteToken {
-        issuer: issuer.public_key(),
-        nonce,
-        target: None,
-        role,
-        expires_unix_secs,
-        sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
-    }
+/// the common shape: a Resident invite, far-future expiry.
+fn mint(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN]) -> InviteToken {
+    mint_as(issuer, binding, nonce, InviteRole::Resident, FAR_FUTURE)
 }
 
-/// the common shape: a Resident invite for `target`, far-future expiry.
-fn mint(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN], target: &Ed) -> InviteToken {
-    mint_as(issuer, binding, nonce, target, InviteRole::Resident, FAR_FUTURE)
-}
-
-/// the `GovMsg::Redeem` wire op — all raw bytes, mirroring the lobby
-/// announce. empty target bytes = bearer, the wire-wide rule.
+/// the `GovMsg::Redeem` wire op — all raw bytes, mirroring the lobby announce.
 fn redeem(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value {
     json!({ "redeem": {
         "issuer": token.issuer.as_ref().to_vec(),
@@ -137,11 +101,6 @@ fn redeem(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value {
         "token_sig": token.sig.as_ref().to_vec(),
         "joiner": joiner,
         "proof": proof,
-        "target": token
-            .target
-            .as_ref()
-            .map(|t| t.as_ref().to_vec())
-            .unwrap_or_default(),
         "role": token.role.as_u8(),
         "expires_unix_secs": token.expires_unix_secs,
     }})
@@ -184,14 +143,6 @@ fn ballot(proposal: &Value, voter: &[u8]) -> Option<bool> {
     })
 }
 
-fn upgrade_status(sim: &Sim) -> Value {
-    sim.query("upgrade", json!("status"))["status"].clone()
-}
-
-fn signal(name: &str, to_version: u64) -> Value {
-    json!({ "signal_ready": { "name": name, "to_version": to_version, "commitment": null } })
-}
-
 /// one filler block — advances the logical clock without touching membership.
 fn filler(sim: &Sim) {
     sim.submit_ok(
@@ -222,7 +173,7 @@ fn a_redeemed_invite_grants_residency_in_its_own_block_and_audits_the_admission(
     let issuer = &validators[0];
     let joiner = Ed::from_seed(10);
     let nonce = [7u8; INVITE_NONCE_LEN];
-    let token = mint(issuer, BINDING, nonce, &joiner);
+    let token = mint(issuer, BINDING, nonce);
     let proof = sign_join_proof(&joiner, BINDING, &token);
     let receipt = sim.submit_ok(
         "governance",
@@ -269,7 +220,7 @@ fn a_nonce_redeems_exactly_once_even_for_a_different_joiner() {
 
     // first redemption admits joiner-one via its own token.
     let joiner_one = Ed::from_seed(20);
-    let token_one = mint(issuer, BINDING, nonce, &joiner_one);
+    let token_one = mint(issuer, BINDING, nonce);
     let proof_one = sign_join_proof(&joiner_one, BINDING, &token_one);
     sim.submit_ok(
         "governance",
@@ -285,7 +236,7 @@ fn a_nonce_redeems_exactly_once_even_for_a_different_joiner() {
     // shy of the nonce set passes (valid sig, matching target, valid proof),
     // isolating the exactly-once property from the target lock.
     let joiner_two = Ed::from_seed(21);
-    let token_two = mint(issuer, BINDING, nonce, &joiner_two);
+    let token_two = mint(issuer, BINDING, nonce);
     let proof_two = sign_join_proof(&joiner_two, BINDING, &token_two);
     let error = sim.submit_rejected(
         "governance",
@@ -313,7 +264,7 @@ fn a_token_minted_for_another_network_does_not_verify() {
     // minted over a DIFFERENT binding than this network's "sim": the token
     // signature never verifies here, so a replay across networks is refused.
     let joiner = Ed::from_seed(30);
-    let token = mint(issuer, b"other-net", [1u8; INVITE_NONCE_LEN], &joiner);
+    let token = mint(issuer, b"other-net", [1u8; INVITE_NONCE_LEN]);
     let proof = sign_join_proof(&joiner, b"other-net", &token);
     let error = sim.submit_rejected(
         "governance",
@@ -341,7 +292,7 @@ fn a_token_from_a_non_member_issuer_is_refused() {
     // (correct binding, correct proof) but the issuer is no current member.
     let stranger = Ed::from_seed(99);
     let joiner = Ed::from_seed(40);
-    let token = mint(&stranger, BINDING, [2u8; INVITE_NONCE_LEN], &joiner);
+    let token = mint(&stranger, BINDING, [2u8; INVITE_NONCE_LEN]);
     let proof = sign_join_proof(&joiner, BINDING, &token);
     let error = sim.submit_rejected(
         "governance",
@@ -371,7 +322,7 @@ fn a_blob_holder_cannot_redeem_under_a_key_that_never_asked_to_join() {
     // cannot bind it to a key whose secret they do not hold.
     let joiner_one = Ed::from_seed(50);
     let joiner_two = Ed::from_seed(51);
-    let token = mint(issuer, BINDING, [3u8; INVITE_NONCE_LEN], &joiner_one);
+    let token = mint(issuer, BINDING, [3u8; INVITE_NONCE_LEN]);
     let forged_proof = sign_join_proof(&joiner_two, BINDING, &token);
     let error = sim.submit_rejected(
         "governance",
@@ -385,42 +336,6 @@ fn a_blob_holder_cannot_redeem_under_a_key_that_never_asked_to_join() {
     assert!(
         error.contains("joiner proof-of-possession does not verify"),
         "forged proof: {error}"
-    );
-}
-
-// ── B5b: the target lock — the bearer hole is closed ────
-
-#[test]
-fn a_blob_holder_cannot_redeem_under_its_own_key_when_the_invite_names_another() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, validators) = governed(storage.path());
-    let issuer = &validators[0];
-
-    // the invite was minted FOR the target; a thief holding the blob announces
-    // its OWN key with a perfectly valid self-proof — pre-targeting this was
-    // the bearer hole (any holder could join), now it dies on the target lock.
-    let target = Ed::from_seed(52);
-    let thief = Ed::from_seed(53);
-    let token = mint(issuer, BINDING, [6u8; INVITE_NONCE_LEN], &target);
-    let thief_proof = sign_join_proof(&thief, BINDING, &token);
-    let error = sim.submit_rejected(
-        "governance",
-        redeem(
-            &token,
-            thief.public_key().as_ref().to_vec(),
-            thief_proof.as_ref().to_vec(),
-        ),
-        Some("relay"),
-    );
-    assert!(
-        error.contains("invite is locked to another key"),
-        "target lock: {error}"
-    );
-    // and the thief gained nothing: no standing of any tier.
-    let residents = sim.query("valset", json!("residents"));
-    assert!(
-        !has_key(&residents["residents"], thief.public_key().as_ref()),
-        "thief holds no standing: {residents}"
     );
 }
 
@@ -438,7 +353,6 @@ fn a_client_role_invite_grants_client_standing_not_residency_and_is_single_use()
         issuer,
         BINDING,
         [7u8; INVITE_NONCE_LEN],
-        &client,
         InviteRole::Client,
         FAR_FUTURE,
     );
@@ -507,7 +421,6 @@ fn consensus_admits_a_wall_clock_expired_token_expiry_lives_at_the_doorbells() {
         issuer,
         BINDING,
         [8u8; INVITE_NONCE_LEN],
-        &joiner,
         InviteRole::Resident,
         1, // 1970 — expired on any wall clock
     );
@@ -537,7 +450,7 @@ fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
     let issuer = &validators[0];
 
     // bearer: NO target lock — the token names no key at mint time.
-    let token = mint_bearer(
+    let token = mint_as(
         issuer,
         BINDING,
         [10u8; INVITE_NONCE_LEN],
@@ -593,50 +506,6 @@ fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
     );
 }
 
-// ── B5f: bearer is CLIENT-ONLY — no bearer path onto the resident plane ──
-
-#[test]
-fn a_bearer_resident_invite_is_rejected_as_client_only() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, validators) = governed(storage.path());
-    let issuer = &validators[0];
-
-    // a WELL-FORMED bearer Resident token (valid sig over the current preimage):
-    // the rule is semantic, not cryptographic — pin the exact reject.
-    let token = mint_bearer(
-        issuer,
-        BINDING,
-        [11u8; INVITE_NONCE_LEN],
-        InviteRole::Resident,
-        FAR_FUTURE,
-    );
-    let joiner = Ed::from_seed(72);
-    let proof = sign_join_proof(&joiner, BINDING, &token);
-    let error = sim.submit_rejected(
-        "governance",
-        redeem(
-            &token,
-            joiner.public_key().as_ref().to_vec(),
-            proof.as_ref().to_vec(),
-        ),
-        Some("relay"),
-    );
-    assert!(
-        error.contains("bearer invites are client-only"),
-        "client-only rule: {error}"
-    );
-    let residents = sim.query("valset", json!("residents"));
-    assert!(
-        !has_key(&residents["residents"], joiner.public_key().as_ref()),
-        "no resident standing granted: {residents}"
-    );
-    let clients = sim.query("identity", json!("clients"));
-    assert!(
-        !has_key(&clients["clients"], joiner.public_key().as_ref()),
-        "no client standing granted: {clients}"
-    );
-}
-
 // ── B6: the staged-admission ladder ─────────────────────
 
 #[test]
@@ -648,7 +517,7 @@ fn a_resident_is_promoted_to_validator_then_demoted_by_governance() {
     let joiner_key = joiner.public_key().as_ref().to_vec();
 
     // redeem grants residency (the pre-promotion tier).
-    let token = mint(issuer, BINDING, [4u8; INVITE_NONCE_LEN], &joiner);
+    let token = mint(issuer, BINDING, [4u8; INVITE_NONCE_LEN]);
     let proof = sign_join_proof(&joiner, BINDING, &token);
     sim.submit_ok(
         "governance",
@@ -708,7 +577,7 @@ fn a_resident_is_promoted_to_validator_then_demoted_by_governance() {
     // removed-after-minting (B4's other half): a token the now-removed joiner
     // mints dies on the CURRENT-membership check — an ex-member's invites lapse.
     let latecomer = Ed::from_seed(61);
-    let stale = mint(&joiner, BINDING, [5u8; INVITE_NONCE_LEN], &latecomer);
+    let stale = mint(&joiner, BINDING, [5u8; INVITE_NONCE_LEN]);
     let late_proof = sign_join_proof(&latecomer, BINDING, &stale);
     let error = sim.submit_rejected(
         "governance",
@@ -920,94 +789,6 @@ fn share_governance_refuses_actions_that_precede_an_adoption() {
     assert!(
         error.contains("configure governance shares before enabling share mode"),
         "enable share mode before adopt: {error}"
-    );
-}
-
-// ── B8: the upgrade module — arm and abort ──────────────
-
-#[test]
-fn a_scheduled_upgrade_arms_at_the_boundary_once_every_validator_signals() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, validators) = governed(storage.path());
-
-    // governance authorizes the schedule (activation comfortably past the
-    // upgrade module's MIN_UPGRADE_LEAD from the execute block).
-    let base = sim.status()["height"].as_u64().unwrap();
-    let activation = base + 30;
-    pass(
-        &sim,
-        &[&validators[0], &validators[1]],
-        "sched-v2",
-        json!({ "schedule_upgrade": { "name": "v2", "activation_height": activation, "to_version": 2 } }),
-        1_000_000,
-    );
-    let st = upgrade_status(&sim);
-    assert_eq!(st["current_version"], 0, "not yet armed: {st}");
-    assert!(
-        st["pending"].is_object(),
-        "a pending upgrade is scheduled: {st}"
-    );
-
-    // each validator signals readiness under its OWN key.
-    for v in &validators {
-        sim.submit_ok("upgrade", signal("v2", 2), Some(origin(v).as_str()));
-    }
-    let st = upgrade_status(&sim);
-    assert_eq!(st["ready_count"], 3, "R=n readiness: {st}");
-    assert_eq!(st["member_count"], 3);
-    assert_eq!(
-        st["armed"], true,
-        "the verdict arms once every member signals: {st}"
-    );
-    assert_eq!(
-        st["current_version"], 0,
-        "but the flip waits for the boundary tick: {st}"
-    );
-
-    // walk to the activation height: the host-injected System `Advance` rides
-    // that block and ARMS — current_version flips, the pending slot clears.
-    walk_to(&sim, activation);
-    let st = upgrade_status(&sim);
-    assert_eq!(
-        st["current_version"], 2,
-        "the boundary Advance armed it: {st}"
-    );
-    assert!(st["pending"].is_null(), "and freed the pending slot: {st}");
-}
-
-#[test]
-fn a_scheduled_upgrade_aborts_at_the_boundary_when_readiness_is_incomplete() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, validators) = governed(storage.path());
-    let base = sim.status()["height"].as_u64().unwrap();
-    let activation = base + 30;
-    pass(
-        &sim,
-        &[&validators[0], &validators[1]],
-        "sched-abort",
-        json!({ "schedule_upgrade": { "name": "v2", "activation_height": activation, "to_version": 2 } }),
-        1_000_000,
-    );
-
-    // only two of three validators signal — the readiness set never reaches R=n.
-    for v in &validators[..2] {
-        sim.submit_ok("upgrade", signal("v2", 2), Some(origin(v).as_str()));
-    }
-    let st = upgrade_status(&sim);
-    assert_eq!(st["ready_count"], 2);
-    assert_eq!(st["armed"], false, "an incomplete set never arms: {st}");
-
-    // at the boundary the injected Advance ABORTS: the version is unchanged and
-    // the slot clears, so the operator can reschedule.
-    walk_to(&sim, activation);
-    let st = upgrade_status(&sim);
-    assert_eq!(
-        st["current_version"], 0,
-        "aborted — version untouched: {st}"
-    );
-    assert!(
-        st["pending"].is_null(),
-        "and the pending slot cleared: {st}"
     );
 }
 

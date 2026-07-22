@@ -39,8 +39,9 @@ locates crates.
 A module's lifecycle is the host-owned path from genesis registration to
 committed state transitions. Ducktape does not currently have runtime
 install/enable/disable rows for modules: every registered genesis module is
-active, and changing the module set is a new genesis or coordinated upgrade
-concern.
+active, and changing the module set is a new-genesis concern. Swapping a
+registered module's wasm code in place is separate — the lifecycle code
+registry schedules that at an agreed height.
 
 <ModuleLifecycle client:visible />
 

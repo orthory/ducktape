@@ -4,7 +4,8 @@
 //! automations, and the identity→duckdns chain have no console actions), so
 //! neither the TS scenario lane nor fleet live-QA can reach them. every
 //! rejection asserted here is the REAL module refusing over noded's exact
-//! wire; the sim adds only WHEN blocks commit.
+//! wire; the sim adds only WHEN blocks commit. the job board lives in the
+//! merged `tasks` module; job ops ride the WorkMsg envelope's `job` arm.
 
 mod harness;
 
@@ -21,16 +22,16 @@ fn a_lost_claim_race_fails_deterministically() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } }),
+        "tasks",
+        serde_json::json!({ "job": { "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } } }),
         Some("poster"),
     );
 
     // script the race: our claim parks…
     sim.set_auto(false);
     let pending = sim.submit_in_background(
-        "jobs",
-        serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } }),
+        "tasks",
+        serde_json::json!({ "job": { "claim": { "job_id": "j1", "lease_views": 10 } } }),
         Some("worker-a"),
     );
     sim.await_sim_state("held", 1);
@@ -38,8 +39,8 @@ fn a_lost_claim_race_fails_deterministically() {
     // …and the rival's claim commits first — the consensus order already
     // picked the winner.
     sim.peer_block(
-        "jobs",
-        serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } }),
+        "tasks",
+        serde_json::json!({ "job": { "claim": { "job_id": "j1", "lease_views": 10 } } }),
         "worker-b",
     );
 
@@ -58,9 +59,9 @@ fn a_lost_claim_race_fails_deterministically() {
     );
 
     // the board holds the winner's lease.
-    let job = sim.query("jobs", serde_json::json!({ "get": { "job_id": "j1" } }));
-    assert_eq!(job["job"]["status"], "processing", "board: {job}");
-    assert_eq!(job["job"]["attempt"], 1);
+    let job = sim.query("tasks", serde_json::json!({ "job": { "get": { "job_id": "j1" } } }));
+    assert_eq!(job["job"]["job"]["status"], "processing", "board: {job}");
+    assert_eq!(job["job"]["job"]["attempt"], 1);
 }
 
 #[test]
@@ -68,20 +69,21 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } }),
+        "tasks",
+        serde_json::json!({ "job": { "submit": { "job_id": "j1", "kind": "build", "spec": "{}" } } }),
         Some("poster"),
     ); // height 1
     sim.submit_ok(
-        "jobs",
-        serde_json::json!({ "claim": { "job_id": "j1", "lease_views": 10 } }),
+        "tasks",
+        serde_json::json!({ "job": { "claim": { "job_id": "j1", "lease_views": 10 } } }),
         Some("worker-a"),
     ); // height 2 → deadline = 2 + 10
 
-    let reclaim = serde_json::json!({ "reclaim": { "job_id": "j1" } });
+    let reclaim = serde_json::json!({ "job": { "reclaim": { "job_id": "j1" } } });
 
-    // an early reclaim is refused with the deadline math (and mints no block).
-    let error = sim.submit_rejected("jobs", reclaim.clone(), Some("scavenger"));
+    // an early reclaim is refused with the deadline math (the rejected op
+    // still seals a block, so it advances the clock to height 3).
+    let error = sim.submit_rejected("tasks", reclaim.clone(), Some("scavenger"));
     assert!(
         error.contains("lease not expired"),
         "early reclaim: {error}"
@@ -89,14 +91,14 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
 
     // the LOGICAL clock is the lease clock: walk it with filler blocks to the
     // last in-lease height. a reclaim executing AT the deadline still fails…
-    for i in 0..9 {
+    for i in 0..8 {
         sim.submit_ok(
             "inbox",
             serde_json::json!({ "deliver": { "member": "filler", "kind": "tick", "body": format!("{i}") } }),
             Some("filler"),
         );
-    } // heights 3..=11 — the next op executes at 12 == deadline
-    let error = sim.submit_rejected("jobs", reclaim.clone(), Some("scavenger"));
+    } // heights 4..=11 — the next op executes at 12 == deadline
+    let error = sim.submit_rejected("tasks", reclaim.clone(), Some("scavenger"));
     assert!(
         error.contains("lease not expired (height 12 <= deadline 12)"),
         "boundary reclaim: {error}"
@@ -107,10 +109,10 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
         "inbox",
         serde_json::json!({ "deliver": { "member": "filler", "kind": "tick", "body": "last" } }),
         Some("filler"),
-    ); // height 12
-    sim.submit_ok("jobs", reclaim, Some("scavenger")); // height 13 > deadline
-    let job = sim.query("jobs", serde_json::json!({ "get": { "job_id": "j1" } }));
-    assert_eq!(job["job"]["status"], "pending", "reclaimed board: {job}");
+    ); // height 13
+    sim.submit_ok("tasks", reclaim, Some("scavenger")); // height 14 > deadline
+    let job = sim.query("tasks", serde_json::json!({ "job": { "get": { "job_id": "j1" } } }));
+    assert_eq!(job["job"]["job"]["status"], "pending", "reclaimed board: {job}");
 }
 
 // ── automations: the chat-hook cascade ──────────────────
@@ -137,9 +139,9 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
 
     // a non-matching post fires nothing.
     sim.submit_ok("chat", post_message("general", "m-1", "hello world"), None);
-    let tasks = sim.query("tasks", serde_json::json!("list"));
+    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
     assert_eq!(
-        tasks["tasks"].as_array().map(Vec::len),
+        tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
         "non-matching post must not fire: {tasks}"
     );
@@ -159,9 +161,9 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
     );
 
     // the task id is deterministic per (prefix, channel, seq) — m-2 is seq 2.
-    let tasks = sim.query("tasks", serde_json::json!("list"));
-    assert_eq!(tasks["tasks"][0]["id"], "auto-general-2", "tasks: {tasks}");
-    assert_eq!(tasks["tasks"][0]["title"], "deploy requested");
+    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
+    assert_eq!(tasks["task"]["tasks"][0]["id"], "auto-general-2", "tasks: {tasks}");
+    assert_eq!(tasks["task"]["tasks"][0]["title"], "deploy requested");
 
     // the run history recorded exactly one fire.
     let history = sim.query(
@@ -274,7 +276,7 @@ fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {
     );
     let error = sim.submit_rejected("gateway", set_handle("eddy".into()), Some(&node_a));
     assert!(
-        error.contains("not bound to an identity account"),
+        error.contains("not bound to an Identity account"),
         "{error}"
     );
 

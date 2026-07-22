@@ -146,26 +146,6 @@ pub(crate) async fn run(
         hex(&manifest.app_hash)
     );
 
-    // BOOT PREFLIGHT (design §5 / plan Task 7.3): refuse an under-versioned
-    // binary against the SERVED boundary before installing/composing, so a
-    // too-old joiner fails with a clear "install the newer binary" message
-    // rather than an opaque post-compose app-hash mismatch. the served
-    // `required_min_version` is an unauthenticated hint (untrusted-server
-    // model): a lying value can at worst refuse-to-boot this joiner, never
-    // fork. inert on a baseline manifest.
-    if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
-        metrics.record_sync_failure(e.to_string());
-        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
-        tracing::error!(
-            event = "node_sync_refused",
-            role = "sync_only",
-            node = label,
-            stage = "protocol_preflight",
-            error = %e
-        );
-        eprintln!("[node {label}] SYNC REFUSED: {e}");
-        std::process::exit(1);
-    }
     if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
         metrics.record_sync_failure(e.to_string());
         metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);

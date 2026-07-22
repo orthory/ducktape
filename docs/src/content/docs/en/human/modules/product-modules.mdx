@@ -265,9 +265,8 @@ nodes to an account for authority, display, and authorship without collapsing
 consensus weight.
 
 Adding identity to a network that predates it is a module-set change like any
-other: the genesis app-hash moves, so an already-running network needs a
-coordinated rebuild — a lockstep upgrade across every validator, not a rolling
-one — to adopt it.
+other: the genesis app-hash moves, so an already-running network adopts it by
+re-genesis — there is no protocol versioning or rolling-upgrade path.
 
 The module stores public membership and binding state; custody of private
 member keys is a desktop-app concern layered on top through `bin/node`'s

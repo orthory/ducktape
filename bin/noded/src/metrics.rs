@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     ConsensusOperationalStatus, IndexOperationalStatus, NodeCommand, NodeHandle, NodePhase,
-    NodeRole, OperationalStatus, SyncOperationalStatus, UpgradeOperationalStatus, actor_gone,
+    NodeRole, OperationalStatus, SyncOperationalStatus, actor_gone,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,14 +89,6 @@ pub struct NodeMetrics {
     checkpoint_height: Registered<raw::Gauge>,
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
-    upgrade_current_version: Registered<raw::Gauge>,
-    upgrade_max_supported_version: Registered<raw::Gauge>,
-    upgrade_pending_version: Registered<raw::Gauge>,
-    upgrade_activation_height: Registered<raw::Gauge>,
-    upgrade_ready: Registered<raw::Gauge>,
-    upgrade_required: Registered<raw::Gauge>,
-    upgrade_local_ready: Registered<raw::Gauge>,
-    upgrade_armed: Registered<raw::Gauge>,
     operations: Arc<RwLock<OperationalStatus>>,
 }
 
@@ -197,38 +189,6 @@ impl NodeMetrics {
             index_height: context.family(
                 "ducktape_index_height",
                 "latest fully indexed height by bounded module id",
-            ),
-            upgrade_current_version: context.gauge(
-                "ducktape_upgrade_current_version",
-                "currently active node protocol version",
-            ),
-            upgrade_max_supported_version: context.gauge(
-                "ducktape_upgrade_max_supported_version",
-                "highest protocol version this running node binary can execute",
-            ),
-            upgrade_pending_version: context.gauge(
-                "ducktape_upgrade_pending_version",
-                "pending protocol version, or zero when none is scheduled",
-            ),
-            upgrade_activation_height: context.gauge(
-                "ducktape_upgrade_activation_height",
-                "pending upgrade activation height, or zero when none is scheduled",
-            ),
-            upgrade_ready: context.gauge(
-                "ducktape_upgrade_ready_validators",
-                "validators ready for the pending upgrade",
-            ),
-            upgrade_required: context.gauge(
-                "ducktape_upgrade_required_validators",
-                "validators required to arm the pending upgrade",
-            ),
-            upgrade_local_ready: context.gauge(
-                "ducktape_upgrade_local_ready",
-                "whether this boundary validator has committed readiness for the pending upgrade",
-            ),
-            upgrade_armed: context.gauge(
-                "ducktape_upgrade_armed",
-                "whether every required validator is ready for the pending upgrade",
             ),
             operations: Arc::new(RwLock::new(OperationalStatus {
                 phase_since: unix_seconds(),
@@ -406,27 +366,6 @@ impl NodeMetrics {
         status.storage.indexes = indexes;
     }
 
-    pub fn update_upgrade(&self, upgrade: UpgradeOperationalStatus) {
-        self.upgrade_current_version
-            .set(upgrade.current_version as i64);
-        self.upgrade_max_supported_version
-            .set(upgrade.max_supported_version as i64);
-        self.upgrade_pending_version
-            .set(upgrade.pending_version.unwrap_or_default() as i64);
-        self.upgrade_activation_height
-            .set(upgrade.activation_height.unwrap_or_default() as i64);
-        self.upgrade_ready.set(upgrade.ready_validators as i64);
-        self.upgrade_required
-            .set(upgrade.required_validators as i64);
-        self.upgrade_local_ready
-            .set(i64::from(upgrade.locally_ready.unwrap_or(false)));
-        self.upgrade_armed.set(i64::from(upgrade.armed));
-        self.operations
-            .write()
-            .expect("operations lock poisoned")
-            .upgrade = upgrade;
-    }
-
     fn record_finalized_now(&self) {
         let now = unix_seconds();
         self.last_finalized_at.set(now as i64);
@@ -485,17 +424,6 @@ mod tests {
             metrics.record_sync_retry("manifest unavailable");
             metrics.record_sync_progress(40);
             metrics.update_storage(36, true, [("chat", 39), ("files", 40)]);
-            metrics.update_upgrade(UpgradeOperationalStatus {
-                current_version: 1,
-                max_supported_version: 2,
-                pending_name: Some("v2".into()),
-                pending_version: Some(2),
-                activation_height: Some(50),
-                ready_validators: 3,
-                required_validators: 4,
-                locally_ready: Some(true),
-                armed: false,
-            });
 
             let status = metrics.operational_status();
             assert_eq!(status.role, NodeRole::Validator);
@@ -504,8 +432,6 @@ mod tests {
             assert_eq!(status.sync.as_ref().unwrap().applied_height, 40);
             assert_eq!(status.sync.as_ref().unwrap().retries, 1);
             assert!(status.storage.index_poisoned);
-            assert_eq!(status.upgrade.pending_version, Some(2));
-            assert_eq!(status.upgrade.locally_ready, Some(true));
 
             let scrape = context.encode();
             for sample in [
@@ -520,10 +446,6 @@ mod tests {
                 "ducktape_checkpoint_height 36",
                 r#"ducktape_index_height{module="files"} 40"#,
                 "ducktape_index_poisoned 1",
-                "ducktape_upgrade_pending_version 2",
-                "ducktape_upgrade_max_supported_version 2",
-                "ducktape_upgrade_local_ready 1",
-                "ducktape_upgrade_activation_height 50",
             ] {
                 assert!(scrape.contains(sample), "missing {sample:?}:\n{scrape}");
             }

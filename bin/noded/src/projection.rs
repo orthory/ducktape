@@ -284,14 +284,14 @@ mod tests {
     /// pre-extraction validator path (`bin/node`'s `block_actions`). Any change
     /// to the projection that shifts these bytes is a wire change to
     /// `GET /v1/blocks` and must be treated as one. Covers: applied member,
-    /// rejected member, System dispatch fold, multi-member block, op-frame v3
+    /// rejected member, System dispatch fold, multi-member block, envelope
     /// continuation row ordering, and the two empty-batch-no-row shapes
     /// (nop-only + System dispatch, and discarded-only).
     #[test]
     fn project_block_row_bytes_are_golden() {
         let blobs = BlobHandle::default();
         let member = dispatch("chat", b"member");
-        let system = dispatch("upgrade", b"system");
+        let system = dispatch("lifecycle", b"system");
         let frames = vec![
             // multi-member block: applied + rejected members, plus a System
             // dispatch folded into the block's dispatch stream (never a row).
@@ -323,7 +323,7 @@ mod tests {
                     continuation: None,
                 }),
             ),
-            // applied member carrying an applied continuation (op-frame v3): the
+            // applied member carrying an applied continuation (an envelope): the
             // continuation is its own row, right after its parent.
             drained(
                 4,

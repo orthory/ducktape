@@ -2,7 +2,7 @@
 //! the mesh BEFORE `network.start()` — the per-epoch engine-channel bank
 //! (cert/payload/black-holed lanes), the statesync channel pair, the
 //! reachability plane's STANDBY wiring (+ the tunnel-first join race, which
-//! since Join v2 §4 carries the GATE itself: the raced sealed intro is the
+//! since join ADR §4 carries the GATE itself: the raced sealed intro is the
 //! gate request and the acked `Admitted` is the authoritative admission),
 //! and the relay lane, ending with the `network.start()` call itself. `park`
 //! (phase 6b–6d) picks up everything this phase produced via
@@ -43,7 +43,7 @@ pub(super) struct ReplicaChannels {
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
-    /// the joiner's admission signal (Join v2 §4): set by the first-contact
+    /// the joiner's admission signal (join ADR §4): set by the first-contact
     /// task the moment a member's doorbell answers the gate with the
     /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
     /// retired `CHANNEL_LOBBY` gate FSM.
@@ -167,7 +167,7 @@ pub(super) async fn wire(
     // promotion reboot via the persisted mesh, start connected
     // instead of assembling. Without `wireguard_listen` the channel
     // just stays legal — black-hole.
-    // the joiner's TCP relay fallback endpoints (Join v2 item 2), derived
+    // the joiner's TCP relay fallback endpoints (join ADR item 2), derived
     // from the SAME ambient coordinator set before it moves into the plane
     // below. empty = fallback off.
     let mut relay_endpoints: Vec<String> = Vec::new();
@@ -226,7 +226,7 @@ pub(super) async fn wire(
             }
         }
     };
-    // the TUNNEL-FIRST join window, which since Join v2 §4 IS the join GATE:
+    // the TUNNEL-FIRST join window, which since join ADR §4 IS the join GATE:
     // an invite that carried a WireGuard bootstrap makes the tunnel the
     // join's carrier — before any p2p, (a) this node's interface gains the
     // INVITER as a peer (endpoint straight from the blob), and (b) an intro
@@ -451,7 +451,7 @@ pub(super) async fn wire(
 }
 
 /// TCP/443: the relay lane's deployed port — the one port every network
-/// forwards, which is the whole reason the lane exists (Join v2 item 2).
+/// forwards, which is the whole reason the lane exists (join ADR item 2).
 const RELAY_FALLBACK_PORT: u16 = 443;
 
 /// the relay endpoint derived from one coordinator ingress: SAME host,

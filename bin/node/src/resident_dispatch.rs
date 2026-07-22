@@ -617,7 +617,7 @@ format = "text"
                 // marker-less flat payloads post-flag-day. the test
                 // provisioner keeps the production-required workspace path.
                 payload: serde_json::json!({
-                    "ducktape_run": 3,
+                    "ducktape_run": 1,
                     "agent_id": "bot",
                     "run_id": "chat\u{1f}general\u{1f}1\u{1f}bot",
                     "agent_display_name": "BOT",

@@ -1,12 +1,11 @@
-# ADR: Join Protocol v2 — bearer invites, sealed doorbell, no lobby identity
+# ADR: Join Protocol — bearer invites, sealed doorbell, no lobby identity
 
 Date: 2026-07-17. Status: **Accepted — implemented** (§1–§5 all landed; merged
-to `dev` in PR #672, 2026-07-17). Supersedes the
-invite/gate half of [Join Protocol v1](./2026-07-13-join-protocol.mdx) — that
-ADR is now **HISTORICAL** for everything it says about targeted invites, the
-lobby channel, and the lobby transport identity.
+to `dev` in PR #672, 2026-07-17). Supersedes the earlier invitation-gated
+handshake ADR (2026-07-13), whose targeted invites, lobby channel, and lobby
+transport identity are gone from the tree.
 
-Join Protocol v2 makes three changes to how a node joins a Ducktape network,
+This protocol makes three changes to how a node joins a Ducktape network,
 each motivated by the same realization: an invite minted at member level never
 authenticated a *person*, only a key the inviter was handed. So the target lock
 bought nothing but blob-in-transit secrecy — which we now buy directly, with a

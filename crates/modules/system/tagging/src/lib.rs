@@ -432,7 +432,6 @@ mod tests {
                 consensus_time: 0,
                 origin,
                 me: "tagging".into(),
-                protocol_version: 0,
             }),
             |ctx, module| ctx.with_module_root(module, StateRoot::ZERO),
         )

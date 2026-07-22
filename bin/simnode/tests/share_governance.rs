@@ -9,10 +9,6 @@
 //!   — the load-bearing invariant — every proposal FREEZES its electorate, so
 //!   one opened in share mode stays account-decided even after the mode flips
 //!   back to validator ballots.
-//! - **the freed upgrade slot** (B8's other half): after a v2 upgrade arms, a
-//!   second upgrade to v3 takes the freed at-most-one slot and arms in turn; a
-//!   schedule whose `to_version` is not strictly greater than current is refused
-//!   by the upgrade module's monotonicity gate.
 //! - **kv under the preset**: kv registers only with `--with-valset`; a
 //!   set/get/overwrite round-trip, the no-delete reality, and a cheap
 //!   same-script-same-hash determinism pass.
@@ -125,18 +121,6 @@ fn proposal(sim: &Sim, id: &str) -> Value {
 
 fn shares_view(sim: &Sim) -> Value {
     sim.query("governance", json!("shares"))["shares"].clone()
-}
-
-fn upgrade_status(sim: &Sim) -> Value {
-    sim.query("upgrade", json!("status"))["status"].clone()
-}
-
-fn signal(name: &str, to_version: u64) -> Value {
-    json!({ "signal_ready": { "name": name, "to_version": to_version, "commitment": null } })
-}
-
-fn schedule(name: &str, activation_height: u64, to_version: u64) -> Value {
-    json!({ "schedule_upgrade": { "name": name, "activation_height": activation_height, "to_version": to_version } })
 }
 
 /// one filler block — advances the logical clock without touching membership.
@@ -400,88 +384,6 @@ fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
         settled["votes"][0][0],
         json!(acct_a),
         "keyed by the account id: {settled}"
-    );
-}
-
-// ── the freed upgrade slot + monotonicity ───────────────
-
-/// after a v2 upgrade arms at its boundary, the freed at-most-one slot accepts a
-/// second upgrade to v3, which arms in turn; and the upgrade module's
-/// monotonicity gate refuses a schedule whose to_version is not above current.
-#[test]
-fn a_second_upgrade_reuses_the_freed_slot_and_monotonicity_is_enforced() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, validators) = governed(storage.path());
-    let v0 = origin(&validators[0]);
-    let v1 = origin(&validators[1]);
-
-    // v2: authorize, every validator signals, boundary Advance arms it.
-    let activation = height(&sim) + 30;
-    pass(
-        &sim,
-        &[&v0, &v1],
-        "sched-v2",
-        schedule("v2", activation, 2),
-        1_000_000,
-    );
-    for v in &validators {
-        sim.submit_ok("upgrade", signal("v2", 2), Some(origin(v).as_str()));
-    }
-    walk_to(&sim, activation);
-    let st = upgrade_status(&sim);
-    assert_eq!(st["current_version"], 2, "v2 armed: {st}");
-    assert!(st["pending"].is_null(), "the at-most-one slot freed: {st}");
-
-    // v3: the freed slot accepts a second schedule; full readiness arms it.
-    let activation2 = height(&sim) + 30;
-    pass(
-        &sim,
-        &[&v0, &v1],
-        "sched-v3",
-        schedule("v3", activation2, 3),
-        1_000_000,
-    );
-    let st = upgrade_status(&sim);
-    assert!(
-        st["pending"].is_object(),
-        "the freed slot took the second upgrade: {st}"
-    );
-    assert_eq!(st["current_version"], 2, "not yet armed: {st}");
-    for v in &validators {
-        sim.submit_ok("upgrade", signal("v3", 3), Some(origin(v).as_str()));
-    }
-    let st = upgrade_status(&sim);
-    assert_eq!(
-        st["ready_count"], 3,
-        "R=n readiness on the second upgrade: {st}"
-    );
-    assert_eq!(st["armed"], true, "the second verdict arms: {st}");
-    walk_to(&sim, activation2);
-    let st = upgrade_status(&sim);
-    assert_eq!(
-        st["current_version"], 3,
-        "the second boundary armed v3: {st}"
-    );
-    assert!(st["pending"].is_null(), "and freed the slot again: {st}");
-
-    // monotonicity: a schedule to_version 3 (not ABOVE current 3) is authorized by
-    // governance but refused by the upgrade module when the emitted Schedule
-    // drains — aborting the execute block with the gate's exact string.
-    let activation3 = height(&sim) + 30;
-    propose(
-        &sim,
-        v0.as_str(),
-        "mono",
-        schedule("v3-again", activation3, 3),
-        1_000_000,
-    );
-    vote(&sim, v0.as_str(), "mono", true);
-    vote(&sim, v1.as_str(), "mono", true);
-    let error = execute_rejected(&sim, v0.as_str(), "mono");
-    assert!(
-        error.contains("upgrade to_version 3 must exceed current_version 3")
-            && error.contains("(monotonic)"),
-        "the monotonicity gate refuses a non-increasing schedule: {error}"
     );
 }
 

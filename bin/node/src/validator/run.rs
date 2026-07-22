@@ -13,9 +13,8 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use recovery::Manifest;
 
-use super::announce::{CapabilityAnnouncer, ReadinessSignaller};
-use crate::constants::{DRAIN_TICK, MAX_PROTOCOL_VERSION};
-use crate::host_reads::read_upgrade_version_fields;
+use super::announce::CapabilityAnnouncer;
+use crate::constants::DRAIN_TICK;
 use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
 use crate::sync::serve::SyncStateRequest;
@@ -31,7 +30,7 @@ pub(super) type ValidatorNode = node::OrderedNode<
 /// §3.2). the member submitted the redemption and holds the joiner's outcome
 /// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
 /// the settle-then-answer seam, mirroring `pending_relays`. no mesh `peer`
-/// rides here any more (Join v2 §4): the answer goes back over the tunnel
+/// rides here any more (join ADR §4): the answer goes back over the tunnel
 /// doorbell, read from the shared map on the joiner's next retransmit.
 struct GatePending {
     /// the joiner key: clears the `gating` in-flight index and keys the
@@ -44,7 +43,7 @@ struct GatePending {
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
-/// shared map the joiner's next retransmit is answered from (Join v2 §4).
+/// shared map the joiner's next retransmit is answered from (join ADR §4).
 fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroReply) {
     outcomes
         .lock()
@@ -71,7 +70,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
-    /// the join GATE's forward lane from the intro doorbell (Join v2 §4):
+    /// the join GATE's forward lane from the intro doorbell (join ADR §4):
     /// verified gate requests the reachability plane rang through.
     pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
     /// a never-sending clone of the forward lane's sender, held so the select
@@ -169,15 +168,12 @@ struct ValidatorRuntime<'a> {
     last_crank: std::time::SystemTime,
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
-    signaller: ReadinessSignaller,
     code_signaller: super::code_announce::CodeReadinessSignaller,
     /// completed pending-swap code fetches, reaped at each readiness pump so
     /// a failed fetch retries next tick (the sender rides in each task).
     fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
     announcer: CapabilityAnnouncer,
-    upgrade_armed_latch: Option<(String, u32)>,
-    upgrade_pending_seen: Option<String>,
     next_drain: std::time::SystemTime,
 }
 
@@ -354,17 +350,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         sandbox_capacity.clone(),
     );
     let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
-    // the readiness self-signaller: polls COMMITTED upgrade state between drains
-    // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
-    // this binary can execute. survives restart/late-join (state-driven, not a
-    // one-shot effect). inert before the module is registered.
-    let signaller = ReadinessSignaller::new(
-        MAX_PROTOCOL_VERSION,
-        signer.public_key().as_ref().to_vec(),
-    );
-    // the CODE readiness self-signaller: the byte-receipt twin of the
-    // above for pending modreg swaps — verifies (or fetches) the committed
-    // component bytes and emits one truthful `SignalReady` per swap.
+    // the CODE readiness self-signaller for pending code swaps — verifies (or
+    // fetches) the committed component bytes and emits one truthful
+    // `SignalReady` per swap.
     let code_signaller =
         super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
     let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -376,16 +364,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         my_capabilities,
         sandbox_capacity,
     );
-    // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
-    // modeled on the `converged` latch: `upgrade armed …` fires when readiness
-    // first reaches R==n (every current boundary member signaled) for the
-    // pending upgrade — the pre-boundary observable the e2e keys on; `upgrade
-    // cleared …` fires when a previously-observed pending clears (the boundary
-    // `Advance` reconciliation at H, on ARM or ABORT). the boundary crossing
-    // itself prints the `upgrade activated …` / `upgrade aborted …` verdict.
-    let upgrade_armed_latch: Option<(String, u32)> = None;
-    let upgrade_pending_seen: Option<String> = None;
-
     // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
     // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
     // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
@@ -469,13 +447,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_crank,
         last_nudge,
         workers,
-        signaller,
         code_signaller,
         fetch_done_tx,
         fetch_done_rx,
         announcer,
-        upgrade_armed_latch,
-        upgrade_pending_seen,
         next_drain: context.current() + DRAIN_TICK,
     };
 
@@ -567,7 +542,6 @@ async fn graceful_checkpoint(
 ) {
     if let Some(f) = node.finalized() {
         let pos = node.sink_mut().oplog_pos().await;
-        let (cv, pu) = read_upgrade_version_fields(node.host()).await;
         if let Ok(manifest) = Manifest::capture(
             node.host(),
             Some(f.height),
@@ -578,8 +552,6 @@ async fn graceful_checkpoint(
             orchestrator
                 .pending_cutover()
                 .map(|cutover| cutover.cutover_view()),
-            cv,
-            pu,
             pos,
             next_seq,
         ) {

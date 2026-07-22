@@ -28,8 +28,10 @@ follow-up op로 drain한다.
   node e2e suite는 joiner가 live state-sync wire로 모든 module을 재구축해
   source app-hash에 도달함을 증명한다.
 - dynamic valset wiring, live admission, restart recovery, video huddle,
-  no-downtime upgrade module은 구현되어 있다. 남은 일은 주로 product depth,
-  demotion behavior, replay nonce, WireGuard runtime wiring이다.
+  module code-swap registry는 구현되어 있다. protocol versioning은 없다:
+  아직 live network가 없으므로 breaking change는 re-genesis로 처리한다.
+  남은 일은 주로 product depth, demotion behavior, replay nonce,
+  WireGuard runtime wiring이다.
 
 ## 다음에 읽을 문서
 

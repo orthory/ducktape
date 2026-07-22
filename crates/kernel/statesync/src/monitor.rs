@@ -195,9 +195,6 @@ mod tests {
             participants: vec![],
             residents: vec![],
             floor_cert: None,
-            current_version: 1,
-            pending_upgrade: None,
-            required_min_version: 1,
             state_schema: [0u8; 32],
             entries: vec![],
         }

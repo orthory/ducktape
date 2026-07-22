@@ -22,7 +22,7 @@ pub(crate) enum IntroPath {
 /// verify → install → ack, in that order — the ack is only emitted after the
 /// `InstallInvitePeer` reply settles, so "acked" can never outrun
 /// "installed". The datagram arrives SEALED to this member's WireGuard X25519
-/// key (Join Protocol v2, item 5): a bearer token never crosses the wire in
+/// key (join ADR, item 5): a bearer token never crosses the wire in
 /// the clear, so `open` decrypts it with the member's secret before anything
 /// else. `ack` abstracts the reply transport (the direct listener answers on
 /// its own socket, the coordinated receiver via `SendResolverDatagram`).
@@ -719,7 +719,7 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
         persist_file: Some(mesh_state_file),
-        // the derived lobby transport identity is RETIRED (Join v2 §4): a
+        // the derived lobby transport identity is RETIRED (join ADR §4): a
         // joiner's gossip arrives under its REAL key — the mesh re-track at
         // its Redeem grant is what admits it.
         gossip_ingress: None,

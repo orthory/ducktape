@@ -1991,7 +1991,7 @@ format = "text"
     /// a v3 duckfs run envelope — the shape the composer emits for every run.
     fn envelope_payload() -> Vec<u8> {
         serde_json::json!({
-            "ducktape_run": 3,
+            "ducktape_run": 1,
             "agent_id": "bot",
             "run_id": "chat\u{1f}general\u{1f}7\u{1f}bot",
             "agent_display_name": "BOT",
@@ -2058,7 +2058,7 @@ format = "text"
         assert!(ctx.cancellation.is_some());
     }
 
-    // ---- the portable (v3) provisioning bracket -----------------------------
+    // ---- the portable provisioning bracket ----------------------------------
 
     /// the same v3 duckfs envelope, named for the provisioning-bracket tests.
     fn v3_envelope_payload() -> Vec<u8> {
@@ -2070,7 +2070,7 @@ format = "text"
     /// forge workspace, `context`, requested-Pr sink WITHOUT title/body keys.
     fn forge_envelope_payload() -> Vec<u8> {
         serde_json::json!({
-            "ducktape_run": 3,
+            "ducktape_run": 1,
             "agent_id": "bot",
             "run_id": "chat\u{1f}forge:app:7\u{1f}2\u{1f}bot",
             "agent_display_name": "BOT",

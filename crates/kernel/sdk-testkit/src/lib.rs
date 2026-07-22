@@ -68,7 +68,6 @@ impl TestCtx {
             consensus_time: height,
             origin: Origin::System,
             me: "test".into(),
-            protocol_version: 0,
         })
     }
 

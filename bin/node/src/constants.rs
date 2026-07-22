@@ -1,18 +1,8 @@
 use std::time::Duration;
 
-// the consensus signature scheme is V1 ed25519, the only wired variant — see
+// the consensus signature scheme is ed25519, the only wired variant — see
 // `consensus::ConsensusScheme`'s rekey/respawn contract for what a scheme
 // migration would take (an epoch teardown-respawn, not a constant flip).
-/// the highest protocol version THIS binary's dual-path modules can execute — a
-/// per-node BUILD constant, NEVER consensus state (a lying value can only
-/// refuse-to-boot or halt this one node, never fork the network). the
-/// `ReadinessSignaller` truthfully signals readiness iff the numeric version and
-/// any named route commitment are implemented by this binary; the boot preflight
-/// refuses a boundary whose `required_min_version` exceeds it. Phase 9 raised
-/// this to 2 when the forge v2 dual path landed; the staged-admission resident
-/// tier raised it to 3 — this binary can execute a scheduled `to_version=3`
-/// (valset/governance resident ops, gated below 3) and truthfully `SignalReady`.
-pub(crate) const MAX_PROTOCOL_VERSION: u32 = 3;
 /// the module-code fetch cap: the largest content-addressed code artifact (a
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a
@@ -105,10 +95,10 @@ pub(crate) const CHANNEL_SUBMIT_RELAY: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 pub(crate) const CHANNEL_STATE_SYNC: u64 = 4;
-// channel 5 was CHANNEL_LOBBY — the pre-v2 join-gate mesh lane (a joiner
-// connected as the derived lobby identity and spoke `GateMsg` here). Join
-// Protocol v2 rides the gate over the WireGuard-tunnel intro doorbell instead
-// (docs/adr/2026-07-17-join-protocol-v2.mdx §4). the number stays RESERVED:
+// channel 5 was CHANNEL_LOBBY — the retired join-gate mesh lane (a joiner
+// connected as a derived lobby identity and spoke `GateMsg` here). the join
+// protocol rides the gate over the WireGuard-tunnel intro doorbell instead
+// (docs/adr/2026-07-17-join-protocol.mdx §4). the number stays RESERVED:
 // never assign 5 to a new lane.
 /// the reachability channel: members gossip WireGuard endpoint records and
 /// signed advertisements and run the tunnel-upgrade handshake here (the
@@ -143,9 +133,8 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// the topology's own tests pin the selection to today's 20.
 ///
 /// A module here is in the app-hash: every node must run it, agree on its root
-/// at every height, and keep doing so forever (the height-gated upgrade path
-/// flips `protocol_version` only — it cannot change the module SET). Experiments
-/// therefore live unwired in `crates/labs` and appear in no genesis set.
+/// at every height, and keep doing so forever. Experiments therefore live
+/// unwired in `crates/labs` and appear in no genesis set.
 pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;
 
 /// Canonical committed-state revisions for the production module set.
@@ -190,7 +179,9 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // noded/simnode/demo keep composing the NATIVE `Files`, which is
     // root-identical, so they never diverge.
     ("files", 1),
-    ("forge", 1),
+    // 2: the root domain + snapshot magic reset to v1 tags (no-versioning
+    // sweep) — the preimage bytes changed.
+    ("forge", 2),
     // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
     // revision 3 folds the `.duck` handle registry (the retired `duckdns`
     // module's plane) into the same host-KV snapshot under one root — a
@@ -205,9 +196,9 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // — a state-schema break from revision 2 (beta re-genesis, no shim).
     ("identity", 3),
     ("inbox", 2),
-    // 1: the native lifecycle module (merged upgrade + modreg): protocol-version
-    // coordination + the module code registry, one app-hashed root.
-    ("lifecycle", 1),
+    // 2: the module code registry alone — the protocol-version half (and its
+    // snapshot section) was removed with the no-versioning reset.
+    ("lifecycle", 2),
     // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
     // 3: the wasm adapter port — the native canonical snapshot (itself at
@@ -253,14 +244,3 @@ pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     (base, base + 1, base + 2, base + 3, base + 4)
 }
 
-// raising `MAX_PROTOCOL_VERSION` past the admission activation version is the
-// deliberate act that turns post-genesis module ADMISSION on network-wide.
-// it must not happen before recovery/state-sync can recompose an admitted
-// module's ACCUMULATED state — today's composers enumerate a fixed module set
-// (see `host_state::ProductionModules`), so a restarting node or a fresh
-// joiner would fail closed on the first post-admission checkpoint. whoever
-// removes this assert is claiming that restore half now exists.
-const _: () = assert!(
-    MAX_PROTOCOL_VERSION < lifecycle::ADMISSION_ACTIVATION_VERSION,
-    "land the admitted-module restore/state-sync path before crossing the admission boundary"
-);

@@ -87,7 +87,7 @@ use futures::{StreamExt as _, pin_mut};
 
 use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_batch};
-use sdk::{ModuleId, StateRoot, UpgradeCoords};
+use sdk::{ModuleId, StateRoot};
 
 /// Stable machine-readable marker consumed by the native shell when a node
 /// refuses a clean-break-incompatible workspace.
@@ -106,30 +106,26 @@ pub struct IncompatibleStateSchema {
 }
 
 /// Compare a persisted schema fingerprint with the binary's production
-/// schema. `None` names the exact legacy manifest format that predates this
-/// fence.
+/// schema.
 pub fn check_state_schema(
-    found: Option<[u8; 32]>,
+    found: [u8; 32],
     expected: [u8; 32],
 ) -> Result<(), IncompatibleStateSchema> {
-    if found == Some(expected) {
+    if found == expected {
         return Ok(());
     }
     Err(IncompatibleStateSchema {
-        expected: FingerprintDisplay(Some(expected)),
+        expected: FingerprintDisplay(expected),
         found: FingerprintDisplay(found),
     })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct FingerprintDisplay(Option<[u8; 32]>);
+struct FingerprintDisplay([u8; 32]);
 
 impl std::fmt::Display for FingerprintDisplay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Some(bytes) = self.0 else {
-            return f.write_str("legacy/unversioned");
-        };
-        for byte in bytes {
+        for byte in self.0 {
             write!(f, "{byte:02x}")?;
         }
         Ok(())
@@ -202,9 +198,6 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn put_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     sdk::codec::push_bytes(out, b);
@@ -445,22 +438,9 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
-    /// the agreed protocol version active at this boundary. an UNAUTHENTICATED
-    /// preflight hint — the authority stays the replayed upgrade-module state,
-    /// confirmed by the final app-hash compose.
-    pub current_version: u32,
-    /// the single upgrade armed but not yet activated at checkpoint time, if
-    /// any — the version analogue of `pending_cutover_view`.
-    pub pending_upgrade: Option<UpgradeCoords>,
-    /// the highest protocol version any block at or after this boundary needs
-    /// (`pending.to_version` once `height >= pending.activation_height`, else
-    /// `current_version`). the boot preflight compares the local build's
-    /// `MAX_PROTOCOL_VERSION` against this and refuses EARLY when it is lower.
-    pub required_min_version: u32,
     /// Fingerprint of the exact ordered module/state-schema set that produced
-    /// this checkpoint. `None` decodes only legacy manifests written before
-    /// the clean-break fence existed; preflight rejects them actionably.
-    pub state_schema: Option<[u8; 32]>,
+    /// this checkpoint.
+    pub state_schema: [u8; 32],
 }
 
 impl Manifest {
@@ -492,21 +472,8 @@ impl Manifest {
         }
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
-        put_u32(&mut out, self.current_version);
-        match &self.pending_upgrade {
-            Some(u) => {
-                out.push(1);
-                put_bytes(&mut out, u.name.as_bytes());
-                put_u64(&mut out, u.activation_height);
-                put_u32(&mut out, u.to_version);
-            }
-            None => out.push(0),
-        }
-        put_u32(&mut out, self.required_min_version);
         put_keys(&mut out, &self.residents);
-        if let Some(fingerprint) = self.state_schema {
-            out.extend_from_slice(&fingerprint);
-        }
+        out.extend_from_slice(&self.state_schema);
         out
     }
 
@@ -538,31 +505,8 @@ impl Manifest {
         }
         let oplog_pos = c.u64("oplog pos")?;
         let next_seq = c.u64("next seq")?;
-        let current_version = c.u32("current version")?;
-        let pending_upgrade = match c.byte("pending-upgrade tag")? {
-            0 => None,
-            1 => {
-                let name = c.string("upgrade name")?;
-                let activation_height = c.u64("activation height")?;
-                let to_version = c.u32("to version")?;
-                Some(UpgradeCoords {
-                    name,
-                    activation_height,
-                    to_version,
-                })
-            }
-            t => return Err(Error::Corrupt(format!("bad pending-upgrade tag {t}"))),
-        };
-        let required_min_version = c.u32("required min version")?;
         let residents = get_keys(&mut c)?;
-        // The exact EOF after `residents` is the pre-schema-manifest format.
-        // Preserve that distinction so boot reports an incompatible workspace,
-        // not damaged/truncated storage. A partial new trailer is corruption.
-        let state_schema = if c.remaining() == 0 {
-            None
-        } else {
-            Some(c.array::<32>("state schema fingerprint")?)
-        };
+        let state_schema = c.array::<32>("state schema fingerprint")?;
         c.finish("manifest")?;
         Ok(Self {
             height,
@@ -576,9 +520,6 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
-            current_version,
-            pending_upgrade,
-            required_min_version,
             state_schema,
         })
     }
@@ -611,8 +552,6 @@ impl Manifest {
         participants: Vec<Vec<u8>>,
         residents: Vec<Vec<u8>>,
         pending_cutover_view: Option<u64>,
-        current_version: u32,
-        pending_upgrade: Option<UpgradeCoords>,
         oplog_pos: u64,
         next_seq: u64,
     ) -> Result<Self, Error> {
@@ -637,12 +576,6 @@ impl Manifest {
                 _ => None,
             })
             .collect();
-        let required_min_version = sdk::required_min_version(
-            current_version,
-            pending_upgrade.as_ref(),
-            // genesis has no boundary yet; 0 is a placeholder height there.
-            height.unwrap_or(0),
-        );
         Ok(Self {
             height,
             epoch,
@@ -655,20 +588,8 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
-            current_version,
-            pending_upgrade,
-            required_min_version,
-            state_schema: Some(host.state_schema_fingerprint()),
+            state_schema: host.state_schema_fingerprint(),
         })
-    }
-
-    /// boot preflight: fail loud when the local build's `max_supported`
-    /// protocol version is below this boundary's `required_min_version`,
-    /// turning an opaque post-replay app-hash mismatch into an early,
-    /// actionable "height needs binary vX" refusal. every resume path runs
-    /// it (replica park, sync-only boot, validator boot).
-    pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
-        sdk::check_required_version(self.required_min_version, max_supported)
     }
 
     /// Clean-break state-schema preflight. Call this before opening or
@@ -1239,11 +1160,9 @@ where
         // replaying only STRICTLY above it. exact-match only: a disk module whose
         // live root matches NO recorded post-root keeps no floor and still
         // fail-stops as `Error::Torn` below (genuine corruption / a torn write) —
-        // recovery never heals from a nearest/approximate record. the disk cohort
-        // is single-path (no ResolverBacked module overrides `set_active_version`),
-        // so `root()` is version-independent and needs no version selector here;
-        // were that to change, a mis-read root could only mis-seed a floor and
-        // trip the final app-hash recompose (fail-stop), never fork.
+        // recovery never heals from a nearest/approximate record. a mis-read
+        // root could only mis-seed a floor and trip the final app-hash
+        // recompose (fail-stop), never fork.
         let disk_cohort = host.resolver_backed_ids();
         let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
         if !disk_cohort.is_empty() {
@@ -1330,21 +1249,8 @@ where
                             "seal height {height} does not match its block record {block_height}"
                         )));
                     }
-                    // VERSION-AWARE REPLAY (fork-critical): restore the boundary
-                    // version for THIS height BEFORE any `root()` read below — both
-                    // the at_pre/at_post branch decision AND the post-apply
-                    // verification branch a dual-path module's `root()` on
-                    // `active_version`, so it must equal what the live node held at
-                    // `height` or replay recomputes a different root across H.
-                    // derived the SAME pure way `Host::effective_version` does, from
-                    // the replayed committed upgrade state.
-                    // the block's OWN effective version — the value the live node
-                    // dispatched and sealed under. this is what `apply_block` stamps
-                    // and what the post-apply verification (and the at_post
-                    // already-applied check) must read `root()` under.
-                    let protocol_version = host.effective_version(height).await;
                     // the modules this block CHANGED: the replay unit. a pure
-                    // comparison of RECORDED root values — version-independent.
+                    // comparison of RECORDED root values.
                     let changed: Vec<(ModuleId, StateRoot)> = roots
                         .iter()
                         .filter(|(id, root)| expected.get(id) != Some(root))
@@ -1372,23 +1278,14 @@ where
                             }
                         }
                     } else {
-                        // the PRE-apply state was sealed under the PREVIOUS height's
-                        // effective version — it differs from this block's version
-                        // ONLY at an activation boundary H, where a dual-path
-                        // `root()` switches algorithm. check "still at the pre-block
-                        // roots?" under it; check "already at the sealed post-roots?"
-                        // (a disk substrate that applied H before the crash) under
-                        // this block's version. at the boundary the two checks need
-                        // DIFFERENT selectors — evaluate each under its own.
-                        let pre_version =
-                            host.effective_version(height.saturating_sub(1)).await;
-                        // classify each CHANGED module once, under its own selector.
-                        host.set_active_version(pre_version);
+                        // classify each CHANGED module once: "still at the
+                        // pre-block roots?" vs "already at the sealed post-roots?"
+                        // (a disk substrate that applied this block before the
+                        // crash).
                         let at_pre_of: Vec<bool> = changed
                             .iter()
                             .map(|(id, _)| host.module_root(id) == expected.get(id).copied())
                             .collect();
-                        host.set_active_version(protocol_version);
                         let at_post_of: Vec<bool> = changed
                             .iter()
                             .map(|(id, root)| host.module_root(id) == Some(*root))
@@ -1426,7 +1323,6 @@ where
                                 host,
                                 height,
                                 &frame,
-                                protocol_version,
                                 Some(disposition),
                                 code_source.as_ref(),
                             )
@@ -1462,12 +1358,8 @@ where
                             let mut commit_only: BTreeSet<ModuleId> = BTreeSet::new();
                             let mut durable = 0usize;
                             for (i, (id, _root)) in changed.iter().enumerate() {
-                                // the split selectors were evaluated above:
-                                // `at_pre_of` under the PREVIOUS height's version,
-                                // `at_post_of` under THIS block's; `ahead_of` from
-                                // the exact-match forward floor. a rolled-back
-                                // in-memory module is at pre; a disk substrate at or
-                                // past its post-root is durable.
+                                // a rolled-back in-memory module is at pre; a disk
+                                // substrate at or past its post-root is durable.
                                 if at_pre_of[i] {
                                     commit_only.insert(id.clone());
                                 } else if at_post_of[i] || ahead_of[i] {
@@ -1475,9 +1367,6 @@ where
                                 }
                                 // else: neither — genuine damage, caught below.
                             }
-                            // re-execute and verify under this block's version,
-                            // matching the all_pre replay path above.
-                            host.set_active_version(protocol_version);
                             // MULTI-DISK atomicity limit — fail-stop EXPLICITLY.
                             // only a per-block-durable disk substrate can be
                             // durable after a crash (the in-memory cohort always
@@ -1522,7 +1411,6 @@ where
                                 host,
                                 height,
                                 &frame,
-                                protocol_version,
                                 Some(disposition),
                                 &commit_only,
                                 code_source.as_ref(),
@@ -1577,25 +1465,17 @@ where
         // seal it NOW from the observed outcome.
         let mut rolled_forward = false;
         if let Some((height, frame)) = pending {
-            // version-aware replay: same split-selector restore as the sealed path
-            // above — the at_pre comparison reads `root()` under the PREVIOUS
-            // height's version, the roll-forward + seal under this block's version.
-            let protocol_version = host.effective_version(height).await;
-            let pre_version = host.effective_version(height.saturating_sub(1)).await;
-            host.set_active_version(pre_version);
             let moved: BTreeSet<ModuleId> = host
                 .module_roots()
                 .iter()
                 .filter(|(id, root)| expected.get(id) != Some(root))
                 .map(|(id, _)| id.clone())
                 .collect();
-            host.set_active_version(protocol_version);
             let disposition = if moved.is_empty() {
                 let (disposition, dispatches) = apply_block(
                     host,
                     height,
                     &frame,
-                    protocol_version,
                     None,
                     code_source.as_ref(),
                 )
@@ -1643,7 +1523,6 @@ where
                         host,
                         height,
                         &frame,
-                        protocol_version,
                         None,
                         &commit_only,
                         code_source.as_ref(),
@@ -1702,19 +1581,12 @@ where
             rolled_forward = true;
         }
 
-        // final belt-and-suspenders: drive every dual-path module's branch
-        // selector to the TIP's effective version before the app-hash check, so a
-        // replay whose tail blocks were all skipped (disk substrates already held
-        // them) or a genesis boot with no journal suffix still evaluates `root()`
-        // at the correct boundary version. no-op below an activation boundary.
         if let Some(h) = tip_height {
-            let v = host.effective_version(h).await;
-            host.set_active_version(v);
-            // the code-space twin: reconcile running module code to the committed
-            // registry at the tip, so a checkpoint AT (or past) a swap boundary —
-            // no replayed frame to realize through — still boots on the committed
-            // code instead of serving stale genesis components until the next
-            // live block. idempotent; fail-closed on missing/tampered bytes.
+            // reconcile running module code to the committed registry at the
+            // tip, so a checkpoint AT (or past) a swap boundary — no replayed
+            // frame to realize through — still boots on the committed code
+            // instead of serving stale genesis components until the next live
+            // block. idempotent; fail-closed on missing/tampered bytes.
             host.realize_module_swaps(h, code_source.as_ref())
                 .await
                 .map_err(|e| {
@@ -1757,12 +1629,11 @@ async fn apply_block(
     host: &mut Host,
     height: u64,
     frame: &[u8],
-    protocol_version: u32,
     expect: Option<Disposition>,
     code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     let (disposition, dispatches) =
-        replay_batch(host, height, frame, protocol_version, None, code_source).await?;
+        replay_batch(host, height, frame, None, code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1782,13 +1653,12 @@ async fn apply_block_committing(
     host: &mut Host,
     height: u64,
     frame: &[u8],
-    protocol_version: u32,
     expect: Option<Disposition>,
     commit_only: &BTreeSet<ModuleId>,
     code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     let (disposition, dispatches) =
-        replay_batch(host, height, frame, protocol_version, Some(commit_only), code_source).await?;
+        replay_batch(host, height, frame, Some(commit_only), code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1812,35 +1682,31 @@ async fn apply_block_committing(
 /// applied member's dispatches in member order, then the once-per-block System
 /// injections) for the [`ReplaySink`] fold.
 ///
-/// `protocol_version` is the PURE `effective_version(height)` over the REPLAYED
-/// committed upgrade state — the identical value the live node stamped, never the
-/// old baseline (which would fork a dual-path module's `root()` at/after an
-/// activation boundary). `ctx.origin` is unused on the batch path: each member
 /// the module ids a frame's decodable members DIRECTLY target — the trailing
 /// roll-forward's backstop widener: a moved module whose member re-executes
 /// as a duplicate-reject on its own post-state records no dispatch, but the
 /// frame still explains it. undecodable members target nothing
-/// (deterministic no-ops live and on replay alike). decodes either codec
-/// ([`node::decode_frame_any`]) and includes a v3 envelope's continuation
-/// target beside its parent's: a released continuation moves ITS module in
-/// the same block, and a widener may only over-explain, never under-explain.
+/// (deterministic no-ops live and on replay alike). includes an envelope's
+/// continuation target beside its parent's: a released continuation moves ITS
+/// module in the same block, and a widener may only over-explain, never
+/// under-explain.
 fn frame_targets(frame: &[u8]) -> BTreeSet<ModuleId> {
     let Ok(members) = decode_batch(frame) else {
         return BTreeSet::new();
     };
     members
         .iter()
-        .filter_map(|m| node::decode_frame_any(m).ok())
+        .filter_map(|m| node::decode_frame(m).ok())
         .flat_map(|(_, msg, cont)| std::iter::once(msg.target).chain(cont.map(|c| c.target)))
         .collect()
 }
 
-/// carries its own origin, which the host stamps into that member's `Env`.
+/// `ctx.origin` is unused on the batch path: each member carries its own
+/// origin, which the host stamps into that member's `Env`.
 async fn replay_batch(
     host: &mut Host,
     height: u64,
     frame: &[u8],
-    protocol_version: u32,
     commit_only: Option<&BTreeSet<ModuleId>>,
     code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
@@ -1857,8 +1723,8 @@ async fn replay_batch(
     let Ok(members) = decode_batch(frame) else {
         return Ok((Disposition::Rejected, Vec::new()));
     };
-    // decode exactly as the live drain does — a journaled v3 frame replays
-    // WITH its continuation (dropping it would fork the replayed app-hash).
+    // decode exactly as the live drain does — a journaled frame replays WITH
+    // its continuation (dropping it would fork the replayed app-hash).
     let mut ops = Vec::new();
     for member in &members {
         if let Ok(op) = node::decode_member(member) {
@@ -1866,7 +1732,6 @@ async fn replay_batch(
         }
     }
     let ctx = BlockContext {
-        protocol_version,
         height,
         consensus_time: height,
         origin: sdk::Origin::System,
@@ -2008,50 +1873,27 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
-            current_version: 0,
-            pending_upgrade: None,
-            required_min_version: 0,
-            state_schema: Some([0xAB; 32]),
+            state_schema: [0xAB; 32],
         }
     }
 
     #[test]
     fn manifest_roundtrip() {
-        // defaults for the version tail.
         let m = sample_manifest();
         let decoded = Manifest::decode(&m.encode()).expect("roundtrip");
         assert_eq!(decoded, m);
         assert_eq!(decoded.snapshot("directory"), Some(b"dir-bytes".as_ref()));
         assert_eq!(decoded.root("valset"), Some(StateRoot([3; 32])));
-
-        // non-default version tail, with a pending upgrade set.
-        let m = Manifest {
-            current_version: 3,
-            pending_upgrade: Some(UpgradeCoords {
-                name: "v4".into(),
-                activation_height: 100,
-                to_version: 4,
-            }),
-            required_min_version: 3,
-            ..sample_manifest()
-        };
-        assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
     }
 
     #[test]
-    fn legacy_manifest_decodes_for_actionable_schema_preflight() {
-        let current = sample_manifest();
-        let mut legacy = current.clone();
-        legacy.state_schema = None;
-        let decoded = Manifest::decode(&legacy.encode()).expect("legacy shape is classifiable");
-        assert_eq!(decoded.state_schema, None);
-
+    fn schema_mismatch_clean_breaks_with_actionable_error() {
+        let decoded = Manifest::decode(&sample_manifest().encode()).expect("roundtrip");
         let error = decoded
-            .preflight_state_schema([0xAB; 32])
-            .expect_err("legacy schema must clean-break");
+            .preflight_state_schema([0xCD; 32])
+            .expect_err("mismatched schema must clean-break");
         let message = error.to_string();
         assert!(message.contains(STATE_SCHEMA_INCOMPATIBLE_MARKER));
-        assert!(message.contains("legacy/unversioned"));
         assert!(message.contains("workspace data was not modified"));
     }
 
@@ -2060,8 +1902,8 @@ mod tests {
         let revision_one = host::state_schema_fingerprint([("runs", 1)]);
         let revision_two = host::state_schema_fingerprint([("runs", 2)]);
         assert_ne!(revision_one, revision_two);
-        assert!(check_state_schema(Some(revision_two), revision_two).is_ok());
-        assert!(check_state_schema(Some(revision_one), revision_two).is_err());
+        assert!(check_state_schema(revision_two, revision_two).is_ok());
+        assert!(check_state_schema(revision_one, revision_two).is_err());
     }
 
     #[test]
@@ -2076,67 +1918,23 @@ mod tests {
     }
 
     #[test]
-    fn manifest_decode_rejects_old_format() {
-        // pre-field on-disk checkpoints are no longer tolerated: a checkpoint
-        // truncated at `next_seq` (before the version fields) or at
-        // `required_min_version` (before the resident set) must fail loud —
-        // the node resyncs instead of booting on silent defaults.
+    fn manifest_decode_rejects_truncated_tail() {
+        // a checkpoint truncated before the schema fingerprint, or torn inside
+        // it, must fail loud — the node resyncs instead of booting on silent
+        // defaults.
         let m = Manifest {
             residents: vec![],
             ..sample_manifest()
         };
         let full = m.encode();
-        // the tails are `u32 current + 1-byte pending tag(None) + u32 required`
-        // = 9 bytes, then the empty resident keys = 8 bytes.
-        assert!(Manifest::decode(&full[..full.len() - 17]).is_err());
-        assert!(Manifest::decode(&full[..full.len() - 8]).is_err());
-    }
-
-    #[test]
-    fn manifest_decode_rejects_truncated_version_tail() {
-        // a torn tail (mid-field truncation) fails loud too. drop the whole
-        // (empty) resident section — 8 bytes — plus half the required_min u32
-        // to tear inside the version fields.
-        let m = Manifest {
-            residents: vec![],
-            ..sample_manifest()
-        };
-        let full = m.encode();
-        let torn = &full[..full.len() - 8 - 4];
-        assert!(Manifest::decode(torn).is_err());
+        // the tail is the empty resident keys (8 bytes) + the 32-byte schema.
+        assert!(Manifest::decode(&full[..full.len() - 40]).is_err());
+        assert!(Manifest::decode(&full[..full.len() - 32]).is_err());
+        assert!(Manifest::decode(&full[..full.len() - 4]).is_err());
         // and a torn RESIDENT tail fails loud too.
         let full = sample_manifest().encode();
-        let torn = &full[..full.len() - 4]; // inside the resident key bytes.
+        let torn = &full[..full.len() - 32 - 4]; // inside the resident key bytes.
         assert!(Manifest::decode(torn).is_err());
-    }
-
-    #[test]
-    fn required_min_version_fencepost_via_capture() {
-        // the derivation the capture path uses, exercised through the shared
-        // sdk fence: below activation -> current_version, at/after -> to_version.
-        let pending = UpgradeCoords {
-            name: "v2".into(),
-            activation_height: 50,
-            to_version: 2,
-        };
-        assert_eq!(sdk::required_min_version(1, Some(&pending), 49), 1);
-        assert_eq!(sdk::required_min_version(1, Some(&pending), 50), 2);
-        assert_eq!(sdk::required_min_version(1, None, 50), 1);
-    }
-
-    #[test]
-    fn preflight_gates_on_required_min() {
-        let m = Manifest {
-            required_min_version: 3,
-            ..sample_manifest()
-        };
-        // a build that supports >= the required min boots.
-        assert!(m.preflight(3).is_ok());
-        assert!(m.preflight(4).is_ok());
-        // an under-versioned build refuses loud.
-        let err = m.preflight(2).expect_err("under-versioned build");
-        assert_eq!(err.required_min, 3);
-        assert_eq!(err.max_supported, 2);
     }
 
     #[test]

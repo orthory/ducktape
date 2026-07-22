@@ -61,7 +61,6 @@ impl CaptureCtx {
     fn new() -> Self {
         Self {
             env: Env {
-                protocol_version: 0,
                 height: 7,
                 consensus_time: 42,
                 origin: Origin::System,
@@ -678,7 +677,6 @@ fn post_message_fire_reads_chat_via_testkit_on_query() {
     // TestCtx answers automations' two chat probes: "announce" exists, and the
     // composed message id is still free.
     let mut ctx = TestCtx::with_env(Env {
-        protocol_version: 0,
         height: 7,
         consensus_time: 42,
         origin: Origin::Module(CHAT.into()),
