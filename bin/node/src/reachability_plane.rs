@@ -138,13 +138,16 @@ where
     }
     match reply_rx.await {
         Ok(Ok(())) => {
-            let flavor = match path {
-                IntroPath::Direct => "",
-                IntroPath::Coordinated => "coordinated ",
+            let via = match path {
+                IntroPath::Direct => "direct",
+                IntroPath::Coordinated => "coordinated",
             };
-            println!(
-                "[node {label}] invite intro: {flavor}tunnel peer installed for {}",
-                config::hex_bytes(&verified.joiner.as_ref()[..4])
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
+                via,
+                "invite intro tunnel peer installed"
             );
             // THE GATE (§4): the sealed intro IS the gate request. Forward it to
             // the run loop and ack the CURRENT outcome — `Installed` while it
@@ -505,9 +508,11 @@ async fn reachability_plane(
     // (WireGuard roams to the authenticated source). A concrete address
     // advertises exactly as before.
     if wireguard_listen.port() == 0 {
-        eprintln!(
-            "[node {label}] reachability: wireguard_listen needs a concrete UDP port — plane \
-             not started"
+        tracing::error!(
+            target: "ducktape::reachability",
+            node = %label,
+            reason = "wireguard_port_zero",
+            "reachability plane NOT started; wireguard_listen needs a concrete UDP port"
         );
         return;
     }
@@ -525,17 +530,23 @@ async fn reachability_plane(
             ) {
                 Ok(endpoint) => Some(endpoint),
                 Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: wireguard_advertised rejected ({err:?}) — \
-                         plane not started"
+                    tracing::error!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = ?err,
+                        reason = "wireguard_advertised_rejected",
+                        "reachability plane NOT started"
                     );
                     return;
                 }
             },
             None => {
-                eprintln!(
-                    "[node {label}] reachability: wireguard_advertised {ingress:?} did not \
-                     resolve — plane not started"
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    advertised = ?ingress,
+                    reason = "wireguard_advertised_unresolvable",
+                    "reachability plane NOT started"
                 );
                 return;
             }
@@ -551,9 +562,12 @@ async fn reachability_plane(
         ) {
             Ok(endpoint) => Some(endpoint),
             Err(err) => {
-                eprintln!(
-                    "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane \
-                     not started"
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    error = ?err,
+                    reason = "wireguard_listen_rejected",
+                    "reachability plane NOT started"
                 );
                 return;
             }
@@ -564,8 +578,12 @@ async fn reachability_plane(
         match resolve_ingress(ingress) {
             Some(addr) if !coords.contains(&addr) => coords.push(addr),
             Some(_) => {}
-            None => eprintln!(
-                "[node {label}] reachability: coordinator {ingress:?} did not resolve — skipped"
+            None => tracing::warn!(
+                target: "ducktape::reachability",
+                node = %label,
+                coordinator = ?ingress,
+                reason = "coordinator_unresolvable",
+                "coordinator skipped"
             ),
         }
     }
@@ -582,10 +600,13 @@ async fn reachability_plane(
     ) {
         Ok(underlay) => underlay,
         Err(err) => {
-            eprintln!(
-                "[node {label}] reachability: underlay udp/{} bind failed: {err} — \
-                 plane not started",
-                wireguard_listen.port()
+            tracing::error!(
+                target: "ducktape::reachability",
+                node = %label,
+                port = wireguard_listen.port(),
+                error = %err,
+                reason = "underlay_bind_failed",
+                "reachability plane NOT started"
             );
             return;
         }
@@ -632,9 +653,12 @@ async fn reachability_plane(
                 // candidates (InstallInvitePeer + this node's own
                 // initiations) need no rendezvous at all.
                 Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: rendezvous socket unusable ({err}) — \
-                         continuing WITHOUT rendezvous (direct/front paths still work)"
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = %err,
+                        reason = "rendezvous_socket_unusable",
+                        "continuing without rendezvous; direct/front paths still work"
                     );
                     reachability::NatResolver::bind(me, Vec::new(), None)
                         .await
@@ -649,9 +673,12 @@ async fn reachability_plane(
                 // bind can only fail LOCALLY now (its own UDP socket); an
                 // unreachable coordinator is retried inside the resolver.
                 Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: rendezvous socket unusable ({err}) — \
-                         continuing WITHOUT rendezvous (direct/front paths still work)"
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = %err,
+                        reason = "rendezvous_socket_unusable",
+                        "continuing without rendezvous; direct/front paths still work"
                     );
                     reachability::NatResolver::bind(me, Vec::new(), None)
                         .await
@@ -671,18 +698,21 @@ async fn reachability_plane(
                 let current = *status.borrow_and_update();
                 match current {
                     reachability::RendezvousStatus::Ready { reflexive } => {
-                        println!(
-                            "[node {status_label}] reachability: coordinator-observed \
-                             reflexive {reflexive}"
+                        tracing::info!(
+                            target: "ducktape::reachability",
+                            node = %status_label,
+                            %reflexive,
+                            "coordinator-observed reflexive"
                         );
                         return;
                     }
                     reachability::RendezvousStatus::Unavailable { attempts: 1 } => {
-                        eprintln!(
-                            "[node {status_label}] reachability: coordinator rendezvous \
-                             unavailable — retrying in the background (direct/front paths \
-                             still work; coordinated-by-identity paths wake once a \
-                             coordinator responds)"
+                        tracing::warn!(
+                            target: "ducktape::reachability",
+                            node = %status_label,
+                            attempts = 1,
+                            reason = "coordinator_unavailable",
+                            "coordinator rendezvous unavailable; retrying in the background"
                         );
                     }
                     _ => {}
@@ -701,10 +731,13 @@ async fn reachability_plane(
     let intro_keypair = match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
         Ok((keypair, _)) => Some(std::sync::Arc::new(keypair)),
         Err(e) => {
-            eprintln!(
-                "[node {label}] invite intro: wireguard key {wireguard_key_file:?} unreadable \
-                 ({e}) — inbound joins via this node's invites are disabled (cannot open sealed \
-                 intros)"
+            tracing::warn!(
+                target: "ducktape::join",
+                node = %label,
+                path = %wireguard_key_file.display(),
+                error = %e,
+                reason = "wireguard_key_unreadable",
+                "inbound joins via this node's invites are disabled"
             );
             None
         }
@@ -737,9 +770,10 @@ async fn reachability_plane(
         // resolve.rs already decided this config can never mint a direct
         // intro endpoint — say so once at boot instead of binding a
         // wildcard socket no joiner could ever reach.
-        println!(
-            "[node {label}] no direct invite intro listener (this config mints no direct \
-             intro endpoint) — intros arrive via the coordinated path"
+        tracing::info!(
+            target: "ducktape::join",
+            node = %label,
+            "no direct invite intro listener; intros arrive via the coordinated path"
         );
     }
     if let (Some(intro_addr), Some(intro_keypair)) = (intro_listen, intro_keypair.clone()) {
@@ -753,14 +787,23 @@ async fn reachability_plane(
             let socket = match tokio::net::UdpSocket::bind(intro_addr).await {
                 Ok(socket) => socket,
                 Err(err) => {
-                    eprintln!(
-                        "[node {intro_label}] invite intro listener bind {intro_addr} failed: \
-                         {err} — joins via this node's invites need another member"
+                    tracing::error!(
+                        target: "ducktape::join",
+                        node = %intro_label,
+                        listen = %intro_addr,
+                        error = %err,
+                        reason = "intro_bind_failed",
+                        "invite intro listener stopped; joins need another member"
                     );
                     return;
                 }
             };
-            println!("[node {intro_label}] invite intro listening on udp/{intro_addr}");
+            tracing::info!(
+                target: "ducktape::join",
+                node = %intro_label,
+                listen = %intro_addr,
+                "invite intro listening"
+            );
             let mut buf = vec![0u8; 4096];
             loop {
                 let Ok((n, src)) = socket.recv_from(&mut buf).await else {
@@ -861,9 +904,11 @@ async fn reachability_plane(
         }
     });
     let underlay = socket_underlay;
-    println!(
-        "[node {label}] reachability: driving the userspace socket backend (TUN-less; \
-         no interface, no privilege — overlay reachability lives inside this process)"
+    tracing::info!(
+        target: "ducktape::reachability",
+        node = %label,
+        backend = "userspace_socket",
+        "reachability backend ready"
     );
     let effect = overlay_net::userspace::UserspaceWireGuardEffect::with_shared_underlay(
         tokio::runtime::Handle::current(),

@@ -132,7 +132,13 @@ pub fn delete_invite_token(dir: &Path) {
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => eprintln!("warning: could not delete spent invite token {path:?}: {e}"),
+        Err(e) => tracing::warn!(
+            target: "ducktape::join",
+            path = %path.display(),
+            error = %e,
+            reason = "spent_token_delete_failed",
+            "spent invite token retained"
+        ),
     }
 }
 

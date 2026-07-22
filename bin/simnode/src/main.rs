@@ -118,18 +118,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("simnode boot failed: {error}");
         std::process::exit(1);
     });
-    println!(
-        "[simnode] listening on {}, storage {}, hold={hold}, persona={persona_label}",
-        handle.addr(),
-        storage.display(),
+    tracing::info!(
+        target: "ducktape::node",
+        listen = %handle.addr(),
+        storage = %storage.display(),
+        hold,
+        persona = %persona_label,
+        "simnode listening"
     );
     match handle.wait() {
         Ok(()) => {
-            println!("[simnode] shutdown requested, exiting");
+            tracing::info!(target: "ducktape::node", "simnode shutdown requested; exiting");
             Ok(())
         }
         Err(reason) => {
-            eprintln!("simnode fatal: {reason}");
+            tracing::error!(
+                target: "ducktape::node",
+                error = %reason,
+                "simnode fatal"
+            );
             std::process::exit(1);
         }
     }

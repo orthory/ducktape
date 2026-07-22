@@ -173,9 +173,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
 
-    println!(
-        "[noded] listening on {listen}, storage {}",
-        storage.display()
+    tracing::info!(
+        target: "ducktape::node",
+        %listen,
+        storage = %storage.display(),
+        "noded listening"
     );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -185,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             noded::serve(listener, handle).await?;
             // in-flight requests drained; blocks commit at the block boundary,
             // so exiting here loses nothing.
-            println!("[noded] shutdown requested, exiting");
+            tracing::info!(target: "ducktape::node", "noded shutdown requested; exiting");
             Ok(())
         })
 }
@@ -305,7 +307,11 @@ fn run_node(
         ])
         .expect("genesis");
 
-        println!("[noded] genesis app_hash={}", hex_root(&host.app_hash()));
+        tracing::info!(
+            target: "ducktape::consensus",
+            app_hash = %hex_root(&host.app_hash()),
+            "noded genesis"
+        );
 
         // register the daemon's `ducktape_*` series on the runtime registry —
         // one `context.encode()` then serves them alongside commonware's own
@@ -333,7 +339,11 @@ fn run_node(
         let mut height = index.resume_height().expect("read index watermarks");
         stream_hub.prime(height, hex_root(&host.app_hash()));
         if height > 0 {
-            println!("[noded] module index resumes at height {height}");
+            tracing::info!(
+                target: "ducktape::modules",
+                height,
+                "noded module index resumed"
+            );
         }
         // heal modules whose watermark trails the resume floor — a wiped (or
         // torn) per-module database that forward folding can never refill,
@@ -349,8 +359,12 @@ fn run_node(
         {
             Ok(rebuilt) => {
                 for (module, rows) in rebuilt {
-                    println!(
-                        "[noded] module index for {module} re-derived from state at height {height} ({rows} rows)"
+                    tracing::info!(
+                        target: "ducktape::modules",
+                        module,
+                        height,
+                        rows,
+                        "noded module index re-derived from state"
                     );
                 }
             }

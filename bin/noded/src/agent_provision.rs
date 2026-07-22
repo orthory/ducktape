@@ -418,7 +418,11 @@ impl NodedProvisioner {
         self.forge =
             forge::ForgeLane::configure(&self.handle, push_base, committer_name.into(), probe);
         if let Err(reason) = &self.forge {
-            eprintln!("[oracle] forge workspace provisioning unavailable on this node: {reason}");
+            tracing::warn!(
+                target: "ducktape::saga",
+                error = %reason,
+                "forge workspace provisioning unavailable on this node"
+            );
         }
         self
     }

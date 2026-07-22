@@ -224,12 +224,15 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // into this bounded queue; the pump answers between drains.
     let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
     if let Some(listener) = rpc_listener {
-        println!(
-            "[node {label}] rpc listening on {}",
-            listener
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_default()
+        let listen = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            %listen,
+            "rpc listening on {listen}"
         );
         spawn_rpc_listener(listener, rpc_tx);
     } else {
@@ -378,9 +381,13 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!(
-                "[node {label}] WARN: SIGTERM handler install failed ({e}); \
-                     graceful-quit checkpoint disabled (a hard kill still recovers)"
+            tracing::warn!(
+                target: "ducktape::node",
+                node = %label,
+                signal = "SIGTERM",
+                error = %e,
+                reason = "signal_handler_install_failed",
+                "graceful-quit checkpoint disabled"
             );
             None
         }
@@ -389,9 +396,13 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!(
-                "[node {label}] WARN: SIGINT handler install failed ({e}); \
-                     graceful-quit checkpoint disabled (a hard kill still recovers)"
+            tracing::warn!(
+                target: "ducktape::node",
+                node = %label,
+                signal = "SIGINT",
+                error = %e,
+                reason = "signal_handler_install_failed",
+                "graceful-quit checkpoint disabled"
             );
             None
         }
@@ -522,9 +533,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
 
 impl ValidatorRuntime<'_> {
     async fn on_signal(&mut self) -> ! {
-        println!(
-            "[node {}] SIGTERM/SIGINT — graceful checkpoint then exit",
-            self.label
+        tracing::info!(
+            target: "ducktape::node",
+            node = %self.label,
+            "SIGTERM/SIGINT — graceful checkpoint then exit"
         );
         self.graceful_checkpoint().await;
         std::process::exit(0);

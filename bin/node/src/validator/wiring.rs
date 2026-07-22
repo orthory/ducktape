@@ -111,14 +111,21 @@ pub(super) async fn finish(
     let member_keys = match resume_member_keys(resumed, validators) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {e}");
+            tracing::error!(
+                target: "ducktape::node",
+                node = %label,
+                error = %e,
+                "FATAL: recovered validator set is invalid"
+            );
             std::process::exit(1);
         }
     };
     if !member_keys.contains(&signer.public_key()) {
-        println!(
-            "[node {label}] this identity is not in the recovered validator set — \
-             halting (restart with --sync-only to observe)"
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            reason = "not_in_recovered_validator_set",
+            "halting; restart with --sync-only to observe"
         );
         std::process::exit(0);
     }
@@ -130,10 +137,13 @@ pub(super) async fn finish(
         super::wiring::mesh_at(&peers, &member_keys.iter().cloned().collect()),
     );
     if resume_epoch < bank_base || resume_epoch >= bank_base + EPOCH_CHANNEL_BANK {
-        eprintln!(
-            "[node {label}] FATAL: recovered epoch {resume_epoch} outside the \
-             pre-registered channel bank [{bank_base}, {})",
-            bank_base + EPOCH_CHANNEL_BANK
+        tracing::error!(
+            target: "ducktape::node",
+            node = %label,
+            epoch = resume_epoch,
+            bank_base,
+            bank_end = bank_base + EPOCH_CHANNEL_BANK,
+            "FATAL: recovered epoch outside the pre-registered channel bank"
         );
         std::process::exit(1);
     }
@@ -518,14 +528,21 @@ pub(super) async fn wire(
     let initial_member_keys = match resume_member_keys(resumed, &validators) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {e}");
+            tracing::error!(
+                target: "ducktape::node",
+                node = %label,
+                error = %e,
+                "FATAL: recovered validator set is invalid"
+            );
             std::process::exit(1);
         }
     };
     if !initial_member_keys.contains(&signer.public_key()) {
-        println!(
-            "[node {label}] this identity is not in the recovered validator set — \
-             halting (restart with --sync-only to observe)"
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            reason = "not_in_recovered_validator_set",
+            "halting; restart with --sync-only to observe"
         );
         std::process::exit(0);
     }
@@ -645,10 +662,11 @@ pub(super) async fn wire(
         } else {
             // Say it at boot: an operator whose node can never host a huddle
             // otherwise learns it one failed join at a time, from the webview.
-            eprintln!(
-                "[node {label}] calls are DISABLED on this node: huddle media rides the mesh \
-                 overlay, and this node has none (wireguard_listen unset). \
-                 set wireguard_listen to enable huddles."
+            tracing::warn!(
+                target: "ducktape::voice",
+                node = %label,
+                reason = "overlay_unavailable",
+                "calls disabled; set wireguard_listen to enable huddles"
             );
             drop(voice_requests);
             None
@@ -688,9 +706,12 @@ pub(super) async fn wire(
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!(
-                        "[node {label}] reachability: ambient coordinator unusable ({e}) — \
-                         registering with descriptor-hinted coordinators only"
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = %e,
+                        reason = "ambient_coordinator_unusable",
+                        "registering with descriptor-hinted coordinators only"
                     ),
                 }
                 Some(wire_reachability_plane(

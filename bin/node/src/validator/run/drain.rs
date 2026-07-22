@@ -432,7 +432,13 @@ impl ValidatorRuntime<'_> {
                         *last_cert_height = Some(height);
                         *latest_floor = Some(fc);
                     }
-                    Err(e) => eprintln!("[node {label}] floor cert write failed (will retry): {e}"),
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::recovery",
+                        node = %label,
+                        height,
+                        error = %e,
+                        "floor cert write failed; retrying"
+                    ),
                 }
             }
         }
@@ -480,10 +486,16 @@ impl ValidatorRuntime<'_> {
                         } else if floor_passed
                             && let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await
                         {
-                            eprintln!("[node {label}] oplog prune failed: {e}");
+                            tracing::warn!(
+                                target: "ducktape::recovery",
+                                node = %label,
+                                error = %e,
+                                "oplog prune failed"
+                            );
                         }
                         *prev_ckpt = (m.height, pos);
                         tracing::info!(
+                            target: "ducktape::recovery",
                             event = "node_checkpoint_written",
                             node = %label,
                             height = m.height.unwrap_or_default()
@@ -496,17 +508,16 @@ impl ValidatorRuntime<'_> {
                             stage = "write",
                             error = %e
                         );
-                        eprintln!("[node {label}] checkpoint write failed (will retry): {e}");
                     }
                 },
                 Err(e) => {
                     tracing::warn!(
+                        target: "ducktape::recovery",
                         event = "node_checkpoint_failed",
                         node = %label,
                         stage = "capture",
                         error = %e
                     );
-                    eprintln!("[node {label}] checkpoint capture failed (will retry): {e}");
                 }
             }
         }
@@ -568,11 +579,13 @@ impl ValidatorRuntime<'_> {
             let mut actions =
                 EpochActions::new(orchestrator, engine_view, observed, observed_residents);
             if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
-                println!(
-                    "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
-                    cutover.observed_view(),
-                    cutover.next_epoch(),
-                    cutover.cutover_view()
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    observed_view = cutover.observed_view(),
+                    next_epoch = cutover.next_epoch(),
+                    cutover_view = cutover.cutover_view(),
+                    "membership change observed"
                 );
                 node.set_view_ceiling(cutover.cutover_view());
             }
@@ -639,9 +652,11 @@ impl ValidatorRuntime<'_> {
                     });
                 }
                 if !members.contains(&signer.public_key()) {
-                    println!(
-                        "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/resident)",
-                        plan.epoch()
+                    tracing::info!(
+                        target: "ducktape::consensus",
+                        node = %label,
+                        epoch = plan.epoch(),
+                        "demoted from the validator set; halting"
                     );
                     std::process::exit(0);
                 }
@@ -666,9 +681,12 @@ impl ValidatorRuntime<'_> {
                     // every locally-accepted op the old epoch
                     // never resolved was re-proposed into the
                     // new engine.
-                    Ok(carried) if carried > 0 => println!(
-                        "[node {label}] carried {carried} accepted ops across the cutover into epoch {}",
-                        plan.epoch()
+                    Ok(carried) if carried > 0 => tracing::info!(
+                        target: "ducktape::consensus",
+                        node = %label,
+                        carried,
+                        epoch = plan.epoch(),
+                        "accepted ops carried across the cutover"
                     ),
                     Ok(_) => {}
                     Err(e) => {
@@ -697,21 +715,31 @@ impl ValidatorRuntime<'_> {
                             *blocks_since_checkpoint = 0;
                             *prev_ckpt = (m.height, pos);
                         }
-                        Err(e) => eprintln!(
-                            "[node {label}] post-cutover checkpoint write failed \
-                                     (the journal's cutover record covers a restart): {e}"
+                        Err(e) => tracing::warn!(
+                            target: "ducktape::recovery",
+                            node = %label,
+                            error = %e,
+                            "post-cutover checkpoint write failed; the cutover journal record \
+                             covers a restart"
                         ),
                     },
-                    Err(e) => eprintln!(
-                        "[node {label}] post-cutover checkpoint capture failed \
-                                 (the journal's cutover record covers a restart): {e}"
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::recovery",
+                        node = %label,
+                        error = %e,
+                        "post-cutover checkpoint capture failed; the cutover journal record \
+                         covers a restart"
                     ),
                 }
-                println!(
-                    "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    epoch = plan.epoch(),
+                    validators = members.len(),
+                    base_height = plan.cutover_app_height(),
+                    "cutover complete: epoch {} with {} validators",
                     plan.epoch(),
-                    members.len(),
-                    plan.cutover_app_height()
+                    members.len()
                 );
             }
         }
@@ -778,7 +806,10 @@ impl ValidatorRuntime<'_> {
         notes.finish();
         if dev_demo && !*converged && *applied >= expected {
             let h = node.app_hash();
-            println!("[node {label}] converged app_hash={}", hex(&h));
+            tracing::info!(
+                target: "ducktape::consensus",
+                "node={label} converged app_hash={}", hex(&h)
+            );
             // dump every directory key so the demo can eyeball the ops
             // (each node ends holding the op it originated AND the peer's).
             for k in 0..expected {
@@ -793,7 +824,13 @@ impl ValidatorRuntime<'_> {
                     .await
                     .expect("directory query");
                 if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                    println!("[node {label}]   directory k{k}={v:?}");
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        key = %format_args!("k{k}"),
+                        value = ?v,
+                        "demo directory value"
+                    );
                 }
             }
             *converged = true;
@@ -850,13 +887,23 @@ impl ValidatorRuntime<'_> {
                     )
                     .await
                 {
-                    eprintln!("[node {label}] heartbeat nop submit failed: {e}");
+                    tracing::debug!(
+                        target: "ducktape::submit",
+                        node = %label,
+                        error = %e,
+                        "heartbeat nop submit failed"
+                    );
                 }
             }
             // flush the window: no-op when `pending_batch` is empty
             // (idle with a batch already in flight — wait for it).
             if let Err(e) = node.flush_batch().await {
-                eprintln!("[node {label}] batch flush failed: {e}");
+                tracing::debug!(
+                    target: "ducktape::submit",
+                    node = %label,
+                    error = %e,
+                    "batch flush failed"
+                );
             }
         }
     }
@@ -919,9 +966,12 @@ impl ValidatorRuntime<'_> {
                 )
                 .await
                 {
-                    eprintln!(
-                        "[node {label}] pending-swap code fetch {} failed: {e}",
-                        crate::config::hex_bytes(&digest)
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        digest = %crate::config::hex_bytes(&digest),
+                        error = %e,
+                        "pending-swap code fetch failed"
                     );
                 }
                 let _ = done.send(digest);
@@ -931,14 +981,22 @@ impl ValidatorRuntime<'_> {
             let seq = *next_seq;
             *next_seq += 1;
             match node.submit(signer, seq, msg).await {
-                Ok(_) => println!(
-                    "[node {label}] signaled code-ready module={} swap={}",
-                    key.0, key.1
+                Ok(_) => tracing::info!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    module = %key.0,
+                    swap = key.1,
+                    "code-ready signaled"
                 ),
                 Err(e) => {
                     // un-latch so a transient submit failure retries next tick.
                     code_signaller.unlatch(&key);
-                    eprintln!("[node {label}] code readiness submit failed: {e}");
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        error = %e,
+                        "code readiness submit failed; retrying"
+                    );
                 }
             }
         }
@@ -973,14 +1031,21 @@ impl ValidatorRuntime<'_> {
             let seq = *next_seq;
             *next_seq += 1;
             match node.submit(signer, seq, msg).await {
-                Ok(_) => println!(
-                    "[node {label}] announced capabilities {:?}",
-                    announcer.capabilities
+                Ok(_) => tracing::info!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    capabilities = ?announcer.capabilities,
+                    "capabilities announced"
                 ),
                 Err(e) => {
                     // un-latch so a transient submit failure retries.
                     announcer.announced = None;
-                    eprintln!("[node {label}] capability announce submit failed: {e}");
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        error = %e,
+                        "capability announce submit failed; retrying"
+                    );
                 }
             }
         }
@@ -1026,11 +1091,19 @@ impl ValidatorRuntime<'_> {
                 )
                 .await
             {
-                eprintln!("[node {label}] saga crank submit failed: {e}");
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    error = %e,
+                    "saga crank submit failed"
+                );
             } else {
-                println!(
-                    "[node {label}] saga crank submitted \
-                             (next expiry {expiry} <= height {finalized_height})"
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    next_expiry = expiry,
+                    finalized_height,
+                    "saga crank submitted"
                 );
             }
         }
@@ -1072,9 +1145,18 @@ impl ValidatorRuntime<'_> {
                 )
                 .await
             {
-                eprintln!("[node {label}] dispatch nudge submit failed: {e}");
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    error = %e,
+                    "dispatch delivery nudge submit failed"
+                );
             } else {
-                println!("[node {label}] dispatch delivery nudge submitted");
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    "dispatch delivery nudge submitted"
+                );
             }
         }
     }

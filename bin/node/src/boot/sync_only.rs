@@ -100,14 +100,12 @@ pub(crate) async fn run(
         metrics.record_sync_failure(error);
         metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
         tracing::error!(
+            target: "ducktape::statesync",
             event = "node_sync_failed",
             role = "sync_only",
-            node = label,
-            error
-        );
-        eprintln!(
-            "[node {label}] no statesync source: no validator other than this node \
-             is available to serve (only validators answer the statesync channel)"
+            node = %label,
+            error,
+            "SYNC FAILED: no validator state-sync source is available"
         );
         std::process::exit(1);
     }
@@ -129,34 +127,48 @@ pub(crate) async fn run(
 
     // the mesh takes a moment to connect, and the server only serves
     // once it has a finalized boundary — retry until the manifest lands.
+    let mut manifest_attempts = 0u64;
     let manifest = loop {
         match fetch_manifest(&client).await {
             Ok(m) => break m,
             Err(e) => {
+                manifest_attempts += 1;
                 metrics.record_sync_retry(e.to_string());
-                println!("[node {label}] manifest not ready ({e}); retrying");
+                let should_log = manifest_attempts == 1 || manifest_attempts.is_multiple_of(20);
+                if should_log {
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        attempts = manifest_attempts,
+                        error = %e,
+                        "manifest not ready; retrying"
+                    );
+                }
                 context.sleep(Duration::from_millis(500)).await;
             }
         }
     };
     metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
-    println!(
-        "[node {label}] manifest height={} app_hash={}",
-        manifest.height,
-        hex(&manifest.app_hash)
+    tracing::info!(
+        target: "ducktape::statesync",
+        node = %label,
+        height = manifest.height,
+        app_hash = %hex(&manifest.app_hash),
+        "manifest ready"
     );
 
     if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
         metrics.record_sync_failure(e.to_string());
         metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
         tracing::error!(
+            target: "ducktape::statesync",
             event = "node_sync_refused",
             role = "sync_only",
-            node = label,
+            node = %label,
             stage = "schema_preflight",
-            error = %e
+            error = %e,
+            "SYNC REFUSED: {e}"
         );
-        eprintln!("[node {label}] SYNC REFUSED: {e}");
         std::process::exit(1);
     }
 
@@ -187,24 +199,29 @@ pub(crate) async fn run(
             metrics.record_sync_progress(manifest.height);
             metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Serving);
             tracing::info!(
+                target: "ducktape::statesync",
                 event = "node_phase_transition",
                 role = "sync_only",
                 phase = "serving",
-                node = label,
+                node = %label,
                 height = manifest.height
             );
-            println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
+            tracing::info!(
+                target: "ducktape::statesync",
+                "node={label} synced app_hash={}", hex(&host.app_hash())
+            );
         }
         Err(e) => {
             metrics.record_sync_failure(e.to_string());
             metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
             tracing::error!(
+                target: "ducktape::statesync",
                 event = "node_sync_failed",
                 role = "sync_only",
-                node = label,
-                error = %e
+                node = %label,
+                error = %e,
+                "SYNC FAILED: {e}"
             );
-            eprintln!("[node {label}] SYNC FAILED: {e}");
             std::process::exit(1);
         }
     }

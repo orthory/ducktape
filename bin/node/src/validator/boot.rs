@@ -141,21 +141,16 @@ pub(super) async fn restore(
             let me_bytes = signer.public_key().as_ref().to_vec();
             let mut next_seq = manifest.next_seq;
             advance_next_seq_from_frames(&mut next_seq, &rec.frames, &me_bytes);
-            println!(
-                "[node {label}] recovered app_hash={} height={} epoch={} (replayed {}, \
-             already-on-disk {}{})",
-                hex(&rec.app_hash),
-                rec.height
-                    .map(|h| h.to_string())
-                    .unwrap_or_else(|| "genesis".into()),
-                rec.epoch,
-                rec.applied,
-                rec.skipped,
-                if rec.rolled_forward {
-                    ", rolled 1 forward"
-                } else {
-                    ""
-                },
+            tracing::info!(
+                target: "ducktape::recovery",
+                node = %label,
+                app_hash = %hex(&rec.app_hash),
+                height = %rec.height.map(|h| h.to_string()).unwrap_or_else(|| "genesis".into()),
+                epoch = rec.epoch,
+                replayed = rec.applied,
+                already_on_disk = rec.skipped,
+                rolled_forward = rec.rolled_forward,
+                "recovered app_hash={}", hex(&rec.app_hash)
             );
             let prev = (manifest.height, manifest.oplog_pos);
             (host, Some(rec), next_seq, prev, Some(manifest))
@@ -236,9 +231,16 @@ pub(super) async fn post_reboot_catchup<'a>(
             .await
             {
                 Ok(summary) => {
-                    println!(
-                        "[node {label}] post-reboot catch-up {} -> {} ({} frames)",
-                        summary.from_height, summary.to_height, summary.frames
+                    tracing::info!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        from_height = summary.from_height,
+                        to_height = summary.to_height,
+                        frames = summary.frames,
+                        "post-reboot catch-up {} -> {} ({} frames)",
+                        summary.from_height,
+                        summary.to_height,
+                        summary.frames
                     );
                     let Some(target) = summary.target.as_ref() else {
                         if summary.to_height == recovered_height {
@@ -249,10 +251,12 @@ pub(super) async fn post_reboot_catchup<'a>(
                             // the halted source can serve. the recovered
                             // state is journal-proven; seat ourselves and
                             // the chain resumes.
-                            println!(
-                                "[node {label}] post-reboot catch-up: the source trails \
-                                 the recovered height {recovered_height} — proceeding as \
-                                 the freshest member"
+                            tracing::warn!(
+                                target: "ducktape::statesync",
+                                node = %label,
+                                recovered_height,
+                                reason = "source_trails_recovered_state",
+                                "proceeding as the freshest member"
                             );
                             break;
                         }
@@ -320,11 +324,14 @@ pub(super) async fn post_reboot_catchup<'a>(
                     requested_after,
                     retained_from,
                 }) => {
-                    println!(
-                        "[node {label}] post-reboot frame range pruned after \
-                         {requested_after} (retained from {retained_from}); full syncing \
-                         boundary {}",
-                        target.height
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        requested_after,
+                        retained_from,
+                        target_height = target.height,
+                        reason = "range_pruned",
+                        "post-reboot frame range pruned; full-syncing the boundary"
                     );
                     let resumed_epoch = resumed.as_ref().map(|rec| rec.epoch).unwrap_or(0);
                     finalize_catchup_boundary(
@@ -411,10 +418,13 @@ pub(super) async fn post_reboot_catchup<'a>(
                 Err(PostRebootCatchupError::Retry(e))
                     if attempts < POST_REBOOT_CATCHUP_MAX_ATTEMPTS =>
                 {
-                    println!(
-                        "[node {label}] post-reboot catch-up unavailable \
-                         (attempt {attempts}/{POST_REBOOT_CATCHUP_MAX_ATTEMPTS}): {e}; \
-                         retrying"
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        attempts,
+                        max_attempts = POST_REBOOT_CATCHUP_MAX_ATTEMPTS,
+                        error = %e,
+                        "post-reboot catch-up unavailable; retrying"
                     );
                     // escalate toward a 5s beat: an overlay-only source
                     // (a fully-NATed inviter) is reachable only once the

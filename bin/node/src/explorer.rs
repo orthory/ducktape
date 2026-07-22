@@ -148,7 +148,13 @@ impl recovery::ReplaySink for IndexFold<'_> {
             ..noded::index_block_ops(height, height, block.dispatches)
         };
         if let Err(err) = self.index.apply_block(&ops) {
-            eprintln!("[node] module index fold failed at height {height}: {err}");
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                height,
+                error = %err,
+                "module index fold stopped"
+            );
             self.stopped = true;
         }
     }
@@ -177,15 +183,23 @@ pub(crate) async fn heal_index(index: &indexer::IndexStore, host: &Host, boundar
     match noded::rebuild_stale_modules(index, host, meta).await {
         Ok(rebuilt) => {
             for (module, rows) in rebuilt {
-                println!(
-                    "[node {label}] index for {module} re-derived from state at height \
-                     {boundary} ({rows} rows)"
+                tracing::info!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    module,
+                    height = boundary,
+                    rows,
+                    "index for {module} re-derived from state at height {boundary} ({rows} rows)"
                 );
             }
         }
-        Err(err) => eprintln!(
-            "[node {label}] index heal at height {boundary} failed: {err} — wipe \
-             <storage>/index to rebuild"
+        Err(err) => tracing::error!(
+            target: "ducktape::modules",
+            event = "node_index_poisoned",
+            node = %label,
+            height = boundary,
+            error = %err,
+            "index heal failed; wipe <storage>/index to rebuild"
         ),
     }
 }
@@ -210,7 +224,14 @@ pub(crate) fn ship_index_blobs(
             Ok(files) => {
                 blobs.insert(db, statesync::encode_index_archive(&files));
             }
-            Err(err) => eprintln!("[node {label}] shipped index skips {db}: {err}"),
+            Err(err) => tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                database = %db,
+                error = %err,
+                reason = "index_checkpoint_failed",
+                "shipped index database skipped"
+            ),
         }
     }
     blobs
@@ -246,7 +267,13 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
             // a db this binary does not know (version skew) would sit
             // unopened on disk forever — skip it, its module heals instead.
             if !known.contains(db.as_str()) {
-                println!("[node {label}] shipped index skips unknown db {db:?}");
+                tracing::warn!(
+                    target: "ducktape::statesync",
+                    node = %label,
+                    database = %db,
+                    reason = "unknown_index_database",
+                    "shipped index database skipped"
+                );
                 continue;
             }
             let blob = statesync::fetch_index_db(client, boundary, db)
@@ -264,18 +291,33 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
     }
     .await;
     match staged {
-        Ok(0) => println!("[node {label}] source ships no index — views heal from verified state"),
-        Ok(n) => println!(
-            "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
-             reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
+        Ok(0) => tracing::info!(
+            target: "ducktape::statesync",
+            node = %label,
+            "source ships no index; views heal from verified state"
+        ),
+        Ok(n) => tracing::info!(
+            target: "ducktape::statesync",
+            node = %label,
+            databases = n,
+            "shipped index staged; it will be adopted at the promoted reboot"
         ),
         Err(e) => {
-            eprintln!(
-                "[node {label}] shipped index fetch failed: {e} — views heal from verified \
-                 state instead"
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                error = %e,
+                reason = "shipped_index_fetch_failed",
+                "views will heal from verified state instead"
             );
             if let Err(e) = indexer::discard_staged(&indexer::DiskFs, &index_base) {
-                eprintln!("[node {label}] shipped index staging cleanup failed: {e}");
+                tracing::warn!(
+                    target: "ducktape::statesync",
+                    node = %label,
+                    error = %e,
+                    reason = "shipped_index_cleanup_failed",
+                    "shipped index staging cleanup failed"
+                );
             }
         }
     }

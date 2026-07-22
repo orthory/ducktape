@@ -124,20 +124,18 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
     if joiner {
         if invite_token.is_some() {
-            println!(
-                "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: announcing this key with the invite token; a member node redeems it \
-                 automatically (the mint was the approval) and full-node standing lands at \
-                 the next block",
-                hex_bytes(signer.public_key().as_ref())
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                invited = true,
+                "joiner mode: announcing this key for automatic invite redemption"
             );
         } else {
-            println!(
-                "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: no invite token on disk, so a member must grant standing manually \
-                 (`ducktape node resident accept {}`)",
-                hex_bytes(signer.public_key().as_ref()),
-                hex_bytes(signer.public_key().as_ref())
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                invited = false,
+                "joiner mode: no invite token on disk; a member must grant standing manually"
             );
         }
     }
@@ -168,9 +166,11 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         && coord_cap.is_none()
         && !validators.contains(&signer.public_key())
     {
-        eprintln!(
-            "[node {label}] reachability: private coordination but no coord.cap and not a \
-             genesis validator — rendezvous will be denied; provide coord.cap or use a \
+        tracing::warn!(
+            target: "ducktape::reachability",
+            node = %label,
+            reason = "coord_cap_missing",
+            "private coordinator rendezvous will be denied; provide coord.cap or use a \
              fronted/direct reach hint"
         );
     }
@@ -193,10 +193,12 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
                     })
                     .collect();
                 if !seeds.is_empty() {
-                    println!(
-                        "[node {label}] {} mesh dial seed(s) from the persisted mesh (epoch {})",
-                        seeds.len(),
-                        mesh.epoch
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        seeds = seeds.len(),
+                        epoch = mesh.epoch,
+                        "persisted mesh dial seeds restored"
                     );
                 }
                 seeds

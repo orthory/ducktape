@@ -89,7 +89,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             let listener = std::net::TcpListener::bind(address)?;
             listener.set_nonblocking(true)?;
             let actual = listener.local_addr()?;
-            println!("[node {label}] gateway browser listening on http://{actual}");
+            tracing::info!(
+                target: "ducktape::gateway",
+                node = %label,
+                listen = %actual,
+                "gateway browser listening"
+            );
             Some((listener, actual))
         }
         _ => None,
@@ -117,14 +122,22 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                 .map_err(|error| format!("airlock gateway: {error}"))?;
             crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
                 .map_err(|error| format!("register airlock gateway route: {error}"))?;
-            println!(
-                "[node {label}] airlock gateway listening on http://127.0.0.1:{port} (route \"airlock\", attest={vendor})"
+            tracing::info!(
+                target: "ducktape::gateway",
+                node = %label,
+                listen = %format_args!("127.0.0.1:{port}"),
+                route = "airlock",
+                attest = %vendor,
+                "airlock gateway listening"
             );
             Some((listener, router))
         }
         Some(Ok(_)) => {
-            eprintln!(
-                "[node {label}] DUCKTAPE_AIRLOCK_SERVE set but the gateway plane is off — not serving airlock"
+            tracing::warn!(
+                target: "ducktape::gateway",
+                node = %label,
+                reason = "gateway_plane_off",
+                "DUCKTAPE_AIRLOCK_SERVE set but airlock is not served"
             );
             None
         }
@@ -264,12 +277,11 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         Some(addr) if !sync_only => {
             let listener = std::net::TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
-            println!(
-                "[node {label}] app surface listening on http://{}",
-                listener
-                    .local_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default()
+            tracing::info!(
+                target: "ducktape::http",
+                node = %label,
+                listen = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                "app surface listening"
             );
             let thread_label = label.to_string();
             let gateway_listener = gateway_listener.map(|(listener, _)| listener);
@@ -289,7 +301,11 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                     if let Err(error) =
                                         noded::serve_browser_gateway(listener, gateway_handle).await
                                     {
-                                        eprintln!("gateway browser server error: {error}");
+                                        tracing::error!(
+                                            target: "ducktape::gateway",
+                                            error = %error,
+                                            "gateway browser server stopped"
+                                        );
                                     }
                                 });
                             }
@@ -304,19 +320,31 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                     )
                                     .await
                                     {
-                                        eprintln!("airlock gateway server error: {error}");
+                                        tracing::error!(
+                                            target: "ducktape::gateway",
+                                            error = %error,
+                                            "airlock gateway server stopped"
+                                        );
                                     }
                                 });
                             }
                             let listener = tokio::net::TcpListener::from_std(listener)
                                 .expect("adopt app-surface listener");
                             if let Err(e) = noded::serve(listener, http_handle).await {
-                                eprintln!("app surface server error: {e}");
+                                tracing::error!(
+                                    target: "ducktape::http",
+                                    error = %e,
+                                    "app surface server stopped"
+                                );
                             }
                         });
                     // a client asked the surface to shut down (POST /v1/admin/shutdown) —
                     // mirror the rpc shutdown: exit the whole process gracefully.
-                    println!("[node {thread_label}] shutdown requested via app surface — exiting");
+                    tracing::info!(
+                        target: "ducktape::node",
+                        node = %thread_label,
+                        "shutdown requested via app surface; exiting"
+                    );
                     std::process::exit(0);
                 })?;
         }
