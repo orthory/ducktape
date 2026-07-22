@@ -98,6 +98,8 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
+nettest = { path = "../../crates/nettest" }
 tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

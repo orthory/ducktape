@@ -10,7 +10,7 @@
 //! has drifted from that promise.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -97,31 +97,7 @@ impl Daemon {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> std::io::Result<(u16, serde_json::Value)> {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-        let body_bytes = body
-            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-            .unwrap_or_default();
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body_bytes.len()
-        );
-        stream.write_all(req.as_bytes())?;
-        stream.write_all(&body_bytes)?;
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
-        let text = String::from_utf8_lossy(&raw);
-        let status: u16 = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let payload = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .map(parse_http_body)
-            .unwrap_or(serde_json::Value::Null);
-        Ok((status, payload))
+        nettest::try_http_json(self.port, method, path, body)
     }
 
     fn request(
@@ -179,33 +155,7 @@ impl Daemon {
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
     fn request_bytes(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("read timeout");
-        let head = format!(
-            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(head.as_bytes()).expect("write head");
-        // best-effort body write: the daemon may legally answer 413 and stop
-        // reading mid-body, which can surface here as a broken pipe.
-        let _ = stream.write_all(body);
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("read response");
-        // split head/body at the byte level — chunk bytes must round-trip
-        // untouched, so no utf-8 decoding of the body.
-        let split = raw
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .expect("http header terminator");
-        let status_line = String::from_utf8_lossy(&raw[..split]);
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        (status, raw[split + 4..].to_vec())
+        nettest::http_bytes(self.port, method, path, "application/octet-stream", body)
     }
 
     /// open /v1/ws with a minimal rfc6455 client handshake and return the
@@ -321,19 +271,7 @@ impl Daemon {
     }
 }
 
-fn parse_http_body(body: &str) -> serde_json::Value {
-    // axum replies with content-length (no chunking) for these routes; the
-    // split above already isolated the body.
-    serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null)
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind port probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
-}
+use nettest::free_port;
 
 fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Value {
     serde_json::json!({
@@ -1473,17 +1411,7 @@ fn pending_run_count(daemon: &Daemon) -> usize {
         .unwrap_or(0)
 }
 
-/// poll `probe` until it returns Some, panicking past `budget`.
-fn poll_until<T>(what: &str, budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + budget;
-    loop {
-        if let Some(v) = probe() {
-            return v;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(150));
-    }
-}
+use nettest::poll_until;
 
 /// THE HEADLINE FIX, asserted directly: submit a run whose provider sleeps,
 /// then Status and Query answer BEFORE the run completes. on the pre-fix

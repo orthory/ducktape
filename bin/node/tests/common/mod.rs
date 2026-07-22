@@ -22,7 +22,7 @@
 //!   assertions go through rpc queries instead.
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1058,90 +1058,20 @@ pub fn http_request(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> (u16, serde_json::Value) {
-    use std::io::Read as _;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("app-surface read timeout");
-    let body_bytes = body
-        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-        .unwrap_or_default();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body_bytes.len()
-    );
-    stream.write_all(req.as_bytes()).expect("app-surface write");
-    stream
-        .write_all(&body_bytes)
-        .expect("app-surface write body");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("app-surface read");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let payload = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .and_then(|b| serde_json::from_str(b.trim()).ok())
-        .unwrap_or(serde_json::Value::Null);
-    (status, payload)
+    nettest::http_json(port, method, path, body)
 }
 
 /// GET a raw TEXT body from an app-surface port — the non-json twin of
 /// [`http_request`], for bodies like the Prometheus `/metrics` exposition.
 pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
-    use std::io::Read as _;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("app-surface read timeout");
-    let req =
-        format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).expect("app-surface write");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("app-surface read");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_string();
-    (status, body)
+    nettest::http_text(port, "GET", path)
 }
 
-/// poll `probe` every 300ms until it returns `Some`, or panic with `what`
-/// after `timeout`. the standard shape for "submitted, now wait for it to
-/// finalize and become readable".
-pub fn poll_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(v) = probe() {
-            return v;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(300));
-    }
-}
+pub use nettest::poll_until;
 
-/// allocate `n` distinct free localhost ports by holding all the listeners at
-/// once (sequential bind-drop could hand the same port back twice).
-fn alloc_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe"))
-        .collect();
-    listeners
-        .iter()
-        .map(|l| l.local_addr().expect("probe addr").port())
-        .collect()
-}
+// `n` distinct free localhost ports, collision-safe (holds every listener at
+// once — sequential bind-drop could hand the same port back twice).
+use nettest::alloc_ports;
 
 fn find_marker(text: &str, marker: &str) -> Option<String> {
     text.lines().find_map(|line| {
