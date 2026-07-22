@@ -39,8 +39,6 @@
 //! multi-dispatch blocks) by `wasm_chat_parity`.
 
 use chat::Chat;
-use guest_adapter::{Guest, WitCtx, WitStore, block_on, host};
-use sdk::{Error, Module as _, Msg};
 
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
@@ -52,54 +50,12 @@ const MODULE_ID: &str = "chat";
 /// fork.
 const TAGGING_ID: &str = "tagging";
 
-struct Component;
+use guest_adapter::WitStore;
 
-/// the native module over the host's real store, rebuilt fresh per dispatch.
-/// no state load: the store IS the state, and the module's own `pending`
-/// overlay is per-dispatch by design (cross-dispatch read-your-writes comes
-/// from the host's outer staged overlay via `WitStore::get`).
-fn module() -> Chat {
-    Chat::new(MODULE_ID, Box::new(WitStore)).with_tagging(TAGGING_ID)
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+guest_adapter::store_guest! {
+    id: MODULE_ID,
+    module: Chat,
+    new: Chat::new(MODULE_ID, Box::new(WitStore)).with_tagging(TAGGING_ID),
 }
-
-/// map an inner sdk error onto the wit surface. `Module` is the native
-/// rejection verbatim; anything else a native chat never surfaces from
-/// its own execute, so the debug rendering is purely diagnostic.
-fn to_wit_error(e: Error) -> host::Error {
-    match e {
-        Error::Module(m) => host::Error::Rejected(m),
-        other => host::Error::Rejected(other.to_string()),
-    }
-}
-
-impl Guest for Component {
-    fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
-        let mut module = module();
-        let mut ctx = WitCtx::new();
-        block_on(module.execute(
-            &mut ctx,
-            &Msg {
-                target: MODULE_ID.into(),
-                payload,
-            },
-        ))
-        .map_err(to_wit_error)?;
-        // flush the inner per-dispatch staging into the host's OUTER overlay
-        // (WitStore::commit_batch = state-set/state-delete per record). the
-        // host owns the real store commit/abort boundary (see the crate doc).
-        block_on(module.commit_block()).map_err(to_wit_error)?;
-        Ok(())
-    }
-
-    fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
-        // a fresh module's `pending` is empty, so the native query reads
-        // straight through `WitStore::get` — the staged-over-committed view
-        // this round serves, byte-identical to the native committed+pending
-        // merge. chat queries are pure own-store reads (no sibling access),
-        // so the ctx-less native `query` is the whole surface.
-        let module = module();
-        block_on(module.query(&req)).map_err(to_wit_error)
-    }
-}
-
-guest_adapter::export_module!(Component);
