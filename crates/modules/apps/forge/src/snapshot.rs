@@ -43,10 +43,9 @@ impl Forge {
 
         codec::put_u32(&mut out, born.len() as u32);
         for (name, refs) in born {
-            // every born head's objects live in the repo's odb (Commit built
-            // them there, or materialize installed the pack); a still-pending
-            // branch fails pack_closure_many here — a node can only SERVE
-            // state it holds, same as phase 1.
+            // every born head's objects reached the repo's odb through
+            // materialization; a still-pending branch fails pack_closure_many
+            // here — a node can only SERVE state it holds, same as phase 1.
             let repo = open_or_init_repo(&self.base, name)?;
             let heads: Vec<Oid> = refs.values().copied().collect();
             let pack =

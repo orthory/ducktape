@@ -3,8 +3,8 @@
 //! forge is a git-backed module: its state is a NAMED NAMESPACE of git repos,
 //! addressed by a repo slug (`[a-z0-9._-]`, 1..=64 bytes). its `root()` is a
 //! canonical sorted hash over the committed HEAD oid of every repo that has a
-//! head. writes go via [`ForgeMsg`] (a file put + commit, or a git push); reads
-//! via [`ForgeQuery`] -> [`ForgeReply`], returning HEAD oids as hex.
+//! head. git writes go via [`ForgeMsg::PushRefs`]; reads via [`ForgeQuery`] ->
+//! [`ForgeReply`], returning HEAD oids as hex.
 //!
 //! ## the default repo
 //!
@@ -21,11 +21,12 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 
 /// a write intent at forge.
 ///
-/// the git surface: the file-by-file [`ForgeMsg::Commit`] (forge builds the
-/// commit object itself) and the atomic multi-branch [`ForgeMsg::PushRefs`] —
-/// git-faithful ref updates that adopt a client's REAL commit history by oid,
+/// the git surface is the atomic multi-branch [`ForgeMsg::PushRefs`]: a
+/// git-faithful ref update that adopts a client's real commit history by oid,
 /// with the objects carried out-of-band in a node-local packfile (never in
-/// consensus).
+/// consensus). [`ForgeMsg::Commit`] remains only as a decode-compatible
+/// tombstone and is rejected deterministically; no consensus path builds Git
+/// objects or reads a node-local ODB.
 ///
 /// the tracker surface: GitHub-shaped issues / pull requests / reviews
 /// ([`ForgeMsg::OpenIssue`] .. [`ForgeMsg::SubmitReview`]) — see
@@ -36,6 +37,9 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeMsg {
+    /// Retired wire variant. Build the commit off-chain and submit its pack and
+    /// ref update through [`ForgeMsg::PushRefs`]. Kept so old payloads receive a
+    /// deterministic migration error instead of becoming undecodable bytes.
     Commit {
         /// the target repo slug; empty -> the `"default"` repo.
         repo: String,

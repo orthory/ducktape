@@ -29,14 +29,6 @@ fn ed_auth(key: &Ed, ns: &[u8], preimage: &[u8]) -> serde_json::Value {
         .expect("MemberAuth serializes")
 }
 
-/// 40-char sha1 hex → its 20 raw bytes (a forge oid on the RefUpdate wire).
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex oid"))
-        .collect()
-}
-
 // ── C2 — identity: the shared replay nonce ──────────────
 
 /// AddMemberKey advances the account's shared nonce, so a certificate minted at
@@ -505,18 +497,23 @@ fn forge_push_is_cas_guarded_and_a_review_pins_its_commit() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
 
-    // born the default repo via `commit` (PR #530's compose-over-the-wire path):
-    // `main` gets a real head oid.
+    // Born the default repo from the data-plane commitment. Consensus accepts
+    // the head CAS even though this sim intentionally has no matching pack.
+    let head_bytes = vec![1u8; 20];
     sim.submit_ok(
         "forge",
-        serde_json::json!({ "commit": { "repo": "default", "path": "README.md", "content": "hi", "message": "init" } }),
+        serde_json::json!({ "push_refs": {
+            "repo": "default",
+            "updates": [{ "ref_name": "main", "prev_oid": null, "new_oid": head_bytes }],
+            "pack_digest": vec![0u8; 32],
+        }}),
         None,
     );
     let head = sim.query("forge", serde_json::json!("head"))["head"]
         .as_str()
         .expect("main is born")
         .to_string();
-    let head_bytes = hex_to_bytes(&head);
+    assert_eq!(head, "01".repeat(20));
 
     // a push whose prev_oid does NOT equal the committed head is a CAS reject —
     // the SOLE consensus gate of the push path, fired at execute (no block).
