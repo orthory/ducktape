@@ -837,74 +837,85 @@ impl ValidatorRuntime<'_> {
         }
     }
 
-    // BLOCK CADENCE + heartbeat, unified. `submit`/`submit_frame`
-    // now ENQUEUE into the node's `pending_batch`; this is the one
-    // place per block-time that FLUSHES the window — packing every
-    // frame that arrived in it (real ops and/or an idle nop) into
-    // ONE batch super-frame and proposing it as a single block.
-    // that is the aggregation: at most one block per BLOCK_TIME,
-    // carrying all the window's txs, never 1-tx-1-block.
+    // BLOCK CADENCE + heartbeat, unified. `submit`/`submit_frame` ENQUEUE into
+    // the node's `pending_batch`; this arm is the one place that FLUSHES the
+    // window — packing every frame it holds (real ops and/or an idle nop) into
+    // ONE batch super-frame proposed as a single block — on TWO cadences,
+    // decided purely in [`heartbeat_action`]:
     //
-    // the idle nop still exists: finalized views only advance with
-    // a proposed frame, so an idle network would freeze (its height
-    // never ticks and a pending cutover, which crosses only when
-    // finalized views REACH it, would park forever). so on an EMPTY
-    // window inject one deterministically-rejected nop (unknown
-    // module target: rejects identically everywhere, leaves no
-    // state) and flush that. a window with real ops needs no nop —
-    // the ops ARE the block.
+    // - BUSY: a window holding real ops flushes on THIS drain tick. the
+    //   block-interval floor is `DRAIN_TICK` (the pump never runs this arm
+    //   faster), so agreement runs at max speed while everything that arrived
+    //   within one tick still aggregates into one block — the 1-tx-1-block
+    //   regime stays dead.
+    // - IDLE: an empty window beats one nop per `BLOCK_TIME`. finalized views
+    //   only advance with a proposed frame, so an idle network would freeze
+    //   (its height never ticks and a pending cutover, which crosses only when
+    //   finalized views REACH it, would park forever). the nop targets an
+    //   unregistered module: it rejects identically everywhere and leaves no
+    //   state. a window with real ops needs no nop — the ops ARE the block.
     //
     // GATE the idle nop on an empty orderer FIFO too: a nop pushed
     // while a batch still awaits finalization only piles behind a
     // finalization stall (a flapping quorum peer would stack idle
     // blocks). real ops are never gated — they must not wait.
     async fn pump_heartbeat(&mut self) {
+        let now = self.context.current();
+        let heartbeat_due = now.duration_since(self.last_flush).unwrap_or_default()
+            >= consensus::BLOCK_TIME;
+        let ops_pending = self.node.pending_batch_len() > 0;
+        let orderer_idle = self.node.orderer().pending_len() == 0;
+        match heartbeat_action(self.heartbeat_disabled, ops_pending, heartbeat_due, orderer_idle) {
+            HeartbeatAction::Idle => {}
+            HeartbeatAction::Flush => self.flush_window(now).await,
+            HeartbeatAction::BeatNop => self.beat_nop(now).await,
+        }
+    }
+
+    /// submit one heartbeat nop, then flush it as the idle beat's block.
+    async fn beat_nop(&mut self, now: std::time::SystemTime) {
         let Self {
-            context,
             node,
             next_seq,
             signer,
             label,
-            last_flush,
-            heartbeat_disabled,
             ..
         } = self;
-        let now = context.current();
-        let flush_due = now.duration_since(*last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
-        if !*heartbeat_disabled && flush_due {
-            *last_flush = now;
-            if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
-                let seq = *next_seq;
-                *next_seq += 1;
-                if let Err(e) = node
-                    .submit(
-                        signer,
-                        seq,
-                        Msg {
-                            target: NOP_TARGET.into(),
-                            payload: Vec::new(),
-                        },
-                    )
-                    .await
-                {
-                    tracing::debug!(
-                        target: "ducktape::submit",
-                        node = %label,
-                        error = %e,
-                        "heartbeat nop submit failed"
-                    );
-                }
-            }
-            // flush the window: no-op when `pending_batch` is empty
-            // (idle with a batch already in flight — wait for it).
-            if let Err(e) = node.flush_batch().await {
-                tracing::debug!(
-                    target: "ducktape::submit",
-                    node = %label,
-                    error = %e,
-                    "batch flush failed"
-                );
-            }
+        let seq = *next_seq;
+        *next_seq += 1;
+        if let Err(e) = node
+            .submit(
+                signer,
+                seq,
+                Msg {
+                    target: NOP_TARGET.into(),
+                    payload: Vec::new(),
+                },
+            )
+            .await
+        {
+            tracing::debug!(
+                target: "ducktape::submit",
+                node = %label,
+                error = %e,
+                "heartbeat nop submit failed"
+            );
+        }
+        self.flush_window(now).await;
+    }
+
+    /// restart the beat grid, then flush the window: no-op when
+    /// `pending_batch` is empty (idle with a batch already in flight — wait
+    /// for it).
+    async fn flush_window(&mut self, now: std::time::SystemTime) {
+        self.last_flush = now;
+        if let Err(e) = self.node.flush_batch().await {
+            tracing::debug!(
+                target: "ducktape::submit",
+                node = %self.label,
+                error = %e,
+                "batch flush failed"
+            );
         }
     }
 
@@ -1157,6 +1168,112 @@ impl ValidatorRuntime<'_> {
                     node = %label,
                     "dispatch delivery nudge submitted"
                 );
+            }
+        }
+    }
+}
+
+/// what one heartbeat tick does — the pure decision behind
+/// [`ValidatorRuntime::pump_heartbeat`], separate so the two block cadences
+/// stay unit-testable without a runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAction {
+    /// nothing due this tick.
+    Idle,
+    /// restart the beat grid and flush the window now: real ops are pending
+    /// (the busy cadence — every drain tick), or the idle beat is due while a
+    /// batch is still in flight (the flush itself is then a no-op).
+    Flush,
+    /// the idle beat is due with a clear orderer: submit one nop, then flush.
+    BeatNop,
+}
+
+fn heartbeat_action(
+    disabled: bool,
+    ops_pending: bool,
+    heartbeat_due: bool,
+    orderer_idle: bool,
+) -> HeartbeatAction {
+    if disabled {
+        return HeartbeatAction::Idle;
+    }
+    // the busy cadence: pending real ops flush on THIS tick — the block
+    // interval floors at the drain tick, never waiting out `BLOCK_TIME`.
+    if ops_pending {
+        return HeartbeatAction::Flush;
+    }
+    if !heartbeat_due {
+        return HeartbeatAction::Idle;
+    }
+    // the idle beat: one nop per `BLOCK_TIME`, and only while nothing is
+    // already in flight — a nop behind a finalization stall would stack
+    // idle blocks.
+    if orderer_idle {
+        HeartbeatAction::BeatNop
+    } else {
+        HeartbeatAction::Flush
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_action_tests {
+    use super::{HeartbeatAction, heartbeat_action};
+
+    #[test]
+    fn pending_ops_flush_on_this_tick_not_the_beat() {
+        // the busy cadence: the beat interval has NOT elapsed, yet pending
+        // real ops flush anyway — the block interval floors at the drain tick.
+        assert_eq!(
+            heartbeat_action(false, true, false, true),
+            HeartbeatAction::Flush
+        );
+        assert_eq!(
+            heartbeat_action(false, true, false, false),
+            HeartbeatAction::Flush
+        );
+    }
+
+    #[test]
+    fn pending_ops_never_beat_a_nop() {
+        // a window with real ops needs no nop — the ops ARE the block.
+        assert_eq!(
+            heartbeat_action(false, true, true, true),
+            HeartbeatAction::Flush
+        );
+    }
+
+    #[test]
+    fn idle_beat_waits_for_block_time() {
+        assert_eq!(
+            heartbeat_action(false, false, false, true),
+            HeartbeatAction::Idle
+        );
+        assert_eq!(
+            heartbeat_action(false, false, true, true),
+            HeartbeatAction::BeatNop
+        );
+    }
+
+    #[test]
+    fn idle_beat_never_stacks_behind_a_stall() {
+        // a batch is still in flight: restart the grid without piling a nop
+        // behind the stall.
+        assert_eq!(
+            heartbeat_action(false, false, true, false),
+            HeartbeatAction::Flush
+        );
+    }
+
+    #[test]
+    fn disabled_heartbeat_flushes_nothing() {
+        for ops_pending in [false, true] {
+            for heartbeat_due in [false, true] {
+                for orderer_idle in [false, true] {
+                    assert_eq!(
+                        heartbeat_action(true, ops_pending, heartbeat_due, orderer_idle),
+                        HeartbeatAction::Idle
+                    );
+                }
             }
         }
     }

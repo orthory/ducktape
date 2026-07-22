@@ -461,12 +461,14 @@ impl ConsensusHandle {
 /// is a no-op `true` — in this single-app sim every payload asked about is one we
 /// stored. generic over the public key `P` so `Context<Digest, P>` lines up with
 /// whatever scheme the engine runs.
-/// the single block-time knob: the target interval between finalized blocks.
-/// an idle chain ticks exactly one nop block per `BLOCK_TIME`; a busy window's
-/// ops all aggregate into the single block that closes the window. the node's
-/// flush/heartbeat loop AND this automaton's idle-wait both pace off this one
-/// value, so no producer can outpace it (the 1-tx-1-block + faster-than-intended
-/// beat regime is gone). raising it slows the visibly-live height tick 1:1.
+/// the IDLE block cadence: the target interval between finalized blocks while
+/// nothing is happening. an idle chain ticks exactly one nop block per
+/// `BLOCK_TIME`; the node's heartbeat AND this automaton's idle-wait both pace
+/// off this one value, so an idle chain never outpaces it. a BUSY window is
+/// deliberately faster: the node flushes pending real ops once per drain tick
+/// (its `DRAIN_TICK`, 100ms — the block-interval floor), with everything that
+/// arrived inside one tick still aggregating into a single block, so the
+/// 1-tx-1-block regime stays dead. raising it slows the idle height tick 1:1.
 pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
 /// how long a leader holds an otherwise-idle view open, polling for an op or the
 /// node's heartbeat nop before declining — keeping a solo validator (no quorum

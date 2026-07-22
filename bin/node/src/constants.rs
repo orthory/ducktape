@@ -32,11 +32,12 @@ pub(crate) const PEER_SET: u64 = 0;
 // blocks, and this heartbeat must submit the same string — so the value lives in
 // `noded::projection` and both sides read it here.
 pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
-// block cadence is a single knob: `consensus::BLOCK_TIME` (1s). the idle
-// heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
+// block cadence runs on two knobs. BUSY: a window holding real ops flushes
+// every `DRAIN_TICK` — the block-interval floor. IDLE: the heartbeat beats one
+// nop block per `consensus::BLOCK_TIME` (1s) so an idle chain still finalizes
 // (its height keeps ticking) and any pending cutover still crosses — paced to
-// the same interval the leader's idle-propose holds a view open, so the beat
-// never outpaces the intended block time.
+// the same interval the leader's idle-propose holds a view open, so the idle
+// beat never outpaces the view hold.
 /// request timeout for the promoted-validator boot catch-up client. it is long
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
@@ -81,7 +82,9 @@ pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TI
 /// everything that rides the drain arm — checkpoints, valset orchestration,
 /// the epoch cutover, the heartbeat). enforced as a FLOOR via an absolute
 /// deadline in the pump loop: ingress load can delay one drain by one
-/// request's service time, but can never starve the arm.
+/// request's service time, but can never starve the arm. because the
+/// heartbeat arm flushes a window holding real ops on every tick, this floor
+/// is also the busy-chain BLOCK-INTERVAL floor (see `pump_heartbeat`).
 pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one

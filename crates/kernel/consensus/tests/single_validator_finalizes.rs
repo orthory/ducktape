@@ -105,9 +105,9 @@ fn a_single_validator_finalizes_sequential_blocks() {
         let mut applied = 0usize;
         while applied < 2 {
             context.sleep(Duration::from_millis(50)).await;
-            // the production drain flushes the batch window every BLOCK_TIME tick
-            // (bin/node main); enqueue-only submits never propose without it — the
-            // sim mirrors that cadence (a no-op when nothing is pending).
+            // the production drain flushes a window holding real ops every DRAIN_TICK
+            // (bin/node main); enqueue-only submits never propose without a flush — the
+            // sim mirrors that flush-per-tick cadence (a no-op when nothing is pending).
             node.flush_batch().await.expect("flush");
             applied += node.drain_delivered().await.expect("drain");
         }
