@@ -11,7 +11,7 @@ edition = "2021"
 publish = false
 
 [features]
-# the duckfs object-store adapter (`GuestOdb`). non-default so the ~20 guests
+# the duckfs object-store adapter (`GuestOdb`). non-default so the guests
 # that never touch the object plane don't compile `duckfs-core`; the files
 # guest enables it.
 odb = ["dep:duckfs-core"]

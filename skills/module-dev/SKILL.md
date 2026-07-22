@@ -51,11 +51,6 @@ canonical COMMITTED `component.wasm` into the module directory.
 `Makefile`: add the module to `BUILDER_MODULES` — that one entry covers the
 build, the fixture `cp`, and the `wasm-modules-check` `cmp`.
 
-UNMIGRATED modules (the pre-builder remainder of `crates/guests/<id>-wasm`
-standalone crates, listed in `WASM_GUESTS`) still follow the old shape:
-standalone workspace, `crate-type = ["cdylib"]`, deps = `guest-adapter` + the
-native crate. Port them to the module-owned shape when touched.
-
 ## 3. Registration — four bins compose modules
 
 | Bin | Runs | What to touch |
@@ -78,8 +73,6 @@ to its contents (the auto-merge count trap).
 ```
 cargo test -p <id>                                        # 1. native logic
 cargo run -p guest-builder -- crates/modules/<plane>/<id> # 2. catches native-dep leaks
-                                                          #    (unmigrated: cd crates/guests/<id>-wasm &&
-                                                          #     cargo build --target wasm32-unknown-unknown --release)
 make wasm-modules                                         # 3. BEFORE bin/node compiles —
                                                           #    include_bytes! needs the artifact
 cargo check --workspace --all-targets                     # 4. registry parity test gates

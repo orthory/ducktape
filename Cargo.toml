@@ -24,15 +24,13 @@
 #                      inbox, files, jobs)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
-#   crates/guests/   — shared wasm-port infra: guest-adapter (the
+#   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
 #                      ducktape:module world binding every port shares), the
 #                      wasm32 dep stubs, and the kernel-fixture test guests
-#                      (hello, hello-v2, sibling, object). product modules
-#                      carry their OWN port (src/guest.rs behind the `guest`
+#                      (hello, hello-v2, sibling, object). every module
+#                      carries its OWN port (src/guest.rs behind the `guest`
 #                      feature) and bin/guest-builder synthesizes the
-#                      packaging — migrated modules have no crate here;
-#                      unmigrated ones still keep a standalone X-wasm
-#                      workspace pending the sweep
+#                      packaging — no per-module crate lives here
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
 #                      canary), greeter (the types-only composition example)
 #   crates/testing/  — dev-only shared test support (nettest: raw-http client,

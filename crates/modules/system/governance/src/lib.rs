@@ -1790,3 +1790,9 @@ mod dead_electorate_refusal {
         );
     }
 }
+
+// the wasm-guest port: the dispatch shell that adapts this module to the
+// ducktape:module world. compiled only by the guest-builder's synthesized
+// wasm32 cdylib workspace (feature `guest`), never by the native build.
+#[cfg(feature = "guest")]
+mod guest;

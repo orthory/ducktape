@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the tagging cutover: the
-//! `tagging-wasm` component (the NATIVE `tagging` crate compiled to wasm behind
+//! `tagging` guest component (the NATIVE `tagging` crate compiled to wasm behind
 //! `guest-adapter`) and the native `TaggingModule` answer the SAME op sequence
 //! with IDENTICAL routing decisions, and their roots move in lockstep (move on
 //! commit, hold on no-ops and abort). the roots THEMSELVES differ from the
@@ -25,8 +25,8 @@ use tagging::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/tagging-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `tagging` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const TAGGING_WASM: &[u8] = include_bytes!("fixtures/tagging.component.wasm");
 
 /// the plane truncates one event's tag list to this many entries and caps a

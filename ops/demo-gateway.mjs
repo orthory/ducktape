@@ -168,7 +168,7 @@ async function main() {
     if (!error.message.includes("invalid type: map, expected a sequence")) throw error;
     // NO-BACKCOMPAT: the embedded gateway component must be regenerated for
     // Identity's Vec<NodeView>; never retry with its stale Vec<Vec<u8>> wire.
-    console.error("[gateway] SKIPPED all routes: embedded gateway component expects Identity AccountView.nodes as byte arrays, but Identity now returns NodeView objects; regenerate gateway-wasm/component.wasm");
+    console.error("[gateway] SKIPPED all routes: embedded gateway component expects Identity AccountView.nodes as byte arrays, but Identity now returns NodeView objects; regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway)");
     process.exitCode = 78;
     return;
   }

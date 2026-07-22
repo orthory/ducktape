@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the dispatch cutover, PART 1 — the
-//! block-boundary matrix. the `dispatch-wasm` component (the NATIVE `dispatch`
+//! block-boundary matrix. the `dispatch` guest component (the NATIVE `dispatch`
 //! crate compiled to wasm behind `guest-adapter`) and the native
 //! [`DispatchModule`] answer the SAME op sequence with IDENTICAL accept/reject
 //! verdicts, their committed reads agree between blocks, and their roots move in
@@ -48,8 +48,8 @@ use dispatch::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/dispatch-wasm` by the module
-/// build target; committed (Task 1) so this proof is self-contained.
+/// GENERATED artifact — built from the `dispatch` module's guest port by
+/// guest-builder (`make wasm-modules`); committed (Task 1) so this proof is self-contained.
 const DISPATCH_WASM: &[u8] = include_bytes!("fixtures/dispatch.component.wasm");
 
 fn wasm_dispatch() -> WasmModule {

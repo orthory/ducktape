@@ -1,5 +1,0 @@
-# standalone guest crate build artifacts (the canonical componentized artifact
-# IS committed here and the kernel test fixture pins the same bytes).
-/target
-/out
-/Cargo.lock

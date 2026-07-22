@@ -1,5 +1,0 @@
-# standalone guest crate build artifacts (the componentized artifact is pinned
-# as the kernel host test fixture: crates/kernel/host/tests/fixtures/).
-/target
-/out
-/Cargo.lock

@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the runs cutover — the FINAL
-//! portable module: the `runs-wasm` component (the NATIVE `runs` crate
+//! portable module: the `runs` guest component (the NATIVE `runs` crate
 //! compiled to wasm behind `guest-adapter`) and the native `RunsModule`
 //! answer the SAME op sequence with IDENTICAL query replies, emit IDENTICAL
 //! event traces (WorkerRequests included), land IDENTICAL follow-ups on every
@@ -84,8 +84,8 @@ use tasks::{
 use valset::Valset;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/runs-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `runs` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 
 fn wasm_runs() -> WasmModule {

@@ -15,7 +15,7 @@
 //! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store
 //! IS the state, the wasm root IS the store's merkle root, and the cutover is
 //! ROOT-CONTINUOUS (state schema revision stays 1; pre-cutover workspaces
-//! reopen unchanged). see `pages-wasm` for the staging-contract argument
+//! reopen unchanged). see the `pages` guest port for the staging-contract argument
 //! spelled out point by point — chat rides the identical seams:
 //!
 //! * the guest rebuilds the module FRESH per dispatch over the exact

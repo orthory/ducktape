@@ -1,7 +1,7 @@
 //! proves typed cross-module composition end-to-end through the host: a greeter
 //! module QUERIES a directory module and, from the result, WRITES a greeting to
 //! both directory and kv — using only the modules' interface crates. runs the
-//! directory both NATIVE and as the `directory-wasm` component (the first real
+//! directory both NATIVE and as the `directory` guest component (the first real
 //! wasm tenant): the composing peer cannot tell which runtime serves it.
 
 use commonware_runtime::{Runner as _, deterministic};
@@ -13,8 +13,8 @@ use sdk::{Ctx, Error, Module, Msg, StateRoot};
 use wasm_host::WasmModule;
 use statesync::qmdb::QmdbStore;
 
-/// GENERATED artifact — built from `crates/guests/directory-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `directory` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const DIRECTORY_WASM: &[u8] = include_bytes!("fixtures/directory.component.wasm");
 
 struct QueryCycler {

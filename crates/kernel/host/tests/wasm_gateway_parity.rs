@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the MERGED gateway module: the
-//! `gateway-wasm` component (the NATIVE `gateway` crate compiled to wasm
+//! `gateway` guest component (the NATIVE `gateway` crate compiled to wasm
 //! behind `guest-adapter`) and the native `Gateway` module answer the SAME op
 //! sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
@@ -9,7 +9,7 @@
 //!
 //! gateway now owns the WHOLE `.duck` name → AccountId → route pipeline: BOTH
 //! the route plane AND the `.duck` handle plane absorbed from the retired
-//! `duckdns` module (which had its own `duckdns-wasm` guest + parity proof —
+//! `duckdns` module (which had its own `duckdns` guest + parity proof —
 //! both merged here). the route-plane tests below cover SetRoute; the
 //! handle-plane test covers SetHandle / Resolve on the SAME merged tenant.
 //!
@@ -42,8 +42,8 @@ use sdk::{Error, Module as _, Msg, Origin, StateRoot};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/gateway-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `gateway` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const GATEWAY_WASM: &[u8] = include_bytes!("fixtures/gateway.component.wasm");
 
 /// the chain id BOTH runtimes are constructed with — natively as a constructor
