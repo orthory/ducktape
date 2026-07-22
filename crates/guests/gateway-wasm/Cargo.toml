@@ -26,14 +26,14 @@ sdk = { path = "../../kernel/sdk" }
 # imports into the cdylib and breaks componentization. no consensus path ever
 # calls getrandom (modules are deterministic by contract; the guest only links
 # the pure verify paths), so the guest links a vendored stub whose only backend
-# is a deterministic refusal — see getrandom-stub/Cargo.toml.
+# is a deterministic refusal — see ../stubs/getrandom-02/Cargo.toml.
 [patch.crates-io]
-getrandom = { path = "getrandom-stub" }
+getrandom = { path = "../stubs/getrandom-02" }
 # one stub per major the graph pulls — the commonware 2026.7 bump brought
 # getrandom 0.3 and 0.4 alongside 0.2 (same ruling for all three; see
-# getrandom-stub-03/Cargo.toml).
-getrandom-03 = { package = "getrandom", path = "getrandom-stub-03" }
-getrandom-04 = { package = "getrandom", path = "getrandom-stub-04" }
+# ../stubs/getrandom-03/Cargo.toml).
+getrandom-03 = { package = "getrandom", path = "../stubs/getrandom-03" }
+getrandom-04 = { package = "getrandom", path = "../stubs/getrandom-04" }
 
 # blst reaches every commonware-cryptography guest unconditionally, but no
 # module calls bls12381 — wasm-ld dead-strips every blst symbol from the
