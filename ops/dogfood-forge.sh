@@ -101,8 +101,8 @@ log "source commit: $SOURCE_OID ($SRC_REF)"
 # a healthy node is required (git-receive-pack is served off the node's http
 # surface). fail fast with an actionable message rather than a git transport error.
 if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
-  die "no node responding at $BASE_URL — start the dev app/node first \
-(\`make dev\`), or set DUCKTAPE_DEV_FORGE_URL to a running node."
+  die "no node responding at $BASE_URL — start a node first (\
+`cargo run -p noded`), or set DUCKTAPE_DEV_FORGE_URL to a running node."
 fi
 
 # idempotent remote wiring: add, or re-point if it already exists.

@@ -145,8 +145,6 @@ until you roll it in Step 4.
 ```bash
 cargo build --release -p node-bin
 cargo test -p node-bin --test cluster_e2e
-# Optional desktop package verification for the same sidecar revision:
-make app
 ```
 
 **Admission gate during an open window:** any validator admitted after a
