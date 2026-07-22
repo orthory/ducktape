@@ -650,17 +650,11 @@ impl WasmModule {
 
     /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
     /// pairs — the exact preimage of [`WasmModule::root_of`], and therefore the
-    /// snapshot format (verify-then-adopt against the root, like modreg).
+    /// snapshot format (verify-then-adopt against the root, like modreg). The
+    /// shared [`sdk::hash::encode_pairs`] IS this byte contract (the `sdk-testkit`
+    /// `MemStore::root` preimage is checked against the same helper).
     fn encode_state(committed: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(committed.len() as u64).to_le_bytes());
-        for (k, v) in committed {
-            out.extend_from_slice(&(k.len() as u64).to_le_bytes());
-            out.extend_from_slice(k);
-            out.extend_from_slice(&(v.len() as u64).to_le_bytes());
-            out.extend_from_slice(v);
-        }
-        out
+        sdk::hash::encode_pairs(committed)
     }
 
     /// The authenticated root of the committed store: SHA-256 over

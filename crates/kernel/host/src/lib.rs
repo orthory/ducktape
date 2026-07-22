@@ -155,11 +155,7 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 
 /// lowercase hex of a hash, for fail-closed error messages.
 fn hex32(bytes: &[u8]) -> String {
-    use core::fmt::Write;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    sdk::hash::hex_lower(bytes)
 }
 
 /// the block-constant consensus context for one [`Host::submit_at`]: the agreed
