@@ -113,7 +113,12 @@ export function TrackCard({
       <div className="dt-track__body">{children}</div>
       <div className="dt-track__links">
         {links.map((l) => (
-          <a key={l.href} className="dt-track__link" href={l.href}>
+          <a
+            key={l.href}
+            className="dt-track__link"
+            href={l.href}
+            aria-label={`${kind === 'human' ? 'Human' : 'Agent'} · ${l.label}`}
+          >
             {l.label}
             <span aria-hidden="true">→</span>
           </a>

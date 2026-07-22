@@ -69,6 +69,45 @@
     0 12px 32px -18px light-dark(rgba(15, 18, 26, 0.28), rgba(0, 0, 0, 0.6));
 }
 
+.dt-diagram__scroll {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+
+.dt-diagram__frame {
+  position: relative;
+}
+
+.dt-diagram__visual {
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.dt-diagram__alternative {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.dt-diagram__canvas--wide {
+  width: var(--dt-diagram-mobile-width);
+}
+
+@media (max-width: 48rem) {
+  .dt-diagram__canvas {
+    width: var(--dt-diagram-mobile-width);
+  }
+}
+
 .dt-diagram__skeleton {
   width: 100%;
   height: 100%;
@@ -220,13 +259,17 @@
   background: var(--dt-surface-2);
   border-bottom: 1px solid var(--dt-hairline);
   color: var(--dt-text);
-  width: 26px;
-  height: 26px;
+  width: 44px;
+  height: 44px;
 }
 .dt-diagram .react-flow__controls-button:hover {
   background: var(--nb-muted);
 }
-.dt-diagram .react-flow__controls-button svg { fill: var(--dt-text-muted); }
+.dt-diagram .react-flow__controls-button svg {
+  max-width: 16px;
+  max-height: 16px;
+  fill: var(--dt-text-muted);
+}
 
 .dt-diagram .react-flow__attribution {
   background: transparent;

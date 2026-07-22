@@ -11,6 +11,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
         <input
           data-search-input
           role="combobox"
+          aria-label="Search documentation"
           aria-expanded="false"
           aria-haspopup="listbox"
           aria-autocomplete="list"
@@ -23,7 +24,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
           autocorrect="off"
           autocapitalize="none"
         />
-        <DialogClose class="rounded border border-border bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
+        <DialogClose aria-label="Close search" class="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-border bg-muted px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground">
           Esc
         </DialogClose>
       </div>
@@ -32,6 +33,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
         data-search-results
         role="listbox"
         id="search-listbox"
+        aria-label="Search results"
         aria-orientation="vertical"
         class="min-h-40 overflow-y-auto p-2"
       >
@@ -54,7 +56,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
   import { provider } from "./providers/pagefind";
 
   type SearchDialogElement = HTMLDialogElement & {
-    __openSearchDialog?: () => void;
+    __openSearchDialog?: (restoreFocusTo?: HTMLElement) => void;
   };
 
   function primaryDialog(): SearchDialogElement | null {
@@ -73,7 +75,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
     document.addEventListener("click", (event) => {
       const trigger = (event.target as Element | null)?.closest("[data-search-trigger]");
       if (!trigger) return;
-      primaryDialog()?.__openSearchDialog?.();
+      primaryDialog()?.__openSearchDialog?.(trigger as HTMLElement);
     });
 
     document.addEventListener("keydown", (event) => {
@@ -95,6 +97,7 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
       const resultsContainer = dialog.querySelector<HTMLElement>("[data-search-results]");
       const emptyState = dialog.querySelector<HTMLElement>("[data-search-empty]");
       if (!input || !resultsContainer || !emptyState) return;
+      let restoreFocusTo: HTMLElement | null = null;
 
       const search = initSearch({
         input,
@@ -104,10 +107,17 @@ import { Dialog, DialogClose, DialogContent } from "@/components/ui/dialog";
         onNavigate: () => dialog.close(),
       });
 
-      dialog.__openSearchDialog = () => {
+      dialog.__openSearchDialog = (trigger) => {
+        restoreFocusTo = trigger
+          ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
         if (!dialog.open) dialog.showModal();
         void search.reset();
       };
+
+      dialog.addEventListener("close", () => {
+        if (restoreFocusTo?.isConnected) restoreFocusTo.focus();
+        restoreFocusTo = null;
+      });
     });
 
     bindGlobals();

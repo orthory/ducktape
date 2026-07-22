@@ -57,6 +57,12 @@ const ko = readFileSync(join(dist, 'ko/human/index.html'), 'utf8')
 if (!en.includes('<html lang="en"')) failures.push('English pages must declare lang="en"')
 if (!ko.includes('<html lang="ko"')) failures.push('Korean pages must declare lang="ko"')
 if (!en.includes('/opengraph.png')) failures.push('pages must advertise the static social card')
+if (!en.includes('data-md-url="/en/human/index.md"') || !en.includes('href="/en/human/index.md"')) {
+  failures.push('Markdown page actions must use a host-relative URL')
+}
+if (!/<div data-nb-page-actions[^>]*data-pagefind-ignore/.test(en)) {
+  failures.push('Page actions must stay out of Pagefind snippets')
+}
 for (const label of ['Human · English', 'Human · 한국어', 'Agent · English', 'Agent · 한국어']) {
   if (!en.includes(label)) failures.push(`header is missing ${label}`)
 }

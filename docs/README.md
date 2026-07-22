@@ -50,5 +50,8 @@ bun run dev
 ```
 
 `bun run docs:check` runs the structure check before the Nimbus static build.
-`DOCS_SITE_URL` sets the canonical production origin; local builds default to
-`http://localhost:4321`. Use the three checks before opening a docs PR.
+`DOCS_SITE_URL` sets the canonical, Open Graph, and sitemap origin; local builds
+default to `http://localhost:4321`. Set it to the externally reachable origin for
+every non-local preview or deployment (for example,
+`DOCS_SITE_URL=https://docs.example.com bun run build`). Use the three checks
+before opening a docs PR.

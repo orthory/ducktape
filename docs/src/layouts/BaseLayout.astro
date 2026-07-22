@@ -74,6 +74,8 @@ const llmsUrl = Astro.site
           root.style.colorScheme = mode;
           document.querySelectorAll("[data-nb-theme-toggle]").forEach((b) => {
             b.setAttribute("data-nb-state", mode);
+            b.setAttribute("aria-label", `Switch to ${mode === "dark" ? "light" : "dark"} mode`);
+            b.setAttribute("aria-pressed", String(mode === "dark"));
           });
         };
 

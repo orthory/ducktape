@@ -44,7 +44,7 @@
 	--nb-border: oklch(0.935 0 0);
 	--nb-border-strong: oklch(0.87 0 0);
 	--nb-selected: oklch(0.89 0 0);
-	--nb-ring: color-mix(in oklch, var(--nb-primary) 35%, transparent);
+	--nb-ring: var(--nb-primary);
 
 	/* Status colors — paired (saturated for text/border + muted for bg) */
 	--nb-info: oklch(0.45 0.18 255);
@@ -92,13 +92,6 @@
 	--nb-shadow-lg: 0 4px 12px oklch(0 0 0 / 0.08), 0 2px 4px oklch(0 0 0 / 0.04);
 }
 
-/* Wider content area on large displays (e.g. MacBook Pro 16″) */
-@media (min-width: 1536px) {
-	:root {
-		--nb-content-max: 52rem;
-	}
-}
-
 /* ---- Dark mode ---- */
 [data-mode="dark"] {
 	color-scheme: dark;
@@ -110,7 +103,7 @@
 	--nb-card-foreground: var(--nb-foreground);
 
 	--nb-muted: #060606;
-	--nb-muted-foreground: oklch(0.556 0 0);
+	--nb-muted-foreground: oklch(0.72 0 0);
 
 	--nb-accent: oklch(0.269 0 0);
 	--nb-accent-foreground: var(--nb-foreground);
@@ -122,7 +115,7 @@
 	--nb-border: oklch(0.269 0 0);
 	--nb-border-strong: oklch(0.371 0 0);
 	--nb-selected: oklch(0.371 0 0);
-	--nb-ring: color-mix(in oklch, var(--nb-primary) 35%, transparent);
+	--nb-ring: var(--nb-primary);
 
 	--nb-info: oklch(0.75 0.12 255);
 	--nb-info-foreground: oklch(0.75 0.12 255);
@@ -488,4 +481,9 @@ pre.astro-code .highlighted-word {
 /* Hide hamburger on pages without a sidebar dialog. */
 body:not(:has([data-mobile-sidebar])) [data-menu-btn] {
 	display: none;
+}
+
+[data-nb-banner-close] {
+	min-width: 2.75rem;
+	min-height: 2.75rem;
 }
