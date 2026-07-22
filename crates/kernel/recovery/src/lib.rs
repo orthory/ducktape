@@ -171,6 +171,16 @@ impl From<Error> for node::Error {
     }
 }
 
+/// a shared-cursor decode failure (truncation, a forged length over the field
+/// cap, trailing bytes) is a damaged/forged journal record — the same class
+/// this crate's own `Cursor` reported as [`Error::Corrupt`]. mapping it here
+/// lets the record/manifest decoders below use `sdk::codec::Cursor` with `?`.
+impl From<sdk::Error> for Error {
+    fn from(e: sdk::Error) -> Self {
+        Error::Corrupt(e.to_string())
+    }
+}
+
 // ============================================================================
 // wire — hand-rolled little-endian records (statesync-wire discipline:
 // length-prefixed, bounds-checked, no partial reads).
@@ -185,6 +195,9 @@ const MAX_RECORD_FIELD_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + fra
 /// keep their per-field decoder bound aligned with the smart-HTTP pack ceiling.
 const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
 
+// WRITE side: raw fixed-width ints stay inline one-liners; the length-prefixed
+// byte writer IS `sdk::codec::push_bytes` (verbatim `u64`-LE length + bytes), so
+// it delegates rather than keep a byte-for-byte duplicate.
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -194,81 +207,19 @@ fn put_u32(out: &mut Vec<u8>, v: u32) {
 }
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    put_u64(out, b.len() as u64);
-    out.extend_from_slice(b);
+    sdk::codec::push_bytes(out, b);
 }
 
 fn put_root(out: &mut Vec<u8>, r: &StateRoot) {
     out.extend_from_slice(&r.0);
 }
 
-struct Cursor<'a> {
-    buf: &'a [u8],
-    at: usize,
-    max_field_len: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            at: 0,
-            max_field_len: MAX_RECORD_FIELD_LEN,
-        }
-    }
-
-    fn checkpoint(buf: &'a [u8]) -> Self {
-        Self {
-            buf,
-            at: 0,
-            max_field_len: MAX_CHECKPOINT_FIELD_LEN,
-        }
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
-        let end = self
-            .at
-            .checked_add(n)
-            .filter(|e| *e <= self.buf.len())
-            .ok_or_else(|| Error::Corrupt("record truncated".into()))?;
-        let s = &self.buf[self.at..end];
-        self.at = end;
-        Ok(s)
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes(b.try_into().expect("8 bytes")))
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes(b.try_into().expect("4 bytes")))
-    }
-
-    fn bytes(&mut self) -> Result<Vec<u8>, Error> {
-        let len = self.u64()? as usize;
-        if len > self.max_field_len {
-            return Err(Error::Corrupt(format!(
-                "length {len} exceeds the field cap {}",
-                self.max_field_len
-            )));
-        }
-        Ok(self.take(len)?.to_vec())
-    }
-
-    fn root(&mut self) -> Result<StateRoot, Error> {
-        let b = self.take(32)?;
-        Ok(StateRoot(b.try_into().expect("32 bytes")))
-    }
-
-    fn done(&self) -> Result<(), Error> {
-        if self.at == self.buf.len() {
-            Ok(())
-        } else {
-            Err(Error::Corrupt("trailing bytes after record".into()))
-        }
-    }
+// READ side: the shared `sdk::codec::Cursor`, opened `with_cap` so recovery's
+// per-field length caps survive (`MAX_RECORD_FIELD_LEN` for op-journal records,
+// `MAX_CHECKPOINT_FIELD_LEN` for checkpoint manifests carrying forge snapshots).
+// a `StateRoot` is a fixed 32-byte field (no length prefix), read via `array`.
+fn read_root(c: &mut sdk::codec::Cursor, what: &str) -> Result<StateRoot, Error> {
+    Ok(StateRoot(c.array::<32>(what)?))
 }
 
 fn put_roots(out: &mut Vec<u8>, roots: &[(ModuleId, StateRoot)]) {
@@ -279,8 +230,8 @@ fn put_roots(out: &mut Vec<u8>, roots: &[(ModuleId, StateRoot)]) {
     }
 }
 
-fn get_roots(c: &mut Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
-    let n = c.u64()? as usize;
+fn get_roots(c: &mut sdk::codec::Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
+    let n = c.u64("module roots count")? as usize;
     if n > 4096 {
         return Err(Error::Corrupt(format!(
             "{n} module roots exceeds sanity cap"
@@ -288,9 +239,8 @@ fn get_roots(c: &mut Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
     }
     let mut roots = Vec::with_capacity(n);
     for _ in 0..n {
-        let id = String::from_utf8(c.bytes()?)
-            .map_err(|_| Error::Corrupt("module id is not utf-8".into()))?;
-        roots.push((id, c.root()?));
+        let id = c.string("module id")?;
+        roots.push((id, read_root(c, "module root")?));
     }
     Ok(roots)
 }
@@ -302,8 +252,8 @@ fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
     }
 }
 
-fn get_keys(c: &mut Cursor) -> Result<Vec<Vec<u8>>, Error> {
-    let n = c.u64()? as usize;
+fn get_keys(c: &mut sdk::codec::Cursor) -> Result<Vec<Vec<u8>>, Error> {
+    let n = c.u64("participant keys count")? as usize;
     if n > 4096 {
         return Err(Error::Corrupt(format!(
             "{n} participant keys exceeds sanity cap"
@@ -311,7 +261,7 @@ fn get_keys(c: &mut Cursor) -> Result<Vec<Vec<u8>>, Error> {
     }
     let mut keys = Vec::with_capacity(n);
     for _ in 0..n {
-        keys.push(c.bytes()?);
+        keys.push(c.bytes("participant key")?.to_vec());
     }
     Ok(keys)
 }
@@ -404,23 +354,25 @@ impl Record {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor::new(bytes);
-        let tag = c.take(1)?[0];
+        let mut c = sdk::codec::Cursor::with_cap(bytes, MAX_RECORD_FIELD_LEN);
+        let tag = c.byte("record tag")?;
         let record = match tag {
-            TAG_PINNED => Record::Pinned { frame: c.bytes()? },
+            TAG_PINNED => Record::Pinned {
+                frame: c.bytes("pinned frame")?.to_vec(),
+            },
             TAG_BLOCK => Record::Block {
-                height: c.u64()?,
-                frame: c.bytes()?,
+                height: c.u64("block height")?,
+                frame: c.bytes("block frame")?.to_vec(),
             },
             TAG_SEAL => {
-                let height = c.u64()?;
-                let disposition = match c.take(1)?[0] {
+                let height = c.u64("seal height")?;
+                let disposition = match c.byte("disposition")? {
                     DISP_APPLIED => Disposition::Applied,
                     DISP_REJECTED => Disposition::Rejected,
                     d => return Err(Error::Corrupt(format!("unknown disposition {d}"))),
                 };
                 let roots = get_roots(&mut c)?;
-                let app_hash = c.root()?;
+                let app_hash = read_root(&mut c, "seal app hash")?;
                 Record::Seal {
                     height,
                     disposition,
@@ -429,8 +381,8 @@ impl Record {
                 }
             }
             TAG_CUTOVER => {
-                let epoch = c.u64()?;
-                let view_base = c.u64()?;
+                let epoch = c.u64("cutover epoch")?;
+                let view_base = c.u64("cutover view base")?;
                 let participants = get_keys(&mut c)?;
                 let residents = get_keys(&mut c)?;
                 Record::Cutover {
@@ -442,7 +394,7 @@ impl Record {
             }
             t => return Err(Error::Corrupt(format!("unknown record tag {t}"))),
         };
-        c.done()?;
+        c.finish("record")?;
         Ok(record)
     }
 }
@@ -559,42 +511,40 @@ impl Manifest {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor::checkpoint(bytes);
-        let height = match c.take(1)?[0] {
+        let mut c = sdk::codec::Cursor::with_cap(bytes, MAX_CHECKPOINT_FIELD_LEN);
+        let height = match c.byte("height tag")? {
             0 => None,
-            1 => Some(c.u64()?),
+            1 => Some(c.u64("height")?),
             t => return Err(Error::Corrupt(format!("bad height tag {t}"))),
         };
-        let epoch = c.u64()?;
-        let view_base = c.u64()?;
+        let epoch = c.u64("epoch")?;
+        let view_base = c.u64("view base")?;
         let participants = get_keys(&mut c)?;
-        let pending_cutover_view = match c.take(1)?[0] {
+        let pending_cutover_view = match c.byte("pending-cutover tag")? {
             0 => None,
-            1 => Some(c.u64()?),
+            1 => Some(c.u64("pending cutover view")?),
             t => return Err(Error::Corrupt(format!("bad pending-cutover tag {t}"))),
         };
-        let app_hash = c.root()?;
+        let app_hash = read_root(&mut c, "app hash")?;
         let roots = get_roots(&mut c)?;
-        let n = c.u64()? as usize;
+        let n = c.u64("snapshots count")? as usize;
         if n > 4096 {
             return Err(Error::Corrupt(format!("{n} snapshots exceeds sanity cap")));
         }
         let mut snapshots = Vec::with_capacity(n);
         for _ in 0..n {
-            let id = String::from_utf8(c.bytes()?)
-                .map_err(|_| Error::Corrupt("module id is not utf-8".into()))?;
-            snapshots.push((id, c.bytes()?));
+            let id = c.string("snapshot module id")?;
+            snapshots.push((id, c.bytes("snapshot bytes")?.to_vec()));
         }
-        let oplog_pos = c.u64()?;
-        let next_seq = c.u64()?;
-        let current_version = c.u32()?;
-        let pending_upgrade = match c.take(1)?[0] {
+        let oplog_pos = c.u64("oplog pos")?;
+        let next_seq = c.u64("next seq")?;
+        let current_version = c.u32("current version")?;
+        let pending_upgrade = match c.byte("pending-upgrade tag")? {
             0 => None,
             1 => {
-                let name = String::from_utf8(c.bytes()?)
-                    .map_err(|_| Error::Corrupt("upgrade name is not utf-8".into()))?;
-                let activation_height = c.u64()?;
-                let to_version = c.u32()?;
+                let name = c.string("upgrade name")?;
+                let activation_height = c.u64("activation height")?;
+                let to_version = c.u32("to version")?;
                 Some(UpgradeCoords {
                     name,
                     activation_height,
@@ -603,21 +553,17 @@ impl Manifest {
             }
             t => return Err(Error::Corrupt(format!("bad pending-upgrade tag {t}"))),
         };
-        let required_min_version = c.u32()?;
+        let required_min_version = c.u32("required min version")?;
         let residents = get_keys(&mut c)?;
         // The exact EOF after `residents` is the pre-schema-manifest format.
         // Preserve that distinction so boot reports an incompatible workspace,
         // not damaged/truncated storage. A partial new trailer is corruption.
-        let state_schema = if c.at == c.buf.len() {
+        let state_schema = if c.remaining() == 0 {
             None
         } else {
-            Some(
-                c.take(32)?
-                    .try_into()
-                    .expect("state schema fingerprint is 32 bytes"),
-            )
+            Some(c.array::<32>("state schema fingerprint")?)
         };
-        c.done()?;
+        c.finish("manifest")?;
         Ok(Self {
             height,
             epoch,
@@ -757,13 +703,13 @@ impl FloorCert {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut c = Cursor::new(bytes);
+        let mut c = sdk::codec::Cursor::with_cap(bytes, MAX_RECORD_FIELD_LEN);
         let out = Self {
-            epoch: c.u64()?,
-            height: c.u64()?,
-            cert: c.bytes()?,
+            epoch: c.u64("floor epoch")?,
+            height: c.u64("floor height")?,
+            cert: c.bytes("floor cert")?.to_vec(),
         };
-        c.done()?;
+        c.finish("floor cert")?;
         Ok(out)
     }
 }

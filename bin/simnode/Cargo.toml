@@ -85,6 +85,10 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
+# the shared raw-http/port/poll harness helpers (was a local copy in harness/).
+nettest = { path = "../../crates/nettest" }
+# the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
+identity = { workspace = true, features = ["testkit"] }
 # sim_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
 # core_scenarios signs identity member-consent certificates.

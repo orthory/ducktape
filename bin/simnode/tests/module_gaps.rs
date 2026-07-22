@@ -20,15 +20,13 @@ use identity::{
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
 /// a MemberAuth whose ed25519 `key` consents to `preimage` under `ns` — the
-/// identity module's own member-consent shape (core_scenarios' `ed_bind_auth`,
-/// generalized to any signing namespace).
+/// identity module's own member-consent shape (the shared `identity::testkit`
+/// builder, wrapped back to the untyped JSON the sim's `/v1/submit` takes), over
+/// ANY signing namespace — the general ns variant this suite needs (bind, unbind,
+/// add/remove-member).
 fn ed_auth(key: &Ed, ns: &[u8], preimage: &[u8]) -> serde_json::Value {
-    let sig = key.sign(ns, preimage);
-    serde_json::json!({
-        "key": key.public_key().as_ref().to_vec(),
-        "kind": "ed25519",
-        "proof": { "signature": { "sig": sig.as_ref().to_vec() } },
-    })
+    serde_json::to_value(identity::testkit::ed_auth(key, ns, preimage))
+        .expect("MemberAuth serializes")
 }
 
 /// 40-char sha1 hex → its 20 raw bytes (a forge oid on the RefUpdate wire).

@@ -612,17 +612,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     }));
     //     …the http app surface answers its status route from the same host…
     {
-        use std::io::{Read as _, Write as _};
-        let mut conn =
-            std::net::TcpStream::connect(("127.0.0.1", cluster.http_ports[1]))
-                .expect("connect the resident's app surface");
-        conn.set_read_timeout(Some(Duration::from_secs(15))).expect("http timeout");
-        conn.write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("http write");
-        let mut raw = String::new();
-        conn.read_to_string(&mut raw).expect("http read");
-        assert!(raw.starts_with("HTTP/1.1 200"), "resident /v1/status must answer 200:\n{raw}");
-        assert!(raw.contains("\"height\""), "resident /v1/status carries a height:\n{raw}");
+        let (status, body) = nettest::http_text(cluster.http_ports[1], "GET", "/v1/status");
+        assert_eq!(status, 200, "resident /v1/status must answer 200:\n{body}");
+        assert!(body.contains("\"height\""), "resident /v1/status carries a height:\n{body}");
     }
     //     …a write LANDS through the submit relay: the resident signs with its
     //     own key, ships the frame to the validator, and the rpc reply holds

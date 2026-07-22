@@ -10,36 +10,14 @@
 #[path = "fs_support/mod.rs"]
 mod support;
 
-use std::io::{Read as _, Write as _};
-use std::net::TcpStream;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use commonware_cryptography::{Signer as _, ed25519};
 use support::Harness;
 
-/// minimal raw http/1.1 exchange with a body — returns (status, body).
+/// minimal raw http/1.1 exchange with an explicit content-type — (status, body).
 fn http(port: u16, method: &str, path: &str, content_type: &str, body: &[u8]) -> (u16, Vec<u8>) {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect harness");
-    let head = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes()).expect("write head");
-    stream.write_all(body).expect("write body");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read response");
-    let text_head_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("response has a header/body split");
-    let head_text = String::from_utf8_lossy(&raw[..text_head_end]);
-    let status: u16 = head_text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .expect("status line");
-    (status, raw[text_head_end + 4..].to_vec())
+    nettest::http_bytes(port, method, path, content_type, body)
 }
 
 /// the commit payload exactly as the TS transport serializes it.

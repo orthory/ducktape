@@ -2257,14 +2257,9 @@ checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 name = "duckdns"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "futures",
- "identity",
- "sdk",
  "serde",
  "serde_json",
  "sha2",
- "valset",
 ]
 
 [[package]]
@@ -3925,6 +3920,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nettest"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4004,6 +4006,7 @@ dependencies = [
  "libc",
  "lifecycle",
  "nat-traversal",
+ "nettest",
  "node",
  "noded",
  "objc2-foundation",
@@ -4068,6 +4071,7 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
+ "nettest",
  "node",
  "pages",
  "rand 0.8.6",
@@ -5821,6 +5825,7 @@ dependencies = [
  "indexer",
  "kv",
  "lifecycle",
+ "nettest",
  "node",
  "noded",
  "pages",

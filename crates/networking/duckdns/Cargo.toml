@@ -3,20 +3,15 @@ name = "duckdns"
 edition.workspace = true
 version.workspace = true
 
-# `.duck` account naming: wire types, hostname grammar, replicated registry,
-# canonical state codec, and the Ducktape module adapter that derives the
-# authenticated AccountId through Identity.
+# `.duck` account naming library: wire types, hostname grammar, replicated
+# registry, and canonical state codec. Consumed by the `gateway` module, which
+# owns the authenticated AccountId derivation through Identity.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sdk = { workspace = true }
-identity = { workspace = true }
-valset = { workspace = true }
-async-trait = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true }
 # the snapshot root is sha256 over the canonical bytes; the legacy-handle
 # regression test forges snapshot bytes no live `set_handle` can produce.
 sha2 = { workspace = true }

@@ -29,6 +29,7 @@
 
 pub mod codec;
 pub mod genesis_config;
+pub mod hash;
 pub mod staged_store;
 pub mod wire;
 

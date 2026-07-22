@@ -100,6 +100,11 @@ pub use metrics::NodeMetrics;
 pub mod projection;
 pub use projection::{BlockProjection, NOP_TARGET, project_block, project_root_op};
 
+// the in-process daemon testkit (a real Host + router on loopback threads) for
+// e2e harnesses. dev-only: gated so the shipping node never compiles it.
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::ws::WebSocketUpgrade;

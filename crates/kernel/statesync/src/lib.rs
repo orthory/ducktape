@@ -2049,7 +2049,7 @@ where
 }
 
 fn hex_root(root: &StateRoot) -> String {
-    root.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    sdk::hash::hex_lower(root.as_bytes())
 }
 
 #[cfg(test)]

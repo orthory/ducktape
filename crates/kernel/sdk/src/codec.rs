@@ -55,11 +55,27 @@ pub fn push_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
 /// WHICH field was truncated/forged, not just that one was.
 pub struct Cursor<'a> {
     buf: &'a [u8],
+    /// a per-field length cap enforced by [`Cursor::bytes`] BEFORE it checks
+    /// the remaining buffer — the recovery-journal defense against a forged
+    /// length that is within the buffer but absurd for the field. `usize::MAX`
+    /// (the [`Cursor::new`] default) means "no extra cap", so a plain cursor
+    /// behaves exactly as before.
+    max_field_len: usize,
 }
 
 impl<'a> Cursor<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf }
+        Self {
+            buf,
+            max_field_len: usize::MAX,
+        }
+    }
+
+    /// a cursor that additionally rejects any length-prefixed field longer than
+    /// `max_field_len` (see the field doc) — the home for recovery's
+    /// `MAX_RECORD_FIELD_LEN` / `MAX_CHECKPOINT_FIELD_LEN` per-field caps.
+    pub fn with_cap(buf: &'a [u8], max_field_len: usize) -> Self {
+        Self { buf, max_field_len }
     }
 
     /// bytes not yet consumed.
@@ -112,6 +128,12 @@ impl<'a> Cursor<'a> {
     /// a `u64`-length-prefixed byte slice, length-checked before the split.
     pub fn bytes(&mut self, what: &str) -> Result<&'a [u8], Error> {
         let len = self.u64(what)?;
+        if len > self.max_field_len as u64 {
+            return Err(Error::Module(format!(
+                "{what} length {len} exceeds the field cap {}",
+                self.max_field_len
+            )));
+        }
         if len > self.buf.len() as u64 {
             return Err(Error::Module(format!(
                 "{what} length {len} exceeds the {} remaining bytes",
@@ -249,5 +271,23 @@ mod tests {
         let c = Cursor::new(&[0u8; 16]);
         assert!(c.bound(3, 8, "entries").is_err());
         assert!(c.bound(2, 8, "entries").is_ok());
+    }
+
+    #[test]
+    fn with_cap_rejects_oversized_field() {
+        // a 4-byte field that fits the buffer but exceeds a 3-byte cap.
+        let mut out = Vec::new();
+        push_bytes(&mut out, &[1, 2, 3, 4]);
+
+        // no cap: accepted.
+        assert_eq!(Cursor::new(&out).bytes("f").unwrap(), &[1, 2, 3, 4]);
+
+        // capped below the field length: rejected, and the message names the cap
+        // (the recovery `record_keeps_the_operation_field_cap` contract).
+        let err = Cursor::with_cap(&out, 3).bytes("f").unwrap_err().to_string();
+        assert!(err.contains("field cap"), "{err}");
+
+        // capped at exactly the field length: still accepted.
+        assert_eq!(Cursor::with_cap(&out, 4).bytes("f").unwrap(), &[1, 2, 3, 4]);
     }
 }

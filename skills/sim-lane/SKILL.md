@@ -1,87 +1,26 @@
 ---
 name: sim-lane
-description: Use when testing transaction flows of the iced desktop app deterministically (submit → commit → re-render, module rejections in UI state), when adding tests under app/src-iced/src/shell/sim/, or when any Rust #[test] in this workspace needs a deterministic in-process Ducktape node (no child processes, no fleet). Also covers the chat wire shapes and Simulator traps those tests hit.
+description: Use when any Rust #[test] in this workspace needs a deterministic in-process Ducktape node (no child processes, no fleet) — boot it with simnode::boot from bin/simnode, drive real submit → commit → query round-trips, and step commits deterministically. Covers the embedding harness, SimOpts, and the chat-module wire shapes those tests hit. (The old iced-UI sim lane under app/src-iced was retired with app/ removal.)
 ---
 
-# Sim lane — deterministic transaction tests
+# Sim lane — deterministic in-process node
 
-Two halves, one embedded node:
-- **The iced lane** (`app/src-iced/src/shell/sim/`) — UI-driven transaction
-  round-trips: real `update()` loop + `iced_test::Simulator`, with an embedded
-  `simnode` answering the app's real HTTP. `cargo test -p ducktape-iced
-  shell::sim` — self-contained, ~0.3s, no external binaries, no env vars.
-- **The embeddable node** (`simnode::boot`, `bin/simnode/src/lib.rs`) — any
-  crate's `#[test]` can boot a deterministic node in-process.
+`simnode::boot` (`bin/simnode/src/lib.rs`) boots a deterministic Ducktape node
+in-process: the full noded `/v1` HTTP surface plus a synchronous control handle,
+no child processes and no timers. Any crate's `#[test]` can drive real
+transaction round-trips (submit → commit → query) against it.
 
-Which lane a test belongs in: see the lane-doctrine table in `skills/qa`
-(node/module semantics without UI → `bin/simnode/tests`; TS store → `app/src/test/sim`).
+> The UI half of this lane — `app/src-iced/src/shell/sim/` (`SimShell`, the
+> `iced_test::Simulator` harness, the composer/`rich_text` traps) — was
+> **retired with the removal of app/**. Only the embeddable node below survives.
 
 ## Where things live
 
 | Thing | Path |
 |---|---|
-| Harness (`SimShell`, task pump) | `app/src-iced/src/shell/sim/mod.rs` |
-| In-process signing override | `app/src-iced/src/shell/sim/signing.rs` (seam: `run_verb_inner`, `backend/node_control.rs`) |
-| Chat proof tests (the exemplars) | `app/src-iced/src/shell/sim/chat.rs` |
 | Embeddable node lib + doc comment | `bin/simnode/src/lib.rs` |
 | Cross-crate embedder example | `bin/simnode/tests/embed.rs` |
-
-The lane is a `shell` child on purpose: `Shell`/`Message`/`update` are
-module-private. New surface files go under `shell/sim/`, declared in `mod.rs`.
-
-## SimShell quick reference
-
-`SimShell::boot()` → embedded auto-mode sim + `NodeClient` + `Backend` +
-signing override installed. Returns `Self`; failures panic. All `pub(super)`:
-
-| Call | Does |
-|---|---|
-| `click(role, name)` | Simulator click by Sem role+name, then pumps |
-| `inject(message)` | Feed a `Message` straight into `update()`, then pumps — for widgets with no Sem wrapper, composer text, timer ticks |
-| `has(role, name)` / `sees_text(t)` | Widget-tree probes (see traps) |
-| `shell()` | `&Shell` — assert render models directly (in-crate) |
-| `node_query(target, query)` | Raw `/v1/query` against the embedded node — the chain-side assert |
-
-The pump runs each `update()` Task on a private runtime and feeds
-`Action::Output` back through `update()` until quiescent (15s deadline, 10s
-per-action stall — both panic loudly). **No sleeps, no polling ever**: if a
-test seems to need a wait, the flow is broken, not slow.
-
-## Simulator traps (each cost a debug round once)
-
-- **`typewrite` does not reach a `text_editor`** (blank post, Send disabled).
-  Inject composer text as a Paste edit:
-  `inject(Message::UserScreen(user_screens::Message::Chat(ChatMessageEvent::Composer{ thread: false, message: chat_composer::Message::Edit(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(body.into())))) })))`
-  — `thread` is a `bool`. There is deliberately no `click_and_type`.
-- **`sees_text` can NEVER match a message body**: bodies render as
-  `rich_text`, which has no `operate`/text hook (only plain `text` feeds the
-  finder). Assert bodies via the render model
-  (`shell().user_screens.chat.data` — node-sourced only, no local-echo
-  writer) and confirm the row materialized via a plain-text sibling (the
-  author label).
-- **Bare inputs have no Sem wrapper** (e.g. the channel-name field): drive
-  them with `inject(...Changed(value))`, keep buttons as real clicks.
-- **`ChatLoaded` auto-selects** the first non-archived channel; a rail click
-  is only needed to exercise `SelectChannel → LoadChannel` itself.
-- **`chat.error` gates the auto-refresh**: on submit Ok the reducer chains
-  `LoadChat` (that re-query is what makes committed state render); on Err it
-  sets `chat.error` and chains nothing. Assert `error.is_none()` FIRST when
-  a rail entry is missing. Rejection strings look like
-  `op rejected: Module(channel already exists: dup)`.
-
-## Chat wire facts (safe to rely on, verified in-tree)
-
-- Replies are externally tagged: `{"channels":[..]}`, `{"messages":[..]}`.
-- `messages_latest` returns messages **ascending by `seq`**
-  (`crates/modules/apps/chat/src/lib.rs`), and the app maps the reply 1:1 with no
-  reversal (`screen_service/chat.rs`) — order assertions are sound.
-- The composer clears on Submit (`chat_composer::update`), so consecutive
-  posts don't concatenate.
-- Frames are signed in-process by a fixed-seed test key
-  (`signing::author_pubkey_hex()`); the override answers only
-  `user-key status` and `user-sign-frame` — any other verb errors loudly.
-  It is process-global and authoritative; never expect a real
-  `ducktape` subprocess inside `cargo test -p ducktape-iced`.
+| Node-semantics scenario suites | `bin/simnode/tests/*.rs` (`cargo test -p simnode`) |
 
 ## Embedding the node in any crate's test
 
@@ -109,14 +48,14 @@ pubkeys) + `invite_binding`; `node_key` fabricates `status.publicKey`;
 After a host fatal the control surface fails closed (every call errs with
 the reason); the *triggering* call may still return Ok — check the next one.
 
-## Adding a new surface beyond chat
+**Tests wait on events, never on time.** The control handle's `step()` /
+`state()` are the synchronization seam — no sleeps, no polling. If a test
+seems to need a wait, the flow is broken, not slow.
 
-Map three things before writing the test (grep, don't guess):
-1. Widget handles: `Sem(Role::…, "name")` wrappers in `screens/<surface>.rs`
-   (`sem(`/`filled(`/`outline(` helpers) — unwrapped widgets need `inject`.
-2. The message chain: widget → `ChatMessageEvent`-style reducer →
-   `Command::…` → `screen_service/<surface>.rs` (the node wire + reply shape).
-3. The refresh contract: which `ServiceEvent` writes the render model, and
-   whether success auto-chains a reload (chat does; a surface that only
-   refreshes via notifications-ws push needs an explicit `inject` tick —
-   subscriptions never run in this lane).
+## Chat module wire facts (safe to rely on, verified in-tree)
+
+- Replies are externally tagged: `{"channels":[..]}`, `{"messages":[..]}`.
+- `messages_latest` returns messages **ascending by `seq`**
+  (`crates/modules/apps/chat/src/lib.rs`) — order assertions are sound.
+- Frames carry a caller-supplied signature and the node verifies their origin;
+  never expect a real `ducktape` subprocess inside an in-process test.
