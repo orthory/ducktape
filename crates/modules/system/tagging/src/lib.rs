@@ -57,9 +57,10 @@ use sdk::codec;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
-/// the field separator inside composite scope keys. rejected inside
-/// caller-chosen ids so a crafted container can never forge another scope.
-const SEP: char = '\x1f';
+/// the field separator inside composite scope keys (the shared
+/// [`sdk::KEY_SEP`]). rejected inside caller-chosen ids by [`sdk::validate_id`]
+/// so a crafted container can never forge another scope.
+const SEP: char = sdk::KEY_SEP;
 
 /// the composite subscription key: scopes are namespaced per source module.
 fn scope_key(source: &str, container: &str) -> String {
@@ -189,24 +190,6 @@ impl TaggingModule {
 
     // ---- validation helpers --------------------------------------------------------
 
-    fn validate_id(field: &str, value: &str) -> Result<(), Error> {
-        if value.is_empty() {
-            return Err(Error::Module(format!("{field} must be non-empty")));
-        }
-        if value.len() > MAX_ID_BYTES {
-            return Err(Error::Module(format!(
-                "{field} is {} bytes; the cap is {MAX_ID_BYTES}",
-                value.len()
-            )));
-        }
-        if value.contains(SEP) {
-            return Err(Error::Module(format!(
-                "{field} must not contain the reserved separator"
-            )));
-        }
-        Ok(())
-    }
-
     /// the module behind the current dispatch — every tagging op's acting
     /// party. externals and the system have no surface here.
     fn acting_module(origin: &Origin) -> Result<ModuleId, Error> {
@@ -236,8 +219,8 @@ impl TaggingModule {
         container: String,
     ) -> Result<(), Error> {
         let subscriber = Self::acting_module(&ctx.env().origin)?;
-        Self::validate_id("source", &source)?;
-        Self::validate_id("container", &container)?;
+        sdk::validate_id("source", &source, MAX_ID_BYTES)?;
+        sdk::validate_id("container", &container, MAX_ID_BYTES)?;
         // the registry is genesis-fixed, so this existence check is
         // deterministic across every validator.
         if ctx.module_root(&source).is_none() {
@@ -293,7 +276,7 @@ impl TaggingModule {
             author,
             mut tags,
         } = event;
-        if Self::validate_id("container", &container).is_err() {
+        if sdk::validate_id("container", &container, MAX_ID_BYTES).is_err() {
             self.note(ctx, "dropped tag event with a malformed container".into());
             return Ok(());
         }
@@ -310,8 +293,8 @@ impl TaggingModule {
             tags.truncate(MAX_TAGS_PER_EVENT);
         }
         let malformed = |t: &crate::EntityRef| {
-            Self::validate_id("tag module", &t.module).is_err()
-                || Self::validate_id("tag entity", &t.entity).is_err()
+            sdk::validate_id("tag module", &t.module, MAX_ID_BYTES).is_err()
+                || sdk::validate_id("tag entity", &t.entity, MAX_ID_BYTES).is_err()
         };
         if tags.iter().any(malformed) {
             self.note(ctx, "dropped malformed tags from a tag event".into());

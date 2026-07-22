@@ -49,10 +49,10 @@ use sdk::codec;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
-/// the field separator inside composite dispatch keys and saga ids. rejected
-/// inside caller-chosen ids so a crafted id can never forge another
-/// receiver's key.
-const SEP: char = '\x1f';
+/// the field separator inside composite dispatch keys and saga ids (the shared
+/// [`sdk::KEY_SEP`]). rejected inside caller-chosen ids by [`sdk::validate_id`]
+/// so a crafted id can never forge another receiver's key.
+const SEP: char = sdk::KEY_SEP;
 
 /// the composite state key: dispatches are namespaced PER RECEIVER, so two
 /// modules choosing the same local `dispatch_id` can never collide.
@@ -389,24 +389,6 @@ impl DispatchModule {
 
     // ---- validation helpers --------------------------------------------------------
 
-    fn validate_id(field: &str, value: &str) -> Result<(), Error> {
-        if value.is_empty() {
-            return Err(Error::Module(format!("{field} must be non-empty")));
-        }
-        if value.len() > MAX_ID_BYTES {
-            return Err(Error::Module(format!(
-                "{field} is {} bytes; the cap is {MAX_ID_BYTES}",
-                value.len()
-            )));
-        }
-        if value.contains(SEP) {
-            return Err(Error::Module(format!(
-                "{field} must not contain the reserved separator"
-            )));
-        }
-        Ok(())
-    }
-
     fn validate_recipe_shape(
         capability: &str,
         routing: &Routing,
@@ -539,7 +521,7 @@ impl DispatchModule {
             ));
         };
         let receiver = receiver.clone();
-        Self::validate_id("dispatch_id", &dispatch_id)?;
+        sdk::validate_id("dispatch_id", &dispatch_id, MAX_ID_BYTES)?;
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(Error::Module(format!(
                 "payload is {} bytes; the cap is {MAX_PAYLOAD_BYTES}",
@@ -732,7 +714,7 @@ impl DispatchModule {
                 deadline_views,
                 lease_views,
             } => {
-                Self::validate_id("recipe_id", &recipe_id)?;
+                sdk::validate_id("recipe_id", &recipe_id, MAX_ID_BYTES)?;
                 Self::validate_recipe_shape(&capability, &routing, max_attempts, &description)?;
                 if self.recipe(&recipe_id).is_some() {
                     return Err(Error::Module(format!(

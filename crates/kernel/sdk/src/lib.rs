@@ -307,6 +307,36 @@ pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// the field separator inside composite module keys (dispatch keys and saga
+/// ids, tagging scope keys): the ASCII unit separator. rejected inside a
+/// caller-chosen id by [`validate_id`] so a crafted id can never forge another
+/// composite key.
+pub const KEY_SEP: char = '\x1f';
+
+/// validate a caller-chosen id: non-empty, within `max_bytes`, and free of the
+/// reserved [`KEY_SEP`] — the shared guard for keys that compose with
+/// [`KEY_SEP`]. shared by dispatch and tagging. NOT agent's `validate_agent_id`,
+/// which is a deliberately separate DNS-label admission rule (an agent id must
+/// round-trip as `<id>@agents.duck`), kept distinct so neither rule can
+/// silently move the other.
+pub fn validate_id(field: &str, value: &str, max_bytes: usize) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::Module(format!("{field} must be non-empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(Error::Module(format!(
+            "{field} is {} bytes; the cap is {max_bytes}",
+            value.len()
+        )));
+    }
+    if value.contains(KEY_SEP) {
+        return Err(Error::Module(format!(
+            "{field} must not contain the reserved separator"
+        )));
+    }
+    Ok(())
+}
+
 /// the "re-derive root, compare, all-or-nothing" guard every in-memory module's
 /// `install` shares: a decoded snapshot is adopted ONLY when its recomputed
 /// root equals the expected (consensus-committed) root. `actual` is the root
@@ -699,6 +729,30 @@ mod tests {
         assert!(require_non_empty("id", "x").is_ok());
         let err = require_non_empty("id", "").unwrap_err().to_string();
         assert!(err.contains("id must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_id_guard() {
+        assert!(validate_id("id", "ok", 128).is_ok());
+        assert!(
+            validate_id("id", "", 128)
+                .unwrap_err()
+                .to_string()
+                .contains("must be non-empty")
+        );
+        assert!(
+            validate_id("id", "toolong", 3)
+                .unwrap_err()
+                .to_string()
+                .contains("the cap is 3")
+        );
+        let with_sep = format!("a{KEY_SEP}b");
+        assert!(
+            validate_id("id", &with_sep, 128)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved separator")
+        );
     }
 
     #[test]
