@@ -328,23 +328,14 @@ fn derive_coordinator_relay(primary_coordinator: &str) -> String {
     format!("{host}:443")
 }
 
-/// the column trailing notes start in — wide enough for the typical
-/// `key = value`; longer assignments just push their note right.
-const NOTE_COLUMN: usize = 36;
-
-/// one live `key = value  # note` line, notes column-aligned so the file
-/// reads as its own reference sheet.
+/// one entry: a `# note` line ABOVE its live `key = value` line, blank-line
+/// separated — the file reads as its own reference sheet.
 fn keyline(s: &mut String, key: &str, value: std::fmt::Arguments<'_>, note: &str) {
-    let assignment = format!("{key} = {value}");
-    if assignment.len() < NOTE_COLUMN {
-        let _ = writeln!(s, "{assignment:<NOTE_COLUMN$}# {note}");
-    } else {
-        let _ = writeln!(s, "{assignment}  # {note}");
-    }
+    let _ = writeln!(s, "\n# {note}\n{key} = {value}");
 }
 
 /// write the network-shape node.toml (init/join): the COMPLETE key set,
-/// every line live with a brief note — the parser requires every key, so
+/// every key live under a brief comment — the parser requires every key, so
 /// the file IS the reference: what each key does, and what its sentinel
 /// values mean. the file references its siblings relatively, so the whole
 /// dir is relocatable.
