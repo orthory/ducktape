@@ -458,7 +458,7 @@ pub(super) async fn post_reboot_catchup<'a>(
         // refuses while clones live. the runtime wiring installs the serve-
         // lane fetching source right after boot.
         recovery.set_code_source(std::sync::Arc::new(crate::host_state::BlobCodeSource(
-            blobs.clone(),
+            std::sync::Arc::new(blobs.clone()),
         )));
         match client.into_parts() {
             Ok((tx, rx)) => {

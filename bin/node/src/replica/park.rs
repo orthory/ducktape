@@ -458,7 +458,7 @@ pub(super) async fn park(
     // validator targets and consumes unclaimed pump replies.
     let mut resident_relay = relay_runtime::ResidentRelay::new(
         storage_for_sync.join("relay-submit-seq"),
-        blobs.clone(),
+        std::sync::Arc::new(blobs.clone()),
     );
     // bridge the relay lane ONCE, before the park loop: the serve
     // window's select is torn down every 2s tick, and dropping the p2p

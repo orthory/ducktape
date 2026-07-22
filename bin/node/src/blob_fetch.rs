@@ -58,7 +58,7 @@ pub type PendingMap =
 
 /// answer a peer's blob request from this node's store — the serve loop's
 /// intercept arm (blobs are host state; `SyncServer` never sees these).
-pub fn serve_blob(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> statesync::SyncResponse {
+pub fn serve_blob(blobs: &dyn blobstore::Blobs, digest: &[u8; 32]) -> statesync::SyncResponse {
     let bytes = blobs
         .get_chunk(digest)
         .filter(|b| b.len() <= MAX_SERVED_BLOB);
@@ -67,7 +67,7 @@ pub fn serve_blob(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> statesync
 
 /// answer the ranged lane's discovery half: the blob's total length, or an
 /// honest miss. no size refusal here — ranges keep every frame bounded.
-pub fn serve_blob_info(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> SyncResponse {
+pub fn serve_blob_info(blobs: &dyn blobstore::Blobs, digest: &[u8; 32]) -> SyncResponse {
     SyncResponse::BlobInfo {
         len: blobs.chunk_len(digest),
     }
@@ -77,7 +77,7 @@ pub fn serve_blob_info(blobs: &blobstore::BlobHandle, digest: &[u8; 32]) -> Sync
 /// [`MAX_BLOB_RANGE`] server-side, so a greedy (or lying) requester can never
 /// make this node emit an oversized frame.
 pub fn serve_blob_range(
-    blobs: &blobstore::BlobHandle,
+    blobs: &dyn blobstore::Blobs,
     digest: &[u8; 32],
     offset: u64,
     len: u64,

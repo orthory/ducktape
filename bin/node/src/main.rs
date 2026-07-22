@@ -536,7 +536,9 @@ fn run_node(
         // code-registry swaps realize through the blob plane: replay, catch-up,
         // and the live drain (which lifts this off the recovery sink) all fetch
         // committed component bytes from the node's content-addressed store.
-        recovery.set_code_source(std::sync::Arc::new(host_state::BlobCodeSource(blobs.clone())));
+        recovery.set_code_source(std::sync::Arc::new(host_state::BlobCodeSource(
+            std::sync::Arc::new(blobs.clone()),
+        )));
         let manifest = match recovery.manifest() {
             Ok(m) => m,
             Err(e) => {
