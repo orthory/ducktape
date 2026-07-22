@@ -20,6 +20,7 @@ const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 const ENCRYPTED_KEY_PREFIX: &str = "ducktape-user-key-v1:";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const CHAT_TIMELINE_ROOT_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatChannel {
@@ -78,6 +79,13 @@ pub struct ThreadData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ThreadLoadData {
+    pub generation: i64,
+    pub root_seq: i64,
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
@@ -88,6 +96,7 @@ pub struct ChatSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatSearchData {
+    pub generation: i64,
     pub hits: Vec<ChatSearchHit>,
 }
 
@@ -132,7 +141,14 @@ pub struct PageSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageSearchData {
+    pub generation: i64,
     pub hits: Vec<PageSearchHit>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AutosaveResult {
+    pub generation: i64,
+    pub written: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -219,6 +235,26 @@ pub fn rollback_blocks(mut blocks: Vec<PageBlock>) -> Vec<PageBlock> {
 
 pub fn restore_draft(current: String, pending: String) -> String {
     if current.is_empty() { pending } else { current }
+}
+
+pub fn refreshed_block_draft(
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+    current: String,
+    autosave_status: String,
+) -> String {
+    let has_local_edit = matches!(autosave_status.as_str(), "saving" | "error");
+    if selected_id.is_empty() || has_local_edit {
+        return current;
+    }
+    blocks
+        .into_iter()
+        .find(|block| block.id == selected_id)
+        .map_or(current, |block| block.text)
+}
+
+pub fn scope_key(scope: String, id: String) -> String {
+    format!("{scope}\0{id}")
 }
 
 struct Tip {
@@ -608,14 +644,24 @@ pub async fn load_thread(
     rpc: String,
     channel_id: String,
     root_seq: i64,
-) -> Result<ThreadData, AppError> {
-    async {
+    generation: i64,
+) -> Result<ThreadLoadData, HydrationError> {
+    let result = async {
         let root_seq = positive_sequence(root_seq)?;
         let rpc = rpc_client(&rpc)?;
         load_thread_data(&rpc, &channel_id, root_seq).await
     }
-    .await
-    .map_err(app_error)
+    .await;
+    result
+        .map(|thread| ThreadLoadData {
+            generation,
+            root_seq: thread.root_seq,
+            messages: thread.messages,
+        })
+        .map_err(|message| HydrationError {
+            generation,
+            message,
+        })
 }
 
 pub async fn send_reply(
@@ -736,8 +782,9 @@ pub async fn search_chat(
     rpc: String,
     channel_id: String,
     text: String,
-) -> Result<ChatSearchData, AppError> {
-    async {
+    generation: i64,
+) -> Result<ChatSearchData, HydrationError> {
+    let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
         let reply: chat::index::ChatViewReply = rpc
@@ -756,6 +803,7 @@ pub async fn search_chat(
             return Err("chat search returned an invalid reply".into());
         };
         Ok(ChatSearchData {
+            generation,
             hits: hits
                 .into_iter()
                 .map(|hit| ChatSearchHit {
@@ -768,8 +816,11 @@ pub async fn search_chat(
                 .collect(),
         })
     }
-    .await
-    .map_err(app_error)
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
 }
 
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
@@ -816,7 +867,7 @@ pub async fn autosave_page_title(
         if page_id.is_empty() {
             return Err("choose a page first".to_string());
         }
-        let title = bounded_text(title, "page title", 512)?;
+        let title = bounded_exact_text(title, "page title", 512)?;
         debounced_page_text(rpc, password, page_id, title).await
     }
     .await
@@ -829,14 +880,23 @@ pub async fn autosave_block_text(
     block_id: String,
     kind: String,
     text: String,
-) -> Result<bool, AppError> {
-    async {
+    generation: i64,
+) -> Result<AutosaveResult, HydrationError> {
+    let result = async {
         let kind = parse_block_kind(&kind)?;
-        let text = bounded_block_text(kind, text)?;
+        let text = bounded_updated_block_text(kind, text)?;
         debounced_page_text(rpc, password, block_id, text).await
     }
-    .await
-    .map_err(app_error)
+    .await;
+    result
+        .map(|written| AutosaveResult {
+            generation,
+            written,
+        })
+        .map_err(|message| HydrationError {
+            generation,
+            message,
+        })
 }
 
 pub async fn delete_page(
@@ -877,7 +937,7 @@ pub async fn add_block(
             return Err("choose a page first".to_string());
         }
         let kind = parse_block_kind(&kind)?;
-        let text = bounded_block_text(kind, text)?;
+        let text = bounded_new_block_text(kind, text)?;
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
         let root = blocks
@@ -927,7 +987,7 @@ pub async fn save_block(
 ) -> Result<PagesData, AppError> {
     async {
         let kind = parse_block_kind(&kind)?;
-        let text = bounded_block_text(kind, text)?;
+        let text = bounded_updated_block_text(kind, text)?;
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
         let block = blocks
@@ -1039,8 +1099,9 @@ pub async fn search_pages(
     rpc: String,
     page_id: String,
     text: String,
-) -> Result<PageSearchData, AppError> {
-    async {
+    generation: i64,
+) -> Result<PageSearchData, HydrationError> {
+    let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
         let reply: pages::index::PagesViewReply = rpc
@@ -1057,6 +1118,7 @@ pub async fn search_pages(
             .await?;
         let pages::index::PagesViewReply::Hits(hits) = reply;
         Ok(PageSearchData {
+            generation,
             hits: hits
                 .into_iter()
                 .map(|hit| PageSearchHit {
@@ -1068,8 +1130,11 @@ pub async fn search_pages(
                 .collect(),
         })
     }
-    .await
-    .map_err(app_error)
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
 }
 
 async fn load_workspace(
@@ -1145,6 +1210,7 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         active_wire_channel.is_some_and(|channel| channel.post_policy == PostPolicy::MembersOnly);
     let active_channel_huddle_count =
         active_wire_channel.map_or(0, |channel| count_i64(channel.huddle.len()));
+    let active_channel_head_seq = active_wire_channel.map_or(0, |channel| channel.head_seq);
     let channel_members = if active_channel.is_empty() {
         Vec::new()
     } else {
@@ -1153,7 +1219,7 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
     let messages = if active_channel.is_empty() {
         Vec::new()
     } else {
-        load_messages(rpc, &active_channel).await?
+        load_messages(rpc, &active_channel, active_channel_head_seq).await?
     };
     Ok(ChatData {
         channels,
@@ -1192,25 +1258,44 @@ async fn load_channel_members(
         .collect())
 }
 
-async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMessage>, String> {
-    let reply: ChatReply = rpc
-        .query(
-            "chat",
-            &ChatQuery::MessagesLatest {
-                channel_id: channel_id.to_string(),
-                limit: 128,
-            },
-        )
-        .await?;
-    let messages = match reply {
-        ChatReply::Messages(messages) => messages,
-        _ => return Err("node returned an invalid message list".into()),
-    };
-    Ok(messages
-        .into_iter()
-        .filter(|message| message.head.thread.is_none())
-        .map(chat_message)
-        .collect())
+async fn load_messages(
+    rpc: &RpcClient,
+    channel_id: &str,
+    head_seq: u64,
+) -> Result<Vec<ChatMessage>, String> {
+    let mut cursor = head_seq;
+    let mut roots = Vec::new();
+    while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
+        let limit = chat::MAX_QUERY_LIMIT.min(cursor);
+        let from_seq = cursor - limit + 1;
+        let reply: ChatReply = rpc
+            .query(
+                "chat",
+                &ChatQuery::MessagesRange {
+                    channel_id: channel_id.to_string(),
+                    from_seq,
+                    limit,
+                },
+            )
+            .await?;
+        let messages = match reply {
+            ChatReply::Messages(messages) => messages,
+            _ => return Err("node returned an invalid message list".into()),
+        };
+        roots.extend(
+            messages
+                .into_iter()
+                .filter(|message| message.head.thread.is_none()),
+        );
+        if from_seq == 1 {
+            break;
+        }
+        cursor = from_seq - 1;
+    }
+    roots.sort_by_key(|message| message.seq);
+    let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
+    roots.drain(..excess);
+    Ok(roots.into_iter().map(chat_message).collect())
 }
 
 async fn load_thread_data(
@@ -1397,7 +1482,11 @@ fn page_items(wire_pages: Vec<pages::PageMeta>) -> Vec<PageItem> {
         let page_children = children.get(&Some(page.id.as_str()));
         pages.push(PageItem {
             id: page.id.clone(),
-            title: page.title.clone(),
+            title: if page.title.is_empty() {
+                "Untitled".into()
+            } else {
+                page.title.clone()
+            },
             parent: page.parent.clone().unwrap_or_default(),
             prefix: "  ".repeat(depth),
             child_count: page_children.map_or(0, |children| count_i64(children.len())),
@@ -1568,6 +1657,16 @@ fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, Stri
     Ok(value.to_string())
 }
 
+fn bounded_exact_text(value: String, field: &str, limit: usize) -> Result<String, String> {
+    let invalid = value.len() > limit || value.chars().any(|character| character == '\0');
+    if invalid {
+        return Err(format!(
+            "{field} must be at most {limit} bytes and contain no NUL"
+        ));
+    }
+    Ok(value)
+}
+
 fn required_id(value: String, subject: &str) -> Result<String, String> {
     bounded_text(value, &format!("{subject} id"), 512)
 }
@@ -1698,14 +1797,34 @@ fn parse_block_kind(kind: &str) -> Result<BlockKind, String> {
     }
 }
 
-fn bounded_block_text(kind: BlockKind, text: String) -> Result<String, String> {
+fn bounded_new_block_text(kind: BlockKind, text: String) -> Result<String, String> {
+    if kind == BlockKind::Divider {
+        return Ok(String::new());
+    }
+    let field = if kind == BlockKind::Page {
+        "page title"
+    } else {
+        "block text"
+    };
+    let limit = if kind == BlockKind::Page {
+        512
+    } else {
+        64 * 1024
+    };
+    if text.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    bounded_exact_text(text, field, limit)
+}
+
+fn bounded_updated_block_text(kind: BlockKind, text: String) -> Result<String, String> {
     if kind == BlockKind::Divider {
         return Ok(String::new());
     }
     if kind == BlockKind::Page {
-        return bounded_text(text, "page title", 512);
+        return bounded_exact_text(text, "page title", 512);
     }
-    bounded_text(text, "block text", 64 * 1024)
+    bounded_exact_text(text, "block text", 64 * 1024)
 }
 
 async fn debounced_page_text(
@@ -1717,6 +1836,12 @@ async fn debounced_page_text(
     let key = format!("{rpc}\0{block_id}");
     let ticket = begin_autosave(&key);
     tokio::time::sleep(Duration::from_millis(400)).await;
+    if !autosave_is_current(&key, ticket) {
+        password.zeroize();
+        return Ok(false);
+    }
+    // ponytail: one writer is enough before a live network; shard by RPC only if latency proves it.
+    let _writer = autosave_writer().lock().await;
     if !autosave_is_current(&key, ticket) {
         password.zeroize();
         return Ok(false);
@@ -1736,7 +1861,10 @@ async fn debounced_page_text(
         .await
     }
     .await;
-    finish_autosave(&key, ticket);
+    let current = finish_autosave(&key, ticket);
+    if !current {
+        return Ok(false);
+    }
     result?;
     Ok(true)
 }
@@ -1744,6 +1872,11 @@ async fn debounced_page_text(
 fn autosaves() -> &'static std::sync::Mutex<BTreeMap<String, u64>> {
     static AUTOSAVES: OnceLock<std::sync::Mutex<BTreeMap<String, u64>>> = OnceLock::new();
     AUTOSAVES.get_or_init(Default::default)
+}
+
+fn autosave_writer() -> &'static tokio::sync::Mutex<()> {
+    static WRITER: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    WRITER.get_or_init(Default::default)
 }
 
 fn begin_autosave(key: &str) -> u64 {
@@ -1760,11 +1893,14 @@ fn autosave_is_current(key: &str, ticket: u64) -> bool {
     autosaves().lock().expect("autosave lock poisoned").get(key) == Some(&ticket)
 }
 
-fn finish_autosave(key: &str, ticket: u64) {
+fn finish_autosave(key: &str, ticket: u64) -> bool {
     let mut autosaves = autosaves().lock().expect("autosave lock poisoned");
-    if autosaves.get(key) == Some(&ticket) {
-        autosaves.remove(key);
+    let is_current = autosaves.get(key) == Some(&ticket);
+    if !is_current {
+        return false;
     }
+    autosaves.remove(key);
+    true
 }
 
 fn block_move(
@@ -2133,11 +2269,120 @@ mod tests {
         sim.shutdown();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeline_pages_past_thread_only_traffic() {
+        let storage = tempfile::tempdir().unwrap();
+        let sim = simnode::boot(
+            storage.path(),
+            "127.0.0.1:0".parse().unwrap(),
+            simnode::SimOpts {
+                auto: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+        let signer = ed25519::PrivateKey::from_seed(8);
+
+        submit_test(
+            &rpc,
+            &signer,
+            1,
+            "chat",
+            chat::encode_msg(&ChatMsg::CreateChannel {
+                channel_id: "general".into(),
+                name: "General".into(),
+                post_policy: PostPolicy::Open,
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            2,
+            "chat",
+            chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "root".into(),
+                blocks: vec![chat::Block::paragraph("root stays visible")],
+                thread: None,
+                as_agent: None,
+            }),
+        )
+        .await;
+        for index in 0_u64..128 {
+            submit_test(
+                &rpc,
+                &signer,
+                index + 3,
+                "chat",
+                chat::encode_msg(&ChatMsg::PostMessage {
+                    channel_id: "general".into(),
+                    message_id: format!("reply-{index}"),
+                    blocks: vec![chat::Block::paragraph(format!("reply {index}"))],
+                    thread: Some(1),
+                    as_agent: None,
+                }),
+            )
+            .await;
+        }
+
+        let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].body, "root stays visible");
+        sim.shutdown();
+    }
+
     #[test]
     fn hydration_retry_is_capped() {
         assert_eq!(retry_delay(1), Duration::from_secs(1));
         assert_eq!(retry_delay(3), Duration::from_secs(4));
         assert_eq!(retry_delay(99), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn refresh_merges_only_clean_block_drafts() {
+        let blocks = vec![PageBlock {
+            id: "block".into(),
+            parent: "page".into(),
+            kind: "Text".into(),
+            text: "remote".into(),
+            pending: false,
+            checked: false,
+            prefix: String::new(),
+            child_count: 0,
+            mark_count: 0,
+        }];
+
+        assert_eq!(
+            refreshed_block_draft(
+                blocks.clone(),
+                "block".into(),
+                "local".into(),
+                "saving".into(),
+            ),
+            "local"
+        );
+        assert_eq!(
+            refreshed_block_draft(blocks, "block".into(), "local".into(), "saved".into()),
+            "remote"
+        );
+    }
+
+    #[test]
+    fn page_updates_preserve_exact_text() {
+        assert_eq!(
+            bounded_updated_block_text(BlockKind::Code, "  code\n".into()).unwrap(),
+            "  code\n"
+        );
+        assert_eq!(
+            bounded_updated_block_text(BlockKind::Paragraph, String::new()).unwrap(),
+            ""
+        );
+        assert_eq!(
+            bounded_exact_text(String::new(), "page title", 512).unwrap(),
+            ""
+        );
     }
 
     #[test]
@@ -2147,7 +2392,8 @@ mod tests {
         let latest = begin_autosave(key);
         assert!(!autosave_is_current(key, first));
         assert!(autosave_is_current(key, latest));
-        finish_autosave(key, latest);
+        assert!(!finish_autosave(key, first));
+        assert!(finish_autosave(key, latest));
         assert!(!autosave_is_current(key, latest));
     }
 

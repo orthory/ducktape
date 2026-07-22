@@ -1,15 +1,23 @@
 on search_chat_submit
   return if chat_searching || empty(trim(chat_search_draft))
+  chat_search_generation = chat_search_generation + 1
   chat_searching = true
   error = ""
-  run search_chat(connected_rpc, "", trim(chat_search_draft)) -> chat_search_loaded _ | search_failed _
+  run search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
 
 on chat_search_loaded(next)
+  return if next.generation != chat_search_generation
   chat_search_hits = next.hits
   chat_searching = false
   error = ""
 
+on chat_search_failed(cause)
+  return if cause.generation != chat_search_generation
+  chat_searching = false
+  error = cause.message
+
 on clear_chat_search
+  chat_search_generation = chat_search_generation + 1
   chat_search_draft = ""
   chat_search_hits = []
   chat_searching = false
@@ -22,8 +30,18 @@ on open_chat_search_hit(channel_id)
   loading = true
   chat_search_hits = []
   selected_message_seq = 0
+  selected_message_rev = 0
+  message_action = "toolbar"
+  message_edit_draft = ""
+  channel_settings_open = false
+  channel_name_draft = ""
+  member_key_draft = ""
   active_thread_seq = 0
   thread_messages = []
+  thread_generation = thread_generation + 1
+  thread_loading = false
+  reply_draft = ""
+  pending_reply = ""
   error = ""
   run load_chat(connected_rpc, channel_id) -> chat_updated _ | failed _
 
@@ -36,12 +54,15 @@ on choose_channel(id)
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
+  message_action = "toolbar"
   message_edit_draft = ""
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
   active_thread_seq = 0
   thread_messages = []
+  thread_generation = thread_generation + 1
+  thread_loading = false
   reply_draft = ""
   pending_reply = ""
   error = ""
@@ -168,9 +189,12 @@ on chat_mutated(next)
   member_key_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
+  message_action = "toolbar"
   message_edit_draft = ""
   active_thread_seq = 0
   thread_messages = []
+  thread_generation = thread_generation + 1
+  thread_loading = false
   reply_draft = ""
   pending_reply = ""
   pending_channel = ""
@@ -187,20 +211,36 @@ on select_message(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
   selected_message_seq = seq
   selected_message_rev = rev
+  message_action = "toolbar"
   message_edit_draft = body
+
+on begin_message_edit
+  return if selected_message_seq <= 0 || mutation_phase != "idle"
+  message_action = "editing"
+
+on arm_message_delete
+  return if selected_message_seq <= 0 || mutation_phase != "idle"
+  message_action = "delete"
+
+on cancel_message_action
+  return if selected_message_seq <= 0 || mutation_phase != "idle"
+  message_action = "toolbar"
 
 on clear_message_selection
   selected_message_seq = 0
   selected_message_rev = 0
+  message_action = "toolbar"
   message_edit_draft = ""
 
 on open_thread
   return if thread_loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
+  thread_generation = thread_generation + 1
   thread_loading = true
   error = ""
-  run load_thread(connected_rpc, active_channel, selected_message_seq) -> thread_loaded _ | thread_failed _
+  run load_thread(connected_rpc, active_channel, selected_message_seq, thread_generation) -> thread_loaded _ | thread_failed _
 
 on thread_loaded(next)
+  return if next.generation != thread_generation || !thread_loading
   active_thread_seq = next.root_seq
   thread_messages = next.messages
   thread_loading = false
@@ -209,10 +249,12 @@ on thread_loaded(next)
   error = ""
 
 on thread_failed(cause)
+  return if cause.generation != thread_generation || !thread_loading
   thread_loading = false
   error = cause.message
 
 on close_thread
+  thread_generation = thread_generation + 1
   active_thread_seq = 0
   thread_messages = []
   thread_loading = false
@@ -220,7 +262,7 @@ on close_thread
   pending_reply = ""
 
 on edit_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0 || empty(trim(message_edit_draft))
+  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -229,7 +271,7 @@ on edit_message_submit
   run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft)) -> chat_mutated _ | mutation_failed _
 
 on delete_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || message_action != "delete"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"

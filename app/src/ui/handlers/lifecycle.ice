@@ -56,7 +56,11 @@ on workspace_refreshed(next)
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
+  active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
+  block_edit_draft = refreshed_block_draft(next.blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  page_delete_armed = false
+  block_delete_armed = false
   error = ""
   return if !live_dirty
   live_dirty = false
@@ -85,11 +89,6 @@ on refresh_failed(cause)
 
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
-
-on search_failed(cause)
-  chat_searching = false
-  page_searching = false
-  error = cause.message
 
 on mutation_failed(cause)
   mutation_phase = "idle"

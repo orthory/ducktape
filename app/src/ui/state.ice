@@ -1,6 +1,6 @@
 state
   app_theme = "app"
-  app_background = "#101012ee"
+  app_background = "#00000000"
   app_text = "#f2f2f4"
   rpc = ""
   connected_rpc = ""
@@ -28,10 +28,12 @@ state
   member_key_draft = ""
   selected_message_seq:i64 = 0
   selected_message_rev:i64 = 0
+  message_action = "toolbar"
   message_edit_draft = ""
   active_thread_seq:i64 = 0
   thread_messages:[ChatMessage] = []
   thread_loading = false
+  thread_generation:i64 = 0
   reply_draft = ""
   pending_reply = ""
   channel_draft = ""
@@ -41,6 +43,7 @@ state
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_searching = false
+  chat_search_generation:i64 = 0
   pages:[PageItem] = []
   blocks:[PageBlock] = []
   active_page = ""
@@ -57,8 +60,10 @@ state
   selected_block_checked = false
   block_edit_draft = ""
   block_autosave_status = "idle"
+  block_autosave_generation:i64 = 0
   page_delete_armed = false
   block_delete_armed = false
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false
+  page_search_generation:i64 = 0

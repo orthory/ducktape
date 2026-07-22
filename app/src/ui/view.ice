@@ -23,7 +23,7 @@ view
         row width=fill padding-left=7.0 padding-right=7.0 align=center
           text "CHANNELS" width=fill size=10.0 @font-bold text-muted
           text len(channels) size=10.0 @text-muted
-        scroll direction=vertical width=fill height=fill bar=hidden
+        scroll direction=vertical width=fill height=fill
           col width=fill spacing=2.0
             for channel in channels
               ChannelButton channel=channel selected=(channel.id == active_channel)
@@ -43,7 +43,7 @@ view
         row width=fill padding-left=7.0 padding-right=7.0 align=center
           text "PAGES" width=fill size=10.0 @font-bold text-muted
           text len(pages) size=10.0 @text-muted
-        scroll direction=vertical width=fill height=fill bar=hidden
+        scroll direction=vertical width=fill height=fill
           col width=fill spacing=2.0
             for page in pages
               PageButton page=page selected=(page.id == active_page)
@@ -69,7 +69,7 @@ view
                 text error width=fill size=10.0 @text-fg
                 button "Dismiss" padding=5.0 style=text -> dismiss_error
     chat:
-      container width=fill height=fill padding=14.0 bg=linear(2.35, elevated/82@0.0, surface/94@0.5, bg/90@1.0) border=white/18 border-w=1.0 r=16.0 shadow=black/12 shadow-y=4.0 shadow-blur=18.0 clip=true px-snap=true
+      container width=fill height=fill padding=14.0 bg=transparent clip=true px-snap=true
         row width=fill height=fill spacing=10.0
           col width=fill height=fill spacing=9.0
             if !empty(active_channel)
@@ -78,9 +78,9 @@ view
                   text "#" size=11.0 @font-bold text-fg
                 text active_channel_name width=fill size=12.0 @font-bold text-fg
                 if active_channel_archived
-                  text "Archived" size=9.0 @text-muted
+                  text "Archived" size=10.0 @text-muted
                 if active_channel_members_only
-                  text "Members" size=9.0 @text-muted
+                  text "Members" size=10.0 @text-muted
                 if active_channel_huddle_count > 0
                   text active_channel_huddle_count size=10.0 @text-muted
                 text len(messages) size=10.0 @text-muted
@@ -121,7 +121,7 @@ view
                         hovered bg=white/10 text=fg
                         pressed bg=white/15
                     space width=fill
-                    text len(channel_members) size=9.0 @text-muted
+                    text len(channel_members) size=10.0 @text-muted
                   row width=fill spacing=5.0 align=center
                     input "" #member-key label="Member public key" <-> member_key_draft hint="64-character member key" disabled=(mutation_phase != "idle") submit=add_channel_member_submit width=fill padding=6.0 text-size=10.0 line-height=1.2 font=mono
                       active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
@@ -132,9 +132,11 @@ view
                       hovered bg=white/14
                       pressed bg=white/18
                   if !empty(channel_members)
-                    col width=fill spacing=2.0
-                      for member in channel_members
-                        ChatMemberRow member=member disabled=(mutation_phase != "idle")
+                    container width=fill height=92.0
+                      scroll direction=vertical width=fill height=fill
+                        col width=fill spacing=2.0
+                          for member in channel_members
+                            ChatMemberRow member=member disabled=(mutation_phase != "idle")
             row width=fill spacing=6.0 align=center
               input "" #chat-search label="Search messages" <-> chat_search_draft hint="Search workspace messages" disabled=(!connected || chat_searching) submit=search_chat_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
                 active bg=surface border=white/10 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
@@ -152,14 +154,16 @@ view
                   pressed bg=selection
             if !empty(chat_search_hits)
               container width=fill height=148.0 padding=6.0 bg=white/6 border=white/10 border-w=1.0 r=10.0
-                scroll direction=vertical width=fill height=fill bar=hidden
+                scroll direction=vertical width=fill height=fill
                   col width=fill spacing=1.0
                     for hit in chat_search_hits
                       ChatSearchResult hit=hit
-            if empty(messages)
+            if !connected
+              EmptyState title="Connect to a node" detail="Set the RPC endpoint in the sidebar."
+            if connected && empty(messages)
               EmptyState title="No messages yet" detail="Create a channel or start the conversation."
-            if !empty(messages)
-              scroll direction=vertical width=fill height=fill bar=hidden
+            if connected && !empty(messages)
+              scroll direction=vertical width=fill height=fill
                 col width=fill spacing=1.0
                   for message in messages
                     col width=fill spacing=2.0
@@ -167,38 +171,53 @@ view
                       if message.seq == selected_message_seq
                         container width=fill padding=6.0 bg=white/6 border=white/10 border-w=1.0 r=10.0
                           col width=fill spacing=5.0
-                            row width=fill spacing=4.0 align=center
-                              button "Thread" disabled=(thread_loading || mutation_phase != "idle") height=26.0 padding=5.0 -> open_thread
-                                active bg=transparent text=muted r=7.0
-                                hovered bg=white/11 text=fg
-                                pressed bg=white/16
-                              button "👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) width=26.0 height=26.0 padding=4.0 -> add_reaction_submit("👍")
-                                active bg=transparent text=muted r=7.0
-                                hovered bg=white/11 text=fg
-                                pressed bg=white/16
-                              button "♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) width=26.0 height=26.0 padding=4.0 -> add_reaction_submit("❤️")
-                                active bg=transparent text=muted r=7.0
-                                hovered bg=white/11 text=fg
-                                pressed bg=white/16
-                              space width=fill
-                              button "Delete" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> delete_message_submit
-                                active bg=transparent text=muted r=7.0
-                                hovered bg=white/11 text=fg
-                                pressed bg=white/16
-                              button "×" label="Close message actions" disabled=(mutation_phase != "idle") width=26.0 height=26.0 padding=4.0 -> clear_message_selection
-                                active bg=transparent text=muted r=7.0
-                                hovered bg=white/11 text=fg
-                                pressed bg=white/16
-                            row width=fill spacing=5.0 align=center
-                              input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle" || active_channel_archived) submit=edit_message_submit width=fill padding=6.0 text-size=12.0 line-height=1.2
-                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                                focused bg=white/7 border=white/12
-                                disabled value=muted
-                              button "Save changes" disabled=(mutation_phase != "idle" || active_channel_archived || empty(trim(message_edit_draft))) height=28.0 padding=6.0 -> edit_message_submit
-                                active bg=white/11 text=fg border=white/13 border-w=1.0 r=8.0
-                                hovered bg=white/16
-                                pressed bg=white/20
-                                disabled bg=white/4 text=muted
+                            if message_action == "toolbar"
+                              row width=fill spacing=4.0 align=center
+                                button "Thread" disabled=(thread_loading || mutation_phase != "idle") height=26.0 padding=5.0 -> open_thread
+                                  active bg=transparent text=muted r=7.0
+                                  hovered bg=white/11 text=fg
+                                  pressed bg=white/16
+                                button "👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) width=26.0 height=26.0 padding=4.0 -> add_reaction_submit("👍")
+                                  active bg=transparent text=muted r=7.0
+                                  hovered bg=white/11 text=fg
+                                  pressed bg=white/16
+                                button "♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) width=26.0 height=26.0 padding=4.0 -> add_reaction_submit("❤️")
+                                  active bg=transparent text=muted r=7.0
+                                  hovered bg=white/11 text=fg
+                                  pressed bg=white/16
+                                space width=fill
+                                button "Edit" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> begin_message_edit
+                                  active bg=transparent text=muted r=7.0
+                                  hovered bg=white/11 text=fg
+                                  pressed bg=white/16
+                                button "Delete" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> arm_message_delete
+                                  active bg=transparent text=muted r=7.0
+                                  hovered bg=white/11 text=fg
+                                  pressed bg=white/16
+                                button "×" label="Close message actions" disabled=(mutation_phase != "idle") width=26.0 height=26.0 padding=4.0 -> clear_message_selection
+                                  active bg=transparent text=muted r=7.0
+                                  hovered bg=white/11 text=fg
+                                  pressed bg=white/16
+                            if message_action == "editing"
+                              row width=fill spacing=5.0 align=center
+                                input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_message_submit width=fill padding=6.0 text-size=12.0 line-height=1.2
+                                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                                  focused bg=white/7 border=white/12
+                                  disabled value=muted
+                                button "Save changes" disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft))) height=28.0 padding=6.0 -> edit_message_submit
+                                  active bg=white/11 text=fg border=white/13 border-w=1.0 r=8.0
+                                  hovered bg=white/16
+                                  pressed bg=white/20
+                                  disabled bg=white/4 text=muted
+                                button "Cancel" disabled=(mutation_phase != "idle") height=28.0 padding=6.0 style=text -> cancel_message_action
+                            if message_action == "delete"
+                              row width=fill spacing=5.0 align=center
+                                text "Delete this message?" width=fill size=11.0 @text-muted
+                                button "Confirm" disabled=(mutation_phase != "idle") height=28.0 padding=6.0 -> delete_message_submit
+                                  active bg=white/13 text=fg border=white/14 border-w=1.0 r=8.0
+                                  hovered bg=white/18
+                                  pressed bg=white/22
+                                button "Cancel" disabled=(mutation_phase != "idle") height=28.0 padding=6.0 style=text -> cancel_message_action
             container width=fill padding=6.0 bg=linear(2.3, elevated/82@0.0, surface/90@1.0) border=white/16 border-w=1.0 r=14.0 shadow=black/10 shadow-y=2.0 shadow-blur=12.0
               flex width=fill gap=6.0 align-items=center
                 input "" #message label="Message" <-> message_draft hint="Write a message…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) submit=send_message_submit width=fill padding=7.0 text-size=12.0 line-height=1.2
@@ -222,7 +241,7 @@ view
                     pressed bg=selection
                 container width=fill height=1.0 bg=separator
                   text ""
-                scroll direction=vertical width=fill height=fill bar=hidden
+                scroll direction=vertical width=fill height=fill
                   col width=fill spacing=1.0
                     for thread_message in thread_messages
                       ThreadMessageCard message=thread_message
@@ -238,14 +257,16 @@ view
                       pressed bg=fg
                       disabled bg=fg/24 text=bg/12
     pages:
-      container width=fill height=fill padding=16.0 bg=linear(2.35, elevated/82@0.0, surface/94@0.48, bg/90@1.0) border=white/18 border-w=1.0 r=16.0 shadow=black/12 shadow-y=4.0 shadow-blur=18.0 clip=true px-snap=true
+      container width=fill height=fill padding=16.0 bg=transparent clip=true px-snap=true
         col width=fill height=fill
-          if empty(active_page)
+          if !connected
+            EmptyState title="Connect to a node" detail="Set the RPC endpoint in the sidebar."
+          if connected && empty(active_page)
             EmptyState title="No page selected" detail="Create a page to begin writing."
-          if !empty(active_page)
+          if connected && !empty(active_page)
             col width=fill height=fill spacing=9.0
               row width=fill spacing=7.0 align=center
-                PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected) #page-title
+                PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected) #page-title(scope_key(connected_rpc, active_page))
                 if !page_delete_armed
                   button "•••" label="Page menu" disabled=(mutation_phase != "idle") width=30.0 height=28.0 padding=5.0 -> arm_page_delete
                     active bg=transparent text=muted r=8.0
@@ -273,7 +294,7 @@ view
                     pressed bg=selection
               if !empty(page_search_hits)
                 container width=fill height=148.0 padding=6.0 bg=white/6 border=white/10 border-w=1.0 r=10.0
-                  scroll direction=vertical width=fill height=fill bar=hidden
+                  scroll direction=vertical width=fill height=fill
                     col width=fill spacing=1.0
                       for hit in page_search_hits
                         PageSearchResult hit=hit
@@ -282,7 +303,7 @@ view
               if empty(blocks)
                 EmptyState title="An empty page" detail="Add the first block below."
               if !empty(blocks)
-                scroll direction=vertical width=fill height=fill bar=hidden
+                scroll direction=vertical width=fill height=fill
                   col width=fill spacing=1.0
                     for block in blocks
                       col width=fill spacing=2.0
@@ -345,9 +366,9 @@ view
                                     focused bg=white/7 border=white/12
                                     disabled value=muted
                                   if block_autosave_status == "saving"
-                                    text "Saving…" size=9.0 @text-muted
+                                    text "Saving…" size=10.0 @text-muted
                                   if block_autosave_status == "saved"
-                                    text "Saved" size=9.0 @text-muted
+                                    text "Saved" size=10.0 @text-muted
               container width=fill padding=6.0 bg=linear(2.3, elevated/82@0.0, surface/90@1.0) border=white/16 border-w=1.0 r=14.0 shadow=black/10 shadow-y=2.0 shadow-blur=12.0
                 row width=fill spacing=6.0 align=center
                   pick block_kinds some(new_block_kind) placeholder="Block type" width=124.0 menu-height=210.0 padding=7.0 text-size=11.0 line-height=1.2 -> new_block_kind_changed _

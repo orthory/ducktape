@@ -1,15 +1,23 @@
 on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
+  page_search_generation = page_search_generation + 1
   page_searching = true
   error = ""
-  run search_pages(connected_rpc, "", trim(page_search_draft)) -> page_search_loaded _ | search_failed _
+  run search_pages(connected_rpc, "", trim(page_search_draft), page_search_generation) -> page_search_loaded _ | page_search_failed _
 
 on page_search_loaded(next)
+  return if next.generation != page_search_generation
   page_search_hits = next.hits
   page_searching = false
   error = ""
 
+on page_search_failed(cause)
+  return if cause.generation != page_search_generation
+  page_searching = false
+  error = cause.message
+
 on clear_page_search
+  page_search_generation = page_search_generation + 1
   page_search_draft = ""
   page_search_hits = []
   page_searching = false
@@ -23,7 +31,11 @@ on open_page_search_hit(page_id)
   page_search_hits = []
   selected_block_id = ""
   selected_block_kind = ""
+  selected_block_checked = false
   block_edit_draft = ""
+  block_autosave_status = "idle"
+  page_delete_armed = false
+  block_delete_armed = false
   error = ""
   run load_page(connected_rpc, page_id) -> pages_updated _ | failed _
 
@@ -77,7 +89,7 @@ on add_block_submit
   hydration_retry_attempt = 0
   sync_phase = "idle"
   mutation_phase = "block"
-  pending_block = trim(block_draft)
+  pending_block = block_draft
   block_draft = ""
   blocks = optimistic_block(blocks, new_block_kind, pending_block)
   error = ""
@@ -90,6 +102,7 @@ on select_block(id, kind, text, checked)
   selected_block_checked = checked
   block_edit_draft = text
   block_autosave_status = "idle"
+  block_autosave_generation = block_autosave_generation + 1
   block_delete_armed = false
 
 on selected_block_kind_changed(next)
@@ -100,7 +113,7 @@ on selected_block_kind_changed(next)
   sync_phase = "idle"
   mutation_phase = "block-kind"
   error = ""
-  run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, trim(block_edit_draft)) -> pages_mutated _ | mutation_failed _
+  run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, block_edit_draft) -> pages_mutated _ | mutation_failed _
 
 on clear_block_selection
   selected_block_id = ""
@@ -108,20 +121,24 @@ on clear_block_selection
   selected_block_checked = false
   block_edit_draft = ""
   block_autosave_status = "idle"
+  block_autosave_generation = block_autosave_generation + 1
   block_delete_armed = false
 
 on block_text_changed(next)
   block_edit_draft = next
-  return if loading || empty(selected_block_id) || selected_block_kind == "Divider" || empty(trim(block_edit_draft))
+  return if loading || empty(selected_block_id) || selected_block_kind == "Divider"
   block_autosave_status = "saving"
+  block_autosave_generation = block_autosave_generation + 1
   error = ""
-  run autosave_block_text(connected_rpc, password, selected_block_id, selected_block_kind, trim(block_edit_draft)) -> block_text_saved _ | block_text_save_failed _
+  run autosave_block_text(connected_rpc, password, selected_block_id, selected_block_kind, block_edit_draft, block_autosave_generation) -> block_text_saved _ | block_text_save_failed _
 
-on block_text_saved(written)
-  return if !written
+on block_text_saved(next)
+  return if next.generation != block_autosave_generation
+  return if !next.written
   block_autosave_status = "saved"
 
 on block_text_save_failed(cause)
+  return if cause.generation != block_autosave_generation
   block_autosave_status = "error"
   error = cause.message
 

@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(7_500);
 
 /// A node response or transport failure safe to show to a client user.
 #[derive(Debug)]
@@ -241,11 +242,7 @@ impl Client {
             .await
             .map_err(|_| Error::new("RPC stream subscription timed out"))?
             .map_err(|error| Error::new(format!("RPC stream subscription failed: {error}")))?;
-        Ok(socket
-            .filter_map(move |message| {
-                futures::future::ready(decode_stream_message(message, &expected))
-            })
-            .boxed())
+        Ok(module_event_stream(socket, expected, STREAM_IDLE_TIMEOUT))
     }
 
     fn url(&self, path: &str) -> Result<Url> {
@@ -261,6 +258,35 @@ impl Client {
             .map_err(|_| Error::new("could not build RPC stream URL"))?;
         Ok(url.to_string())
     }
+}
+
+fn module_event_stream<S>(
+    socket: S,
+    expected: BTreeSet<String>,
+    idle_timeout: Duration,
+) -> ModuleEventStream
+where
+    S: futures::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Send
+        + Unpin
+        + 'static,
+{
+    futures::stream::unfold(Some((socket, expected)), move |state| async move {
+        let (mut socket, expected) = state?;
+        loop {
+            let message = match tokio::time::timeout(idle_timeout, socket.next()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => return Some((Err(Error::new("RPC stream closed")), None)),
+                Err(_) => {
+                    return Some((Err(Error::new("RPC stream heartbeat timed out")), None));
+                }
+            };
+            if let Some(event) = decode_stream_message(message, &expected) {
+                return Some((event, Some((socket, expected))));
+            }
+        }
+    })
+    .boxed()
 }
 
 fn decode_stream_message(
@@ -441,5 +467,20 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_module_stream_times_out() {
+        let socket = futures::stream::pending::<
+            std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let expected = BTreeSet::from(["module:chat".to_string()]);
+        let mut stream = module_event_stream(socket, expected, STREAM_IDLE_TIMEOUT);
+        let waiting = tokio::spawn(async move { stream.next().await.unwrap() });
+        tokio::task::yield_now().await;
+        tokio::time::advance(STREAM_IDLE_TIMEOUT).await;
+
+        let error = waiting.await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "RPC stream heartbeat timed out");
     }
 }

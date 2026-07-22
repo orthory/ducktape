@@ -9,8 +9,6 @@ component Brand()
 component EmptyState(title:str, detail:str)
   container width=fill height=fill align-x=center align-y=center
     col spacing=6.0 align=center
-      container width=34.0 height=34.0 align-x=center align-y=center bg=subtle r=8.0
-        text "·" size=22.0 @text-fg
       text title size=15.0 @font-bold text-fg
       text detail size=12.0 @text-muted
 
@@ -19,9 +17,9 @@ component WorkspaceTabs(status:str, loading:bool)
     tab = "chat"
   on select_tab(next)
     tab = next
-  container width=fill height=fill clip=true bg=linear(2.35, elevated/76@0.0, bg/98@0.55, surface/90@1.0) border=white/14 border-w=1.0 r=20.0 shadow=black/18 shadow-y=8.0 shadow-blur=28.0 px-snap=true
+  container width=fill height=fill clip=true bg=linear(2.35, elevated/72@0.0, bg/86@0.55, surface/78@1.0) border=white/14 border-w=1.0 r=20.0 shadow=black/18 shadow-y=8.0 shadow-blur=28.0 px-snap=true
     row width=fill height=fill
-      container width=242.0 height=fill padding=12.0 padding-top=38.0 bg=linear(2.25, surface/78@0.0, sidebar/98@0.48, bg/96@1.0) border=white/12 border-w=1.0 r-tr=18.0 r-br=18.0 shadow=black/10 shadow-x=4.0 shadow-blur=18.0 clip=true
+      container width=241.0 height=fill padding=12.0 padding-top=38.0 bg=transparent clip=true
         col width=fill height=fill spacing=8.0
           Brand
           space height=6.0
@@ -73,6 +71,8 @@ component WorkspaceTabs(status:str, loading:bool)
               text "Working…" width=fill size=10.0 wrapping=none @text-muted
             if !loading
               text status width=fill size=10.0 wrapping=none @text-muted
+      container width=1.0 height=fill bg=separator
+        text ""
       col width=fill height=fill
         container width=fill padding=12.0 padding-left=16.0
           row width=fill height=38.0 spacing=12.0 align=center

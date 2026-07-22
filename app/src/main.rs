@@ -52,9 +52,7 @@ mod tests {
             "reply_draft",
             "chat_search_draft",
             "page_draft",
-            "active_page_title",
             "block_draft",
-            "block_edit_draft",
             "page_search_draft",
         ];
         let overwrites_editable = refresh.lines().any(|line| {
@@ -66,6 +64,8 @@ mod tests {
         assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
         assert!(!lifecycle.contains("every 1s"));
         assert!(lifecycle.contains("run refresh(connected_rpc"));
+        assert!(lifecycle.contains("active_page_title = next.active_page_title"));
+        assert!(lifecycle.contains("block_edit_draft = refreshed_block_draft("));
     }
 
     #[test]
@@ -110,6 +110,30 @@ mod tests {
         ));
         assert_eq!(app.status, "Live");
         assert_eq!(app.sync_phase, "idle");
+
+        app.sync_phase = "refreshing".into();
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
+            backend::WorkspaceData {
+                generation: 4,
+                rpc: "http://current".into(),
+                status: "fresh".into(),
+                height: 100,
+                channels: Vec::new(),
+                messages: Vec::new(),
+                active_channel: String::new(),
+                active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                pages: Vec::new(),
+                blocks: Vec::new(),
+                active_page: "page".into(),
+                active_page_title: "Remote title".into(),
+                active_page_parent: String::new(),
+            },
+        ));
+        assert_eq!(app.active_page_title, "Remote title");
     }
 
     #[test]
@@ -153,6 +177,21 @@ mod tests {
         assert_eq!(app.message_draft, "second");
         assert_eq!(app.mutation_phase, "idle");
         assert!(!app.messages[0].pending);
+    }
+
+    #[test]
+    fn message_actions_require_explicit_intent() {
+        let (mut app, _) = Ducktape::__boot();
+        app.mutation_phase = "idle".into();
+
+        let _ = app.__update(__DucktapeMessage::SelectMessage(7, "hello".into(), 2));
+        assert_eq!(app.message_action, "toolbar");
+        let _ = app.__update(__DucktapeMessage::BeginMessageEdit);
+        assert_eq!(app.message_action, "editing");
+        let _ = app.__update(__DucktapeMessage::CancelMessageAction);
+        assert_eq!(app.message_action, "toolbar");
+        let _ = app.__update(__DucktapeMessage::ArmMessageDelete);
+        assert_eq!(app.message_action, "delete");
     }
 
     #[test]
