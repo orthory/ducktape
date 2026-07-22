@@ -46,11 +46,11 @@ pub(super) const NODE_VERBS: &[Verb] = &[
     },
     Verb {
         path: &["init"],
-        usage: "node init --name <network name> [--dir .] [--listen a] [--advertised a] \
+        usage: "node init --name <network name> [--dir <dir>] [--listen a] [--advertised a] \
                 [--http a] [--rpc a] [--gateway a] [--primary-coordinator host:port|none] \
                 [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a] \
                 [--wireguard-effect socket|tun|fake]",
-        summary: "found a new network in a directory",
+        summary: "found a new network (default dir: ~/.ducktape/workspaces/<chain-id>)",
         flags: &[
             "name",
             "dir",
@@ -81,7 +81,7 @@ pub(super) const NODE_VERBS: &[Verb] = &[
     },
     Verb {
         path: &["join"],
-        usage: "node join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a] \
+        usage: "node join <invite blob> [--dir <dir>] [--listen a] [--advertised a] [--http a] \
                 [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port] \
                 [--invite-listen a] [--wireguard-effect socket|tun|fake] \
                 [--primary-coordinator host:port|none]",
@@ -372,12 +372,14 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
+/// `init --name <human name> [--dir <dir>] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]
 /// [--wireguard-effect socket|tun|fake]` — found a network: mint the
 /// chain-id, write the descriptor + node config, seed the genesis validator
-/// set with this identity.
+/// set with this identity. without `--dir` the workspace lands in the
+/// registry (`~/.ducktape/workspaces/<chain-id>/`), where `-n <chain-id>`
+/// finds it.
 fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -386,11 +388,33 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let name = flags
         .get("name")
         .ok_or("init needs --name <human-readable network name>")?;
-    let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
-    std::fs::create_dir_all(&dir)?;
+    // the workspace dir: `--dir` is the explicit escape hatch; the default is
+    // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
+    // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
+    // founded. the default dir is NAMED by the chain id, and the chain id is
+    // minted from the identity pubkey, so the key is born in memory and only
+    // persisted once the dir exists.
+    let (dir, key, generated, chain_id) = match flags.get("dir") {
+        Some(d) => {
+            let dir = PathBuf::from(d);
+            std::fs::create_dir_all(&dir)?;
+            let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
+            let chain_id = config::mint_chain_id(name, &key.public_key());
+            (dir, key, generated, chain_id)
+        }
+        None => {
+            let key = config::generate_identity();
+            let chain_id = config::mint_chain_id(name, &key.public_key());
+            let dir = config::default_workspace_dir(&chain_id)?;
+            std::fs::create_dir_all(&dir)?;
+            config::write_identity(&dir.join("identity.key"), &key)?;
+            (dir, key, true, chain_id)
+        }
+    };
     // re-running init would mint a FRESH chain-id and reset the validator set
     // to just this identity — silently un-founding the network under every
-    // holder of an existing invite. founding is once per directory.
+    // holder of an existing invite. founding is once per directory. (the
+    // registry default cannot trip this: its dir is named by the fresh id.)
     let descriptor_path = dir.join("network.toml");
     if descriptor_path.exists() {
         return Err(format!(
@@ -441,9 +465,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me = key.public_key();
-    let chain_id = config::mint_chain_id(name, &me);
     let mut descriptor = config::NetworkDescriptor {
         chain_id: chain_id.clone(),
         scheme: config::SCHEME_ED25519.into(),
@@ -466,11 +488,14 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         hex_bytes(me.as_ref())
     );
     eprintln!("network {chain_id} initialized in {}", dir.display());
-    eprintln!("start:  ducktape node run --config {}/node.toml", dir.display());
-    eprintln!(
-        "invite: ducktape node invite --config {}/node.toml",
-        dir.display()
-    );
+    // a registry-default workspace is addressable by chain id; an explicit
+    // --dir may live outside the registry, so its hints stay path-based.
+    let selector = match flags.contains_key("dir") {
+        true => format!("--config {}/node.toml", dir.display()),
+        false => format!("-n '{chain_id}'"),
+    };
+    eprintln!("start:  ducktape node run {selector}");
+    eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
     Ok(())
 }
@@ -1588,12 +1613,13 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
+/// `join <invite blob> [--dir <dir>] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port]
 /// [--invite-listen a] [--wireguard-effect socket|tun|fake]
 /// [--primary-coordinator host:port|none]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
-/// config. prints this identity for the inviter's pre-genesis `admit`.
+/// config, defaulting into the registry dir named by the invite's chain id.
+/// prints this identity for the inviter's pre-genesis `admit`.
 /// `--primary-coordinator` is node-local plumbing ONLY — it never touches
 /// the invite or the joined descriptor (the coordinator is always ambient,
 /// per docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md).
@@ -1614,7 +1640,14 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
     let mut descriptor = invite.descriptor.clone();
-    let dir = PathBuf::from(flags.get("dir").map(String::as_str).unwrap_or("."));
+    // same default as `init`: without `--dir` the workspace materializes in
+    // the registry under its chain id (known here from the invite), so the
+    // joined node is `-n <chain-id>`-addressable. a re-join for the same
+    // chain lands in the same dir and reuses its identity, as before.
+    let dir = match flags.get("dir") {
+        Some(d) => PathBuf::from(d),
+        None => config::default_workspace_dir(&descriptor.chain_id)?,
+    };
     std::fs::create_dir_all(&dir)?;
     // mint (or reuse) this workspace dir's identity. Every invite is bearer
     // (기명 dropped in v2): there is no target to match, so any freshly minted
@@ -1724,19 +1757,19 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         descriptor.chain_id,
         dir.display()
     );
+    let selector = match flags.contains_key("dir") {
+        true => format!("--config {}/node.toml", dir.display()),
+        false => format!("-n '{}'", descriptor.chain_id),
+    };
     if descriptor.validators.contains(&me_hex) {
-        eprintln!(
-            "this identity is a member — start: ducktape node run --config {}/node.toml",
-            dir.display()
-        );
+        eprintln!("this identity is a member — start: ducktape node run {selector}");
     } else {
         eprintln!(
-            "NOT yet a member. start now — `ducktape node run --config {}/node.toml` redeems \
+            "NOT yet a member. start now — `ducktape node run {selector}` redeems \
              this invite automatically: the node joins the network's VPN, syncs state, and \
              comes up as a full node. no approval step follows (minting the invite WAS the \
              approval); a member can later promote it into the quorum with \
-             `ducktape node member promote {me_hex}`.",
-            dir.display()
+             `ducktape node member promote {me_hex}`."
         );
     }
     println!("{me_hex}");
