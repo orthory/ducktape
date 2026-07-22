@@ -89,7 +89,7 @@ fn reserved_index_id_is_rejected() {
             "reserved block id",
         )
         .await;
-        assert!(p.pending.is_empty(), "a rejected op must stage nothing");
+        assert!(p.staged.is_empty(), "a rejected op must stage nothing");
         assert_eq!(p.root(), r_before, "a rejected op must not move the root");
         // the sentinel reads as absence on the query surface.
         assert!(get_block(&p, PAGE_INDEX_KEY).await.is_none());

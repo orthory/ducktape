@@ -29,12 +29,10 @@
 mod interface;
 pub use interface::*;
 
-use std::collections::BTreeMap;
-
 use sdk::{
-    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StateRoot, StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, ResolverSyncTarget, StagedStore, StateRoot,
+    StateSyncHandle,
 };
-use sha2::Digest as _;
 
 /// write-time cap on a LOGICAL key. the store key is the 32-byte hash, so this is
 /// a hygiene bound at the interface seam (an unbounded key would still bloat the
@@ -52,23 +50,13 @@ pub const MAX_KEY_LEN: usize = 4 * 1024;
 /// in sync batches.
 pub const MAX_VALUE_LEN: usize = (1 << 20) - 4 * 1024;
 
-/// hash a logical key to its fixed-width store key. deterministic, so every
-/// validator maps a given logical key to the same store slot.
-fn hash_key(key: &[u8]) -> [u8; 32] {
-    sha2::Sha256::digest(key).into()
-}
-
 /// a qmdb-backed key-value module.
 pub struct Kv {
     id: ModuleId,
-    /// the host-injected authenticated store: it owns durability, the merkle
-    /// commitment, and the byte-level sync serve surface.
-    store: Box<dyn MerkleStore>,
-    /// writes staged during the current block, keyed by LOGICAL key. read ahead of
-    /// committed state by `get` (read-your-writes) and flushed to the store (under
-    /// the hashed key) in one batch by `commit_block`; NOT reflected in `root()`
-    /// until then.
-    pending: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes; folded into `root()` at `commit_block`). the store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Kv {
@@ -77,8 +65,7 @@ impl Kv {
     pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
-            store,
-            pending: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
 
@@ -86,12 +73,15 @@ impl Kv {
     /// reflects the new committed merkle root. the store key is `sha256(key)`.
     /// a direct test/dev convenience — but it enforces the same write-time size
     /// caps as the consensus path (`execute` -> `stage`), so it can never commit
-    /// the poison-pill value the caps exist to keep out.
+    /// the poison-pill value the caps exist to keep out. callers use it on an
+    /// empty overlay; it stages then flushes, so its committed batch is the same
+    /// single write.
+    // ponytail: stage-then-commit flushes any co-staged overlay entry too; every
+    // caller uses it on an empty overlay, so the batch is byte-identical to the
+    // old direct single-entry commit.
     pub async fn set(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
-        Self::check_write_caps(&key, &value)?;
-        self.store
-            .commit_batch(vec![(hash_key(&key), Some(value))])
-            .await
+        self.stage(key, value)?;
+        self.staged.commit().await
     }
 
     /// reject a write that would poison the store: its codec bound is enforced
@@ -120,7 +110,7 @@ impl Kv {
     /// over-cap key/value BEFORE staging, so a failed op leaves no overlay entry.
     pub fn stage(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
         Self::check_write_caps(&key, &value)?;
-        self.pending.insert(key, value);
+        self.staged.stage(key, value);
         Ok(())
     }
 
@@ -128,10 +118,7 @@ impl Kv {
     /// a later op in the same block sees an earlier staged write. committed reads
     /// go through the hashed key.
     pub async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(v) = self.pending.get(key) {
-            return Some(v.clone());
-        }
-        self.store.get(&hash_key(key)).await.expect("get failed")
+        self.staged.get(key).await.expect("get failed")
     }
 }
 
@@ -145,25 +132,22 @@ impl Module for Kv {
     /// sync, as the trait requires: the store caches its root and returns it by
     /// value. never a placeholder.
     fn root(&self) -> StateRoot {
-        self.store.root()
+        self.staged.root()
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::ResolverBacked {
-            backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
-        })
+        self.staged.state_sync_handle()
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire requests
     /// (historical proof-carrying op ranges) from committed state. read-only;
     /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        self.store.serve_sync(req).await
+        self.staged.serve_sync(req).await
     }
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
-        self.store.sync_target().await
+        self.staged.sync_target().await
     }
 
     /// interpret the payload as a json-encoded `(key, value)` write and apply it
@@ -194,23 +178,13 @@ impl Module for Kv {
     /// every entry ships as `Some`; BTreeMap iteration keeps the write order
     /// deterministic across validators.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let writes = self
-            .pending
-            .iter()
-            .map(|(key, value)| (hash_key(key), Some(value.clone())))
-            .collect();
-        self.store.commit_batch(writes).await?;
-        self.pending.clear();
-        Ok(())
+        self.staged.commit().await
     }
 
     /// discard the block's staged writes — nothing reached the store, so
     /// `root()` is unchanged.
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -366,7 +340,10 @@ mod tests {
 
             // the rejects happened BEFORE staging: no overlay entry, and a commit
             // is a no-op that leaves the root byte-identical.
-            assert!(kv.pending.is_empty(), "a rejected write must not be staged");
+            assert!(
+                kv.staged.is_empty(),
+                "a rejected write must not be staged"
+            );
             kv.commit_block().await.expect("commit");
             assert_eq!(kv.root(), r0, "a rejected write must not move the root");
 

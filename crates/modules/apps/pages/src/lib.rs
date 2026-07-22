@@ -63,8 +63,8 @@ pub mod index;
 use std::collections::BTreeMap;
 
 use sdk::{
-    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
-    StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
 };
 use tagging::{TagEvent, TaggingMsg};
 
@@ -78,7 +78,6 @@ mod store;
 mod text_ranges;
 
 use error::{PageError, to_page_err};
-use store::hash_key;
 
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
@@ -106,14 +105,13 @@ const MAX_DEPTH: usize = 10_000;
 /// a block-tree pages module over a host-injected authenticated store.
 pub struct Pages {
     id: ModuleId,
-    /// the host-injected authenticated store: it owns durability, the merkle
-    /// commitment, and the byte-level sync serve surface.
-    store: Box<dyn MerkleStore>,
-    /// blocks touched this block-height, keyed by LOGICAL `block_id` bytes.
-    /// `Some(bytes)` stages a write, `None` stages a DELETE (subtree removal).
-    /// read ahead of committed state by `get` (read-your-writes) and flushed
-    /// to the store in one batch by `commit_block`; NOT in `root()` until then.
-    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// the host-injected authenticated store plus this block-height's staging
+    /// overlay: blocks touched this block are staged (a write, or a `None`
+    /// DELETE for subtree removal), read ahead of committed state
+    /// (read-your-writes), and flushed to the store in one batch at
+    /// `commit_block`; NOT in `root()` until then. store key is
+    /// `sha256(block_id)`, owned by [`StagedStore`].
+    staged: StagedStore,
     /// Optional engagement router. Tests/minimal registries may leave it
     /// unwired; production reports each newly-added comment after staging it.
     tagging: Option<ModuleId>,

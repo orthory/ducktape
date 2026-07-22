@@ -161,7 +161,7 @@ fn oversized_block_is_rejected_before_staging() {
             "block too large",
         )
         .await;
-        assert!(p.pending.is_empty(), "a rejected write must not be staged");
+        assert!(p.staged.is_empty(), "a rejected write must not be staged");
         assert_eq!(
             p.root(),
             r_before,
@@ -180,8 +180,8 @@ fn corrupt_stored_block_errors_as_corruption_not_absence() {
         let mut p = pages_on!(context, "pages");
         // commit bytes that are NOT valid Block json under blk1's key
         // (simulating on-disk corruption; unreachable through PageMsg ops).
-        p.pending
-            .insert(b"blk1".to_vec(), Some(b"not json".to_vec()));
+        p.staged
+            .stage(b"blk1".to_vec(), b"not json".to_vec());
         p.commit_block().await.unwrap();
 
         apply_expect_err(

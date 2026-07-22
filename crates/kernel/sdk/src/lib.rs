@@ -29,7 +29,10 @@
 
 pub mod codec;
 pub mod genesis_config;
+pub mod staged_store;
 pub mod wire;
+
+pub use staged_store::StagedStore;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module
