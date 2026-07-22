@@ -1,7 +1,7 @@
 //! `guest-adapter` — the port harness for running NATIVE module crates as wasm
 //! guests without rewriting their logic.
 //!
-//! a ported guest crate (`vaults-wasm`, …) compiles the native module crate to
+//! a ported guest crate (`agent-wasm`, …) compiles the native module crate to
 //! `wasm32-unknown-unknown` and ADAPTS it to the `ducktape:module` world using
 //! the pieces here, so the module's logic stays single-sourced in the native
 //! crate — drift between the native and wasm builds is a compile error, not a
@@ -37,8 +37,9 @@
 //! save the new snapshot back as a staged host write. the OUTER staging —
 //! what the host publishes at the real block boundary or discards on abort —
 //! is the only durable seam, so multi-dispatch blocks and aborts behave
-//! exactly like the native module (see `vaults-wasm` for the argument spelled
-//! out against a concrete module).
+//! exactly like the native module (see `pages-wasm` for the argument spelled
+//! out against a concrete store-backed module, `agent-wasm` for a whole-state
+//! one).
 
 /// the raw generated bindings. a named module (not the crate root) because the
 /// generated `#[macro_export]` machinery re-imports its own crate-root macro
@@ -399,4 +400,177 @@ pub fn save_state(bytes: &[u8], root: &[u8; ROOT_LEN]) {
 /// untouched across every dispatch.
 pub fn load_config() -> Option<Vec<u8>> {
     host::state_get(sdk::genesis_config::CONFIG_KEY)
+}
+
+/// decode this network's `chain_id` genesis parameter as a utf-8 string — the
+/// per-network id the identity/gateway constructors fold into every signed
+/// preimage. the config hook for the `chain_id` twins: it is exactly the
+/// per-guest `chain_id()` these two ports hand-rolled, with the guest's own
+/// label threaded into the rejection messages so a wiring fault reads the same.
+/// a missing or malformed config is host wiring corruption surfaced as a
+/// deterministic rejection — never a guessed default (a wrong chain id would
+/// silently refuse every certificate / route statement).
+pub fn genesis_chain_id(module_label: &str) -> Result<String, host::Error> {
+    let raw = load_config().ok_or_else(|| {
+        host::Error::Rejected(format!("{module_label} genesis config missing (__config)"))
+    })?;
+    let params = sdk::genesis_config::decode_config(&raw)
+        .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
+    let chain_id = sdk::genesis_config::find(&params, "chain_id").ok_or_else(|| {
+        host::Error::Rejected(format!("{module_label} genesis config carries no chain_id"))
+    })?;
+    String::from_utf8(chain_id.to_vec())
+        .map_err(|e| host::Error::Rejected(format!("{module_label} chain_id is not utf-8: {e}")))
+}
+
+// ============================================================================
+// guest dispatch shells — the boilerplate every ported guest repeats
+// ============================================================================
+//
+// a ported guest's `lib.rs` is a doc header, its consts (the module id + the
+// genesis-wired sibling ids), and ONE of these macros. everything below is
+// byte-identical across the family, so it lives here once: the `Component`
+// export type, the sdk-error → wit-error map, the per-dispatch module load, and
+// the `impl Guest` execute/query that runs the native module and persists.
+//
+// * [`snapshot_guest!`] — a WHOLE-STATE (`SnapshotBytes`) port: load the
+//   persisted snapshot, run, commit the inner module, save the snapshot back.
+// * [`store_guest!`] — a STORE-BACKED port (pages, chat): no snapshot; the
+//   host owns the real store and the module is rebuilt fresh per dispatch.
+//
+// both take `id` (the module id const, used as the dispatch `Env::me`/target
+// and threaded into the reload label) and `new` (the native constructor
+// expression, written against the guest's own consts — and, for the chain_id
+// twins, [`genesis_chain_id`]). runs stays hand-written: its delivered-runs
+// ring rides a third `__history` key the shell does not model.
+
+/// whole-state (`SnapshotBytes`) guest shell. `new` is the native constructor
+/// (may use `?` — the loader returns `Result<_, host::Error>`).
+#[macro_export]
+macro_rules! snapshot_guest {
+    (id: $id:expr, module: $module:ty, new: $new:expr $(,)?) => {
+        struct Component;
+
+        /// the native module at THIS dispatch's state: the `new` shape when
+        /// nothing was ever persisted, else the persisted snapshot verify-then-
+        /// adopted against its persisted root. an install failure is host-store
+        /// corruption surfaced as a deterministic rejection, never a silent
+        /// re-genesis.
+        fn loaded_module() -> ::core::result::Result<$module, $crate::host::Error> {
+            use ::sdk::Module as _;
+            let mut module = $new;
+            if let ::core::option::Option::Some((bytes, root)) = $crate::load_state() {
+                module
+                    .install(&bytes, ::sdk::StateRoot(root))
+                    .map_err(|e| {
+                        $crate::host::Error::Rejected(::std::format!("{} state reload: {e}", $id))
+                    })?;
+            }
+            ::core::result::Result::Ok(module)
+        }
+
+        /// map an inner sdk error onto the wit surface. `Module` is the native
+        /// rejection verbatim; anything else the native module never surfaces
+        /// from its own execute, so the debug rendering is purely diagnostic.
+        fn to_wit_error(e: ::sdk::Error) -> $crate::host::Error {
+            match e {
+                ::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
+                other => $crate::host::Error::Rejected(other.to_string()),
+            }
+        }
+
+        impl $crate::Guest for Component {
+            fn execute(
+                payload: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<(), $crate::host::Error> {
+                use ::sdk::Module as _;
+                let mut module = loaded_module()?;
+                let mut ctx = $crate::WitCtx::new();
+                $crate::block_on(module.execute(
+                    &mut ctx,
+                    &::sdk::Msg { target: $id.into(), payload },
+                ))
+                .map_err(to_wit_error)?;
+                // fully apply per dispatch: publish the inner per-op staging,
+                // then persist the canonical snapshot as OUTER staged writes —
+                // the host owns the real commit/abort boundary (see crate doc).
+                $crate::block_on(module.commit_block()).map_err(to_wit_error)?;
+                $crate::save_state(&module.snapshot(), module.root().as_bytes());
+                ::core::result::Result::Ok(())
+            }
+
+            fn query(
+                req: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::host::Error> {
+                use ::sdk::Module as _;
+                // the loaded snapshot was saved post-inner-commit, so the native
+                // query's merged view serves it with an empty pending — the live
+                // staged-overlay projection this round is already folded into
+                // `__state`. these ports' queries are pure self reads.
+                let module = loaded_module()?;
+                $crate::block_on(module.query(&req)).map_err(to_wit_error)
+            }
+        }
+
+        $crate::export_module!(Component);
+    };
+}
+
+/// store-backed guest shell (pages, chat). `new` is the native constructor over
+/// [`WitStore`]; there is NO snapshot — the host owns the real store, and the
+/// module is rebuilt fresh per dispatch.
+#[macro_export]
+macro_rules! store_guest {
+    (id: $id:expr, module: $module:ty, new: $new:expr $(,)?) => {
+        struct Component;
+
+        /// the native module over the host's real store, rebuilt fresh per
+        /// dispatch. no state load: the store IS the state, and the module's own
+        /// `pending` overlay is per-dispatch by design (cross-dispatch read-
+        /// your-writes comes from the host's outer staged overlay).
+        fn module() -> $module {
+            $new
+        }
+
+        /// map an inner sdk error onto the wit surface. `Module` is the native
+        /// rejection verbatim; anything else the native module never surfaces
+        /// from its own execute, so the debug rendering is purely diagnostic.
+        fn to_wit_error(e: ::sdk::Error) -> $crate::host::Error {
+            match e {
+                ::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
+                other => $crate::host::Error::Rejected(other.to_string()),
+            }
+        }
+
+        impl $crate::Guest for Component {
+            fn execute(
+                payload: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<(), $crate::host::Error> {
+                use ::sdk::Module as _;
+                let mut module = module();
+                let mut ctx = $crate::WitCtx::new();
+                $crate::block_on(module.execute(
+                    &mut ctx,
+                    &::sdk::Msg { target: $id.into(), payload },
+                ))
+                .map_err(to_wit_error)?;
+                // flush the inner per-dispatch staging into the host's OUTER
+                // overlay; the host owns the real store commit/abort boundary.
+                $crate::block_on(module.commit_block()).map_err(to_wit_error)?;
+                ::core::result::Result::Ok(())
+            }
+
+            fn query(
+                req: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::host::Error> {
+                use ::sdk::Module as _;
+                // a fresh module's `pending` is empty, so the native query reads
+                // straight through the staged-over-committed store view.
+                let module = module();
+                $crate::block_on(module.query(&req)).map_err(to_wit_error)
+            }
+        }
+
+        $crate::export_module!(Component);
+    };
 }
