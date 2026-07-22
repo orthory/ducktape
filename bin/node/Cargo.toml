@@ -144,7 +144,7 @@ objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
-nettest = { path = "../../crates/nettest" }
+nettest = { path = "../../crates/testing/nettest" }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature: resolver v2 keeps it
 # out of the production `ducktape` binary build.

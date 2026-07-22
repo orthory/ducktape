@@ -24,7 +24,7 @@ testkit = ["dep:nettest"]
 [dependencies]
 # the shared raw-http/port/poll test client — only pulled by the `testkit`
 # feature (the in-proc daemon's readiness probe), never in a normal build.
-nettest = { path = "../../crates/nettest", optional = true }
+nettest = { path = "../../crates/testing/nettest", optional = true }
 # streamed gateway response bodies (GatewayBody chunks + Body::from_stream relay).
 bytes = "1"
 tokio-stream = "0.1"
@@ -108,7 +108,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
-nettest = { path = "../../crates/nettest" }
+nettest = { path = "../../crates/testing/nettest" }
 tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
