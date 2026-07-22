@@ -62,6 +62,8 @@ pub type ModuleEventStream = futures::stream::BoxStream<'static, Result<ModuleEv
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Status {
     pub height: u64,
+    #[serde(default)]
+    pub public_key: String,
 }
 
 /// An HTTP(S) origin serving Ducktape's `/v1` endpoints.
@@ -168,6 +170,29 @@ impl Client {
             .send()
             .await
             .map_err(|error| Error::new(format!("{target} query failed: {error}")))?;
+        decode_json(response).await
+    }
+
+    /// Query one module's derived materialized view, such as Chat/Pages search.
+    pub async fn view<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        module: &str,
+        query: &Q,
+    ) -> Result<R> {
+        let valid_module = !module.is_empty()
+            && module
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        if !valid_module {
+            return Err(Error::new("view module id is invalid"));
+        }
+        let response = self
+            .http
+            .post(self.url(&format!("v1/index/{module}/view"))?)
+            .json(query)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("{module} view query failed: {error}")))?;
         decode_json(response).await
     }
 
@@ -378,6 +403,17 @@ mod tests {
         ] {
             assert!(Client::new(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_view_path_injection_before_transport() {
+        let client = Client::new("http://127.0.0.1:1").unwrap();
+        assert!(
+            client
+                .view::<_, serde_json::Value>("../status", &())
+                .await
+                .is_err()
+        );
     }
 
     #[test]

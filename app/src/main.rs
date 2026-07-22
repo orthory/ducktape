@@ -26,13 +26,15 @@ mod tests {
 
     #[test]
     fn background_refresh_preserves_editing_state() {
-        let source = include_str!("ui/app.ice");
-        let view = source.split_once("\nview\n").unwrap().1;
+        let root = include_str!("ui/app.ice");
+        let view = include_str!("ui/view.ice");
+        let lifecycle = include_str!("ui/handlers/lifecycle.ice");
         assert!(!view.contains("sync_phase"));
-        assert!(!source.contains("on refresh_now"));
+        assert!(root.contains("use \"view.ice\""));
+        assert!(!lifecycle.contains("on refresh_now"));
         assert!(!view.contains("button \"Refresh\""));
 
-        let refresh = source
+        let refresh = lifecycle
             .split_once("on workspace_refreshed(next)\n")
             .unwrap()
             .1
@@ -58,9 +60,9 @@ mod tests {
                 .any(|name| line.trim_start().starts_with(&format!("{name} =")))
         });
         assert!(!overwrites_editable);
-        assert!(source.contains("run live_events(connected_rpc) when connected"));
-        assert!(!source.contains("every 1s"));
-        assert!(source.contains("run refresh(connected_rpc"));
+        assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
+        assert!(!lifecycle.contains("every 1s"));
+        assert!(lifecycle.contains("run refresh(connected_rpc"));
     }
 
     #[test]

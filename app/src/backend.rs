@@ -68,6 +68,20 @@ pub struct ThreadData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatSearchHit {
+    pub channel_id: String,
+    pub seq: i64,
+    pub author: String,
+    pub text: String,
+    pub meta: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatSearchData {
+    pub hits: Vec<ChatSearchHit>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageItem {
     pub id: String,
     pub title: String,
@@ -96,6 +110,19 @@ pub struct PagesData {
     pub active_page: String,
     pub active_page_title: String,
     pub active_page_parent: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PageSearchHit {
+    pub page_id: String,
+    pub block_id: String,
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PageSearchData {
+    pub hits: Vec<PageSearchHit>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -514,6 +541,46 @@ pub async fn add_reaction(
     .map_err(app_error)
 }
 
+pub async fn search_chat(
+    rpc: String,
+    channel_id: String,
+    text: String,
+) -> Result<ChatSearchData, AppError> {
+    async {
+        let text = bounded_text(text, "search", 512)?;
+        let rpc = rpc_client(&rpc)?;
+        let reply: chat::index::ChatViewReply = rpc
+            .view(
+                "chat",
+                &serde_json::json!({
+                    "search": {
+                        "text": text,
+                        "channel_id": (!channel_id.is_empty()).then_some(channel_id),
+                        "limit": 50
+                    }
+                }),
+            )
+            .await?;
+        let chat::index::ChatViewReply::Hits(hits) = reply else {
+            return Err("chat search returned an invalid reply".into());
+        };
+        Ok(ChatSearchData {
+            hits: hits
+                .into_iter()
+                .map(|hit| ChatSearchHit {
+                    channel_id: hit.channel_id,
+                    seq: number_i64(hit.seq),
+                    author: hit.author,
+                    text: hit.text,
+                    meta: format!("#{}", hit.seq),
+                })
+                .collect(),
+        })
+    }
+    .await
+    .map_err(app_error)
+}
+
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
@@ -821,6 +888,43 @@ pub async fn remove_block(
         )
         .await?;
         load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn search_pages(
+    rpc: String,
+    page_id: String,
+    text: String,
+) -> Result<PageSearchData, AppError> {
+    async {
+        let text = bounded_text(text, "search", 512)?;
+        let rpc = rpc_client(&rpc)?;
+        let reply: pages::index::PagesViewReply = rpc
+            .view(
+                "pages",
+                &serde_json::json!({
+                    "search": {
+                        "text": text,
+                        "page_id": (!page_id.is_empty()).then_some(page_id),
+                        "limit": 50
+                    }
+                }),
+            )
+            .await?;
+        let pages::index::PagesViewReply::Hits(hits) = reply;
+        Ok(PageSearchData {
+            hits: hits
+                .into_iter()
+                .map(|hit| PageSearchHit {
+                    page_id: hit.page_id,
+                    block_id: hit.block_id,
+                    kind: block_kind_name(hit.kind).into(),
+                    text: hit.text,
+                })
+                .collect(),
+        })
     }
     .await
     .map_err(app_error)
