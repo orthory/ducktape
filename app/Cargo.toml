@@ -11,8 +11,8 @@ pages.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "tokio", "wgpu", "x11"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "1a97a8e52c61a66122653a0442da3b007ffbc746" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "1a97a8e52c61a66122653a0442da3b007ffbc746", version = "=0.1.0" }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "3703fcf23fa0dda5bd1ad77706a23a62cb511f4d" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "3703fcf23fa0dda5bd1ad77706a23a62cb511f4d", version = "=0.1.0" }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
