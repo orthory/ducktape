@@ -44,6 +44,8 @@ mod tests {
             "password",
             "channel_draft",
             "message_draft",
+            "message_edit_draft",
+            "reply_draft",
             "page_draft",
             "active_page_title",
             "paragraph_draft",
@@ -87,6 +89,7 @@ mod tests {
                 channels: Vec::new(),
                 messages: Vec::new(),
                 active_channel: String::new(),
+                active_channel_name: String::new(),
                 pages: Vec::new(),
                 blocks: Vec::new(),
                 active_page: String::new(),
@@ -115,12 +118,21 @@ mod tests {
         let _ = app.__update(__DucktapeMessage::ChatMutated(backend::ChatData {
             channels: Vec::new(),
             messages: vec![backend::ChatMessage {
+                id: "message-1".into(),
+                seq: 1,
                 author: "you".into(),
                 meta: "#1".into(),
                 body: "first".into(),
                 pending: false,
+                rev: 0,
+                edited: false,
+                deleted: false,
+                reply_count: 0,
+                thread_seq: 0,
+                reactions: Vec::new(),
             }],
             active_channel: "general".into(),
+            active_channel_name: "general".into(),
         }));
         assert_eq!(app.message_draft, "second");
         assert_eq!(app.mutation_phase, "idle");
@@ -143,6 +155,28 @@ mod tests {
         assert_eq!(app.message_draft, "retry me");
         assert!(app.messages.is_empty());
         assert_eq!(app.error, "rejected");
+        assert_eq!(app.mutation_phase, "idle");
+    }
+
+    #[test]
+    fn failed_thread_reply_rolls_back_and_restores_the_draft() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_thread_seq = 1;
+        app.reply_draft = "retry reply".into();
+
+        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        assert_eq!(app.mutation_phase, "reply");
+        assert!(app.reply_draft.is_empty());
+        assert!(app.thread_messages[0].pending);
+
+        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+            message: "rejected".into(),
+        }));
+        assert_eq!(app.reply_draft, "retry reply");
+        assert!(app.thread_messages.is_empty());
         assert_eq!(app.mutation_phase, "idle");
     }
 }

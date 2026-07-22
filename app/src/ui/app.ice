@@ -20,13 +20,15 @@ app Ducktape
       fullsize-content-view true
 
 extern crate::backend
-  ChatChannel(id:str, name:str)
-  ChatMessage(author:str, meta:str, body:str, pending:bool)
-  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str)
+  ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
+  ChatReaction(emoji:str, count:i64)
+  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, reactions:[ChatReaction])
+  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str)
+  ThreadData(root_seq:i64, messages:[ChatMessage])
   PageItem(id:str, title:str)
   PageBlock(id:str, kind:str, text:str, pending:bool)
   PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str)
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str)
   LiveUpdate(kind:str, status:str, height:i64)
   AppError(message:str)
   HydrationError(generation:i64, message:str)
@@ -42,6 +44,11 @@ extern crate::backend
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   create_channel(rpc:str, password:str, name:str) -> ChatData ! AppError
   send_message(rpc:str, password:str, channel_id:str, body:str) -> ChatData ! AppError
+  load_thread(rpc:str, channel_id:str, root_seq:i64) -> ThreadData ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, body:str) -> ThreadData ! AppError
+  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> ChatData ! AppError
+  delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> ChatData ! AppError
+  add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
   rename_page(rpc:str, password:str, page_id:str, title:str) -> PagesData ! AppError
@@ -83,6 +90,15 @@ state
   channels:[ChatChannel] = []
   messages:[ChatMessage] = []
   active_channel = ""
+  active_channel_name = ""
+  selected_message_seq:i64 = 0
+  selected_message_rev:i64 = 0
+  message_edit_draft = ""
+  active_thread_seq:i64 = 0
+  thread_messages:[ChatMessage] = []
+  thread_loading = false
+  reply_draft = ""
+  pending_reply = ""
   channel_draft = ""
   pending_channel = ""
   message_draft = ""
@@ -109,15 +125,27 @@ component ChannelButton(channel:ChatChannel, selected:bool)
     if selected
       button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
         row width=fill spacing=9.0 align=center
-          text "#" width=18.0 size=13.0 align-x=center @text-foreground font-bold
+          if channel.members_only
+            text "◇" width=18.0 size=12.0 align-x=center @text-foreground font-bold
+          if !channel.members_only
+            text "#" width=18.0 size=13.0 align-x=center @text-foreground font-bold
           text channel.name width=fill size=12.0 wrapping=none @text-foreground font-bold
+          if channel.huddle_count > 0
+            text channel.huddle_count size=10.0 @text-muted
         active background=linear(2.3, white/78@0.0, surface/58@1.0) text=foreground border=white/78 border-width=1.0 radius=10.0 shadow=black/8 shadow-y=1.0 shadow-blur=6.0
         pressed background=selection
     if !selected
       button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
         row width=fill spacing=9.0 align=center
-          text "#" width=18.0 size=13.0 align-x=center @text-muted
+          if channel.members_only
+            text "◇" width=18.0 size=12.0 align-x=center @text-muted
+          if !channel.members_only
+            text "#" width=18.0 size=13.0 align-x=center @text-muted
           text channel.name width=fill size=12.0 wrapping=none @text-muted
+          if channel.archived
+            text "archived" size=10.0 @text-muted
+          if !channel.archived && channel.huddle_count > 0
+            text channel.huddle_count size=10.0 @text-muted
         active background=transparent text=muted radius=10.0
         hovered background=white/34 text=foreground
         pressed background=selection text=foreground
@@ -140,13 +168,50 @@ component PageButton(page:PageItem, selected:bool)
         hovered background=white/34 text=foreground
         pressed background=selection text=foreground
 
-component MessageCard(message:ChatMessage)
-  container width=fill padding=8.0 background=transparent radius=6.0
+component MessageContents(message:ChatMessage)
+  col width=fill spacing=4.0
+    row width=fill spacing=8.0 align=center
+      text message.author width=fill size=12.0 @font-bold text-foreground
+      text message.meta size=10.0 @text-muted
+    text message.body width=fill size=13.0 wrapping=word @text-foreground
+    if message.reply_count > 0 || !empty(message.reactions)
+      row width=fill spacing=5.0 align=center
+        if message.reply_count > 0
+          container padding=4.0 padding-left=7.0 padding-right=7.0 background=white/38 border=white/55 border-width=1.0 radius=8.0
+            row spacing=4.0 align=center
+              text "Thread" size=10.0 @font-bold text-muted
+              text message.reply_count size=10.0 @text-muted
+        for reaction in message.reactions
+          container padding=4.0 padding-left=7.0 padding-right=7.0 background=white/38 border=white/55 border-width=1.0 radius=8.0
+            row spacing=4.0 align=center
+              text reaction.emoji size=10.0 @text-foreground
+              text reaction.count size=10.0 @text-muted
+
+component MessageCard(message:ChatMessage, selected:bool)
+  col width=fill
+    if message.deleted
+      container width=fill padding=8.0 background=transparent border=transparent border-width=1.0 radius=10.0
+        MessageContents message=message
+    if !message.deleted && selected
+      button label=message.body width=fill padding=8.0 -> select_message(message.seq, message.body, message.rev)
+        MessageContents message=message
+        active background=linear(2.3, white/70@0.0, surface/52@1.0) text=foreground border=white/72 border-width=1.0 radius=10.0
+        hovered background=white/74 text=foreground
+        pressed background=selection text=foreground
+    if !message.deleted && !selected
+      button label=message.body width=fill padding=8.0 -> select_message(message.seq, message.body, message.rev)
+        MessageContents message=message
+        active background=transparent text=foreground border=transparent border-width=1.0 radius=10.0
+        hovered background=white/34 text=foreground border=white/42
+        pressed background=selection text=foreground
+
+component ThreadMessageCard(message:ChatMessage)
+  container width=fill padding=8.0 background=transparent radius=8.0
     col width=fill spacing=3.0
-      row width=fill align=center
-        text message.author width=fill size=12.0 @font-bold text-foreground
-        text message.meta size=11.0 @text-muted
-      text message.body width=fill size=14.0 wrapping=word @text-foreground
+      row width=fill spacing=7.0 align=center
+        text message.author width=fill size=11.0 @font-bold text-foreground
+        text message.meta size=10.0 @text-muted
+      text message.body width=fill size=12.0 wrapping=word @text-foreground
 
 component BlockCard(block:PageBlock)
   container width=fill padding=8.0 background=transparent radius=6.0
@@ -266,6 +331,7 @@ on workspace_connected(next)
   channels = next.channels
   messages = next.messages
   active_channel = next.active_channel
+  active_channel_name = next.active_channel_name
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
@@ -287,6 +353,7 @@ on workspace_refreshed(next)
   channels = next.channels
   messages = next.messages
   active_channel = next.active_channel
+  active_channel_name = next.active_channel_name
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
@@ -325,6 +392,13 @@ on choose_channel(id)
   hydration_retry_attempt = 0
   sync_phase = "idle"
   loading = true
+  selected_message_seq = 0
+  selected_message_rev = 0
+  message_edit_draft = ""
+  active_thread_seq = 0
+  thread_messages = []
+  reply_draft = ""
+  pending_reply = ""
   error = ""
   run load_chat(connected_rpc, id) -> chat_updated _ | failed _
 
@@ -355,6 +429,7 @@ on chat_updated(next)
   channels = next.channels
   messages = next.messages
   active_channel = next.active_channel
+  active_channel_name = next.active_channel_name
   loading = false
   error = ""
   return if !live_dirty
@@ -367,12 +442,106 @@ on chat_mutated(next)
   channels = next.channels
   messages = next.messages
   active_channel = next.active_channel
+  active_channel_name = next.active_channel_name
+  selected_message_seq = 0
+  selected_message_rev = 0
+  message_edit_draft = ""
+  active_thread_seq = 0
+  thread_messages = []
+  reply_draft = ""
+  pending_reply = ""
   pending_channel = ""
   pending_message = ""
   mutation_phase = "idle"
   error = ""
   return if !live_dirty
   live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+
+on select_message(seq, body, rev)
+  return if seq <= 0 || mutation_phase != "idle"
+  selected_message_seq = seq
+  selected_message_rev = rev
+  message_edit_draft = body
+
+on clear_message_selection
+  selected_message_seq = 0
+  selected_message_rev = 0
+  message_edit_draft = ""
+
+on open_thread
+  return if thread_loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
+  thread_loading = true
+  error = ""
+  run load_thread(connected_rpc, active_channel, selected_message_seq) -> thread_loaded _ | thread_failed _
+
+on thread_loaded(next)
+  active_thread_seq = next.root_seq
+  thread_messages = next.messages
+  thread_loading = false
+  reply_draft = ""
+  pending_reply = ""
+  error = ""
+
+on thread_failed(cause)
+  thread_loading = false
+  error = cause.message
+
+on close_thread
+  active_thread_seq = 0
+  thread_messages = []
+  thread_loading = false
+  reply_draft = ""
+  pending_reply = ""
+
+on edit_message_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "message-edit"
+  error = ""
+  run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft)) -> chat_mutated _ | mutation_failed _
+
+on delete_message_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "message-delete"
+  error = ""
+  run delete_message(connected_rpc, password, active_channel, selected_message_seq) -> chat_mutated _ | mutation_failed _
+
+on add_reaction_submit(emoji)
+  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "reaction"
+  error = ""
+  run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_mutated _ | mutation_failed _
+
+on send_reply_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_thread_seq <= 0 || empty(trim(reply_draft))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "reply"
+  pending_reply = trim(reply_draft)
+  reply_draft = ""
+  thread_messages = optimistic_message(thread_messages, pending_reply)
+  error = ""
+  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply) -> thread_mutated _ | mutation_failed _
+
+on thread_mutated(next)
+  active_thread_seq = next.root_seq
+  thread_messages = next.messages
+  pending_reply = ""
+  mutation_phase = "idle"
+  live_dirty = false
+  error = ""
   hydration_generation = hydration_generation + 1
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
@@ -452,12 +621,15 @@ on mutation_failed(cause)
   message_draft = restore_draft(message_draft, pending_message)
   page_draft = restore_draft(page_draft, pending_page)
   paragraph_draft = restore_draft(paragraph_draft, pending_paragraph)
+  reply_draft = restore_draft(reply_draft, pending_reply)
   messages = rollback_messages(messages)
+  thread_messages = rollback_messages(thread_messages)
   blocks = rollback_blocks(blocks)
   pending_channel = ""
   pending_message = ""
   pending_page = ""
   pending_paragraph = ""
+  pending_reply = ""
   error = cause.message
   return if !live_dirty
   live_dirty = false
@@ -548,30 +720,98 @@ view
                 button "Dismiss" padding=5.0 style=text -> dismiss_error
     chat:
       container width=fill height=fill padding=14.0 background=linear(2.35, white/76@0.0, elevated/64@0.5, surface/54@1.0) border=white/78 border-width=1.0 radius=16.0 shadow=black/12 shadow-y=4.0 shadow-blur=18.0 clip=true pixel-snap=true
-        col width=fill height=fill spacing=9.0
-          if !empty(active_channel)
-            row width=fill height=26.0 spacing=7.0 align=center
-              container width=22.0 height=22.0 align-x=center align-y=center background=white/52 border=white/72 border-width=1.0 radius=7.0
-                text "#" size=11.0 @font-bold text-foreground
-              text active_channel width=fill size=12.0 @font-bold text-foreground
-          if empty(messages)
-            EmptyState title="No messages yet" detail="Create a channel or start the conversation."
-          if !empty(messages)
-            scroll direction=vertical width=fill height=fill bar=hidden
-              col width=fill spacing=1.0
-                for message in messages
-                  MessageCard message=message
-          container width=fill padding=6.0 background=linear(2.3, white/64@0.0, surface/42@1.0) border=white/72 border-width=1.0 radius=14.0 shadow=black/10 shadow-y=2.0 shadow-blur=12.0
-            flex width=fill gap=6.0 align-items=center
-              input "" #message label="Message" <-> message_draft hint="Write a message…" disabled=(loading || !connected || empty(active_channel)) submit=send_message_submit width=fill padding=7.0 text-size=12.0 line-height=1.2
-                active background=transparent border=transparent value=foreground placeholder=muted selection=foreground/18 border-width=0.0 radius=9.0
-                focused background=white/38 border=white/66 border-width=1.0
-                disabled value=muted
-              button "Send" disabled=(loading || mutation_phase != "idle" || !connected || empty(active_channel) || empty(trim(message_draft))) height=30.0 padding=7.0 -> send_message_submit
-                active background=foreground/90 text=white border=white/28 border-width=1.0 radius=10.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
-                hovered background=foreground/80 text=white
-                pressed background=foreground text=white
-                disabled background=foreground/28 text=white/60
+        row width=fill height=fill spacing=10.0
+          col width=fill height=fill spacing=9.0
+            if !empty(active_channel)
+              row width=fill height=26.0 spacing=7.0 align=center
+                container width=22.0 height=22.0 align-x=center align-y=center background=white/52 border=white/72 border-width=1.0 radius=7.0
+                  text "#" size=11.0 @font-bold text-foreground
+                text active_channel_name width=fill size=12.0 @font-bold text-foreground
+                text len(messages) size=10.0 @text-muted
+            if empty(messages)
+              EmptyState title="No messages yet" detail="Create a channel or start the conversation."
+            if !empty(messages)
+              scroll direction=vertical width=fill height=fill bar=hidden
+                col width=fill spacing=1.0
+                  for message in messages
+                    MessageCard message=message selected=(message.seq == selected_message_seq)
+            if selected_message_seq > 0
+              container width=fill padding=7.0 background=linear(2.3, white/58@0.0, surface/38@1.0) border=white/62 border-width=1.0 radius=12.0
+                col width=fill spacing=6.0
+                  row width=fill spacing=5.0 align=center
+                    text "Message actions" width=fill size=10.0 @font-bold text-muted
+                    button "Thread" disabled=(thread_loading || mutation_phase != "idle") height=26.0 padding=6.0 -> open_thread
+                      active background=white/48 text=foreground border=white/62 border-width=1.0 radius=8.0
+                      hovered background=white/72
+                      pressed background=selection
+                      disabled background=white/22 text=muted
+                    button "👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle") width=28.0 height=26.0 padding=5.0 -> add_reaction_submit("👍")
+                      active background=white/48 text=foreground border=white/62 border-width=1.0 radius=8.0
+                      hovered background=white/72
+                      pressed background=selection
+                      disabled background=white/22 text=muted
+                    button "♥" label="Add heart reaction" disabled=(mutation_phase != "idle") width=28.0 height=26.0 padding=5.0 -> add_reaction_submit("❤️")
+                      active background=white/48 text=foreground border=white/62 border-width=1.0 radius=8.0
+                      hovered background=white/72
+                      pressed background=selection
+                      disabled background=white/22 text=muted
+                    button "Delete" disabled=(mutation_phase != "idle") height=26.0 padding=6.0 -> delete_message_submit
+                      active background=white/48 text=foreground border=white/62 border-width=1.0 radius=8.0
+                      hovered background=white/72
+                      pressed background=selection
+                      disabled background=white/22 text=muted
+                    button "×" label="Close message actions" disabled=(mutation_phase != "idle") width=26.0 height=26.0 padding=5.0 -> clear_message_selection
+                      active background=transparent text=muted radius=8.0
+                      hovered background=white/56 text=foreground
+                      pressed background=selection
+                  row width=fill spacing=6.0 align=center
+                    input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_message_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
+                      active background=white/38 border=white/55 value=foreground placeholder=muted selection=foreground/18 border-width=1.0 radius=8.0
+                      focused background=white/62 border=foreground/42
+                      disabled value=muted
+                    button "Save" disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft))) height=28.0 padding=6.0 -> edit_message_submit
+                      active background=foreground/88 text=white border=white/26 border-width=1.0 radius=9.0
+                      hovered background=foreground/78
+                      pressed background=foreground
+                      disabled background=foreground/24 text=white/58
+            container width=fill padding=6.0 background=linear(2.3, white/64@0.0, surface/42@1.0) border=white/72 border-width=1.0 radius=14.0 shadow=black/10 shadow-y=2.0 shadow-blur=12.0
+              flex width=fill gap=6.0 align-items=center
+                input "" #message label="Message" <-> message_draft hint="Write a message…" disabled=(loading || !connected || empty(active_channel)) submit=send_message_submit width=fill padding=7.0 text-size=12.0 line-height=1.2
+                  active background=transparent border=transparent value=foreground placeholder=muted selection=foreground/18 border-width=0.0 radius=9.0
+                  focused background=white/38 border=white/66 border-width=1.0
+                  disabled value=muted
+                button "Send" disabled=(loading || mutation_phase != "idle" || !connected || empty(active_channel) || empty(trim(message_draft))) height=30.0 padding=7.0 -> send_message_submit
+                  active background=foreground/90 text=white border=white/28 border-width=1.0 radius=10.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
+                  hovered background=foreground/80 text=white
+                  pressed background=foreground text=white
+                  disabled background=foreground/28 text=white/60
+          if active_thread_seq > 0
+            container width=286.0 height=fill padding=10.0 background=linear(2.35, white/62@0.0, surface/44@1.0) border=white/68 border-width=1.0 radius=13.0 shadow=black/8 shadow-y=2.0 shadow-blur=12.0
+              col width=fill height=fill spacing=8.0
+                row width=fill height=26.0 spacing=6.0 align=center
+                  text "Thread" width=fill size=12.0 @font-bold text-foreground
+                  text len(thread_messages) size=10.0 @text-muted
+                  button "×" label="Close thread" disabled=(mutation_phase != "idle") width=26.0 height=26.0 padding=5.0 -> close_thread
+                    active background=transparent text=muted radius=8.0
+                    hovered background=white/56 text=foreground
+                    pressed background=selection
+                container width=fill height=1.0 background=separator
+                  text ""
+                scroll direction=vertical width=fill height=fill bar=hidden
+                  col width=fill spacing=1.0
+                    for thread_message in thread_messages
+                      ThreadMessageCard message=thread_message
+                container width=fill padding=5.0 background=white/36 border=white/58 border-width=1.0 radius=11.0
+                  row width=fill spacing=5.0 align=center
+                    input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(mutation_phase != "idle") submit=send_reply_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
+                      active background=transparent border=transparent value=foreground placeholder=muted selection=foreground/18 border-width=0.0 radius=8.0
+                      focused background=white/42 border=white/64 border-width=1.0
+                      disabled value=muted
+                    button "Send" label="Send reply" disabled=(mutation_phase != "idle" || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
+                      active background=foreground/88 text=white border=white/26 border-width=1.0 radius=9.0
+                      hovered background=foreground/78
+                      pressed background=foreground
+                      disabled background=foreground/24 text=white/58
     pages:
       container width=fill height=fill padding=16.0 background=linear(2.35, white/78@0.0, elevated/64@0.48, surface/52@1.0) border=white/80 border-width=1.0 radius=16.0 shadow=black/12 shadow-y=4.0 shadow-blur=18.0 clip=true pixel-snap=true
         col width=fill height=fill

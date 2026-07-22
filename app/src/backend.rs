@@ -25,14 +25,32 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ChatChannel {
     pub id: String,
     pub name: String,
+    pub archived: bool,
+    pub members_only: bool,
+    pub huddle_count: i64,
+    pub head_seq: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatReaction {
+    pub emoji: String,
+    pub count: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatMessage {
+    pub id: String,
+    pub seq: i64,
     pub author: String,
     pub meta: String,
     pub body: String,
     pub pending: bool,
+    pub rev: i64,
+    pub edited: bool,
+    pub deleted: bool,
+    pub reply_count: i64,
+    pub thread_seq: i64,
+    pub reactions: Vec<ChatReaction>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -40,6 +58,13 @@ pub struct ChatData {
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
     pub active_channel: String,
+    pub active_channel_name: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ThreadData {
+    pub root_seq: i64,
+    pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -73,6 +98,7 @@ pub struct WorkspaceData {
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
     pub active_channel: String,
+    pub active_channel_name: String,
     pub pages: Vec<PageItem>,
     pub blocks: Vec<PageBlock>,
     pub active_page: String,
@@ -99,10 +125,18 @@ pub struct LiveUpdate {
 
 pub fn optimistic_message(mut messages: Vec<ChatMessage>, body: String) -> Vec<ChatMessage> {
     messages.push(ChatMessage {
+        id: "pending".into(),
+        seq: -1,
         author: "You".into(),
         meta: "Sending…".into(),
         body,
         pending: true,
+        rev: 0,
+        edited: false,
+        deleted: false,
+        reply_count: 0,
+        thread_seq: 0,
+        reactions: Vec::new(),
     });
     messages
 }
@@ -337,6 +371,134 @@ pub async fn send_message(
     .map_err(app_error)
 }
 
+pub async fn load_thread(
+    rpc: String,
+    channel_id: String,
+    root_seq: i64,
+) -> Result<ThreadData, AppError> {
+    async {
+        let root_seq = positive_sequence(root_seq)?;
+        let rpc = rpc_client(&rpc)?;
+        load_thread_data(&rpc, &channel_id, root_seq).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn send_reply(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    root_seq: i64,
+    body: String,
+) -> Result<ThreadData, AppError> {
+    async {
+        let root_seq = positive_sequence(root_seq)?;
+        let body = bounded_text(body, "reply", 16 * 1024)?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: channel_id.clone(),
+                message_id: fresh_id("message"),
+                blocks: vec![chat::Block::paragraph(body)],
+                thread: Some(root_seq),
+                as_agent: None,
+            }),
+            password,
+        )
+        .await?;
+        load_thread_data(&rpc, &channel_id, root_seq).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn edit_message(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    seq: i64,
+    base_rev: i64,
+    body: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let seq = positive_sequence(seq)?;
+        let base_rev = u32::try_from(base_rev).map_err(|_| "invalid message revision")?;
+        let body = bounded_text(body, "message", 16 * 1024)?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::EditMessage {
+                channel_id: channel_id.clone(),
+                seq,
+                blocks: vec![chat::Block::paragraph(body)],
+                base_rev: Some(base_rev),
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn delete_message(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    seq: i64,
+) -> Result<ChatData, AppError> {
+    async {
+        let seq = positive_sequence(seq)?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::DeleteMessage {
+                channel_id: channel_id.clone(),
+                seq,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn add_reaction(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    seq: i64,
+    emoji: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let seq = positive_sequence(seq)?;
+        let emoji = bounded_text(emoji, "reaction", chat::MAX_EMOJI_BYTES)?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::AddReaction {
+                channel_id: channel_id.clone(),
+                seq,
+                emoji,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
@@ -468,6 +630,7 @@ async fn load_workspace(
         channels: chat.channels,
         messages: chat.messages,
         active_channel: chat.active_channel,
+        active_channel_name: chat.active_channel_name,
         pages: pages.pages,
         blocks: pages.blocks,
         active_page: pages.active_page,
@@ -491,16 +654,24 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
     };
     let channels = wire_channels
         .iter()
-        .filter(|channel| !channel.archived && !channel.id.contains(':'))
         .map(|channel| ChatChannel {
             id: channel.id.clone(),
             name: channel.name.clone(),
+            archived: channel.archived,
+            members_only: channel.post_policy == PostPolicy::MembersOnly,
+            huddle_count: count_i64(channel.huddle.len()),
+            head_seq: number_i64(channel.head_seq),
         })
         .collect::<Vec<_>>();
     let active_channel = requested
         .filter(|id| channels.iter().any(|channel| channel.id == *id))
         .map(str::to_string)
         .or_else(|| channels.first().map(|channel| channel.id.clone()))
+        .unwrap_or_default();
+    let active_channel_name = channels
+        .iter()
+        .find(|channel| channel.id == active_channel)
+        .map(|channel| channel.name.clone())
         .unwrap_or_default();
     let messages = if active_channel.is_empty() {
         Vec::new()
@@ -511,6 +682,7 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         channels,
         messages,
         active_channel,
+        active_channel_name,
     })
 }
 
@@ -531,17 +703,78 @@ async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMess
     Ok(messages
         .into_iter()
         .filter(|message| message.head.thread.is_none())
-        .map(|message| ChatMessage {
-            author: author_name(&message.head.author),
-            meta: format!("#{}", message.seq),
-            body: if message.head.deleted {
-                "Message deleted".into()
-            } else {
-                message_body(&message.head.blocks)
-            },
-            pending: false,
-        })
+        .map(chat_message)
         .collect())
+}
+
+async fn load_thread_data(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+) -> Result<ThreadData, String> {
+    if channel_id.is_empty() || root_seq == 0 {
+        return Ok(ThreadData {
+            root_seq: 0,
+            messages: Vec::new(),
+        });
+    }
+    let reply: ChatReply = rpc
+        .query(
+            "chat",
+            &ChatQuery::Thread {
+                channel_id: channel_id.to_string(),
+                root_seq,
+                from: 0,
+                limit: chat::MAX_QUERY_LIMIT,
+            },
+        )
+        .await?;
+    let thread = match reply {
+        ChatReply::Thread(Some(thread)) => thread,
+        _ => return Err("thread was not found".into()),
+    };
+    let messages = std::iter::once(thread.root)
+        .chain(thread.replies)
+        .map(chat_message)
+        .collect();
+    Ok(ThreadData {
+        root_seq: number_i64(root_seq),
+        messages,
+    })
+}
+
+fn chat_message(message: chat::MessageView) -> ChatMessage {
+    let edited = message.head.rev > 0;
+    let meta = if edited {
+        format!("#{} · edited", message.seq)
+    } else {
+        format!("#{}", message.seq)
+    };
+    ChatMessage {
+        id: message.head.message_id,
+        seq: number_i64(message.seq),
+        author: author_name(&message.head.author),
+        meta,
+        body: if message.head.deleted {
+            "Message deleted".into()
+        } else {
+            message_body(&message.head.blocks)
+        },
+        pending: false,
+        rev: i64::from(message.head.rev),
+        edited,
+        deleted: message.head.deleted,
+        reply_count: number_i64(message.head.reply_count),
+        thread_seq: number_i64(message.head.thread.unwrap_or(0)),
+        reactions: message
+            .reactions
+            .into_iter()
+            .map(|reaction| ChatReaction {
+                emoji: reaction.emoji,
+                count: count_i64(reaction.reactors.len()),
+            })
+            .collect(),
+    }
 }
 
 async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<PagesData, String> {
@@ -746,6 +979,13 @@ fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, Stri
     Ok(value.to_string())
 }
 
+fn positive_sequence(value: i64) -> Result<u64, String> {
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "message sequence must be positive".into())
+}
+
 fn app_error(message: String) -> AppError {
     AppError { message }
 }
@@ -753,6 +993,14 @@ fn app_error(message: String) -> AppError {
 fn retry_delay(attempt: u32) -> Duration {
     let exponent = attempt.saturating_sub(1).min(4);
     Duration::from_secs(1_u64 << exponent)
+}
+
+fn number_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn count_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
@@ -1006,6 +1254,56 @@ mod tests {
         let changed = live.next().await.unwrap();
         assert_eq!(changed.kind, "changed");
         assert!(changed.height > workspace.height);
+        submit_test(
+            &rpc,
+            &signer,
+            6,
+            "chat",
+            chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "reply-1".into(),
+                blocks: vec![chat::Block::paragraph("a threaded reply")],
+                thread: Some(1),
+                as_agent: None,
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            7,
+            "chat",
+            chat::encode_msg(&ChatMsg::EditMessage {
+                channel_id: "general".into(),
+                seq: 1,
+                blocks: vec![chat::Block::paragraph("hello, edited")],
+                base_rev: Some(0),
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            8,
+            "chat",
+            chat::encode_msg(&ChatMsg::AddReaction {
+                channel_id: "general".into(),
+                seq: 1,
+                emoji: "👍".into(),
+            }),
+        )
+        .await;
+
+        let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
+        assert_eq!(chat.active_channel_name, "General");
+        assert_eq!(chat.messages[0].body, "hello, edited");
+        assert!(chat.messages[0].edited);
+        assert_eq!(chat.messages[0].reply_count, 1);
+        assert_eq!(chat.messages[0].reactions[0].emoji, "👍");
+        let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
+        assert_eq!(thread.messages.len(), 2);
+        assert_eq!(thread.messages[1].body, "a threaded reply");
+
         let refreshed = refresh(origin, "general".into(), "welcome".into(), 7)
             .await
             .unwrap();
