@@ -178,6 +178,11 @@ pub fn run_actor(
                         operations: Default::default(),
                     });
                 }
+                NodeCommand::Peers { reply } => {
+                    // the testkit has no mesh and no registry: an empty
+                    // exposition parses to the honest empty sample.
+                    let _ = reply.send(crate::peers::peers_from_exposition("", 0));
+                }
                 NodeCommand::Metrics { reply } => {
                     let _ = reply.send(String::new());
                 }

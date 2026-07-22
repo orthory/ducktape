@@ -42,6 +42,15 @@ impl ValidatorRuntime<'_> {
         );
     }
 
+    /// one direct-peer sample: the exposition parse plus valset standing.
+    async fn peers_sample(&self) -> noded::peers::PeersView {
+        let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
+        let validators = hex_set(read_valset_members(self.node.host()).await);
+        let residents = hex_set(read_valset_residents(self.node.host()).await);
+        noded::peers::peers_from_exposition(&self.context.encode(), unix_ms())
+            .with_roles(&validators, &residents)
+    }
+
     pub(super) async fn on_rpc(&mut self, (req, reply): RpcJob) {
         let Self {
             node,
@@ -129,6 +138,10 @@ impl ValidatorRuntime<'_> {
                     ..RpcReply::ok()
                 }
             }
+            RpcRequest::Peers => RpcReply {
+                peers: Some(self.peers_sample().await),
+                ..RpcReply::ok()
+            },
             RpcRequest::Shutdown => {
                 // best-effort final checkpoint + journal barrier so
                 // the restart replays a minimal suffix; a failure
@@ -565,6 +578,9 @@ impl ValidatorRuntime<'_> {
                     public_key: self.status_public_key.clone(),
                     operations: self.metrics.operational_status(),
                 });
+            }
+            noded::NodeCommand::Peers { reply } => {
+                let _ = reply.send(self.peers_sample().await);
             }
             noded::NodeCommand::Metrics { reply } => {
                 // one registry: commonware's runtime series plus the

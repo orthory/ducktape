@@ -49,6 +49,30 @@ use statesync::p2p::P2pSyncClient;
 use statesync::{fetch_manifest, fetch_tip_coords};
 use std::time::Duration;
 
+/// one direct-peer sample off this lane's registry: the exposition parse
+/// plus whatever standing the lane can attest — the serving host's valset
+/// when one exists, else the announce-target member set alone (a parked
+/// joiner has no queryable valset yet, but it knows who the members are).
+async fn peers_sample(
+    exposition: String,
+    host: Option<&host::Host>,
+    announce_targets: &[ed25519::PublicKey],
+) -> noded::peers::PeersView {
+    use std::collections::BTreeSet;
+    let (validators, residents): (BTreeSet<String>, BTreeSet<String>) = match host {
+        Some(host) => (
+            read_valset_members(host).await.iter().map(|k| hex_bytes(k)).collect(),
+            read_valset_residents(host).await.iter().map(|k| hex_bytes(k)).collect(),
+        ),
+        None => (
+            announce_targets.iter().map(|k| hex_bytes(k.as_ref())).collect(),
+            BTreeSet::new(),
+        ),
+    };
+    noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms())
+        .with_roles(&validators, &residents)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn park(
     channels: ReplicaChannels,
@@ -670,6 +694,17 @@ pub(super) async fn park(
                                     ..RpcReply::ok()
                                 }
                             }
+                            RpcRequest::Peers => RpcReply {
+                                peers: Some(
+                                    peers_sample(
+                                        context.encode(),
+                                        serving.as_ref().map(|(_, node_r)| node_r.host()),
+                                        &announce_targets,
+                                    )
+                                    .await,
+                                ),
+                                ..RpcReply::ok()
+                            },
                             RpcRequest::Shutdown => {
                                 // a resident writes no checkpoint — nothing to
                                 // flush; a restart parks straight back here.
@@ -789,6 +824,16 @@ pub(super) async fn park(
                                     public_key: status_public_key.clone(),
                                     operations: metrics.operational_status(),
                                 });
+                            }
+                            noded::NodeCommand::Peers { reply } => {
+                                let _ = reply.send(
+                                    peers_sample(
+                                        context.encode(),
+                                        serving.as_ref().map(|(_, node_r)| node_r.host()),
+                                        &announce_targets,
+                                    )
+                                    .await,
+                                );
                             }
                             noded::NodeCommand::Metrics { reply } => {
                                 let checkpoint_height = replica_prev_ckpt.0.unwrap_or_default();

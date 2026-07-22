@@ -100,6 +100,11 @@ pub use metrics::NodeMetrics;
 pub mod projection;
 pub use projection::{BlockProjection, NOP_TARGET, project_block, project_root_op};
 
+// the direct-peer projection: `GET /v1/peers` and the local rpc's `peers`
+// cmd both answer with its [`peers::PeersView`], parsed from the lane's own
+// metrics exposition.
+pub mod peers;
+
 // the in-process daemon testkit (a real Host + router on loopback threads) for
 // e2e harnesses. dev-only: gated so the shipping node never compiles it.
 #[cfg(feature = "testkit")]
@@ -531,6 +536,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route("/v1/submit/frame", post(submit_frame))
         .route("/v1/query", post(query))
         .route("/v1/status", get(status))
+        .route("/v1/peers", get(peers))
         .route("/v1/blocks", get(blocks))
         // the derived read-model tier: snapshot reads of the per-module
         // fluent31 indexes the actor materializes as blocks commit.
@@ -798,6 +804,20 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
     }
     match rx.await {
         Ok(status) => Json(status).into_response(),
+        Err(_) => actor_gone(),
+    }
+}
+
+/// GET /v1/peers — the direct-peer sample (see [`peers::PeersView`]): who the
+/// mesh holds open right now, cumulative per-peer traffic counters, and each
+/// peer's statesync progression where one exists.
+async fn peers(State(handle): State<NodeHandle>) -> Response {
+    let (reply, rx) = oneshot::channel();
+    if let Err(resp) = handle.send(NodeCommand::Peers { reply }).await {
+        return resp;
+    }
+    match rx.await {
+        Ok(view) => Json(view).into_response(),
         Err(_) => actor_gone(),
     }
 }

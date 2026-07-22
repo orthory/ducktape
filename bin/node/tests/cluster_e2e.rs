@@ -448,6 +448,43 @@ fn cluster_lifecycle() {
         .as_str()
         .expect("status carries app_hash");
 
+    // 9b. the direct-peer surface: a meshed, finalizing validator holds its
+    // co-members open on the tracker, so `/v1/peers` must list them —
+    // connected, stamped `validator` off the valset, keyed by full mesh-key
+    // hex. (quorum reachability was already asserted above, so at least
+    // quorum-1 co-members are connected here; flake margin keeps this at
+    // "some connected validator peer" rather than an exact count.)
+    let (code, peer_sample) = cluster.http(0, "GET", "/v1/peers", None);
+    assert_eq!(code, 200, "peer sample failed: {peer_sample}");
+    assert!(
+        peer_sample["sampledAtMs"].as_u64().is_some_and(|ms| ms > 0),
+        "peer sample carries its timestamp: {peer_sample}"
+    );
+    let listed = peer_sample["peers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("peer sample carries a peers array: {peer_sample}"));
+    assert!(
+        listed.iter().all(|peer| peer["peer"]
+            .as_str()
+            .is_some_and(|key| key.len() == 64)),
+        "every peer keys on full mesh-key hex: {peer_sample}"
+    );
+    assert!(
+        listed.iter().any(|peer| peer["connected"] == true
+            && peer["role"] == "validator"
+            && peer["connectedSinceMs"].as_u64().is_some()),
+        "a connected co-validator is listed with valset standing: {peer_sample}"
+    );
+    // the local rpc (`ducktape node peers`) answers with the SAME view.
+    let rpc_peers = cluster.rpc(0, serde_json::json!({ "cmd": "peers" }));
+    assert_eq!(rpc_peers["ok"], true, "rpc peers failed: {rpc_peers}");
+    assert!(
+        rpc_peers["peers"]["peers"]
+            .as_array()
+            .is_some_and(|peers| !peers.is_empty()),
+        "rpc peers carries the same non-empty sample: {rpc_peers}"
+    );
+
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
     // channel from node 0 and must compose the identical app-hash. node 3's
     // slot is reused as a FRESH resident: kill the promoted validator
