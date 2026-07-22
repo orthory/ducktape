@@ -63,7 +63,7 @@ const isOpen = Boolean(hasActive || collapsed === false || collapsed === undefin
 // Shared classes for the row that holds the label + caret in both
 // rendering modes (landing-as-link vs. label-as-trigger).
 const rowClass = cn(
-  "group/expander flex min-h-[2rem] items-center rounded-lg px-3 py-1 text-[0.8125rem] no-underline transition-colors duration-150 focus-visible:outline-offset-[-2px]",
+  "group/expander flex min-h-11 items-center rounded-lg px-3 py-1 text-[0.8125rem] no-underline transition-colors duration-150 focus-visible:outline-offset-[-2px] lg:min-h-[2rem]",
   "hover:bg-accent hover:text-foreground",
   hasActive ? "font-semibold text-foreground" : "font-medium text-muted-foreground",
 );
@@ -97,7 +97,7 @@ const caretClass =
         target={indexIsExternal ? "_blank" : undefined}
         rel={indexIsExternal ? "noopener" : undefined}
         class={cn(
-          "flex flex-1 min-w-0 items-center min-h-[2rem] px-3 py-1 rounded-l-lg focus-visible:outline-offset-[-2px]",
+          "flex min-h-11 min-w-0 flex-1 items-center rounded-l-lg px-3 py-1 focus-visible:outline-offset-[-2px] lg:min-h-[2rem]",
         )}
       >
         <span class="flex items-center gap-2 flex-1 min-w-0">
@@ -115,7 +115,7 @@ const caretClass =
           // `w-auto` overrides CollapsibleTrigger's default `w-full`,
           // which would otherwise compete with the label-link's
           // `flex-1` and starve the label's width.
-          "w-auto flex items-center shrink-0 min-h-[2rem] px-1.5 py-1 rounded-r-lg",
+          "flex min-h-11 w-auto shrink-0 items-center rounded-r-lg px-3 py-1 lg:min-h-[2rem] lg:px-1.5",
           "hover:bg-accent hover:text-foreground focus-visible:outline-offset-[-2px]",
           // The chevron icon uses `group-data-[nb-state=open]/expander:rotate-90`
           // to rotate on toggle. That variant resolves to the nearest

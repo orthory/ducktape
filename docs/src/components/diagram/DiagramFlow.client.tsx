@@ -8,11 +8,12 @@ import {
   type Node,
   type NodeProps,
   Handle,
+  Panel,
   Position,
   ReactFlow,
   ReactFlowProvider,
 } from '@xyflow/react'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type CSSProperties } from 'react'
 import '@xyflow/react/dist/style.css'
 import './diagram.css'
 
@@ -118,35 +119,99 @@ export function DiagramFlow({
   const [mounted, setMounted] = useState(false)
   useEffect(() => setMounted(true), [])
 
+  const nodeLabels = new Map(
+    nodes.map((node) => [node.id, typeof node.data.label === 'string' ? node.data.label : node.id]),
+  )
+  const mobileWidth = Math.min(1440, Math.max(720, ...nodes.map((node) => node.position.x + 240)))
+  const canvasClass = mobileWidth > 720
+    ? 'dt-diagram__canvas dt-diagram__canvas--wide'
+    : 'dt-diagram__canvas'
+
   return (
     <figure className="dt-diagram" role="group" aria-label={title ?? description}>
-      <div className="dt-diagram__canvas" style={{ height }}>
+      <div className="dt-diagram__frame">
         {mounted ? (
           <ReactFlowProvider>
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              nodeTypes={nodeTypes}
-              fitView
+            <div className="dt-diagram__scroll">
+              <div
+                className={canvasClass}
+                style={{ height, '--dt-diagram-mobile-width': `${mobileWidth}px` } as CSSProperties}
+              >
+                <div className="dt-diagram__visual" aria-hidden="true" inert>
+                  <ReactFlow
+                    nodes={nodes}
+                    edges={edges}
+                    nodeTypes={nodeTypes}
+                    fitView
+                    fitViewOptions={{ padding: 0.16 }}
+                    minZoom={0.2}
+                    maxZoom={1.75}
+                    nodesDraggable={draggable}
+                    nodesConnectable={false}
+                    nodesFocusable={false}
+                    edgesFocusable={false}
+                    elementsSelectable={false}
+                    disableKeyboardA11y
+                    zoomOnScroll={false}
+                    zoomOnPinch={false}
+                    panOnScroll={false}
+                    panOnDrag={false}
+                    preventScrolling={false}
+                    zoomOnDoubleClick={false}
+                    proOptions={{ hideAttribution: true }}
+                  >
+                    <Background variant={BackgroundVariant.Dots} gap={22} size={1} className="dt-bg" />
+                  </ReactFlow>
+                </div>
+              </div>
+            </div>
+            <Controls
+              aria-label={`${title ?? 'Diagram'} view controls`}
               fitViewOptions={{ padding: 0.16 }}
-              minZoom={0.35}
-              maxZoom={1.75}
-              nodesDraggable={draggable}
-              nodesConnectable={false}
-              elementsSelectable
-              zoomOnScroll={false}
-              panOnScroll={false}
-              preventScrolling={false}
-              zoomOnDoubleClick={false}
-              proOptions={{ hideAttribution: false }}
-            >
-              <Background variant={BackgroundVariant.Dots} gap={22} size={1} className="dt-bg" />
-              <Controls showInteractive={false} position="bottom-right" />
-            </ReactFlow>
+              showInteractive={false}
+              position="bottom-right"
+            />
+            <Panel position="bottom-left" className="react-flow__attribution">
+              <a
+                href="https://reactflow.dev?utm_source=attribution"
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="React Flow attribution"
+              >
+                React Flow
+              </a>
+            </Panel>
           </ReactFlowProvider>
         ) : (
-          <div className="dt-diagram__skeleton" aria-hidden="true" />
+          <div className="dt-diagram__scroll">
+            <div
+              className={canvasClass}
+              style={{ height, '--dt-diagram-mobile-width': `${mobileWidth}px` } as CSSProperties}
+            >
+              <div className="dt-diagram__skeleton" aria-hidden="true" />
+            </div>
+          </div>
         )}
+      </div>
+      <div className="dt-diagram__alternative">
+        <p>Nodes</p>
+        <ul>
+          {nodes.map((node) => (
+            <li key={node.id}>
+              {nodeLabels.get(node.id)}
+              {typeof node.data.sub === 'string' ? ` — ${node.data.sub}` : null}
+            </li>
+          ))}
+        </ul>
+        <p>Connections</p>
+        <ul>
+          {edges.map((edge) => (
+            <li key={edge.id}>
+              {nodeLabels.get(edge.source) ?? edge.source} to {nodeLabels.get(edge.target) ?? edge.target}
+              {typeof edge.label === 'string' ? ` — ${edge.label}` : null}
+            </li>
+          ))}
+        </ul>
       </div>
       {legend && legend.length > 0 ? (
         <ul className="dt-legend">

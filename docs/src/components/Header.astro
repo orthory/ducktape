@@ -36,8 +36,8 @@ const hasActiveTrack = tracks.some((track) => track.isActive);
 ---
 
 <header class="sticky top-0 z-30 border-b border-border bg-card/80 backdrop-blur-lg">
-  <div class="mx-auto flex items-center justify-between h-14 px-4 lg:px-6">
-    <div class="flex items-center gap-3">
+  <div class="mx-auto flex h-14 items-center justify-between px-2 sm:px-4 lg:px-6">
+    <div class="flex min-w-0 items-center gap-1 sm:gap-3">
       {showSidebar && (
         <Button
           variant="ghost"
@@ -46,24 +46,24 @@ const hasActiveTrack = tracks.some((track) => track.isActive);
           icon="ph:list"
           aria-label="Open navigation"
           data-menu-btn
-          class="lg:hidden text-muted-foreground"
+          class="size-11 text-muted-foreground lg:hidden"
         />
       )}
 
-      <a href="/" class="group">
-        <span class="flex items-center gap-2 font-semibold text-sm text-foreground group-hover:text-primary transition-colors">
-          <img src="/favicon.svg" alt="" class="h-6 w-6" />
-          {config.title}
+      <a href="/" aria-label={config.title} class="group flex min-h-11 min-w-11 shrink-0 items-center justify-center sm:justify-start">
+        <span class="flex items-center gap-2 text-sm font-semibold text-foreground transition-colors group-hover:text-primary">
+          <img src="/favicon.svg" alt="" class="h-6 w-6 shrink-0" />
+          <span class="hidden sm:inline">{config.title}</span>
         </span>
       </a>
 
-      <nav aria-label="Documentation tracks" class="hidden md:flex items-center gap-1 ml-4 pl-4 border-l border-border h-6">
+      <nav aria-label="Documentation tracks" class="ml-4 hidden h-11 items-center gap-1 border-l border-border pl-4 lg:flex">
           {tracks.map((track) => (
             <a
               href={track.href}
               aria-current={track.isActive ? "page" : undefined}
               class:list={[
-                "px-2 py-1 rounded-md text-[0.8125rem] font-medium no-underline transition-colors",
+                "inline-flex min-h-11 items-center rounded-md px-2 text-[0.8125rem] font-medium no-underline transition-colors",
                 track.isActive
                   ? "text-foreground bg-accent"
                   : "text-muted-foreground hover:text-foreground hover:bg-accent/60",
@@ -74,9 +74,9 @@ const hasActiveTrack = tracks.some((track) => track.isActive);
           ))}
       </nav>
 
-      <label class="md:hidden">
+      <label class="lg:hidden">
         <span class="sr-only">Documentation track</span>
-        <select data-track-picker class="max-w-28 rounded-md border border-border bg-card px-2 py-1 text-xs text-foreground">
+        <select data-track-picker class="h-11 w-24 rounded-md border border-border bg-card px-2 text-xs text-foreground">
           {!hasActiveTrack && <option value="" selected disabled>Choose track</option>}
           {tracks.map((track) => (
             <option value={track.href} selected={track.isActive}>{track.shortLabel}</option>
@@ -85,7 +85,7 @@ const hasActiveTrack = tracks.some((track) => track.isActive);
       </label>
     </div>
 
-    <div class="flex items-center gap-2">
+    <div class="flex shrink-0 items-center gap-1 sm:gap-2">
       {config.search !== false && <SearchTrigger />}
       {config.github && (
         <LinkButton
@@ -96,7 +96,7 @@ const hasActiveTrack = tracks.some((track) => track.isActive);
           aria-label="GitHub"
           target="_blank"
           rel="noopener"
-          class="text-muted-foreground"
+          class="hidden size-11 text-muted-foreground lg:inline-flex"
         >
           <Icon name="ph:github-logo" class="w-4 h-4" />
         </LinkButton>
