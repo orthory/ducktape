@@ -120,6 +120,7 @@ use recovery::Recovery;
 use sdk::{Msg, StateRoot};
 
 fn main() {
+    resource_limits::cap_malloc_arenas();
     resource_limits::raise_open_file_limit();
     #[cfg(target_os = "macos")]
     hold_macos_activity();
