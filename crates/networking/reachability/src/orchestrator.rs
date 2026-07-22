@@ -59,14 +59,11 @@ use crate::keys::{KeyError, WireGuardKeypair};
 use crate::msg::{MsgError, ReachabilityMsg};
 use crate::store::{self, PersistedMesh};
 
-/// Views an advertisement stays valid for past the cutover view that minted
-/// it. Generous: a re-advertisement (NAT rebind, key rotation) supersedes by
-/// nonce long before expiry matters.
-pub const ADVERT_TTL_VIEWS: u64 = 10_000;
-
-/// Views a handshake message stays valid for. Tight relative to
-/// [`ADVERT_TTL_VIEWS`]: a handshake is a live conversation, not a standing
-/// record.
+/// Views a handshake message stays valid for. Tight on purpose: a handshake
+/// is a live conversation, not a standing record. (Endpoint RECORDS carry no
+/// TTL at all — signed once per epoch and re-offered verbatim, their lifetime
+/// IS the epoch tuple; a record TTL would expire every record on any epoch
+/// that outlives it.)
 pub const HANDSHAKE_TTL_VIEWS: u64 = 500;
 
 /// WireGuard persistent keepalive for every mesh peer: NAT mappings on the
@@ -1193,9 +1190,8 @@ struct Driver<'a, E, R> {
 /// 1. **Bind.** Derive the epoch's `ActiveValidatorSet` via
 ///    [`binding::active_set`]; fresh replay cache and nonce counter.
 /// 2. **Record gossip.** Send our `EndpointRecord` (WG public key, control +
-///    wireguard endpoints, `+ ADVERT_TTL_VIEWS` expiry) to every other
-///    member; collect theirs, re-sending ours on first contact so joining
-///    order can't strand anyone.
+///    wireguard endpoints) to every other member; collect theirs, re-sending
+///    ours on first contact so joining order can't strand anyone.
 /// 3. **Advertise.** With ALL records held: `compute_mesh_version`, sign the
 ///    `EndpointAdvertisement`, fan out; collect everyone's.
 /// 4. **Verify.** With all advertisements held: `MeshView::verify`; emit
@@ -1393,7 +1389,6 @@ where
                 wireguard_public_key: self.keypair.public_key(),
                 control_endpoint: self.config.control_endpoint,
                 wireguard_endpoint: self.config.wireguard_advertised,
-                expires_at_view: self.view + ADVERT_TTL_VIEWS,
                 // the epoch's first signed nonce; the counter below starts
                 // past it.
                 nonce: 1,
@@ -2050,7 +2045,7 @@ where
         {
             return Ok(());
         }
-        if let Err(err) = signed.record.check(&self.config.port_policy, self.view) {
+        if let Err(err) = signed.record.check(&self.config.port_policy) {
             return self
                 .fail_peer(via, &format!("standby record refused: {err:?}"))
                 .await;
@@ -2272,7 +2267,7 @@ where
             // boundary crossing are not synchronized.
             return Ok(());
         }
-        if let Err(err) = record.check(&self.config.port_policy, self.view) {
+        if let Err(err) = record.check(&self.config.port_policy) {
             return self
                 .fail_peer(owner, &format!("member record refused: {err:?}"))
                 .await;
@@ -2341,7 +2336,7 @@ where
         {
             let ads: Vec<EndpointAdvertisement> = state.adverts.values().cloned().collect();
             let epoch = state.epoch;
-            match MeshView::verify(state.set.clone(), ads, &self.config.port_policy, self.view) {
+            match MeshView::verify(state.set.clone(), ads, &self.config.port_policy) {
                 Ok(view) => {
                     let version = view.mesh_version;
                     state.view_state = Some(view);

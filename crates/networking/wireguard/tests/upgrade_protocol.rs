@@ -49,7 +49,6 @@ fn record_for(
         wireguard_public_key: wg,
         control_endpoint: endpoint([1, 1, 1, wg_addr[3]], 443, Transport::Tcp, &policy),
         wireguard_endpoint: Some(endpoint(wg_addr, 51820, Transport::Udp, &policy)),
-        expires_at_view: 50,
         nonce,
     }
 }
@@ -84,7 +83,7 @@ fn mesh() -> (
     let policy = prod_policy();
     let set = active_set(id(&a), id(&b));
     let (ad_a, ad_b) = signed_ads(&a, &b, &set, [8, 8, 8, 10], [8, 8, 8, 20]);
-    let view = MeshView::verify(set.clone(), vec![ad_b, ad_a], &policy, 10).unwrap();
+    let view = MeshView::verify(set.clone(), vec![ad_b, ad_a], &policy).unwrap();
     (a, b, set, view, policy)
 }
 
@@ -129,13 +128,13 @@ fn mesh_view_uses_only_admitted_validators_and_has_deterministic_version() {
         compute_mesh_version(&[ad_a.record.clone(), outsider_record.clone()]).unwrap();
     let outsider_ad = EndpointAdvertisement::sign(outsider_record, outsider_version, &outsider);
 
-    assert!(MeshView::verify(set.clone(), vec![ad_a.clone(), outsider_ad], &policy, 10).is_err());
+    assert!(MeshView::verify(set.clone(), vec![ad_a.clone(), outsider_ad], &policy).is_err());
 
     let expected_a = set.stable_index(id(&a)).unwrap();
     let expected_b = set.stable_index(id(&b)).unwrap();
     let view_ab =
-        MeshView::verify(set.clone(), vec![ad_a.clone(), ad_b.clone()], &policy, 10).unwrap();
-    let view_ba = MeshView::verify(set, vec![ad_b, ad_a], &policy, 10).unwrap();
+        MeshView::verify(set.clone(), vec![ad_a.clone(), ad_b.clone()], &policy).unwrap();
+    let view_ba = MeshView::verify(set, vec![ad_b, ad_a], &policy).unwrap();
 
     assert_eq!(view_ab.mesh_version, view_ba.mesh_version);
     assert_eq!(view_ab.records.len(), 2);
@@ -385,7 +384,7 @@ fn mesh_view_rejects_a_zero_wireguard_key() {
         EndpointAdvertisement::sign(record_b, mesh_version, &b),
     ];
     assert_eq!(
-        MeshView::verify(set, ads, &policy, 10).unwrap_err(),
+        MeshView::verify(set, ads, &policy).unwrap_err(),
         UpgradeError::InvalidWireGuardKey
     );
 }
@@ -532,18 +531,15 @@ fn record_check_mirrors_the_per_record_view_rules() {
     // `EndpointRecord::check` is the standalone form of the per-record
     // checks `MeshView::verify` runs — for records consumed outside a
     // verified view (a standby's pre-warm record). Each rule must hold
-    // independently: freshness, endpoint policy on both endpoints, and a
-    // non-zero X25519 key.
+    // independently: endpoint policy on both endpoints, and a non-zero
+    // X25519 key. Records carry NO freshness rule: signed once per epoch
+    // and re-offered verbatim, they stay valid for the epoch's whole life.
     let a = PrivateKey::from_seed(1);
     let policy = prod_policy();
     let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
     let good = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
 
-    good.check(&policy, 10)
-        .expect("a fresh, policy-clean record checks");
-
-    // expired: current view past `expires_at_view` (50 in the fixture).
-    assert_eq!(good.check(&policy, 51).unwrap_err(), UpgradeError::Expired);
+    good.check(&policy).expect("a policy-clean record checks");
 
     // an all-zero X25519 key can never be a real WireGuard peer key.
     let zero_key = EndpointRecord {
@@ -551,7 +547,7 @@ fn record_check_mirrors_the_per_record_view_rules() {
         ..good.clone()
     };
     assert_eq!(
-        zero_key.check(&policy, 10).unwrap_err(),
+        zero_key.check(&policy).unwrap_err(),
         UpgradeError::InvalidWireGuardKey
     );
 
@@ -570,7 +566,7 @@ fn record_check_mirrors_the_per_record_view_rules() {
         ..good.clone()
     };
     assert!(matches!(
-        private_wg.check(&policy, 10).unwrap_err(),
+        private_wg.check(&policy).unwrap_err(),
         UpgradeError::InvalidEndpoint(_)
     ));
 }
@@ -591,7 +587,7 @@ fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
     };
 
     endpoint_less
-        .check(&policy, 10)
+        .check(&policy)
         .expect("no endpoint means nothing to policy-check");
 
     let signed = SignedEndpointRecord::sign(endpoint_less.clone(), &a);

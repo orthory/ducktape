@@ -93,7 +93,6 @@ fn direct_member_advert(namespace: &str, seed: u64, octet: u8) -> EndpointAdvert
         wireguard_public_key: X25519PublicKey([octet; 32]),
         control_endpoint: ep(443, Transport::Tcp),
         wireguard_endpoint: Some(ep(51820, Transport::Udp)),
-        expires_at_view: 1000,
         nonce: 1,
     };
     EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)

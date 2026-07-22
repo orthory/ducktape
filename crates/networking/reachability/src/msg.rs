@@ -91,7 +91,6 @@ mod tests {
             wireguard_public_key: X25519PublicKey([4; 32]),
             control_endpoint: endpoint(10, 443, Transport::Tcp),
             wireguard_endpoint: Some(endpoint(10, 51820, Transport::Udp)),
-            expires_at_view: 50,
             nonce: 1,
         };
         let msg = ReachabilityMsg::Record(SignedEndpointRecord::sign(record, &signer));

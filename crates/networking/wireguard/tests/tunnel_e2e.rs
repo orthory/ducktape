@@ -52,7 +52,6 @@ fn record(
             51820,
             Transport::Udp,
         )),
-        expires_at_view: 50,
         nonce,
     }
 }
@@ -201,13 +200,13 @@ fn both_parties_validate_but_the_plan_is_initiator_local() {
 
     // each party builds its OWN view from its OWN gossip arrival order; the
     // mesh version is content-derived, so all three converge byte-identically.
-    let view_a = MeshView::verify(set.clone(), ads.clone(), &policy, 10).unwrap();
+    let view_a = MeshView::verify(set.clone(), ads.clone(), &policy).unwrap();
     let mut reversed = ads.clone();
     reversed.reverse();
-    let view_b = MeshView::verify(set.clone(), reversed, &policy, 10).unwrap();
+    let view_b = MeshView::verify(set.clone(), reversed, &policy).unwrap();
     let mut rotated = ads.clone();
     rotated.rotate_left(1);
-    let view_c = MeshView::verify(set.clone(), rotated, &policy, 10).unwrap();
+    let view_c = MeshView::verify(set.clone(), rotated, &policy).unwrap();
     assert_eq!(view_a.mesh_version, view_b.mesh_version);
     assert_eq!(view_a.mesh_version, view_c.mesh_version);
 
@@ -285,10 +284,10 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
         ],
         &set,
     );
-    let view_a = MeshView::verify(set.clone(), ads.clone(), &policy, 10).unwrap();
+    let view_a = MeshView::verify(set.clone(), ads.clone(), &policy).unwrap();
     let mut reversed = ads.clone();
     reversed.reverse();
-    let view_b = MeshView::verify(set.clone(), reversed, &policy, 10).unwrap();
+    let view_b = MeshView::verify(set.clone(), reversed, &policy).unwrap();
 
     let hs = handshake(&a, &b, xkey(0x0a), xkey(0x0b), &view_a, &policy, &overlay);
 
@@ -359,8 +358,7 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
 
 /// docs/records/protocols/wireguard-tunnel-upgrade.md: "Implementations must ship fixed test
 /// vectors for this preimage so that independent nodes produce the same mesh
-/// version from the same admitted set." this pins the v2 preimage (v1 + the
-/// record's `wireguard_public_key`, minus the retired capabilities vector) —
+/// version from the same admitted set." this pins the current preimage —
 /// an accidental encoding change fails HERE instead of splitting a live mesh.
 /// (a deliberate protocol change updates the constant in the same commit.)
 ///
@@ -370,7 +368,7 @@ fn responder_derives_its_own_install_plan_from_validate_upgrade_as() {
 #[test]
 fn mesh_version_fixed_vector() {
     const MESH_VERSION_VECTOR: &str =
-        "3763f34945c44cc6593466ff5f6707d8dc5b8df0b8314817369ce8da44184b09";
+        "760cdf81e882e55e960262b7aa5b5845fb37e616f83a568e473194a6c703b1e5";
 
     let policy = PortPolicy::production();
     let literal_record = |identity_byte: u8, host_octet: u8| EndpointRecord {
@@ -390,7 +388,6 @@ fn mesh_version_fixed_vector() {
             51820,
             Transport::Udp,
         )),
-        expires_at_view: 50,
         nonce: 1,
     };
     let records = vec![
@@ -458,7 +455,7 @@ fn epoch_cutover_revokes_departed_validators_and_rekeys_survivors() {
         ],
         &set7,
     );
-    let view7 = MeshView::verify(set7.clone(), ads7, &policy, 10).unwrap();
+    let view7 = MeshView::verify(set7.clone(), ads7, &policy).unwrap();
     let hs7 = handshake(&a, &b, xkey(0x0a), xkey(0x0b), &view7, &policy, &overlay);
     let mut cache = ReplayCache::default();
     validate_upgrade_as(
@@ -486,7 +483,7 @@ fn epoch_cutover_revokes_departed_validators_and_rekeys_survivors() {
     )
     .unwrap();
     let ads8 = advertisements(&[(&a8, 10, xkey(0xa8)), (&b8, 20, xkey(0xb8))], &set8);
-    let view8 = MeshView::verify(set8.clone(), ads8.clone(), &policy, 10).unwrap();
+    let view8 = MeshView::verify(set8.clone(), ads8.clone(), &policy).unwrap();
     assert_ne!(view8.mesh_version, view7.mesh_version);
 
     // the departed validator's fresh epoch-8 advertisement is rejected: it is
@@ -497,7 +494,7 @@ fn epoch_cutover_revokes_departed_validators_and_rekeys_survivors() {
     let mut with_c = ads8.clone();
     with_c.push(c_ad);
     assert_eq!(
-        MeshView::verify(set8.clone(), with_c, &policy, 10).unwrap_err(),
+        MeshView::verify(set8.clone(), with_c, &policy).unwrap_err(),
         UpgradeError::UnknownValidator
     );
 
@@ -574,7 +571,7 @@ fn handshake_wireguard_keys_must_match_the_advertised_records() {
         ],
         &set,
     );
-    let view = MeshView::verify(set.clone(), ads, &policy, 10).unwrap();
+    let view = MeshView::verify(set.clone(), ads, &policy).unwrap();
 
     // a signs its request under an unadvertised key: refused at the record
     // pin, not at any signature check.
@@ -613,7 +610,7 @@ fn ula_v6_overlay_routes_the_tunnel_with_identity_pinned_128s() {
         ],
         &set,
     );
-    let view = MeshView::verify(set.clone(), ads, &policy, 10).unwrap();
+    let view = MeshView::verify(set.clone(), ads, &policy).unwrap();
     let hs = handshake(&a, &b, xkey(0x0a), xkey(0x0b), &view, &policy, &overlay);
     let mut cache = ReplayCache::default();
     let plan = validate_upgrade_as(
