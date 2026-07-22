@@ -82,6 +82,7 @@ members = [
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
+    "crates/rpc-client",
     # apps — product feature modules
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
@@ -102,6 +103,8 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
     "bin/guest-builder",
+    # native desktop client — intentionally only Chat + Pages
+    "app",
 ]
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
@@ -244,6 +247,7 @@ files = { path = "crates/modules/apps/files" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
+ducktape-rpc = { path = "crates/rpc-client" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
