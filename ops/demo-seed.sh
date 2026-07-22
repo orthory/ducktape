@@ -182,7 +182,7 @@ EOF
 if [ "$GATEWAY_ROUTES" -eq 0 ]; then
 cat <<EOF
 Gateway web apps were not published: the embedded gateway component still
-expects Identity's retired node-list wire. Regenerate gateway-wasm/component.wasm;
+expects Identity's retired node-list wire. Regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway);
 the seed deliberately does not submit a backwards-compatible payload.
 EOF
 else

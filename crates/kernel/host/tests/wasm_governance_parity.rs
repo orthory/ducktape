@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the governance cutover: the
-//! `governance-wasm` component (the NATIVE `governance` crate compiled to wasm
+//! `governance` guest component (the NATIVE `governance` crate compiled to wasm
 //! behind `guest-adapter`) and the native `Governance` module answer the SAME
 //! op sequence with IDENTICAL query replies, and their roots move in lockstep.
 //! the roots THEMSELVES differ — the port persists the native canonical
@@ -43,8 +43,8 @@ use valset::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/governance-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `governance` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const GOVERNANCE_WASM: &[u8] = include_bytes!("fixtures/governance.component.wasm");
 
 /// the network binding invite tokens sign over — BOTH runtimes are wired with

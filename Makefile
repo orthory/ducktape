@@ -93,31 +93,27 @@ test: wasm-modules-check
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
 ## guards mutual consistency, not reproducibility.
 #
-# Migrated modules carry their own guest port (src/guest.rs behind the `guest`
-# feature); guest-builder synthesizes the packaging workspace and writes the
-# canonical component.wasm into the module directory itself.
-BUILDER_MODULES := apps/tasks apps/chat apps/files
-
-# The unmigrated uniform guests each build a canonical `component.wasm` in
-# their standalone crates/guests workspace, copied into the host test
-# fixtures. The four odd ones out are kept explicit below.
-WASM_GUESTS := directory inbox tagging dispatch capability identity \
-  gateway governance pages saga agent automations runs
+# Every product/example module carries its own guest port (src/guest.rs behind
+# the `guest` feature); guest-builder synthesizes the packaging workspace and
+# writes the canonical component.wasm into the module directory itself. The
+# four kernel-fixture test guests (hello, hello-v2, sibling, object) keep
+# their standalone crates/guests workspaces below.
+BUILDER_MODULES := \
+  crates/examples/directory \
+  crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
+  crates/modules/apps/automations crates/modules/apps/runs \
+  crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
+  crates/modules/system/tagging crates/modules/system/dispatch \
+  crates/modules/system/capability crates/modules/system/identity \
+  crates/modules/system/gateway crates/modules/system/governance \
+  crates/modules/system/saga
 
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q -p guest-builder -- crates/modules/$$m && \
-	  cp crates/modules/$$m/component.wasm \
+	  $(CARGO) run -q -p guest-builder -- $$m && \
+	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
-	done
-	@for g in $(WASM_GUESTS); do \
-	  ( cd crates/guests/$$g-wasm && $(CARGO) build --target wasm32-unknown-unknown --release ) && \
-	  wasm-tools component new \
-	    crates/guests/$$g-wasm/target/wasm32-unknown-unknown/release/$${g}_wasm.wasm \
-	    -o crates/guests/$$g-wasm/component.wasm && \
-	  cp crates/guests/$$g-wasm/component.wasm \
-	    crates/kernel/host/tests/fixtures/$$g.component.wasm || exit 1; \
 	done
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-v2 builds the v2
@@ -154,12 +150,8 @@ wasm-modules-check:
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  cmp crates/modules/$$m/component.wasm \
+	  cmp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
-	done
-	@for g in $(WASM_GUESTS); do \
-	  cmp crates/guests/$$g-wasm/component.wasm \
-	    crates/kernel/host/tests/fixtures/$$g.component.wasm || exit 1; \
 	done
 	@echo "wasm module artifacts are mutually consistent"
 

@@ -1,7 +1,8 @@
 //! `guest-adapter` — the port harness for running NATIVE module crates as wasm
 //! guests without rewriting their logic.
 //!
-//! a ported guest crate (`agent-wasm`, …) compiles the native module crate to
+//! a ported module's guest (its `src/guest.rs` behind the `guest` feature —
+//! see `agent`, …) compiles the native module crate to
 //! `wasm32-unknown-unknown` and ADAPTS it to the `ducktape:module` world using
 //! the pieces here, so the module's logic stays single-sourced in the native
 //! crate — drift between the native and wasm builds is a compile error, not a
@@ -37,8 +38,8 @@
 //! save the new snapshot back as a staged host write. the OUTER staging —
 //! what the host publishes at the real block boundary or discards on abort —
 //! is the only durable seam, so multi-dispatch blocks and aborts behave
-//! exactly like the native module (see `pages-wasm` for the argument spelled
-//! out against a concrete store-backed module, `agent-wasm` for a whole-state
+//! exactly like the native module (see the `pages` guest port for the argument spelled
+//! out against a concrete store-backed module, the `agent` guest port for a whole-state
 //! one).
 
 /// the raw generated bindings. a named module (not the crate root) because the

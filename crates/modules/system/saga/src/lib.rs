@@ -3302,3 +3302,9 @@ mod tests {
         assert_eq!(get(&m, "s2"), None, "nothing was staged");
     }
 }
+
+// the wasm-guest port: the dispatch shell that adapts this module to the
+// ducktape:module world. compiled only by the guest-builder's synthesized
+// wasm32 cdylib workspace (feature `guest`), never by the native build.
+#[cfg(feature = "guest")]
+mod guest;

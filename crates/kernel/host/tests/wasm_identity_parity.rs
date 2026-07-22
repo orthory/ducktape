@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the identity cutover: the
-//! `identity-wasm` component (the NATIVE `identity` crate compiled to wasm
+//! `identity` guest component (the NATIVE `identity` crate compiled to wasm
 //! behind `guest-adapter`) and the native `Identity` module answer the SAME op
 //! sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
@@ -37,8 +37,8 @@ use sha2::{Digest as _, Sha256};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/identity-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `identity` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/identity.component.wasm");
 
 /// the chain id BOTH runtimes are constructed with — natively as a constructor

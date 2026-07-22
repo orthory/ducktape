@@ -7,7 +7,7 @@
 //!
 //! the canonical encoding here (le-u64 entry count, then sorted le-u64
 //! length-prefixed pairs) is BYTE-IDENTICAL to the wasm host store's — the
-//! `directory-wasm` guest carries the same keys/values, so root(), snapshot(),
+//! `directory` guest carries the same keys/values, so root(), snapshot(),
 //! and install() stay continuous across a native↔wasm cutover. change either
 //! side only in lockstep with the other.
 

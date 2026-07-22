@@ -1,4 +1,4 @@
-//! the adapter-port equivalence proof for the saga cutover: the `saga-wasm`
+//! the adapter-port equivalence proof for the saga cutover: the `saga` guest
 //! component (the NATIVE `saga` crate compiled to wasm behind `guest-adapter`)
 //! and the native `SagaModule` answer the SAME op sequence with IDENTICAL
 //! query replies, emit IDENTICAL work-order events, and their roots move in
@@ -40,8 +40,8 @@ use std::collections::BTreeMap;
 use valset::Valset;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/saga-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `saga` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const SAGA_WASM: &[u8] = include_bytes!("fixtures/saga.component.wasm");
 
 fn wasm_saga() -> WasmModule {

@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the agent-registry cutover: the
-//! `agent-wasm` component (the NATIVE `agent` crate compiled to wasm behind
+//! `agent` guest component (the NATIVE `agent` crate compiled to wasm behind
 //! `guest-adapter`) and the native `AgentModule` answer the SAME op sequence
 //! with IDENTICAL query replies, and their roots move in lockstep. the
 //! first state-schema break is pinned with agent's OWN genesis shape: like saga,
@@ -33,8 +33,8 @@ use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::Digest as _;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/agent-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `agent` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const AGENT_WASM: &[u8] = include_bytes!("fixtures/agent.component.wasm");
 
 fn wasm_agent() -> WasmModule {

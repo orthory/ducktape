@@ -92,11 +92,11 @@ impl host::ModuleFactory for WasmModuleFactory {
 
 /// the directory module's GENESIS component — the first REAL production tenant
 /// of the module runtime. bytes-compatible with the retired native
-/// implementation (`directory-wasm` stores the same keys/values under the same
+/// implementation (the `directory` guest port stores the same keys/values under the same
 /// canonical encoding), so root(), snapshots, and pre-cutover workspace
 /// restores are all continuous across the cutover.
 const DIRECTORY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/directory-wasm/component.wasm");
+    include_bytes!("../../../crates/examples/directory/component.wasm");
 
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
@@ -106,7 +106,7 @@ const DIRECTORY_MODULE_ID: &str = "directory";
 /// store). `tasks` is the MERGED work module (task board + job board), revision
 /// 3 in `MODULE_STATE_SCHEMAS`.
 const INBOX_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/inbox-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/inbox/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
 const TASKS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/tasks/component.wasm");
@@ -119,10 +119,10 @@ const TASKS_MODULE_ID: &str = "tasks";
 /// wit world's staged-over-committed reads cannot represent (kernel
 /// coordinators — valset, lifecycle — gate the machinery itself).
 const TAGGING_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/tagging-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/tagging/component.wasm");
 const TAGGING_MODULE_ID: &str = "tagging";
 const CAPABILITY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/capability-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/capability/component.wasm");
 const CAPABILITY_MODULE_ID: &str = "capability";
 
 /// identity / gateway / governance — adapter-ported tenants whose native
@@ -134,13 +134,13 @@ const CAPABILITY_MODULE_ID: &str = "capability";
 /// every node, in the module root (hence the app-hash) from genesis, and
 /// carried by checkpoint snapshots like any other store key.
 const IDENTITY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/identity-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/identity/component.wasm");
 const IDENTITY_MODULE_ID: &str = "identity";
 const GATEWAY_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/gateway-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/gateway/component.wasm");
 const GATEWAY_MODULE_ID: &str = "gateway";
 const GOVERNANCE_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/governance-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/governance/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
 
 /// saga / agent / automations — adapter-ported tenants of the async engine's
@@ -150,13 +150,13 @@ const GOVERNANCE_MODULE_ID: &str = "governance";
 /// events, P6 callbacks, registry hooks, and chat-hook probe reads all cross
 /// the wit seam unchanged.
 const SAGA_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/saga-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/saga/component.wasm");
 const SAGA_MODULE_ID: &str = "saga";
 const AGENT_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/agent-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/agent/component.wasm");
 const AGENT_MODULE_ID: &str = "agent";
 const AUTOMATIONS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/automations-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/automations/component.wasm");
 const AUTOMATIONS_MODULE_ID: &str = "automations";
 
 /// dispatch — the task plane's recipe-manifest + capability-routed delivery
@@ -178,7 +178,7 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 ///
 /// its saga collaborator id ("saga") is genesis-constant, compiled into the guest.
 const DISPATCH_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/dispatch-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/system/dispatch/component.wasm");
 const DISPATCH_MODULE_ID: &str = "dispatch";
 
 /// runs — the FINAL adapter-ported tenant: the collaboration loop's actor.
@@ -201,7 +201,7 @@ const DISPATCH_MODULE_ID: &str = "dispatch";
 /// (the app's runs client and the dogfood receipt lane read it), so it rides
 /// the wasm root and snapshots like everything else the guest keeps.
 const RUNS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/runs-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/runs/component.wasm");
 const RUNS_MODULE_ID: &str = "runs";
 
 /// pages / chat — the first STORE-BACKED wasm tenants: the native crates are
@@ -214,7 +214,7 @@ const RUNS_MODULE_ID: &str = "runs";
 /// workspaces reopen unchanged. NOTE the `.with_tagging("tagging")` wiring
 /// moved INTO the guests — the host builder chain drops it.
 const PAGES_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/pages-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/pages/component.wasm");
 const PAGES_MODULE_ID: &str = "pages";
 const CHAT_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/chat/component.wasm");

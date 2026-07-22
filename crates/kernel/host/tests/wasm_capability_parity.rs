@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the capability cutover: the
-//! `capability-wasm` component (the NATIVE `capability` crate compiled to wasm
+//! `capability` guest component (the NATIVE `capability` crate compiled to wasm
 //! behind `guest-adapter`) and the native `CapabilityRegistry` answer the SAME
 //! op sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
@@ -30,8 +30,8 @@ use sdk::{Error, Msg, Origin, StateRoot};
 use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/capability-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `capability` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const CAPABILITY_WASM: &[u8] = include_bytes!("fixtures/capability.component.wasm");
 
 fn wasm_capability() -> WasmModule {

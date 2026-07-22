@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the automations cutover: the
-//! `automations-wasm` component (the NATIVE `automations` crate compiled to
+//! `automations` guest component (the NATIVE `automations` crate compiled to
 //! wasm behind `guest-adapter`) and the native `Automations` module answer
 //! the SAME op sequence with IDENTICAL query replies, and their roots move in
 //! lockstep. the roots THEMSELVES differ — the port persists the native
@@ -36,8 +36,8 @@ use tasks::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/automations-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `automations` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.wasm");
 
 fn wasm_automations() -> WasmModule {

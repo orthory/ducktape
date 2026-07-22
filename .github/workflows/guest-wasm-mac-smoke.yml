@@ -2,10 +2,11 @@
 # Apple hardware: a blst-carrying guest builds to wasm32-unknown-unknown and
 # componentizes on stock rustup, with NO wasm-capable clang involved. The
 # mechanism under test is patches/blst (build.rs early-returns on wasm32, so no
-# C is compiled at all — see patches/blst/PATCH.md) plus the getrandom stubs in
-# the guest workspace. CC for the wasm target is pinned to /usr/bin/false so
-# any attempt to compile C for wasm32 fails loudly rather than silently
-# succeeding via a toolchain the runner happens to carry.
+# C is compiled at all — see patches/blst/PATCH.md) plus the getrandom stubs
+# guest-builder patches into every synthesized packaging workspace. CC for the
+# wasm target is pinned to /usr/bin/false so any attempt to compile C for
+# wasm32 fails loudly rather than silently succeeding via a toolchain the
+# runner happens to carry.
 name: guest-wasm-mac-smoke
 
 on:
@@ -14,7 +15,9 @@ on:
     paths:
       - ".github/workflows/guest-wasm-mac-smoke.yml"
       - "patches/blst/**"
-      - "crates/guests/identity-wasm/**"
+      - "bin/guest-builder/**"
+      - "crates/guests/stubs/**"
+      - "crates/modules/system/identity/**"
       - "crates/guests/guest-adapter/**"
 
 concurrency:
@@ -51,27 +54,21 @@ jobs:
           rustup target add wasm32-unknown-unknown
           rustc -vV
 
-      - name: build identity-wasm (no C toolchain)
-        working-directory: crates/guests/identity-wasm
-        run: cargo build --target wasm32-unknown-unknown --release
-
       - name: install wasm-tools
         run: cargo install wasm-tools --locked
 
-      - name: componentize
-        working-directory: crates/guests/identity-wasm
+      - name: build the identity guest via guest-builder (no C toolchain)
         run: |
-          wasm-tools component new \
-            target/wasm32-unknown-unknown/release/identity_wasm.wasm \
-            -o "$RUNNER_TEMP/identity.component.wasm"
-          ls -l target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+          cargo run -p guest-builder -- crates/modules/system/identity \
+            --scratch "$RUNNER_TEMP/identity-guest" \
+            --out "$RUNNER_TEMP/identity.component.wasm"
+          ls -l "$RUNNER_TEMP/identity-guest/target/wasm32-unknown-unknown/release/identity_wasm.wasm" \
             "$RUNNER_TEMP/identity.component.wasm"
 
       - name: assert blst dead-stripped
-        working-directory: crates/guests/identity-wasm
         run: |
           wasm-tools print \
-            target/wasm32-unknown-unknown/release/identity_wasm.wasm \
+            "$RUNNER_TEMP/identity-guest/target/wasm32-unknown-unknown/release/identity_wasm.wasm" \
             > "$RUNNER_TEMP/identity_wasm.wat"
           count=$(grep -c blst "$RUNNER_TEMP/identity_wasm.wat" || true)
           echo "blst symbol refs in module: $count"

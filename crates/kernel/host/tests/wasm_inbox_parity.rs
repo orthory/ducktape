@@ -1,4 +1,4 @@
-//! the adapter-port equivalence proof for the inbox cutover: the `inbox-wasm`
+//! the adapter-port equivalence proof for the inbox cutover: the `inbox` guest
 //! component (the NATIVE `inbox` crate compiled to wasm behind `guest-adapter`)
 //! and the native `Inbox` module answer the SAME op sequence with IDENTICAL
 //! query replies, and their roots move in lockstep (move on commit, hold on
@@ -20,8 +20,8 @@ use inbox::{
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/inbox-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `inbox` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const INBOX_WASM: &[u8] = include_bytes!("fixtures/inbox.component.wasm");
 
 fn wasm_inbox() -> WasmModule {

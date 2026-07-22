@@ -1,5 +1,5 @@
 //! the cutover-continuity proof for the first real wasm tenant: the
-//! `directory-wasm` component and the native `Directory` are BYTE-COMPATIBLE.
+//! `directory` guest component and the native `Directory` are BYTE-COMPATIBLE.
 //! the same op sequence yields the same root() after every block, the same
 //! snapshot bytes, and the same query replies — and each side's snapshot
 //! installs into the other against the same root. a native→wasm cutover of
@@ -13,8 +13,8 @@ use host::Host;
 use sdk::{Module, Msg, StateSyncHandle};
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/directory-wasm` by the
-/// module build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the `directory` module's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const DIRECTORY_WASM: &[u8] = include_bytes!("fixtures/directory.component.wasm");
 
 fn wasm_directory() -> WasmModule {
