@@ -19,6 +19,12 @@
 mod interface;
 pub use interface::*;
 
+// the wasm-guest port: the dispatch shell that adapts this module to the
+// ducktape:module world. compiled only by the guest-builder's synthesized
+// wasm32 cdylib workspace (feature `guest`), never by the native build.
+#[cfg(feature = "guest")]
+mod guest;
+
 mod job_board;
 mod task_board;
 
@@ -34,7 +40,7 @@ pub use job_board::{
 
 // the derived-tier materialized view over the task board; registered only by
 // serving binaries. native-only: `indexer` drags unix-only IO, and the index is
-// node-local derived state -- the wasm guest (`tasks-wasm`) builds without it.
+// node-local derived state -- the wasm guest port builds without it.
 #[cfg(feature = "native")]
 pub mod index;
 

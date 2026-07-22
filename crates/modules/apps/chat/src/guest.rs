@@ -1,10 +1,11 @@
-//! `chat-wasm` — the wasm port of the `chat` module, built the ADAPTER way:
-//! the NATIVE `chat` crate is compiled to wasm32 unmodified (minus the
-//! `native`-feature off-consensus submodules — the derived index and the
-//! voice/video media engines, which never touch the app-hash) and adapted to
-//! the `ducktape:module` world through `guest-adapter`, so the module's logic
-//! is single-sourced (a behavior change in the native crate IS the wasm
-//! change).
+//! the wasm port of this module, built the ADAPTER way: the native crate is
+//! compiled to wasm32 unmodified (minus the `native`-feature off-consensus
+//! submodules — the derived index and the voice/video media engines, which
+//! never touch the app-hash) and adapted to the `ducktape:module` world
+//! through `guest-adapter`, so the module's logic is single-sourced (a
+//! behavior change in the native crate IS the wasm change). the packaging
+//! cdylib around this port is synthesized by `guest-builder` — this module is
+//! the whole of the guest's hand-written surface.
 //!
 //! ## the STORE-BACKED dispatch model, and why it is equivalent
 //!
@@ -38,7 +39,7 @@
 //! equivalence is pinned block-by-block (roots, replies, aborts,
 //! multi-dispatch blocks) by `wasm_chat_parity`.
 
-use chat::Chat;
+use crate::Chat;
 
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).

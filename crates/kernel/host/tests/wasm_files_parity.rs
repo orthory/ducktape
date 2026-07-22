@@ -1,4 +1,4 @@
-//! the ROOT-CONTINUITY proof for files (duckfs): the `files-wasm` component over
+//! the ROOT-CONTINUITY proof for files (duckfs): the files guest component over
 //! `WasmModule::with_odb(FilesOdbBacking)` and the native `Files` module over the
 //! same disk substrate are BYTE-IDENTICAL block-by-block. unlike the whole-state
 //! adapter ports (whose roots diverge by a declared schema break), files' root is
@@ -31,8 +31,8 @@ use wasm_host::WasmModule;
 
 const FILES: &str = "files";
 
-/// GENERATED artifact — built from `crates/guests/files-wasm` by `make
-/// wasm-modules`; committed so this proof is self-contained (the same fixture the
+/// GENERATED artifact — built from the module crate's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained (the same fixture the
 /// node embeds).
 const FILES_WASM: &[u8] = include_bytes!("fixtures/files.component.wasm");
 
@@ -51,7 +51,7 @@ fn native_host(dir: &tempfile::TempDir) -> Host {
     .expect("native genesis")
 }
 
-/// the wasm `files` tenant: the `files-wasm` component over a `FilesOdbBacking`
+/// the wasm `files` tenant: the files guest component over a `FilesOdbBacking`
 /// on `dir` — the exact `WasmModule::with_odb` composition bin/node uses — beside
 /// the SAME two native siblings (kept native on both hosts so the emitted
 /// follow-ups land identically and only the files cutover is under test).

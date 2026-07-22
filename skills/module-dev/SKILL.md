@@ -35,18 +35,26 @@ Clone the `tasks` shape:
 - Native-only deps (derived index, unix IO, tokio) must sit behind a `native`
   feature or be absent — the guest build compiles this same crate to wasm32.
 
-## 2. Wasm guest — `crates/guests/<id>-wasm`
+## 2. Wasm guest — `src/guest.rs` in the module crate, packaged by guest-builder
 
-Copy `tasks-wasm`: standalone workspace (own `[workspace]` table — NEVER a
-root member; that isolation keeps wasm32 deps/features out of the native
-build), `crate-type = ["cdylib"]`, deps = `guest-adapter` + the native crate
-(`default-features = false` if it has a `native` feature). `component.wasm`
-is a COMMITTED artifact.
+The module carries its OWN port (the `tasks`/`chat`/`files` shape): a
+`src/guest.rs` behind a wasm-only `guest = ["dep:guest-adapter"]` feature —
+the doc header, the id consts, and ONE dispatch-shell macro
+(`guest_adapter::snapshot_guest!` for whole-state `SnapshotBytes` modules,
+`store_guest!` for store-backed ones, or a hand-written `Guest` impl +
+`export_module!` for odd tenants like files). `#[cfg(feature = "guest")] mod
+guest;` in lib.rs. No packaging crate is checked in: `bin/guest-builder`
+synthesizes the ephemeral cdylib workspace (wasm32 dep resolution + the
+getrandom/blst patch set, isolated from the host workspace) and writes the
+canonical COMMITTED `component.wasm` into the module directory.
 
-`Makefile`: add a stanza to `wasm-modules` (cargo build wasm32 + `wasm-tools
-component new`); if kernel tests pin a fixture, also the `cp` into
-`crates/kernel/host/tests/fixtures/` and the matching `wasm-modules-check`
-`cmp` line. Refresh the whole set together — bytes are toolchain-dependent.
+`Makefile`: add the module to `BUILDER_MODULES` — that one entry covers the
+build, the fixture `cp`, and the `wasm-modules-check` `cmp`.
+
+UNMIGRATED modules (the pre-builder remainder of `crates/guests/<id>-wasm`
+standalone crates, listed in `WASM_GUESTS`) still follow the old shape:
+standalone workspace, `crate-type = ["cdylib"]`, deps = `guest-adapter` + the
+native crate. Port them to the module-owned shape when touched.
 
 ## 3. Registration — four bins compose modules
 
@@ -69,8 +77,9 @@ to its contents (the auto-merge count trap).
 
 ```
 cargo test -p <id>                                        # 1. native logic
-cd crates/guests/<id>-wasm && \
-  cargo build --target wasm32-unknown-unknown --release   # 2. catches native-dep leaks
+cargo run -p guest-builder -- crates/modules/<plane>/<id> # 2. catches native-dep leaks
+                                                          #    (unmigrated: cd crates/guests/<id>-wasm &&
+                                                          #     cargo build --target wasm32-unknown-unknown --release)
 make wasm-modules                                         # 3. BEFORE bin/node compiles —
                                                           #    include_bytes! needs the artifact
 cargo check --workspace --all-targets                     # 4. registry parity test gates

@@ -1,4 +1,4 @@
-//! the STORE-BACKED cutover-continuity proof for chat: the `chat-wasm`
+//! the STORE-BACKED cutover-continuity proof for chat: the chat guest
 //! component over `WasmModule::with_store(QmdbStore)` and the native `Chat`
 //! over the same store shape are ROOT-CONTINUOUS — the same op sequence
 //! commits the IDENTICAL qmdb merkle root after every block (both roots ARE
@@ -22,8 +22,8 @@ use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
 use tagging::TaggingModule;
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/chat-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the module crate's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const CHAT_WASM: &[u8] = include_bytes!("fixtures/chat.component.wasm");
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519

@@ -31,10 +31,10 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/modules/system/` | System modules and their host-side counterparts: `kv` (byte-KV), `valset` (ed25519 validator membership), `clients`, `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `airlock` (exec/credential gateway), plus `blobstore`, `dispatch-oracle`, `capability-host` |
 | `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`), `jobs` (first-claim-wins work board) |
 | `crates/duckfs/` | The versioned-filesystem engine: `core` (pure, wasm-ready — the `files` module wraps it), `disk`, `client` (OS-side) |
-| `crates/guests/` | The wasm ports — one `*-wasm` guest per module (compiles the native crate to a component the node embeds) plus `guest-adapter` (the shared `ducktape:module` world binding) |
+| `crates/guests/` | Shared wasm-port infra: `guest-adapter` (the `ducktape:module` world binding every port shares), the wasm32 dep stubs, and the kernel-fixture test guests. Migrated modules carry their own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` synthesizes the packaging; unmigrated modules still keep a standalone `*-wasm` crate here pending the sweep |
 | `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
-| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` / `airlock-broker` / `airlock-cli` (credential gateway) |
+| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` / `airlock-broker` / `airlock-cli` (credential gateway), `guest-builder` (module → wasm component packaging tool) |
 | `docs/` | Nimbus documentation site (human/agent tracks, English/Korean) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
@@ -127,6 +127,45 @@ make coordinator
 target/release/coordinator --help
 target/release/coordinator --listen 0.0.0.0:3478
 ```
+
+### Build wasm module components (guest-builder)
+
+Prerequisites (same as always): `rustup target add wasm32-unknown-unknown` and
+`cargo install wasm-tools`.
+
+Day to day you don't invoke the tool — `make wasm-modules` rebuilds every
+module component (and refreshes the kernel test fixtures), and
+`make wasm-modules-check` guards that the committed copies agree.
+
+To build one module directly:
+
+```sh
+cargo run -p guest-builder -- crates/modules/apps/tasks
+```
+
+This synthesizes the packaging workspace under `target/guest-builder/`, builds
+it for wasm32, componentizes, and writes the canonical committed artifact to
+`crates/modules/apps/tasks/component.wasm` (path printed on stdout). If kernel
+tests pin a fixture copy, refresh it too — `make wasm-modules` does both.
+
+An out-of-tree module directory — the distributable-as-git case — builds the
+same way:
+
+```sh
+cargo run -p guest-builder -- ~/src/my-module --out /tmp/my-module.component.wasm
+```
+
+`--platform-root` overrides the ducktape checkout supplying `guest-adapter` and
+the wasm32 dep patches (it defaults to the checkout the tool was built from);
+`--scratch` overrides the synthesis directory.
+
+For the tool to accept a module it must declare the port contract: a
+`guest = ["dep:guest-adapter"]` feature, an optional `guest-adapter` path dep,
+and a `src/guest.rs` behind `#[cfg(feature = "guest")]` containing either
+`guest_adapter::snapshot_guest!` (whole-state modules), `store_guest!`
+(store-backed), or a hand-written `Guest` impl + `export_module!` (the `files`
+shape). `crates/modules/apps/tasks` is the reference; the full wiring runbook
+is `skills/module-dev/SKILL.md`.
 
 ## Run a node
 

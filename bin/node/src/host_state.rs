@@ -109,7 +109,7 @@ const INBOX_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/inbox-wasm/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
 const TASKS_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/tasks-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/tasks/component.wasm");
 const TASKS_MODULE_ID: &str = "tasks";
 
 /// tagging / capability — adapter-ported tenants whose ops resolve
@@ -217,7 +217,7 @@ const PAGES_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/pages-wasm/component.wasm");
 const PAGES_MODULE_ID: &str = "pages";
 const CHAT_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/chat-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/chat/component.wasm");
 const CHAT_MODULE_ID: &str = "chat";
 
 /// files (duckfs) — the ROOT-CONTINUOUS wasm tenant: the guest runs pure
@@ -230,7 +230,7 @@ const CHAT_MODULE_ID: &str = "chat";
 /// `.with_state_schema_revision` call — revision 1 is the default, matching the
 /// parity harness and the native module exactly.
 const FILES_WASM_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/guests/files-wasm/component.wasm");
+    include_bytes!("../../../crates/modules/apps/files/component.wasm");
 const FILES_MODULE_ID: &str = "files";
 
 /// genesis-seed the code registry: every wasm tenant's initial active code

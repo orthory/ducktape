@@ -1,5 +1,5 @@
 //! the adapter-port equivalence proof for the merged `tasks` work module: the
-//! `tasks-wasm` component (the NATIVE `tasks` crate compiled to wasm behind
+//! tasks guest component (the NATIVE `tasks` crate compiled to wasm behind
 //! `guest-adapter`, with `default-features = false` dropping only the node-local
 //! derived index) and the native `Tasks` module answer the SAME op sequence with
 //! IDENTICAL query replies across BOTH boards (the assigned-list task board AND
@@ -18,8 +18,8 @@ use tasks::{
 };
 use wasm_host::WasmModule;
 
-/// GENERATED artifact — built from `crates/guests/tasks-wasm` by the module
-/// build target; committed so this proof is self-contained.
+/// GENERATED artifact — built from the module crate's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const TASKS_WASM: &[u8] = include_bytes!("fixtures/tasks.component.wasm");
 
 fn wasm_tasks() -> WasmModule {
