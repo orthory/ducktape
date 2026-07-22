@@ -12,6 +12,8 @@
 //! blob store LACKS the pack reaches the SAME root as one that has it. that is
 //! the fork-safety invariant — pack possession is per-node, root is not.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
@@ -86,22 +88,6 @@ fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
     out
 }
 
-/// drive one file change through the REAL commit path (execute + publish) on the
-/// default repo (empty `repo` -> back-compat default).
-fn commit_one(forge: &mut Forge, t: u64, path: &str, content: &str, message: &str) {
-    let msg = Msg {
-        target: "forge".into(),
-        payload: encode_msg(&ForgeMsg::Commit {
-            repo: String::new(),
-            path: path.into(),
-            content: content.into(),
-            message: message.into(),
-        }),
-    };
-    futures::executor::block_on(forge.execute(&mut at(t), &msg)).unwrap();
-    futures::executor::block_on(forge.commit_block()).unwrap();
-}
-
 /// a captured push input: a real commit's head oid, the packfile of its full
 /// object closure (exactly what `snapshot()` carries after its 20-byte oid
 /// header — the same closure `install` consumes, so materialize's git plumbing
@@ -141,6 +127,30 @@ fn capture(src: &Forge) -> Captured {
     }
 }
 
+/// Build Git history off-chain, then drive every resulting head through the
+/// real PushRefs path. This is the production ownership split in miniature.
+fn source_history(
+    tag: &str,
+    changes: &[(u64, &str, &str, &str)],
+) -> (PathBuf, Forge, Vec<Captured>) {
+    let commits = support::history(tag, changes);
+    let blobs = blobstore::BlobHandle::default();
+    let digests = commits
+        .iter()
+        .map(|commit| blobs.put_chunk(commit.pack.clone()).to_vec())
+        .collect::<Vec<_>>();
+    let dir = tmp_repo(tag);
+    let mut forge = Forge::with_blobs("forge", dir.clone(), blobs).unwrap();
+    let mut prev = None;
+    let mut captures = Vec::with_capacity(commits.len());
+    for (commit, digest) in commits.iter().zip(digests) {
+        push(&mut forge, prev.as_deref(), &commit.head, &digest);
+        captures.push(capture(&forge));
+        prev = Some(commit.head.clone());
+    }
+    (dir, forge, captures)
+}
+
 /// build a single-update `PushRefs` on `branch` of the default repo (empty `repo`).
 fn push_branch_msg(branch: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
     Msg {
@@ -164,8 +174,7 @@ fn push_msg(prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
 
 /// execute a Push and publish the block — the happy path.
 fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
-    futures::executor::block_on(forge.execute(&mut at(0), &push_msg(prev, new, digest)))
-        .unwrap();
+    futures::executor::block_on(forge.execute(&mut at(0), &push_msg(prev, new, digest))).unwrap();
     futures::executor::block_on(forge.commit_block()).unwrap();
 }
 
@@ -222,10 +231,8 @@ fn read_blob(base: &Path, name: &str) -> Vec<u8> {
 
 /// a single-commit source module + its captured push input.
 fn source_one(tag: &str) -> (PathBuf, Forge, Captured) {
-    let dir = tmp_repo(tag);
-    let mut src = Forge::init("forge", dir.clone()).unwrap();
-    commit_one(&mut src, 1, "a.txt", "hello", "first");
-    let cap = capture(&src);
+    let (dir, src, mut captures) = source_history(tag, &[(1, "a.txt", "hello", "first")]);
+    let cap = captures.remove(0);
     (dir, src, cap)
 }
 
@@ -260,13 +267,13 @@ fn push_to_unborn_moves_head_and_materializes_content() {
 
 #[test]
 fn fast_forward_push_advances_the_head() {
-    // a source that commits twice, captured after each commit.
-    let src_dir = tmp_repo("ff-src");
-    let mut src = Forge::init("forge", src_dir.clone()).unwrap();
-    commit_one(&mut src, 1, "a.txt", "one", "c1");
-    let c1 = capture(&src);
-    commit_one(&mut src, 2, "b.txt", "two", "c2");
-    let c2 = capture(&src);
+    // a source that advances twice, captured after each pushed commit.
+    let (src_dir, _src, mut captures) = source_history(
+        "ff-src",
+        &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")],
+    );
+    let c1 = captures.remove(0);
+    let c2 = captures.remove(0);
 
     let blobs = blobstore::BlobHandle::default();
     let d1 = c1.stash(&blobs);
@@ -298,12 +305,12 @@ fn fast_forward_push_advances_the_head() {
 
 #[test]
 fn stale_prev_oid_is_rejected_and_head_is_unchanged() {
-    let src_dir = tmp_repo("stale-src");
-    let mut src = Forge::init("forge", src_dir.clone()).unwrap();
-    commit_one(&mut src, 1, "a.txt", "one", "c1");
-    let c1 = capture(&src);
-    commit_one(&mut src, 2, "b.txt", "two", "c2");
-    let c2 = capture(&src);
+    let (src_dir, _src, mut captures) = source_history(
+        "stale-src",
+        &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")],
+    );
+    let c1 = captures.remove(0);
+    let c2 = captures.remove(0);
 
     let blobs = blobstore::BlobHandle::default();
     let d1 = c1.stash(&blobs);
@@ -441,61 +448,26 @@ fn malformed_push_fields_are_rejected_deterministically() {
     let _ = std::fs::remove_dir_all(&dst_dir);
 }
 
-#[test]
-fn commit_and_push_coexist_on_one_module() {
-    // back-compat: the file-by-file Commit still works, and a Push can build on
-    // a Commit-made head (prev = the committed commit oid). the pinned identity +
-    // date make c1's oid identical across independent repos, so a second module
-    // can replay c1 then push c2's closure onto it.
-    let src_dir = tmp_repo("coexist-src");
-    let mut src = Forge::init("forge", src_dir.clone()).unwrap();
-    commit_one(&mut src, 1, "a.txt", "one", "c1");
-    let c1_head = on_disk_head(&src_dir).unwrap();
-    commit_one(&mut src, 2, "b.txt", "two", "c2");
-    let c2 = capture(&src);
-
-    let dst_dir = tmp_repo("coexist-dst");
-    let blobs = blobstore::BlobHandle::default();
-    let d2 = c2.stash(&blobs);
-    let mut dst = Forge::with_blobs("forge", dst_dir.clone(), blobs).unwrap();
-    commit_one(&mut dst, 1, "a.txt", "one", "c1");
-    assert_eq!(
-        on_disk_head(&dst_dir),
-        Some(c1_head),
-        "same deterministic c1 oid across repos"
-    );
-
-    push(&mut dst, Some(c1_head.as_bytes()), &c2.head, &d2);
-    assert_eq!(dst.root(), c2.root, "push advanced the head off the commit");
-    assert_eq!(
-        on_disk_head(&dst_dir),
-        Some(c2.oid()),
-        "push materialized on top of a commit-made head"
-    );
-    assert_eq!(read_blob(&dst_dir, "a.txt"), b"one".to_vec());
-    assert_eq!(read_blob(&dst_dir, "b.txt"), b"two".to_vec());
-
-    let _ = std::fs::remove_dir_all(&src_dir);
-    let _ = std::fs::remove_dir_all(&dst_dir);
-}
-
 /// `list_repos` answers the INTEGRATION head: a main-only repo falls back to
 /// the main head, but once `dev` is born the listing reports dev's oid —
 /// the branch every browse surface reads, so a dev-only repo must never list
 /// as unborn to a remote client.
 #[test]
 fn list_repos_reports_the_integration_head() {
-    let src_dir = tmp_repo("listrepos-src");
-    let mut src = Forge::init("forge", src_dir.clone()).unwrap();
-    commit_one(&mut src, 1, "a.txt", "one", "c1");
-    let c1 = capture(&src);
+    let (src_dir, _src, mut captures) = source_history(
+        "listrepos-src",
+        &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")],
+    );
+    let c1 = captures.remove(0);
+    let c2 = captures.remove(0);
 
     let dst_dir = tmp_repo("listrepos-dst");
     let blobs = blobstore::BlobHandle::default();
     let d1 = c1.stash(&blobs);
+    let d2 = c2.stash(&blobs);
     let mut dst = Forge::with_blobs("forge", dst_dir.clone(), blobs).unwrap();
-    commit_one(&mut dst, 1, "a.txt", "one", "c1");
-    commit_one(&mut dst, 2, "b.txt", "two", "c2");
+    push(&mut dst, None, &c1.head, &d1);
+    push(&mut dst, Some(&c1.head), &c2.head, &d2);
     let main_head = on_disk_head(&dst_dir).unwrap();
 
     // main-only: the listing falls back to the main head.
@@ -505,10 +477,9 @@ fn list_repos_reports_the_integration_head() {
     );
 
     // dev born at c1 (≠ main's c2): the integration branch owns the listing.
-    futures::executor::block_on(dst.execute(
-        &mut at(3),
-        &push_branch_msg("dev", None, &c1.head, &d1),
-    ))
+    futures::executor::block_on(
+        dst.execute(&mut at(3), &push_branch_msg("dev", None, &c1.head, &d1)),
+    )
     .unwrap();
     futures::executor::block_on(dst.commit_block()).unwrap();
     assert_ne!(c1.oid(), main_head, "the two branches must diverge");

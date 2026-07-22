@@ -36,10 +36,9 @@
 //!   (no committed branch and no tracker item anywhere -> StateRoot::ZERO.)
 //!
 //! WHAT DOES NOT CHANGE:
-//!   - DETERMINISM: git2's typed `Signature` sets the FIXED `ducktape` identity +
-//!     a date from `ctx.env().consensus_time` (never wall clock), so each repo's
-//!     sha1 oid — and thus the composed root — is byte-identical across nodes on
-//!     the same inputs.
+//!   - DETERMINISM: clients build immutable Git objects before submission;
+//!     consensus only compare-and-swaps already-fixed oids and never reads a
+//!     validator's node-local object database.
 //!   - the object format is a NETWORK-WIDE GENESIS CONSTANT: every validator MUST
 //!     use the identical format. a sha1 node and a sha256 node compute different
 //!     roots for the same state and FORK. it is NOT a per-node choice.
@@ -80,20 +79,13 @@
 //! the well-known `"default"` repo. the unit [`ForgeQuery::Head`] answers the
 //! default repo's `main` head.
 //!
-//! ## the determinism landmine (per repo)
+//! ## the consensus / data-plane boundary
 //!
-//! a git *commit* embeds committer identity + a timestamp, so each repo keeps
-//! its commit reproducible: a FIXED author/committer identity (`ducktape`) and
-//! a date derived from `ctx.env().consensus_time`, so the sha1 oid is byte-
-//! identical across independent repos given the same inputs (see [`git`]).
-//!
-//! KNOWN PRE-EXISTING HAZARD (unchanged by the multi-branch work): a `Commit`
-//! op builds on the parent COMMIT OBJECT, which only exists in odbs that have
-//! materialized the history — mixing `Commit` and `PushRefs` on one repo can make
-//! `Commit` fail on validators that still lack the pushed pack. the app commits
-//! to app-managed repos and git users push to git-managed repos, so the mix
-//! does not occur in practice; a consensus-visible "pushed" flag is the proper
-//! fix if it ever must.
+//! Git commit/tree/blob objects are data-plane state. a producer builds them
+//! off-chain and the relay distributes their content-addressed pack before the
+//! corresponding [`ForgeMsg::PushRefs`] enters consensus. consensus state owns
+//! only the canonical branch oids (plus tracker state), and its sole Git write
+//! is a pure `prev -> new` CAS.
 //!
 //! ## the host-lent staging seam (per repo + tracker)
 //!
@@ -127,9 +119,7 @@ use git2::Oid;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
-use crate::refs::{
-    norm_branch, open_or_init_repo, RepoState, INTEGRATION_BRANCH, MAIN_BRANCH,
-};
+use crate::refs::{norm_branch, RepoState, INTEGRATION_BRANCH, MAIN_BRANCH};
 use crate::tracker::{author_from_origin, parse_hex_oid, Tracker};
 
 /// the well-known repo an empty `repo` field maps to — the single-repo wire
@@ -307,8 +297,8 @@ pub struct Forge {
 }
 
 impl Forge {
-    /// genesis wiring with a private, default (empty) blob store — enough for a
-    /// `Commit`-only or test deployment.
+    /// genesis wiring with a private, default (empty) blob store — useful for
+    /// pack-less determinism tests and tracker-only deployments.
     pub fn init(id: impl Into<ModuleId>, base_dir: impl Into<PathBuf>) -> Result<Self, Error> {
         Self::with_blobs(id, base_dir, blobstore::BlobHandle::default())
     }
@@ -445,58 +435,6 @@ impl Forge {
         Ok(())
     }
 
-    /// stage one `Commit` onto `name`'s `main` (already normalized + ensured):
-    /// build the deterministic commit object over the effective parent and
-    /// stage it WITHOUT moving the ref. chaining on the staged head gives
-    /// multi-commit-in-one-block the correct parent.
-    fn stage_commit(
-        &mut self,
-        name: &str,
-        consensus_time: u64,
-        path: String,
-        content: String,
-        message: String,
-    ) -> Result<(), Error> {
-        let repo = open_or_init_repo(&self.base, name)?;
-        let state = self.repos.get_mut(name).expect("ensured by caller");
-
-        let parent_oid = state.effective_head(MAIN_BRANCH);
-        let parent_commit = parent_oid
-            .map(|oid| repo.find_commit(oid))
-            .transpose()
-            .map_err(|e| Error::Module(e.to_string()))?;
-
-        let blob = repo
-            .blob(content.as_bytes())
-            .map_err(|e| Error::Module(e.to_string()))?;
-        let base_tree = parent_commit
-            .as_ref()
-            .map(|c| c.tree())
-            .transpose()
-            .map_err(|e| Error::Module(e.to_string()))?;
-        let tree_oid = git::build_tree(&repo, base_tree.as_ref(), &path, blob)
-            .map_err(|e| Error::Module(e.to_string()))?;
-        let tree = repo
-            .find_tree(tree_oid)
-            .map_err(|e| Error::Module(e.to_string()))?;
-
-        let commit = git::commit(
-            &repo,
-            &tree,
-            parent_commit.as_ref(),
-            &message,
-            consensus_time,
-        )
-        .map_err(|e| Error::Module(e.to_string()))?;
-
-        // a Commit CHAINS in-block, so it replaces any staged main fate rather
-        // than conflicting with it.
-        state
-            .staged
-            .insert(MAIN_BRANCH.to_string(), refs::StagedRef::Local(commit));
-        Ok(())
-    }
-
     /// stage an atomic multi-branch push: validate the update list, then CAS
     /// every branch. PURE and deterministic — no repo opened, nothing
     /// installed, no ref moves (see [`refs::RepoState::stage_update`]).
@@ -580,24 +518,12 @@ impl Module for Forge {
         Ok(StateSyncHandle::SnapshotBytes(self.snapshot()?))
     }
 
-    /// apply one write op. git ops stage per-branch CAS updates or build
-    /// deterministic commit objects; tracker ops mutate the block-scratch
-    /// tracker and emit chat follow-ups (channel creation, system lines) that
-    /// commit atomically with the block. all git2 IO is blocking with no
-    /// `.await`.
+    /// apply one write op. Git writes stage pure per-branch CAS updates;
+    /// tracker ops mutate the block-scratch tracker and emit chat follow-ups
+    /// that commit atomically with the block. execute never opens a Git repo.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let now = ctx.env().consensus_time;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            ForgeMsg::Commit {
-                repo,
-                path,
-                content,
-                message,
-            } => {
-                let name = norm_repo(&repo)?;
-                self.ensure_repo(&name);
-                self.stage_commit(&name, now, path, content, message)
-            }
             ForgeMsg::PushRefs {
                 repo,
                 updates,
@@ -883,9 +809,8 @@ impl Module for Forge {
         }
     }
 
-    /// publish everything staged: per-repo branch fates (Local ref moves,
-    /// Packed head publications + materialization targets, Deletes), then the
-    /// block-scratch tracker (persisted to disk).
+    /// publish everything staged: packed head publications + materialization
+    /// targets and deletes, then the block-scratch tracker (persisted to disk).
     async fn commit_block(&mut self) -> Result<(), Error> {
         let base = &self.base;
         let blobs = &self.blobs;
@@ -938,18 +863,6 @@ mod tests {
         p
     }
 
-    fn commit_msg(repo: &str, path: &str, content: &str, message: &str) -> Msg {
-        Msg {
-            target: "forge".into(),
-            payload: encode_msg(&ForgeMsg::Commit {
-                repo: repo.into(),
-                path: path.into(),
-                content: content.into(),
-                message: message.into(),
-            }),
-        }
-    }
-
     fn exec(forge: &mut Forge, ctx: &mut TestCtx, m: &ForgeMsg) -> Result<(), Error> {
         let msg = Msg {
             target: "forge".into(),
@@ -963,13 +876,50 @@ mod tests {
         futures::executor::block_on(forge.commit_block()).unwrap();
     }
 
-    fn commit(forge: &mut Forge, t: u64, repo: &str, path: &str, content: &str, message: &str) {
-        futures::executor::block_on(forge.execute(
-            &mut ctx_at(t),
-            &commit_msg(repo, path, content, message),
-        ))
-        .unwrap();
-        futures::executor::block_on(forge.commit_block()).unwrap();
+    /// Test-fixture plumbing only: put real objects and a ref directly on disk
+    /// so diff/snapshot tests can exercise libgit2 without restoring a
+    /// consensus commit-building path.
+    fn seed_materialized_commit(
+        forge: &mut Forge,
+        t: u64,
+        repo: &str,
+        path: &str,
+        content: &str,
+        message: &str,
+    ) {
+        let name = norm_repo(repo).unwrap();
+        forge.ensure_repo(&name);
+        let git_repo = refs::open_or_init_repo(&forge.base, &name).unwrap();
+        let state = forge.repos.get_mut(&name).unwrap();
+        let parent = state
+            .refs
+            .get(MAIN_BRANCH)
+            .copied()
+            .map(|oid| git_repo.find_commit(oid).unwrap());
+        let base_tree = parent.as_ref().map(|commit| commit.tree().unwrap());
+        let blob = git_repo.blob(content.as_bytes()).unwrap();
+        let tree_oid = git::build_tree(&git_repo, base_tree.as_ref(), path, blob).unwrap();
+        let tree = git_repo.find_tree(tree_oid).unwrap();
+        let oid = git::commit(&git_repo, &tree, parent.as_ref(), message, t).unwrap();
+        git::update_ref(&git_repo, &refs::full_ref(MAIN_BRANCH), oid).unwrap();
+        state.refs.insert(MAIN_BRANCH.to_string(), oid);
+    }
+
+    fn push_head(forge: &mut Forge, repo: &str, prev: Option<Oid>, new: Oid) {
+        let mut ctx = ctx_at(0);
+        exec_commit(
+            forge,
+            &mut ctx,
+            &ForgeMsg::PushRefs {
+                repo: repo.into(),
+                updates: vec![RefUpdate {
+                    ref_name: MAIN_BRANCH.into(),
+                    prev_oid: prev.map(|oid| oid.as_bytes().to_vec()),
+                    new_oid: Some(new.as_bytes().to_vec()),
+                }],
+                pack_digest: Some(vec![7u8; 32]),
+            },
+        );
     }
 
     // read a repo's main oid via git2 directly — the independent oracle that
@@ -987,7 +937,7 @@ mod tests {
 
     fn materialized_pr(base: &std::path::Path, content: &[u8]) -> (Forge, Oid, Oid) {
         let mut forge = Forge::init("forge", base.to_path_buf()).unwrap();
-        commit(&mut forge, 1, "demo", "base.txt", "base\n", "base");
+        seed_materialized_commit(&mut forge, 1, "demo", "base.txt", "base\n", "base");
         let repo = git::open(&base.join("demo")).unwrap();
         let target = git_head_oid(base, "demo");
         let target_commit = repo.find_commit(target).unwrap();
@@ -1471,47 +1421,16 @@ mod tests {
     }
 
     #[test]
-    fn genesis_is_zero_then_commit_makes_root_equal_composed_head() {
-        let base = tmp_base("basic");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
-        assert_eq!(forge.root(), StateRoot::ZERO, "empty namespace -> ZERO root");
-
-        // a Commit with an EMPTY repo -> the default repo (back-compat wire).
-        commit(&mut forge, 100, "", "a.txt", "hello", "first");
-
-        assert_ne!(forge.root(), StateRoot::ZERO, "a commit must move the root");
-
-        // root() == the composition over {"default": {"main": <real HEAD>}}.
-        let head = git_head_oid(&base, DEFAULT_REPO);
-        let refs: BTreeMap<String, Oid> = [(MAIN_BRANCH.to_string(), head)].into();
-        assert_eq!(
-            forge.root(),
-            compose_state_root(
-                [(DEFAULT_REPO, &refs)].into_iter(),
-                &Tracker::default()
-            ),
-            "root() must be the composition of the real default-repo refs"
-        );
-
-        let reply =
-            futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::Head))).unwrap();
-        assert_eq!(
-            decode_reply(&reply).unwrap(),
-            ForgeReply::Head(Some(head.to_string()))
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn second_commit_moves_the_root() {
+    fn successive_pushes_move_the_root() {
         let base = tmp_base("second");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        commit(&mut forge, 1, "", "a.txt", "one", "c1");
+        let a = oid('a');
+        let b = oid('b');
+        push_head(&mut forge, "", None, a);
         let r1 = forge.root();
-        commit(&mut forge, 2, "", "b.txt", "two", "c2");
+        push_head(&mut forge, "", Some(a), b);
         let r2 = forge.root();
-        assert_ne!(r1, r2, "a second commit must advance the root");
+        assert_ne!(r1, r2, "a second pushed head must advance the root");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1520,21 +1439,21 @@ mod tests {
         let base = tmp_base("compose");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let before = host::global_root(&[&forge as &dyn Module]);
-        commit(&mut forge, 7, "", "a.txt", "x", "c");
+        push_head(&mut forge, "", None, oid('a'));
         let after = host::global_root(&[&forge as &dyn Module]);
         assert_ne!(before, after, "forge's root must move the global app-hash");
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn commit_oid_is_reproducible_across_namespaces() {
+    fn pushed_head_root_is_reproducible_across_namespaces() {
         let a = tmp_base("det-a");
         let b = tmp_base("det-b");
         let mut fa = Forge::init("forge", a.clone()).unwrap();
         let mut fb = Forge::init("forge", b.clone()).unwrap();
-        commit(&mut fa, 555, "myrepo", "f.txt", "same", "same-msg");
-        commit(&mut fb, 555, "myrepo", "f.txt", "same", "same-msg");
-        assert_eq!(fa.root(), fb.root(), "pinned identity+date -> identical root");
+        push_head(&mut fa, "myrepo", None, oid('a'));
+        push_head(&mut fb, "myrepo", None, oid('a'));
+        assert_eq!(fa.root(), fb.root(), "same fixed oid -> identical root");
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
     }
@@ -1926,7 +1845,7 @@ mod tests {
     fn snapshot_leads_with_magic_and_install_requires_it() {
         let base = tmp_base("magic");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        commit(&mut forge, 42, "docs", "a.txt", "x", "c");
+        seed_materialized_commit(&mut forge, 42, "docs", "a.txt", "x", "c");
         let root = forge.root();
         let snap = forge.snapshot().unwrap();
         assert!(snap.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
@@ -1953,9 +1872,9 @@ mod tests {
         let base = tmp_base("snap");
         let mut forge = Forge::init("forge", base.clone()).unwrap().with_chat("chat");
 
-        // real objects on main (Commit builds them), then a second branch on
-        // the SAME oid — its objects exist, so the snapshot pack closes.
-        commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
+        // Real fixture objects on main, then a second branch on the same oid —
+        // its objects exist, so the snapshot pack closes.
+        seed_materialized_commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
         let head = git_head_oid(&base, "demo");
         let mut ctx = ctx_at(2);
         exec_commit(

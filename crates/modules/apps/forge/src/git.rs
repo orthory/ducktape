@@ -1,10 +1,10 @@
 //! a thin git2 seam — forge's private substrate via VENDORED libgit2.
 //!
 //! forge needs only a handful of plumbing ops (init/adopt a repo, read HEAD,
-//! hash a blob, build a tree, write a deterministic commit object, move a ref).
-//! each verb here is a typed wrapper over `git2` operating on a `&Repository`
-//! the caller opens per-call. there is NO `std::process::Command` — libgit2 is
-//! vendored INTO the binary, so a node runs with no host `git` installed.
+//! install/verify packs, move refs, and serve bounded diffs). each production
+//! verb is a typed wrapper over `git2` operating on a `&Repository` the caller
+//! opens per-call. there is NO `std::process::Command` — libgit2 is vendored
+//! INTO the binary, so a node runs with no host `git` installed.
 //!
 //! repos are git's DEFAULT sha1 object format (sha256 needs experimental
 //! libgit2 and can't interop with the git ecosystem). a 20-byte sha1 oid is the
@@ -18,12 +18,16 @@ use std::{
 
 use git2::{
     Buf, Commit, DiffFormat, DiffOptions, ErrorCode, ObjectType, Oid, Repository,
-    RepositoryInitOptions, Signature, Time, Tree,
+    RepositoryInitOptions, Tree,
 };
+#[cfg(test)]
+use git2::{Signature, Time};
 
 /// the fixed author/committer identity — pinning it makes the commit oid
 /// reproducible across nodes (no host `user.name`/`user.email` leak).
+#[cfg(test)]
 const IDENT_NAME: &str = "ducktape";
+#[cfg(test)]
 const IDENT_EMAIL: &str = "ducktape@localhost";
 
 /// init a fresh sha1 repo at `dir`: hermetic (`external_template(false)`, no
@@ -59,6 +63,7 @@ pub fn resolve_ref(repo: &Repository, name: &str) -> Result<Option<Oid>, git2::E
 /// NB: `path` must be a single flat segment — libgit2's `TreeBuilder` rejects
 /// `/` (it doesn't synthesize intermediate subtrees). every forge caller is
 /// flat today. TODO: nested paths (recursive subtree build) for `dir/file`.
+#[cfg(test)]
 pub fn build_tree(
     repo: &Repository,
     base: Option<&Tree>,
@@ -78,6 +83,7 @@ pub fn build_tree(
 /// +0000), set for BOTH author and committer, are the only two timestamps in a
 /// commit — pinning both makes the sha1 oid byte-identical across nodes on the
 /// same inputs. libgit2's `commit` never gpg-signs (that's a separate call).
+#[cfg(test)]
 pub fn commit(
     repo: &Repository,
     tree: &Tree,

@@ -118,38 +118,36 @@ fn main() {
         println!("\n[block 2] greeter(name): query directory -> write greeting to directory + kv");
         println!("  app-hash       : {:?}", out.app_hash);
 
-        // block 3: a typed Commit to the GIT-backed forge module. this writes a
-        // file + makes a real (deterministic) git commit; forge's root moves to
-        // the new HEAD oid, which folds straight into the app-hash.
+        // block 3: tracker state is consensus-owned; Git objects are built by
+        // clients and enter through the node's PushRefs data-plane lane, which
+        // this in-process Host demo deliberately does not emulate.
         let out = host
             .submit(Msg {
                 target: "forge".into(),
-                payload: forge_encode_msg(&ForgeMsg::Commit {
-                    // empty repo slug -> the default repo (single-repo wire).
-                    repo: String::new(),
-                    path: "README.md".into(),
-                    content: "# hello from a git-backed module\n".into(),
-                    message: "forge: initial commit".into(),
+                payload: forge_encode_msg(&ForgeMsg::OpenIssue {
+                    repo: "demo".into(),
+                    title: "Ship the first pushed commit".into(),
+                    body: "Git objects travel through the data plane".into(),
                 }),
             })
             .await
             .expect("submit block 3");
-        println!("\n[block 3] forge <- Commit(README.md) — a real git commit");
+        println!("\n[block 3] forge <- OpenIssue — consensus-owned tracker state");
         println!("  app-hash       : {:?}", out.app_hash);
         println!(
             "  forge root     : {:?}",
             host.module_root("forge").unwrap()
         );
 
-        // read forge's HEAD back out (typed query) — the sha1 git oid hex. this hex is
-        // the sha256 PREIMAGE of the forge root: a git commit addressing the app-hash.
+        // read the consensus-owned tracker projection back out.
         let reply = host
-            .query("forge", &forge_encode_query(&ForgeQuery::Head))
+            .query("forge", &forge_encode_query(&ForgeQuery::ListItems {
+                repo: "demo".into(),
+            }))
             .await
             .expect("query forge");
-        if let ForgeReply::Head(Some(oid)) = forge_decode_reply(&reply).unwrap() {
-            println!("  forge git HEAD : {oid}");
-            println!("  (^ the 40-char sha1 oid is the sha256 preimage of the forge root above)");
+        if let ForgeReply::Items(items) = forge_decode_reply(&reply).unwrap() {
+            println!("  forge items    : {}", items.len());
         }
 
         // read the derived greeting back out of the directory (sync typed query).

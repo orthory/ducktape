@@ -14,10 +14,12 @@
 //! these tests drive the SINGLE default repo (empty `repo` -> back-compat
 //! default); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
-use forge::{ForgeMsg, encode_msg};
+use forge::{ForgeMsg, RefUpdate, encode_msg};
 use sdk::{Error, Module, Msg, StateRoot};
 
 /// the module's canonical branch — the ref install must (and may only) move.
@@ -53,19 +55,20 @@ fn repo_dir(base: &Path) -> PathBuf {
     base.join(DEFAULT_REPO)
 }
 
-/// drive one file change through the REAL execute path and publish it, on the
-/// default repo — the snapshot source is a normally-operated module.
-fn commit_one(forge: &mut Forge, t: u64, path: &str, content: &str, message: &str) {
+fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
     let msg = Msg {
         target: "forge".into(),
-        payload: encode_msg(&ForgeMsg::Commit {
+        payload: encode_msg(&ForgeMsg::PushRefs {
             repo: String::new(),
-            path: path.into(),
-            content: content.into(),
-            message: message.into(),
+            updates: vec![RefUpdate {
+                ref_name: "main".into(),
+                prev_oid: prev.map(<[u8]>::to_vec),
+                new_oid: Some(new.to_vec()),
+            }],
+            pack_digest: Some(digest.to_vec()),
         }),
     };
-    futures::executor::block_on(forge.execute(&mut at(t), &msg)).unwrap();
+    futures::executor::block_on(forge.execute(&mut at(0), &msg)).unwrap();
     futures::executor::block_on(forge.commit_block()).unwrap();
 }
 
@@ -73,9 +76,20 @@ fn commit_one(forge: &mut Forge, t: u64, path: &str, content: &str, message: &st
 /// closure, not just the tip).
 fn source(tag: &str) -> (PathBuf, Forge) {
     let base = tmp_base(tag);
-    let mut forge = Forge::init("forge", base.clone()).unwrap();
-    commit_one(&mut forge, 1, "a.txt", "one", "c1");
-    commit_one(&mut forge, 2, "b.txt", "two", "c2");
+    let commits = support::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
+    let blobs = blobstore::BlobHandle::default();
+    let digests = commits
+        .iter()
+        .map(|commit| blobs.put_chunk(commit.pack.clone()).to_vec())
+        .collect::<Vec<_>>();
+    let mut forge = Forge::with_blobs("forge", base.clone(), blobs).unwrap();
+    push(&mut forge, None, &commits[0].head, &digests[0]);
+    push(
+        &mut forge,
+        Some(&commits[0].head),
+        &commits[1].head,
+        &digests[1],
+    );
     (base, forge)
 }
 
@@ -299,8 +313,13 @@ fn install_replaces_a_divergent_head() {
     let bytes = src.snapshot().unwrap();
 
     let dst_base = tmp_base("replace-dst");
-    let mut dst = Forge::init("forge", dst_base.clone()).unwrap();
-    commit_one(&mut dst, 9, "z.txt", "other", "unrelated");
+    let mut divergent =
+        support::history("replace-divergent", &[(9, "z.txt", "other", "unrelated")]);
+    let divergent = divergent.remove(0);
+    let blobs = blobstore::BlobHandle::default();
+    let digest = blobs.put_chunk(divergent.pack).to_vec();
+    let mut dst = Forge::with_blobs("forge", dst_base.clone(), blobs).unwrap();
+    push(&mut dst, None, &divergent.head, &digest);
     assert_ne!(
         dst.root(),
         root,

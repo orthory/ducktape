@@ -76,9 +76,6 @@ pub fn norm_branch(name: &str) -> Result<(), Error> {
 /// one branch's staged (this-block) fate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagedRef {
-    /// objects already live in this repo's odb (the `Commit` path) — the ref
-    /// moves directly at `commit_block`.
-    Local(Oid),
     /// objects ride a node-local pack (the push/merge path): the committed
     /// head publishes unconditionally, the on-disk ref catches up via
     /// `materialize`.
@@ -118,7 +115,7 @@ impl RepoState {
     /// committed one.
     pub fn effective_head(&self, branch: &str) -> Option<Oid> {
         match self.staged.get(branch) {
-            Some(StagedRef::Local(oid) | StagedRef::Packed(oid, _)) => Some(*oid),
+            Some(StagedRef::Packed(oid, _)) => Some(*oid),
             Some(StagedRef::Delete) => None,
             None => self.refs.get(branch).copied(),
         }
@@ -161,19 +158,20 @@ impl RepoState {
                 }
                 StagedRef::Delete
             }
-            Some(oid) => match digest {
-                Some(d) => StagedRef::Packed(oid, d),
-                None => StagedRef::Local(oid),
-            },
+            Some(oid) => StagedRef::Packed(
+                oid,
+                digest.ok_or_else(|| {
+                    Error::Module("forge: a head update needs a pack digest".into())
+                })?,
+            ),
         };
         self.staged.insert(branch.to_string(), fate);
         Ok(())
     }
 
-    /// publish every staged branch (the `commit_block` half): move/unbind
-    /// on-disk refs for Local/Delete fates, publish Packed heads to the
-    /// committed map + record their materialization targets, then attempt the
-    /// node-local catch-up opportunistically.
+    /// publish every staged branch (the `commit_block` half): publish packed
+    /// heads to the committed map + record their materialization targets, or
+    /// unbind deletes, then attempt node-local catch-up opportunistically.
     pub fn publish(
         &mut self,
         base: &Path,
@@ -183,12 +181,6 @@ impl RepoState {
         let staged = std::mem::take(&mut self.staged);
         for (branch, fate) in staged {
             match fate {
-                StagedRef::Local(oid) => {
-                    let repo = open_or_init_repo(base, name)?;
-                    git::update_ref(&repo, &full_ref(&branch), oid)
-                        .map_err(|e| Error::Module(e.to_string()))?;
-                    self.refs.insert(branch, oid);
-                }
                 StagedRef::Packed(oid, digest) => {
                     self.refs.insert(branch.clone(), oid);
                     self.pending.insert(branch.clone(), (oid, digest));
@@ -339,17 +331,34 @@ mod tests {
         let mut st = RepoState::default();
         let a = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         let b = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let digest = [7u8; 32];
+
+        let mut missing_pack = RepoState::default();
+        assert!(
+            missing_pack
+                .stage_update("feat", None, Some(a), None)
+                .is_err(),
+            "every born head is backed by an off-chain pack"
+        );
 
         // unborn branch: prev must be None.
         assert!(st.stage_update("feat", Some(a), Some(b), None).is_err());
-        st.stage_update("feat", None, Some(a), None).unwrap();
+        st.stage_update("feat", None, Some(a), Some(digest))
+            .unwrap();
         // double-stage in one block is rejected.
-        assert!(st.stage_update("feat", None, Some(b), None).is_err());
+        assert!(
+            st.stage_update("feat", None, Some(b), Some(digest))
+                .is_err()
+        );
 
         // committed CAS.
         st.refs.insert("main".into(), a);
-        assert!(st.stage_update("main", Some(b), Some(a), None).is_err());
-        st.stage_update("main", Some(a), Some(b), None).unwrap();
+        assert!(
+            st.stage_update("main", Some(b), Some(a), Some(digest))
+                .is_err()
+        );
+        st.stage_update("main", Some(a), Some(b), Some(digest))
+            .unwrap();
 
         // Protected branches cannot be deleted; neither can unborn branches.
         let mut st2 = RepoState::default();

@@ -158,11 +158,10 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             },
             Msg {
                 target: "forge".into(),
-                payload: forge::encode_msg(&forge::ForgeMsg::Commit {
-                    repo: String::new(),
-                    path: "README.md".into(),
-                    content: "# ducktape\n".into(),
-                    message: "init".into(),
+                payload: forge::encode_msg(&forge::ForgeMsg::OpenIssue {
+                    repo: "demo".into(),
+                    title: "State-sync the Forge tracker".into(),
+                    body: "Git objects use the separate PushRefs data plane".into(),
                 }),
             },
             Msg {

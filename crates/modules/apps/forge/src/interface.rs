@@ -3,8 +3,8 @@
 //! forge is a git-backed module: its state is a NAMED NAMESPACE of git repos,
 //! addressed by a repo slug (`[a-z0-9._-]`, 1..=64 bytes). its `root()` is a
 //! canonical sorted hash over the committed HEAD oid of every repo that has a
-//! head. writes go via [`ForgeMsg`] (a file put + commit, or a git push); reads
-//! via [`ForgeQuery`] -> [`ForgeReply`], returning HEAD oids as hex.
+//! head. git writes go via [`ForgeMsg::PushRefs`]; reads via [`ForgeQuery`] ->
+//! [`ForgeReply`], returning HEAD oids as hex.
 //!
 //! ## the default repo
 //!
@@ -21,11 +21,10 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 
 /// a write intent at forge.
 ///
-/// the git surface: the file-by-file [`ForgeMsg::Commit`] (forge builds the
-/// commit object itself) and the atomic multi-branch [`ForgeMsg::PushRefs`] —
-/// git-faithful ref updates that adopt a client's REAL commit history by oid,
+/// the git surface is the atomic multi-branch [`ForgeMsg::PushRefs`]: a
+/// git-faithful ref update that adopts a client's real commit history by oid,
 /// with the objects carried out-of-band in a node-local packfile (never in
-/// consensus).
+/// consensus). no consensus path builds Git objects or reads a node-local ODB.
 ///
 /// the tracker surface: GitHub-shaped issues / pull requests / reviews
 /// ([`ForgeMsg::OpenIssue`] .. [`ForgeMsg::SubmitReview`]) — see
@@ -36,13 +35,6 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeMsg {
-    Commit {
-        /// the target repo slug; empty -> the `"default"` repo.
-        repo: String,
-        path: String,
-        content: String,
-        message: String,
-    },
     /// the atomic multi-branch push: every [`RefUpdate`] is a per-branch CAS
     /// against that branch's COMMITTED head, and the whole list stages or the
     /// whole op rejects. `pack_digest` (sha256, 32 raw bytes) locates the ONE
@@ -241,25 +233,20 @@ mod tests {
         // omits the key is rejected. every live producer emits `repo` — the
         // single-repo ergonomic is `repo: ""`, an explicit empty slug that the
         // module maps to the default repo, not an absent key.
-        let no_repo_key = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
-        assert!(
-            decode_msg(no_repo_key).is_err(),
-            "a commit without a repo key must be rejected"
-        );
         let no_repo_push = br#"{"push_refs":{"updates":[{"ref_name":"main","prev_oid":null,"new_oid":[1,2,3]}],"pack_digest":[4,5]}}"#;
         assert!(
             decode_msg(no_repo_push).is_err(),
             "a push_refs without a repo key must be rejected"
         );
         // the explicit empty slug still decodes (single-repo ergonomic).
-        let empty_repo = br#"{"commit":{"repo":"","path":"a.txt","content":"hi","message":"m"}}"#;
+        let empty_repo =
+            br#"{"push_refs":{"repo":"","updates":[],"pack_digest":null}}"#;
         assert_eq!(
             decode_msg(empty_repo).unwrap(),
-            ForgeMsg::Commit {
+            ForgeMsg::PushRefs {
                 repo: String::new(),
-                path: "a.txt".into(),
-                content: "hi".into(),
-                message: "m".into(),
+                updates: Vec::new(),
+                pack_digest: None,
             }
         );
     }

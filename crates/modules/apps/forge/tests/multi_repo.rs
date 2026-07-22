@@ -13,6 +13,8 @@
 //!     to an identical composed root, and a node WITHOUT a push's pack still
 //!     composes the SAME root (the phase-1 determinism invariant, now per-repo).
 
+mod support;
+
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
@@ -23,7 +25,6 @@ use futures::executor::block_on;
 use sdk::{Error, Module, Msg, StateRoot};
 
 const MAIN_REF: &str = "refs/heads/main";
-const OID_LEN: usize = 20;
 
 use sdk_testkit::TestCtx;
 
@@ -48,54 +49,6 @@ fn oid_hex(raw: &[u8]) -> String {
     git2::Oid::from_bytes(raw).unwrap().to_string()
 }
 
-/// parse forge's multi-branch snapshot container into `(name, main_oid, pack)`
-/// (per repo: name, ref_count, per-ref branch+oid, pack; trailing tracker
-/// section ignored here).
-fn parse_container(bytes: &[u8]) -> Vec<(String, Vec<u8>, Vec<u8>)> {
-    fn u32_at(bytes: &[u8], p: &mut usize) -> usize {
-        let v = u32::from_le_bytes(bytes[*p..*p + 4].try_into().unwrap()) as usize;
-        *p += 4;
-        v
-    }
-    let mut p = 4; // skip the 4-byte "FGv1" container magic
-    let count = u32_at(bytes, &mut p);
-    let mut out = Vec::new();
-    for _ in 0..count {
-        let nl = u32_at(bytes, &mut p);
-        let name = String::from_utf8(bytes[p..p + nl].to_vec()).unwrap();
-        p += nl;
-        let ref_count = u32_at(bytes, &mut p);
-        let mut main_oid = Vec::new();
-        for _ in 0..ref_count {
-            let bl = u32_at(bytes, &mut p);
-            let branch = String::from_utf8(bytes[p..p + bl].to_vec()).unwrap();
-            p += bl;
-            let oid = bytes[p..p + OID_LEN].to_vec();
-            p += OID_LEN;
-            if branch == "main" {
-                main_oid = oid;
-            }
-        }
-        let pl = u32_at(bytes, &mut p);
-        let pack = bytes[p..p + pl].to_vec();
-        p += pl;
-        out.push((name, main_oid, pack));
-    }
-    out
-}
-
-fn commit_msg(repo: &str, path: &str, content: &str, message: &str) -> Msg {
-    Msg {
-        target: "forge".into(),
-        payload: encode_msg(&ForgeMsg::Commit {
-            repo: repo.into(),
-            path: path.into(),
-            content: content.into(),
-            message: message.into(),
-        }),
-    }
-}
-
 fn push_msg(repo: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
     Msg {
         target: "forge".into(),
@@ -109,16 +62,6 @@ fn push_msg(repo: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) -> Msg {
             pack_digest: Some(digest.to_vec()),
         }),
     }
-}
-
-/// commit one file to a named repo (execute + publish).
-fn commit_named(forge: &mut Forge, t: u64, repo: &str, path: &str, content: &str, message: &str) {
-    block_on(forge.execute(
-        &mut at(t),
-        &commit_msg(repo, path, content, message),
-    ))
-    .unwrap();
-    block_on(forge.commit_block()).unwrap();
 }
 
 /// push a captured head to a named repo (execute + publish).
@@ -173,14 +116,9 @@ fn on_disk_head(base: &Path, repo: &str) -> Option<git2::Oid> {
 /// source forge's default repo. a pushed head is just an oid + a pack of git
 /// objects, so the source repo NAME is irrelevant to the closure.
 fn make_closure(tag: &str, t: u64, path: &str, content: &str, message: &str) -> (Vec<u8>, Vec<u8>) {
-    let base = tmp_base(tag);
-    let mut src = Forge::init("forge", base.clone()).unwrap();
-    commit_named(&mut src, t, "", path, content, message);
-    let mut entries = parse_container(&src.snapshot().unwrap());
-    assert_eq!(entries.len(), 1);
-    let (_, head, pack) = entries.remove(0);
-    let _ = std::fs::remove_dir_all(&base);
-    (head, pack)
+    let mut commits = support::history(tag, &[(t, path, content, message)]);
+    let commit = commits.remove(0);
+    (commit.head, commit.pack)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,21 +208,21 @@ fn stale_push_on_one_repo_does_not_touch_another() {
 #[test]
 fn empty_repo_targets_default_and_is_addressable() {
     let base = tmp_base("compat");
-    let mut f = Forge::init("forge", base.clone()).unwrap();
+    let (head, pack) = make_closure("compat-commit", 5, "a.txt", "hi", "m");
+    let blobs = blobstore::BlobHandle::default();
+    let digest = blobs.put_chunk(pack).to_vec();
+    let mut f = Forge::with_blobs("forge", base.clone(), blobs).unwrap();
 
-    // the single-repo wire: a commit with an explicit empty `repo` slug, which
+    // the single-repo wire: a push with an explicit empty `repo` slug, which
     // the module maps to the default repo.
-    let wire = br#"{"commit":{"repo":"","path":"a.txt","content":"hi","message":"m"}}"#;
-    let msg = Msg {
-        target: "forge".into(),
-        payload: wire.to_vec(),
-    };
-    block_on(f.execute(&mut at(5), &msg)).unwrap();
-    block_on(f.commit_block()).unwrap();
+    push(&mut f, "", None, &head, &digest);
 
     // the unit Head query answers the default repo.
     let head = head_query(&f);
-    assert!(head.is_some(), "Head must see the default repo's commit");
+    assert!(
+        head.is_some(),
+        "Head must see the default repo's pushed commit"
+    );
     // HeadOf("default") and HeadOf("") resolve to the same repo.
     assert_eq!(head_of(&f, "default"), head);
     assert_eq!(head_of(&f, ""), head);
@@ -308,8 +246,11 @@ fn empty_repo_targets_default_and_is_addressable() {
 #[test]
 fn head_of_reads_named_repos_and_bad_slugs_are_rejected() {
     let base = tmp_base("headof");
-    let mut f = Forge::init("forge", base.clone()).unwrap();
-    commit_named(&mut f, 1, "docs", "r.md", "hello", "c");
+    let (head, pack) = make_closure("headof-commit", 1, "r.md", "hello", "c");
+    let blobs = blobstore::BlobHandle::default();
+    let digest = blobs.put_chunk(pack).to_vec();
+    let mut f = Forge::with_blobs("forge", base.clone(), blobs).unwrap();
+    push(&mut f, "docs", None, &head, &digest);
 
     let on_disk = on_disk_head(&base, "docs").unwrap().to_string();
     assert_eq!(head_of(&f, "docs"), Some(on_disk), "HeadOf reads the repo");
@@ -318,7 +259,7 @@ fn head_of_reads_named_repos_and_bad_slugs_are_rejected() {
     // a bad slug in a write is rejected DETERMINISTICALLY at execute.
     for bad in ["BAD", "a/b", "..", "with space"] {
         let err =
-            block_on(f.execute(&mut at(2), &commit_msg(bad, "x", "y", "z"))).unwrap_err();
+            block_on(f.execute(&mut at(2), &push_msg(bad, None, &head, &digest))).unwrap_err();
         assert!(matches!(err, Error::Module(_)), "{bad:?} must reject");
     }
     // a bad slug in a HeadOf query also errs (never a silent None).
@@ -339,17 +280,20 @@ fn head_of_reads_named_repos_and_bad_slugs_are_rejected() {
 
 #[test]
 fn multi_repo_snapshot_round_trips_and_pack_less_node_composes_the_same_root() {
-    // a pushed closure for the third repo.
+    let (ha, pa) = make_closure("rt-alpha", 1, "a.txt", "AAA", "ca");
+    let (hb, pb) = make_closure("rt-beta", 2, "b.txt", "BBB", "cb");
     let (hp, pp) = make_closure("rt-push", 9, "p.txt", "pushed", "cp");
 
-    // a source with three repos: two by Commit, one by Push (the submitter holds
-    // the pack, so gamma materializes on disk).
+    // The source holds all three off-chain packs, so every pushed repo
+    // materializes before it serves the snapshot.
     let src_base = tmp_base("rt-src");
     let src_blobs = blobstore::BlobHandle::default();
+    let da = src_blobs.put_chunk(pa).to_vec();
+    let db = src_blobs.put_chunk(pb).to_vec();
     let dp = src_blobs.put_chunk(pp.clone()).to_vec();
     let mut src = Forge::with_blobs("forge", src_base.clone(), src_blobs).unwrap();
-    commit_named(&mut src, 1, "alpha", "a.txt", "AAA", "ca");
-    commit_named(&mut src, 2, "beta", "b.txt", "BBB", "cb");
+    push(&mut src, "alpha", None, &ha, &da);
+    push(&mut src, "beta", None, &hb, &db);
     push(&mut src, "gamma", None, &hp, &dp);
     let src_root = src.root();
     assert_ne!(src_root, StateRoot::ZERO);
@@ -378,11 +322,11 @@ fn multi_repo_snapshot_round_trips_and_pack_less_node_composes_the_same_root() {
     // LACKS the push pack. root must still compose to src_root — pack possession
     // is per-node, root is not.
     let nopack_base = tmp_base("rt-nopack");
-    let nopack_blobs = blobstore::BlobHandle::default(); // never holds pp
+    let nopack_blobs = blobstore::BlobHandle::default();
     let mut nopack = Forge::with_blobs("forge", nopack_base.clone(), nopack_blobs).unwrap();
-    commit_named(&mut nopack, 1, "alpha", "a.txt", "AAA", "ca");
-    commit_named(&mut nopack, 2, "beta", "b.txt", "BBB", "cb");
-    push(&mut nopack, "gamma", None, &hp, &dp); // digest known, pack absent
+    push(&mut nopack, "alpha", None, &ha, &da);
+    push(&mut nopack, "beta", None, &hb, &db);
+    push(&mut nopack, "gamma", None, &hp, &dp);
 
     assert_eq!(
         nopack.root(),
@@ -390,15 +334,15 @@ fn multi_repo_snapshot_round_trips_and_pack_less_node_composes_the_same_root() {
         "a pack-less node composes the SAME root (per-repo P1 determinism)"
     );
     assert_eq!(head_of(&nopack, "gamma"), Some(oid_hex(&hp)));
-    // the ONLY difference is node-local: gamma is not materialized on disk…
-    assert_eq!(
-        on_disk_head(&nopack_base, "gamma"),
-        None,
-        "no pack -> gamma's on-disk ref stays behind"
-    );
-    // …while the commit-built repos ARE on disk.
-    assert!(on_disk_head(&nopack_base, "alpha").is_some());
-    assert!(on_disk_head(&nopack_base, "beta").is_some());
+    // The only difference is node-local: no repo can materialize without its
+    // pack, while all three consensus heads and the composed root still match.
+    for repo in ["alpha", "beta", "gamma"] {
+        assert_eq!(
+            on_disk_head(&nopack_base, repo),
+            None,
+            "no pack -> {repo}'s on-disk ref stays behind"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&src_base);
     let _ = std::fs::remove_dir_all(&dst_base);
