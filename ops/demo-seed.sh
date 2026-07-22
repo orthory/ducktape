@@ -51,8 +51,6 @@ read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostn
 WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close()')"
 # Gateway serving needs the app's workspace_create posture:
 #   --gateway            binds the isolated browser plane that serves the routes
-#   --wireguard-effect   the userspace (TUN-less) overlay — no /dev/net/tun, no
-#     socket             privilege; the default "tun" effect can't start without them
 #   --wireguard-listen   a CONCRETE UDP port (0.0.0.0 = endpoint-less/roaming,
 #     0.0.0.0:$WGP       like the app), so the overlay comes up instead of being
 #                        skipped on port 0
@@ -63,7 +61,7 @@ CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
   --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
-  --wireguard-effect socket --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
+  --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
 PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 

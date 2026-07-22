@@ -139,8 +139,7 @@ struct Backend {
 }
 
 /// `WireGuardEffect` over the in-process userspace overlay. construct once
-/// per interface (like `DefguardWireGuardEffect::new`), with the tokio
-/// runtime the pumps should live on injected.
+/// per interface, with the tokio runtime the pumps should live on injected.
 pub struct UserspaceWireGuardEffect {
     handle: tokio::runtime::Handle,
     /// `Some` between `create_interface` and `remove_interface`; the inner

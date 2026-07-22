@@ -110,43 +110,6 @@ fn identity_hex(seed: u64) -> String {
         .collect()
 }
 
-/// run `ducktape node run --config <config> <extra…>` with combined output to
-/// `log`, polling until it exits on its own or `timeout` elapses (then kill +
-/// reap). Returns `(exit code, captured log)`; `None` code means it was killed
-/// for timing out — a HANG, which for the honest-terminal path is a failure.
-fn run_node_until_exit(
-    config: &Path,
-    extra: &[&str],
-    log: &Path,
-    timeout: Duration,
-) -> (Option<i32>, String) {
-    let out = std::fs::File::create(log).expect("create node log");
-    let err = out.try_clone().expect("clone node log handle");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-        .arg("run")
-        .arg("--config")
-        .arg(config)
-        .args(extra)
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .expect("spawn ducktape");
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll node") {
-            let text = std::fs::read_to_string(log).unwrap_or_default();
-            return (status.code(), text);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let text = std::fs::read_to_string(log).unwrap_or_default();
-            return (None, text);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 #[test]
 fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     let _serial = serial();
@@ -315,95 +278,6 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     );
 }
 
-/// A coordinated-only invite (the inviter offers no direct underlay endpoint,
-/// no fronts) on a node running the real kernel-TUN effect has NOTHING to race:
-/// the userspace rendezvous the coordinated path needs is inactive under TUN,
-/// so the by-identity candidate is dropped and the joiner hits the HONEST
-/// terminal — a distinct non-zero exit with a mode-naming FATAL, never a hang
-/// and never a silent success.
-#[test]
-fn coordinated_only_invite_on_a_tun_node_fails_honestly() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let founder = dir.path().join("founder");
-    let friend = dir.path().join("friend");
-
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-        .args([
-            "init",
-            "--name",
-            "coordinated-honest-terminal",
-            "--dir",
-            founder.to_str().expect("utf-8 founder dir"),
-        ])
-        .output()
-        .expect("run init");
-    assert!(
-        init.status.success(),
-        "init failed:\n{}",
-        command_output(&init)
-    );
-
-    // a default founder advertises the overlay ULA (not a routable host), so its
-    // WireGuard bootstrap is coordinated-only — no underlay endpoint baked in.
-    keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-        .args(["invite", "--config"])
-        .arg(founder.join("node.toml"))
-        .output()
-        .expect("run invite");
-    assert!(
-        invite.status.success(),
-        "invite failed:\n{}",
-        command_output(&invite)
-    );
-    let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
-
-    // join in TUN mode: the friend's node.toml carries `wireguard_effect = "tun"`.
-    let ports = alloc_ports(4);
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
-        .args([
-            "join",
-            &blob,
-            "--dir",
-            friend.to_str().expect("utf-8 friend dir"),
-            "--listen",
-            &format!("127.0.0.1:{}", ports[0]),
-            "--advertised",
-            &format!("127.0.0.1:{}", ports[0]),
-            "--http",
-            &format!("127.0.0.1:{}", ports[1]),
-            "--rpc",
-            &format!("127.0.0.1:{}", ports[2]),
-            "--wireguard-effect",
-            "tun",
-        ])
-        .output()
-        .expect("run join");
-    assert!(
-        join.status.success(),
-        "join failed:\n{}",
-        command_output(&join)
-    );
-
-    let (code, log) = run_node_until_exit(
-        &friend.join("node.toml"),
-        &[],
-        &dir.path().join("friend-run.log"),
-        Duration::from_secs(90),
-    );
-    assert!(
-        log.contains("first contact failed across all"),
-        "a coordinated-only invite under TUN must surface the HONEST first-contact terminal, not \
-         hang or silently proceed:\n{log}"
-    );
-    assert_eq!(
-        code,
-        Some(3),
-        "the honest terminal exits with a distinct non-zero code (never a silent success):\n{log}"
-    );
-}
-
 /// The field failure this branch fixes, end to end through the REAL binary: a
 /// node boots while its coordinator is DARK (machine woke before its network,
 /// coordinator restarting) and the coordinator only comes up LATER. The plane
@@ -437,8 +311,6 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
             "coordinator-heal",
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
-            "--wireguard-effect",
-            "socket",
             "--wireguard-listen",
             &format!("127.0.0.1:{wg_port}"),
             "--primary-coordinator",
@@ -545,7 +417,13 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     let founder = dir.path().join("founder");
 
     // a socket-mode network whose only coordinator is an unroutable blackhole
-    // (RFC5737 TEST-NET-3 — guaranteed never to answer).
+    // (RFC5737 TEST-NET-3 — guaranteed never to answer). every surface gets
+    // an explicit ephemeral-range port: init's working defaults (52200,
+    // 8844/8845, 51820) would collide with a real node on this host.
+    let ports = alloc_ports(3);
+    let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
+    let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
+    drop(wg_probe);
     let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
         .args([
             "init",
@@ -553,10 +431,18 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
             "coordinator-degrade",
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
-            "--wireguard-effect",
-            "socket",
             "--primary-coordinator",
             "203.0.113.1:3478",
+            "--listen",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--advertised",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--http",
+            &format!("127.0.0.1:{}", ports[1]),
+            "--rpc",
+            &format!("127.0.0.1:{}", ports[2]),
+            "--wireguard-listen",
+            &format!("127.0.0.1:{wg_port}"),
         ])
         .output()
         .expect("run init");

@@ -12,9 +12,9 @@
 //!
 //! two backends live behind the boundary ([`OverlayBackend`]):
 //!
-//! - the TUN pass-through (`tun`): the kernel routes overlay ULAs through
-//!   the WireGuard interface, so the backend's answer IS the OS socket and
-//!   behavior is bit-identical to routing nothing at all.
+//! - the OS pass-through (`passthrough`): no reachability plane, no
+//!   overlay — the backend's answer IS the OS socket, and overlay dials
+//!   fail like a downed interface.
 //! - the userspace backend (ADR phases 1–2, [`userspace`]): overlay
 //!   connections terminate in the in-process smoltcp host, carried as the
 //!   `Virtual` arm of the [`OverlayListener`]/[`OverlaySink`]/
@@ -34,7 +34,7 @@ use commonware_runtime::{
     Resolver, Sink, SinkOf, Spawner, Stream, StreamOf, Supervisor, signal, telemetry,
 };
 
-mod tun;
+mod passthrough;
 pub mod userspace;
 
 use userspace::StackSlot;
@@ -79,13 +79,14 @@ impl OverlayRouter {
 
 // ── Backend selection ───────────────────────────────────
 
-/// where overlay-routed connections terminate — the per-node backend choice
-/// the ADR's `wireguard_effect = socket | tun` config resolves to.
+/// where overlay-routed connections terminate — the plane-follows-config
+/// choice: a configured reachability plane runs `Userspace`, no plane runs
+/// `Passthrough`.
 #[derive(Clone)]
 pub enum OverlayBackend {
-    /// TUN pass-through: the kernel routes overlay ULAs through the
-    /// WireGuard interface, so overlay connections ride ordinary OS sockets.
-    Tun,
+    /// OS pass-through: no overlay — overlay dials/binds hit the plain OS
+    /// network and fail like a downed interface.
+    Passthrough,
     /// userspace: overlay connections terminate in the in-process virtual
     /// stack.
     Userspace {
@@ -120,7 +121,7 @@ pub struct OverlayContext<E> {
 impl<E> OverlayContext<E> {
     /// the TUN-backed context — every shipped caller's arm.
     pub fn new(inner: E, router: OverlayRouter) -> Self {
-        Self::with_backend(inner, router, OverlayBackend::Tun)
+        Self::with_backend(inner, router, OverlayBackend::Passthrough)
     }
 
     pub fn with_backend(inner: E, router: OverlayRouter, backend: OverlayBackend) -> Self {
@@ -309,7 +310,9 @@ impl<E: Network> Network for OverlayContext<E> {
             return Ok(OverlayListener::Os(self.inner.bind(socket).await?));
         }
         match &self.backend {
-            OverlayBackend::Tun => Ok(OverlayListener::Os(tun::bind(&self.inner, socket).await?)),
+            OverlayBackend::Passthrough => {
+                Ok(OverlayListener::Os(passthrough::bind(&self.inner, socket).await?))
+            }
             OverlayBackend::Userspace { slot, .. } => Ok(OverlayListener::Virtual(
                 userspace::seam::bind(slot, socket).await?,
             )),
@@ -322,8 +325,8 @@ impl<E: Network> Network for OverlayContext<E> {
             return Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)));
         }
         match &self.backend {
-            OverlayBackend::Tun => {
-                let (sink, stream) = tun::dial(&self.inner, socket).await?;
+            OverlayBackend::Passthrough => {
+                let (sink, stream) = passthrough::dial(&self.inner, socket).await?;
                 Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)))
             }
             OverlayBackend::Userspace { slot, .. } => {

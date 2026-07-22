@@ -64,7 +64,6 @@ pub(super) async fn wire(
     label: String,
     namespace: Vec<u8>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
@@ -203,7 +202,6 @@ pub(super) async fn wire(
                     &wireguard_key_file,
                     &mesh_state_file,
                     wg_addr,
-                    wireguard_effect,
                     overlay_slot.clone(),
                     advertised_reach,
                     wireguard_advertised,
@@ -268,15 +266,11 @@ pub(super) async fn wire(
                 }
             }
         });
-        let raw = first_contact_join::build_candidates(inviter, &invite_fronts);
-        if raw.is_empty() {
+        let candidates = first_contact_join::build_candidates(inviter, &invite_fronts);
+        if candidates.is_empty() {
             // the invite offered no wireguard/front bootstrap — the join
             // rides the descriptor's reach hints, exactly as before.
         } else {
-            let candidates = first_contact_join::plan_race(
-                raw,
-                matches!(wireguard_effect, config::WireGuardEffectKind::Tun),
-            );
             match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
                 Ok((keypair, _)) => {
                     // this joiner's own token-signed intro, built once

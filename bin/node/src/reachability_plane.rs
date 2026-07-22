@@ -6,7 +6,7 @@ use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
 
-use crate::config::{self, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, hex_bytes};
 use crate::constants::NUDGE_INTERVAL;
 use crate::lobby;
 
@@ -210,9 +210,7 @@ async fn gate_reply(
 
 /// the reachability plane's thread body: derive the plane's endpoints, bind
 /// the nat client against the coordinated-reach coordinators, and drive
-/// `reachability::run` with the configured WireGuard effect — real (an
-/// actual interface via the userspace WireGuard runtime) by default,
-/// in-memory fake when `wireguard_effect = "fake"` opts out. every failure
+/// `reachability::run` on the in-process userspace backend. every failure
 /// path prints and returns — the plane is an overlay on a working node,
 /// never a reason to take the node down.
 /// Wire the staged WireGuard reachability plane onto an already-registered
@@ -232,7 +230,6 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_key_file: &std::path::Path,
     mesh_state_file: &std::path::Path,
     wireguard_listen: std::net::SocketAddr,
-    wireguard_effect: WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
     // an explicit WireGuard advertise override (node.toml
@@ -281,7 +278,6 @@ where
                     key_file,
                     state_file,
                     wireguard_listen,
-                    wireguard_effect,
                     overlay_slot,
                     advertised,
                     wireguard_advertised,
@@ -346,7 +342,6 @@ where
                             tracing::info!(
                                 target: "ducktape::reachability",
                                 node = %pump_label, epoch, %interface, peers,
-                                backend = ?wireguard_effect,
                                 "tunnels applied (config accepted — the handshake is reported \
                                  separately)"
                             )
@@ -436,7 +431,6 @@ async fn reachability_plane(
     // re-applies it from at boot (the cold-restart path).
     mesh_state_file: PathBuf,
     wireguard_listen: std::net::SocketAddr,
-    effect_kind: WireGuardEffectKind,
     // the seam's stack handle (socket mode): created by the node so the mesh
     // context and the data-plane factory hold it BEFORE this thread exists;
     // the socket-mode effect publishes/clears the live stack through it.
@@ -576,48 +570,38 @@ async fn reachability_plane(
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
-    // socket mode owns the underlay socket from PLANE START, not first
+    // the plane owns the underlay socket from PLANE START, not first
     // apply: the NAT client below rides it (reflexive discovery,
     // registration, keepalives, and the punch all originate from the
     // tunnel's own 5-tuple — the pinhole a punch opens is only good for the
     // socket it originated from), and it survives interface rebuilds so the
     // coordinator mapping stays warm while a tunnel is torn down/re-applied.
-    let socket_underlay = match effect_kind {
-        WireGuardEffectKind::Socket => {
-            match overlay_net::userspace::UnderlaySocket::bind(
-                &tokio::runtime::Handle::current(),
-                wireguard_listen.port(),
-            ) {
-                Ok(underlay) => Some(underlay),
-                Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: underlay udp/{} bind failed: {err} — \
-                         plane not started",
-                        wireguard_listen.port()
-                    );
-                    return;
-                }
-            }
+    let socket_underlay = match overlay_net::userspace::UnderlaySocket::bind(
+        &tokio::runtime::Handle::current(),
+        wireguard_listen.port(),
+    ) {
+        Ok(underlay) => underlay,
+        Err(err) => {
+            eprintln!(
+                "[node {label}] reachability: underlay udp/{} bind failed: {err} — \
+                 plane not started",
+                wireguard_listen.port()
+            );
+            return;
         }
-        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => None,
     };
-    // the coordinated intro lane rides the shared underlay socket, so it
-    // exists whenever that socket does — INCLUDING on a node that binds no
-    // direct intro listener below (a NAT'd desktop's only join door is
-    // this lane).
-    let (invite_intro_tx, mut invite_intro_rx) = if socket_underlay.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    // the coordinated intro lane rides the shared underlay socket —
+    // INCLUDING on a node that binds no direct intro listener below (a
+    // NAT'd desktop's only join door is this lane).
+    let (invite_intro_tx, invite_intro_rx) = tokio::sync::mpsc::channel(32);
+    let (invite_intro_tx, mut invite_intro_rx) = (Some(invite_intro_tx), Some(invite_intro_rx));
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
     // carries the genesis-issued cap. A fully-open coordinator ignores the
     // authenticator; a public/private one requires it. With no coordinators
     // configured `bind` short-circuits to pass-through and never touches this.
     let resolver = match &socket_underlay {
-        Some(underlay) if !coords.is_empty() => {
+        underlay if !coords.is_empty() => {
             let bypass = underlay
                 .take_bypass()
                 .expect("a fresh underlay socket still holds its bypass lane");
@@ -876,81 +860,26 @@ async fn reachability_plane(
             }
         }
     });
-    match effect_kind {
-        WireGuardEffectKind::Fake => {
-            println!(
-                "[node {label}] reachability: wireguard_effect = \"fake\" — tunnel configs are \
-                 recorded in memory; no real interface is touched"
-            );
-            if let Err(err) = reachability::run(
-                config,
-                wireguard::effect::FakeWireGuardEffect::default(),
-                resolver,
-                commands,
-                events,
-            )
-            .await
-            {
-                eprintln!("[node {label}] reachability plane exited: {err}");
-            }
-        }
-        WireGuardEffectKind::Socket => {
-            let underlay = socket_underlay.expect("bound above for socket mode");
-            println!(
-                "[node {label}] reachability: driving the userspace socket backend (TUN-less; \
-                 no interface, no privilege — overlay reachability lives inside this process)"
-            );
-            let effect = overlay_net::userspace::UserspaceWireGuardEffect::with_shared_underlay(
-                tokio::runtime::Handle::current(),
-                overlay_slot,
-                underlay,
-            );
-            // take the probe BEFORE the effect is moved into the orchestrator.
-            spawn_handshake_sampler(effect.probe_slot(), label.clone());
-            if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
-                tracing::error!(
-                    target: "ducktape::reachability",
-                    node = %label,
-                    error = %err,
-                    "reachability plane EXITED — this node has no overlay for the rest of \
-                     this boot"
-                );
-            }
-        }
-        WireGuardEffectKind::Tun => {
-            #[cfg(unix)]
-            {
-                // same name the orchestrator writes into every
-                // InterfaceConfiguration it applies — the WGApi handle and
-                // the configs it receives must agree on the interface.
-                let ifname = reachability::interface_name(&config.chain_id);
-                let effect = match wireguard::effect::DefguardWireGuardEffect::new(&ifname) {
-                    Ok(effect) => effect,
-                    Err(err) => {
-                        eprintln!(
-                            "[node {label}] reachability: wireguard api handle for {ifname:?} \
-                             failed ({err}) — plane not started; set wireguard_effect = \
-                             \"fake\" to run without a real interface"
-                        );
-                        return;
-                    }
-                };
-                println!("[node {label}] reachability: driving wireguard interface {ifname}");
-                if let Err(err) =
-                    reachability::run(config, effect, resolver, commands, events).await
-                {
-                    eprintln!("[node {label}] reachability plane exited: {err}");
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                eprintln!(
-                    "[node {label}] reachability: the real wireguard effect needs a unix host — \
-                     plane not started; set wireguard_effect = \"fake\" to run without a real \
-                     interface"
-                );
-            }
-        }
+    let underlay = socket_underlay;
+    println!(
+        "[node {label}] reachability: driving the userspace socket backend (TUN-less; \
+         no interface, no privilege — overlay reachability lives inside this process)"
+    );
+    let effect = overlay_net::userspace::UserspaceWireGuardEffect::with_shared_underlay(
+        tokio::runtime::Handle::current(),
+        overlay_slot,
+        underlay,
+    );
+    // take the probe BEFORE the effect is moved into the orchestrator.
+    spawn_handshake_sampler(effect.probe_slot(), label.clone());
+    if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
+        tracing::error!(
+            target: "ducktape::reachability",
+            node = %label,
+            error = %err,
+            "reachability plane EXITED — this node has no overlay for the rest of \
+             this boot"
+        );
     }
 }
 

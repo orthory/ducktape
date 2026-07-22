@@ -10,7 +10,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 
 use super::identity::load_identity;
-use super::node_toml::NodeToml;
+use super::node_toml::{DevSeedToml, NodeToml};
 use super::{
     Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
     StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap,
@@ -58,11 +58,10 @@ pub struct Resolved {
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
     pub gateway_listen: Option<String>,
-    /// the staged WireGuard reachability plane's advertised UDP endpoint;
-    /// None = plane off.
+    /// the staged WireGuard reachability plane's advertised UDP endpoint
+    /// (userspace socket backend); None = plane off (dev-seed harness
+    /// configs only — the network shape requires it).
     pub wireguard_listen: Option<SocketAddr>,
-    /// which `WireGuardEffect` the plane drives when it is on.
-    pub wireguard_effect: WireGuardEffectKind,
     /// the DIRECT invite intro listener endpoint (`invite_listen`, defaulted
     /// from `wireguard_listen` + 1); `None` when the plane is off — or when
     /// this config can never mint a direct intro endpoint (no dialable
@@ -139,24 +138,37 @@ pub struct Resolved {
     pub sandbox_capacity: BTreeMap<String, u64>,
 }
 
+/// the podman provider image default — also what generation prints into a
+/// fresh node.toml's `sandbox_image`.
+pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/node:22-slim";
+/// the tart provider image default (used when `sandbox = "tart"` and the
+/// operator kept the podman default in `sandbox_image` untouched is NOT a
+/// case we guess about — tart configs set their image).
+pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:latest";
+
 /// resolve the operator's sandbox choice into a spawn backend plus the numeric
 /// capacity a sandboxed node announces. absent/`"direct"` → `Direct` (no
 /// capacity — a direct spawn makes no promise); `"podman"` → `Podman` with the
 /// probed host totals, per-key overrides winning; `"tart"` → `Tart` (ephemeral
 /// macOS VMs, same capacity model); anything else is a loud config error.
-fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
+fn resolve_sandbox(
+    sandbox: Option<&str>,
+    sandbox_image: Option<&str>,
+    sandbox_cores: Option<u64>,
+    sandbox_mem_gb: Option<u64>,
+) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
     // podman and tart share the capacity derivation: probed totals with the
     // operator's per-key overrides winning. the map is validated through THE
     // consensus rule (capability::validate_resources) before it leaves this
     // boundary: a zero override would otherwise pass boot, get announced,
     // and be rejected by the module — wedging the announcer's in-flight
     // latch with a false success log instead of erroring here, loudly.
-    let probed = |raw: &NodeToml| -> Result<BTreeMap<String, u64>, String> {
+    let probed = || -> Result<BTreeMap<String, u64>, String> {
         let mut capacity = crate::host_resources::probe();
-        if let Some(cores) = raw.sandbox_cores {
+        if let Some(cores) = sandbox_cores {
             capacity.insert("cores".into(), cores);
         }
-        if let Some(mem_gb) = raw.sandbox_mem_gb {
+        if let Some(mem_gb) = sandbox_mem_gb {
             capacity.insert("mem_gb".into(), mem_gb);
         }
         capability::validate_resources(&capacity)
@@ -170,21 +182,15 @@ fn resolve_sandbox(raw: &NodeToml) -> Result<(SandboxBackend, BTreeMap<String, u
         }
         Ok(capacity)
     };
-    match raw.sandbox.as_deref() {
+    match sandbox {
         None | Some("direct") => Ok((SandboxBackend::Direct, BTreeMap::new())),
         Some("podman") => {
-            let image = raw
-                .sandbox_image
-                .clone()
-                .unwrap_or_else(|| "docker.io/library/node:22-slim".into());
-            Ok((SandboxBackend::Podman { image }, probed(raw)?))
+            let image = sandbox_image.unwrap_or(DEFAULT_PODMAN_IMAGE).to_string();
+            Ok((SandboxBackend::Podman { image }, probed()?))
         }
         Some("tart") => {
-            let image = raw
-                .sandbox_image
-                .clone()
-                .unwrap_or_else(|| "ghcr.io/cirruslabs/macos-sonoma-base:latest".into());
-            let capacity = probed(raw)?;
+            let image = sandbox_image.unwrap_or(DEFAULT_TART_IMAGE).to_string();
+            let capacity = probed()?;
             if capacity.get("cores").copied().unwrap_or(0) < capability_host::TART_MIN_CORES {
                 return Err(format!(
                     "sandbox capacity: Tart requires at least {} cores",
@@ -216,18 +222,17 @@ fn absolute_runtime_path(path: &Path) -> Result<PathBuf, String> {
 /// (network, key_file, storage_dir) resolve relative to the file's directory,
 /// so a workspace directory is relocatable.
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
-    let text = std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
-    let raw: NodeToml = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
-    if raw.network.is_some() {
-        let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
-        resolve_network_shape(&base, raw)
-    } else {
-        resolve_dev_shape(raw)
+    match super::node_toml::load_raw_node_toml(cfg_path)? {
+        (super::node_toml::RawNodeToml::Network(raw), _) => {
+            let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
+            resolve_network_shape(&base, raw)
+        }
+        (super::node_toml::RawNodeToml::DevSeed(raw), _) => resolve_dev_shape(raw),
     }
 }
 
 fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String> {
-    let descriptor_path = base.join(raw.network.as_deref().expect("checked by caller"));
+    let descriptor_path = base.join(&raw.network);
     let descriptor = NetworkDescriptor::load(&descriptor_path)?;
     if descriptor.scheme != SCHEME_ED25519 {
         return Err(format!(
@@ -235,7 +240,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
             descriptor.chain_id, descriptor.scheme
         ));
     }
-    let key_path = base.join(raw.key_file.as_deref().unwrap_or("identity.key"));
+    let key_path = base.join(&raw.key_file);
     let signer = load_identity(&key_path).map_err(|e| {
         format!("{e} — run `ducktape node init` or `ducktape node join <invite>` first")
     })?;
@@ -279,24 +284,31 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
     let advertised = resolve_advertised(
-        raw.advertised.as_deref(),
+        Some(&raw.advertised),
         listen,
         &descriptor.genesis_namespace(),
         &me,
     )?;
     let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
-    let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
-    let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
-    let invite_listen = resolved_intro_listener(&raw, wireguard_listen)?;
-    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
-    let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
-    // Existing workspaces predate `gateway_listen`. Any node already exposing
-    // the app surface gets the safe loopback/ephemeral gateway automatically;
-    // no registry or node.toml migration (and no stale port) is required.
-    let gateway_listen = raw
-        .gateway_listen
-        .clone()
-        .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
+    let wireguard_listen: SocketAddr = raw
+        .wireguard_listen
+        .parse()
+        .map_err(|e| format!("wireguard_listen: {e}"))?;
+    let wireguard_listen = Some(wireguard_listen);
+    let invite_listen = resolved_intro_listener(
+        Some(&raw.advertised),
+        &raw.listen,
+        Some(&raw.invite_listen),
+        raw.wireguard_advertised_value(),
+        wireguard_listen,
+    )?;
+    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(
+        Some(&raw.sandbox),
+        Some(&raw.sandbox_image),
+        (raw.sandbox_cores != 0).then_some(raw.sandbox_cores),
+        (raw.sandbox_mem_gb != 0).then_some(raw.sandbox_mem_gb),
+    )?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -309,21 +321,20 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         coordinated,
         listen,
         advertised,
-        storage_dir: base.join(raw.storage_dir.as_deref().unwrap_or("storage")),
-        rpc_listen: raw.rpc_listen,
-        http_listen: raw.http_listen,
-        gateway_listen,
+        storage_dir: base.join(&raw.storage_dir),
+        rpc_listen: Some(raw.rpc_listen),
+        http_listen: Some(raw.http_listen),
+        gateway_listen: Some(raw.gateway_listen),
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file: base.join("wireguard.key"),
         invite_listen,
         dev_demo: false,
-        checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
+        checkpoint_blocks: raw.checkpoint_blocks,
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
-        sync_index: raw.sync_index.unwrap_or(false),
-        announce_capabilities: raw.announce_capabilities.unwrap_or(false),
+        sync_index: raw.sync_index,
+        announce_capabilities: raw.announce_capabilities,
         coordination: descriptor.coordination(),
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
@@ -332,8 +343,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         // the config directory: identity.key / network.toml / coord.cap live
         // here, so a joiner persists a delivered cap into it.
         workspace: base.to_path_buf(),
-        primary_coordinator: raw.primary_coordinator,
-        coordinator_relay: raw.coordinator_relay,
+        primary_coordinator: Some(raw.primary_coordinator),
+        coordinator_relay: Some(raw.coordinator_relay),
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -346,12 +357,6 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
             .map_err(|e| format!("wireguard_listen: {e}"))
     })
     .transpose()
-}
-
-/// the parsed `wireguard_listen`, for callers working off a raw `NodeToml`
-/// (the CLI verbs) rather than a full `resolve`.
-pub fn resolved_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, String> {
-    parse_wireguard_listen(raw)
 }
 
 /// resolve `wireguard_advertised` into a dial ingress: absent = "derive from
@@ -376,23 +381,19 @@ fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, Stri
 /// a kernel intro listener would sit unreachable by construction — while
 /// tripping host firewall prompts (macOS asks about every wildcard bind).
 fn resolved_intro_listener(
-    raw: &NodeToml,
+    advertised: Option<&str>,
+    listen: &str,
+    invite_listen: Option<&str>,
+    wireguard_advertised: Option<&str>,
     wireguard_listen: Option<SocketAddr>,
 ) -> Result<Option<SocketAddr>, String> {
     let Some(wg) = wireguard_listen else {
         return Ok(None);
     };
-    if endpoint_host(
-        raw.advertised.as_deref(),
-        &raw.listen,
-        wg,
-        raw.wireguard_advertised.as_deref(),
-    )
-    .is_err()
-    {
+    if endpoint_host(advertised, listen, wg, wireguard_advertised).is_err() {
         return Ok(None);
     }
-    resolved_invite_listen(raw.invite_listen.as_deref(), wg).map(Some)
+    resolved_invite_listen(invite_listen, wg).map(Some)
 }
 
 /// the invite intro listener endpoint: explicit `invite_listen`, else the
@@ -470,30 +471,6 @@ pub fn invite_wireguard_endpoint(
     Ok(format!("{host}:{}", wireguard_listen.port()))
 }
 
-/// which `WireGuardEffect` implementation the reachability plane drives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireGuardEffectKind {
-    /// the TUN-less in-process backend (overlay-net ADR): BoringTun `Tunn`s
-    /// + smoltcp behind the overlay seam, no privilege, no host mutation.
-    Socket,
-    /// configure an actual interface through the userspace WireGuard runtime.
-    Tun,
-    /// record configurations in memory without touching the network stack.
-    Fake,
-}
-
-pub(super) fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, String> {
-    match raw {
-        Some("socket") => Ok(WireGuardEffectKind::Socket),
-        // "real" predates the socket backend and stays as an alias for the
-        // interface-backed path it always meant.
-        None | Some("tun") | Some("real") => Ok(WireGuardEffectKind::Tun),
-        Some("fake") => Ok(WireGuardEffectKind::Fake),
-        Some(other) => Err(format!(
-            "wireguard_effect: {other:?} is not \"socket\", \"tun\" (alias \"real\"), or \"fake\""
-        )),
-    }
-}
 
 /// resolve the `advertised` config value into a dial ingress. the sentinel
 /// `"overlay"` advertises this node's chain-derived WireGuard overlay address
@@ -537,21 +514,26 @@ fn resolve_advertised(
 
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
-fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
+fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // resolved before any field of `raw` is moved out below (they borrow the
     // whole struct).
-    let (sandbox, sandbox_capacity) = resolve_sandbox(&raw)?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(
+        raw.sandbox.as_deref(),
+        raw.sandbox_image.as_deref(),
+        raw.sandbox_cores,
+        raw.sandbox_mem_gb,
+    )?;
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
-    let invite_listen = resolved_intro_listener(&raw, wireguard_listen)?;
-    let id = raw
-        .id
-        .ok_or("a dev-shape config needs `id` (or add `network = ...`)")?;
-    let namespace = raw
-        .namespace
-        .ok_or("a dev-shape config needs `namespace`")?;
-    let peer_seeds = raw
-        .peer_seeds
-        .ok_or("a dev-shape config needs `peer_seeds`")?;
+    let invite_listen = resolved_intro_listener(
+        raw.advertised.as_deref(),
+        &raw.listen,
+        raw.invite_listen.as_deref(),
+        raw.wireguard_advertised.as_deref(),
+        wireguard_listen,
+    )?;
+    let id = raw.id;
+    let namespace = raw.namespace;
+    let peer_seeds = raw.peer_seeds;
     let validator_seeds = raw
         .validator_seeds
         .clone()
@@ -605,7 +587,6 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         Some(path) => absolute_runtime_path(Path::new(&path))?,
         None => std::env::temp_dir().join(format!("ducktape-{id}")),
     };
-    let wireguard_effect = parse_wireguard_effect(raw.wireguard_effect.as_deref())?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
     let gateway_listen = raw
         .gateway_listen
@@ -636,7 +617,6 @@ fn resolve_dev_shape(raw: NodeToml) -> Result<Resolved, String> {
         http_listen: raw.http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         invite_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
@@ -695,8 +675,10 @@ mod tests {
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:52250\"\n\
-             advertised = \"my-tunnel.example.com:443\"\n",
+            network_shape_toml(&[
+                ("listen", "\"127.0.0.1:52250\""),
+                ("advertised", "\"my-tunnel.example.com:443\""),
+            ]),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
@@ -733,7 +715,10 @@ mod tests {
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:52240\"\n",
+            network_shape_toml(&[
+                ("listen", "\"127.0.0.1:52240\""),
+                ("advertised", "\"127.0.0.1:52240\""),
+            ]),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
@@ -745,12 +730,12 @@ mod tests {
     }
 
     #[test]
-    fn a_non_wg_joiner_resolves_with_zero_reachability_config() {
-        // the zero-config joiner contract, non-WG shape: a network-shape
-        // config with NO `advertised` and a listen that is not dialable
-        // (loopback-ephemeral — cmd_join's non-WG default plumbing) must
-        // resolve: the joiner only ever dials OUT to the descriptor's reach
-        // hints, so nothing may demand it be reachable itself.
+    fn a_default_joiner_resolves_without_being_dialable() {
+        // the zero-config joiner contract: the generated defaults (overlay
+        // advertised, dual-stack listen, plane on) must resolve for a node
+        // with no dialable underlay address at all — the joiner only ever
+        // dials OUT to the descriptor's reach hints, so nothing may demand
+        // it be reachable itself.
         let dir = tmp("nonwgjoin");
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let founder = ed25519::PrivateKey::from_seed(7).public_key();
@@ -766,7 +751,7 @@ mod tests {
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:0\"\n",
+            network_shape_toml(&[]),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect(
@@ -797,7 +782,10 @@ mod tests {
         d.save(&dir.join("network.toml")).expect("save descriptor");
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:52201\"\n",
+            network_shape_toml(&[
+                ("listen", "\"127.0.0.1:52201\""),
+                ("advertised", "\"127.0.0.1:52201\""),
+            ]),
         )
         .expect("write node.toml");
 
@@ -841,8 +829,10 @@ mod tests {
         .expect("save descriptor");
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:52201\"\n\
-             storage_dir = \"storage\"\n",
+            network_shape_toml(&[
+                ("listen", "\"127.0.0.1:52201\""),
+                ("advertised", "\"127.0.0.1:52201\""),
+            ]),
         )
         .expect("write node.toml");
 
@@ -861,7 +851,7 @@ mod tests {
     #[test]
     fn dev_shape_relative_storage_is_absolute_from_launch_cwd() {
         let launch_cwd = std::env::current_dir().expect("current directory");
-        let raw: NodeToml = toml::from_str(
+        let raw: DevSeedToml = toml::from_str(
             "id = 7\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
              peer_seeds = [7]\nbootstrapper_addr = \"127.0.0.1:52220\"\n\
              storage_dir = \"relative/storage\"\n",
@@ -871,7 +861,7 @@ mod tests {
         assert_eq!(resolved.storage_dir, launch_cwd.join("relative/storage"));
         assert!(resolved.storage_dir.is_absolute());
 
-        let default_raw: NodeToml = toml::from_str(
+        let default_raw: DevSeedToml = toml::from_str(
             "id = 8\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
              peer_seeds = [8]\nbootstrapper_addr = \"127.0.0.1:52220\"\n",
         )
@@ -920,7 +910,10 @@ mod tests {
         let network_config = network_dir.join("node.toml");
         std::fs::write(
             &network_config,
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:52201\"\n",
+            network_shape_toml(&[
+                ("listen", "\"127.0.0.1:52201\""),
+                ("advertised", "\"127.0.0.1:52201\""),
+            ]),
         )
         .expect("write network config");
 
@@ -974,7 +967,10 @@ mod tests {
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"127.0.0.1:52202\"\n",
+            network_shape_toml(&[
+                ("listen", "\"127.0.0.1:52202\""),
+                ("advertised", "\"127.0.0.1:52202\""),
+            ]),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("non-member resolves as a joiner");
@@ -1260,12 +1256,50 @@ mod tests {
         );
     }
 
-    /// the desktop shape's kernel-socket posture: a config with no dialable
-    /// underlay host (advertised = "overlay", unspecified binds) mints no
-    /// direct intro endpoint (`cmd_invite`), so the resolved DIRECT intro
-    /// listener is None — the plane binds no wildcard UDP socket (a macOS
-    /// firewall prompt trigger) and joins ride the coordinated path. any
-    /// mintable host keeps the listener.
+    /// a COMPLETE network-shape config (every key is required now), with
+    /// per-key overrides for the aspect under test.
+    fn network_shape_toml(overrides: &[(&str, &str)]) -> String {
+        let defaults: &[(&str, &str)] = &[
+            ("network", "\"network.toml\""),
+            ("key_file", "\"identity.key\""),
+            ("listen", "\"[::]:52320\""),
+            ("advertised", "\"overlay\""),
+            ("storage_dir", "'storage'"),
+            ("http_listen", "\"127.0.0.1:0\""),
+            ("gateway_listen", "\"127.0.0.1:0\""),
+            ("rpc_listen", "\"127.0.0.1:0\""),
+            ("wireguard_listen", "\"0.0.0.0:52323\""),
+            ("invite_listen", "\"0.0.0.0:52324\""),
+            ("wireguard_advertised", "\"auto\""),
+            ("primary_coordinator", "\"none\""),
+            ("coordinator_relay", "\"none\""),
+            ("checkpoint_blocks", "32"),
+            ("sync_index", "false"),
+            ("announce_capabilities", "false"),
+            ("sandbox", "\"direct\""),
+            ("sandbox_image", "\"docker.io/library/node:22-slim\""),
+            ("sandbox_cores", "0"),
+            ("sandbox_mem_gb", "0"),
+        ];
+        defaults
+            .iter()
+            .map(|(key, default)| {
+                let value = overrides
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| *v)
+                    .unwrap_or(default);
+                format!("{key} = {value}\n")
+            })
+            .collect()
+    }
+
+    /// the desktop shape's posture: a config with no dialable underlay host
+    /// (advertised = "overlay", unspecified binds) mints no direct intro
+    /// endpoint (`cmd_invite`), so the resolved DIRECT intro listener is
+    /// None — the plane binds no wildcard UDP socket (a macOS firewall
+    /// prompt trigger) and joins ride the coordinated path. any mintable
+    /// host keeps the listener.
     #[test]
     fn intro_listener_resolves_only_when_a_direct_endpoint_is_mintable() {
         let dir = tmp("intro-listener");
@@ -1281,13 +1315,7 @@ mod tests {
         d.save(&dir.join("network.toml")).expect("save");
 
         // the desktop shape: overlay-advertised, unspecified binds.
-        std::fs::write(
-            dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"[::]:52320\"\nadvertised = \"overlay\"\n\
-             wireguard_listen = \"0.0.0.0:52323\"\ninvite_listen = \"0.0.0.0:52324\"\n\
-             wireguard_effect = \"socket\"\n",
-        )
-        .expect("write");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve desktop shape");
         assert_eq!(
             r.invite_listen, None,
@@ -1297,9 +1325,7 @@ mod tests {
         // the port-forwarded NAT shape: wireguard_advertised keeps it.
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"[::]:52320\"\nadvertised = \"overlay\"\n\
-             wireguard_listen = \"0.0.0.0:52323\"\ninvite_listen = \"0.0.0.0:52324\"\n\
-             wireguard_effect = \"socket\"\nwireguard_advertised = \"203.0.113.9:41820\"\n",
+            network_shape_toml(&[("wireguard_advertised", "\"203.0.113.9:41820\"")]),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve port-forwarded shape");
@@ -1309,20 +1335,17 @@ mod tests {
             "a dialable WG endpoint keeps the direct intro listener"
         );
 
-        // the server shape: a concrete advertised keeps it, with the
-        // wireguard_listen + 1 default.
+        // the server shape: a concrete advertised keeps it.
         std::fs::write(
             dir.join("node.toml"),
-            "network = \"network.toml\"\nlisten = \"[::]:52320\"\n\
-             advertised = \"203.0.113.9:52320\"\nwireguard_listen = \"0.0.0.0:52323\"\n\
-             wireguard_effect = \"socket\"\n",
+            network_shape_toml(&[("advertised", "\"203.0.113.9:52320\"")]),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve server shape");
         assert_eq!(
             r.invite_listen,
             Some("0.0.0.0:52324".parse().unwrap()),
-            "a dialable advertised keeps the intro default (wireguard_listen + 1)"
+            "a dialable advertised keeps the direct intro listener"
         );
     }
 
@@ -1459,48 +1482,21 @@ bootstrapper_addr = "127.0.0.1:52200"
         );
     }
 
+    /// the retired `wireguard_effect` key is GONE, not tolerated: any
+    /// spelling fails the strict parse in both shapes.
     #[test]
-    fn wireguard_effect_defaults_tun_and_rejects_unknown_values() {
+    fn retired_wireguard_effect_key_is_refused() {
         let dir = tmp("wgeffect");
         let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
-        std::fs::write(dir.join("node.toml"), base).expect("write");
-        let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun);
-
-        // "real" is the legacy alias for the interface-backed path.
-        for spelled in ["tun", "real"] {
+        for spelled in ["socket", "fake", "tun"] {
             std::fs::write(
                 dir.join("node.toml"),
                 format!("{base}wireguard_effect = \"{spelled}\"\n"),
             )
             .expect("write");
-            let r = resolve(&dir.join("node.toml")).expect("resolve");
-            assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun, "{spelled}");
+            let err = resolve(&dir.join("node.toml")).expect_err("retired key refused");
+            assert!(err.contains("wireguard_effect"), "{spelled}: {err}");
         }
-
-        std::fs::write(
-            dir.join("node.toml"),
-            format!("{base}wireguard_effect = \"socket\"\n"),
-        )
-        .expect("write");
-        let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Socket);
-
-        std::fs::write(
-            dir.join("node.toml"),
-            format!("{base}wireguard_effect = \"fake\"\n"),
-        )
-        .expect("write");
-        let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Fake);
-
-        std::fs::write(
-            dir.join("node.toml"),
-            format!("{base}wireguard_effect = \"simulated\"\n"),
-        )
-        .expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("unknown effect refused");
-        assert!(err.contains("wireguard_effect"), "{err}");
     }
 
     #[test]

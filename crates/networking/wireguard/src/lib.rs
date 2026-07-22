@@ -5,9 +5,10 @@
 //! WireGuard peer. It verifies the active validator set, endpoint
 //! advertisements, port policy, overlay routes, replay nonces, and the
 //! request/response/ack handshake. A successful validation yields a
-//! [`TunnelInstallPlan`]; the [`effect`] module converts plans into defguard
-//! `wireguard-rs` peer/interface configuration and pushes them through a
-//! `WireGuardEffect` (fake in tests, `WGApi::<Userspace>` in production).
+//! [`TunnelInstallPlan`]; the [`effect`] module converts plans into
+//! peer/interface configuration (`defguard_wireguard_rs` types) and pushes
+//! them through a `WireGuardEffect` (fake in tests, the in-process
+//! userspace backend in production).
 
 pub mod effect;
 

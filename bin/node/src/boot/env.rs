@@ -7,7 +7,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
 
-use crate::config::{self, Resolved, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
@@ -29,7 +29,6 @@ pub(crate) struct BootEnv {
     pub(crate) http_listen: Option<String>,
     pub(crate) gateway_listen: Option<String>,
     pub(crate) wireguard_listen: Option<SocketAddr>,
-    pub(crate) wireguard_effect: WireGuardEffectKind,
     pub(crate) wireguard_key_file: PathBuf,
     pub(crate) invite_listen: Option<SocketAddr>,
     pub(crate) invite_token: Option<config::InviteToken>,
@@ -89,7 +88,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         dev_demo,
@@ -292,12 +290,12 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         }
     }
     if let Some(wg) = &wireguard_listen {
+        // the backend is always the userspace socket stack now — no field.
         tracing::info!(
             target: "ducktape::reachability",
             node = %label,
             listen = %wg,
             endpoint_less = wg.ip().is_unspecified(),
-            backend = ?wireguard_effect,
             "reachability plane configured"
         );
     }
@@ -318,7 +316,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         invite_token,

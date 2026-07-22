@@ -282,7 +282,4 @@ pub struct PlumbingArgs {
     /// invite intro listener address
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub invite_listen: Option<String>,
-    /// how the WireGuard interface takes effect
-    #[arg(long, value_name = "EFFECT", value_parser = ["socket", "tun", "fake"], hide_short_help = true)]
-    pub wireguard_effect: Option<String>,
 }

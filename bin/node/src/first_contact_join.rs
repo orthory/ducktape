@@ -34,7 +34,7 @@ use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
@@ -79,10 +79,6 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    fn is_coordinated(&self) -> bool {
-        self.endpoint.is_none()
-    }
-
     /// how this candidate was reached — for the winner log.
     pub fn via(&self) -> ContactVia {
         match &self.endpoint {
@@ -201,20 +197,6 @@ pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Ve
         }
     }
     out
-}
-
-/// filter the race for the effect mode. Under a real kernel TUN interface the
-/// userspace rendezvous/hole-punch resolver the coordinated path needs is not
-/// active, so a coordinated (by-identity) candidate can only hang — drop it.
-/// Direct candidates are always kept.
-pub fn plan_race(candidates: Vec<Candidate>, tun_mode: bool) -> Vec<Candidate> {
-    if !tun_mode {
-        return candidates;
-    }
-    candidates
-        .into_iter()
-        .filter(|c| !c.is_coordinated())
-        .collect()
 }
 
 /// Race `attempt` across every candidate concurrently; the FIRST to settle
@@ -612,20 +594,30 @@ fn run_direct_announcer(
         Ok(socket) => socket,
         Err(e) => return AttemptResult::Failed(format!("intro udp bind: {e}")),
     };
-    let _ = socket.set_read_timeout(Some(RETRY_INTERVAL));
     let mut buf = [0u8; 2048];
     for _ in 0..iters {
         if stop.load(Ordering::Relaxed) {
             return AttemptResult::Failed("cancelled".into());
         }
         let _ = socket.send_to(intro, dest);
-        // the read timeout paces the loop; a resolving ack for THIS invite
-        // settles the attempt, anything else is ignored and we retry.
-        if let Ok((n, _)) = socket.recv_from(&mut buf)
-            && let Some(reply) = open_ack(keypair, token_nonce, &buf[..n])
-            && let Some(result) = ack_resolution(reply)
-        {
-            return result;
+        // each iteration spans a FULL RETRY_INTERVAL: a resolving ack for
+        // THIS invite settles the attempt the moment it lands, while
+        // non-resolving acks (`Installed` — the member's consensus is still
+        // settling the redemption) keep DRAINING inside the interval. an
+        // instant `Installed` reply must not consume a whole iteration, or
+        // a fast responder burns the entire join window in milliseconds —
+        // faster than one block can possibly commit.
+        let deadline = Instant::now() + RETRY_INTERVAL;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let _ = socket.set_read_timeout(Some(remaining));
+            let Ok((n, _)) = socket.recv_from(&mut buf) else {
+                break;
+            };
+            if let Some(reply) = open_ack(keypair, token_nonce, &buf[..n])
+                && let Some(result) = ack_resolution(reply)
+            {
+                return result;
+            }
         }
     }
     AttemptResult::Failed(format!(
@@ -903,18 +895,6 @@ mod tests {
         assert_eq!(coordinated.via(), ContactVia::Coordinated);
     }
 
-    #[test]
-    fn plan_race_drops_coordinated_under_tun() {
-        let candidates = build_candidates(
-            Some(inviter(None)), // coordinated inviter
-            &[front(2, Some("198.51.100.2:51820")), front(3, None)],
-        );
-        assert_eq!(candidates.len(), 3);
-        let planned = plan_race(candidates, true);
-        assert_eq!(planned.len(), 1, "only the direct front survives TUN mode");
-        assert!(matches!(planned[0].via(), ContactVia::Direct(_)));
-    }
-
     #[tokio::test]
     async fn race_admits_the_first_to_settle_without_waiting_on_the_rest() {
         let winner = key(1);
@@ -1153,11 +1133,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_candidate_set_is_terminal_not_a_hang() {
-        // a lone coordinated candidate filtered out by TUN leaves nothing to
+        // an invite that offers no contactable candidate leaves nothing to
         // race — an immediate honest terminal, never a hang.
-        let planned = plan_race(build_candidates(Some(inviter(None)), &[]), true);
-        assert!(planned.is_empty());
-        let outcome = race_first_contact(planned, |_c| async move {
+        let outcome = race_first_contact(Vec::new(), |_c| async move {
             AttemptResult::Admitted {
                 height: 1,
                 cap: None,

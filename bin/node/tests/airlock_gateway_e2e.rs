@@ -295,7 +295,6 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     // Two real WireGuard nodes: alice (0, publisher) and bob (1, compute).
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     for index in 0..2 {
         cluster.spawn(index);
     }
@@ -450,7 +449,6 @@ fn airlock_single_node_self_serves_its_own_route() {
     // plane still binds and serves the node's own routes locally.
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", READY);
     cluster.wait_marker(0, "converged app_hash=", READY);
@@ -645,7 +643,6 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
 
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", READY);
     cluster.wait_marker(0, "converged app_hash=", READY);
@@ -809,7 +806,6 @@ fn airlock_embed_without_tee_fails_boot_loudly() {
     let _serial = serial();
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     cluster.env[0] = vec![
         ("DUCKTAPE_AIRLOCK_SERVE".into(), "1".into()),
         ("DUCKTAPE_AIRLOCK_SERVE_ATTEST".into(), "auto".into()),
@@ -864,7 +860,6 @@ fn airlock_embedded_gateway_self_serves() {
 
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     // The node runs the airlock gateway itself — no external serve/bind/seal.
     cluster.env[0] = vec![
         ("DUCKTAPE_AIRLOCK_SERVE".into(), "1".into()),
