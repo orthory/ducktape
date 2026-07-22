@@ -19,6 +19,8 @@
 //! claimed follow-up as its own block. events a worker does NOT claim are the
 //! plain observability stream — one lane, two consumer classes.
 
+use std::collections::VecDeque;
+
 use sdk::{Event, Msg};
 
 /// outer-loop non-termination guard — the async sibling of the host's
@@ -96,4 +98,228 @@ pub enum WorkOutcome {
 #[async_trait::async_trait(?Send)]
 pub trait Worker {
     async fn run(&self, event: &Event) -> Result<WorkOutcome, Error>;
+}
+
+/// the follow-up ops one round of [`offer`] produced, plus the events no worker
+/// claimed. `follows` are submitted each as their own block (by the caller, or
+/// by [`drive`]); `unclaimed` is the caller's diagnostic stream — a module's
+/// only log channel (a wasm guest cannot log), so the caller surfaces it
+/// through its own note seam, and a decodable-but-unhandled one means a saga is
+/// stuck Pending.
+pub struct Offered {
+    pub follows: Vec<Msg>,
+    pub unclaimed: Vec<Event>,
+}
+
+/// offer one block's events to the workers, in order: the first worker to claim
+/// an event handles it (`Handled(Some)` yields a follow-up op, `Handled(None)`
+/// is a deliberate skip — e.g. work leased to another node's key); `NotMine`
+/// falls through to the next worker. a worker ERROR is logged and the event
+/// treated as claimed — an errored event is not an unclaimed one, so it is not
+/// double-reported. events no worker claims come back in [`Offered::unclaimed`].
+///
+/// this is the routing the validator drain, the noded submit lane, and the sim
+/// once shared three copies of; the lane-flavored bits (which height stamps the
+/// notes, how a follow-up is submitted) stay with each caller.
+pub async fn offer(workers: &[Box<dyn Worker>], events: Vec<Event>) -> Offered {
+    let mut follows = Vec::new();
+    let mut unclaimed = Vec::new();
+    for eff in events {
+        let mut claimed = false;
+        for w in workers {
+            match w.run(&eff).await {
+                Ok(WorkOutcome::Handled(follow)) => {
+                    follows.extend(follow);
+                    claimed = true;
+                    break;
+                }
+                Ok(WorkOutcome::NotMine) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        source = %eff.source,
+                        error = %err,
+                        "worker failed to handle a module event"
+                    );
+                    claimed = true;
+                    break;
+                }
+            }
+        }
+        if !claimed {
+            unclaimed.push(eff);
+        }
+    }
+    Offered { follows, unclaimed }
+}
+
+/// the caller's own submit path, abstracted so the reactor [`drive`] loop is
+/// shared across the block-per-op daemon and the sim's auto mode. a lane
+/// applies one worker follow-up op as its OWN block and returns the block's
+/// emitted events (offered to the workers for the next round); `pending` reports
+/// whether the committed dispatch mailbox still holds an undelivered result a
+/// Nudge block must flush. a deterministic rejection is the lane's to absorb
+/// (log it, return no events); only a fatal block-boundary fault propagates.
+#[async_trait::async_trait(?Send)]
+pub trait Lane {
+    async fn submit(&mut self, follow: Msg) -> Result<Vec<Event>, Error>;
+    async fn pending(&self) -> bool;
+}
+
+/// the shared reactor loop. offer `initial` events to the workers, submit each
+/// worker follow-up through `lane` (each its own block, its events offered back
+/// for the next round), and keep draining while a follow-up OR a pending
+/// delivery remains — appending the Nudge that flushes a stranded mailbox when
+/// nothing else is queued. bounded by [`MAX_WORKER_ROUNDS`] so a worker that
+/// keeps re-triggering itself can't spin forever. returns every unclaimed event
+/// across all rounds, for the caller to surface through its own log seam.
+pub async fn drive(
+    workers: &[Box<dyn Worker>],
+    initial: Vec<Event>,
+    lane: &mut dyn Lane,
+) -> Result<Vec<Event>, Error> {
+    let mut queue: VecDeque<Msg> = VecDeque::new();
+    let Offered { follows, mut unclaimed } = offer(workers, initial).await;
+    queue.extend(follows);
+    let mut rounds = 1u32;
+    loop {
+        let Some(follow) = queue.pop_front() else {
+            // the never-pop-stack tail: a result committed into the dispatch
+            // mailbox delivers in a LATER block, and a settle loop ticks no
+            // other blocks — nudge one flush block per stranded delivery.
+            if !lane.pending().await {
+                break;
+            }
+            queue.push_back(Msg {
+                target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
+                payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
+            });
+            continue;
+        };
+        rounds += 1;
+        if rounds > MAX_WORKER_ROUNDS {
+            return Err(Error::BudgetExceeded);
+        }
+        let events = lane.submit(follow).await?;
+        let Offered { follows, unclaimed: more } = offer(workers, events).await;
+        queue.extend(follows);
+        unclaimed.extend(more);
+    }
+    Ok(unclaimed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+
+    /// claims events whose `source` matches `trigger`, returning `follow`;
+    /// everything else is `NotMine`.
+    struct StubWorker {
+        trigger: &'static str,
+        follow: Option<Msg>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Worker for StubWorker {
+        async fn run(&self, event: &Event) -> Result<WorkOutcome, Error> {
+            if event.source == self.trigger {
+                Ok(WorkOutcome::Handled(self.follow.clone()))
+            } else {
+                Ok(WorkOutcome::NotMine)
+            }
+        }
+    }
+
+    /// records every submitted follow-up, echoes a scripted event set back on
+    /// each submit (to re-trigger workers), and reports `pending` until it has
+    /// absorbed `nudge_budget` submits.
+    struct StubLane {
+        submitted: Vec<Msg>,
+        echo: Vec<Event>,
+        nudge_budget: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Lane for StubLane {
+        async fn submit(&mut self, follow: Msg) -> Result<Vec<Event>, Error> {
+            self.submitted.push(follow);
+            Ok(self.echo.clone())
+        }
+        async fn pending(&self) -> bool {
+            self.submitted.len() < self.nudge_budget
+        }
+    }
+
+    fn event(source: &str) -> Event {
+        Event {
+            source: source.into(),
+            payload: Vec::new(),
+        }
+    }
+
+    fn msg(target: &str) -> Msg {
+        Msg {
+            target: target.into(),
+            payload: Vec::new(),
+        }
+    }
+
+    /// offer routes each event to the FIRST claiming worker in order, collects
+    /// its follow-up, and returns the events no worker claimed.
+    #[test]
+    fn offer_routes_and_reports_unclaimed() {
+        let workers: Vec<Box<dyn Worker>> = vec![
+            Box::new(StubWorker { trigger: "a", follow: Some(msg("x")) }),
+            Box::new(StubWorker { trigger: "b", follow: Some(msg("y")) }),
+        ];
+        let out = block_on(offer(&workers, vec![event("a"), event("b"), event("c")]));
+        assert_eq!(
+            out.follows.iter().map(|m| m.target.clone()).collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        assert_eq!(
+            out.unclaimed.iter().map(|e| e.source.clone()).collect::<Vec<_>>(),
+            vec!["c"]
+        );
+    }
+
+    /// a `Handled(None)` claim is a deliberate skip: the event is neither a
+    /// follow-up nor unclaimed.
+    #[test]
+    fn offer_handled_none_is_a_silent_claim() {
+        let workers: Vec<Box<dyn Worker>> =
+            vec![Box::new(StubWorker { trigger: "a", follow: None })];
+        let out = block_on(offer(&workers, vec![event("a")]));
+        assert!(out.follows.is_empty());
+        assert!(out.unclaimed.is_empty());
+    }
+
+    /// drive nudges once per pending delivery when nothing else is queued, and
+    /// each Nudge targets the dispatch mailbox flush.
+    #[test]
+    fn drive_nudges_until_the_mailbox_drains() {
+        let workers: Vec<Box<dyn Worker>> = Vec::new();
+        let mut lane = StubLane { submitted: Vec::new(), echo: Vec::new(), nudge_budget: 3 };
+        let unclaimed = block_on(drive(&workers, Vec::new(), &mut lane)).expect("drive");
+        assert!(unclaimed.is_empty());
+        assert_eq!(lane.submitted.len(), 3, "one Nudge per pending check until drained");
+        let nudge = dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {});
+        for m in &lane.submitted {
+            assert_eq!(m.target, dispatch::DEFAULT_DISPATCH_TARGET);
+            assert_eq!(m.payload, nudge);
+        }
+    }
+
+    /// a worker whose follow-up re-emits an event it re-claims spins forever;
+    /// the budget stops it at MAX_WORKER_ROUNDS - 1 submits.
+    #[test]
+    fn drive_bounds_a_self_retriggering_worker() {
+        let workers: Vec<Box<dyn Worker>> =
+            vec![Box::new(StubWorker { trigger: "loop", follow: Some(msg("again")) })];
+        let mut lane = StubLane { submitted: Vec::new(), echo: vec![event("loop")], nudge_budget: 0 };
+        let err = block_on(drive(&workers, vec![event("loop")], &mut lane)).expect_err("budget");
+        assert!(matches!(err, Error::BudgetExceeded), "got {err:?}");
+        assert_eq!(lane.submitted.len(), MAX_WORKER_ROUNDS as usize - 1);
+    }
 }

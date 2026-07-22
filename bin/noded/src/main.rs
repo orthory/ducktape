@@ -18,7 +18,6 @@
 //! heights stay monotonic across restarts (a counter restarting at 0 would
 //! make every new block look already-indexed and be silently skipped).
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,17 +35,15 @@ use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use host::{BlockContext, Host, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use noded::{
-    BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
-    hex_bytes, hex_root, payload_preview,
+    BlockDisposition, BlockRecord, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row, hex_root,
 };
 use pages::Pages;
-use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
@@ -525,58 +522,82 @@ async fn submit_and_drain(
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
         };
 
-    let mut queue = VecDeque::new();
-    offer_effects(workers, *height, events, &mut queue).await;
-    let mut rounds = 1u32;
-
-    loop {
-        let Some(follow) = queue.pop_front() else {
-            // the never-pop-stack tail: results committed into the dispatch
-            // mailbox deliver in a LATER block, and this block-per-op daemon
-            // ticks no other blocks — nudge one flush block per pending batch.
-            if !host.has_pending_deliveries().await {
-                break;
-            }
-            queue.push_back(Msg {
-                target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
-                payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
-            });
-            continue;
-        };
-        rounds += 1;
-        if rounds > MAX_WORKER_ROUNDS {
-            return Err("worker-round budget exceeded".into());
+    // the shared reactor loop settles worker follow-ups through this lane's own
+    // 1-op-1-block submit path (each its own block), nudging a stranded dispatch
+    // mailbox and bounding a self-retriggering worker.
+    let mut lane = OracleLane {
+        host: &mut *host,
+        height: &mut *height,
+        index,
+        blobs,
+        stream_hub,
+        metrics,
+    };
+    let unclaimed = match host::worker::drive(workers, events, &mut lane).await {
+        Ok(unclaimed) => unclaimed,
+        Err(host::worker::Error::Fatal(err)) => {
+            tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
+            std::process::exit(1);
         }
+        Err(err) => return Err(err.to_string()),
+    };
+
+    // an unclaimed event is a module's ONLY diagnostic channel (a wasm guest
+    // cannot log) — unless it decodes as a worker request, which means a saga
+    // is stuck Pending.
+    let mut notes = noded::log::ModuleNotes::new(*height);
+    for eff in &unclaimed {
+        notes.unclaimed(eff);
+    }
+    notes.finish();
+
+    Ok(included)
+}
+
+/// the noded submit lane behind the shared reactor [`host::worker::drive`]: each
+/// worker follow-up commits as its own block through [`submit_one`] under the
+/// oracle origin. a deterministic rejection is logged and skipped (the oracle's
+/// result never landed); only a fatal block-boundary fault propagates.
+struct OracleLane<'a> {
+    host: &'a mut Host,
+    height: &'a mut u64,
+    index: &'a IndexStore,
+    blobs: &'a noded::blobs::BlobHandle,
+    stream_hub: &'a StreamHub,
+    metrics: &'a NodeMetrics,
+}
+
+#[async_trait::async_trait(?Send)]
+impl host::worker::Lane for OracleLane<'_> {
+    async fn submit(&mut self, follow: Msg) -> Result<Vec<Event>, host::worker::Error> {
         match submit_one(
-            host,
-            height,
-            index,
-            blobs,
-            stream_hub,
-            metrics,
+            self.host,
+            self.height,
+            self.index,
+            self.blobs,
+            self.stream_hub,
+            self.metrics,
             Origin::External(ORACLE_ORIGIN.to_vec()),
             follow,
         )
         .await
         {
-            Ok((_block, events)) => {
-                offer_effects(workers, *height, events, &mut queue).await;
-            }
-            Err(SubmitError::Fatal(err)) => {
-                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
-                std::process::exit(1);
-            }
+            Ok((_block, events)) => Ok(events),
+            Err(SubmitError::Fatal(err)) => Err(host::worker::Error::Fatal(err)),
             Err(err @ SubmitError::Rejected(_)) => {
                 tracing::warn!(
                     target: "ducktape::modules",
                     error = %err,
                     "worker follow-up REJECTED — the oracle's result never landed"
                 );
+                Ok(Vec::new())
             }
         }
     }
 
-    Ok(included)
+    async fn pending(&self) -> bool {
+        self.host.has_pending_deliveries().await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -591,27 +612,17 @@ async fn submit_one(
     msg: Msg,
 ) -> Result<(BlockSummary, Vec<Event>), SubmitError> {
     let consensus_time = unix_millis();
-    // the explorer row's identity: capture the root op's coordinates before
-    // ctx/msg consume them. this lane frames and signs nothing, so the
-    // "proposer" is the SUBMITTER's origin bytes, hex like the networked
-    // lane's keys (identity maps bound node keys to account display names).
-    let proposer = match &origin {
-        Origin::External(id) => hex_bytes(id),
-        Origin::Module(id) => format!("module:{id}"),
-        Origin::System => "system".into(),
-    };
+    // the row's coordinates, captured before ctx/msg consume them. this lane
+    // frames and signs nothing, so the shared projection renders the SUBMITTER's
+    // origin as the row `proposer` (hex like the networked lane's keys — identity
+    // maps bound node keys to account display names).
     let target = msg.target.clone();
-    let payload = payload_preview(&msg.payload);
-    // staging IS hashing: put_chunk keys the blob by sha256, so this both
-    // computes the op's content address and keeps it dereferencable via
-    // GET /v1/files/blob/{op_hash} — receipt-parity with the submit reply,
-    // and coverage for worker follow-ups no client ever POSTed.
-    let op_hash = hex_bytes(&blobs.put_chunk(msg.payload.clone()));
+    let payload = msg.payload.clone();
     let ctx = BlockContext {
         protocol_version: 0,
         height: *height + 1,
         consensus_time,
-        origin,
+        origin: origin.clone(),
     };
     // node-local wall-clock cost of applying this block — the metrics plane's
     // one non-deterministic signal (the apply-latency histogram). measured HERE
@@ -626,7 +637,6 @@ async fn submit_one(
         height: *height,
         app_hash: hex_root(&out.app_hash),
     };
-    let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
     metrics.record_op_outcomes(1, 0); // this lane is one applied member op per block
@@ -636,24 +646,28 @@ async fn submit_one(
     // never the block. the store poisons itself on error (contiguity over
     // coverage) and stays loud on every later block until rebuilt.
     let block_ops = indexer::BlockOps {
-        // the explorer row. every block on this lane is applied — a rejected
-        // submit never increments the height, so it never was a block. the
-        // frame hash stays empty: nothing is framed on this lane, and an
-        // invented digest would claim a verification that never happened.
+        // the explorer row via the shared projection seam — RootOp assembly,
+        // dispatch trace, payload preview, and op-hash staging (put_chunk keys
+        // the blob by sha256, keeping it dereferencable via
+        // GET /v1/files/blob/{op_hash}) in ONE shape with the validator lane.
+        // every block on this lane is applied (a rejected submit never
+        // increments the height, so it never was a block); the frame hash stays
+        // empty — nothing is framed here, and an invented digest would claim a
+        // verification that never happened.
         record: Some(block_row(&BlockRecord {
             height: *height,
             hash: String::new(),
             commit_hash: hex_root(&out.app_hash),
             // the embedded daemon lane is 1-op-1-block (one host.submit per
             // block), so the block carries exactly one member op.
-            ops: vec![noded::RootOp {
-                proposer,
-                disposition: BlockDisposition::Applied,
-                target,
-                operations,
-                payload,
-                op_hash,
-            }],
+            ops: vec![noded::projection::project_root_op(
+                blobs,
+                &origin,
+                &target,
+                &payload,
+                &out.dispatches,
+                BlockDisposition::Applied,
+            )],
         })),
         ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
     };
@@ -674,65 +688,4 @@ async fn submit_one(
     stream_hub.publish_block(block.height, block.app_hash.clone());
 
     Ok((block, out.events))
-}
-
-/// map a deterministic dispatch record to its explorer wire twin (the block
-/// record's `operations`).
-fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
-    DispatchInfo {
-        module: record.module.clone(),
-        origin: origin_tag(&record.origin),
-        emitted_msgs: record.emitted_msgs,
-        emitted_events: record.emitted_events,
-    }
-}
-
-/// a compact, human-legible tag for what triggered a dispatch.
-fn origin_tag(origin: &Origin) -> String {
-    match origin {
-        Origin::External(name) if name.is_empty() => "external".to_string(),
-        Origin::External(name) => format!("external:{}", String::from_utf8_lossy(name)),
-        Origin::Module(id) => format!("module:{id}"),
-        Origin::System => "system".to_string(),
-    }
-}
-
-async fn offer_effects(
-    workers: &[Box<dyn host::worker::Worker>],
-    height: u64,
-    events: Vec<Event>,
-    queue: &mut VecDeque<Msg>,
-) {
-    let mut notes = noded::log::ModuleNotes::new(height);
-    for eff in events {
-        let mut claimed = false;
-        for w in workers {
-            match w.run(&eff).await {
-                Ok(host::worker::WorkOutcome::Handled(follow)) => {
-                    queue.extend(follow);
-                    claimed = true;
-                    break;
-                }
-                Ok(host::worker::WorkOutcome::NotMine) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        height,
-                        source = %eff.source,
-                        error = %err,
-                        "worker failed to handle a module event"
-                    );
-                    claimed = true;
-                    break;
-                }
-            }
-        }
-        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
-        // guest cannot log) — unless it decodes as a worker request, which means
-        // a saga is stuck Pending.
-        if !claimed {
-            notes.unclaimed(&eff);
-        }
-    }
-    notes.finish();
 }
