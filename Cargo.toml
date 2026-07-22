@@ -82,6 +82,7 @@ members = [
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
+    "crates/rpc-client",
     # apps — product feature modules
     "crates/modules/apps/forge",
     "crates/modules/apps/pages",
@@ -246,6 +247,7 @@ files = { path = "crates/modules/apps/files" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
+ducktape-rpc = { path = "crates/rpc-client" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)

@@ -7,17 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chat::{AuthorRef, ChatMsg, ChatQuery, ChatReply, PostPolicy};
-use futures::StreamExt as _;
+use ducktape_rpc::{Client as RpcClient, Status as NodeStatus};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
-use reqwest::{Client, Response, Url};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt as _;
 use zeroize::{Zeroize as _, Zeroizing};
 
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_ERROR_BYTES: usize = 4 * 1024;
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;
 const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
@@ -90,107 +85,18 @@ pub struct AppError {
     pub message: String,
 }
 
-#[derive(Clone)]
-struct Rpc {
-    origin: String,
-    base: Url,
-    client: Client,
-}
-
-#[derive(Serialize)]
-struct QueryRequest<'a, Q> {
-    target: &'a str,
-    query: &'a Q,
-}
-
-#[derive(serde::Deserialize)]
-struct NodeStatus {
-    height: u64,
-}
-
-impl Rpc {
-    fn new(input: &str) -> Result<Self, String> {
-        let configured = if input.trim().is_empty() {
-            std::env::var("DUCKTAPE_NODE").unwrap_or_else(|_| DEFAULT_RPC.to_string())
-        } else {
-            input.trim().to_string()
-        };
-        let mut base = Url::parse(&configured).map_err(|_| "RPC endpoint is not a URL")?;
-        let invalid_origin = !matches!(base.scheme(), "http" | "https")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-            || !matches!(base.path(), "" | "/");
-        if invalid_origin {
-            return Err(
-                "RPC endpoint must be an http(s) origin without credentials or a path".into(),
-            );
-        }
-        base.set_path("/");
-        let origin = base.as_str().trim_end_matches('/').to_string();
-        let client = Client::builder()
-            .timeout(RPC_TIMEOUT)
-            .build()
-            .map_err(|error| format!("could not initialize RPC client: {error}"))?;
-        Ok(Self {
-            origin,
-            base,
-            client,
-        })
-    }
-
-    fn url(&self, path: &str) -> Result<Url, String> {
-        self.base
-            .join(path)
-            .map_err(|_| "could not build RPC URL".to_string())
-    }
-
-    async fn status(&self) -> Result<NodeStatus, String> {
-        let response = self
-            .client
-            .get(self.url("v1/status")?)
-            .send()
-            .await
-            .map_err(|error| format!("RPC status failed: {error}"))?;
-        decode_json(response).await
-    }
-
-    async fn query<Q: Serialize, R: DeserializeOwned>(
-        &self,
-        target: &str,
-        query: &Q,
-    ) -> Result<R, String> {
-        let response = self
-            .client
-            .post(self.url("v1/query")?)
-            .json(&QueryRequest { target, query })
-            .send()
-            .await
-            .map_err(|error| format!("{target} query failed: {error}"))?;
-        decode_json(response).await
-    }
-
-    async fn submit_frame(&self, frame: Vec<u8>) -> Result<(), String> {
-        let response = self
-            .client
-            .post(self.url("v1/submit/frame")?)
-            .header("content-type", "application/octet-stream")
-            .body(frame)
-            .send()
-            .await
-            .map_err(|error| format!("transaction submission failed: {error}"))?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        Err(response_error(response).await)
-    }
+fn rpc_client(input: &str) -> Result<RpcClient, String> {
+    let configured = if input.trim().is_empty() {
+        std::env::var("DUCKTAPE_NODE").unwrap_or_else(|_| DEFAULT_RPC.to_string())
+    } else {
+        input.trim().to_string()
+    };
+    RpcClient::new(&configured).map_err(Into::into)
 }
 
 pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
     async {
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         load_workspace(&rpc, None, None).await
     }
     .await
@@ -199,7 +105,7 @@ pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
 
 pub async fn block_tip(rpc: String) -> Result<BlockTip, AppError> {
     async {
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         tip_from_status(rpc.status().await?)
     }
     .await
@@ -212,7 +118,7 @@ pub async fn refresh(
     page_id: String,
 ) -> Result<WorkspaceData, AppError> {
     async {
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         load_workspace(
             &rpc,
             (!channel_id.is_empty()).then_some(channel_id.as_str()),
@@ -226,7 +132,7 @@ pub async fn refresh(
 
 pub async fn load_chat(rpc: String, channel_id: String) -> Result<ChatData, AppError> {
     async {
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         load_chat_data(&rpc, Some(&channel_id)).await
     }
     .await
@@ -241,7 +147,7 @@ pub async fn create_channel(
     async {
         let name = bounded_text(name, "channel name", 128)?;
         let channel_id = fresh_id("channel");
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
             "chat",
@@ -270,7 +176,7 @@ pub async fn send_message(
             return Err("choose a channel first".to_string());
         }
         let body = bounded_text(body, "message", 16 * 1024)?;
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
             "chat",
@@ -292,7 +198,7 @@ pub async fn send_message(
 
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
     async {
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         load_pages_data(&rpc, Some(&page_id)).await
     }
     .await
@@ -307,7 +213,7 @@ pub async fn create_page(
     async {
         let title = bounded_text(title, "page title", 512)?;
         let page_id = fresh_id("page");
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
             "pages",
@@ -336,7 +242,7 @@ pub async fn rename_page(
             return Err("choose a page first".to_string());
         }
         let title = bounded_text(title, "page title", 512)?;
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
             "pages",
@@ -365,7 +271,7 @@ pub async fn add_paragraph(
             return Err("choose a page first".to_string());
         }
         let text = bounded_text(text, "paragraph", 64 * 1024)?;
-        let rpc = Rpc::new(&rpc)?;
+        let rpc = rpc_client(&rpc)?;
         let reply: PageReply = rpc
             .query(
                 "pages",
@@ -405,7 +311,7 @@ pub async fn add_paragraph(
 }
 
 async fn load_workspace(
-    rpc: &Rpc,
+    rpc: &RpcClient,
     channel_id: Option<&str>,
     page_id: Option<&str>,
 ) -> Result<WorkspaceData, String> {
@@ -413,7 +319,7 @@ async fn load_workspace(
     let chat = load_chat_data(rpc, channel_id).await?;
     let pages = load_pages_data(rpc, page_id).await?;
     Ok(WorkspaceData {
-        rpc: rpc.origin.clone(),
+        rpc: rpc.origin().to_string(),
         status: tip.status,
         height: tip.height,
         channels: chat.channels,
@@ -434,7 +340,7 @@ fn tip_from_status(status: NodeStatus) -> Result<BlockTip, String> {
     })
 }
 
-async fn load_chat_data(rpc: &Rpc, requested: Option<&str>) -> Result<ChatData, String> {
+async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<ChatData, String> {
     let reply: ChatReply = rpc.query("chat", &ChatQuery::Channels).await?;
     let wire_channels = match reply {
         ChatReply::Channels(channels) => channels,
@@ -465,7 +371,7 @@ async fn load_chat_data(rpc: &Rpc, requested: Option<&str>) -> Result<ChatData, 
     })
 }
 
-async fn load_messages(rpc: &Rpc, channel_id: &str) -> Result<Vec<ChatMessage>, String> {
+async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMessage>, String> {
     let reply: ChatReply = rpc
         .query(
             "chat",
@@ -494,7 +400,7 @@ async fn load_messages(rpc: &Rpc, channel_id: &str) -> Result<Vec<ChatMessage>, 
         .collect())
 }
 
-async fn load_pages_data(rpc: &Rpc, requested: Option<&str>) -> Result<PagesData, String> {
+async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<PagesData, String> {
     let reply: PageReply = rpc.query("pages", &PageQuery::ListPages).await?;
     let wire_pages = match reply {
         PageReply::PageList(pages) => pages,
@@ -554,7 +460,7 @@ async fn load_pages_data(rpc: &Rpc, requested: Option<&str>) -> Result<PagesData
 }
 
 async fn signed_write(
-    rpc: &Rpc,
+    rpc: &RpcClient,
     target: &str,
     payload: Vec<u8>,
     password: String,
@@ -565,7 +471,7 @@ async fn signed_write(
         ));
     }
     let frame = sign_frame(target, &payload, password).await?;
-    rpc.submit_frame(frame).await
+    rpc.submit_frame(frame).await.map_err(Into::into)
 }
 
 async fn sign_frame(target: &str, payload: &[u8], mut password: String) -> Result<Vec<u8>, String> {
@@ -685,48 +591,6 @@ fn ducktape_binary() -> PathBuf {
         return sibling;
     }
     PathBuf::from("ducktape")
-}
-
-async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T, String> {
-    let status = response.status();
-    let bytes = read_bounded(response, MAX_RESPONSE_BYTES).await?;
-    if !status.is_success() {
-        return Err(format!(
-            "RPC returned {status}: {}",
-            bounded_detail(&String::from_utf8_lossy(&bytes))
-        ));
-    }
-    serde_json::from_slice(&bytes).map_err(|error| format!("RPC returned invalid JSON: {error}"))
-}
-
-async fn response_error(response: Response) -> String {
-    let status = response.status();
-    match read_bounded(response, MAX_ERROR_BYTES).await {
-        Ok(bytes) => format!(
-            "transaction was rejected ({status}): {}",
-            bounded_detail(&String::from_utf8_lossy(&bytes))
-        ),
-        Err(error) => format!("transaction was rejected ({status}): {error}"),
-    }
-}
-
-async fn read_bounded(response: Response, limit: usize) -> Result<Vec<u8>, String> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err("RPC response exceeds the desktop limit".into());
-    }
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("could not read RPC response: {error}"))?;
-        if bytes.len().saturating_add(chunk.len()) > limit {
-            return Err("RPC response exceeds the desktop limit".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, String> {
@@ -887,7 +751,7 @@ mod tests {
             },
         )
         .unwrap();
-        let rpc = Rpc::new(&format!("http://{}", sim.addr())).unwrap();
+        let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
         let signer = ed25519::PrivateKey::from_seed(7);
 
         submit_test(
@@ -953,7 +817,7 @@ mod tests {
         assert_eq!(pages.active_page_title, "Welcome");
         assert_eq!(pages.blocks[0].text, "A signed page block");
 
-        let origin = rpc.origin.clone();
+        let origin = rpc.origin().to_string();
         let workspace = connect(origin.clone()).await.unwrap();
         submit_test(
             &rpc,
@@ -980,7 +844,7 @@ mod tests {
     }
 
     async fn submit_test(
-        rpc: &Rpc,
+        rpc: &RpcClient,
         signer: &ed25519::PrivateKey,
         sequence: u64,
         target: &str,

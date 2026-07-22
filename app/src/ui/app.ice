@@ -84,16 +84,15 @@ component ChannelButton(channel:ChatChannel, selected:bool)
           text "#" size=15.0 @text-primary font-bold
           text channel.name width=fill wrapping=none @text-foreground font-bold
         active background=elevated text=foreground radius=9.0
-        hovered background=elevated text=foreground radius=9.0
-        pressed background=subtle text=foreground radius=9.0
+        pressed background=subtle
     if !selected
       button label=channel.name width=fill padding=11.0 -> choose_channel(channel.id)
         row spacing=9.0 align=center
           text "#" size=15.0 @text-muted
           text channel.name width=fill wrapping=none @text-muted
         active background=transparent text=muted radius=9.0
-        hovered background=subtle text=foreground radius=9.0
-        pressed background=elevated text=foreground radius=9.0
+        hovered background=subtle text=foreground
+        pressed background=elevated text=foreground
 
 component PageButton(page:PageItem, selected:bool)
   col width=fill
@@ -103,16 +102,15 @@ component PageButton(page:PageItem, selected:bool)
           text "□" size=15.0 @text-primary
           text page.title width=fill wrapping=none @text-foreground font-bold
         active background=elevated text=foreground radius=9.0
-        hovered background=elevated text=foreground radius=9.0
-        pressed background=subtle text=foreground radius=9.0
+        pressed background=subtle
     if !selected
       button label=page.title width=fill padding=11.0 -> choose_page(page.id)
         row spacing=9.0 align=center
           text "□" size=15.0 @text-muted
           text page.title width=fill wrapping=none @text-muted
         active background=transparent text=muted radius=9.0
-        hovered background=subtle text=foreground radius=9.0
-        pressed background=elevated text=foreground radius=9.0
+        hovered background=subtle text=foreground
+        pressed background=elevated text=foreground
 
 component MessageCard(message:ChatMessage)
   container width=fill padding=14.0 background=elevated radius=12.0

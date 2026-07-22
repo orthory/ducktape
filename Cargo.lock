@@ -2903,20 +2903,27 @@ version = "0.1.0"
 dependencies = [
  "chat",
  "commonware-cryptography",
- "futures",
+ "ducktape-rpc",
  "iced",
  "node",
  "pages",
- "reqwest 0.12.28",
  "sdk",
- "serde",
- "serde_json",
  "simnode",
  "tempfile",
  "tokio",
  "ui-lang",
  "ui-lang-runtime",
  "zeroize",
+]
+
+[[package]]
+name = "ducktape-rpc"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
