@@ -24,9 +24,7 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 /// the git surface is the atomic multi-branch [`ForgeMsg::PushRefs`]: a
 /// git-faithful ref update that adopts a client's real commit history by oid,
 /// with the objects carried out-of-band in a node-local packfile (never in
-/// consensus). [`ForgeMsg::Commit`] remains only as a decode-compatible
-/// tombstone and is rejected deterministically; no consensus path builds Git
-/// objects or reads a node-local ODB.
+/// consensus). no consensus path builds Git objects or reads a node-local ODB.
 ///
 /// the tracker surface: GitHub-shaped issues / pull requests / reviews
 /// ([`ForgeMsg::OpenIssue`] .. [`ForgeMsg::SubmitReview`]) — see
@@ -37,16 +35,6 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeMsg {
-    /// Retired wire variant. Build the commit off-chain and submit its pack and
-    /// ref update through [`ForgeMsg::PushRefs`]. Kept so old payloads receive a
-    /// deterministic migration error instead of becoming undecodable bytes.
-    Commit {
-        /// the target repo slug; empty -> the `"default"` repo.
-        repo: String,
-        path: String,
-        content: String,
-        message: String,
-    },
     /// the atomic multi-branch push: every [`RefUpdate`] is a per-branch CAS
     /// against that branch's COMMITTED head, and the whole list stages or the
     /// whole op rejects. `pack_digest` (sha256, 32 raw bytes) locates the ONE
@@ -245,25 +233,20 @@ mod tests {
         // omits the key is rejected. every live producer emits `repo` — the
         // single-repo ergonomic is `repo: ""`, an explicit empty slug that the
         // module maps to the default repo, not an absent key.
-        let no_repo_key = br#"{"commit":{"path":"a.txt","content":"hi","message":"m"}}"#;
-        assert!(
-            decode_msg(no_repo_key).is_err(),
-            "a commit without a repo key must be rejected"
-        );
         let no_repo_push = br#"{"push_refs":{"updates":[{"ref_name":"main","prev_oid":null,"new_oid":[1,2,3]}],"pack_digest":[4,5]}}"#;
         assert!(
             decode_msg(no_repo_push).is_err(),
             "a push_refs without a repo key must be rejected"
         );
         // the explicit empty slug still decodes (single-repo ergonomic).
-        let empty_repo = br#"{"commit":{"repo":"","path":"a.txt","content":"hi","message":"m"}}"#;
+        let empty_repo =
+            br#"{"push_refs":{"repo":"","updates":[],"pack_digest":null}}"#;
         assert_eq!(
             decode_msg(empty_repo).unwrap(),
-            ForgeMsg::Commit {
+            ForgeMsg::PushRefs {
                 repo: String::new(),
-                path: "a.txt".into(),
-                content: "hi".into(),
-                message: "m".into(),
+                updates: Vec::new(),
+                pack_digest: None,
             }
         );
     }

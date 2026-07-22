@@ -448,49 +448,6 @@ fn malformed_push_fields_are_rejected_deterministically() {
     let _ = std::fs::remove_dir_all(&dst_dir);
 }
 
-#[test]
-fn legacy_commit_rejects_identically_regardless_of_pack_possession() {
-    let (src_dir, _src, cap) = source_one("retired-commit-src");
-    let with_blobs = blobstore::BlobHandle::default();
-    let digest = cap.stash(&with_blobs);
-
-    let with_dir = tmp_repo("retired-commit-with");
-    let mut with = Forge::with_blobs("forge", with_dir.clone(), with_blobs).unwrap();
-    push(&mut with, None, &cap.head, &digest);
-
-    let without_dir = tmp_repo("retired-commit-without");
-    let mut without = Forge::init("forge", without_dir.clone()).unwrap();
-    push(&mut without, None, &cap.head, &digest);
-
-    let legacy = Msg {
-        target: "forge".into(),
-        payload: encode_msg(&ForgeMsg::Commit {
-            repo: String::new(),
-            path: "b.txt".into(),
-            content: "two".into(),
-            message: "c2".into(),
-        }),
-    };
-    let with_root = with.root();
-    let without_root = without.root();
-    let with_error = futures::executor::block_on(with.execute(&mut at(2), &legacy))
-        .unwrap_err()
-        .to_string();
-    let without_error = futures::executor::block_on(without.execute(&mut at(2), &legacy))
-        .unwrap_err()
-        .to_string();
-
-    assert_eq!(with_error, without_error);
-    assert!(with_error.contains("Commit is retired"), "{with_error}");
-    assert_eq!(with.root(), with_root);
-    assert_eq!(without.root(), without_root);
-    assert_eq!(with.root(), without.root());
-
-    let _ = std::fs::remove_dir_all(&src_dir);
-    let _ = std::fs::remove_dir_all(&with_dir);
-    let _ = std::fs::remove_dir_all(&without_dir);
-}
-
 /// `list_repos` answers the INTEGRATION head: a main-only repo falls back to
 /// the main head, but once `dev` is born the listing reports dev's oid —
 /// the branch every browse surface reads, so a dev-only repo must never list

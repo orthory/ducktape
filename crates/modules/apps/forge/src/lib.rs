@@ -85,8 +85,7 @@
 //! off-chain and the relay distributes their content-addressed pack before the
 //! corresponding [`ForgeMsg::PushRefs`] enters consensus. consensus state owns
 //! only the canonical branch oids (plus tracker state), and its sole Git write
-//! is a pure `prev -> new` CAS. the old file-by-file [`ForgeMsg::Commit`] wire
-//! variant is retained only to return a deterministic migration error.
+//! is a pure `prev -> new` CAS.
 //!
 //! ## the host-lent staging seam (per repo + tracker)
 //!
@@ -217,12 +216,6 @@ fn parse_hex_digest(s: &str) -> Result<[u8; 32], Error> {
             .map_err(|e| Error::Module(e.to_string()))?;
     }
     Ok(out)
-}
-
-fn reject_legacy_commit() -> Result<(), Error> {
-    Err(Error::Module(
-        "forge: Commit is retired; build the Git commit off-chain and submit PushRefs".into(),
-    ))
 }
 
 /// lowercase-hex a byte slice — for human-readable log lines only.
@@ -531,7 +524,6 @@ impl Module for Forge {
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         let now = ctx.env().consensus_time;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            ForgeMsg::Commit { .. } => reject_legacy_commit(),
             ForgeMsg::PushRefs {
                 repo,
                 updates,
@@ -869,18 +861,6 @@ mod tests {
         p.push(format!("ducktape-forge-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         p
-    }
-
-    fn commit_msg(repo: &str, path: &str, content: &str, message: &str) -> Msg {
-        Msg {
-            target: "forge".into(),
-            payload: encode_msg(&ForgeMsg::Commit {
-                repo: repo.into(),
-                path: path.into(),
-                content: content.into(),
-                message: message.into(),
-            }),
-        }
     }
 
     fn exec(forge: &mut Forge, ctx: &mut TestCtx, m: &ForgeMsg) -> Result<(), Error> {
@@ -1438,24 +1418,6 @@ mod tests {
 
     fn user_origin(b: u8) -> sdk::Origin {
         sdk::Origin::External(vec![b; 8])
-    }
-
-    #[test]
-    fn legacy_commit_rejects_without_touching_state_or_disk() {
-        let base = tmp_base("basic");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
-        assert_eq!(forge.root(), StateRoot::ZERO, "empty namespace -> ZERO root");
-        let err = futures::executor::block_on(forge.execute(
-            &mut ctx_at(100),
-            &commit_msg("", "a.txt", "hello", "first"),
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("Commit is retired"), "{err}");
-        assert_eq!(forge.root(), StateRoot::ZERO);
-        assert!(!base.join(DEFAULT_REPO).exists(), "execute performs no Git IO");
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
