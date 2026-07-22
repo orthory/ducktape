@@ -256,7 +256,7 @@ fn an_add_resident_proposal_grants_resident_standing_at_v0() {
         assert_eq!(
             residents(&host).await,
             vec![friend],
-            "resident standing granted at protocol_version 0"
+            "resident standing granted from genesis"
         );
         assert_eq!(
             validators(&host).await.len(),
