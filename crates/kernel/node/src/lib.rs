@@ -676,6 +676,107 @@ impl Orderer for ArrivalOrderer {
     }
 }
 
+/// the SIM orderer, behind the SAME [`Orderer`] trait: submissions PARK in
+/// FIFO arrival order and deliver only when an external [`StepHandle`] releases
+/// them — the scripted-scenario engine behind simnode's `/sim/step` (release
+/// one) and auto mode (release all). unlike [`RoundOrderer`] it does NOT
+/// byte-sort: a sim scenario's value is its EXACT authored order, which a
+/// content sort would scramble. like the other orderers it stamps a monotone
+/// view per delivered frame. the release budget is shared with the handle by an
+/// `Arc`, so simnode's serve thread can release while its actor thread owns the
+/// orderer.
+pub struct StepOrderer {
+    /// parked frames in FIFO (submit) order; the front releases first.
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// the next agreed view to stamp, monotone across releases.
+    next_view: u64,
+    /// the release budget the paired [`StepHandle`] commands.
+    budget: std::sync::Arc<StepBudget>,
+}
+
+/// the release budget a [`StepHandle`] commands and a [`StepOrderer`] spends,
+/// shared by `Arc`. `permits` counts frames cleared to deliver — `release(n)`
+/// adds n, each `poll_delivered` spends up to that many (a counting budget, so
+/// a release BEFORE a frame parks still delivers it on arrival). `all` latches
+/// AUTO mode: every parked frame, and every future submit, delivers.
+#[derive(Default)]
+struct StepBudget {
+    permits: std::sync::atomic::AtomicU64,
+    all: std::sync::atomic::AtomicBool,
+}
+
+impl StepOrderer {
+    /// a fresh sim orderer and the handle that releases its parked frames.
+    #[allow(clippy::new_without_default)] // the handle must be returned too.
+    pub fn new() -> (Self, StepHandle) {
+        let budget = std::sync::Arc::new(StepBudget::default());
+        let orderer = Self {
+            pending: std::collections::VecDeque::new(),
+            next_view: 0,
+            budget: budget.clone(),
+        };
+        (orderer, StepHandle { budget })
+    }
+}
+
+impl Orderer for StepOrderer {
+    async fn submit(&mut self, frame: Vec<u8>) -> Result<(), Error> {
+        self.pending.push_back(frame);
+        Ok(())
+    }
+
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // auto mode delivers everything parked; otherwise spend up to `permits`
+        // parked frames, FIFO from the front. a poll never spends more permits
+        // than it delivers, so an over-release simply carries forward.
+        let release_all = self.budget.all.load(Relaxed);
+        let n = if release_all {
+            self.pending.len()
+        } else {
+            let n = (self.budget.permits.load(Relaxed) as usize).min(self.pending.len());
+            self.budget.permits.fetch_sub(n as u64, Relaxed);
+            n
+        };
+        (0..n)
+            .map(|_| {
+                let frame = self.pending.pop_front().expect("n <= pending.len()");
+                let view = self.next_view;
+                self.next_view += 1;
+                (view, frame)
+            })
+            .collect()
+    }
+}
+
+/// the external release trigger for a [`StepOrderer`] (see its doc). `Clone`
+/// (it is an `Arc` over the shared budget) and `Send + Sync` — simnode's serve
+/// thread holds one while its actor thread owns the orderer.
+#[derive(Clone)]
+pub struct StepHandle {
+    budget: std::sync::Arc<StepBudget>,
+}
+
+impl StepHandle {
+    /// clear `n` more parked frames to deliver on the next drain — the
+    /// `/sim/step` trigger (release one). permits ACCUMULATE: releasing before a
+    /// frame parks still delivers it when it arrives.
+    pub fn release(&self, n: u64) {
+        self.budget
+            .permits
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// latch AUTO mode: every parked frame, and every future submit, delivers on
+    /// the next drain without a further `release`. a latch — auto mode is not
+    /// toggled back off mid-run.
+    pub fn release_all(&self) {
+        self.budget
+            .all
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// how a drained frame landed. every finalized frame gets exactly one of
 /// these, and each is a deterministic function of the agreed order plus the
 /// agreed ceiling — so dispositions are identical on every honest validator.
@@ -901,6 +1002,34 @@ impl BlockSink for NullSink {
     }
 }
 
+/// how a block's `consensus_time` (the `Env` clock every module reads) is
+/// derived from its app height, stamped into every block's [`BlockContext`] by
+/// [`OrderedNode::drain_delivered`]. the default is byte-identical to the
+/// pre-policy hardcode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConsensusTimePolicy {
+    /// the validator lane: `consensus_time = height`. the real clock rides in
+    /// the frames' agreed order, not a wall read — the height IS the logical
+    /// clock. DEFAULT, so every existing construction site keeps today's bytes.
+    #[default]
+    HeightIsTime,
+    /// the sim lane's logical clock: `consensus_time = base_ms + height *
+    /// block_ms` — a deterministic millisecond clock advancing one `block_ms`
+    /// per block from `base_ms`, so sim receipts carry stable wall-clock-shaped
+    /// times with no real clock read.
+    Epoch { base_ms: u64, block_ms: u64 },
+}
+
+impl ConsensusTimePolicy {
+    /// stamp the `consensus_time` for a block at app `height`.
+    pub fn stamp(&self, height: u64) -> u64 {
+        match self {
+            Self::HeightIsTime => height,
+            Self::Epoch { base_ms, block_ms } => base_ms + height * block_ms,
+        }
+    }
+}
+
 /// a replicated host on the ORDERED lane. owns its [`Host`] and an [`Orderer`].
 /// unlike [`Node`], `submit` does NOT apply to the local host — it only proposes
 /// into the agreed order; application happens exclusively in [`OrderedNode::
@@ -1007,6 +1136,22 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// boundary instead of silently running stale code. `Arc` so the node and
     /// its recovery sink can share the one source.
     code_source: std::sync::Arc<dyn host::CodeSource>,
+    /// how each block's `consensus_time` is derived from its height (see
+    /// [`ConsensusTimePolicy`]). defaults to `HeightIsTime` — the validator
+    /// lane's pre-policy behavior, byte-for-byte.
+    time_policy: ConsensusTimePolicy,
+    /// SIM ONLY: ops parked by [`OrderedNode::submit_decoded`], keyed by the
+    /// placeholder frame id that rides the batch pipeline in their place. the
+    /// drain takes the decoded op from here instead of verifying the placeholder
+    /// bytes — so an UNSIGNED sim lane applies without the wire codec gaining an
+    /// unsigned variant.
+    #[cfg(feature = "sim")]
+    decoded: std::collections::HashMap<FrameId, host::BlockOp>,
+    /// SIM ONLY: a monotone counter minting a UNIQUE placeholder per
+    /// [`OrderedNode::submit_decoded`], so two byte-identical unsigned ops are
+    /// still distinct ordered units and distinct `decoded` entries.
+    #[cfg(feature = "sim")]
+    decoded_seq: u64,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -1037,6 +1182,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            time_policy: ConsensusTimePolicy::HeightIsTime,
+            #[cfg(feature = "sim")]
+            decoded: std::collections::HashMap::new(),
+            #[cfg(feature = "sim")]
+            decoded_seq: 0,
         }
     }
 
@@ -1070,6 +1220,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            time_policy: ConsensusTimePolicy::HeightIsTime,
+            #[cfg(feature = "sim")]
+            decoded: std::collections::HashMap::new(),
+            #[cfg(feature = "sim")]
+            decoded_seq: 0,
         }
     }
 
@@ -1078,6 +1233,54 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// default is [`host::NoCodeSource`] — see the field doc.
     pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
         self.code_source = src;
+    }
+
+    /// choose how each block's `consensus_time` is derived from its height (see
+    /// [`ConsensusTimePolicy`]). the default `HeightIsTime` is the validator
+    /// lane; the sim backend sets `Epoch{..}` for its logical millisecond clock.
+    pub fn set_consensus_time_policy(&mut self, policy: ConsensusTimePolicy) {
+        self.time_policy = policy;
+    }
+
+    /// SIM ONLY — the pre-decoded ingress: enqueue an ALREADY-DECODED op to ride
+    /// the same batch -> orderer -> drain pipeline as a signed client frame,
+    /// WITHOUT the signature a wire frame carries. the unsigned sim lanes
+    /// (`/sim/peer-block`, the `hex:` origin escape) carry origins that are not
+    /// ed25519 keys and could never verify, so they cannot ride
+    /// [`OrderedNode::submit_frame`]. NO wire variant: the op is stored decoded
+    /// in a side table keyed by a UNIQUE placeholder frame's id; the orderer
+    /// still orders only opaque bytes and [`decode_member`] is untouched (the
+    /// codec stays a machine contract). returns the placeholder [`FrameId`] so
+    /// the caller correlates the drained outcome exactly as with `submit_frame`.
+    #[cfg(feature = "sim")]
+    pub fn submit_decoded(&mut self, op: host::BlockOp) -> FrameId {
+        // a UNIQUE placeholder per call: two byte-identical unsigned ops must
+        // still be DISTINCT ordered units (a tie-free order key) and distinct
+        // side-table entries, so key on a monotone counter, not the op content.
+        self.decoded_seq += 1;
+        let mut placeholder = b"sim-decoded:".to_vec();
+        placeholder.extend_from_slice(&self.decoded_seq.to_le_bytes());
+        let id = frame_id(&placeholder);
+        // stamp the op's own frame id to the placeholder id, so a drained record
+        // (keyed by the placeholder's id) and the op agree. the placeholder then
+        // joins `pending_batch` exactly like a signed frame — flush packs it, the
+        // orderer FIFO-orders it, and the drain resolves it via `decoded`.
+        self.decoded.insert(id, host::BlockOp { frame: id, ..op });
+        self.pending_batch.push((id, placeholder));
+        id
+    }
+
+    /// resolve a batch member to its op: a SIM pre-decoded op parked via
+    /// [`OrderedNode::submit_decoded`] (taken from the side table by its
+    /// placeholder id, WITHOUT the signature check a wire frame carries), else
+    /// the verifying wire decode. non-sim builds compile to exactly
+    /// [`decode_member`], so the validator lane is untouched.
+    fn take_decoded(&mut self, member: &[u8]) -> Result<host::BlockOp, Error> {
+        #[cfg(feature = "sim")]
+        if let Some(op) = self.decoded.remove(&frame_id(member)) {
+            return Ok(op);
+        }
+        decode_member(member)
     }
 
     /// arm the observation barrier on `module` (see the field doc): every
@@ -1443,7 +1646,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             let mut decode_fail: Vec<(FrameId, String)> = Vec::new();
             for member in &members {
                 let mid = frame_id(member);
-                match decode_member(member) {
+                match self.take_decoded(member) {
                     Ok(op) => {
                         op_meta.push(MemberMeta {
                             id: mid,
@@ -1478,7 +1681,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 .submit_block_ops(
                     BlockContext {
                         height,
-                        consensus_time: height,
+                        consensus_time: self.time_policy.stamp(height),
                         origin: Origin::System,
                         protocol_version,
                     },
