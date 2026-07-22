@@ -19,19 +19,21 @@ use commonware_cryptography::ed25519;
 use data_plane::{AddressBook, AdmissionPolicy, BulkPacer, FlowId, PeerId, Service};
 
 /// the socket seam's factory selection, in one place for every plane
-/// bring-up caller: a plane's backend follows `wireguard_effect` exactly as
-/// the mesh context's does (fake stages no data plane, so it keeps the OS
-/// factory's downed-interface behavior).
+/// bring-up caller: a plane's backend follows the reachability plane
+/// exactly as the mesh context's does — plane configured
+/// (`wireguard_listen` present) routes overlay dials into the in-process
+/// virtual stack; no plane stages no data plane, so the OS factory keeps
+/// its downed-interface behavior.
 pub fn socket_factory(
-    kind: crate::config::WireGuardEffectKind,
+    overlay_enabled: bool,
     slot: &overlay_net::userspace::StackSlot,
 ) -> Arc<dyn data_plane::SocketFactory> {
-    match kind {
-        crate::config::WireGuardEffectKind::Socket => Arc::new(
-            overlay_net::userspace::VirtualSocketFactory::new(slot.clone()),
-        ),
-        crate::config::WireGuardEffectKind::Fake => Arc::new(data_plane::OsSocketFactory),
+    if overlay_enabled {
+        return Arc::new(overlay_net::userspace::VirtualSocketFactory::new(
+            slot.clone(),
+        ));
     }
+    Arc::new(data_plane::OsSocketFactory)
 }
 
 /// bulk ceiling shared by every stream-class per-use plane in this process

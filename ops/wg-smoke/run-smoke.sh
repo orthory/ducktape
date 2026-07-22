@@ -9,9 +9,6 @@
 # with no interface, no routes, no host mutation. (Both keep CAP_NET_ADMIN
 # solely so the harness can cut their underlay with iptables; the backend
 # itself uses none of it, which the no-dt-interface evidence leg asserts.)
-# node0's config omits `wireguard_effect` (the default path production
-# hits); node1 carries the legacy `wireguard_effect = "socket"` line to pin
-# that pre-retirement files keep booting.
 #
 # Assertions:
 #   1. tunnels apply on both nodes (the in-process backend — and NO dt-*
@@ -90,7 +87,6 @@ bootstrapper_addr = "$IP0:41000"
 listen = "[::]:41000"
 advertised = "overlay"
 wireguard_listen = "$IP1:51820"
-wireguard_effect = "socket"
 rpc_listen = "127.0.0.1:41100"
 storage_dir = "/data/storage"
 TOML
@@ -129,8 +125,8 @@ wait_marker() { # container marker timeout
 }
 
 note "waiting for tunnels on both nodes (1 peer each — a 0-peer apply is a FAILED epoch)"
-wait_marker dtwg-node0 "tunnels applied on dt-.*(1 peer(s); userspace socket backend" 480
-wait_marker dtwg-node1 "tunnels applied on dt-.*(1 peer(s); userspace socket backend" 480
+wait_marker dtwg-node0 "tunnels applied (config accepted.*peers=1" 480
+wait_marker dtwg-node1 "tunnels applied (config accepted.*peers=1" 480
 note "tunnels applied with peers (socket backend both sides)"
 
 height() { # container
@@ -187,8 +183,8 @@ note "persisted mesh state present on both nodes"
 
 podman start dtwg-node0 dtwg-node1 >/dev/null || fail "restart"
 
-wait_marker dtwg-node0 "persisted mesh (epoch .*) restored on dt-" 240
-wait_marker dtwg-node1 "persisted mesh (epoch .*) restored on dt-" 240
+wait_marker dtwg-node0 "persisted mesh restored" 240
+wait_marker dtwg-node1 "persisted mesh restored" 240
 note "both nodes restored tunnels from disk with zero TCP paths"
 
 # node1 has a configured hint for node0 (config wins — no seed); node0 has
@@ -208,8 +204,8 @@ wait_marker_count() { # container marker count timeout
   fail "$1: fewer than $3 of: $2"
 }
 note "waiting for live assembly to replace the restored mesh"
-wait_marker_count dtwg-node0 "tunnels applied on dt-" 2 300
-wait_marker_count dtwg-node1 "tunnels applied on dt-" 2 300
+wait_marker_count dtwg-node0 "tunnels applied (config accepted" 2 300
+wait_marker_count dtwg-node1 "tunnels applied (config accepted" 2 300
 
 note "post-restart liveness (heights must pass their pre-restart values)"
 HC=$(wait_height_past dtwg-node0 "$HA" 300) || fail "node0 height stuck after cold restart"

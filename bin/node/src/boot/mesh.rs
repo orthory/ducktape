@@ -4,7 +4,7 @@ use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_runtime::{Quota, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 
-use crate::config::{self, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, hex_bytes};
 use crate::constants::MAX_MESSAGE_SIZE;
 
 /// `run_node`'s shared runtime head (phase P3): the head of the async
@@ -55,7 +55,7 @@ pub(crate) fn build(
     listen: std::net::SocketAddr,
     advertised: Ingress,
     bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
-    wireguard_effect: WireGuardEffectKind,
+    overlay_enabled: bool,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> MeshHead {
     // the validator's own `ducktape_*` Prometheus series, registered on the
@@ -138,12 +138,11 @@ pub(crate) fn build(
     let overlay_router = overlay_net::OverlayRouter::for_prefix48(
         wireguard::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
     );
-    // ADR phase 3: the backend follows `wireguard_effect`. socket mode
-    // routes overlay dials/binds into the in-process virtual stack (and
-    // gives the wildcard mesh listener its virtual leg); fake keeps the OS
-    // pass-through — it stages no data plane at all, so pass-through
-    // preserves its long-standing "overlay dials just fail like a downed
-    // interface" behavior.
+    // ADR phase 3: the backend follows the reachability plane. a
+    // configured plane routes overlay dials/binds into the in-process
+    // virtual stack (and gives the wildcard mesh listener its virtual
+    // leg); no plane keeps the OS pass-through, so overlay dials just fail
+    // like a downed interface.
     //
     // socket mode's wildcard mesh bind normally carries the kernel OS leg
     // beside the virtual one — but a node that advertises ONLY its overlay
@@ -157,12 +156,13 @@ pub(crate) fn build(
         // a hostname advertisement is an underlay address by construction.
         Ingress::Dns { .. } => true,
     };
-    let overlay_backend = match wireguard_effect {
-        WireGuardEffectKind::Socket => overlay_net::OverlayBackend::Userspace {
+    let overlay_backend = if overlay_enabled {
+        overlay_net::OverlayBackend::Userspace {
             slot: overlay_slot.clone(),
             underlay_ingress,
-        },
-        WireGuardEffectKind::Fake => overlay_net::OverlayBackend::Tun,
+        }
+    } else {
+        overlay_net::OverlayBackend::Passthrough
     };
     let (network, oracle) = Network::new(
         overlay_net::OverlayContext::with_backend(

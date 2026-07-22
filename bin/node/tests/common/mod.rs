@@ -79,13 +79,9 @@ pub struct Cluster {
     /// points bootstrap at a forwarder in front of node 0.
     pub bootstrap_addr_override: Option<String>,
     /// When true every config gets `wireguard_listen` on the node's distinct
-    /// UDP port. The default fake effect exercises orchestration only;
-    /// `wireguard_socket` upgrades it to the real, unprivileged userspace
-    /// encrypted transport (the node's only real backend).
+    /// UDP port — the reachability plane runs the real, unprivileged
+    /// userspace transport (the node's only backend).
     pub wireguard: bool,
-    /// Use the in-process WireGuard stack instead of the fake effect —
-    /// exercises encrypted overlay sockets end to end.
-    pub wireguard_socket: bool,
     /// extra `node.toml` lines appended verbatim to EVERY node's generated
     /// config (`spawn` regenerates the file, so a hand-edit after the fact
     /// would not survive a respawn). set before the first spawn; empty by
@@ -570,7 +566,6 @@ impl Cluster {
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
             wireguard: false,
-            wireguard_socket: false,
             extra_toml: Vec::new(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
@@ -622,11 +617,6 @@ impl Cluster {
                 "wireguard_listen = \"127.0.0.1:{}\"\n",
                 self.p2p_ports[idx]
             ));
-            cfg.push_str(if self.wireguard_socket {
-                "wireguard_effect = \"socket\"\n"
-            } else {
-                "wireguard_effect = \"fake\"\n"
-            });
         }
         for line in &self.extra_toml {
             cfg.push_str(line);

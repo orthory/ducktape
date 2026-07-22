@@ -401,13 +401,11 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let primary_coordinator = config::primary_coordinator_or_default(
         flags.get("primary-coordinator").map(String::as_str),
     )?;
-    // node.toml carries the SAME raw flag value (not the defaulted/
-    // normalized `primary_coordinator` above) — an absent flag leaves the
-    // key absent too, so the runtime re-derives the identical compiled
-    // default `apply_primary_coordinator` just baked into the descriptor;
-    // an explicit "none"/host:port is persisted verbatim so the two never
-    // silently disagree (see `docs`: coordinator is ambient, node-local).
-    let mut plumbing = config::merged_plumbing(
+    // node.toml is COMPLETE: merged_plumbing pins the same compiled
+    // coordinator default `apply_primary_coordinator` bakes into the
+    // descriptor, so the two never silently disagree (see `docs`:
+    // coordinator is ambient, node-local).
+    let plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
@@ -419,8 +417,6 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("primary-coordinator").map(String::as_str),
         flags.get("wireguard-advertised").map(String::as_str),
     )?;
-    config::seed_reachability_defaults(&mut plumbing, flags.contains_key("listen"));
-
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me = key.public_key();
     let chain_id = config::mint_chain_id(name, &me);
@@ -432,7 +428,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         reach: Vec::new(),
         coordination: None,
     };
-    if let Some(addr) = config::dialable(plumbing.advertised.as_deref(), &plumbing.listen)? {
+    if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
     }
     if let Some(coord) = &primary_coordinator {
@@ -507,55 +503,26 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
-    let network_rel = raw
-        .network
-        .as_deref()
-        .ok_or("invite needs a network-shape config (no `network` field found)")?;
-    let descriptor_path = base.join(network_rel);
+    let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
-    let key = config::load_identity(&base.join(raw.key_file.as_deref().unwrap_or("identity.key")))?;
-    let dial_hint = config::dialable(raw.advertised.as_deref(), &raw.listen)?;
+    let key = config::load_identity(&base.join(&raw.key_file))?;
+    let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
     let has_coordinated_reach = descriptor.has_coordinated_reach()?;
-    match &dial_hint {
-        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
-        // an invite must carry SOME dialable member. a member that joined via
-        // an invite holds its dial hints as `reach` (bootstrap is empty), so
-        // check the union, not just bootstrap — else a reachable NAT'd member
-        // is wrongly refused. reachability-plane inviters are exempt when
-        // they carry either a direct WireGuard bootstrap or coordinated reach.
-        None if raw.wireguard_listen.is_none()
-            && !has_coordinated_reach
-            && descriptor
-                .reach_hints()
-                .map(|h| h.is_empty())
-                .unwrap_or(true) =>
-        {
-            return Err(
-                "no dialable address: give node.toml a concrete `listen` port or an \
-                        `advertised` addr, or configure a primary coordinator, so a joiner can \
-                        reach the network"
-                    .into(),
-            );
-        }
-        None => {}
+    if let Some(addr) = &dial_hint {
+        descriptor.add_bootstrap(&key.public_key(), addr);
     }
     descriptor.save(&descriptor_path)?;
 
-    // the WireGuard bootstrap: present iff this member runs the reachability
-    // plane. endpoints are minted from the advertised host (the listen IP is
-    // usually unspecified) + the plane's UDP ports; the mesh port is where
-    // the joiner dials this member's overlay ULA once the tunnel routes.
-    // the WireGuard bootstrap is MANDATORY in v2 (the overlay plane carries the
-    // data planes and the sealed first-contact intro), so minting REQUIRES a
-    // configured reachability plane — a WG-less invite no longer exists.
-    let Some(wg_listen) = config::resolved_wireguard_listen(raw.wireguard_listen.as_deref())? else {
-        return Err(
-            "this member runs no reachability plane, but a v2 invite must carry a WireGuard \
-             bootstrap. set `wireguard_listen` in node.toml (or configure a primary coordinator, \
-             which enables the plane) and mint again."
-                .into(),
-        );
-    };
+    // the WireGuard bootstrap: endpoints are minted from the advertised host
+    // (the listen IP is usually unspecified) + the plane's UDP ports; the
+    // mesh port is where the joiner dials this member's overlay ULA once the
+    // tunnel routes. the bootstrap is MANDATORY in v2 (the overlay plane
+    // carries the data planes and the sealed first-contact intro) — and the
+    // network shape always runs the plane (`wireguard_listen` is required).
+    let wg_listen: std::net::SocketAddr = raw
+        .wireguard_listen
+        .parse()
+        .map_err(|e| format!("wireguard_listen: {e}"))?;
     let wireguard = {
         let (wg_keypair, _) =
             reachability::WireGuardKeypair::load_or_generate(&base.join("wireguard.key"))
@@ -566,10 +533,10 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .map(|a| a.port())
             .map_err(|e| format!("listen {:?}: {e}", raw.listen))?;
         let host = match config::endpoint_host(
-            raw.advertised.as_deref(),
+            Some(&raw.advertised),
             &raw.listen,
             wg_listen,
-            raw.wireguard_advertised.as_deref(),
+            raw.wireguard_advertised_value(),
         ) {
             Ok(host) => Some(host),
             Err(_) if has_coordinated_reach => {
@@ -582,16 +549,16 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match host {
             Some(host) => {
                 let intro_port =
-                    config::resolved_invite_listen(raw.invite_listen.as_deref(), wg_listen)?.port();
+                    config::resolved_invite_listen(Some(&raw.invite_listen), wg_listen)?.port();
                 // the tunnel endpoint carries the FULL advertised host:port when
                 // `wireguard_advertised` is configured — the external port can
                 // differ from the bind port in the port-forwarded setup the key
                 // exists for. The intro stays host + intro port.
                 let endpoint = config::invite_wireguard_endpoint(
-                    raw.advertised.as_deref(),
+                    Some(&raw.advertised),
                     &raw.listen,
                     wg_listen,
-                    raw.wireguard_advertised.as_deref(),
+                    raw.wireguard_advertised_value(),
                 )?;
                 config::InviteWireGuard {
                     public_key: wg_keypair.public_key().0,
@@ -614,7 +581,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // ANY of them, not just the inviter (the unified all-paths invite). A
     // host-capable member rides as a direct front, a NAT'd-but-registered one
     // as a coordinated (by-identity) front. No mesh state yet → no fronts.
-    let storage = base.join(raw.storage_dir.as_deref().unwrap_or("storage"));
+    let storage = base.join(&raw.storage_dir);
     let mesh_state_file = storage.join("mesh-state.json");
     let chain_id = descriptor.genesis_namespace();
     let own: [u8; 32] = key
@@ -704,11 +671,7 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let key = config::decode_key(pubkey_hex)?;
     let cfg_path = config_path(&flags)?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
-    let network_rel = raw
-        .network
-        .as_deref()
-        .ok_or("admit needs a network-shape config")?;
-    let storage = base.join(raw.storage_dir.as_deref().unwrap_or("storage"));
+    let storage = base.join(&raw.storage_dir);
     if storage.exists() {
         return Err(format!(
             "{} already has state — a running network admits members via governance \
@@ -717,7 +680,7 @@ fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let descriptor_path = base.join(network_rel);
+    let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
     descriptor.admit(&key);
     descriptor.save(&descriptor_path)?;
@@ -1610,7 +1573,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the join without leaving a half-migrated dir. the file is ALWAYS
     // rewritten in the network shape — a join must take effect even in a dir
     // holding the app's dev-shape solo config.
-    let mut plumbing = config::merged_plumbing(
+    let plumbing = config::merged_plumbing(
         &dir,
         flags.get("listen").map(String::as_str),
         flags.get("advertised").map(String::as_str),
@@ -1622,7 +1585,6 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("primary-coordinator").map(String::as_str),
         flags.get("wireguard-advertised").map(String::as_str),
     )?;
-    config::seed_reachability_defaults(&mut plumbing, flags.contains_key("listen"));
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the
         // dial path: fold the inviter's (and every offered front's) overlay

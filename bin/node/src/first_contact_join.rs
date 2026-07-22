@@ -34,7 +34,7 @@ use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
@@ -594,20 +594,30 @@ fn run_direct_announcer(
         Ok(socket) => socket,
         Err(e) => return AttemptResult::Failed(format!("intro udp bind: {e}")),
     };
-    let _ = socket.set_read_timeout(Some(RETRY_INTERVAL));
     let mut buf = [0u8; 2048];
     for _ in 0..iters {
         if stop.load(Ordering::Relaxed) {
             return AttemptResult::Failed("cancelled".into());
         }
         let _ = socket.send_to(intro, dest);
-        // the read timeout paces the loop; a resolving ack for THIS invite
-        // settles the attempt, anything else is ignored and we retry.
-        if let Ok((n, _)) = socket.recv_from(&mut buf)
-            && let Some(reply) = open_ack(keypair, token_nonce, &buf[..n])
-            && let Some(result) = ack_resolution(reply)
-        {
-            return result;
+        // each iteration spans a FULL RETRY_INTERVAL: a resolving ack for
+        // THIS invite settles the attempt the moment it lands, while
+        // non-resolving acks (`Installed` — the member's consensus is still
+        // settling the redemption) keep DRAINING inside the interval. an
+        // instant `Installed` reply must not consume a whole iteration, or
+        // a fast responder burns the entire join window in milliseconds —
+        // faster than one block can possibly commit.
+        let deadline = Instant::now() + RETRY_INTERVAL;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            let _ = socket.set_read_timeout(Some(remaining));
+            let Ok((n, _)) = socket.recv_from(&mut buf) else {
+                break;
+            };
+            if let Some(reply) = open_ack(keypair, token_nonce, &buf[..n])
+                && let Some(result) = ack_resolution(reply)
+            {
+                return result;
+            }
         }
     }
     AttemptResult::Failed(format!(

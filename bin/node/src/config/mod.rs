@@ -785,7 +785,7 @@ fn resolve_network_in(root: &Path, needle: &str) -> Result<(PathBuf, Option<Stri
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
     let (raw, _) = node_toml::load_node_toml(&node_toml)?;
-    Ok((dir, raw.http_listen.as_deref().map(http_base_of)))
+    Ok((dir, Some(http_base_of(&raw.http_listen))))
 }
 
 /// `http://<host:port>` for a node.toml `http_listen`, rewriting a wildcard
@@ -1076,7 +1076,7 @@ mod tests {
         assert!(err.contains("ambiguous"), "{err}");
     }
 
-    fn write_workspace(root: &Path, ws: &str, chain: &str, node_toml: &str) -> PathBuf {
+    fn write_workspace(root: &Path, ws: &str, chain: &str, listen: &str, http: &str) -> PathBuf {
         let dir = root.join(ws);
         std::fs::create_dir_all(&dir).expect("mk workspace");
         NetworkDescriptor {
@@ -1089,6 +1089,19 @@ mod tests {
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
+        // the network shape is COMPLETE by construction — write every key.
+        let node_toml = format!(
+            "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
+             listen = \"{listen}\"\nadvertised = \"127.0.0.1:9000\"\n\
+             storage_dir = 'storage'\nhttp_listen = \"{http}\"\n\
+             gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
+             wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
+             wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n\
+             sync_index = false\nannounce_capabilities = false\n\
+             sandbox = \"direct\"\nsandbox_image = \"docker.io/library/node:22-slim\"\n\
+             sandbox_cores = 0\nsandbox_mem_gb = 0\n"
+        );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir
     }
@@ -1097,27 +1110,17 @@ mod tests {
     fn resolve_network_reads_http_base_and_reports_a_missing_listen() {
         let root = tmp("resolve-net");
         // a workspace with a wildcard http listen resolves to a loopback base.
-        let a = write_workspace(
-            &root,
-            "a",
-            "ducktape#a1b2c3d4",
-            "listen = \"0.0.0.0:9000\"\nhttp_listen = \"0.0.0.0:8844\"\n",
-        );
+        let a = write_workspace(&root, "a", "ducktape#a1b2c3d4", "0.0.0.0:9000", "0.0.0.0:8844");
         let (dir, http) = resolve_network_in(&root, "ducktape").expect("prefix resolves");
         assert_eq!(dir, a);
         assert_eq!(http.as_deref(), Some("http://127.0.0.1:8844"));
 
-        // a workspace WITHOUT an http listen still resolves its directory (the
-        // gateway family needs only that); the http base is `None`.
-        let b = write_workspace(
-            &root,
-            "b",
-            "kitchen#99887766",
-            "listen = \"127.0.0.1:9001\"\n",
-        );
+        // every network-shape workspace carries an http listen (the key is
+        // required), so the base always resolves.
+        let b = write_workspace(&root, "b", "kitchen#99887766", "127.0.0.1:9001", "127.0.0.1:9002");
         let (bdir, bhttp) = resolve_network_in(&root, "kitchen").expect("prefix resolves");
         assert_eq!(bdir, b);
-        assert_eq!(bhttp, None);
+        assert_eq!(bhttp.as_deref(), Some("http://127.0.0.1:9002"));
     }
 
     #[test]

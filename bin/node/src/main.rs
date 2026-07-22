@@ -321,7 +321,6 @@ fn gateway_can_start(
     gateway_listen: Option<&str>,
     http_listen: Option<&str>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
 ) -> bool {
     let api_is_loopback = http_listen
         .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
@@ -339,7 +338,6 @@ fn gateway_can_start(
         && gateway_listen.is_some()
         && api_is_loopback
         && wireguard_listen.is_some()
-        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
 }
 
 fn run_node(
@@ -363,7 +361,6 @@ fn run_node(
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         invite_token,
@@ -393,7 +390,6 @@ fn run_node(
         gateway_listen.as_deref(),
         http_listen.as_deref(),
         wireguard_listen,
-        wireguard_effect,
     );
 
     let boot::surfaces::Surfaces {
@@ -488,7 +484,7 @@ fn run_node(
             listen,
             advertised,
             bootstrappers,
-            wireguard_effect,
+            wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
         // One process-wide bulk budget: the per-use planes retain separate
@@ -594,7 +590,6 @@ fn run_node(
                 peers,
                 validators,
                 wireguard_listen,
-                wireguard_effect,
                 wireguard_key_file,
                 primary_coordinator,
                 coordinator_relay,
@@ -650,7 +645,6 @@ fn run_node(
             validators,
             coordinated,
             wireguard_listen,
-            wireguard_effect,
             wireguard_key_file,
             primary_coordinator,
             wireguard_advertised,

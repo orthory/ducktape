@@ -258,7 +258,6 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     for index in 0..2 {
         cluster.spawn(index);
     }

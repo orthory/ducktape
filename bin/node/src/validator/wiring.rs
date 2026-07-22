@@ -82,7 +82,7 @@ pub(super) async fn finish(
     label: String,
     peers: Vec<ed25519::PublicKey>,
     namespace: Vec<u8>,
-    wireguard_effect: config::WireGuardEffectKind,
+    overlay_enabled: bool,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -222,7 +222,7 @@ pub(super) async fn finish(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+                factory: crate::overlay_book::socket_factory(overlay_enabled, &overlay_slot),
                 pacer: bulk_pacer,
                 planes,
                 commands: gateway_commands,
@@ -515,7 +515,6 @@ pub(super) async fn wire(
     label: String,
     coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
@@ -635,8 +634,7 @@ pub(super) async fn wire(
         // reachability plane unconfigured) there is no media transport at
         // all (the overlay-only cutover — no mesh fallback), so drop the
         // session lane and huddle joins refuse fast instead of hanging.
-        let overlay_capable = wireguard_listen.is_some()
-            && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake);
+        let overlay_capable = wireguard_listen.is_some();
         if overlay_capable {
             // tracked media set = transport members ∪ residents, refreshed
             // on every valset cutover (below, beside the statesync book).
@@ -655,7 +653,7 @@ pub(super) async fn wire(
                 .expect("ed25519 keys are 32 bytes");
             voice::spawn_hub(
                 voice_requests,
-                crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+                crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
                 planes,
@@ -666,7 +664,7 @@ pub(super) async fn wire(
             // otherwise learns it one failed join at a time, from the webview.
             eprintln!(
                 "[node {label}] calls are DISABLED on this node: huddle media rides the mesh \
-                 overlay, and this node has none (wireguard_listen unset, or the fake effect). \
+                 overlay, and this node has none (wireguard_listen unset). \
                  set wireguard_listen to enable huddles."
             );
             drop(voice_requests);
@@ -720,7 +718,6 @@ pub(super) async fn wire(
                     &wireguard_key_file,
                     &mesh_state_file,
                     wg_addr,
-                    wireguard_effect,
                     overlay_slot.clone(),
                     advertised_reach,
                     wireguard_advertised,

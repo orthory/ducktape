@@ -232,9 +232,11 @@ So the backend seam stays, the option goes:
 - `DefguardWireGuardEffect` is deleted; `UserspaceWireGuardEffect` is the
   node's only real backend. `FakeWireGuardEffect` remains as the
   test-harness seam.
-- `wireguard_effect` is retired as an operator option: the key is
-  tolerated in existing files (`"socket"` = no-op; `"fake"` = test
-  harnesses), `"tun"`/`"real"` fail loudly, and the `--wireguard-effect`
-  CLI flags are gone.
+- `wireguard_effect` is GONE: the key is refused outright (strict
+  parsing, no tolerated spellings), the `--wireguard-effect` CLI flags
+  are gone, and the backend follows the plane — `wireguard_listen`
+  configured runs the userspace backend, no plane runs the OS
+  pass-through. `FakeWireGuardEffect` survives only as an in-process
+  unit-test seam, never a config value.
 - `ops/wg-smoke` (interop, smoke, bench) runs socket-only; the four-leg
   matrix above is the historical record of why.

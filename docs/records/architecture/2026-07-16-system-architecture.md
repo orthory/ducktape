@@ -405,13 +405,15 @@ flowchart BT
 ```
 
 **Which WireGuard backend.** (2026-07-22: the TUN backend is retired — the
-option surface with it.) The one real backend is **socket/userspace mode**
-(`UserspaceWireGuardEffect`), behind `wireguard::effect::WireGuardEffect`
-(`create_interface`/`apply`/`remove_interface` — the orchestration boundary
-never moves): TUN-less, no privilege — the BoringTun noise core used
-sans-io, one process-owned UDP socket, smoltcp as the virtual host. Test
-harnesses may set `wireguard_effect = "fake"` in config (in-memory recording,
-no tunnels); `"socket"` is tolerated in pre-retirement files as a no-op.
+`wireguard_effect` key with it, refused outright.) The one backend is
+**socket/userspace mode** (`UserspaceWireGuardEffect`), behind
+`wireguard::effect::WireGuardEffect` (`create_interface`/`apply`/
+`remove_interface` — the orchestration boundary never moves): TUN-less, no
+privilege — the BoringTun noise core used sans-io, one process-owned UDP
+socket, smoltcp as the virtual host. The backend follows the plane:
+`wireguard_listen` configured → userspace, no plane → OS pass-through
+(`OverlayBackend::Passthrough`). `FakeWireGuardEffect` survives only as an
+in-process unit-test seam.
 
 **Socket-mode loops** (all spawned on the injected runtime): `demux_pump`
 (single recv owner: classifies WG vs bypass datagrams — the bypass lane is how

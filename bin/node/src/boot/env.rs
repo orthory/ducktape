@@ -7,7 +7,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
 
-use crate::config::{self, Resolved, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
@@ -29,7 +29,6 @@ pub(crate) struct BootEnv {
     pub(crate) http_listen: Option<String>,
     pub(crate) gateway_listen: Option<String>,
     pub(crate) wireguard_listen: Option<SocketAddr>,
-    pub(crate) wireguard_effect: WireGuardEffectKind,
     pub(crate) wireguard_key_file: PathBuf,
     pub(crate) invite_listen: Option<SocketAddr>,
     pub(crate) invite_token: Option<config::InviteToken>,
@@ -89,7 +88,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         dev_demo,
@@ -296,17 +294,10 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         } else {
             format!("advertising WireGuard endpoint udp/{wg}")
         };
-        match wireguard_effect {
-            WireGuardEffectKind::Socket => println!(
-                "[node {label}] reachability plane: {advertise}; userspace socket backend \
-                 (TUN-less — overlay reachability lives inside this process)"
-            ),
-            WireGuardEffectKind::Fake => println!(
-                "[node {label}] reachability plane: {advertise}; \
-                 records, advertisements, and tunnel handshakes run for real, the interface \
-                 effect is the in-memory fake (no real tunnel)."
-            ),
-        }
+        println!(
+            "[node {label}] reachability plane: {advertise}; userspace socket backend \
+             (TUN-less — overlay reachability lives inside this process)"
+        );
     }
 
     BootEnv {
@@ -325,7 +316,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         invite_token,

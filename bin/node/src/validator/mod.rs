@@ -36,7 +36,6 @@ pub(crate) async fn run_validator(
     validators: Vec<ed25519::PublicKey>,
     coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: crate::config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     primary_coordinator: Option<String>,
     wireguard_advertised: Option<Ingress>,
@@ -132,7 +131,6 @@ pub(crate) async fn run_validator(
         label.clone(),
         coordinated,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         chain_id,
         mesh_state_file,
@@ -206,7 +204,7 @@ pub(crate) async fn run_validator(
         label.clone(),
         peers.clone(),
         namespace.clone(),
-        wireguard_effect,
+        wireguard_listen.is_some(),
         overlay_slot.clone(),
         bulk_pacer.clone(),
         planes.clone(),
@@ -234,7 +232,7 @@ pub(crate) async fn run_validator(
             .expect("ed25519 keys are 32 bytes");
         crate::agent_plane::spawn(
             label.clone(),
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(peers),
             me,
             bulk_pacer.clone(),
@@ -245,7 +243,7 @@ pub(crate) async fn run_validator(
         // ordered command log to peers, so a member on another node streams it.
         crate::term_plane::spawn(
             label.clone(),
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(peers),
             me,
             bulk_pacer.clone(),
@@ -257,7 +255,7 @@ pub(crate) async fn run_validator(
         // admin RPC's stage fan-outs. same overlay book as the agent plane.
         crate::code_plane::spawn(
             label.clone(),
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(peers),
             me,
             bulk_pacer,
