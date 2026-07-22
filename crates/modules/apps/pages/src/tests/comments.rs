@@ -92,9 +92,9 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
         });
         let mut ctx = ctx_as(user("eddy"));
         p.execute(&mut ctx, &msg(&op)).await.unwrap();
-        assert_eq!(ctx.msgs.len(), 1);
-        assert_eq!(ctx.msgs[0].target, "tagging");
-        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs[0].payload).unwrap()
+        assert_eq!(ctx.msgs().len(), 1);
+        assert_eq!(ctx.msgs()[0].target, "tagging");
+        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("expected tag event")
         };
@@ -127,7 +127,7 @@ fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
         let mut ctx = ctx_as(user("eddy"));
         p.execute(&mut ctx, &msg(&edit)).await.unwrap();
 
-        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs[0].payload).unwrap()
+        let tagging::TaggingMsg::Tag(event) = tagging::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("expected tag event")
         };

@@ -19,3 +19,4 @@ async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures = "0.3"
+sdk-testkit = { workspace = true }

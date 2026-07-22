@@ -479,56 +479,32 @@ mod tests {
     use crate::{Author, EntityRef, decode_event, encode_msg};
     use futures::executor::block_on;
     use sdk::Env;
+    use sdk_testkit::TestCtx;
 
-    struct CaptureCtx {
-        env: Env,
-        msgs: Vec<Msg>,
-        registered: Vec<&'static str>,
-    }
-    impl CaptureCtx {
-        fn new() -> Self {
-            Self {
-                env: Env {
-                    height: 0,
-                    consensus_time: 0,
-                    origin: Origin::System,
-                    me: "tagging".into(),
-                    protocol_version: 0,
-                },
-                msgs: Vec::new(),
-                registered: vec!["chat", "agent", "pages", "runs", "tagging"],
-            }
-        }
-        fn with_origin(mut self, origin: Origin) -> Self {
-            self.env.origin = origin;
-            self
-        }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for CaptureCtx {
-        fn env(&self) -> &Env {
-            &self.env
-        }
-        fn module_root(&self, target: &str) -> Option<StateRoot> {
-            self.registered.contains(&target).then_some(StateRoot::ZERO)
-        }
-        async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-            Err(Error::QueryUnsupported)
-        }
-        fn emit_msg(&mut self, msg: Msg) {
-            self.msgs.push(msg);
-        }
-        fn emit_event(&mut self, _ev: Event) {}
+    /// module ids `module_root` reports as live — the genesis-fixed registry.
+    /// tagging gates source-liveness and tag-target resolution on
+    /// `module_root(target).is_some()`.
+    const REGISTERED: [&str; 5] = ["chat", "agent", "pages", "runs", "tagging"];
+
+    // build the ctx a host hands tagging: env at block 0 with a chosen origin,
+    // `me = "tagging"`, and the registered modules live via `module_root`.
+    fn ctx_with_origin(origin: Origin) -> TestCtx {
+        REGISTERED.iter().fold(
+            TestCtx::with_env(Env {
+                height: 0,
+                consensus_time: 0,
+                origin,
+                me: "tagging".into(),
+                protocol_version: 0,
+            }),
+            |ctx, module| ctx.with_module_root(module, StateRoot::ZERO),
+        )
     }
 
     fn module() -> TaggingModule {
         TaggingModule::new("tagging").with_direct_owner("runs")
     }
-    fn exec(
-        m: &mut TaggingModule,
-        ctx: &mut CaptureCtx,
-        payload: &TaggingMsg,
-    ) -> Result<(), Error> {
+    fn exec(m: &mut TaggingModule, ctx: &mut TestCtx, payload: &TaggingMsg) -> Result<(), Error> {
         let msg = Msg {
             target: "tagging".into(),
             payload: encode_msg(payload),
@@ -538,8 +514,8 @@ mod tests {
     fn commit(m: &mut TaggingModule) {
         block_on(m.commit_block()).unwrap();
     }
-    fn from_module(id: &str) -> CaptureCtx {
-        CaptureCtx::new().with_origin(Origin::Module(id.into()))
+    fn from_module(id: &str) -> TestCtx {
+        ctx_with_origin(Origin::Module(id.into()))
     }
     fn subscribe(source: &str, container: &str) -> TaggingMsg {
         TaggingMsg::Subscribe {
@@ -566,7 +542,7 @@ mod tests {
     fn ops_are_module_origin_only() {
         let mut m = module();
         for origin in [Origin::External(b"user".to_vec()), Origin::System] {
-            let mut ctx = CaptureCtx::new().with_origin(origin);
+            let mut ctx = ctx_with_origin(origin);
             assert!(exec(&mut m, &mut ctx, &subscribe("chat", "general")).is_err());
             assert!(exec(&mut m, &mut ctx, &user_tag("general", 1, vec![])).is_err());
         }
@@ -576,11 +552,11 @@ mod tests {
             target: "tagging".into(),
             payload: b"not json".to_vec(),
         };
-        let mut ctx = CaptureCtx::new().with_origin(Origin::External(b"user".to_vec()));
+        let mut ctx = ctx_with_origin(Origin::External(b"user".to_vec()));
         assert!(block_on(m.execute(&mut ctx, &garbage)).is_err());
         let mut ctx = from_module("chat");
         block_on(m.execute(&mut ctx, &garbage)).unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.msgs().is_empty());
     }
 
     #[test]
@@ -617,9 +593,9 @@ mod tests {
             &user_tag("general", 7, vec![agent_ref("bot")]),
         )
         .unwrap();
-        assert_eq!(ctx.msgs.len(), 1);
-        assert_eq!(ctx.msgs[0].target, "agent");
-        let event = decode_event(&ctx.msgs[0].payload).unwrap();
+        assert_eq!(ctx.msgs().len(), 1);
+        assert_eq!(ctx.msgs()[0].target, "agent");
+        let event = decode_event(&ctx.msgs()[0].payload).unwrap();
         assert_eq!(event.source, "chat");
         assert_eq!(event.container, "general");
         assert_eq!(event.content_seq, 7);
@@ -628,13 +604,13 @@ mod tests {
         // an unsubscribed container delivers nothing.
         let mut ctx = from_module("chat");
         exec(&mut m, &mut ctx, &user_tag("other", 1, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.msgs().is_empty());
 
         // the SOURCE is the origin: the same container name under another
         // source module is a different scope.
         let mut ctx = from_module("pages");
         exec(&mut m, &mut ctx, &user_tag("general", 1, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.msgs().is_empty());
     }
 
     #[test]
@@ -651,9 +627,9 @@ mod tests {
             &user_tag("thread-1", 1, vec![tag.clone()]),
         )
         .unwrap();
-        assert_eq!(ctx.msgs.len(), 1);
-        assert_eq!(ctx.msgs[0].target, "runs");
-        let event = decode_event(&ctx.msgs[0].payload).unwrap();
+        assert_eq!(ctx.msgs().len(), 1);
+        assert_eq!(ctx.msgs()[0].target, "runs");
+        let event = decode_event(&ctx.msgs()[0].payload).unwrap();
         assert_eq!(event.source, "pages");
         assert_eq!(event.container, "thread-1");
         assert_eq!(event.tags, vec![tag]);
@@ -675,7 +651,7 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.msgs().is_empty());
     }
 
     #[test]
@@ -702,7 +678,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            assert!(ctx.msgs.is_empty(), "non-user authors must never fire");
+            assert!(ctx.msgs().is_empty(), "non-user authors must never fire");
         }
     }
 
@@ -716,7 +692,7 @@ mod tests {
         // malformed container: dropped, not an error (the content block lives).
         let mut ctx = from_module("chat");
         exec(&mut m, &mut ctx, &user_tag("", 1, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.msgs().is_empty());
 
         // an overlong tag list is truncated deterministically, not rejected.
         let many: Vec<EntityRef> = (0..MAX_TAGS_PER_EVENT + 4)
@@ -724,7 +700,7 @@ mod tests {
             .collect();
         let mut ctx = from_module("chat");
         exec(&mut m, &mut ctx, &user_tag("general", 2, many)).unwrap();
-        let event = decode_event(&ctx.msgs[0].payload).unwrap();
+        let event = decode_event(&ctx.msgs()[0].payload).unwrap();
         assert_eq!(event.tags.len(), MAX_TAGS_PER_EVENT);
 
         // malformed tags are filtered out; well-formed ones still deliver.
@@ -745,7 +721,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let event = decode_event(&ctx.msgs[0].payload).unwrap();
+        let event = decode_event(&ctx.msgs()[0].payload).unwrap();
         assert_eq!(event.tags, vec![agent_ref("bot")]);
     }
 
@@ -810,7 +786,7 @@ mod tests {
         // and the staged subscription is gone: a tag delivers nothing.
         let mut ctx = from_module("chat");
         exec(&mut m, &mut ctx, &user_tag("general", 1, vec![])).unwrap();
-        assert!(ctx.msgs.is_empty());
+        assert!(ctx.msgs().is_empty());
     }
 
     #[test]

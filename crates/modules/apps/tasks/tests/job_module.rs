@@ -19,7 +19,8 @@ use tasks::{
     encode_job_event as encode_jobs_event, encode_job_msg as encode_msg,
     encode_job_query as encode_query,
 };
-use sdk::{Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk_testkit::TestCtx;
 
 // the merged work module's genesis id -- the job board now lives here.
 const JOBS: &str = "tasks";
@@ -106,54 +107,23 @@ fn actor(id: &str) -> String {
 }
 
 // ---- a configurable dispatch ctx (height + origin) -------------------------
-
-struct TestCtx {
-    env: Env,
-    modules: Vec<ModuleId>,
-}
-
-impl TestCtx {
-    fn new(height: u64, origin: Origin) -> Self {
-        Self {
-            env: Env { protocol_version: 0,
-                height,
-                consensus_time: 0,
-                origin,
-                me: JOBS.into(),
-            },
-            modules: Vec::new(),
-        }
-    }
-
-    fn with_modules(mut self, modules: &[&str]) -> Self {
-        self.modules = modules.iter().map(|module| (*module).to_string()).collect();
-        self
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-    fn module_root(&self, target: &str) -> Option<StateRoot> {
-        self.modules
-            .iter()
-            .any(|module| module == target)
-            .then_some(StateRoot::ZERO)
-    }
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, _msg: Msg) {}
-    fn emit_event(&mut self, _event: Event) {}
+// jobs never reads module_root, so no live-module set is needed here; the
+// shared TestCtx stands in behind a thin constructor.
+fn ctx(height: u64, origin: Origin) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height,
+        consensus_time: 0,
+        origin,
+        me: JOBS.into(),
+    })
 }
 
 // ---- test helpers ----------------------------------------------------------
 
 /// execute one op at a height and origin, then commit it as its own block.
 async fn apply(jobs: &mut Jobs, height: u64, origin: Origin, msg: Msg) {
-    jobs.execute(&mut TestCtx::new(height, origin), &msg)
+    jobs.execute(&mut ctx(height, origin), &msg)
         .await
         .expect("op should apply");
     jobs.commit_block().await.expect("commit");
@@ -161,21 +131,19 @@ async fn apply(jobs: &mut Jobs, height: u64, origin: Origin, msg: Msg) {
 
 /// execute one op WITHOUT committing (leaves it staged).
 async fn stage(jobs: &mut Jobs, height: u64, origin: Origin, msg: Msg) -> Result<(), Error> {
-    jobs.execute(&mut TestCtx::new(height, origin), &msg).await
+    jobs.execute(&mut ctx(height, origin), &msg).await
 }
 
+// jobs never reads module_root, so the module set is inert; this forwards to
+// `stage`, retained so the module-argument call sites stay put.
 async fn stage_with_modules(
     jobs: &mut Jobs,
     height: u64,
     origin: Origin,
-    modules: &[&str],
+    _modules: &[&str],
     msg: Msg,
 ) -> Result<(), Error> {
-    jobs.execute(
-        &mut TestCtx::new(height, origin).with_modules(modules),
-        &msg,
-    )
-    .await
+    stage(jobs, height, origin, msg).await
 }
 
 async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {

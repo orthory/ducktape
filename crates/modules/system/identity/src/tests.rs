@@ -9,60 +9,19 @@ use futures::executor::block_on;
 
 const CHAIN: &str = "test-chain";
 
-// ---- a minimal Ctx ------------------------------------------------------
+// ---- a minimal Ctx (the shared sdk-testkit double) ----------------------
 
-struct TestCtx {
-    env: sdk::Env,
+use sdk_testkit::TestCtx;
+
+/// a valset-query responder over an optional member/resident set — the only
+/// host-routed read identity's execute makes.
+fn valset_reads(
     members: Option<Vec<Vec<u8>>>,
     residents: Option<Vec<Vec<u8>>>,
-}
-impl TestCtx {
-    fn external(key: &[u8]) -> Self {
-        Self {
-            env: sdk::Env {
-                protocol_version: 0,
-                height: 0,
-                consensus_time: 100,
-                origin: sdk::Origin::External(key.to_vec()),
-                me: "identity".into(),
-            },
-            members: None,
-            residents: None,
-        }
-    }
-    fn gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> Self {
-        let mut ctx = Self::external(key);
-        ctx.members = Some(validators);
-        ctx.residents = Some(residents);
-        ctx
-    }
-    /// a governance-follow-up origin (module), the only origin allowed to move
-    /// client standing besides genesis.
-    fn module(name: &str) -> Self {
-        let mut ctx = Self::external(&[]);
-        ctx.env.origin = sdk::Origin::Module(name.into());
-        ctx
-    }
-    fn system() -> Self {
-        let mut ctx = Self::external(&[]);
-        ctx.env.origin = sdk::Origin::System;
-        ctx
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, t: &str, r: &[u8]) -> Result<Vec<u8>, Error> {
-        if t != "valset" {
-            return Err(Error::QueryUnsupported);
-        }
-        let q = valset::decode_query(r).map_err(Error::Module)?;
-        match (q, &self.members, &self.residents) {
+) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+    move |req| {
+        let q = valset::decode_query(req).map_err(Error::Module)?;
+        match (q, &members, &residents) {
             (valset::ValsetQuery::Validators, Some(m), _) => Ok(valset::encode_reply(
                 &valset::ValsetReply::Validators(m.clone()),
             )),
@@ -72,8 +31,40 @@ impl Ctx for TestCtx {
             _ => Err(Error::QueryUnsupported),
         }
     }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: sdk::Event) {}
+}
+
+fn ctx_with(
+    origin: sdk::Origin,
+    members: Option<Vec<Vec<u8>>>,
+    residents: Option<Vec<Vec<u8>>>,
+) -> TestCtx {
+    TestCtx::with_env(sdk::Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time: 100,
+        origin,
+        me: "identity".into(),
+    })
+    .on_query("valset", valset_reads(members, residents))
+}
+
+fn ctx_external(key: &[u8]) -> TestCtx {
+    ctx_with(sdk::Origin::External(key.to_vec()), None, None)
+}
+fn ctx_gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> TestCtx {
+    ctx_with(
+        sdk::Origin::External(key.to_vec()),
+        Some(validators),
+        Some(residents),
+    )
+}
+/// a governance-follow-up origin (module), the only origin allowed to move
+/// client standing besides genesis.
+fn ctx_module(name: &str) -> TestCtx {
+    ctx_with(sdk::Origin::Module(name.into()), None, None)
+}
+fn ctx_system() -> TestCtx {
+    ctx_with(sdk::Origin::System, None, None)
 }
 
 // ---- member builders (one per scheme) -----------------------------------
@@ -167,7 +158,7 @@ fn new_gated_identity() -> Identity {
 
 /// execute a message from `origin`, then commit the block.
 fn apply(id: &mut Identity, origin: &[u8], msg: IdentityMsg) -> Result<(), Error> {
-    let mut ctx = TestCtx::external(origin);
+    let mut ctx = ctx_external(origin);
     let m = Msg {
         target: "identity".into(),
         payload: encode_msg(&msg),
@@ -759,7 +750,7 @@ fn bind_is_valset_gated_when_configured() {
     let msg = IdentityMsg::BindNode { authorizer: auth };
 
     // origin not in validators/residents -> rejected.
-    let mut ctx = TestCtx::gated(node, vec![b"someone-else".to_vec()], vec![]);
+    let mut ctx = ctx_gated(node, vec![b"someone-else".to_vec()], vec![]);
     let m = Msg {
         target: "identity".into(),
         payload: encode_msg(&msg),
@@ -771,7 +762,7 @@ fn bind_is_valset_gated_when_configured() {
     );
 
     // origin present as a resident -> admitted.
-    let mut ctx = TestCtx::gated(node, vec![], vec![node.to_vec()]);
+    let mut ctx = ctx_gated(node, vec![], vec![node.to_vec()]);
     block_on(id.execute(&mut ctx, &m)).expect("resident may bind");
 }
 
@@ -951,7 +942,7 @@ fn client_grant_from_module_origin_moves_root_and_reads_back() {
     let key = ed_pub(&ed(1));
 
     // staged: read-your-writes sees it before commit; root reflects committed.
-    let mut ctx = TestCtx::module("governance");
+    let mut ctx = ctx_module("governance");
     let m = Msg {
         target: "identity".into(),
         payload: encode_msg(&IdentityMsg::GrantClient { key: key.clone() }),
@@ -967,7 +958,7 @@ fn client_grant_from_module_origin_moves_root_and_reads_back() {
 #[test]
 fn client_grant_from_external_origin_is_refused() {
     let mut id = new_identity();
-    let mut ctx = TestCtx::external(&ed_pub(&ed(9)));
+    let mut ctx = ctx_external(&ed_pub(&ed(9)));
     let err = run_client(
         &mut id,
         &mut ctx,
@@ -986,7 +977,7 @@ fn client_revoke_restores_the_empty_plane_root() {
     let mut id = new_identity();
     let empty = id.snapshot();
     let key = ed_pub(&ed(2));
-    let mut sys = TestCtx::system();
+    let mut sys = ctx_system();
     run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: key.clone() }).unwrap();
     assert_eq!(client_set(&id), vec![key.clone()]);
     run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key }).unwrap();
@@ -998,7 +989,7 @@ fn client_revoke_restores_the_empty_plane_root() {
 #[test]
 fn client_grant_rejects_a_malformed_key() {
     let mut id = new_identity();
-    let mut sys = TestCtx::system();
+    let mut sys = ctx_system();
     let err = run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: vec![0u8; 16] }).unwrap_err();
     assert!(matches!(err, Error::Module(_)));
     assert!(client_set(&id).is_empty());
@@ -1010,7 +1001,7 @@ fn snapshot_round_trips_accounts_and_clients_together() {
     // an account AND a client, so the client tail rides a non-empty snapshot.
     found_account(&mut id, &ed(3), b"node-x");
     let ckey = ed_pub(&ed(7));
-    let mut sys = TestCtx::system();
+    let mut sys = ctx_system();
     run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: ckey.clone() }).unwrap();
 
     let bytes = id.snapshot();

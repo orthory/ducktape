@@ -45,6 +45,7 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "macros"], optiona
 
 [dev-dependencies]
 host = { workspace = true }
+sdk-testkit = { workspace = true }
 # the tests drive the module the way a host does: construct the concrete
 # QmdbStore and inject it as `Box<dyn MerkleStore>`.
 statesync = { workspace = true }

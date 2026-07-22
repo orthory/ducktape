@@ -13,5 +13,6 @@ async-trait = { workspace = true }
 [dev-dependencies]
 futures = "0.3"
 host = { workspace = true }
+sdk-testkit = { workspace = true }
 # crafted-snapshot tests hash the canonical encoding to the expected root.
 sha2 = { workspace = true }

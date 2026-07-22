@@ -8,7 +8,7 @@ use labs::multisig::{
     ExecutableView, Multisig, MultisigEvent, MultisigMsg, MultisigQuery, MultisigReply,
     bind_preimage, decode_event, decode_reply, encode_msg, encode_query, register_preimage,
 };
-use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
+use sdk::{Env, Error, Module, Msg, Origin};
 use valset::{ValsetQuery, ValsetReply};
 
 const VAULT: &str = "treasury";
@@ -16,51 +16,28 @@ const CHAIN: u64 = 1;
 
 // ---- harness ---------------------------------------------------------------
 
-struct TestCtx {
-    env: Env,
-    validators: Vec<Vec<u8>>,
-    events: Vec<Event>,
-}
+use sdk_testkit::TestCtx;
 
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, target: &str, request: &[u8]) -> Result<Vec<u8>, Error> {
-        match target {
-            "valset" => match valset::decode_query(request).map_err(Error::Module)? {
-                ValsetQuery::Validators => Ok(valset::encode_reply(&ValsetReply::Validators(
-                    self.validators.clone(),
-                ))),
-                ValsetQuery::Residents => {
-                    Ok(valset::encode_reply(&ValsetReply::Residents(vec![])))
-                }
-            },
-            _ => Err(Error::UnknownModule(target.into())),
-        }
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, e: Event) {
-        self.events.push(e);
+/// a valset-query responder: Validators from the given set, Residents empty —
+/// the only host-routed read the multisig member gate makes.
+fn valset_reads(validators: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+    move |req| match valset::decode_query(req).map_err(Error::Module)? {
+        ValsetQuery::Validators => Ok(valset::encode_reply(&ValsetReply::Validators(
+            validators.clone(),
+        ))),
+        ValsetQuery::Residents => Ok(valset::encode_reply(&ValsetReply::Residents(vec![]))),
     }
 }
 
 fn ctx(who: &[u8], validators: Vec<Vec<u8>>) -> TestCtx {
-    TestCtx {
-        env: Env {
-            protocol_version: 0,
-            height: 1,
-            consensus_time: 1_000,
-            origin: Origin::External(who.to_vec()),
-            me: "multisig".into(),
-        },
-        validators,
-        events: Vec::new(),
-    }
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height: 1,
+        consensus_time: 1_000,
+        origin: Origin::External(who.to_vec()),
+        me: "multisig".into(),
+    })
+    .on_query("valset", valset_reads(validators))
 }
 
 /// One vault owner: a secp256k1 key, exactly as the desktop derives it from the
@@ -183,7 +160,7 @@ fn two_of_three_needs_two_distinct_owners() {
         // one approval (the proposer's own) is not a threshold
         assert!(executables(&m).await.is_empty());
         assert!(
-            cx.events.is_empty(),
+            cx.events().is_empty(),
             "no executable event before the threshold"
         );
 
@@ -208,8 +185,8 @@ fn two_of_three_needs_two_distinct_owners() {
         assert!(!ready[0].calldata.is_empty());
 
         // the threshold-crossing approval emits the broadcast cue
-        assert_eq!(cx.events.len(), 1);
-        match decode_event(&cx.events[0].payload).expect("decode event") {
+        assert_eq!(cx.events().len(), 1);
+        match decode_event(&cx.events()[0].payload).expect("decode event") {
             MultisigEvent::Executable(e) => assert_eq!(e.safe_tx_hash, hash.to_vec()),
         }
     });

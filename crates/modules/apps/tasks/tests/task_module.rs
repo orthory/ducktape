@@ -1,8 +1,7 @@
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use sdk::{
-    Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle,
-};
+use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk_testkit::TestCtx;
 use tasks::Tasks;
 use tasks::{
     TaskMsg, TaskQuery, TaskReply, TaskStatus, decode_task_reply as decode_reply,
@@ -58,39 +57,16 @@ async fn host_tasks(host: &Host) -> Vec<tasks::Task> {
     }
 }
 
-struct TestCtx {
-    env: Env,
-}
-
-impl TestCtx {
-    fn at(consensus_time: u64) -> Self {
-        Self {
-            env: Env { protocol_version: 0,
-                height: 0,
-                consensus_time,
-                origin: Origin::System,
-                me: TASKS.into(),
-            },
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &Env {
-        &self.env
-    }
-
-    fn module_root(&self, _target: &str) -> Option<StateRoot> {
-        None
-    }
-
-    async fn query(&self, _target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-
-    fn emit_msg(&mut self, _msg: Msg) {}
-    fn emit_event(&mut self, _event: Event) {}
+// tasks' execute reads only env (consensus_time); me/height are cosmetic, so
+// the shared TestCtx stands in behind a thin System-origin constructor.
+fn at(consensus_time: u64) -> TestCtx {
+    TestCtx::with_env(Env {
+        protocol_version: 0,
+        height: 0,
+        consensus_time,
+        origin: Origin::System,
+        me: TASKS.into(),
+    })
 }
 
 #[test]
@@ -99,11 +75,11 @@ fn create_list_and_update_status() {
         let mut tasks = Tasks::new(TASKS);
 
         tasks
-            .execute(&mut TestCtx::at(11), &create("task-b", "second"))
+            .execute(&mut at(11), &create("task-b", "second"))
             .await
             .expect("create b");
         tasks
-            .execute(&mut TestCtx::at(11), &create("task-a", "first"))
+            .execute(&mut at(11), &create("task-a", "first"))
             .await
             .expect("create a");
         tasks.commit_block().await.expect("commit creates");
@@ -118,7 +94,7 @@ fn create_list_and_update_status() {
 
         tasks
             .execute(
-                &mut TestCtx::at(22),
+                &mut at(22),
                 &update("task-a", TaskStatus::InProgress),
             )
             .await
@@ -139,7 +115,7 @@ fn root_changes_only_after_commit() {
         let root0 = tasks.root();
 
         tasks
-            .execute(&mut TestCtx::at(7), &create("task-1", "write docs"))
+            .execute(&mut at(7), &create("task-1", "write docs"))
             .await
             .expect("stage create");
         assert_eq!(
@@ -158,7 +134,7 @@ fn root_changes_only_after_commit() {
         assert_ne!(root1, root0, "commit moves the root");
 
         tasks
-            .execute(&mut TestCtx::at(8), &update("task-1", TaskStatus::Done))
+            .execute(&mut at(8), &update("task-1", TaskStatus::Done))
             .await
             .expect("stage update");
         assert_eq!(tasks.root(), root1, "root remains committed-state only");
@@ -279,11 +255,11 @@ fn state_sync_handle_returns_installable_snapshot_bytes() {
     block_on(async {
         let mut source = Tasks::new(TASKS);
         source
-            .execute(&mut TestCtx::at(5), &create("task-1", "sync me"))
+            .execute(&mut at(5), &create("task-1", "sync me"))
             .await
             .expect("create");
         source
-            .execute(&mut TestCtx::at(5), &create("task-2", "me too"))
+            .execute(&mut at(5), &create("task-2", "me too"))
             .await
             .expect("create");
         source.commit_block().await.expect("commit");
@@ -314,12 +290,12 @@ fn snapshot_with_updated_at_before_created_at_round_trips() {
         // of refusing a snapshot an honest validator committed.
         let mut source = Tasks::new(TASKS);
         source
-            .execute(&mut TestCtx::at(10), &create("task-1", "time travels"))
+            .execute(&mut at(10), &create("task-1", "time travels"))
             .await
             .expect("create at t=10");
         source.commit_block().await.expect("commit create");
         source
-            .execute(&mut TestCtx::at(5), &update("task-1", TaskStatus::Done))
+            .execute(&mut at(5), &update("task-1", TaskStatus::Done))
             .await
             .expect("update at t=5");
         source.commit_block().await.expect("commit update");
@@ -345,7 +321,7 @@ fn snapshot_install_reconstructs_task_state() {
     block_on(async {
         let mut source = Tasks::new(TASKS);
         source
-            .execute(&mut TestCtx::at(5), &create("task-1", "sync me"))
+            .execute(&mut at(5), &create("task-1", "sync me"))
             .await
             .expect("create");
         source.commit_block().await.expect("commit");
