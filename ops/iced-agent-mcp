@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# Stdio MCP server twin of ops/iced-agent — same lock-pinned cached clone.
-set -euo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ICED_AGENT_ENTRY=iced-agent-mcp.ts exec "$here/iced-agent" "$@"
