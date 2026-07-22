@@ -15,6 +15,13 @@ endpoint-record and upgrade-response signing preimages carry fewer fields
 under the same domain strings. Blobs signed before 2026-07-11 no longer
 verify, and the mesh-version fixed vector was recomputed.
 
+Flag day (2026-07-23): `expires_at_view` was deleted from the endpoint
+record. A record is signed once per epoch and re-offered verbatim, so its
+lifetime is the epoch tuple itself — a record TTL expired every record on any
+epoch that outlived it (standby pre-warm records on a quiet network first).
+Only handshake messages expire. Same signed-bytes rule: earlier records no
+longer verify, and the mesh-version fixed vector was recomputed.
+
 ## Goals
 
 - Upgrade an already-known validator peer relationship into a WireGuard data
@@ -71,8 +78,7 @@ For epoch `E`, a node accepts a mesh view only when:
 2. The mesh view version is derived from the canonical mesh-version preimage for
    that admitted set and its endpoint records.
 3. The advertisement signature verifies under the admitted validator identity.
-4. The advertisement is still within its expiry view.
-5. Its endpoints satisfy the local port policy.
+4. Its endpoints satisfy the local port policy.
 
 Node-local config may restrict the policy further, but it must not add
 validators outside the finalized active consensus set. Until the
@@ -94,7 +100,6 @@ EndpointAdvertisementV2 {
   wireguard_public_key_x25519
   control_endpoint
   wireguard_endpoint        (optional)
-  expires_at_view
   nonce
   mesh_version
   signature_ed25519
@@ -174,7 +179,6 @@ EndpointRecordV2 {
   wireguard_public_key_x25519
   control_endpoint
   wireguard_endpoint        (optional)
-  expires_at_view
   nonce
 }
 
@@ -376,7 +380,9 @@ reroutes the pair through a third party.
 ## Replay, Downgrade, and Cutover
 
 - Every signed message includes a domain string, namespace, epoch, valset root,
-  mesh version, expiry view, and nonce.
+  and nonce; advertisements add the mesh version, and handshake messages add
+  the mesh version and an expiry view (records carry no expiry — their
+  lifetime is the epoch tuple).
 - Nodes store a bounded replay cache keyed by `(identity, epoch, nonce)` until
   the epoch expires.
 - A node rejects older protocol versions unless explicitly configured for a
@@ -407,7 +413,7 @@ Possession of a tunnel never bypasses module/root/kind checks.
   protocol version enables DNS.
 - Signed endpoint advertisement fails for wrong epoch, wrong mesh version,
   unknown admitted validator, candidate-only permissionless valset membership,
-  duplicate nonce, and expired view.
+  and duplicate nonce.
 - Mesh-version fixed vectors cover identical inputs, endpoint changes, valset
   changes, and signatures excluded from the preimage.
 - Upgrade request/response/ack fail when request hash, response hash, policy

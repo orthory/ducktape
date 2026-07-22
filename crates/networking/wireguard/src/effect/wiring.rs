@@ -266,7 +266,6 @@ mod tests {
                     51820,
                     Transport::Udp,
                 )),
-                expires_at_view: 50,
                 nonce: 1,
             })
             .collect();
@@ -276,7 +275,7 @@ mod tests {
             .zip(records)
             .map(|((sk, _, _), rec)| EndpointAdvertisement::sign(rec, mesh_version, sk))
             .collect();
-        MeshView::verify(set, ads, &policy, 10).unwrap()
+        MeshView::verify(set, ads, &policy).unwrap()
     }
 
     /// sign the full initiator->responder conversation against `view` and

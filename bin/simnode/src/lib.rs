@@ -967,6 +967,9 @@ fn run_sim(
                         let _ = reply.send(sim.status());
                     }
                     Some(NodeCommand::Peers { reply }) => {
+                        // the sim has no mesh: its exposition carries no peer
+                        // families, so this parses to the honest empty sample
+                        // (same shape as the embedded daemon).
                         let sampled_at_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()

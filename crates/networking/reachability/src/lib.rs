@@ -32,7 +32,7 @@ pub use keys::{KeyError, WireGuardKeypair};
 pub use seal::{open as open_sealed, seal};
 pub use msg::{MsgError, ReachabilityMsg};
 pub use orchestrator::{
-    ADVERT_TTL_VIEWS, CoordinatedInviteReply, EndpointResolver, HANDSHAKE_TTL_VIEWS, InstallReply,
+    CoordinatedInviteReply, EndpointResolver, HANDSHAKE_TTL_VIEWS, InstallReply,
     KEEPALIVE_SECONDS, MeshEpochEvent, NatResolver, RENDEZVOUS_KEEPALIVE, ReachabilityCommand,
     ReachabilityConfig, ReachabilityError, ReachabilityEvent, RendezvousStatus, Resolution,
     StaticResolver, initiates, run,

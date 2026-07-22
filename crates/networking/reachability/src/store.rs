@@ -163,7 +163,6 @@ mod tests {
             wireguard_public_key: X25519PublicKey([octet; 32]),
             control_endpoint: endpoint(443, Transport::Tcp),
             wireguard_endpoint: Some(endpoint(51820, Transport::Udp)),
-            expires_at_view: 50,
             nonce: 1,
         };
         EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)

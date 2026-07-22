@@ -280,22 +280,21 @@ pub struct EndpointRecord {
     /// to the pre-Option encoding (and old records decodable).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wireguard_endpoint: Option<Endpoint>,
-    pub expires_at_view: u64,
     pub nonce: u64,
 }
 
 impl EndpointRecord {
     /// The record-level validity checks [`MeshView::verify`] runs per
     /// member advertisement — endpoint policy on both endpoints, a real
-    /// X25519 key, freshness — available standalone for records consumed
-    /// OUTSIDE a verified view (a standby's pre-warm record, whose owner is
-    /// not in the epoch's `ActiveValidatorSet` and therefore can never be
-    /// part of a `MeshView`). The caller still owns signature verification
-    /// and the epoch-tuple/membership binding.
-    pub fn check(&self, policy: &PortPolicy, current_view: u64) -> Result<(), UpgradeError> {
-        if current_view > self.expires_at_view {
-            return Err(UpgradeError::Expired);
-        }
+    /// X25519 key — available standalone for records consumed OUTSIDE a
+    /// verified view (a standby's pre-warm record, whose owner is not in
+    /// the epoch's `ActiveValidatorSet` and therefore can never be part of
+    /// a `MeshView`). The caller still owns signature verification and the
+    /// epoch-tuple/membership binding. No freshness check: a record is
+    /// signed once per epoch and re-offered verbatim, so the epoch tuple is
+    /// its only lifetime — a record TTL would (and, historically, did)
+    /// expire every record on any epoch outliving it.
+    pub fn check(&self, policy: &PortPolicy) -> Result<(), UpgradeError> {
         policy.check_endpoint(&self.control_endpoint)?;
         if let Some(wireguard_endpoint) = &self.wireguard_endpoint {
             policy.check_endpoint(wireguard_endpoint)?;
@@ -388,7 +387,6 @@ impl MeshView {
         active_set: ActiveValidatorSet,
         advertisements: Vec<EndpointAdvertisement>,
         policy: &PortPolicy,
-        current_view: u64,
     ) -> Result<Self, UpgradeError> {
         validate_admission_root(active_set.admission_root)?;
         let mut selected: BTreeMap<ValidatorIdentity, EndpointAdvertisement> = BTreeMap::new();
@@ -401,9 +399,6 @@ impl MeshView {
                 || !active_set.contains(record.validator_identity)
             {
                 return Err(UpgradeError::UnknownValidator);
-            }
-            if current_view > record.expires_at_view {
-                return Err(UpgradeError::Expired);
             }
             policy.check_endpoint(&record.control_endpoint)?;
             if let Some(wireguard_endpoint) = &record.wireguard_endpoint {
@@ -1271,7 +1266,6 @@ fn put_endpoint_record(out: &mut Vec<u8>, record: &EndpointRecord) {
     put_x25519(out, record.wireguard_public_key);
     put_endpoint(out, record.control_endpoint);
     put_opt_endpoint(out, record.wireguard_endpoint);
-    put_u64(out, record.expires_at_view);
     put_u64(out, record.nonce);
 }
 

@@ -1015,7 +1015,6 @@ async fn forged_relayed_record_is_refused() {
                     wireguard_public_key: wireguard::X25519PublicKey([4; 32]),
                     control_endpoint: endpoint(&policy, 20, 443, Transport::Tcp),
                     wireguard_endpoint: Some(endpoint(&policy, 20, 51820, Transport::Udp)),
-                    expires_at_view: 100,
                     nonce: 9,
                 },
                 signature: wireguard::SignatureBytes(vec![0; 64]),
@@ -1731,7 +1730,6 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                             )
                             .unwrap(),
                         ),
-                        expires_at_view: 10 + reachability::ADVERT_TTL_VIEWS,
                         nonce,
                     },
                     &nodes[2].signer,
@@ -1816,7 +1814,6 @@ async fn record_from_neither_member_nor_standby_is_refused() {
                     wireguard_public_key: wireguard::X25519PublicKey([9; 32]),
                     control_endpoint: endpoint(&policy, 99, 443, Transport::Tcp),
                     wireguard_endpoint: Some(endpoint(&policy, 99, 51820, Transport::Udp)),
-                    expires_at_view: 1000,
                     nonce: 1,
                 },
                 &stranger,

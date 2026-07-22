@@ -1494,7 +1494,8 @@ pub(super) async fn park(
         // manifest: membership and resident standing come from the
         // synced boundary, whose height doubles as the plane's
         // freshness clock (the same app-height regime the members'
-        // ViewTicks run — within the advert TTL's generous window).
+        // ViewTicks run — it bounds handshake-message freshness;
+        // records themselves carry no TTL).
         // Nothing is sent before standing: no member would admit the
         // gossip yet.
         if let Some(cmd) = &reach_cmd
