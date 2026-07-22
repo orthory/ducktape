@@ -11,7 +11,7 @@ _ducktape() {
 
     local families="node user gateway fs mcp help --help -h version --version -V"
 
-    local node_verbs="run key init invite admit join list status resident member help"
+    local node_verbs="run key init invite admit join list status peers resident member help"
     local node_resident="accept remove"
     local node_member="promote remove leave status"
     local node_join="requests state"
@@ -40,7 +40,7 @@ webauthn-challenge p256-payload help"
                 resident) COMPREPLY=( $(compgen -W "$node_resident $node_flags" -- "$cur") ) ;;
                 member)   COMPREPLY=( $(compgen -W "$node_member $node_flags" -- "$cur") ) ;;
                 join)     COMPREPLY=( $(compgen -W "$node_join $node_flags" -- "$cur") ) ;;
-                run|key|init|invite|admit|list|status)
+                run|key|init|invite|admit|list|status|peers)
                           COMPREPLY=( $(compgen -W "$node_flags" -- "$cur") ) ;;
                 *)        COMPREPLY=( $(compgen -W "$node_verbs" -- "$cur") ) ;;
             esac

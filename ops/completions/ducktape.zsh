@@ -8,7 +8,7 @@
 _ducktape() {
     local families=(node user gateway fs mcp help --help -h version --version -V)
 
-    local node_verbs=(run key init invite admit join list status resident member help)
+    local node_verbs=(run key init invite admit join list status peers resident member help)
     local node_resident=(accept remove)
     local node_member=(promote remove leave status)
     local node_join=(requests state)
@@ -37,7 +37,7 @@ _ducktape() {
                 resident) compadd -- $node_resident $node_flags ;;
                 member)   compadd -- $node_member $node_flags ;;
                 join)     compadd -- $node_join $node_flags ;;
-                run|key|init|invite|admit|list|status) compadd -- $node_flags ;;
+                run|key|init|invite|admit|list|status|peers) compadd -- $node_flags ;;
                 *)        compadd -- $node_verbs ;;
             esac
             ;;

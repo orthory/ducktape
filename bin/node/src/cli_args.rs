@@ -36,6 +36,8 @@ pub enum OpCmd {
     List,
     /// the running node's tip: height + app hash (reads the local rpc)
     Status(StatusArgs),
+    /// the running node's direct peers: connection, traffic, sync heights
+    Peers(StatusArgs),
     /// resident standing: the staged-admission tier
     #[command(subcommand)]
     Resident(ResidentCmd),

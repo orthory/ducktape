@@ -29,6 +29,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Join(cmd) => dispatch_join(cmd),
         OpCmd::List => cmd_list(),
         OpCmd::Status(args) => cmd_node_status(args),
+        OpCmd::Peers(args) => cmd_node_peers(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
     }
@@ -112,6 +113,115 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
     let app_hash = status["app_hash"].as_str().unwrap_or("");
     println!("height={height} app_hash={app_hash}");
     Ok(())
+}
+
+/// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
+/// direct-peer sample off its local rpc: one `key=value` line per peer.
+/// `--json` emits one raw [`noded::peers::PeersView`] sample (cumulative
+/// counters — consumers derive rates from deltas); the prose form takes a
+/// second sample after one second so the line can carry live `…/s` rates.
+fn cmd_node_peers(args: StatusArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("node peers reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let first = peers_rpc(&rpc_addr)?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&first).expect("peers view serializes")
+        );
+        return Ok(());
+    }
+    if first.peers.is_empty() {
+        println!("no direct peers");
+        return Ok(());
+    }
+    // cumulative counters only become rates as a delta over time: hold one
+    // second, sample again, and let the SECOND sample carry the truth.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let second = peers_rpc(&rpc_addr)?;
+    for peer in &second.peers {
+        let baseline = first.peers.iter().find(|p| p.peer == peer.peer);
+        println!("{}", peer_line(peer, baseline, &first, &second));
+    }
+    Ok(())
+}
+
+/// one `peers` rpc round-trip, decoded to the shared view.
+fn peers_rpc(addr: &str) -> Result<noded::peers::PeersView, String> {
+    let reply = rpc_call(addr, &serde_json::json!({ "cmd": "peers" }))?;
+    if reply["ok"] != true {
+        return Err(format!("peers: {}", reply["error"]));
+    }
+    serde_json::from_value(reply["peers"].clone()).map_err(|e| format!("peers reply: {e}"))
+}
+
+/// one peer's `key=value` prose line. rates appear only when the peer was
+/// present in the baseline sample — a peer first seen mid-measurement has no
+/// honest denominator.
+fn peer_line(
+    peer: &noded::peers::PeerView,
+    baseline: Option<&noded::peers::PeerView>,
+    first: &noded::peers::PeersView,
+    second: &noded::peers::PeersView,
+) -> String {
+    let mut line = format!("peer={}", peer.peer);
+    if let Some(role) = &peer.role {
+        line.push_str(&format!(" role={role}"));
+    }
+    match peer.connected_since_ms {
+        Some(since) => {
+            let for_secs = second.sampled_at_ms.saturating_sub(since) / 1000;
+            line.push_str(&format!(" connected={}", human_duration(for_secs)));
+        }
+        None => line.push_str(" connected=no"),
+    }
+    line.push_str(&format!(
+        " msgs_tx={} msgs_rx={}",
+        peer.msgs_sent, peer.msgs_received
+    ));
+    let dt_secs =
+        (second.sampled_at_ms.saturating_sub(first.sampled_at_ms)).max(1) as f64 / 1000.0;
+    if let Some(base) = baseline {
+        let tx_rate = (peer.msgs_sent.saturating_sub(base.msgs_sent)) as f64 / dt_secs;
+        let rx_rate = (peer.msgs_received.saturating_sub(base.msgs_received)) as f64 / dt_secs;
+        line.push_str(&format!(" tx/s={tx_rate:.1} rx/s={rx_rate:.1}"));
+    }
+    let Some(sync) = &peer.statesync else {
+        return line;
+    };
+    line.push_str(&format!(" sync_bytes={}", sync.bytes_tx));
+    let baseline_sync = baseline.and_then(|b| b.statesync.as_ref());
+    if let Some(base) = baseline_sync {
+        let byte_rate = (sync.bytes_tx.saturating_sub(base.bytes_tx)) as f64 / dt_secs;
+        line.push_str(&format!(" sync_B/s={byte_rate:.0}"));
+    }
+    if let Some(height) = sync.served_height {
+        line.push_str(&format!(" sync_height={height}"));
+    }
+    if let Some(boundary) = sync.boundary_height {
+        line.push_str(&format!(" sync_boundary={boundary}"));
+    }
+    line.push_str(&format!(" sync_idle={}s", sync.idle_seconds));
+    if let Some(kind) = &sync.last_request_kind {
+        line.push_str(&format!(" sync_last={kind}"));
+    }
+    line
+}
+
+/// seconds → compact `42s` / `3m12s` / `2h05m` prose.
+fn human_duration(secs: u64) -> String {
+    let (hours, minutes, seconds) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if hours > 0 {
+        return format!("{hours}h{minutes:02}m");
+    }
+    if minutes > 0 {
+        return format!("{minutes}m{seconds:02}s");
+    }
+    format!("{seconds}s")
 }
 
 // ============================================================================
@@ -1380,5 +1490,60 @@ mod tests {
     #[test]
     fn the_clap_tree_is_internally_consistent() {
         <crate::Cli as clap::CommandFactory>::command().debug_assert();
+    }
+
+    use super::{human_duration, peer_line};
+
+    /// the peers prose line: rates only with a baseline, statesync tokens
+    /// only when the lane reports, durations compacted.
+    #[test]
+    fn peer_line_carries_rates_only_with_a_baseline() {
+        let sample = |sent, bytes| noded::peers::PeerView {
+            peer: "ab".repeat(32),
+            connected: true,
+            connected_since_ms: Some(1_000),
+            role: Some("validator".into()),
+            msgs_sent: sent,
+            msgs_received: 0,
+            statesync: Some(noded::peers::StatesyncServeView {
+                bytes_tx: bytes,
+                frames_served: 2,
+                boundary_height: Some(230),
+                served_height: Some(230),
+                idle_seconds: 4,
+                age_seconds: 90,
+                last_request_kind: Some("tip_coords".into()),
+            }),
+        };
+        let first = noded::peers::PeersView {
+            sampled_at_ms: 10_000,
+            peers: vec![sample(100, 1_000)],
+        };
+        let second = noded::peers::PeersView {
+            sampled_at_ms: 12_000,
+            peers: vec![sample(150, 3_000)],
+        };
+
+        let with_baseline = peer_line(&second.peers[0], Some(&first.peers[0]), &first, &second);
+        assert_eq!(
+            with_baseline,
+            format!(
+                "peer={} role=validator connected=11s msgs_tx=150 msgs_rx=0 \
+                 tx/s=25.0 rx/s=0.0 sync_bytes=3000 sync_B/s=1000 sync_height=230 \
+                 sync_boundary=230 sync_idle=4s sync_last=tip_coords",
+                "ab".repeat(32)
+            )
+        );
+
+        let without_baseline = peer_line(&second.peers[0], None, &first, &second);
+        assert!(!without_baseline.contains("tx/s="), "{without_baseline}");
+        assert!(!without_baseline.contains("sync_B/s="), "{without_baseline}");
+    }
+
+    #[test]
+    fn durations_compact_by_magnitude() {
+        assert_eq!(human_duration(42), "42s");
+        assert_eq!(human_duration(192), "3m12s");
+        assert_eq!(human_duration(7500), "2h05m");
     }
 }

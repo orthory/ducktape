@@ -51,6 +51,12 @@ pub enum NodeCommand {
     Status {
         reply: oneshot::Sender<NodeStatus>,
     },
+    /// sample the direct-peer projection (`GET /v1/peers`): the actor owns
+    /// the metrics registry the sample is parsed from, so this read crosses
+    /// the command lane like every other.
+    Peers {
+        reply: oneshot::Sender<crate::peers::PeersView>,
+    },
     /// encode the runtime's Prometheus registry (commonware runtime metrics plus
     /// the daemon's own `ducktape_*` series) to the OpenMetrics text exposition.
     /// the actor owns the commonware context that holds the registry, so this,

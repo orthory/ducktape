@@ -19,6 +19,9 @@ pub(crate) enum RpcRequest {
     /// app renders instead of parsing daemon.log markers. derived from gate
     /// progress + committed chain state, never a scattered guess.
     JoinState,
+    /// the direct-peer sample: mesh-tracked connections plus per-peer
+    /// traffic counters and statesync progression (see [`noded::peers`]).
+    Peers,
     /// graceful stop: replies ok, then exits 0 after the current pump turn.
     Shutdown,
 }
@@ -67,6 +70,8 @@ pub(crate) struct RpcReply {
     pub(crate) join_requests: Option<Vec<JoinRequestView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) join_state: Option<JoinStateView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peers: Option<noded::peers::PeersView>,
 }
 
 #[derive(serde::Serialize)]
@@ -85,6 +90,7 @@ impl RpcReply {
             status: None,
             join_requests: None,
             join_state: None,
+            peers: None,
         }
     }
     pub(crate) fn err(msg: impl Into<String>) -> Self {
@@ -95,6 +101,7 @@ impl RpcReply {
             status: None,
             join_requests: None,
             join_state: None,
+            peers: None,
         }
     }
 }

@@ -93,6 +93,14 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         },
                     });
                 }
+                NodeCommand::Peers { reply } => {
+                    // answered as the real lanes answer it: a sample parsed
+                    // from an exposition — here one connected peer.
+                    let _ = reply.send(noded::peers::peers_from_exposition(
+                        "network_tracker_directory_connected{peer=\"ab\"} 1000\n",
+                        2000,
+                    ));
+                }
                 NodeCommand::Metrics { reply } => {
                     let _ = reply.send(
                         "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n"
@@ -386,6 +394,29 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["operations"]["role"], "validator");
     assert_eq!(body["operations"]["phase"], "validating");
     assert_eq!(body["operations"]["phaseSince"], 1_720_000_000u64);
+}
+
+#[tokio::test]
+async fn peers_reports_the_direct_peer_sample() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/peers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["sampledAtMs"], 2000);
+    assert_eq!(body["peers"][0]["peer"], "ab");
+    assert_eq!(body["peers"][0]["connected"], true);
+    assert_eq!(body["peers"][0]["connectedSinceMs"], 1000);
 }
 
 #[tokio::test]
