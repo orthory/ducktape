@@ -142,7 +142,7 @@ use host::worker;
 use host::{BlockOp, Host};
 use identity::Identity;
 use inbox::Inbox;
-use indexer::{BlockOps, IndexStore};
+use indexer::IndexStore;
 use kv::Kv;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
 use noded::{
@@ -1193,19 +1193,13 @@ impl Sim {
                 block_ms: SIM_BLOCK_MS,
             }
             .stamp(projection.height);
-            let block_ops = BlockOps {
-                record: projection.record,
-                ..noded::index_block_ops(projection.height, time, &projection.dispatches)
-            };
-            if let Err(err) = self.index.apply_block(&block_ops) {
-                tracing::error!(
-                    target: "ducktape::consensus",
-                    height = projection.height,
-                    error = %err,
-                    "module index apply FAILED — the app's views are now STALE; wipe \
-                     <storage>/index to rebuild"
-                );
-            }
+            noded::projection::apply_block_to_index(
+                &self.index,
+                projection.height,
+                time,
+                projection.record,
+                &projection.dispatches,
+            );
             if let Some(app_hash) = projection.sealed_hash {
                 self.stream_hub
                     .publish_block(projection.height, hex_root(&app_hash));

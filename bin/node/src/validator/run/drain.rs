@@ -144,27 +144,9 @@ impl ValidatorRuntime<'_> {
             }
             metrics.record_op_outcomes(applied_ops, rejected_ops);
             // this lane's agreed clock IS the height: the drain stamps
-            // BlockContext { consensus_time: height } for every block.
-            let ops = indexer::BlockOps {
-                record,
-                ..noded::index_block_ops(height, height, &dispatches)
-            };
-            if let Err(err) = index.apply_block(&ops) {
-                // consensus stays perfectly healthy while the ENTIRE app UI
-                // silently stops updating: every module view the app reads is
-                // served from this derived index. it does not self-heal.
-                // `event` is the operational contract (#603); `target` is the
-                // filtering plane — orthogonal, so carry both.
-                tracing::error!(
-                    target: "ducktape::consensus",
-                    event = "node_index_poisoned",
-                    node = %label,
-                    height,
-                    error = %err,
-                    "module index apply failed — the app's views are now STALE; \
-                     wipe <storage>/index to rebuild"
-                );
-            }
+            // BlockContext { consensus_time: height } for every block. the
+            // shared index-fold epilogue owns the STALE-index error log.
+            noded::projection::apply_block_to_index(index, height, height, record, &dispatches);
         }
         for d in drained {
             // a DISCARD is not this hold's outcome: the cutover

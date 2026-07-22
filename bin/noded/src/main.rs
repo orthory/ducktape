@@ -630,45 +630,32 @@ async fn submit_one(
 
     // fold the block into the derived per-module index LAST: canonical state
     // is already committed, so an index failure degrades the read models and
-    // never the block. the store poisons itself on error (contiguity over
-    // coverage) and stays loud on every later block until rebuilt.
-    let block_ops = indexer::BlockOps {
-        // the explorer row via the shared projection seam — RootOp assembly,
-        // dispatch trace, payload preview, and op-hash staging (put_chunk keys
-        // the blob by sha256, keeping it dereferencable via
-        // GET /v1/files/blob/{op_hash}) in ONE shape with the validator lane.
-        // every block on this lane is applied (a rejected submit never
-        // increments the height, so it never was a block); the frame hash stays
-        // empty — nothing is framed here, and an invented digest would claim a
-        // verification that never happened.
-        record: Some(block_row(&BlockRecord {
-            height: *height,
-            hash: String::new(),
-            commit_hash: hex_root(&out.app_hash),
-            // the embedded daemon lane is 1-op-1-block (one host.submit per
-            // block), so the block carries exactly one member op.
-            ops: vec![noded::projection::project_root_op(
-                blobs,
-                &origin,
-                &target,
-                &payload,
-                &out.dispatches,
-                BlockDisposition::Applied,
-            )],
-        })),
-        ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
-    };
-    if let Err(err) = index.apply_block(&block_ops) {
-        // consensus stays healthy while the ENTIRE app UI silently stops updating:
-        // every module view the app reads is served from this derived index.
-        tracing::error!(
-            target: "ducktape::consensus",
-            height = *height,
-            error = %err,
-            "module index apply FAILED — the app's views are now STALE; wipe \
-             <storage>/index to rebuild"
-        );
-    }
+    // never the block. the explorer row via the shared projection seam — RootOp
+    // assembly, dispatch trace, payload preview, and op-hash staging (put_chunk
+    // keys the blob by sha256, keeping it dereferencable via
+    // GET /v1/files/blob/{op_hash}) in ONE shape with the validator lane. every
+    // block on this lane is applied (a rejected submit never increments the
+    // height, so it never was a block); the frame hash stays empty — nothing is
+    // framed here, and an invented digest would claim a verification that never
+    // happened.
+    let record = Some(block_row(&BlockRecord {
+        height: *height,
+        hash: String::new(),
+        commit_hash: hex_root(&out.app_hash),
+        // the embedded daemon lane is 1-op-1-block (one host.submit per block),
+        // so the block carries exactly one member op.
+        ops: vec![noded::projection::project_root_op(
+            blobs,
+            &origin,
+            &target,
+            &payload,
+            &out.dispatches,
+            BlockDisposition::Applied,
+        )],
+    }));
+    // the shared index-fold epilogue (store poisons itself on error, staying
+    // loud on every later block until rebuilt).
+    noded::projection::apply_block_to_index(index, *height, consensus_time, record, &out.dispatches);
 
     // fan the block out live after the derived index had its chance to
     // materialize rows. no subscribers is fine.
