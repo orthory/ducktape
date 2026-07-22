@@ -210,11 +210,11 @@ async fn gate_reply(
 
 /// the reachability plane's thread body: derive the plane's endpoints, bind
 /// the nat client against the coordinated-reach coordinators, and drive
-/// `reachability::run` with the configured WireGuard effect — real (an
-/// actual interface via the userspace WireGuard runtime) by default,
-/// in-memory fake when `wireguard_effect = "fake"` opts out. every failure
-/// path prints and returns — the plane is an overlay on a working node,
-/// never a reason to take the node down.
+/// `reachability::run` with the configured WireGuard effect — the in-process
+/// userspace backend by default, in-memory fake when `wireguard_effect =
+/// "fake"` opts out (test harnesses). every failure path prints and
+/// returns — the plane is an overlay on a working node, never a reason to
+/// take the node down.
 /// Wire the staged WireGuard reachability plane onto an already-registered
 /// mesh channel: the orchestrator runs on its own plain-tokio OS thread (the
 /// app-surface split exactly), and two pump tasks bridge it — mesh datagrams
@@ -599,7 +599,7 @@ async fn reachability_plane(
                 }
             }
         }
-        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => None,
+        WireGuardEffectKind::Fake => None,
     };
     // the coordinated intro lane rides the shared underlay socket, so it
     // exists whenever that socket does — INCLUDING on a node that binds no
@@ -914,40 +914,6 @@ async fn reachability_plane(
                     error = %err,
                     "reachability plane EXITED — this node has no overlay for the rest of \
                      this boot"
-                );
-            }
-        }
-        WireGuardEffectKind::Tun => {
-            #[cfg(unix)]
-            {
-                // same name the orchestrator writes into every
-                // InterfaceConfiguration it applies — the WGApi handle and
-                // the configs it receives must agree on the interface.
-                let ifname = reachability::interface_name(&config.chain_id);
-                let effect = match wireguard::effect::DefguardWireGuardEffect::new(&ifname) {
-                    Ok(effect) => effect,
-                    Err(err) => {
-                        eprintln!(
-                            "[node {label}] reachability: wireguard api handle for {ifname:?} \
-                             failed ({err}) — plane not started; set wireguard_effect = \
-                             \"fake\" to run without a real interface"
-                        );
-                        return;
-                    }
-                };
-                println!("[node {label}] reachability: driving wireguard interface {ifname}");
-                if let Err(err) =
-                    reachability::run(config, effect, resolver, commands, events).await
-                {
-                    eprintln!("[node {label}] reachability plane exited: {err}");
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                eprintln!(
-                    "[node {label}] reachability: the real wireguard effect needs a unix host — \
-                     plane not started; set wireguard_effect = \"fake\" to run without a real \
-                     interface"
                 );
             }
         }

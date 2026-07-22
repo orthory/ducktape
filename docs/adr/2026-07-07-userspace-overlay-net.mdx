@@ -1,9 +1,11 @@
 # ADR: Userspace Overlay Networking (in-process BoringTun, TUN-less by default)
 
-Date: 2026-07-07. Status: **Accepted**. This decides how the node carries its
-WireGuard overlay for end users: an in-process, TUN-less data plane built
-directly on `boringtun` becomes the desktop default, behind a backend seam
-that keeps today's TUN path available for servers and validators.
+Date: 2026-07-07. Status: **Accepted; superseded on defaults 2026-07-22 —
+the TUN backend is RETIRED** (see the addendum at the end). This decided how
+the node carries its WireGuard overlay for end users: an in-process,
+TUN-less data plane built directly on `boringtun` becomes the desktop
+default, behind a backend seam that keeps today's TUN path available for
+servers and validators.
 
 ## Context
 
@@ -213,3 +215,26 @@ host-routable overlay (the `ss`/`ip`/debugging surface and any
 non-ducktape consumers), not for throughput. The statesync plane's bulk
 ceiling (`BULK_BYTES_PER_SEC`, 24 MB/s) is comfortably inside
 socket-mode headroom and far above what tun-mode bulk achieves today.
+
+## Addendum (2026-07-22) — TUN retired, socket is the only backend
+
+The phase-4 numbers above argued the direction; nothing since argued back.
+The tun default could not sustain the statesync plane's own bulk ceiling
+(0.7–2.3 MB/s vs the 24 MB/s `BULK_BYTES_PER_SEC`), could not boot
+unprivileged, and its one remaining virtue — a host-routable overlay for
+`ss`/`ip` debugging and non-ducktape consumers — had no consumer anywhere
+in the deployment set. Keeping it as the file-absent default made the
+naive keyless operator carry both costs to preserve an option only an
+expert would use, and the expert can't use what isn't maintained.
+
+So the backend seam stays, the option goes:
+
+- `DefguardWireGuardEffect` is deleted; `UserspaceWireGuardEffect` is the
+  node's only real backend. `FakeWireGuardEffect` remains as the
+  test-harness seam.
+- `wireguard_effect` is retired as an operator option: the key is
+  tolerated in existing files (`"socket"` = no-op; `"fake"` = test
+  harnesses), `"tun"`/`"real"` fail loudly, and the `--wireguard-effect`
+  CLI flags are gone.
+- `ops/wg-smoke` (interop, smoke, bench) runs socket-only; the four-leg
+  matrix above is the historical record of why.

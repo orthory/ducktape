@@ -3,8 +3,6 @@
 
 use std::path::{Path, PathBuf};
 
-use super::resolve::parse_wireguard_effect;
-
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeToml {
@@ -38,14 +36,11 @@ pub struct NodeToml {
     /// PRESENT stages the node-driven reachability plane (node-local
     /// operator policy, like checkpoint_blocks). absent = plane off.
     pub wireguard_listen: Option<String>,
-    /// which `WireGuardEffect` the reachability plane drives: "tun"
-    /// (default — configure an actual interface via the userspace WireGuard
-    /// runtime; needs root/CAP_NET_ADMIN; "real" is the legacy alias),
-    /// "socket" (the ADR's TUN-less in-process backend: no privilege, no
-    /// host mutation — overlay reachability exists only inside this
-    /// process), or "fake" (record configs in memory; for dev/sim runs, and
-    /// for several same-chain nodes on one host, which would otherwise
-    /// fight over one interface name).
+    /// RETIRED as an operator option — the node always drives the in-process
+    /// userspace backend (no privilege, no host mutation). The key is still
+    /// parsed for two reasons only: "socket" is tolerated so files written
+    /// before the retirement keep booting, and "fake" remains the test-harness
+    /// seam (record configs in memory, no tunnels). "tun"/"real" fail loudly.
     pub wireguard_effect: Option<String>,
     /// the UDP endpoint this node's invite intro listener binds — where a
     /// fresh joiner announces its keys (token-authenticated) so the tunnel
@@ -141,10 +136,6 @@ pub struct Plumbing {
     /// merged from explicit flags or existing file; defaults from
     /// `wireguard_listen` when absent.
     pub invite_listen: Option<String>,
-    /// merged like the rest — a hand-set value survives; the desktop app
-    /// passes "socket" here (overlay-net ADR phase 4) while the parse
-    /// default for a file without the key stays `tun`.
-    pub wireguard_effect: Option<String>,
     /// merged like the rest; see `NodeToml::primary_coordinator`. Absent
     /// (`None`) preserves today's behavior exactly (the runtime re-derives
     /// the compiled default / whatever the descriptor already encodes).
@@ -161,7 +152,6 @@ pub fn merged_plumbing(
     http_listen: Option<&str>,
     gateway_listen: Option<&str>,
     rpc_listen: Option<&str>,
-    wireguard_effect: Option<&str>,
     wireguard_listen: Option<&str>,
     invite_listen: Option<&str>,
     primary_coordinator: Option<&str>,
@@ -174,9 +164,6 @@ pub fn merged_plumbing(
         None
     };
     let e = existing.as_ref();
-    // reject a typo'd effect value at the verb, before anything lands on disk
-    // — resolve() would only catch it on the node's NEXT boot.
-    parse_wireguard_effect(wireguard_effect)?;
     Ok(Plumbing {
         listen: listen
             .map(str::to_string)
@@ -203,9 +190,6 @@ pub fn merged_plumbing(
         invite_listen: invite_listen
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.invite_listen.clone())),
-        wireguard_effect: wireguard_effect
-            .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
         primary_coordinator: primary_coordinator
             .map(str::to_string)
             .or_else(|| e.and_then(|r| r.primary_coordinator.clone())),
@@ -243,9 +227,6 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     }
     if let Some(i) = &p.invite_listen {
         s += &format!("invite_listen = \"{i}\"\n");
-    }
-    if let Some(w) = &p.wireguard_effect {
-        s += &format!("wireguard_effect = \"{w}\"\n");
     }
     if let Some(pc) = &p.primary_coordinator {
         s += &format!("primary_coordinator = \"{pc}\"\n");
@@ -313,7 +294,6 @@ storage_dir = '/data/ducktape'
             None,
             None,
             None,
-            None,
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
@@ -329,80 +309,38 @@ storage_dir = '/data/ducktape'
         assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
     }
 
+    /// A legacy file carrying the retired `wireguard_effect` key still merges
+    /// (the key is tolerated at parse) — and the rewrite DROPS the key: the
+    /// node's behavior is the same with or without it.
     #[test]
-    fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
+    fn plumbing_tolerates_legacy_wireguard_effect_and_rewrite_drops_it() {
         let dir = tmp("plumbing-wg-effect");
-        // fresh dir + flag (the desktop app's init/join): written to disk.
-        let p = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("socket"),
-            None,
-            None,
-            None,
-            None,
+        std::fs::write(
+            dir.join("node.toml"),
+            "listen = \"127.0.0.1:1\"\nwireguard_effect = \"socket\"\n",
         )
-        .expect("merge");
-        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
+        .expect("write");
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
+            .expect("legacy key must not abort the merge");
         write_node_toml(&dir, &p).expect("write");
-
-        // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
-            .expect("re-merge");
-        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
-
-        // the flag wins over the file (merged_plumbing's standing precedence).
-        let p = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("tun"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("override");
-        assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
-
-        // a typo aborts the verb before anything is written.
-        let err = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("sokcet"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .err()
-        .expect("a bad effect value must abort the merge");
-        assert!(err.contains("wireguard_effect"), "{err}");
+        let reread = std::fs::read_to_string(dir.join("node.toml")).expect("reread");
+        assert!(
+            !reread.contains("wireguard_effect"),
+            "the retired key must not be re-minted: {reread}"
+        );
     }
 
-    /// Both change (1)/(3) keys ride the SAME `Plumbing` chain as
-    /// `wireguard_effect` above: a flag wins, an existing file's value
-    /// survives an unflagged re-merge, and `write_node_toml` round-trips it
-    /// verbatim (config.rs's "GOTCHA" — a key not in `Plumbing` is silently
-    /// dropped on rewrite; this pins that it is NOT dropped).
+    /// Both change (1)/(3) keys ride the SAME `Plumbing` chain: a flag wins,
+    /// an existing file's value survives an unflagged re-merge, and
+    /// `write_node_toml` round-trips it verbatim (config.rs's "GOTCHA" — a
+    /// key not in `Plumbing` is silently dropped on rewrite; this pins that
+    /// it is NOT dropped).
     #[test]
     fn plumbing_primary_coordinator_and_wireguard_advertised_flag_wins_and_absence_preserves() {
         let dir = tmp("plumbing-coord-wgadv");
         // fresh dir + flags (the desktop app's init/join shape): written to disk.
         let p = merged_plumbing(
             &dir,
-            None,
             None,
             None,
             None,
@@ -419,7 +357,7 @@ storage_dir = '/data/ducktape'
         write_node_toml(&dir, &p).expect("write");
 
         // no flags: the hand-settable values on disk survive a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
             .expect("re-merge");
         assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
         assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
@@ -427,7 +365,6 @@ storage_dir = '/data/ducktape'
         // the flags win over the file (merged_plumbing's standing precedence).
         let p = merged_plumbing(
             &dir,
-            None,
             None,
             None,
             None,

@@ -140,10 +140,10 @@ pub(crate) fn build(
     );
     // ADR phase 3: the backend follows `wireguard_effect`. socket mode
     // routes overlay dials/binds into the in-process virtual stack (and
-    // gives the wildcard mesh listener its virtual leg); tun AND fake
-    // keep the OS pass-through — fake stages no data plane at all, so
-    // pass-through preserves its long-standing "overlay dials just fail
-    // like a downed interface" behavior.
+    // gives the wildcard mesh listener its virtual leg); fake keeps the OS
+    // pass-through — it stages no data plane at all, so pass-through
+    // preserves its long-standing "overlay dials just fail like a downed
+    // interface" behavior.
     //
     // socket mode's wildcard mesh bind normally carries the kernel OS leg
     // beside the virtual one — but a node that advertises ONLY its overlay
@@ -162,7 +162,7 @@ pub(crate) fn build(
             slot: overlay_slot.clone(),
             underlay_ingress,
         },
-        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => overlay_net::OverlayBackend::Tun,
+        WireGuardEffectKind::Fake => overlay_net::OverlayBackend::Tun,
     };
     let (network, oracle) = Network::new(
         overlay_net::OverlayContext::with_backend(

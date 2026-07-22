@@ -393,7 +393,7 @@ TCP) is untouched by all the WireGuard machinery, which drives only the
 ```mermaid
 flowchart BT
     udp["Underlay UDP/IP — one dual-stack socket (socket mode)<br/>overlay-net UnderlaySocket, device.rs:73-111"]
-    wg["WireGuard crypto — boringtun Tunn per peer<br/>socket mode: WgDevice · tun mode: defguard WGApi"]
+    wg["WireGuard crypto — boringtun Tunn per peer<br/>overlay-net WgDevice (userspace, TUN-less)"]
     ula["Overlay ULA plane — deterministic IPv6<br/>/48 = fd‖hash(chain_id), /128 = hash(chain_id‖identity)<br/>wireguard/src/lib.rs:540-566"]
     vhost["Virtual host (socket mode) — smoltcp VirtualStack<br/>terminates TCP/UDP in-process at the node's /128"]
     seam["OverlayContext&lt;E&gt; routing seam — dial/bind by address:<br/>chain ULA → overlay backend, else OS<br/>overlay-net/src/lib.rs:282-335"]
@@ -404,17 +404,14 @@ flowchart BT
     ula --> dp
 ```
 
-**Which WireGuard backend, when.** Both implement
-`wireguard::effect::WireGuardEffect` (`create_interface`/`apply`/
-`remove_interface` — the orchestration boundary never moves). **TUN mode**
-(`DefguardWireGuardEffect`): defguard/BoringTun behind an OS TUN device; needs
-root/`CAP_NET_ADMIN`; kernel owns timers and routing; used where the overlay
-must be host-routable (servers). **Socket/userspace mode**
-(`UserspaceWireGuardEffect`): TUN-less, the desktop default — the same
-BoringTun noise core used sans-io, one process-owned UDP socket, smoltcp as
-the virtual host. Wire compatibility between modes is by construction (same
-crypto core, workspace `Cargo.toml:128-134`). Selected by
-`wireguard_effect = socket | tun | fake` in config.
+**Which WireGuard backend.** (2026-07-22: the TUN backend is retired — the
+option surface with it.) The one real backend is **socket/userspace mode**
+(`UserspaceWireGuardEffect`), behind `wireguard::effect::WireGuardEffect`
+(`create_interface`/`apply`/`remove_interface` — the orchestration boundary
+never moves): TUN-less, no privilege — the BoringTun noise core used
+sans-io, one process-owned UDP socket, smoltcp as the virtual host. Test
+harnesses may set `wireguard_effect = "fake"` in config (in-memory recording,
+no tunnels); `"socket"` is tolerated in pre-retirement files as a no-op.
 
 **Socket-mode loops** (all spawned on the injected runtime): `demux_pump`
 (single recv owner: classifies WG vs bypass datagrams — the bypass lane is how

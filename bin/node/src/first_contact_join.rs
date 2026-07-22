@@ -79,10 +79,6 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    fn is_coordinated(&self) -> bool {
-        self.endpoint.is_none()
-    }
-
     /// how this candidate was reached — for the winner log.
     pub fn via(&self) -> ContactVia {
         match &self.endpoint {
@@ -201,20 +197,6 @@ pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Ve
         }
     }
     out
-}
-
-/// filter the race for the effect mode. Under a real kernel TUN interface the
-/// userspace rendezvous/hole-punch resolver the coordinated path needs is not
-/// active, so a coordinated (by-identity) candidate can only hang — drop it.
-/// Direct candidates are always kept.
-pub fn plan_race(candidates: Vec<Candidate>, tun_mode: bool) -> Vec<Candidate> {
-    if !tun_mode {
-        return candidates;
-    }
-    candidates
-        .into_iter()
-        .filter(|c| !c.is_coordinated())
-        .collect()
 }
 
 /// Race `attempt` across every candidate concurrently; the FIRST to settle
@@ -903,18 +885,6 @@ mod tests {
         assert_eq!(coordinated.via(), ContactVia::Coordinated);
     }
 
-    #[test]
-    fn plan_race_drops_coordinated_under_tun() {
-        let candidates = build_candidates(
-            Some(inviter(None)), // coordinated inviter
-            &[front(2, Some("198.51.100.2:51820")), front(3, None)],
-        );
-        assert_eq!(candidates.len(), 3);
-        let planned = plan_race(candidates, true);
-        assert_eq!(planned.len(), 1, "only the direct front survives TUN mode");
-        assert!(matches!(planned[0].via(), ContactVia::Direct(_)));
-    }
-
     #[tokio::test]
     async fn race_admits_the_first_to_settle_without_waiting_on_the_rest() {
         let winner = key(1);
@@ -1153,11 +1123,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_candidate_set_is_terminal_not_a_hang() {
-        // a lone coordinated candidate filtered out by TUN leaves nothing to
+        // an invite that offers no contactable candidate leaves nothing to
         // race — an immediate honest terminal, never a hang.
-        let planned = plan_race(build_candidates(Some(inviter(None)), &[]), true);
-        assert!(planned.is_empty());
-        let outcome = race_first_contact(planned, |_c| async move {
+        let outcome = race_first_contact(Vec::new(), |_c| async move {
             AttemptResult::Admitted {
                 height: 1,
                 cap: None,

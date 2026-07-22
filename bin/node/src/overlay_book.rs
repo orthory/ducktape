@@ -30,9 +30,7 @@ pub fn socket_factory(
         crate::config::WireGuardEffectKind::Socket => Arc::new(
             overlay_net::userspace::VirtualSocketFactory::new(slot.clone()),
         ),
-        crate::config::WireGuardEffectKind::Tun | crate::config::WireGuardEffectKind::Fake => {
-            Arc::new(data_plane::OsSocketFactory)
-        }
+        crate::config::WireGuardEffectKind::Fake => Arc::new(data_plane::OsSocketFactory),
     }
 }
 

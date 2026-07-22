@@ -48,8 +48,7 @@ pub(super) const NODE_VERBS: &[Verb] = &[
         path: &["init"],
         usage: "node init --name <network name> [--dir .] [--listen a] [--advertised a] \
                 [--http a] [--rpc a] [--gateway a] [--primary-coordinator host:port|none] \
-                [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a] \
-                [--wireguard-effect socket|tun|fake]",
+                [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]",
         summary: "found a new network in a directory",
         flags: &[
             "name",
@@ -63,7 +62,6 @@ pub(super) const NODE_VERBS: &[Verb] = &[
             "wireguard-listen",
             "wireguard-advertised",
             "invite-listen",
-            "wireguard-effect",
         ],
     },
     Verb {
@@ -83,8 +81,7 @@ pub(super) const NODE_VERBS: &[Verb] = &[
         path: &["join"],
         usage: "node join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a] \
                 [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port] \
-                [--invite-listen a] [--wireguard-effect socket|tun|fake] \
-                [--primary-coordinator host:port|none]",
+                [--invite-listen a] [--primary-coordinator host:port|none]",
         summary: "materialize a workspace from an invite blob",
         flags: &[
             "dir",
@@ -95,7 +92,6 @@ pub(super) const NODE_VERBS: &[Verb] = &[
             "wireguard-listen",
             "wireguard-advertised",
             "invite-listen",
-            "wireguard-effect",
             "primary-coordinator",
         ],
     },
@@ -374,10 +370,9 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `init --name <human name> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
-/// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]
-/// [--wireguard-effect socket|tun|fake]` — found a network: mint the
-/// chain-id, write the descriptor + node config, seed the genesis validator
-/// set with this identity.
+/// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
+/// — found a network: mint the chain-id, write the descriptor + node config,
+/// seed the genesis validator set with this identity.
 fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -416,7 +411,6 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("http").map(String::as_str),
         flags.get("gateway").map(String::as_str),
         flags.get("rpc").map(String::as_str),
-        flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
         flags.get("primary-coordinator").map(String::as_str),
@@ -1590,7 +1584,7 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 
 /// `join <invite blob> [--dir .] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port]
-/// [--invite-listen a] [--wireguard-effect socket|tun|fake]
+/// [--invite-listen a]
 /// [--primary-coordinator host:port|none]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config. prints this identity for the inviter's pre-genesis `admit`.
@@ -1637,7 +1631,6 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("http").map(String::as_str),
         flags.get("gateway").map(String::as_str),
         flags.get("rpc").map(String::as_str),
-        flags.get("wireguard-effect").map(String::as_str),
         flags.get("wireguard-listen").map(String::as_str),
         flags.get("invite-listen").map(String::as_str),
         flags.get("primary-coordinator").map(String::as_str),

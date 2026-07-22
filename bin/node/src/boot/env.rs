@@ -297,9 +297,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
             format!("advertising WireGuard endpoint udp/{wg}")
         };
         match wireguard_effect {
-            WireGuardEffectKind::Tun => {
-                println!("[node {label}] reachability plane: {advertise}")
-            }
             WireGuardEffectKind::Socket => println!(
                 "[node {label}] reachability plane: {advertise}; userspace socket backend \
                  (TUN-less — overlay reachability lives inside this process)"

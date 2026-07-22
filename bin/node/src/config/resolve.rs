@@ -473,24 +473,28 @@ pub fn invite_wireguard_endpoint(
 /// which `WireGuardEffect` implementation the reachability plane drives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireGuardEffectKind {
-    /// the TUN-less in-process backend (overlay-net ADR): BoringTun `Tunn`s
-    /// + smoltcp behind the overlay seam, no privilege, no host mutation.
+    /// the in-process backend (overlay-net ADR): BoringTun `Tunn`s + smoltcp
+    /// behind the overlay seam, no privilege, no host mutation. The only
+    /// real-run backend.
     Socket,
-    /// configure an actual interface through the userspace WireGuard runtime.
-    Tun,
-    /// record configurations in memory without touching the network stack.
+    /// record configurations in memory without touching the network stack —
+    /// the test-harness seam (cluster e2e orchestration without tunnels).
     Fake,
 }
 
 pub(super) fn parse_wireguard_effect(raw: Option<&str>) -> Result<WireGuardEffectKind, String> {
     match raw {
-        Some("socket") => Ok(WireGuardEffectKind::Socket),
-        // "real" predates the socket backend and stays as an alias for the
-        // interface-backed path it always meant.
-        None | Some("tun") | Some("real") => Ok(WireGuardEffectKind::Tun),
+        // "socket" is tolerated for existing files; it is the only behavior.
+        None | Some("socket") => Ok(WireGuardEffectKind::Socket),
         Some("fake") => Ok(WireGuardEffectKind::Fake),
+        Some("tun") | Some("real") => Err(
+            "wireguard_effect: the TUN backend is retired — the node always runs the \
+             in-process userspace backend; remove the key (test harnesses may set \"fake\")"
+            .into(),
+        ),
         Some(other) => Err(format!(
-            "wireguard_effect: {other:?} is not \"socket\", \"tun\" (alias \"real\"), or \"fake\""
+            "wireguard_effect: {other:?} — the key is retired (the node always runs the \
+             in-process userspace backend); remove it, or set \"fake\" in a test harness"
         )),
     }
 }
@@ -1460,24 +1464,14 @@ bootstrapper_addr = "127.0.0.1:52200"
     }
 
     #[test]
-    fn wireguard_effect_defaults_tun_and_rejects_unknown_values() {
+    fn wireguard_effect_defaults_socket_tolerates_legacy_key_and_rejects_tun() {
         let dir = tmp("wgeffect");
         let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
         std::fs::write(dir.join("node.toml"), base).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun);
+        assert_eq!(r.wireguard_effect, WireGuardEffectKind::Socket);
 
-        // "real" is the legacy alias for the interface-backed path.
-        for spelled in ["tun", "real"] {
-            std::fs::write(
-                dir.join("node.toml"),
-                format!("{base}wireguard_effect = \"{spelled}\"\n"),
-            )
-            .expect("write");
-            let r = resolve(&dir.join("node.toml")).expect("resolve");
-            assert_eq!(r.wireguard_effect, WireGuardEffectKind::Tun, "{spelled}");
-        }
-
+        // "socket" survives in existing files as a tolerated no-op.
         std::fs::write(
             dir.join("node.toml"),
             format!("{base}wireguard_effect = \"socket\"\n"),
@@ -1494,13 +1488,17 @@ bootstrapper_addr = "127.0.0.1:52200"
         let r = resolve(&dir.join("node.toml")).expect("resolve");
         assert_eq!(r.wireguard_effect, WireGuardEffectKind::Fake);
 
-        std::fs::write(
-            dir.join("node.toml"),
-            format!("{base}wireguard_effect = \"simulated\"\n"),
-        )
-        .expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("unknown effect refused");
-        assert!(err.contains("wireguard_effect"), "{err}");
+        // the retired TUN backend (and its legacy alias) fails loudly with a
+        // pointer, not silently as some other backend.
+        for spelled in ["tun", "real", "simulated"] {
+            std::fs::write(
+                dir.join("node.toml"),
+                format!("{base}wireguard_effect = \"{spelled}\"\n"),
+            )
+            .expect("write");
+            let err = resolve(&dir.join("node.toml")).expect_err("retired effect refused");
+            assert!(err.contains("wireguard_effect"), "{spelled}: {err}");
+        }
     }
 
     #[test]

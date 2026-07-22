@@ -268,15 +268,11 @@ pub(super) async fn wire(
                 }
             }
         });
-        let raw = first_contact_join::build_candidates(inviter, &invite_fronts);
-        if raw.is_empty() {
+        let candidates = first_contact_join::build_candidates(inviter, &invite_fronts);
+        if candidates.is_empty() {
             // the invite offered no wireguard/front bootstrap — the join
             // rides the descriptor's reach hints, exactly as before.
         } else {
-            let candidates = first_contact_join::plan_race(
-                raw,
-                matches!(wireguard_effect, config::WireGuardEffectKind::Tun),
-            );
             match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
                 Ok((keypair, _)) => {
                     // this joiner's own token-signed intro, built once

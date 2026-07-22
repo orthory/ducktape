@@ -667,7 +667,7 @@ pub(super) async fn wire(
             eprintln!(
                 "[node {label}] calls are DISABLED on this node: huddle media rides the mesh \
                  overlay, and this node has none (wireguard_listen unset, or the fake effect). \
-                 set wireguard_listen + wireguard_effect = \"socket\" to enable huddles."
+                 set wireguard_listen to enable huddles."
             );
             drop(voice_requests);
             None
