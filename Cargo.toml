@@ -102,6 +102,8 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
     "bin/guest-builder",
+    # native desktop client — intentionally only Chat + Pages
+    "app",
 ]
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
