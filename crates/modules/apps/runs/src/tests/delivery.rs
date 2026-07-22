@@ -567,3 +567,54 @@ fn a_post_message_action_decodes_and_threads() {
         msgs[1]
     );
 }
+
+/// the dispatch sibling read runs' session + settle lanes make (a committed
+/// `DispatchView` lookup) round-trips through the shared `sdk_testkit::TestCtx`
+/// `on_query` seam — the programmable sibling response the per-crate
+/// `CaptureCtx` doubles had to hand-roll, driven here with runs' real dispatch
+/// wire types.
+#[test]
+fn dispatch_view_reads_through_testkit_on_query() {
+    use sdk_testkit::TestCtx;
+
+    let dispatch_id = "d-runs-1";
+    let ctx = TestCtx::at_height(5).on_query("dispatch", |req| {
+        let dispatch::DispatchQuery::Dispatch {
+            receiver,
+            dispatch_id,
+        } = dispatch::decode_query(req).map_err(Error::Module)?
+        else {
+            return Err(Error::QueryUnsupported);
+        };
+        assert_eq!(receiver, "runs", "runs is the dispatching module");
+        Ok(dispatch::encode_reply(&dispatch::DispatchReply::Dispatch(
+            Some(DispatchView {
+                dispatch_id,
+                recipe_id: "agent/x".into(),
+                receiver,
+                status: DispatchStatus::Delivered,
+                outcome: Some(Ok(Vec::new())),
+                created_at: 0,
+                updated_at: 0,
+            }),
+        )))
+    });
+
+    let req = dispatch::encode_query(&dispatch::DispatchQuery::Dispatch {
+        receiver: "runs".into(),
+        dispatch_id: dispatch_id.into(),
+    });
+    let bytes = block_on(ctx.query("dispatch", &req)).expect("dispatch served via on_query");
+    let dispatch::DispatchReply::Dispatch(Some(view)) =
+        dispatch::decode_reply(&bytes).expect("decode reply")
+    else {
+        panic!("expected a Dispatch view");
+    };
+    assert_eq!(view.dispatch_id, dispatch_id);
+    assert_eq!(view.receiver, "runs");
+    assert!(matches!(view.status, DispatchStatus::Delivered));
+
+    // an unregistered sibling still gets the shared QueryUnsupported default.
+    let err = block_on(ctx.query("saga", b"")).unwrap_err();
+    assert!(matches!(err, Error::QueryUnsupported));
+}

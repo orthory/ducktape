@@ -26,6 +26,8 @@ async-trait = { workspace = true }
 [dev-dependencies]
 # the host-side qmdb store handle the chat test fixtures inject.
 statesync = { workspace = true }
+# the shared programmable `TestCtx` (dev-only) — serves the live chat probe.
+sdk-testkit = { workspace = true }
 futures = "0.3"
 host = { workspace = true }
 commonware-runtime = { workspace = true }

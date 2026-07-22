@@ -30,6 +30,7 @@ use chat::{
 use futures::executor::block_on;
 use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
 use sdk::{Env, Event};
+use sdk_testkit::TestCtx;
 use tasks::{
     Task, TaskStatus, decode_task_msg as tasks_decode_msg, encode_task_reply as tasks_encode_reply,
 };
@@ -650,6 +651,75 @@ fn post_message_action_emits_deterministic_message_id() {
         "deterministic message id"
     );
     assert_eq!(blocks, &vec![Block::paragraph("welcome from general/3")]);
+}
+
+/// the same PostMessage fire, but the live chat probes (Channel existence +
+/// Message-id freshness) are served through the shared `sdk_testkit::TestCtx`
+/// `on_query` seam instead of the crate-local `CaptureCtx` — the sibling-read
+/// capability the hand-rolled doubles lacked, driving the module's REAL
+/// `execute` against a programmed chat response.
+#[test]
+fn post_message_fire_reads_chat_via_testkit_on_query() {
+    let mut m = module();
+    let mut create_ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut create_ctx,
+        &create(
+            "greet",
+            post_trigger(Some("general"), None),
+            post_action("announce", "welcome from {channel}/{seq}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    // chat delivers the hook event (origin = the chat module), and the shared
+    // TestCtx answers automations' two chat probes: "announce" exists, and the
+    // composed message id is still free.
+    let mut ctx = TestCtx::with_env(Env {
+        protocol_version: 0,
+        height: 7,
+        consensus_time: 42,
+        origin: Origin::Module(CHAT.into()),
+        me: ME.into(),
+    })
+    .on_query(CHAT, |req| match chat_decode_query(req).map_err(Error::Module)? {
+        ChatQuery::Channel { channel_id } => Ok(chat_encode_reply(&ChatReply::Channel(Some(Channel {
+            id: channel_id.clone(),
+            name: channel_id,
+            created_at: 0,
+            head_seq: 0,
+            post_policy: PostPolicy::Open,
+            hooks: Vec::new(),
+            pinned: Vec::new(),
+            huddle: Vec::new(),
+            owner: None,
+            archived: false,
+        })))),
+        ChatQuery::Message { .. } => Ok(chat_encode_reply(&ChatReply::Message(None))),
+        _ => Err(Error::QueryUnsupported),
+    });
+
+    block_on(m.execute(&mut ctx, &posted("general", 3, user(2), Vec::new()))).expect("fire");
+
+    let posts: Vec<ChatMsg> = ctx
+        .msgs()
+        .iter()
+        .filter(|msg| msg.target == CHAT)
+        .map(|msg| chat_decode_msg(&msg.payload).expect("chat msg"))
+        .collect();
+    assert_eq!(posts.len(), 1, "the served chat probe let the post through");
+    let ChatMsg::PostMessage {
+        channel_id,
+        message_id,
+        ..
+    } = &posts[0]
+    else {
+        panic!("expected PostMessage");
+    };
+    assert_eq!(channel_id, "announce");
+    assert_eq!(message_id, "auto-greet-general-3");
 }
 
 #[test]

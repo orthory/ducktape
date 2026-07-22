@@ -27,7 +27,7 @@ fn unknown_json_op_rejects_and_putblob_frame_routes() {
         let mut f = open_files(&d);
         let err = f
             .execute(
-                &mut TestCtx::new(sdk::Origin::System, 1),
+                &mut test_ctx(sdk::Origin::System, 1),
                 &sdk::Msg {
                     target: "files".into(),
                     payload: b"{\"nope\":{}}".to_vec(),
@@ -41,7 +41,7 @@ fn unknown_json_op_rejects_and_putblob_frame_routes() {
         // decoder: a well-formed chunk stages cleanly (task 7) — the json decoder
         // would instead reject these raw bytes as invalid utf-8/json.
         f.execute(
-            &mut TestCtx::new(sdk::Origin::System, 1),
+            &mut test_ctx(sdk::Origin::System, 1),
             &sdk::Msg {
                 target: "files".into(),
                 payload: files::encode_putblob(b"chunk bytes"),

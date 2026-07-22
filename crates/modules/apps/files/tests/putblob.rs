@@ -23,7 +23,7 @@ fn putblob(
     bytes: &[u8],
 ) -> Result<(), sdk::Error> {
     futures::executor::block_on(f.execute(
-        &mut TestCtx::new(origin, h),
+        &mut test_ctx(origin, h),
         &sdk::Msg {
             target: "files".into(),
             payload: encode_putblob(bytes),

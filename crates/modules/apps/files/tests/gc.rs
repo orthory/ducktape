@@ -33,7 +33,7 @@ fn msg(m: FilesMsg) -> sdk::Msg {
 }
 
 fn exec(f: &mut files::Files, origin: Origin, h: u64, op: sdk::Msg) -> Result<TestCtx, sdk::Error> {
-    let mut ctx = TestCtx::new(origin, h);
+    let mut ctx = test_ctx(origin, h);
     futures::executor::block_on(f.execute(&mut ctx, &op))?;
     Ok(ctx)
 }
