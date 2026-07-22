@@ -30,8 +30,16 @@
 //! same app-hash here. reads (query/status) always serve committed state:
 //! held ops are invisible until stepped, which is consensus semantics.
 //!
+//! the sim actor IS an [`OrderedNode`]`<`[`StepOrderer`]`, `[`NullSink`]`>` —
+//! the SAME apply/drain/projection engine the validator runs, with a scripted
+//! FIFO orderer (`/sim/step` releases one; auto releases each) and a logical
+//! [`ConsensusTimePolicy::Epoch`] clock. a commit is flush → step-release →
+//! `drain_delivered` → [`noded::projection::project_block`] — one shared block
+//! path, no re-implemented row/index assembly. `NullSink` keeps the no-WAL
+//! restart-from-index-watermark behavior.
+//!
 //! the blocks/index lane is the real daemons' exactly: every commit feeds the
-//! durable block index (`BlockOps.record` via [`noded::block_row`]), so
+//! durable block index (`BlockOps.record` via the shared `project_block`), so
 //! `GET /v1/blocks` and `/v1/index/*` serve just like noded. personas shape
 //! the one wire difference left between the two real nodes — the receipt:
 //!   - `local`: submit receipts carry `opHash` (the embedded daemon's shape).
@@ -94,11 +102,13 @@
 //!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]
 //!       [--node-key <64-hex>]`
 //!
-//! v1 limit, by design: a rejected SINGLE op never becomes a block here
-//! (Host::submit_at aborts it pre-commit; only the ordered validator journals
-//! rejected frames as blocks). a rejected MEMBER of a `submit_block` batch is
-//! different — the batch block commits with the accepted members and the
-//! rejected member is reported (never journaled as its own block).
+//! block-on-reject (validator parity): a rejected SINGLE op JOURNALS a block
+//! here, exactly like the ordered validator — the op rides the drain, seals its
+//! height with a `rejected` explorer row, and the submitter still gets the
+//! rejection reply. (this replaced the old `Host::submit_at`-aborts-pre-commit
+//! behavior where a rejected single op minted no block.) a rejected MEMBER of a
+//! batch is folded into that batch's one block with its own `rejected` verdict,
+//! as before.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -128,16 +138,16 @@ use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
 use governance::Governance;
-use host::worker::MAX_WORKER_ROUNDS;
-use host::{BlockContext, DispatchRecord, Host, MemberOutcome, SubmitError};
+use host::worker;
+use host::{BlockOp, Host};
 use identity::Identity;
 use inbox::Inbox;
-use indexer::{AppliedOp, BlockOps, IndexStore};
+use indexer::{BlockOps, IndexStore};
 use kv::Kv;
+use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
 use noded::{
-    BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeStatus, StreamHub, block_row, hex_bytes, hex_root,
-    payload_preview,
+    BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
+    NodeStatus, StreamHub, hex_bytes, hex_root,
 };
 use pages::Pages;
 use saga::SagaModule;
@@ -693,15 +703,19 @@ struct HeldOp {
     reply: oneshot::Sender<Result<BlockSummary, String>>,
 }
 
-struct Committed {
-    block: BlockSummary,
-    op_hash: String,
-    target: String,
-}
-
 struct Sim {
-    host: Host,
-    height: u64,
+    /// the ordered apply lane: the SAME `OrderedNode` drain the validator runs,
+    /// over a scripted [`StepOrderer`] and the sim's logical-clock time policy.
+    /// a commit is `submit_decoded` → `flush_batch` → step-release → drain →
+    /// `project_block`. `NullSink` = no WAL (restart = qmdb + index watermark).
+    node: OrderedNode<StepOrderer, NullSink>,
+    /// releases parked frames into the drain: one per `/sim/step`, `batches`
+    /// per immediate (peer / auto) commit. clones live on the actor only — the
+    /// serve loop scripts releases through the control lane, not this handle.
+    step: StepHandle,
+    /// the index watermark the node resumed at (fresh = 0) — the height
+    /// reported before the first block seals, when `node.finalized()` is `None`.
+    resume_height: u64,
     auto: bool,
     persona: Arc<Mutex<Persona>>,
     held: VecDeque<HeldOp>,
@@ -709,7 +723,7 @@ struct Sim {
     /// held submit — noded drains a submit's follow-ups to completion before
     /// touching the next command, and step order mirrors that.
     oracle_queue: VecDeque<Msg>,
-    workers: Vec<Box<dyn host::worker::Worker>>,
+    workers: Vec<Box<dyn worker::Worker>>,
     blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
@@ -722,10 +736,10 @@ struct Sim {
     /// a clone of the node handle, held only so a FATAL commit can request
     /// graceful shutdown (the embeddable replacement for the binary's
     /// `process::exit(1)` — a lib must never kill the host process).
-    node: NodeHandle,
-    /// set to the fatal reason if a commit hits `SubmitError::Fatal`. the
-    /// embedder's [`SimHandle::wait`] surfaces it (the binary turns that into
-    /// exit 1); reads/steps then fail because the actor is torn down.
+    handle: NodeHandle,
+    /// set to the fatal reason if a commit hits a boundary fault. the embedder's
+    /// [`SimHandle::wait`] surfaces it (the binary turns that into exit 1);
+    /// reads/steps then fail because the actor is torn down.
     fatal: Arc<Mutex<Option<String>>>,
 }
 
@@ -745,7 +759,7 @@ fn run_sim(
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
     stream_hub: StreamHub,
-    node: NodeHandle,
+    handle: NodeHandle,
     fatal: Arc<Mutex<Option<String>>>,
 ) {
     let duckfs_dir = storage.join("duckfs");
@@ -849,12 +863,28 @@ fn run_sim(
         // resume above the index watermark like noded — with the contractual
         // fresh dir this is 0; on a (discouraged) reused dir it keeps op-log
         // heights monotonic instead of silently skipping every new block.
-        let height = index.resume_height().expect("read index watermarks");
-        stream_hub.prime(height, hex_root(&host.app_hash()));
+        let resume_height = index.resume_height().expect("read index watermarks");
+        stream_hub.prime(resume_height, hex_root(&host.app_hash()));
+
+        // wrap the host on the ordered lane, over the scripted FIFO orderer.
+        // `view_base = resume_height + 1` bases the first drained block (engine
+        // view 0) at the height after the watermark — 1 on a fresh dir, so
+        // genesis stays height 0 and blocks are 1-indexed exactly like before.
+        // NullSink: no journal (restart = qmdb + index watermark). the sim's
+        // logical clock rides the `Epoch` time policy — the drain stamps
+        // `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS` per block, the
+        // byte-identical reproduction of the old hand-rolled clock.
+        let (orderer, step) = StepOrderer::new();
+        let mut node = OrderedNode::resume(host, orderer, NullSink, None, resume_height + 1);
+        node.set_consensus_time_policy(ConsensusTimePolicy::Epoch {
+            base_ms: SIM_EPOCH_MS,
+            block_ms: SIM_BLOCK_MS,
+        });
 
         let mut sim = Sim {
-            host,
-            height,
+            node,
+            step,
+            resume_height,
             auto,
             persona,
             held: VecDeque::new(),
@@ -869,7 +899,7 @@ fn run_sim(
             stream_hub,
             module_ids,
             public_key,
-            node,
+            handle,
             fatal,
         };
 
@@ -917,7 +947,11 @@ fn run_sim(
                         }
                     }
                     Some(NodeCommand::Query { target, req, reply }) => {
-                        let result = sim.host.query(&target, &req).await.map_err(|err| err.to_string());
+                        // reads serve COMMITTED state — the ordered lane applies
+                        // only in `drain_delivered`, so a held/parked op is
+                        // invisible here until a step commits it.
+                        let result =
+                            sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);
                     }
                     Some(NodeCommand::Status { reply }) => {
@@ -949,15 +983,16 @@ impl Sim {
             self.held.push_back(HeldOp { origin, msg, reply });
             return;
         }
-        // auto mode = noded's submit_and_drain: commit the caller's op, then
-        // drain its worker follow-ups to completion, each its own block.
-        let result = self.commit(origin, msg).await;
-        let result = match result {
-            Ok(committed) => match self.drain_oracle_budgeted().await {
-                Ok(()) => Ok(committed.block),
-                Err(err) => Err(err),
+        // auto mode = noded's submit_and_drain: commit the caller's op as its own
+        // block, then settle its worker follow-ups through the SHARED reactor loop
+        // (each its own block). a rejected op still journals its block (validator
+        // parity) and the submitter gets the rejection — no follow-ups to drain.
+        let result = match self.commit_block(vec![(origin, msg)]).await {
+            Ok((drained, events)) => match Self::member_summary(&drained) {
+                Ok(block) => self.drive_auto(events).await.map(|()| block),
+                Err(reason) => Err(reason),
             },
-            Err(err) => Err(err),
+            Err(reason) => Err(reason), // fatal — the sim halted
         };
         let _ = reply.send(result); // caller may have hung up
     }
@@ -997,10 +1032,10 @@ impl Sim {
                 // same `hex:` origin escape as /v1/submit — a concurrent writer
                 // can also author as a raw ed25519 key; bad hex rejects the block.
                 let result = match decode_origin(origin) {
-                    Ok(origin) => self
-                        .commit(Origin::External(origin), Msg { target, payload })
-                        .await
-                        .map(|committed| committed_info(&committed, "peer")),
+                    Ok(origin) => {
+                        self.commit_peer(Origin::External(origin), Msg { target, payload })
+                            .await
+                    }
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(result);
@@ -1017,7 +1052,7 @@ impl Sim {
                     })
                     .collect();
                 let result = match resolved {
-                    Ok(ops) => self.commit_batch(ops).await,
+                    Ok(ops) => self.commit_peer_batch(ops).await,
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(result);
@@ -1029,332 +1064,281 @@ impl Sim {
     }
 
     /// commit exactly one queued op — a pending oracle follow-up first, else
-    /// the oldest held submit (releasing its receipt). None when idle or when
-    /// the stepped op was rejected (the submitter got the rejection reply).
+    /// the oldest held submit (releasing its receipt). `None` when idle, and
+    /// `None` when the stepped op was rejected (the submitter got the rejection
+    /// reply; the block is still journaled — validator parity — but the step
+    /// reports no commit).
     async fn step_once(&mut self) -> Option<CommittedInfo> {
+        // oracle follow-ups drain BEFORE held submits — noded settles a submit's
+        // follow-ups before the next command, and step order mirrors that.
         if let Some(follow) = self.oracle_queue.pop_front() {
-            return match self
-                .commit(Origin::External(ORACLE_ORIGIN.to_vec()), follow)
+            let (drained, events) = self
+                .commit_block(vec![(Origin::External(ORACLE_ORIGIN.to_vec()), follow)])
                 .await
-            {
-                Ok(committed) => Some(committed_info(&committed, "oracle")),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        error = %err,
-                        "worker follow-up REJECTED — the oracle's result never landed"
-                    );
-                    None
-                }
-            };
-        }
-        let held = self.held.pop_front()?;
-        let result = self.commit(held.origin, held.msg).await;
-        let info = result
-            .as_ref()
-            .ok()
-            .map(|committed| committed_info(committed, "held"));
-        let _ = held.reply.send(result.map(|committed| committed.block));
-        info
-    }
-
-    /// noded's follow-up budget, for auto mode only: manual steps are already
-    /// bounded by the test issuing them one at a time. (in HOLD mode a
-    /// committed dispatch mailbox flushes on the next explicit step's block —
-    /// that is the deterministic-sim semantic, deliberately not auto-nudged.)
-    async fn drain_oracle_budgeted(&mut self) -> Result<(), String> {
-        let mut rounds = 1u32;
-        loop {
-            let Some(follow) = self.oracle_queue.pop_front() else {
-                // the never-pop-stack tail: results committed into the
-                // dispatch mailbox deliver in a LATER block — auto mode
-                // settles fully, so nudge one flush block per pending batch.
-                if !self.host.has_pending_deliveries().await {
-                    break;
-                }
-                self.oracle_queue.push_back(Msg {
-                    target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
-                    payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
-                });
-                continue;
-            };
-            rounds += 1;
-            if rounds > MAX_WORKER_ROUNDS {
-                return Err("worker-round budget exceeded".into());
-            }
-            if let Err(err) = self
-                .commit(Origin::External(ORACLE_ORIGIN.to_vec()), follow)
-                .await
-            {
+                .ok()?; // fatal — the sim halted, reads fail closed
+            self.offer(&drained, events).await;
+            return self.committed_info(&drained, "oracle").or_else(|| {
                 tracing::warn!(
                     target: "ducktape::modules",
-                    error = %err,
                     "worker follow-up REJECTED — the oracle's result never landed"
                 );
-            }
+                None
+            });
         }
-        Ok(())
-    }
-
-    /// the one commit point — noded's submit_one under the logical clock:
-    /// apply the op at the next height, publish the same ws block frame a real
-    /// node publishes, stage the payload (op hash == content address), and feed
-    /// the durable block index that serves GET /v1/blocks and /v1/index/*.
-    async fn commit(&mut self, origin: Origin, msg: Msg) -> Result<Committed, String> {
-        let target = msg.target.clone();
-        let payload = payload_preview(&msg.payload);
-        let proposer = proposer_hex(&origin);
-        let consensus_time = SIM_EPOCH_MS + (self.height + 1) * SIM_BLOCK_MS;
-        // staging IS hashing (put_chunk keys by sha256), and every real
-        // surface stages committed payloads — the local daemon at submit, the
-        // validator at drain — so /v1/files/blob/{opHash} dereferences here too.
-        let op_hash = hex_bytes(&self.blobs.put_chunk(msg.payload.clone()));
-        let ctx = BlockContext {
-            protocol_version: 0,
-            height: self.height + 1,
-            consensus_time,
-            origin,
-        };
-        let out = match self.host.submit_at(ctx, msg).await {
+        let held = self.held.pop_front()?;
+        let (drained, events) = match self.commit_block(vec![(held.origin, held.msg)]).await {
             Ok(out) => out,
-            Err(SubmitError::Fatal(err)) => {
-                // same fail-stop as the real daemons: a half-committed host is
-                // indeterminate, and a SIM that limps past it would hand tests
-                // green runs over corrupt state. as a LIB we cannot
-                // `process::exit` — record the reason, request graceful
-                // shutdown, and return the error so the held submitter (if any)
-                // gets it and the actor tears down; `SimHandle::wait` surfaces
-                // it (the binary turns that into exit 1).
-                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
-                self.halt(err.to_string());
-                return Err(err.to_string());
+            Err(reason) => {
+                // fatal: the sim halted; surface it to the parked submitter.
+                let _ = held.reply.send(Err(reason));
+                return None;
             }
-            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
         };
-        self.height += 1;
-
-        let block = BlockSummary {
-            height: self.height,
-            app_hash: hex_root(&out.app_hash),
-        };
-        let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
-
-        // fold the block into the durable index LAST, like noded: canonical
-        // state is already committed, so an index failure degrades the read
-        // models, never the block. the frame hash stays empty — nothing is
-        // framed on this lane, same discipline as the real daemon.
-        let ops = out
-            .dispatches
-            .into_iter()
-            .map(|d| AppliedOp {
-                // reuse noded's mapping verbatim (single source of truth) so
-                // index rows read identically across the real and sim daemons —
-                // including the printable-name-or-hex author rendering.
-                origin: noded::index_origin(&d.origin),
-                module: d.module,
-                payload: d.payload,
-            })
-            .collect();
-        let block_ops = BlockOps {
-            height: self.height,
-            time: consensus_time,
-            ops,
-            record: Some(block_row(&BlockRecord {
-                height: self.height,
-                hash: String::new(),
-                commit_hash: block.app_hash.clone(),
-                // the sim commits one op per step/block.
-                ops: vec![noded::RootOp {
-                    proposer,
-                    disposition: BlockDisposition::Applied,
-                    target: target.clone(),
-                    operations,
-                    payload,
-                    op_hash: op_hash.clone(),
-                }],
-            })),
-        };
-        if let Err(err) = self.index.apply_block(&block_ops) {
-            tracing::error!(
-                target: "ducktape::consensus",
-                height = self.height,
-                error = %err,
-                "module index apply FAILED — the app's views are now STALE; wipe \
-                 <storage>/index to rebuild"
-            );
-        }
-
-        self.stream_hub
-            .publish_block(block.height, block.app_hash.clone());
-
-        offer_effects(
-            &self.workers,
-            block.height,
-            out.events,
-            &mut self.oracle_queue,
-        )
-        .await;
-        Ok(Committed {
-            block,
-            op_hash,
-            target,
-        })
+        self.offer(&drained, events).await;
+        // release the parked http reply with the op's consensus fate: an applied
+        // block summary, or the module's rejection.
+        let _ = held.reply.send(Self::member_summary(&drained));
+        self.committed_info(&drained, "held")
     }
 
-    /// commit N ops as ONE block through the host's `submit_block` batch engine
-    /// — per-op isolation with a SINGLE shared app-hash. the batch twin of
-    /// [`Self::commit`]: every member's payload is staged (content-addressed
-    /// op_hash), the block index row aggregates ALL members (applied AND
-    /// rejected, each with its disposition — the real validator's multi-op row
-    /// shape, see `drain_actions::block_actions`), one ws frame is published,
-    /// and the reply carries a per-member applied/rejected verdict. an empty
-    /// `ops` is a valid empty block: height advances, no members, no row.
-    async fn commit_batch(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
-        let consensus_time = SIM_EPOCH_MS + (self.height + 1) * SIM_BLOCK_MS;
-        // capture each member's (proposer, target, payload) BEFORE submit_block
-        // consumes the ops — the row and reply need them after the engine returns.
-        let meta: Vec<(String, String, Vec<u8>)> = ops
+    /// commit a concurrent-writer block (one op, immediate), returning its
+    /// `CommittedInfo`. a rejected peer op journals its block (validator parity)
+    /// but the reply is the rejection — the same single-op convention as a held
+    /// submit.
+    async fn commit_peer(&mut self, origin: Origin, msg: Msg) -> Result<CommittedInfo, String> {
+        let (drained, events) = self.commit_block(vec![(origin, msg)]).await?;
+        self.settle(&drained, events).await;
+        match self.committed_info(&drained, "peer") {
+            Some(info) => Ok(info),
+            None => Err(Self::member_summary(&drained).err().unwrap_or_default()),
+        }
+    }
+
+    /// commit N ops as ONE block, returning per-member verdicts. the batch twin
+    /// of [`Self::commit_peer`]: `submit_decoded` each, flush into ONE batch (one
+    /// block, one app-hash, per-op isolation), and read each member's
+    /// applied/rejected disposition from the drain — the shared `project_block`
+    /// already wrote the block's one row (all members, each with its disposition)
+    /// and the per-module index feed. an empty `ops` produces no ordered frame
+    /// and so no block.
+    async fn commit_peer_batch(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
+        let (drained, events) = self.commit_block(ops).await?;
+        self.settle(&drained, events).await;
+        // the batch is ONE block: every member frame shares its height and the
+        // one post-batch app-hash the drain sealed.
+        let members = drained
             .iter()
-            .map(|(origin, msg)| {
-                (
-                    proposer_hex(origin),
-                    msg.target.clone(),
-                    msg.payload.clone(),
-                )
+            .filter_map(|d| {
+                let op = d.op.as_ref()?;
+                Some(MemberInfo {
+                    target: op.target.clone(),
+                    proposer: proposer_hex(&op.origin),
+                    disposition: block_disposition(d.disposition),
+                    rejection: d.reason.clone(),
+                })
             })
             .collect();
-        let ctx = BlockContext {
-            protocol_version: 0,
-            height: self.height + 1,
-            consensus_time,
-            // apply_block ignores ctx.origin — each member carries its own, and
-            // the once-per-block System injections are System-authored.
-            origin: Origin::System,
-        };
-        let out = match self.host.submit_block(ctx, ops).await {
-            Ok(out) => out,
-            Err(SubmitError::Fatal(err)) => {
-                // same fail-stop as the single-op lane and the real daemons —
-                // but as a lib, halt-and-surface rather than `process::exit`.
-                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
-                self.halt(err.to_string());
-                return Err(err.to_string());
-            }
-            // a member reject is folded into its MemberOutcome, never here: a
-            // whole-batch Rejected is only a boundary-injection failure — surface
-            // it verbatim (no block committed).
-            Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
-        };
-        self.height += 1;
-        let app_hash = hex_root(&out.app_hash);
-
-        // build the per-member reply verdicts + the block row's RootOps in input
-        // order, and the per-module AppliedOp feed from the applied members' (and
-        // the System injections') dispatch traces.
-        let mut members = Vec::with_capacity(meta.len());
-        let mut root_ops = Vec::with_capacity(meta.len());
-        let mut applied_ops: Vec<AppliedOp> = Vec::new();
-        for ((proposer, target, payload), outcome) in meta.into_iter().zip(out.members.iter()) {
-            let (disposition, rejection, dispatches): (
-                BlockDisposition,
-                Option<String>,
-                &[DispatchRecord],
-            ) = match outcome {
-                MemberOutcome::Applied { dispatches } => {
-                    (BlockDisposition::Applied, None, dispatches.as_slice())
-                }
-                MemberOutcome::Rejected { reason } => {
-                    (BlockDisposition::Rejected, Some(reason.clone()), &[])
-                }
-            };
-            // an applied member's dispatches feed the per-module index; a rejected
-            // member left no committed writes, so it contributes none.
-            for d in dispatches {
-                applied_ops.push(AppliedOp {
-                    origin: noded::index_origin(&d.origin),
-                    module: d.module.clone(),
-                    payload: d.payload.clone(),
-                });
-            }
-            let operations: Vec<DispatchInfo> = dispatches.iter().map(dispatch_info).collect();
-            // stage every member's payload (idempotent, content-addressed) so the
-            // row's op_hash dereferences via /v1/files/blob/{opHash} — the
-            // validator stages rejected members too (explorer_root_op).
-            let op_hash = hex_bytes(&self.blobs.put_chunk(payload.clone()));
-            root_ops.push(noded::RootOp {
-                proposer: proposer.clone(),
-                disposition,
-                target: target.clone(),
-                operations,
-                payload: payload_preview(&payload),
-                op_hash,
-            });
-            members.push(MemberInfo {
-                target,
-                proposer,
-                disposition,
-                rejection,
-            });
-        }
-        // the once-per-block System injections also mutate module state — feed
-        // their dispatches to the per-module index like the single-op lane.
-        for d in &out.system_dispatches {
-            applied_ops.push(AppliedOp {
-                origin: noded::index_origin(&d.origin),
-                module: d.module.clone(),
-                payload: d.payload.clone(),
-            });
-        }
-
-        let block_ops = BlockOps {
-            height: self.height,
-            time: consensus_time,
-            ops: applied_ops,
-            // a truly empty batch writes no explorer row (drain_actions' rule);
-            // any member — applied or rejected — gives the block its row.
-            record: (!root_ops.is_empty()).then(|| {
-                block_row(&BlockRecord {
-                    height: self.height,
-                    hash: String::new(),
-                    commit_hash: app_hash.clone(),
-                    ops: root_ops,
-                })
-            }),
-        };
-        if let Err(err) = self.index.apply_block(&block_ops) {
-            tracing::error!(
-                target: "ducktape::consensus",
-                height = self.height,
-                error = %err,
-                "module index apply FAILED — the app's views are now STALE; wipe \
-                 <storage>/index to rebuild"
-            );
-        }
-
-        self.stream_hub.publish_block(self.height, app_hash.clone());
-        offer_effects(
-            &self.workers,
-            self.height,
-            out.events,
-            &mut self.oracle_queue,
-        )
-        .await;
-
         Ok(BatchInfo {
-            height: self.height,
-            app_hash,
+            height: self.height(),
+            app_hash: hex_root(&self.node.app_hash()),
             members,
         })
     }
 
+    /// commit N pre-resolved ops as ONE block on the ordered lane, feed the
+    /// index + stream from the SHARED [`noded::projection::project_block`] seam,
+    /// and return the per-op drained outcomes (input order) plus the block's
+    /// emitted events. `submit_decoded` parks each op (the unsigned sim lanes
+    /// never sign — no wire variant, the codec stays a machine contract);
+    /// `flush_batch` packs them into batch super-frames; the [`StepHandle`]
+    /// releases exactly those; `drain_delivered` applies them as blocks. a member
+    /// REJECTION is a normal `Rejected` frame in the returned vec — the block
+    /// STILL seals (validator parity). only a FATAL boundary fault halts the sim
+    /// and returns `Err(reason)`.
+    async fn commit_block(
+        &mut self,
+        ops: Vec<(Origin, Msg)>,
+    ) -> Result<(Vec<DrainedFrame>, Vec<Event>), String> {
+        for (origin, msg) in ops {
+            self.node.submit_decoded(BlockOp {
+                origin,
+                msg,
+                continuation: None,
+                frame: [0u8; 32],
+            });
+        }
+        // flush → release → drain are paired so the FIFO orderer never holds an
+        // unreleased backlog: auto and hold differ only in WHEN commit_block is
+        // called, never in this release.
+        let batches = match self.node.flush_batch().await {
+            Ok(batches) => batches,
+            Err(err) => return Err(self.fatal(err)),
+        };
+        self.step.release(batches as u64);
+        if let Err(err) = self.node.drain_delivered().await {
+            return Err(self.fatal(err));
+        }
+        let drained = self.node.take_drained();
+        let system = self.node.take_system_dispatches();
+        // ONE block per drained height: feed the durable index (explorer row +
+        // per-module dispatch feed) and publish the ws block frame. canonical
+        // state is already sealed, so an index failure degrades the read models,
+        // never the block. the row carries the ordered-frame id as its `hash`
+        // exactly like the validator — the sim now frames its ops on the ordered
+        // lane, so `project_block` fills it (where the old direct-host path left
+        // it empty).
+        for projection in noded::projection::project_block(&drained, system, &self.blobs) {
+            let time = ConsensusTimePolicy::Epoch {
+                base_ms: SIM_EPOCH_MS,
+                block_ms: SIM_BLOCK_MS,
+            }
+            .stamp(projection.height);
+            let block_ops = BlockOps {
+                record: projection.record,
+                ..noded::index_block_ops(projection.height, time, &projection.dispatches)
+            };
+            if let Err(err) = self.index.apply_block(&block_ops) {
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    height = projection.height,
+                    error = %err,
+                    "module index apply FAILED — the app's views are now STALE; wipe \
+                     <storage>/index to rebuild"
+                );
+            }
+            if let Some(app_hash) = projection.sealed_hash {
+                self.stream_hub
+                    .publish_block(projection.height, hex_root(&app_hash));
+            }
+        }
+        Ok((drained, self.node.take_events()))
+    }
+
+    /// settle worker follow-ups in AUTO mode through the SHARED reactor loop
+    /// ([`worker::drive`]): each follow-up commits as its own block, its events
+    /// feed the next round, a stranded dispatch mailbox is nudged, and a
+    /// self-retriggering worker is bounded. workers are moved out for the borrow
+    /// (the lane holds `&mut self`).
+    async fn drive_auto(&mut self, initial: Vec<Event>) -> Result<(), String> {
+        let workers = std::mem::take(&mut self.workers);
+        let result = {
+            let mut lane = AutoLane { sim: self };
+            worker::drive(&workers, initial, &mut lane).await
+        };
+        self.workers = workers;
+        match result {
+            Ok(unclaimed) => {
+                let mut notes = noded::log::ModuleNotes::new(self.height());
+                for eff in &unclaimed {
+                    notes.unclaimed(eff);
+                }
+                notes.finish();
+                Ok(())
+            }
+            // a budget-exceeded or halted-fatal loop: the sim already recorded a
+            // fatal on the halt path; surface the reason either way.
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    /// route a committed peer block's events by mode: HOLD parks the follow-ups
+    /// in the oracle queue (drained one-per-step); AUTO drives them to a fixpoint
+    /// now (`oracle_queue` is a hold-mode concept — auto never fills it). the
+    /// reply already carries the block, so a drive fault is swallowed here (a
+    /// fatal already halted; a budget-exceeded is logged inside `drive_auto`).
+    async fn settle(&mut self, drained: &[DrainedFrame], events: Vec<Event>) {
+        if self.auto {
+            let _ = self.drive_auto(events).await;
+        } else {
+            self.offer(drained, events).await;
+        }
+    }
+
+    /// route a block's events to the workers (shared try-decode routing) and PARK
+    /// the follow-ups in the oracle queue — HOLD-mode drain discipline (each
+    /// drains one-per-step). an unclaimed event is a module's only diagnostic
+    /// channel (a wasm guest cannot log); a decodable-but-unhandled one means a
+    /// saga is stuck Pending.
+    async fn offer(&mut self, drained: &[DrainedFrame], events: Vec<Event>) {
+        let height = drained
+            .iter()
+            .map(|d| d.height)
+            .max()
+            .unwrap_or_else(|| self.height());
+        let worker::Offered { follows, unclaimed } = worker::offer(&self.workers, events).await;
+        self.oracle_queue.extend(follows);
+        let mut notes = noded::log::ModuleNotes::new(height);
+        for eff in &unclaimed {
+            notes.unclaimed(eff);
+        }
+        notes.finish();
+    }
+
+    /// the current committed height — `node.finalized()` once a block sealed,
+    /// else the index watermark the node resumed at (0 on a fresh dir).
+    fn height(&self) -> u64 {
+        self.node
+            .finalized()
+            .map(|f| f.height)
+            .unwrap_or(self.resume_height)
+    }
+
+    /// record a FATAL boundary fault: log, halt (graceful shutdown), and return
+    /// the reason. a half-committed host is indeterminate — a SIM that limped
+    /// past it would hand tests green runs over corrupt state; as a LIB it cannot
+    /// `process::exit`, so it records the reason (`SimHandle::wait` surfaces it,
+    /// the binary turns that into exit 1) and tears down.
+    fn fatal(&self, err: node::Error) -> String {
+        let reason = err.to_string();
+        tracing::error!(target: "ducktape::node", error = %reason, "FATAL: halting");
+        self.halt(reason.clone());
+        reason
+    }
+
+    /// the held submitter's reply for a one-op commit: `Ok(BlockSummary)` for an
+    /// applied op, `Err(reason)` for a rejected one (the block STILL sealed —
+    /// validator parity — but the op moved no state). the sim feeds exactly one
+    /// op per non-batch commit, so there is exactly one member frame.
+    fn member_summary(drained: &[DrainedFrame]) -> Result<BlockSummary, String> {
+        let Some(frame) = drained.iter().find(|d| d.op.is_some()) else {
+            return Err("commit produced no member".into());
+        };
+        let block = BlockSummary {
+            height: frame.height,
+            app_hash: hex_root(&frame.app_hash),
+        };
+        match frame.disposition {
+            node::Disposition::Applied => Ok(block),
+            _ => Err(frame.reason.clone().unwrap_or_default()),
+        }
+    }
+
+    /// the `CommittedInfo` for an APPLIED one-op commit; `None` if the op was
+    /// rejected (the step/peer reply reports no commit, the submitter got the
+    /// rejection). `op_hash` re-stages the payload (idempotent, content-address).
+    fn committed_info(&self, drained: &[DrainedFrame], kind: &'static str) -> Option<CommittedInfo> {
+        let frame = drained.iter().find(|d| d.op.is_some())?;
+        if frame.disposition != node::Disposition::Applied {
+            return None;
+        }
+        let op = frame.op.as_ref()?;
+        Some(CommittedInfo {
+            height: frame.height,
+            app_hash: hex_root(&frame.app_hash),
+            op_hash: hex_bytes(&self.blobs.put_chunk(op.payload.clone())),
+            target: op.target.clone(),
+            kind,
+        })
+    }
+
     fn status(&self) -> NodeStatus {
+        let host = self.node.host();
         let modules = self
             .module_ids
             .iter()
             .map(|id| ModuleStatus {
                 id: (*id).into(),
-                root: self
-                    .host
+                root: host
                     .module_root(id)
                     .map(|root| hex_root(&root))
                     .unwrap_or_default(),
@@ -1363,8 +1347,8 @@ impl Sim {
             .collect();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
-            app_hash: hex_root(&self.host.app_hash()),
-            height: self.height,
+            app_hash: hex_root(&host.app_hash()),
+            height: self.height(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty
             // key as "no peer-routed features here" (no huddle voice). the
@@ -1381,7 +1365,7 @@ impl Sim {
 
     fn snapshot(&self) -> SimSnapshot {
         SimSnapshot {
-            height: self.height,
+            height: self.height(),
             held: self.held.len(),
             oracle_queued: self.oracle_queue.len(),
             auto: self.auto,
@@ -1399,17 +1383,59 @@ impl Sim {
         if fatal.is_none() {
             *fatal = Some(reason);
         }
-        self.node.request_shutdown();
+        self.handle.request_shutdown();
     }
 }
 
-fn committed_info(committed: &Committed, kind: &'static str) -> CommittedInfo {
-    CommittedInfo {
-        height: committed.block.height,
-        app_hash: committed.block.app_hash.clone(),
-        op_hash: committed.op_hash.clone(),
-        target: committed.target.clone(),
-        kind,
+/// the AUTO-mode reactor lane: each worker follow-up commits as its own block on
+/// the ordered lane (via [`Sim::commit_block`]), returning that block's events
+/// for the next round; `pending` reports the committed dispatch mailbox so
+/// [`worker::drive`] nudges a stranded delivery. `Sim::workers` is moved out
+/// while this borrows `&mut Sim`.
+struct AutoLane<'a> {
+    sim: &'a mut Sim,
+}
+
+#[async_trait::async_trait(?Send)]
+impl worker::Lane for AutoLane<'_> {
+    async fn submit(&mut self, follow: Msg) -> Result<Vec<Event>, worker::Error> {
+        match self
+            .sim
+            .commit_block(vec![(Origin::External(ORACLE_ORIGIN.to_vec()), follow)])
+            .await
+        {
+            Ok((drained, events)) => {
+                // a rejected follow-up journaled its block (validator parity) but
+                // moved no state; log it and feed no events onward.
+                let rejected = drained
+                    .iter()
+                    .any(|d| d.disposition != node::Disposition::Applied);
+                if rejected {
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        "worker follow-up REJECTED — the oracle's result never landed"
+                    );
+                    return Ok(Vec::new());
+                }
+                Ok(events)
+            }
+            // commit_block already halted on this fatal; break the drive loop.
+            Err(reason) => Err(worker::Error::Worker(reason)),
+        }
+    }
+
+    async fn pending(&self) -> bool {
+        self.sim.node.host().has_pending_deliveries().await
+    }
+}
+
+/// the disposition of a drained frame as its explorer wire twin (`Discarded`
+/// can never reach the sim — it sets no cutover ceiling — so it folds to
+/// rejected).
+fn block_disposition(disposition: node::Disposition) -> BlockDisposition {
+    match disposition {
+        node::Disposition::Applied => BlockDisposition::Applied,
+        _ => BlockDisposition::Rejected,
     }
 }
 
@@ -1437,80 +1463,23 @@ fn proposer_hex(origin: &Origin) -> String {
     }
 }
 
-/// map a deterministic dispatch record to its explorer wire twin, keeping the
-/// submitter's readable name (`external:<name>`) like noded's rows do — the
-/// shared `DispatchInfo::from` deliberately flattens to plain `external`.
-fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
-    DispatchInfo {
-        module: record.module.clone(),
-        origin: match &record.origin {
-            Origin::External(name) if name.is_empty() => "external".to_string(),
-            Origin::External(name) => format!("external:{}", String::from_utf8_lossy(name)),
-            Origin::Module(id) => format!("module:{id}"),
-            Origin::System => "system".to_string(),
-        },
-        emitted_msgs: record.emitted_msgs,
-        emitted_events: record.emitted_events,
-    }
-}
-
-async fn offer_effects(
-    workers: &[Box<dyn host::worker::Worker>],
-    height: u64,
-    events: Vec<Event>,
-    queue: &mut VecDeque<Msg>,
-) {
-    let mut notes = noded::log::ModuleNotes::new(height);
-    for eff in events {
-        let mut claimed = false;
-        for w in workers {
-            match w.run(&eff).await {
-                Ok(host::worker::WorkOutcome::Handled(follow)) => {
-                    queue.extend(follow);
-                    claimed = true;
-                    break;
-                }
-                Ok(host::worker::WorkOutcome::NotMine) => {}
-                Err(err) => {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        height,
-                        source = %eff.source,
-                        error = %err,
-                        "worker failed to handle a module event"
-                    );
-                    claimed = true;
-                    break;
-                }
-            }
-        }
-        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
-        // guest cannot log) — unless it decodes as a worker request, which means
-        // a saga is stuck Pending.
-        if !claimed {
-            notes.unclaimed(&eff);
-        }
-    }
-    notes.finish();
-}
-
 /// noded's debug echo oracle, unconditional here: the sim is a dev tool, and a
 /// deterministic canned reply is the ONLY oracle that belongs in it.
 struct EchoWorker;
 
 #[async_trait::async_trait(?Send)]
-impl host::worker::Worker for EchoWorker {
-    async fn run(&self, event: &Event) -> Result<host::worker::WorkOutcome, host::worker::Error> {
+impl worker::Worker for EchoWorker {
+    async fn run(&self, event: &Event) -> Result<worker::WorkOutcome, worker::Error> {
         let request = match saga::decode_worker_request(&event.payload) {
             Ok(request) => request,
-            Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
+            Err(_) => return Ok(worker::WorkOutcome::NotMine),
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
         let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
-            return Ok(host::worker::WorkOutcome::NotMine);
+            return Ok(worker::WorkOutcome::NotMine);
         };
-        Ok(host::worker::WorkOutcome::Handled(Some(Msg {
+        Ok(worker::WorkOutcome::Handled(Some(Msg {
             target: "saga".into(),
             payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
                 saga_id: request.saga_id,

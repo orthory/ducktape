@@ -142,9 +142,14 @@ fn personas_shape_receipts_and_ring() {
         1,
         "the durable block index serves both personas: {body}"
     );
+    // the sim now rides the ordered lane (OrderedNode + the shared projection),
+    // so its rows carry the ordered-frame id as `hash` exactly like the
+    // validator's — where the old direct-host path left it empty. it is a stable
+    // 64-hex digest of the frame the drain applied.
     assert_eq!(
-        records[0]["hash"], "",
-        "nothing is framed on this lane — the frame hash stays empty: {body}"
+        records[0]["hash"].as_str().map(str::len),
+        Some(64),
+        "the ordered-frame id is the row hash: {body}"
     );
 }
 

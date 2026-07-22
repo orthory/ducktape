@@ -206,9 +206,11 @@ fn a_byte_identical_frame_resubmit_is_stopped_by_the_files_cas_not_a_consensus_s
         err.contains("conflict") && err.contains("changed since base"),
         "the files CAS names the conflict (not a consensus swallow): {err}"
     );
-    // no second block: the sim's honesty rule holds — a rejected single op mints
-    // no block, so the double-commit never happens by either path.
-    assert_eq!(sim.status()["height"], 1, "the resubmit minted no block");
+    // the resubmit's op did not double-commit — the files CAS refused it — but
+    // it JOURNALS its rejected block now (validator parity: a rejected single op
+    // rides the drain and seals its own height), so the height advanced to 2. the
+    // state was NOT double-committed: only the honest no-op is journaled.
+    assert_eq!(sim.status()["height"], 2, "the rejected resubmit sealed its own block");
 }
 
 // ── E2 — multi-op batch blocks ──────────────────────────

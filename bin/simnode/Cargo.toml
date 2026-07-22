@@ -58,12 +58,16 @@ duckfs-core = { workspace = true }
 # scenario sees the module breadcrumbs a wasm guest has no other way to emit.
 noded = { path = "../noded" }
 tracing = { workspace = true }
-# the op-frame codec: `node::decode_frame` verifies a signed frame's signature
-# and yields the VERIFIED signer as the op origin — the SAME function every
-# validator and the embedded daemon use, so the sim's `/v1/submit/frame` lane
-# authenticates authorship identically (also available to the frame/batch tests
-# for composing frames via `node::encode_frame`).
-node = { workspace = true }
+# the replication layer: the sim actor runs on `OrderedNode<StepOrderer,
+# NullSink>` — the SAME apply/drain/projection engine the validator uses, with
+# a scripted FIFO orderer and a logical-clock time policy. `sim` toggles the
+# pre-decoded ingress (`submit_decoded`) for the UNSIGNED /sim/peer-block +
+# hex: lanes; the wire op-frame codec gains no unsigned variant. `node::
+# decode_frame` still verifies a signed frame's signature and yields the
+# VERIFIED signer as the op origin — the SAME function every validator and the
+# embedded daemon use (also available to the frame/batch tests for composing
+# frames via `node::encode_frame`).
+node = { workspace = true, features = ["sim"] }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
 # feeds it block-by-block exactly like the real daemons.
 indexer = { workspace = true }
