@@ -23,6 +23,7 @@ pub use interface::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use sdk::codec;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 
@@ -102,15 +103,15 @@ impl Vaults {
         let mut out = Vec::new();
         out.extend_from_slice(&(vaults.len() as u64).to_le_bytes());
         for (id, v) in vaults {
-            push_bytes(&mut out, id.as_bytes());
-            push_bytes(&mut out, v.name.as_bytes());
+            codec::push_bytes(&mut out, id.as_bytes());
+            codec::push_bytes(&mut out, v.name.as_bytes());
             out.extend_from_slice(&v.created_at.to_le_bytes());
             push_key_set(&mut out, &v.owners);
             push_key_set(&mut out, &v.readers);
             out.extend_from_slice(&(v.secrets.len() as u64).to_le_bytes());
             for (name, s) in &v.secrets {
-                push_bytes(&mut out, name.as_bytes());
-                push_bytes(&mut out, &s.ciphertext);
+                codec::push_bytes(&mut out, name.as_bytes());
+                codec::push_bytes(&mut out, &s.ciphertext);
                 out.extend_from_slice(&s.version.to_le_bytes());
                 out.extend_from_slice(&s.created_at.to_le_bytes());
                 out.extend_from_slice(&s.updated_at.to_le_bytes());
@@ -313,51 +314,24 @@ impl Vaults {
     }
 }
 
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 fn push_key_set(out: &mut Vec<u8>, keys: &BTreeSet<Vec<u8>>) {
     out.extend_from_slice(&(keys.len() as u64).to_le_bytes());
     for k in keys {
-        push_bytes(out, k);
+        codec::push_bytes(out, k);
     }
 }
 
 // ---- strict snapshot decode (untrusted bytes) -------------------------------
+// primitives over the shared `sdk::codec::Cursor` (u64-le counts, u64-le
+// length prefixes) — every accessor bounds-checks before it reads.
 
-fn take_u64(buf: &mut &[u8]) -> Result<u64, Error> {
-    let Some((head, rest)) = buf.split_first_chunk::<8>() else {
-        return Err(Error::Module("snapshot truncated".into()));
-    };
-    *buf = rest;
-    Ok(u64::from_le_bytes(*head))
-}
-
-fn take_vec(buf: &mut &[u8]) -> Result<Vec<u8>, Error> {
-    let len = take_u64(buf)?;
-    if len > buf.len() as u64 {
-        return Err(Error::Module("snapshot length exceeds buffer".into()));
-    }
-    let (head, rest) = buf.split_at(len as usize);
-    *buf = rest;
-    Ok(head.to_vec())
-}
-
-fn take_string(buf: &mut &[u8]) -> Result<String, Error> {
-    String::from_utf8(take_vec(buf)?).map_err(|_| Error::Module("snapshot: bad utf-8".into()))
-}
-
-fn take_key_set(buf: &mut &[u8]) -> Result<BTreeSet<Vec<u8>>, Error> {
-    let count = take_u64(buf)?;
-    if count > (buf.len() / 8) as u64 {
-        return Err(Error::Module("snapshot key count exceeds buffer".into()));
-    }
+fn take_key_set(cur: &mut codec::Cursor, what: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
+    let count = cur.u64(what)?;
+    cur.bound(count, 8, what)?;
     let mut set = BTreeSet::new();
     let mut prev: Option<Vec<u8>> = None;
     for _ in 0..count {
-        let key = take_vec(buf)?;
+        let key = cur.bytes(what)?.to_vec();
         if prev.as_deref().is_some_and(|p| p >= key.as_slice()) {
             return Err(Error::Module(
                 "snapshot keys must be strictly increasing".into(),
@@ -370,41 +344,37 @@ fn take_key_set(buf: &mut &[u8]) -> Result<BTreeSet<Vec<u8>>, Error> {
 }
 
 fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
-    let mut buf = bytes;
-    let count = take_u64(&mut buf)?;
-    if count > (buf.len() / 8) as u64 {
-        return Err(Error::Module("snapshot count exceeds buffer".into()));
-    }
+    let mut cur = codec::Cursor::new(bytes);
+    let count = cur.u64("vault count")?;
+    cur.bound(count, 8, "vault")?;
     let mut vaults = BTreeMap::new();
     let mut prev_id: Option<String> = None;
     for _ in 0..count {
-        let id = take_string(&mut buf)?;
+        let id = cur.string("vault id")?;
         if prev_id.as_deref().is_some_and(|p| p >= id.as_str()) {
             return Err(Error::Module(
                 "snapshot vault ids must be strictly increasing".into(),
             ));
         }
-        let name = take_string(&mut buf)?;
-        let created_at = take_u64(&mut buf)?;
-        let owners = take_key_set(&mut buf)?;
-        let readers = take_key_set(&mut buf)?;
-        let secret_count = take_u64(&mut buf)?;
-        if secret_count > (buf.len() / 8) as u64 {
-            return Err(Error::Module("snapshot secret count exceeds buffer".into()));
-        }
+        let name = cur.string("vault name")?;
+        let created_at = cur.u64("vault created_at")?;
+        let owners = take_key_set(&mut cur, "vault owners")?;
+        let readers = take_key_set(&mut cur, "vault readers")?;
+        let secret_count = cur.u64("secret count")?;
+        cur.bound(secret_count, 8, "secret")?;
         let mut secrets = BTreeMap::new();
         let mut prev_name: Option<String> = None;
         for _ in 0..secret_count {
-            let sname = take_string(&mut buf)?;
+            let sname = cur.string("secret name")?;
             if prev_name.as_deref().is_some_and(|p| p >= sname.as_str()) {
                 return Err(Error::Module(
                     "snapshot secret names must be strictly increasing".into(),
                 ));
             }
-            let ciphertext = take_vec(&mut buf)?;
-            let version = take_u64(&mut buf)?;
-            let s_created = take_u64(&mut buf)?;
-            let s_updated = take_u64(&mut buf)?;
+            let ciphertext = cur.bytes("secret ciphertext")?.to_vec();
+            let version = cur.u64("secret version")?;
+            let s_created = cur.u64("secret created_at")?;
+            let s_updated = cur.u64("secret updated_at")?;
             prev_name = Some(sname.clone());
             secrets.insert(
                 sname,
@@ -428,9 +398,7 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<String, Vault>, Error> {
             },
         );
     }
-    if !buf.is_empty() {
-        return Err(Error::Module("snapshot carries trailing bytes".into()));
-    }
+    cur.finish("snapshot")?;
     Ok(vaults)
 }
 

@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use capability::validate_tag;
 use saga::SagaOrigin;
+use sdk::codec;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 
@@ -89,21 +90,17 @@ struct AgentState {
 // [`Module::root`] hashes, so a snapshot and the root that must authenticate
 // it cannot drift. every entry ALWAYS carries the recipe_hash/caps/skills tail
 // (empty/default when unset) — the runtime identity is part of the app-hash.
-
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
+// length-prefixed bytes go through the shared `sdk::codec` writer.
 
 fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
     match origin {
         SagaOrigin::External(key) => {
             out.push(0);
-            put_bytes(out, key);
+            codec::push_bytes(out, key);
         }
         SagaOrigin::Module(module) => {
             out.push(1);
-            put_bytes(out, module.as_bytes());
+            codec::push_bytes(out, module.as_bytes());
         }
         SagaOrigin::System => out.push(2),
     }
@@ -115,7 +112,7 @@ fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
 fn put_str_set(out: &mut Vec<u8>, items: &[String]) {
     out.extend_from_slice(&(items.len() as u64).to_le_bytes());
     for s in items {
-        put_bytes(out, s.as_bytes());
+        codec::push_bytes(out, s.as_bytes());
     }
 }
 
@@ -143,12 +140,12 @@ fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
 fn put_skills(out: &mut Vec<u8>, skills: &[SkillRef]) {
     out.extend_from_slice(&(skills.len() as u64).to_le_bytes());
     for s in skills {
-        put_bytes(out, s.name.as_bytes());
-        put_bytes(out, s.source_prefix.as_bytes());
+        codec::push_bytes(out, s.name.as_bytes());
+        codec::push_bytes(out, s.source_prefix.as_bytes());
         match &s.source_snapshot {
             Some(snap) => {
                 out.push(1);
-                put_bytes(out, snap.as_bytes());
+                codec::push_bytes(out, snap.as_bytes());
             }
             None => out.push(0),
         }
@@ -163,19 +160,19 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(agents.len() as u64).to_le_bytes());
     for (id, a) in agents {
-        put_bytes(&mut out, id.as_bytes());
+        codec::push_bytes(&mut out, id.as_bytes());
         put_origin(&mut out, &a.owner);
-        put_bytes(&mut out, a.display_name.as_bytes());
-        put_bytes(&mut out, a.capability.as_bytes());
+        codec::push_bytes(&mut out, a.display_name.as_bytes());
+        codec::push_bytes(&mut out, a.capability.as_bytes());
         out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
         for action in &a.allowed_actions {
-            put_bytes(&mut out, action.as_bytes());
+            codec::push_bytes(&mut out, action.as_bytes());
         }
         out.push(if a.active { 0 } else { 1 });
         out.extend_from_slice(&a.created_at.to_le_bytes());
         out.extend_from_slice(&a.updated_at.to_le_bytes());
         // the runtime-identity tail — ALWAYS appended (empty/default when unset).
-        put_bytes(&mut out, &a.recipe_hash);
+        codec::push_bytes(&mut out, &a.recipe_hash);
         put_caps(&mut out, &a.caps);
         put_skills(&mut out, &a.skills);
     }
@@ -189,7 +186,7 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
     if !roles.is_empty() {
         out.extend_from_slice(&(roles.len() as u64).to_le_bytes());
         for (id, agent) in roles {
-            put_bytes(&mut out, id.as_bytes());
+            codec::push_bytes(&mut out, id.as_bytes());
             out.push(match agent.role {
                 AgentRole::General => 0,
                 AgentRole::ProjectLibrarian => 1,
@@ -212,73 +209,36 @@ fn committed_root(agents: &BTreeMap<String, AgentState>) -> StateRoot {
 // free), unknown discriminants/tags and trailing bytes are rejected. never
 // panics on malformed input.
 
-/// pull `n` bytes off the front of `buf`, checked before any slicing.
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-    if n > buf.len() {
-        return Err("snapshot truncated".into());
-    }
-    let (head, tail) = buf.split_at(n);
-    *buf = tail;
-    Ok(head)
-}
+// primitives are the shared `sdk::codec::Cursor` (u64/byte/bytes/string, each
+// bounds-checked before it reads); the module-specific readers below thread one
+// `Cursor` through the whole decode.
 
-fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        take(buf, 8)?.try_into().expect("8 bytes"),
-    ))
-}
-
-/// a length prefix, validated against the remaining input before the caller
-/// allocates anything of that size.
-fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
-    let n = take_u64(buf)?;
-    if n > buf.len() as u64 {
-        return Err("snapshot length prefix exceeds input".into());
-    }
-    Ok(n as usize)
-}
-
-fn take_lp_bytes(buf: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let len = take_len(buf)?;
-    Ok(take(buf, len)?.to_vec())
-}
-
-fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
-    let len = take_len(buf)?;
-    Ok(std::str::from_utf8(take(buf, len)?)
-        .map_err(|_| "snapshot string is not utf-8".to_string())?
-        .to_owned())
-}
-
-fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(SagaOrigin::External(take_lp_bytes(buf)?)),
-        1 => Ok(SagaOrigin::Module(take_lp_string(buf)?)),
+fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, Error> {
+    match cur.byte("origin discriminant")? {
+        0 => Ok(SagaOrigin::External(cur.bytes("origin key")?.to_vec())),
+        1 => Ok(SagaOrigin::Module(cur.string("origin module")?)),
         2 => Ok(SagaOrigin::System),
-        d => Err(format!("snapshot has unknown origin discriminant {d}")),
+        d => Err(Error::Module(format!(
+            "snapshot has unknown origin discriminant {d}"
+        ))),
     }
 }
 
 /// a section count, bounded by what the remaining input could possibly hold
 /// given each entry's minimum encoded size — rejected before the loop builds
-/// anything.
-fn take_count(buf: &mut &[u8], min_entry_bytes: u64, what: &str) -> Result<u64, String> {
-    let count = take_u64(buf)?;
-    if count
-        .checked_mul(min_entry_bytes)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err(format!("snapshot {what} count exceeds input"));
-    }
+/// anything (`Cursor::bound`).
+fn take_count(cur: &mut codec::Cursor, min_entry_bytes: u64, what: &str) -> Result<u64, Error> {
+    let count = cur.u64(what)?;
+    cur.bound(count, min_entry_bytes, what)?;
     Ok(count)
 }
 
 /// enforce strictly-ascending map keys while inserting.
-fn insert_ascending<V>(map: &mut BTreeMap<String, V>, key: String, value: V) -> Result<(), String> {
+fn insert_ascending<V>(map: &mut BTreeMap<String, V>, key: String, value: V) -> Result<(), Error> {
     if let Some((last, _)) = map.iter().next_back()
         && last.as_str() >= key.as_str()
     {
-        return Err("snapshot keys not strictly ascending".into());
+        return Err(Error::Module("snapshot keys not strictly ascending".into()));
     }
     map.insert(key, value);
     Ok(())
@@ -330,13 +290,13 @@ pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
 /// decode a canonical string SET, enforcing strictly-ascending order so a
 /// non-canonical (unsorted / duplicated) snapshot is rejected — the same
 /// discipline `allowed_actions` uses. part of the runtime-identity tail.
-fn take_str_set(buf: &mut &[u8]) -> Result<Vec<String>, String> {
-    let n = take_count(buf, 8, "cap")?;
+fn take_str_set(cur: &mut codec::Cursor) -> Result<Vec<String>, Error> {
+    let n = take_count(cur, 8, "cap")?;
     let mut v: Vec<String> = Vec::new();
     for _ in 0..n {
-        let s = take_lp_string(buf)?;
+        let s = cur.string("cap")?;
         if v.last().is_some_and(|last| last.as_str() >= s.as_str()) {
-            return Err("snapshot caps not strictly ascending".into());
+            return Err(Error::Module("snapshot caps not strictly ascending".into()));
         }
         v.push(s);
     }
@@ -346,16 +306,16 @@ fn take_str_set(buf: &mut &[u8]) -> Result<Vec<String>, String> {
 /// decode the D3 caps segment; the budget is range-checked to `u32` so a
 /// byzantine value above `u32::MAX` is rejected, never truncated. part of the
 /// runtime-identity tail.
-fn take_caps(buf: &mut &[u8]) -> Result<ResourceCaps, String> {
-    let forge_read = take_str_set(buf)?;
-    let forge_push = take_str_set(buf)?;
-    let duckfs_read = take_str_set(buf)?;
-    let duckfs_write = take_str_set(buf)?;
-    let tools = take_str_set(buf)?;
-    let secrets = take_str_set(buf)?;
-    let pages_write = take_str_set(buf)?;
-    let subagent_budget = u32::try_from(take_u64(buf)?)
-        .map_err(|_| "snapshot subagent_budget exceeds u32".to_string())?;
+fn take_caps(cur: &mut codec::Cursor) -> Result<ResourceCaps, Error> {
+    let forge_read = take_str_set(cur)?;
+    let forge_push = take_str_set(cur)?;
+    let duckfs_read = take_str_set(cur)?;
+    let duckfs_write = take_str_set(cur)?;
+    let tools = take_str_set(cur)?;
+    let secrets = take_str_set(cur)?;
+    let pages_write = take_str_set(cur)?;
+    let subagent_budget = u32::try_from(cur.u64("subagent_budget")?)
+        .map_err(|_| Error::Module("snapshot subagent_budget exceeds u32".to_string()))?;
     Ok(ResourceCaps {
         forge_read,
         forge_push,
@@ -371,23 +331,31 @@ fn take_caps(buf: &mut &[u8]) -> Result<ResourceCaps, String> {
 /// decode the C4 skills segment IN ORDER (skills are an ordered list, not a
 /// set — no ascending check). an unknown option tag or load discriminant is
 /// rejected: one valid encoding per state. part of the runtime-identity tail.
-fn take_skills(buf: &mut &[u8]) -> Result<Vec<SkillRef>, String> {
+fn take_skills(cur: &mut codec::Cursor) -> Result<Vec<SkillRef>, Error> {
     // per-entry minimum: a name prefix, a source_prefix prefix, the option tag
     // byte, and the load-mode byte.
-    let n = take_count(buf, 8 + 8 + 1 + 1, "skill")?;
+    let n = take_count(cur, 8 + 8 + 1 + 1, "skill")?;
     let mut v: Vec<SkillRef> = Vec::new();
     for _ in 0..n {
-        let name = take_lp_string(buf)?;
-        let source_prefix = take_lp_string(buf)?;
-        let source_snapshot = match take(buf, 1)?[0] {
+        let name = cur.string("skill name")?;
+        let source_prefix = cur.string("skill source_prefix")?;
+        let source_snapshot = match cur.byte("skill snapshot tag")? {
             0 => None,
-            1 => Some(take_lp_string(buf)?),
-            d => return Err(format!("snapshot has unknown skill snapshot tag {d}")),
+            1 => Some(cur.string("skill snapshot")?),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown skill snapshot tag {d}"
+                )));
+            }
         };
-        let load = match take(buf, 1)?[0] {
+        let load = match cur.byte("skill load mode")? {
             0 => LoadMode::Always,
             1 => LoadMode::OnDemand,
-            d => return Err(format!("snapshot has unknown skill load mode {d}")),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown skill load mode {d}"
+                )));
+            }
         };
         v.push(SkillRef {
             name,
@@ -399,7 +367,7 @@ fn take_skills(buf: &mut &[u8]) -> Result<Vec<SkillRef>, String> {
     Ok(v)
 }
 
-fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, String> {
+fn decode_committed(bytes: &[u8]) -> Result<BTreeMap<String, AgentState>, Error> {
     // per-entry minimum size: an agent costs its id prefix, one origin
     // discriminant, two length prefixes (display_name, capability), an action
     // count, a status byte, two u64s, and the ALWAYS-present runtime-identity
@@ -407,38 +375,41 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
     // and the skills count).
     const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 7 * 8 + 8 + 8;
 
+    let mut cur = codec::Cursor::new(bytes);
     let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_AGENT_BYTES, "agent")?;
+    let count = take_count(&mut cur, MIN_AGENT_BYTES, "agent")?;
     for _ in 0..count {
-        let id = take_lp_string(&mut buf)?;
+        let id = cur.string("agent id")?;
         if contains_reserved_separator(&id) {
-            return Err("snapshot agent_id contains reserved unit separator".into());
+            return Err(Error::Module(
+                "snapshot agent_id contains reserved unit separator".into(),
+            ));
         }
-        let owner = take_origin(&mut buf)?;
-        let display_name = take_lp_string(&mut buf)?;
-        let capability = take_lp_string(&mut buf)?;
+        let owner = take_origin(&mut cur)?;
+        let display_name = cur.string("agent display_name")?;
+        let capability = cur.string("agent capability")?;
         let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
-        let actions = take_count(&mut buf, 8, "action")?;
+        let actions = take_count(&mut cur, 8, "action")?;
         for _ in 0..actions {
-            let action = take_lp_string(&mut buf)?;
+            let action = cur.string("action")?;
             if let Some(last) = allowed_actions.iter().next_back()
                 && last.as_str() >= action.as_str()
             {
-                return Err("snapshot actions not strictly ascending".into());
+                return Err(Error::Module("snapshot actions not strictly ascending".into()));
             }
             allowed_actions.insert(action);
         }
-        let active = match take(&mut buf, 1)?[0] {
+        let active = match cur.byte("agent status")? {
             0 => true,
             1 => false,
-            d => return Err(format!("snapshot has unknown agent status {d}")),
+            d => return Err(Error::Module(format!("snapshot has unknown agent status {d}"))),
         };
-        let created_at = take_u64(&mut buf)?;
-        let updated_at = take_u64(&mut buf)?;
+        let created_at = cur.u64("agent created_at")?;
+        let updated_at = cur.u64("agent updated_at")?;
         // the runtime-identity tail — ALWAYS present (empty/default when unset).
-        let recipe_hash = take_lp_bytes(&mut buf)?;
-        let caps = take_caps(&mut buf)?;
-        let skills = take_skills(&mut buf)?;
+        let recipe_hash = cur.bytes("agent recipe_hash")?.to_vec();
+        let caps = take_caps(&mut cur)?;
+        let skills = take_skills(&mut cur)?;
         insert_ascending(
             &mut agents,
             id,
@@ -461,30 +432,34 @@ fn decode_committed(mut buf: &[u8]) -> Result<BTreeMap<String, AgentState>, Stri
     // A missing tail means every agent is General (the common case). A present
     // tail is a canonical, strictly-ascending sparse map of non-default role
     // assignments.
-    if !buf.is_empty() {
-        let role_count = take_count(&mut buf, 8 + 1, "agent role")?;
+    if cur.remaining() > 0 {
+        let role_count = take_count(&mut cur, 8 + 1, "agent role")?;
         if role_count == 0 {
-            return Err("snapshot has empty agent role tail".into());
+            return Err(Error::Module("snapshot has empty agent role tail".into()));
         }
         let mut last: Option<String> = None;
         for _ in 0..role_count {
-            let id = take_lp_string(&mut buf)?;
+            let id = cur.string("agent role id")?;
             if last.as_ref().is_some_and(|previous| previous >= &id) {
-                return Err("snapshot role keys not strictly ascending".into());
+                return Err(Error::Module(
+                    "snapshot role keys not strictly ascending".into(),
+                ));
             }
-            let role = match take(&mut buf, 1)?[0] {
+            let role = match cur.byte("agent role")? {
                 1 => AgentRole::ProjectLibrarian,
-                d => return Err(format!("snapshot has unknown or default agent role {d}")),
+                d => {
+                    return Err(Error::Module(format!(
+                        "snapshot has unknown or default agent role {d}"
+                    )));
+                }
             };
             let agent = agents
                 .get_mut(&id)
-                .ok_or_else(|| format!("snapshot role names unknown agent: {id}"))?;
+                .ok_or_else(|| Error::Module(format!("snapshot role names unknown agent: {id}")))?;
             agent.role = role;
             last = Some(id);
         }
-        if !buf.is_empty() {
-            return Err("snapshot has trailing bytes".into());
-        }
+        cur.finish("snapshot")?;
     }
     Ok(agents)
 }
@@ -880,7 +855,7 @@ impl AgentModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let agents = decode_committed(bytes).map_err(Error::Module)?;
+        let agents = decode_committed(bytes)?;
         sdk::verify_snapshot_root(committed_root(&agents), expected)?;
         self.agents = agents;
         self.pending_agents.clear();
