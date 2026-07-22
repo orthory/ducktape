@@ -1448,12 +1448,14 @@ dependencies = [
  "commonware-runtime",
  "commonware-utils",
  "directory",
+ "futures",
  "host",
  "kv",
  "node",
  "rand_core 0.6.4",
  "sdk",
  "statesync",
+ "tokio",
 ]
 
 [[package]]

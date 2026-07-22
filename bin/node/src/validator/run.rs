@@ -165,6 +165,10 @@ struct ValidatorRuntime<'a> {
     last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
+    /// the sender half of the finalization delivery wake — re-installed on
+    /// every epoch cutover's fresh orderer so event-driven draining survives
+    /// the engine respawn.
+    delivery_wake_tx: tokio::sync::mpsc::UnboundedSender<()>,
     last_crank: std::time::SystemTime,
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
@@ -294,8 +298,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // the last absolute view ticked to the reachability plane — one
     // ViewTick per actual advance, not one per 100ms drain pass.
     let last_reach_view: Option<u64> = None;
-    // the per-block-time flush cadence: packs the window's enqueued frames
-    // (real ops and/or an idle nop) into one batch block. see the flush loop.
+    // the IDLE beat grid: when the last flush (or restamp) happened, pacing
+    // the one-nop-per-BLOCK_TIME idle heartbeat. busy flushing is event-driven
+    // and merely restamps this. see `pump_heartbeat` / `pump_eager_flush`.
     let last_flush = context.current();
     // a cutover Retarget the plane's command queue could not take yet
     // (NON-BLOCKING sends: the plane is not consensus, so the loop never
@@ -408,6 +413,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         }
     };
 
+    // the finalization delivery wake: the engine's reporter pings it the
+    // moment a finalized block becomes drainable, and the loop below drains
+    // event-driven on it — the periodic drain tick stays only as the backstop.
+    let (delivery_wake_tx, mut delivery_wake) = tokio::sync::mpsc::unbounded_channel::<()>();
+    node.orderer().set_delivery_wake(delivery_wake_tx.clone());
+
     let mut runtime = ValidatorRuntime {
         context,
         node,
@@ -455,6 +466,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_flush,
         pending_retarget,
         heartbeat_disabled,
+        delivery_wake_tx,
         last_crank,
         last_nudge,
         workers,
@@ -494,6 +506,16 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         futures::select_biased! {
             _ = signalled => runtime.on_signal().await,
             _ = context.sleep_until(next_drain).fuse() => runtime.on_drain().await,
+            wake = delivery_wake.recv().fuse() => {
+                // a finalized block is drainable NOW — drain event-driven
+                // instead of waiting out the tick. coalesce a finalization
+                // burst into one pass; `None` (all senders dropped) cannot
+                // happen while `runtime.delivery_wake_tx` lives.
+                if wake.is_some() {
+                    while delivery_wake.try_recv().is_ok() {}
+                    runtime.on_drain().await;
+                }
+            }
             job = rpc_ingress.next() => {
                 if let Some(job) = job {
                     runtime.on_rpc(job).await;
@@ -528,6 +550,13 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                 }
             }
         }
+        // the BUSY block path, event-driven: whatever this turn enqueued
+        // (an ingress submit, a relay frame, a drain-arm system op) flushes
+        // into a proposed block NOW — unless a batch of ours is already in
+        // flight, in which case it aggregates until that batch clears and
+        // the delivery wake turns the loop again. no interval anywhere: the
+        // network's own agreement speed is the pacer.
+        runtime.pump_eager_flush().await;
     }
 }
 

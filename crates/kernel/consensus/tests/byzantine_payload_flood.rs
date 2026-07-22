@@ -284,9 +284,9 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             // store-only) reaches `decode_frame` here: random bytes Err out (this
             // `.expect` panics) and the well-formed frame would inflate `applied`
             // past `target` (asserted below). store-only is enforced, not assumed.
-            // the production drain flushes a window holding real ops every DRAIN_TICK
-            // (bin/node main); enqueue-only submits never propose without a flush — the
-            // sim mirrors that flush-per-tick cadence (a no-op when nothing is pending).
+            // the production run loop flushes pending ops event-driven (bin/node
+            // `pump_eager_flush`); enqueue-only submits never propose without a flush —
+            // the sim drives that flush on its own tick (a no-op when nothing is pending).
             n.flush_batch().await.expect("flush");
             applied[i] += n.drain_delivered().await.expect("drain");
         }
