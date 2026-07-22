@@ -413,9 +413,9 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
                     .expect("index blob");
                 assert_eq!(blob.len() as u64, *len, "{db} blob length matches");
                 let files = statesync::decode_index_archive(&blob).expect("archive decodes");
-                indexer::stage_shipped_db(&dest_base, db, &files).expect("stage");
+                indexer::stage_shipped_db(&indexer::DiskFs, &dest_base, db, &files).expect("stage");
             }
-            indexer::commit_staged(&dest_base).expect("commit");
+            indexer::commit_staged(&indexer::DiskFs, &dest_base).expect("commit");
             dest_dir
         };
 

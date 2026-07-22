@@ -16,6 +16,12 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 
+[features]
+# the mem arm of the disk seam (`MemDisk`) for driving the shipping lane on a
+# mock filesystem. always on under `cfg(test)`; this exposes it to downstream
+# sim/test consumers too. no runtime deps — the arm is pure in-memory maps.
+sim = []
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
