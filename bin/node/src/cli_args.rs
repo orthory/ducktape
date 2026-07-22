@@ -34,6 +34,8 @@ pub enum OpCmd {
     Join(JoinCmd),
     /// list registered workspaces (chain-id + config path)
     List,
+    /// the running node's tip: height + app hash (reads the local rpc)
+    Status(StatusArgs),
     /// resident standing: the staged-admission tier
     #[command(subcommand)]
     Resident(ResidentCmd),
