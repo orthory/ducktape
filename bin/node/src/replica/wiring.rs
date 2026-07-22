@@ -186,9 +186,12 @@ pub(super) async fn wire(
                         Ok(Some(ingress)) => vec![ingress],
                         Ok(None) => Vec::new(),
                         Err(e) => {
-                            eprintln!(
-                                "[node {label}] invite: ambient coordinator unusable ({e}) — \
-                                 coordinated first-contact paths disabled"
+                            tracing::warn!(
+                                target: "ducktape::join",
+                                node = %label,
+                                error = %e,
+                                reason = "ambient_coordinator_unusable",
+                                "coordinated first-contact paths disabled"
                             );
                             Vec::new()
                         }
@@ -258,9 +261,11 @@ pub(super) async fn wire(
                     intro: wg.intro.clone(),
                 }),
                 _ => {
-                    eprintln!(
-                        "[node {label}] invite: inviter wireguard bootstrap is malformed \
-                         — racing the offered fronts alone"
+                    tracing::warn!(
+                        target: "ducktape::join",
+                        node = %label,
+                        reason = "inviter_wireguard_malformed",
+                        "racing the offered fronts alone"
                     );
                     None
                 }
@@ -334,34 +339,43 @@ pub(super) async fn wire(
                                     height,
                                     cap,
                                 } => {
-                                    println!(
-                                        "[node {race_label}] ADMITTED at height {height} \
-                                         via {via} by member {} — standing is committed; \
-                                         the join rides the overlay",
-                                        hex_bytes(&key.as_ref()[..4])
+                                    tracing::info!(
+                                        target: "ducktape::join",
+                                        node = %race_label,
+                                        height,
+                                        %via,
+                                        peer = %hex_bytes(&key.as_ref()[..4]),
+                                        "ADMITTED at height {height} via {via}; standing is \
+                                         committed"
                                     );
                                     if let Some(cap_bytes) = cap {
                                         match config::unpack_coord_cap(&cap_bytes) {
                                             Ok(cap) => match config::save_coord_cap(
                                                 &cap_dir, &cap,
                                             ) {
-                                                Ok(()) => println!(
-                                                    "[node {race_label}] coordinator cap \
-                                                     delivered by member {} — saved \
-                                                     (issuer {}, expires {})",
-                                                    hex_bytes(&key.as_ref()[..4]),
-                                                    hex_bytes(&cap.issuer.as_ref()[..4]),
-                                                    cap.not_after,
+                                                Ok(()) => tracing::info!(
+                                                    target: "ducktape::join",
+                                                    node = %race_label,
+                                                    peer = %hex_bytes(&key.as_ref()[..4]),
+                                                    issuer = %hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                    expires = cap.not_after,
+                                                    "coordinator cap delivered and saved"
                                                 ),
-                                                Err(e) => eprintln!(
-                                                    "[node {race_label}] coordinator cap \
-                                                     delivered but could not be saved: {e}"
+                                                Err(e) => tracing::warn!(
+                                                    target: "ducktape::join",
+                                                    node = %race_label,
+                                                    error = %e,
+                                                    reason = "coord_cap_save_failed",
+                                                    "delivered coordinator cap not saved"
                                                 ),
                                             },
-                                            Err(e) => eprintln!(
-                                                "[node {race_label}] member {} sent a \
-                                                 malformed coordinator cap: {e}",
-                                                hex_bytes(&key.as_ref()[..4]),
+                                            Err(e) => tracing::warn!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                peer = %hex_bytes(&key.as_ref()[..4]),
+                                                error = %e,
+                                                reason = "coord_cap_malformed",
+                                                "member sent a malformed coordinator cap"
                                             ),
                                         }
                                     }
@@ -399,20 +413,27 @@ pub(super) async fn wire(
                                             target: "ducktape::join",
                                             node = %race_label,
                                             tried,
-                                            reason = %reason,
+                                            reason = "first_contact_terminal",
+                                            detail = %reason,
                                             "FATAL: first contact failed across all offered \
                                              path(s) — ask the inviter for a fresh invite once \
                                              the mesh is reachable"
                                         );
                                         std::process::exit(3);
                                     }
-                                    eprintln!(
-                                        "[node {race_label}] first contact round {round} \
-                                         failed across all {tried} offered path(s) — \
-                                         {reason}; this node holds a synced checkpoint, \
-                                         so it keeps retrying (next round in 30s) instead \
-                                         of exiting"
-                                    );
+                                    let should_log = round == 1 || round.is_multiple_of(10);
+                                    if should_log {
+                                        tracing::warn!(
+                                            target: "ducktape::join",
+                                            node = %race_label,
+                                            attempts = round,
+                                            tried,
+                                            reason = "first_contact_retry",
+                                            detail = %reason,
+                                            "first contact failed across all offered paths; \
+                                             retrying in 30s"
+                                        );
+                                    }
                                     tokio::time::sleep(std::time::Duration::from_secs(30))
                                         .await;
                                 }
@@ -420,9 +441,12 @@ pub(super) async fn wire(
                         }
                     });
                 }
-                Err(e) => eprintln!(
-                    "[node {label}] invite: wireguard key unreadable ({e}) — first \
-                     contact not started; falling back to the descriptor's reach hints"
+                Err(e) => tracing::warn!(
+                    target: "ducktape::join",
+                    node = %label,
+                    error = %e,
+                    reason = "wireguard_key_unreadable",
+                    "first contact not started; falling back to descriptor reach hints"
                 ),
             }
         }

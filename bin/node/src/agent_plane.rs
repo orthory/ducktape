@@ -85,11 +85,23 @@ pub(crate) fn spawn(
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
             Err(error) => {
-                eprintln!("[node {label}] agent telemetry plane register failed: {error}");
+                tracing::error!(
+                    target: "ducktape::dataplane",
+                    node = %label,
+                    service = "agent_telemetry",
+                    error = %error,
+                    "agent telemetry plane register failed"
+                );
                 return;
             }
         };
-        println!("[node {label}] agent telemetry plane: overlay stream bound on {own}");
+        tracing::info!(
+            target: "ducktape::dataplane",
+            node = %label,
+            service = "agent_telemetry",
+            own = %own,
+            "agent telemetry plane: overlay stream bound"
+        );
         planes.register("agent", Service::AgentTelemetry, plane.watch());
         run_bound(plane, service, peers, PeerId(me), registry).await;
     });

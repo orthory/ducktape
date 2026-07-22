@@ -207,12 +207,19 @@ fn reboot_self() -> ! {
         let err = std::process::Command::new(exe)
             .args(std::env::args_os().skip(1))
             .exec();
-        eprintln!("FATAL: validator reboot exec failed: {err}");
+        tracing::error!(
+            target: "ducktape::node",
+            error = %err,
+            "FATAL: validator reboot exec failed"
+        );
         std::process::exit(1);
     }
     #[cfg(not(unix))]
     {
-        println!("promoted — restart this node to run as a validator");
+        tracing::info!(
+            target: "ducktape::node",
+            "promoted — restart this node to run as a validator"
+        );
         std::process::exit(0);
     }
 }

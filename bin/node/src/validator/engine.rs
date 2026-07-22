@@ -236,9 +236,12 @@ pub(super) async fn resume(
     );
     if let Some(ceiling) = pending_boot {
         node.set_view_ceiling(ceiling);
-        println!(
-            "[node {label}] re-armed pending cutover at view {ceiling} (epoch {})",
-            resume_epoch + 1
+        tracing::info!(
+            target: "ducktape::consensus",
+            node = %label,
+            cutover_view = ceiling,
+            epoch = resume_epoch + 1,
+            "pending cutover re-armed"
         );
     }
 
@@ -247,7 +250,10 @@ pub(super) async fn resume(
     // a RESTORED boot prints its recovered line above instead.
     if resumed.is_none() {
         let genesis_hash = node.app_hash();
-        println!("[node {label}] genesis app_hash={}", hex(&genesis_hash));
+        tracing::info!(
+            target: "ducktape::consensus",
+            "node={label} genesis app_hash={}", hex(&genesis_hash)
+        );
     }
 
     // introduce a DISTINCT op per process: node N writes directory key "kN" =

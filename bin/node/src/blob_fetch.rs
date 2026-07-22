@@ -244,9 +244,11 @@ impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
         {
             // an honest report, not a panic: the caller (realize) fails
             // closed on the None and says which hash it needed.
-            eprintln!(
-                "[blob-fetch] could not obtain code blob {}: {e}",
-                crate::config::hex_bytes(&digest)
+            tracing::warn!(
+                target: "ducktape::modules",
+                digest = %crate::config::hex_bytes(&digest),
+                error = %e,
+                "code blob unavailable"
             );
         }
         self.local.get_chunk(&digest)

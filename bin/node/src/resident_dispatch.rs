@@ -169,8 +169,11 @@ impl ResidentDispatch {
                 stage: stage @ Stage::Executing,
                 ..
             }) => *stage = Stage::Due(msg),
-            _ => eprintln!(
-                "[resident dispatch] dropping a completed run for retired attempt {key:?}"
+            _ => tracing::debug!(
+                target: "ducktape::saga",
+                attempt = ?key,
+                reason = "retired_attempt",
+                "completed resident run dropped"
             ),
         }
     }
@@ -237,9 +240,11 @@ impl ResidentDispatch {
                 if !matches!(entry.stage, Stage::Settled) {
                     // mid-work absence is the flap signature — worth eyes if
                     // it recurs; a settled entry's absence is plain retirement.
-                    eprintln!(
-                        "[resident dispatch] attempt {key:?} left the committed \
-                         projection mid-work — retiring on the next absent read"
+                    tracing::warn!(
+                        target: "ducktape::saga",
+                        attempt = ?key,
+                        reason = "projection_missing_mid_work",
+                        "resident dispatch attempt will retire on the next absent read"
                     );
                 }
                 return true;
@@ -288,7 +293,13 @@ impl ResidentDispatch {
                         Err(e) => {
                             // unreachable for DispatchPool (it never errors)
                             // — settle rather than spin a broken worker.
-                            eprintln!("[resident dispatch] worker error on {key:?}: {e}");
+                            tracing::warn!(
+                                target: "ducktape::saga",
+                                attempt = ?key,
+                                error = %e,
+                                reason = "worker_error",
+                                "resident dispatch attempt settled"
+                            );
                             Stage::Settled
                         }
                     };
