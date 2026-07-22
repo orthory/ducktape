@@ -1,4 +1,4 @@
-component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disabled:bool)
+component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disabled:bool, selected:bool)
   state
     editing = false
     draft = ""
@@ -17,14 +17,18 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
   on save_failed(cause)
     local_error = cause.message
   col width=fill spacing=2.0
+    if selected
+      row width=fill spacing=5.0 align=center
+        text "⌕" size=11.0 @text-fg
+        text "PAGE TITLE MATCH" size=11.0 @font-bold text-muted
     if !editing && !empty(title)
-      button label=title width=fill padding=4.0 -> begin(title)
+      button label=title disabled=disabled width=fill padding=4.0 -> begin(title)
         text title width=fill size=22.0 wrapping=none @font-bold text-fg
         active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=white/5 text=fg border=white/7
         pressed bg=white/8 text=fg
     if !editing && empty(title)
-      button label="Untitled" width=fill padding=4.0 -> begin(title)
+      button label="Untitled" disabled=disabled width=fill padding=4.0 -> begin(title)
         text "Untitled" width=fill size=22.0 wrapping=none @font-bold text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=white/5 text=fg border=white/7
@@ -62,7 +66,7 @@ component PageButton(page:PageItem, selected:bool)
         pressed bg=selection text=fg
 
 component PageSearchResult(hit:PageSearchHit)
-  button label=hit.text width=fill padding=7.0 -> open_page_search_hit(hit.page_id)
+  button label=hit.text width=fill padding=7.0 -> open_page_search_hit(hit.page_id, hit.block_id)
     col width=fill spacing=2.0
       row width=fill spacing=7.0 align=center
         text hit.kind width=fill size=10.0 @font-bold text-muted
@@ -133,13 +137,13 @@ component BlockCard(block:PageBlock, selected:bool)
       container width=fill padding=8.0 bg=white/5 border=transparent border-w=1.0 r=9.0
         BlockContents block=block
     if !block.pending && selected
-      button label=block.kind width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
+      button label=block.kind description=block.text width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
         BlockContents block=block
         active bg=linear(2.3, white/15@0.0, surface/48@1.0) text=fg border=white/15 border-w=1.0 r=9.0
         hovered bg=white/16 text=fg
         pressed bg=selection text=fg
     if !block.pending && !selected
-      button label=block.kind width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
+      button label=block.kind description=block.text width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
         BlockContents block=block
         active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
         hovered bg=white/6 text=fg border=white/7

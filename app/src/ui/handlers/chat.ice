@@ -22,7 +22,7 @@ on clear_chat_search
   chat_search_hits = []
   chat_searching = false
 
-on open_chat_search_hit(channel_id)
+on open_chat_search_hit(channel_id, root_seq, target_seq)
   return if loading || mutation_phase != "idle"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -37,13 +37,14 @@ on open_chat_search_hit(channel_id)
   channel_name_draft = ""
   member_key_draft = ""
   active_thread_seq = 0
+  thread_target_seq = 0
   thread_messages = []
   thread_generation = thread_generation + 1
   thread_loading = false
   reply_draft = ""
   pending_reply = ""
   error = ""
-  run load_chat(connected_rpc, channel_id) -> chat_updated _ | failed _
+  run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_updated _ | failed _
 
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
@@ -60,6 +61,7 @@ on choose_channel(id)
   channel_name_draft = ""
   member_key_draft = ""
   active_thread_seq = 0
+  thread_target_seq = 0
   thread_messages = []
   thread_generation = thread_generation + 1
   thread_loading = false
@@ -168,6 +170,15 @@ on chat_updated(next)
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
   channel_members = next.channel_members
+  selected_message_seq = next.selected_message_seq
+  selected_message_rev = next.selected_message_rev
+  message_action = "toolbar"
+  message_edit_draft = next.selected_message_body
+  active_thread_seq = next.active_thread_seq
+  thread_target_seq = next.thread_target_seq
+  thread_messages = next.thread_messages
+  thread_generation = thread_generation + 1
+  thread_loading = false
   loading = false
   error = ""
   return if !live_dirty
@@ -192,6 +203,7 @@ on chat_mutated(next)
   message_action = "toolbar"
   message_edit_draft = ""
   active_thread_seq = 0
+  thread_target_seq = 0
   thread_messages = []
   thread_generation = thread_generation + 1
   thread_loading = false
@@ -209,6 +221,13 @@ on chat_mutated(next)
 
 on select_message(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
+  thread_generation = thread_generation + 1
+  thread_loading = false
+  active_thread_seq = 0
+  thread_target_seq = 0
+  thread_messages = []
+  reply_draft = ""
+  pending_reply = ""
   selected_message_seq = seq
   selected_message_rev = rev
   message_action = "toolbar"
@@ -236,26 +255,40 @@ on open_thread
   return if thread_loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
   thread_generation = thread_generation + 1
   thread_loading = true
+  thread_target_seq = 0
+  reply_draft = ""
+  pending_reply = ""
   error = ""
   run load_thread(connected_rpc, active_channel, selected_message_seq, thread_generation) -> thread_loaded _ | thread_failed _
 
 on thread_loaded(next)
   return if next.generation != thread_generation || !thread_loading
   active_thread_seq = next.root_seq
+  thread_target_seq = 0
   thread_messages = next.messages
   thread_loading = false
-  reply_draft = ""
-  pending_reply = ""
   error = ""
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on thread_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
   thread_loading = false
+  thread_messages = rollback_messages(thread_messages, false)
   error = cause.message
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on close_thread
   thread_generation = thread_generation + 1
   active_thread_seq = 0
+  thread_target_seq = 0
   thread_messages = []
   thread_loading = false
   reply_draft = ""
@@ -298,10 +331,23 @@ on send_reply_submit
   reply_draft = ""
   thread_messages = optimistic_message(thread_messages, pending_reply)
   error = ""
-  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply) -> thread_mutated _ | mutation_failed _
+  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply) -> thread_mutated _ | reply_mutation_failed _
+
+on reply_mutation_failed(cause)
+  mutation_phase = "recovering"
+  block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
+  reply_draft = restore_draft(reply_draft, pending_reply, cause.committed)
+  thread_messages = rollback_messages(thread_messages, cause.committed)
+  pending_reply = ""
+  error = cause.message
+  live_dirty = true
+  thread_generation = thread_generation + 1
+  thread_loading = true
+  run load_thread(connected_rpc, active_channel, active_thread_seq, thread_generation) -> thread_loaded _ | thread_failed _
 
 on thread_mutated(next)
   active_thread_seq = next.root_seq
+  thread_target_seq = 0
   thread_messages = next.messages
   pending_reply = ""
   mutation_phase = "idle"

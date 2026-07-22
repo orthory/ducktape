@@ -22,7 +22,7 @@ on clear_page_search
   page_search_hits = []
   page_searching = false
 
-on open_page_search_hit(page_id)
+on open_page_search_hit(page_id, block_id)
   return if loading || mutation_phase != "idle"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -32,12 +32,13 @@ on open_page_search_hit(page_id)
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
   page_delete_armed = false
   block_delete_armed = false
   error = ""
-  run load_page(connected_rpc, page_id) -> pages_updated _ | failed _
+  run load_page(connected_rpc, page_id, block_id) -> pages_updated _ | failed _
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
@@ -49,11 +50,12 @@ on choose_page(id)
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  page_title_selected = false
   block_edit_draft = ""
   page_delete_armed = false
   block_delete_armed = false
   error = ""
-  run load_page(connected_rpc, id) -> pages_updated _ | failed _
+  run load_page(connected_rpc, id, "") -> pages_updated _ | failed _
 
 on create_page_submit
   return if loading || mutation_phase != "idle" || empty(trim(page_draft))
@@ -100,6 +102,7 @@ on select_block(id, kind, text, checked)
   selected_block_id = id
   selected_block_kind = kind
   selected_block_checked = checked
+  page_title_selected = false
   block_edit_draft = text
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
@@ -180,6 +183,14 @@ on pages_updated(next)
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
+  selected_block_id = next.selected_block_id
+  selected_block_kind = next.selected_block_kind
+  selected_block_checked = next.selected_block_checked
+  page_title_selected = next.page_title_selected
+  block_edit_draft = next.selected_block_text
+  block_autosave_status = "idle"
+  block_autosave_generation = block_autosave_generation + 1
+  block_delete_armed = false
   loading = false
   error = ""
   return if !live_dirty
@@ -199,6 +210,7 @@ on pages_mutated(next)
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
   page_delete_armed = false

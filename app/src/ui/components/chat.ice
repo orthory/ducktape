@@ -31,7 +31,7 @@ component ChannelButton(channel:ChatChannel, selected:bool)
 component ChatMemberRow(member:ChatMember, disabled:bool)
   row width=fill spacing=6.0 align=center
     text member.label width=fill size=10.0 @text-muted
-    button "Remove" label=member.label disabled=disabled height=24.0 padding=4.0 -> remove_channel_member_submit(member.key)
+    button "Remove" description=member.label disabled=disabled height=28.0 padding=5.0 -> remove_channel_member_submit(member.key)
       active bg=transparent text=muted r=6.0
       hovered bg=white/10 text=fg
       pressed bg=white/15
@@ -73,16 +73,18 @@ component MessageCard(message:ChatMessage, selected:bool)
         hovered bg=white/6 text=fg border=white/8
         pressed bg=selection text=fg
 
-component ThreadMessageCard(message:ChatMessage)
+component ThreadMessageCard(message:ChatMessage, selected:bool)
   container width=fill padding=8.0 bg=transparent r=8.0
     col width=fill spacing=3.0
+      if selected
+        text "SEARCH MATCH" size=10.0 @font-bold text-fg
       row width=fill spacing=7.0 align=center
         text message.author width=fill size=11.0 @font-bold text-fg
         text message.meta size=10.0 @text-muted
       text message.body width=fill size=12.0 wrapping=word @text-fg
 
 component ChatSearchResult(hit:ChatSearchHit)
-  button label=hit.text width=fill padding=7.0 -> open_chat_search_hit(hit.channel_id)
+  button label=hit.text width=fill padding=7.0 -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)
     col width=fill spacing=2.0
       row width=fill spacing=7.0 align=center
         text hit.author width=fill size=10.0 @font-bold text-fg

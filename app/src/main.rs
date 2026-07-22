@@ -173,6 +173,12 @@ mod tests {
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
             channel_members: Vec::new(),
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            selected_message_body: String::new(),
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: Vec::new(),
         }));
         assert_eq!(app.message_draft, "second");
         assert_eq!(app.mutation_phase, "idle");
@@ -195,6 +201,119 @@ mod tests {
     }
 
     #[test]
+    fn selecting_another_message_invalidates_the_pending_thread() {
+        let (mut app, _) = Ducktape::__boot();
+        app.mutation_phase = "idle".into();
+        app.selected_message_seq = 1;
+        app.thread_generation = 4;
+        app.thread_loading = true;
+        app.active_thread_seq = 1;
+        app.thread_messages = backend::optimistic_message(Vec::new(), "old thread".into());
+        app.reply_draft = "old reply".into();
+
+        let _ = app.__update(__DucktapeMessage::SelectMessage(2, "next".into(), 0));
+        assert_eq!(app.thread_generation, 5);
+        assert!(!app.thread_loading);
+        assert_eq!(app.active_thread_seq, 0);
+        assert!(app.thread_messages.is_empty());
+        assert!(app.reply_draft.is_empty());
+
+        let _ = app.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
+            generation: 4,
+            root_seq: 1,
+            messages: Vec::new(),
+        }));
+        assert_eq!(app.active_thread_seq, 0);
+    }
+
+    #[test]
+    fn changing_endpoint_clears_remote_bound_interaction_state() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.connected_rpc = "http://node-a".into();
+        app.rpc = "http://node-b".into();
+        app.password = "node-a-password".into();
+        app.selected_message_seq = 1;
+        app.message_action = "editing".into();
+        app.message_edit_draft = "node a edit".into();
+        app.active_thread_seq = 1;
+        app.reply_draft = "node a reply".into();
+        app.selected_block_id = "same-id".into();
+        app.block_edit_draft = "node a block".into();
+        app.message_draft = "node a message".into();
+        app.page_search_draft = "node a search".into();
+
+        let _ = app.__update(__DucktapeMessage::Reconnect);
+
+        assert_eq!(app.connected_rpc, "http://node-b");
+        assert!(app.password.is_empty());
+        assert_eq!(app.selected_message_seq, 0);
+        assert_eq!(app.message_action, "toolbar");
+        assert!(app.message_edit_draft.is_empty());
+        assert_eq!(app.active_thread_seq, 0);
+        assert!(app.reply_draft.is_empty());
+        assert!(app.selected_block_id.is_empty());
+        assert!(app.block_edit_draft.is_empty());
+        assert!(app.message_draft.is_empty());
+        assert!(app.page_search_draft.is_empty());
+
+        let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
+            message: "offline".into(),
+            committed: false,
+        }));
+        assert_eq!(app.connected_rpc, "http://node-b");
+    }
+
+    #[test]
+    fn same_endpoint_reconnect_preserves_unsent_drafts() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.connected_rpc = "http://node-a".into();
+        app.rpc = "http://node-a/".into();
+        app.message_draft = "next message".into();
+        app.failed_message_draft = "unsent message".into();
+
+        let _ = app.__update(__DucktapeMessage::Reconnect);
+
+        assert_eq!(app.rpc, "http://node-a");
+        assert_eq!(app.connected_rpc, "http://node-a");
+        assert_eq!(app.message_draft, "next message");
+        assert_eq!(app.failed_message_draft, "unsent message");
+    }
+
+    #[test]
+    fn page_search_load_selects_the_canonical_block() {
+        let (mut app, _) = Ducktape::__boot();
+        let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
+            pages: Vec::new(),
+            blocks: vec![backend::PageBlock {
+                id: "block-1".into(),
+                parent: "page-1".into(),
+                kind: "Todo".into(),
+                text: "Canonical text".into(),
+                pending: false,
+                checked: true,
+                prefix: String::new(),
+                child_count: 0,
+                mark_count: 0,
+            }],
+            active_page: "page-1".into(),
+            active_page_title: "Page".into(),
+            active_page_parent: String::new(),
+            selected_block_id: "block-1".into(),
+            selected_block_kind: "Todo".into(),
+            selected_block_text: "Canonical text".into(),
+            selected_block_checked: true,
+            page_title_selected: false,
+        }));
+
+        assert_eq!(app.selected_block_id, "block-1");
+        assert_eq!(app.selected_block_kind, "Todo");
+        assert_eq!(app.block_edit_draft, "Canonical text");
+        assert!(app.selected_block_checked);
+    }
+
+    #[test]
     fn failed_optimistic_send_rolls_back_and_restores_the_draft() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
@@ -205,12 +324,87 @@ mod tests {
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
             message: "rejected".into(),
+            committed: false,
         }));
 
         assert_eq!(app.message_draft, "retry me");
         assert!(app.messages.is_empty());
         assert_eq!(app.error, "rejected");
         assert_eq!(app.mutation_phase, "idle");
+    }
+
+    #[test]
+    fn failed_send_preserves_the_next_and_unsent_drafts() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.message_draft = "first".into();
+
+        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        app.message_draft = "second".into();
+        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+            message: "rejected".into(),
+            committed: false,
+        }));
+
+        assert_eq!(app.message_draft, "second");
+        assert_eq!(app.failed_message_draft, "first");
+        app.message_draft.clear();
+        let _ = app.__update(__DucktapeMessage::RestoreFailedMessage);
+        assert_eq!(app.message_draft, "first");
+        assert!(app.failed_message_draft.is_empty());
+    }
+
+    #[test]
+    fn committed_mutation_keeps_optimistic_state_until_refresh() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.connected_rpc = "http://node".into();
+        app.active_channel = "general".into();
+        app.message_draft = "committed once".into();
+
+        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+            message: "read failed after commit".into(),
+            committed: true,
+        }));
+
+        assert!(app.message_draft.is_empty());
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].pending);
+        assert_eq!(app.mutation_phase, "recovering");
+        assert_eq!(app.sync_phase, "refreshing");
+        assert_eq!(app.block_autosave_generation, 1);
+
+        app.message_draft = "must wait".into();
+        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.mutation_phase, "recovering");
+    }
+
+    #[test]
+    fn committed_message_change_cannot_be_submitted_twice() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected_rpc = "http://node".into();
+        app.active_channel = "general".into();
+        app.selected_message_seq = 7;
+        app.selected_message_rev = 2;
+        app.message_action = "editing".into();
+        app.message_edit_draft = "committed edit".into();
+        app.mutation_phase = "message-edit".into();
+
+        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+            message: "read failed after commit".into(),
+            committed: true,
+        }));
+
+        assert_eq!(app.selected_message_seq, 0);
+        assert_eq!(app.selected_message_rev, 0);
+        assert_eq!(app.message_action, "toolbar");
+        assert!(app.message_edit_draft.is_empty());
+        assert_eq!(app.mutation_phase, "recovering");
     }
 
     #[test]
@@ -227,12 +421,14 @@ mod tests {
         assert!(app.reply_draft.is_empty());
         assert!(app.thread_messages[0].pending);
 
-        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+        let _ = app.__update(__DucktapeMessage::ReplyMutationFailed(backend::AppError {
             message: "rejected".into(),
+            committed: false,
         }));
         assert_eq!(app.reply_draft, "retry reply");
         assert!(app.thread_messages.is_empty());
-        assert_eq!(app.mutation_phase, "idle");
+        assert_eq!(app.mutation_phase, "recovering");
+        assert!(app.thread_loading);
     }
 
     #[test]
@@ -252,6 +448,7 @@ mod tests {
 
         let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
             message: "rejected".into(),
+            committed: false,
         }));
         assert_eq!(app.block_draft, "retry heading");
         assert!(app.blocks.is_empty());

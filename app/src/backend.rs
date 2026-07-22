@@ -70,6 +70,12 @@ pub struct ChatData {
     pub active_channel_members_only: bool,
     pub active_channel_huddle_count: i64,
     pub channel_members: Vec<ChatMember>,
+    pub selected_message_seq: i64,
+    pub selected_message_rev: i64,
+    pub selected_message_body: String,
+    pub active_thread_seq: i64,
+    pub thread_target_seq: i64,
+    pub thread_messages: Vec<ChatMessage>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -89,6 +95,7 @@ pub struct ThreadLoadData {
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
+    pub root_seq: i64,
     pub author: String,
     pub text: String,
     pub meta: String,
@@ -129,6 +136,11 @@ pub struct PagesData {
     pub active_page: String,
     pub active_page_title: String,
     pub active_page_parent: String,
+    pub selected_block_id: String,
+    pub selected_block_kind: String,
+    pub selected_block_text: String,
+    pub selected_block_checked: bool,
+    pub page_title_selected: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -175,6 +187,16 @@ pub struct WorkspaceData {
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AppError {
     pub message: String,
+    pub committed: bool,
+}
+
+impl From<String> for AppError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            committed: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -208,7 +230,10 @@ pub fn optimistic_message(mut messages: Vec<ChatMessage>, body: String) -> Vec<C
     messages
 }
 
-pub fn rollback_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+pub fn rollback_messages(mut messages: Vec<ChatMessage>, keep_pending: bool) -> Vec<ChatMessage> {
+    if keep_pending {
+        return messages;
+    }
     messages.retain(|message| !message.pending);
     messages
 }
@@ -228,13 +253,74 @@ pub fn optimistic_block(mut blocks: Vec<PageBlock>, kind: String, text: String) 
     blocks
 }
 
-pub fn rollback_blocks(mut blocks: Vec<PageBlock>) -> Vec<PageBlock> {
+pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<PageBlock> {
+    if keep_pending {
+        return blocks;
+    }
     blocks.retain(|block| !block.pending);
     blocks
 }
 
-pub fn restore_draft(current: String, pending: String) -> String {
+pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
+    if keep_pending {
+        return current;
+    }
     if current.is_empty() { pending } else { current }
+}
+
+pub fn remember_failed_draft(
+    existing: String,
+    current: String,
+    pending: String,
+    committed: bool,
+) -> String {
+    if committed || current.is_empty() || pending.is_empty() {
+        return existing;
+    }
+    if existing.is_empty() {
+        return pending;
+    }
+    format!("{existing}\n{pending}")
+}
+
+pub fn retain_for_endpoint(value: String, current: String, next: String) -> String {
+    if current == next {
+        value
+    } else {
+        String::new()
+    }
+}
+
+pub fn mutation_failure_phase(committed: bool) -> String {
+    if committed { "recovering" } else { "idle" }.into()
+}
+
+fn committed_message_change(phase: &str, committed: bool) -> bool {
+    committed && matches!(phase, "message-edit" | "message-delete")
+}
+
+pub fn message_seq_after_failure(current: i64, phase: String, committed: bool) -> i64 {
+    if committed_message_change(&phase, committed) {
+        0
+    } else {
+        current
+    }
+}
+
+pub fn message_text_after_failure(current: String, phase: String, committed: bool) -> String {
+    if committed_message_change(&phase, committed) {
+        String::new()
+    } else {
+        current
+    }
+}
+
+pub fn message_action_after_failure(current: String, phase: String, committed: bool) -> String {
+    if committed_message_change(&phase, committed) {
+        "toolbar".into()
+    } else {
+        current
+    }
 }
 
 pub fn refreshed_block_draft(
@@ -271,13 +357,23 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+pub fn canonical_endpoint(input: String) -> String {
+    let configured = input.trim();
+    rpc_client(configured)
+        .map(|rpc| rpc.origin().to_string())
+        .unwrap_or_else(|_| configured.to_string())
+}
+
 pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
-    async {
+    let result = async {
         let rpc = rpc_client(&rpc)?;
         load_workspace(&rpc, None, None, 0).await
     }
-    .await
-    .map_err(app_error)
+    .await;
+    result.map_err(|_| AppError {
+        message: "Could not connect. Check the endpoint and node.".into(),
+        committed: false,
+    })
 }
 
 pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, LiveUpdate> {
@@ -406,6 +502,43 @@ pub async fn load_chat(rpc: String, channel_id: String) -> Result<ChatData, AppE
     .map_err(app_error)
 }
 
+pub async fn load_chat_hit(
+    rpc: String,
+    channel_id: String,
+    root_seq: i64,
+    target_seq: i64,
+) -> Result<ChatData, AppError> {
+    async {
+        let root_seq = positive_sequence(root_seq)?;
+        let target_seq = positive_sequence(target_seq)?;
+        let rpc = rpc_client(&rpc)?;
+        let mut chat = load_chat_data(&rpc, Some(&channel_id)).await?;
+        chat.messages = load_messages_around(&rpc, &channel_id, root_seq).await?;
+        let root = chat
+            .messages
+            .iter()
+            .find(|message| message.seq == number_i64(root_seq))
+            .cloned()
+            .ok_or_else(|| "message was not found".to_string())?;
+        chat.selected_message_seq = root.seq;
+        chat.selected_message_rev = root.rev;
+        chat.selected_message_body.clone_from(&root.body);
+        if target_seq == root_seq {
+            return Ok(chat);
+        }
+        let reply = load_message_at(&rpc, &channel_id, target_seq).await?;
+        if reply.head.thread != Some(root_seq) {
+            return Err("search result does not belong to the selected thread".into());
+        }
+        chat.active_thread_seq = root.seq;
+        chat.thread_target_seq = number_i64(target_seq);
+        chat.thread_messages = vec![root, chat_message(reply)];
+        Ok(chat)
+    }
+    .await
+    .map_err(app_error)
+}
+
 pub async fn create_channel(
     rpc: String,
     password: String,
@@ -426,10 +559,11 @@ pub async fn create_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn rename_channel(
@@ -452,10 +586,11 @@ pub async fn rename_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn archive_channel(
@@ -476,10 +611,11 @@ pub async fn archive_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn unarchive_channel(
@@ -500,10 +636,11 @@ pub async fn unarchive_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn add_channel_member(
@@ -527,10 +664,11 @@ pub async fn add_channel_member(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn remove_channel_member(
@@ -554,10 +692,11 @@ pub async fn remove_channel_member(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn join_huddle(
@@ -568,7 +707,7 @@ pub async fn join_huddle(
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let rpc = rpc_client(&rpc)?;
-        let status = rpc.status().await?;
+        let status = rpc.status().await.map_err(|error| error.to_string())?;
         let node = public_key(&status.public_key, "node public key")?;
         signed_write(
             &rpc,
@@ -580,10 +719,11 @@ pub async fn join_huddle(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn leave_huddle(
@@ -603,10 +743,11 @@ pub async fn leave_huddle(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn send_message(
@@ -617,7 +758,7 @@ pub async fn send_message(
 ) -> Result<ChatData, AppError> {
     async {
         if channel_id.is_empty() {
-            return Err("choose a channel first".to_string());
+            return Err("choose a channel first".to_string().into());
         }
         let body = bounded_text(body, "message", 16 * 1024)?;
         let rpc = rpc_client(&rpc)?;
@@ -634,10 +775,11 @@ pub async fn send_message(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn load_thread(
@@ -688,10 +830,11 @@ pub async fn send_reply(
             password,
         )
         .await?;
-        load_thread_data(&rpc, &channel_id, root_seq).await
+        load_thread_data(&rpc, &channel_id, root_seq)
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn edit_message(
@@ -704,7 +847,8 @@ pub async fn edit_message(
 ) -> Result<ChatData, AppError> {
     async {
         let seq = positive_sequence(seq)?;
-        let base_rev = u32::try_from(base_rev).map_err(|_| "invalid message revision")?;
+        let base_rev =
+            u32::try_from(base_rev).map_err(|_| "invalid message revision".to_string())?;
         let body = bounded_text(body, "message", 16 * 1024)?;
         let rpc = rpc_client(&rpc)?;
         signed_write(
@@ -719,10 +863,11 @@ pub async fn edit_message(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn delete_message(
@@ -744,10 +889,11 @@ pub async fn delete_message(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn add_reaction(
@@ -772,10 +918,11 @@ pub async fn add_reaction(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id)).await
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn search_chat(
@@ -809,6 +956,7 @@ pub async fn search_chat(
                 .map(|hit| ChatSearchHit {
                     channel_id: hit.channel_id,
                     seq: number_i64(hit.seq),
+                    root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
                     author: hit.author,
                     text: hit.text,
                     meta: format!("#{}", hit.seq),
@@ -823,10 +971,15 @@ pub async fn search_chat(
     })
 }
 
-pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
+pub async fn load_page(
+    rpc: String,
+    page_id: String,
+    selected_block_id: String,
+) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        let pages = load_pages_data(&rpc, Some(&page_id)).await?;
+        Ok(with_selected_block(pages, &selected_block_id))
     }
     .await
     .map_err(app_error)
@@ -851,10 +1004,11 @@ pub async fn create_page(
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn autosave_page_title(
@@ -906,7 +1060,7 @@ pub async fn delete_page(
 ) -> Result<PagesData, AppError> {
     async {
         if page_id.is_empty() {
-            return Err("choose a page first".to_string());
+            return Err("choose a page first".to_string().into());
         }
         let rpc = rpc_client(&rpc)?;
         signed_write(
@@ -918,10 +1072,9 @@ pub async fn delete_page(
             password,
         )
         .await?;
-        load_pages_data(&rpc, None).await
+        load_pages_data(&rpc, None).await.map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn add_block(
@@ -934,7 +1087,7 @@ pub async fn add_block(
 ) -> Result<PagesData, AppError> {
     async {
         if page_id.is_empty() {
-            return Err("choose a page first".to_string());
+            return Err("choose a page first".to_string().into());
         }
         let kind = parse_block_kind(&kind)?;
         let text = bounded_new_block_text(kind, text)?;
@@ -971,10 +1124,11 @@ pub async fn add_block(
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn save_block(
@@ -1008,6 +1162,19 @@ pub async fn save_block(
                 password.clone(),
             )
             .await?;
+            if kind_changed {
+                signed_write(
+                    &rpc,
+                    "pages",
+                    pages::encode_msg(&PageMsg::SetKind { block_id, kind }),
+                    password,
+                )
+                .await
+                .map_err(committed_error)?;
+            }
+            return load_pages_data(&rpc, Some(&page_id))
+                .await
+                .map_err(committed_error);
         }
         if kind_changed {
             signed_write(
@@ -1017,11 +1184,15 @@ pub async fn save_block(
                 password,
             )
             .await?;
+            return load_pages_data(&rpc, Some(&page_id))
+                .await
+                .map_err(committed_error);
         }
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id))
+            .await
+            .map_err(app_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn set_block_checked(
@@ -1040,10 +1211,11 @@ pub async fn set_block_checked(
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn move_block(
@@ -1068,10 +1240,11 @@ pub async fn move_block(
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn remove_block(
@@ -1089,10 +1262,11 @@ pub async fn remove_block(
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id))
+            .await
+            .map_err(committed_error)
     }
     .await
-    .map_err(app_error)
 }
 
 pub async fn search_pages(
@@ -1230,6 +1404,12 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         active_channel_members_only,
         active_channel_huddle_count,
         channel_members,
+        selected_message_seq: 0,
+        selected_message_rev: 0,
+        selected_message_body: String::new(),
+        active_thread_seq: 0,
+        thread_target_seq: 0,
+        thread_messages: Vec::new(),
     })
 }
 
@@ -1296,6 +1476,57 @@ async fn load_messages(
     let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
     roots.drain(..excess);
     Ok(roots.into_iter().map(chat_message).collect())
+}
+
+async fn load_messages_around(
+    rpc: &RpcClient,
+    channel_id: &str,
+    seq: u64,
+) -> Result<Vec<ChatMessage>, String> {
+    let reply: ChatReply = rpc
+        .query(
+            "chat",
+            &ChatQuery::MessagesAround {
+                channel_id: channel_id.to_string(),
+                seq,
+                limit: chat::MAX_QUERY_LIMIT,
+            },
+        )
+        .await?;
+    let messages = match reply {
+        ChatReply::Messages(messages) => messages,
+        _ => return Err("node returned an invalid message window".into()),
+    };
+    Ok(messages
+        .into_iter()
+        .filter(|message| message.head.thread.is_none())
+        .map(chat_message)
+        .collect())
+}
+
+async fn load_message_at(
+    rpc: &RpcClient,
+    channel_id: &str,
+    seq: u64,
+) -> Result<chat::MessageView, String> {
+    let reply: ChatReply = rpc
+        .query(
+            "chat",
+            &ChatQuery::MessagesAround {
+                channel_id: channel_id.to_string(),
+                seq,
+                limit: 1,
+            },
+        )
+        .await?;
+    let messages = match reply {
+        ChatReply::Messages(messages) => messages,
+        _ => return Err("node returned an invalid message window".into()),
+    };
+    messages
+        .into_iter()
+        .find(|message| message.seq == seq)
+        .ok_or_else(|| "message was not found".into())
 }
 
 async fn load_thread_data(
@@ -1392,6 +1623,11 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
             active_page,
             active_page_title: String::new(),
             active_page_parent,
+            selected_block_id: String::new(),
+            selected_block_kind: String::new(),
+            selected_block_text: String::new(),
+            selected_block_checked: false,
+            page_title_selected: false,
         });
     }
     let wire_blocks = load_page_blocks(rpc, &active_page).await?;
@@ -1424,7 +1660,31 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
         active_page,
         active_page_title,
         active_page_parent,
+        selected_block_id: String::new(),
+        selected_block_kind: String::new(),
+        selected_block_text: String::new(),
+        selected_block_checked: false,
+        page_title_selected: false,
     })
+}
+
+fn with_selected_block(mut pages: PagesData, selected_block_id: &str) -> PagesData {
+    if !selected_block_id.is_empty() && selected_block_id == pages.active_page {
+        pages.page_title_selected = true;
+        return pages;
+    }
+    let Some(block) = pages
+        .blocks
+        .iter()
+        .find(|block| block.id == selected_block_id)
+    else {
+        return pages;
+    };
+    pages.selected_block_id.clone_from(&block.id);
+    pages.selected_block_kind.clone_from(&block.kind);
+    pages.selected_block_text.clone_from(&block.text);
+    pages.selected_block_checked = block.checked;
+    pages
 }
 
 async fn load_page_blocks(rpc: &RpcClient, page_id: &str) -> Result<Vec<pages::Block>, String> {
@@ -1688,7 +1948,14 @@ fn positive_sequence(value: i64) -> Result<u64, String> {
 }
 
 fn app_error(message: String) -> AppError {
-    AppError { message }
+    message.into()
+}
+
+fn committed_error(message: String) -> AppError {
+    AppError {
+        message,
+        committed: true,
+    }
 }
 
 fn retry_delay(attempt: u32) -> Duration {
@@ -1879,6 +2146,15 @@ fn autosave_writer() -> &'static tokio::sync::Mutex<()> {
     WRITER.get_or_init(Default::default)
 }
 
+pub fn cancel_autosaves(rpc: String, generation: i64) -> i64 {
+    let prefix = format!("{}\0", rpc.trim());
+    autosaves()
+        .lock()
+        .expect("autosave lock poisoned")
+        .retain(|key, _| !key.starts_with(&prefix));
+    generation.saturating_add(1)
+}
+
 fn begin_autosave(key: &str) -> u64 {
     static TICKET: AtomicU64 = AtomicU64::new(1);
     let ticket = TICKET.fetch_add(1, Ordering::Relaxed);
@@ -2041,6 +2317,13 @@ mod tests {
         assert!(!key_is_encrypted(&key).unwrap());
     }
 
+    #[test]
+    fn post_commit_hydration_errors_are_not_retryable() {
+        let error = committed_error("read failed".into());
+        assert!(error.committed);
+        assert_eq!(error.message, "read failed");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn chat_and_pages_round_trip_over_signed_frames() {
         let storage = tempfile::tempdir().unwrap();
@@ -2119,6 +2402,16 @@ mod tests {
         assert_eq!(pages.blocks[0].text, "A signed page block");
 
         let origin = rpc.origin().to_string();
+        let selected_page = load_page(origin.clone(), "welcome".into(), "intro".into())
+            .await
+            .unwrap();
+        assert_eq!(selected_page.selected_block_id, "intro");
+        assert_eq!(selected_page.selected_block_text, "A signed page block");
+        let selected_title = load_page(origin.clone(), "welcome".into(), "welcome".into())
+            .await
+            .unwrap();
+        assert!(selected_title.page_title_selected);
+        assert!(selected_title.selected_block_id.is_empty());
         let workspace = connect(origin.clone()).await.unwrap();
         let mut live = live_events(origin.clone());
         let ready = live.next().await.unwrap();
@@ -2189,6 +2482,13 @@ mod tests {
         let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.messages[1].body, "a threaded reply");
+        let hit = load_chat_hit(origin.clone(), "general".into(), 1, 3)
+            .await
+            .unwrap();
+        assert_eq!(hit.selected_message_seq, 1);
+        assert_eq!(hit.active_thread_seq, 1);
+        assert_eq!(hit.thread_target_seq, 3);
+        assert_eq!(hit.thread_messages[1].body, "a threaded reply");
         submit_test(
             &rpc,
             &signer,
@@ -2395,6 +2695,18 @@ mod tests {
         assert!(!finish_autosave(key, first));
         assert!(finish_autosave(key, latest));
         assert!(!autosave_is_current(key, latest));
+    }
+
+    #[test]
+    fn reconnect_cancels_only_the_previous_endpoint_autosaves() {
+        let old_key = "http://old\0page";
+        let other_key = "http://other\0page";
+        let old_ticket = begin_autosave(old_key);
+        let other_ticket = begin_autosave(other_key);
+
+        assert_eq!(cancel_autosaves("http://old".into(), 4), 5);
+        assert!(!autosave_is_current(old_key, old_ticket));
+        assert!(finish_autosave(other_key, other_ticket));
     }
 
     #[test]

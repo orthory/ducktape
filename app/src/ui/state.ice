@@ -31,6 +31,7 @@ state
   message_action = "toolbar"
   message_edit_draft = ""
   active_thread_seq:i64 = 0
+  thread_target_seq:i64 = 0
   thread_messages:[ChatMessage] = []
   thread_loading = false
   thread_generation:i64 = 0
@@ -40,6 +41,7 @@ state
   pending_channel = ""
   message_draft = ""
   pending_message = ""
+  failed_message_draft = ""
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_searching = false
@@ -58,6 +60,7 @@ state
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
   block_autosave_generation:i64 = 0
