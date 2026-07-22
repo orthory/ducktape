@@ -19,11 +19,25 @@ pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bo
     if path.exists() {
         return load_identity(path).map(|k| (k, false));
     }
+    let key = generate_identity();
+    write_identity(path, &key)?;
+    Ok((key, true))
+}
+
+/// a fresh in-memory identity from OS randomness — for the caller whose
+/// on-disk location is derived FROM the key (init's default workspace dir is
+/// named by the chain id, which is minted from this pubkey). persist it with
+/// [`write_identity`] once the destination exists.
+pub fn generate_identity() -> ed25519::PrivateKey {
     let mut raw = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut raw);
     // every 32-byte string is a valid ed25519 seed (the scheme clamps), so
     // decode cannot fail on fresh OS randomness.
-    let key = ed25519::PrivateKey::decode(raw.as_slice()).expect("32 random bytes decode");
+    ed25519::PrivateKey::decode(raw.as_slice()).expect("32 random bytes decode")
+}
+
+/// persist an identity at `path` with the same guarantees generation gives.
+pub fn write_identity(path: &Path, key: &ed25519::PrivateKey) -> Result<(), String> {
     let encoded = hex_bytes(key.encode().as_ref());
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {dir:?}: {e}"))?;
@@ -50,7 +64,7 @@ pub fn load_or_generate_identity(path: &Path) -> Result<(ed25519::PrivateKey, bo
             return Err(format!("write {path:?}: {e}"));
         }
     }
-    Ok((key, true))
+    Ok(())
 }
 
 pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {

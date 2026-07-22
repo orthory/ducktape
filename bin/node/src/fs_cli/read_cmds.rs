@@ -3,14 +3,14 @@
 //! script can `cut`/`grep` it). every verb resolves the node address the same
 //! way (`--node` or `DUCKTAPE_NODE`) and streams paged reads to completion.
 
-use std::collections::BTreeMap;
 use std::io::Write as _;
 
 use duckfs_client::api::{ApiError, NodeApi};
 use duckfs_client::http::HttpNode;
 use duckfs_core::{DiffEntry, DiffKind, EntryInfo, EntryKindWire, MAX_PAGE, MAX_READ_BYTES, SnapshotInfo};
 
-use crate::fs_cli::args::{CliError, flag_u64, parse_flags, resolve_node};
+use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
+use crate::fs_cli::{CatArgs, DiffArgs, HistoryArgs, LsArgs, StatArgs};
 
 // --- `--json` row shapes: each mirrors exactly the columns the prose form
 // prints, so the JSON string values are byte-for-byte the text column values
@@ -86,8 +86,8 @@ fn print_json<T: serde::Serialize>(value: &T) {
 }
 
 /// build the transport for a read verb from the resolved node address.
-fn node(flags: &BTreeMap<String, String>) -> Result<HttpNode, CliError> {
-    Ok(HttpNode::new(resolve_node(flags)?))
+fn node(addr: &NodeAddr) -> Result<HttpNode, CliError> {
+    Ok(HttpNode::new(resolve_node(addr)?))
 }
 
 /// map a transport failure to a CLI failure (exit 1).
@@ -119,15 +119,12 @@ fn diff_tag(kind: &DiffKind) -> &'static str {
 /// per entry, paged to completion (`--limit` is the per-request page size).
 /// `--json` collects every page into one `[{kind,size,path}, ...]` array on one
 /// stdout line.
-pub fn ls(args: &[String]) -> Result<(), CliError> {
-    let (pos, flags) = parse_flags(args)?;
-    let path = pos
-        .first()
-        .ok_or_else(|| CliError::usage("ls needs a <path>"))?;
-    let node = node(&flags)?;
-    let snapshot = flags.get("snapshot").map(String::as_str);
-    let limit = flag_u64(&flags, "limit")?.unwrap_or(MAX_PAGE);
-    let want_json = flags.contains_key("json");
+pub fn ls(args: LsArgs) -> Result<(), CliError> {
+    let path = &args.path;
+    let node = node(&args.addr)?;
+    let snapshot = args.snapshot.as_deref();
+    let limit = args.limit.unwrap_or(MAX_PAGE);
+    let want_json = args.json;
 
     let mut after: Option<String> = None;
     let mut collected: Vec<EntryInfo> = Vec::new();
@@ -156,13 +153,10 @@ pub fn ls(args: &[String]) -> Result<(), CliError> {
 
 /// `cat <path> [--snapshot S]` — stream the file's bytes to stdout in paged
 /// reads (raw bytes, so a binary file round-trips exactly).
-pub fn cat(args: &[String]) -> Result<(), CliError> {
-    let (pos, flags) = parse_flags(args)?;
-    let path = pos
-        .first()
-        .ok_or_else(|| CliError::usage("cat needs a <path>"))?;
-    let node = node(&flags)?;
-    let snapshot = flags.get("snapshot").map(String::as_str);
+pub fn cat(args: CatArgs) -> Result<(), CliError> {
+    let path = &args.path;
+    let node = node(&args.addr)?;
+    let snapshot = args.snapshot.as_deref();
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -185,14 +179,11 @@ pub fn cat(args: &[String]) -> Result<(), CliError> {
 
 /// `stat <path> [--snapshot S] [--json]` — the entry's facts, one `key\tvalue`
 /// per line (or `{path,kind,size,exec,object}` under `--json`).
-pub fn stat(args: &[String]) -> Result<(), CliError> {
-    let (pos, flags) = parse_flags(args)?;
-    let path = pos
-        .first()
-        .ok_or_else(|| CliError::usage("stat needs a <path>"))?;
-    let node = node(&flags)?;
-    let snapshot = flags.get("snapshot").map(String::as_str);
-    let want_json = flags.contains_key("json");
+pub fn stat(args: StatArgs) -> Result<(), CliError> {
+    let path = &args.path;
+    let node = node(&args.addr)?;
+    let snapshot = args.snapshot.as_deref();
+    let want_json = args.json;
 
     let Some(e) = node.stat(path, snapshot).map_err(api_err)? else {
         return Err(CliError::failed(format!("no entry at {path}")));
@@ -212,14 +203,10 @@ pub fn stat(args: &[String]) -> Result<(), CliError> {
 /// `history [--limit N] [--json]` — the commit window newest-first, one
 /// `height\tsnapshot\tmessage` line each (or `[{height,id,message}, ...]` under
 /// `--json`).
-pub fn history(args: &[String]) -> Result<(), CliError> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(CliError::usage("history takes no positional args"));
-    }
-    let node = node(&flags)?;
-    let limit = flag_u64(&flags, "limit")?.unwrap_or(MAX_PAGE);
-    let want_json = flags.contains_key("json");
+pub fn history(args: HistoryArgs) -> Result<(), CliError> {
+    let node = node(&args.addr)?;
+    let limit = args.limit.unwrap_or(MAX_PAGE);
+    let want_json = args.json;
 
     let snapshots = node.history(limit).map_err(api_err)?;
     if want_json {
@@ -236,16 +223,12 @@ pub fn history(args: &[String]) -> Result<(), CliError> {
 /// `diff <from> <to> [--prefix P] [--json]` — the Added/Removed/Modified leaves
 /// between two committed snapshots, one `A|D|M\tpath` line each (or
 /// `[{kind,path}, ...]` under `--json`, with the same `A`/`D`/`M` tag).
-pub fn diff(args: &[String]) -> Result<(), CliError> {
-    let (pos, flags) = parse_flags(args)?;
-    let [from, to] = pos.as_slice() else {
-        return Err(CliError::usage("diff needs <from> <to>"));
-    };
-    let node = node(&flags)?;
-    let prefix = flags.get("prefix").map(String::as_str).unwrap_or("");
-    let want_json = flags.contains_key("json");
+pub fn diff(args: DiffArgs) -> Result<(), CliError> {
+    let node = node(&args.addr)?;
+    let prefix = args.prefix.as_deref().unwrap_or("");
+    let want_json = args.json;
 
-    let entries = node.diff(from, to, prefix).map_err(api_err)?;
+    let entries = node.diff(&args.from, &args.to, prefix).map_err(api_err)?;
     if want_json {
         let rows: Vec<DiffRow> = entries.iter().map(diff_row).collect();
         print_json(&rows);

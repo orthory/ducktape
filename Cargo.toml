@@ -5,9 +5,12 @@
 # three layers: module / kernel / networking — the tree groups by function,
 # not mechanism ("system" always means system *modules*). layout:
 #   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
-#                      host (submit/execute loop, app-hash composition, the
-#                      host::worker seam), node (ordered replication), consensus
-#                      (BFT orderer), statesync, recovery, indexer
+#                      sdk-testkit (dev-only test doubles for the sdk boundary
+#                      traits), host (submit/execute loop, app-hash composition,
+#                      the host::worker seam), node (ordered replication),
+#                      consensus (BFT orderer), statesync, recovery, indexer,
+#                      wasm-host (runs a ducktape:module component as a native
+#                      sdk::Module), module-guest (that world's WIT definition)
 #   crates/networking/ — the netstack: host-side transport infra ONLY
 #                      (wireguard, nat-traversal, reachability, data-plane,
 #                      overlay-net) — owns no consensus module
@@ -27,6 +30,9 @@
 #                      ducktape:module world binding they all share)
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
 #                      canary), greeter (the types-only composition example)
+#   crates/testing/  — dev-only shared test support (nettest: raw-http client,
+#                      port allocation, poll). [dev-dependencies] of the bin
+#                      integration suites ONLY; no shipping crate depends on it
 #   crates/labs/     — quarantined experimental consensus modules (evm,
 #                      multisig): in-tree and tested but registered by NO
 #                      genesis set. EXCLUDED from the workspace as its own
@@ -85,9 +91,9 @@ members = [
     "crates/modules/apps/files",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
-    # test support — dev-only shared harness helpers (raw-http client, ports,
+    # testing — dev-only shared harness helpers (raw-http client, ports,
     # poll). NOT a Module Rule surface; no shipping crate depends on it.
-    "crates/nettest",
+    "crates/testing/nettest",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
@@ -102,6 +108,9 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+# the ducktape CLI's argument grammar (derive). already in the graph
+# transitively, so this costs no new compilation unit.
+clap = { version = "4.6", features = ["derive"] }
 # the logging facade. events land in `noded::LogRing` (streamed to the app's
 # Logs tab over the ws `logs` topic) AND on stderr (tee'd to daemon.log) —
 # both gated by ONE reloadable filter, see bin/noded/src/log.rs.

@@ -263,40 +263,40 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     // config — surface that loudly rather than park silently.
     if !coordinated.is_empty() {
         if bootstrappers.is_empty() {
-            println!(
-                "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
-                 bootstrap link and no persisted mesh — tunnel bring-up gossip has no path to \
-                 ride, so these peers stay unreachable. add at least one direct/fronted hint \
-                 (an ephemeral ingress is enough) for the join window; after the first \
-                 converged mesh, restarts ride the persisted state.",
-                coordinated.len()
+            tracing::warn!(
+                target: "ducktape::reachability",
+                node = %label,
+                targets = coordinated.len(),
+                reason = "no_bootstrap_link",
+                "coordinated targets UNREACHABLE — add a direct/fronted bootstrap hint for the \
+                 first join"
             );
         } else {
-            println!(
-                "[node {label}] {} coordinated reach target(s): mesh traffic flows over the \
-                 WireGuard tunnel once the reachability plane converges.",
-                coordinated.len()
+            tracing::info!(
+                target: "ducktape::reachability",
+                node = %label,
+                targets = coordinated.len(),
+                "coordinated reach configured"
             );
         }
         for (target, coord, _coord_key) in &coordinated {
-            println!(
-                "[node {label}]   coordinated target {} via coordinator {coord:?}",
-                hex_bytes(&target.as_ref()[..4])
+            tracing::debug!(
+                target: "ducktape::reachability",
+                node = %label,
+                peer = %hex_bytes(&target.as_ref()[..4]),
+                coordinator = ?coord,
+                "coordinated target"
             );
         }
     }
     if let Some(wg) = &wireguard_listen {
-        let advertise = if wg.ip().is_unspecified() {
-            format!(
-                "endpoint-less on udp port {} (roaming: peers learn this node's address from its own initiations)",
-                wg.port()
-            )
-        } else {
-            format!("advertising WireGuard endpoint udp/{wg}")
-        };
-        println!(
-            "[node {label}] reachability plane: {advertise}; userspace socket backend \
-             (TUN-less — overlay reachability lives inside this process)"
+        // the backend is always the userspace socket stack now — no field.
+        tracing::info!(
+            target: "ducktape::reachability",
+            node = %label,
+            listen = %wg,
+            endpoint_less = wg.ip().is_unspecified(),
+            "reachability plane configured"
         );
     }
 

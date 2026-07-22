@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = noded::open_index_store(&storage, MODULE_IDS)?;
 
     let log_ring = noded::LogRing::default();
-    noded::log::init(Some(log_ring.clone()));
+    noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));
 
     let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle

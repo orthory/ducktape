@@ -85,8 +85,11 @@ pub fn set_filter(directives: &str) -> Result<(), String> {
 }
 
 /// install the subscriber. call ONCE, from `main`. `ring: None` for a binary
-/// with no stream surface (mcp, fs).
-pub fn init(ring: Option<crate::LogRing>) {
+/// with no stream surface (mcp, fs). `log_file: Some(<workspace>/daemon.log)`
+/// makes the node its OWN tee: the desktop spawner that used to pipe stderr
+/// into daemon.log is gone, so without this a hand-run `ducktape node run`
+/// leaves no durable record at all — the log "looks off by default".
+pub fn init(ring: Option<crate::LogRing>, log_file: Option<std::path::PathBuf>) {
     let (boot, bad_env) = boot_filter();
     let (filter_layer, handle) = reload::Layer::new(boot);
     let _ = RELOAD.set(Box::new(move |directives: &str| {
@@ -100,10 +103,31 @@ pub fn init(ring: Option<crate::LogRing>) {
             .with_ansi(false)
             .with_writer(ring)
     });
+    // an unwritable log file must not kill the node — warn (below, once a
+    // subscriber exists) and run on stderr + ring only.
+    let (file_layer, file_err) = match log_file {
+        None => (None, None),
+        Some(path) => match open_log_file(&path) {
+            Ok(file) => (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file)),
+                ),
+                None,
+            ),
+            Err(err) => (None, Some(format!("{}: {err}", path.display()))),
+        },
+    };
     let _ = tracing_subscriber::registry()
-        // ONE filter, gating BOTH sinks — the ring and stderr can never again
-        // disagree about what was worth recording.
-        .with(stderr_layer.and_then(ring_layer).with_filter(filter_layer))
+        // ONE filter, gating EVERY sink — the ring, stderr and daemon.log can
+        // never disagree about what was worth recording.
+        .with(
+            stderr_layer
+                .and_then(ring_layer)
+                .and_then(file_layer)
+                .with_filter(filter_layer),
+        )
         .try_init();
 
     // now that there IS a subscriber, say so: a typo'd RUST_LOG that silently did
@@ -115,8 +139,26 @@ pub fn init(ring: Option<crate::LogRing>) {
             "RUST_LOG is malformed — ignored, running at the default filter"
         );
     }
+    if let Some(err) = file_err {
+        tracing::warn!(
+            target: "ducktape::node",
+            error = %err,
+            "daemon.log unavailable — logging to stderr and the ring only"
+        );
+    }
 
     install_panic_hook();
+}
+
+/// append-open the daemon log, creating its parent. append (never truncate):
+/// the record across restarts is exactly what a crash post-mortem reads.
+// ponytail: unbounded growth at info cadence; rotation when a real workspace
+// shows a daemon.log worth rotating.
+fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// a panic in a spawned task kills THAT TASK ONLY: the node stays "up" while one
