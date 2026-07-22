@@ -35,8 +35,7 @@ pub const RUN_OUTPUT_MAX_RUNS: usize = 32;
 pub const RUN_OUTPUT_MAX_LINES: usize = 2_048;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(tag = "op", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(tag = "op", rename_all = "snake_case")]
 pub enum ClientMsg {
     Subscribe {
         topics: Vec<String>,
@@ -57,9 +56,7 @@ pub enum ClientMsg {
     /// the CLI's TUI reflows.
     TermResize {
         session: String,
-        #[cfg_attr(test, ts(type = "number"))]
         cols: u16,
-        #[cfg_attr(test, ts(type = "number"))]
         rows: u16,
     },
     /// a submitted COMMAND for an interactive session — the ordered "command
@@ -82,12 +79,7 @@ pub enum ClientMsg {
 // no `Deserialize` to conflict when [`Self::TermChunk`] shares the `event` tag
 // with [`Self::Event`] (a derived deserializer's tag match would be ambiguous).
 #[derive(Clone, Debug, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     Subscribed {
         topics: BTreeMap<String, Option<String>>,
@@ -103,13 +95,10 @@ pub enum ServerFrame {
     /// rides the SAME `type: "event"` tag the client keys on, but carries no
     /// `op` — the client routes it by the `term:` topic prefix + string `item`,
     /// distinct from the op-carrying
-    /// module [`Self::Event`]. `ts(skip)`: the client hand-authors this frame
-    /// type (a second `type:"event"` arm would widen the generated `EventFrame`
-    /// and is intentionally kept out of `stream.gen.ts`). ServerFrame is
+    /// module [`Self::Event`]. ServerFrame is
     /// serialize-only at runtime (the node sends, never parses its own frames),
     /// so sharing the `event` tag is safe.
     #[serde(rename = "event")]
-    #[cfg_attr(test, ts(skip))]
     TermChunk {
         topic: String,
         cursor: String,
@@ -123,7 +112,6 @@ pub enum ServerFrame {
     /// tail: a `seq` cursor, replayed on (re)subscribe.
     TermCommandLog {
         topic: String,
-        #[cfg_attr(test, ts(type = "number"))]
         seq: u64,
         origin: String,
         text: String,
@@ -138,12 +126,9 @@ pub enum ServerFrame {
         cursor: String,
     },
     Heartbeat {
-        #[cfg_attr(test, ts(type = "number"))]
         height: u64,
         app_hash: String,
-        #[cfg_attr(test, ts(type = "number"))]
         time_ms: u64,
-        #[cfg_attr(test, ts(type = "number"))]
         interval_ms: u64,
     },
     Error {
@@ -154,8 +139,7 @@ pub enum ServerFrame {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum StreamErrorCode {
     UnknownTopic,
     Unavailable,
@@ -165,39 +149,28 @@ pub enum StreamErrorCode {
 
 /// Owned mirror of indexer::OpRow's exact serde output.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
 pub struct StreamOpRow {
-    #[cfg_attr(test, ts(type = "number"))]
     pub height: u64,
-    #[cfg_attr(test, ts(type = "number"))]
     pub seq: u32,
-    #[cfg_attr(test, ts(type = "number"))]
     pub time: u64,
     pub origin: StreamOrigin,
     // skip_serializing_if omits the field on the wire, so the TS side must
     // read `payload?: …` (absent), not `payload: … | null`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
     pub payload: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
     pub payload_hex: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
 pub struct StreamOrigin {
     pub kind: StreamOriginKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
     pub id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum StreamOriginKind {
     External,
     Module,
@@ -205,16 +178,13 @@ pub enum StreamOriginKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(untagged, rename_all_fields = "camelCase")]
+#[serde(untagged)]
 pub enum TailItem {
     Log {
         line: String,
     },
     FileChange {
-        #[cfg_attr(test, ts(type = "number"))]
         height: u64,
-        #[cfg_attr(test, ts(type = "number"))]
         time: u64,
         message: String,
         base_snapshot: Option<String>,
@@ -229,15 +199,13 @@ pub enum TailItem {
     /// is the server-side sample instant, so a client derives counter rates
     /// from one clock instead of its own frame-arrival jitter.
     Metrics {
-        #[cfg_attr(test, ts(type = "number"))]
         time_ms: u64,
         text: String,
     },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum RunStream {
     Stdout,
     Stderr,
@@ -451,7 +419,6 @@ pub struct RunOutputRegistry {
 /// agent data-plane subscribes to this feed and forwards it to peer nodes;
 /// remotely ingested lines deliberately do not re-enter the feed.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct RunOutputEvent {
     pub id: String,
     pub stream: RunStream,
@@ -1609,11 +1576,9 @@ fn append_change_paths(change: &Change, paths: &mut Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
 
     use indexer::{AppliedOp, BlockOps, OriginTag, RebuildMeta};
     use serde_json::json;
-    use ts_rs::TS;
 
     use super::*;
 
@@ -1892,7 +1857,7 @@ mod tests {
         assert_eq!(seq, 2, "the cursor advances past the replayed commands");
         // ordered + attributed: seq 1 first, carrying its origin + text.
         let json = serde_json::to_value(&result.frames[0]).expect("frame json");
-        assert_eq!(json["type"], "termCommandLog");
+        assert_eq!(json["type"], "term_command_log");
         assert_eq!(json["topic"], "term-cmd:s");
         assert_eq!(json["seq"], 1);
         assert_eq!(json["origin"], "alice");
@@ -2065,39 +2030,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn export_ts_bindings() {
-        let header = "// GENERATED by `make stream-types` (bin/noded/src/stream.rs, \
-            bin/noded/src/lib.rs call-control types) — do not edit.\n\n";
-        let cfg = ts_rs::Config::default();
-        let decls = [
-            serde_json::Value::decl(&cfg),
-            ClientMsg::decl(&cfg),
-            ServerFrame::decl(&cfg),
-            StreamErrorCode::decl(&cfg),
-            StreamOpRow::decl(&cfg),
-            StreamOrigin::decl(&cfg),
-            StreamOriginKind::decl(&cfg),
-            TailItem::decl(&cfg),
-            RunStream::decl(&cfg),
-            crate::CallClientControl::decl(&cfg),
-            crate::CallServerControl::decl(&cfg),
-        ];
-        let mut out = header.to_string();
-        for decl in decls {
-            out.push_str("export ");
-            out.push_str(&decl);
-            if !decl.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../app/src/domain/stream.gen.ts"
-        );
-        if fs::read_to_string(path).ok().as_deref() != Some(out.as_str()) {
-            fs::write(path, out).expect("write stream.gen.ts");
-        }
-    }
 }

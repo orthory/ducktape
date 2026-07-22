@@ -42,9 +42,9 @@
 //! durable block index (`BlockOps.record` via the shared `project_block`), so
 //! `GET /v1/blocks` and `/v1/index/*` serve just like noded. personas shape
 //! the one wire difference left between the two real nodes — the receipt:
-//!   - `local`: submit receipts carry `opHash` (the embedded daemon's shape).
+//!   - `local`: submit receipts carry `op_hash` (the embedded daemon's shape).
 //!   - `networked`: receipts are height-only — a response layer strips
-//!     `opHash`, the validator's shape until its ordered-node convergence.
+//!     `op_hash`, the validator's shape until its ordered-node convergence.
 //!
 //! `POST /sim/peer-block` commits a block owned by no held submit — the
 //! "concurrent writer" for optimistic-projection race scenarios. it takes
@@ -172,7 +172,7 @@ const PEER_ORIGIN: &[u8] = b"peer";
 const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
 const SIM_BLOCK_MS: u64 = 1_000;
 
-/// cap when buffering a /v1/submit response body to strip `opHash` — receipts
+/// cap when buffering a /v1/submit response body to strip `op_hash` — receipts
 /// are ~200 bytes; anything past this is not a receipt.
 const RECEIPT_BODY_CAP: usize = 64 * 1024;
 
@@ -186,7 +186,6 @@ pub enum Persona {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SimSnapshot {
     height: u64,
     held: usize,
@@ -196,7 +195,6 @@ struct SimSnapshot {
 }
 
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct CommittedInfo {
     height: u64,
     app_hash: String,
@@ -208,7 +206,6 @@ struct CommittedInfo {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct StepReport {
     /// `null` when the step found both queues empty, or when the stepped op
     /// was rejected (its submitter got the rejection as its reply).
@@ -252,7 +249,6 @@ enum PeerBlockRequest {
 
 /// one member's verdict in a `/sim/peer-block` batch reply (input order).
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct MemberInfo {
     target: String,
     /// this member's authored origin, hex or the printable convention — the
@@ -268,7 +264,6 @@ struct MemberInfo {
 /// the multi-op `/sim/peer-block` reply: ONE committed block carrying N members,
 /// each with its own applied/rejected verdict.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct BatchInfo {
     height: u64,
     app_hash: String,
@@ -969,7 +964,8 @@ fn run_sim(
                     Some(NodeCommand::Peers { reply }) => {
                         // the sim has no mesh: its exposition carries no peer
                         // families, so this parses to the honest empty sample
-                        // (same shape as the embedded daemon).
+                        // (same shape as the embedded daemon — logical clock,
+                        // no consensus, so no epoch either).
                         let sampled_at_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -977,6 +973,8 @@ fn run_sim(
                         let _ = reply.send(noded::peers::peers_from_exposition(
                             &context.encode(),
                             sampled_at_ms,
+                            sim.height(),
+                            None,
                         ));
                     }
                     Some(NodeCommand::Metrics { reply }) => {
@@ -1636,7 +1634,7 @@ async fn sim_state(State(handle): State<ControlState>) -> Response {
 
 // ── Networked-persona receipt shaping ───────────────────
 
-/// the networked validator's submit reply is height-only — `opHash` is a
+/// the networked validator's submit reply is height-only — `op_hash` is a
 /// local-daemon receipt field. noded's shared submit handler always adds it,
 /// so the networked persona strips it at the response layer instead of
 /// forking the handler.
@@ -1661,7 +1659,7 @@ async fn strip_receipt_op_hash(
     let stripped = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|mut value| {
-            value.as_object_mut()?.remove("opHash");
+            value.as_object_mut()?.remove("op_hash");
             serde_json::to_vec(&value).ok()
         });
     // the buffered body replaces the streamed one, so the recorded length is

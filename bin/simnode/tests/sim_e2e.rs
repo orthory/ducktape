@@ -35,12 +35,12 @@ fn held_submit_commits_only_on_step() {
     assert_eq!(report["committed"]["height"], 1);
 
     // the step released the parked http reply — a receipt for block 1, with
-    // the local persona's opHash content address.
+    // the local persona's op_hash content address.
     let (code, receipt) = pending.join().expect("submit thread");
     assert_eq!(code, 200, "released submit failed: {receipt}");
     assert_eq!(receipt["height"], 1, "receipt is the inclusion block");
     assert_eq!(
-        receipt["opHash"].as_str().map(str::len),
+        receipt["op_hash"].as_str().map(str::len),
         Some(64),
         "local persona receipts carry the content address: {receipt}"
     );
@@ -70,7 +70,7 @@ fn same_script_same_app_hash() {
             sim.await_sim_state("held", 1);
             let report = sim.step();
             hashes.push(
-                report["committed"]["appHash"]
+                report["committed"]["app_hash"]
                     .as_str()
                     .expect("step committed")
                     .to_string(),
@@ -79,7 +79,7 @@ fn same_script_same_app_hash() {
             assert_eq!(code, 200);
         }
         hashes.push(
-            sim.status()["appHash"]
+            sim.status()["app_hash"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
@@ -103,7 +103,7 @@ fn personas_shape_receipts_and_ring() {
     assert_eq!(code, 200, "released submit failed: {receipt}");
     assert_eq!(receipt["height"], 1);
     assert!(
-        receipt.get("opHash").is_none(),
+        receipt.get("op_hash").is_none(),
         "networked receipts are height-only: {receipt}"
     );
 
@@ -113,7 +113,7 @@ fn personas_shape_receipts_and_ring() {
     assert_eq!(records.len(), 1, "networked persona fills the ring: {body}");
     // a block carries its member ops under `ops[]`; the sim is one op per block.
     assert_eq!(records[0]["ops"][0]["target"], "chat");
-    let op_hash = records[0]["ops"][0]["opHash"].as_str().unwrap_or_default();
+    let op_hash = records[0]["ops"][0]["op_hash"].as_str().unwrap_or_default();
     assert_eq!(op_hash.len(), 64, "ring records carry the content address");
     let (code, blob) = sim.request("GET", &format!("/v1/files/blob/{op_hash}"), None);
     assert_eq!(code, 200, "op hash must dereference on the blob lane");
@@ -123,7 +123,7 @@ fn personas_shape_receipts_and_ring() {
         "blob lane serves the committed payload back"
     );
 
-    // local: receipts carry opHash — and the blocks lane is served either
+    // local: receipts carry op_hash — and the blocks lane is served either
     // way (both real daemons feed the durable block index; the persona only
     // shapes the receipt).
     let storage = tempfile::tempdir().expect("storage dir");
@@ -133,7 +133,7 @@ fn personas_shape_receipts_and_ring() {
     sim.step();
     let (code, receipt) = pending.join().expect("submit thread");
     assert_eq!(code, 200);
-    assert_eq!(receipt["opHash"].as_str().map(str::len), Some(64));
+    assert_eq!(receipt["op_hash"].as_str().map(str::len), Some(64));
     let (code, body) = sim.request("GET", "/v1/blocks", None);
     assert_eq!(code, 200);
     let records = body["blocks"].as_array().expect("blocks is an array");
@@ -181,7 +181,7 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
                 let report = sim.step();
                 let (code, _) = pending.join().expect("submit thread");
                 assert_eq!(code, 200);
-                report["committed"]["appHash"]
+                report["committed"]["app_hash"]
                     .as_str()
                     .expect("step committed")
                     .to_string()
@@ -197,7 +197,7 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
             .map(|(target, payload)| {
                 // auto mode: the submit reply IS the commit receipt.
                 let receipt = sim.submit_ok(target, payload, None);
-                receipt["appHash"]
+                receipt["app_hash"]
                     .as_str()
                     .expect("receipt app hash")
                     .to_string()

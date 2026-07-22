@@ -152,11 +152,10 @@ pub async fn rebuild_stale_modules(
 
 /// query params for `GET /v1/index/{module}/scan` and `…/ops`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct IndexScanParams {
     /// key prefix to scan under. ignored by `…/ops` (pinned to the op log).
     pub prefix: Option<String>,
-    /// opaque page cursor: the `nextAfter` of the previous page.
+    /// opaque page cursor: the `next_after` of the previous page.
     pub after: Option<String>,
     /// page size; the store clamps oversized asks.
     pub limit: Option<usize>,
@@ -166,9 +165,8 @@ pub struct IndexScanParams {
 const INDEX_DEFAULT_LIMIT: usize = 100;
 
 /// one scanned entry. values written by this tier are json (`value`); a
-/// derived value that is not valid json ships as `valueHex` instead.
+/// derived value that is not valid json ships as `value_hex` instead.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct IndexEntry {
     key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,7 +176,6 @@ struct IndexEntry {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct IndexScanResponse {
     entries: Vec<IndexEntry>,
     has_more: bool,
@@ -187,7 +184,6 @@ struct IndexScanResponse {
 }
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct IndexOpsResponse {
     /// stored op-row envelopes, verbatim (height/seq/time/origin + payload).
     ops: Vec<Box<serde_json::value::RawValue>>,
@@ -250,7 +246,7 @@ pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
 
 /// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
 /// log, oldest-first. rows are the stored envelopes verbatim; page forward by
-/// echoing `nextAfter` as the next call's `after`.
+/// echoing `next_after` as the next call's `after`.
 pub(crate) async fn index_ops(
     State(handle): State<NodeHandle>,
     Path(module): Path<String>,
@@ -356,7 +352,6 @@ pub(crate) async fn index_scan(
 
 /// query params for `GET /v1/blocks`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BlocksParams {
     /// cap the response to the most recent N blocks (default:
     /// [`BLOCKS_DEFAULT_LIMIT`]).

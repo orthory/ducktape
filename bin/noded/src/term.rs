@@ -9,7 +9,7 @@
 //! member typing into the container never reaches the operator's secrets.
 //!
 //! Three moving parts:
-//! - [`TerminalSessions`] — the manager: a bounded map `sessionId ->
+//! - [`TerminalSessions`] — the manager: a bounded map `session_id ->
 //!   Arc<InteractiveSession>`, a per-session output ring, and a pump task per
 //!   session that copies pty output into the ring and broadcasts it on the ws
 //!   `term:<id>` topic (modelled on the `run-output:<id>` plane).
@@ -110,7 +110,6 @@ pub fn command_topic(session_id: &str) -> String {
 /// `seq`: the raw byte stream is opaque, so each node stamps its own local
 /// ring cursor — the reliable per-peer stream preserves arrival order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct TermChunkEvent {
     pub session: String,
     pub chunk_b64: String,
@@ -123,7 +122,6 @@ pub struct TermChunkEvent {
 /// verbatim via [`TermCommandRing::append_remote`] (which never re-stamps),
 /// so every node shows the same order. `text` can carry secrets — never logged.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct TermCommandEvent {
     pub session: String,
     pub seq: u64,
@@ -527,7 +525,6 @@ struct Inner {
 
 /// the create-session reply — the fixed wire shape the app client consumes.
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CreatedSession {
     pub session_id: String,
     pub topic: String,

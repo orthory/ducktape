@@ -97,11 +97,10 @@ fn error_message(resp: reqwest::blocking::Response) -> String {
     }
 }
 
-/// the camelCase `BlockSummary` a stage/commit/pin POST answers with. only the
+/// the `BlockSummary` a stage/commit/pin POST answers with. only the
 /// height matters to the engine (it resolves the snapshot id by height); the app
 /// hash is carried for parity with the wire type but unused here.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct BlockSummaryWire {
     height: u64,
     #[allow(dead_code)]

@@ -480,10 +480,13 @@ fn run_node(
                 }
                 NodeCommand::Peers { reply } => {
                     // the embedded daemon has no mesh, so the exposition
-                    // carries no peer families and the honest sample is empty.
+                    // carries no peer families and the honest sample is empty;
+                    // no consensus either, so the epoch stays absent.
                     let _ = reply.send(noded::peers::peers_from_exposition(
                         &context.encode(),
                         unix_millis(),
+                        height,
+                        None,
                     ));
                 }
                 NodeCommand::Metrics { reply } => {

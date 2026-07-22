@@ -43,8 +43,8 @@ let sim = simnode::boot(
 process-global tracing subscriber + panic hook — binary only). `auto: true`
 = submits commit inline; `false` = held mode, commits happen on `step()`
 (races as scripts). Governance scenarios: `valset_keys` (raw 32-byte ed25519
-pubkeys) + `invite_binding`; `node_key` fabricates `status.publicKey`;
-`persona` picks daemon (`opHash` receipts) vs validator (height-only) shape.
+pubkeys) + `invite_binding`; `node_key` fabricates `status.public_key`;
+`persona` picks daemon (`op_hash` receipts) vs validator (height-only) shape.
 After a host fatal the control surface fails closed (every call errs with
 the reason); the *triggering* call may still return Ok — check the next one.
 

@@ -367,14 +367,14 @@ fn full_surface_blocks_authorship_and_ws() {
             "gateway"
         ]
     );
-    let genesis_hash = status["appHash"].as_str().expect("appHash").to_string();
+    let genesis_hash = status["app_hash"].as_str().expect("app_hash").to_string();
 
     // connect before submitting: the stream heartbeats without a subscription,
     // then module events catch up from the subscribed cursor.
     let mut ws = daemon.ws_connect();
     let heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
     assert_eq!(heartbeat["height"], 0);
-    assert_eq!(heartbeat["intervalMs"], 3_000);
+    assert_eq!(heartbeat["interval_ms"], 3_000);
 
     Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
     let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
@@ -393,7 +393,7 @@ fn full_surface_blocks_authorship_and_ws() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
     assert_eq!(block["height"], 1);
-    assert_ne!(block["appHash"].as_str(), Some(genesis_hash.as_str()));
+    assert_ne!(block["app_hash"].as_str(), Some(genesis_hash.as_str()));
 
     let (code, block) = daemon.submit(
         "chat",
@@ -768,14 +768,14 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(code, 200, "chat view failed: {reply}");
         let hits = hits_of(&reply);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0]["messageId"], "m1");
+        assert_eq!(hits[0]["message_id"], "m1");
         assert_eq!(hits[0]["author"], "user:eddy");
 
         // tasks' endpoint: the by-status partition.
         let (code, reply) = daemon.request(
             "POST",
             "/v1/index/tasks/view",
-            Some(&serde_json::json!({ "byStatus": { "status": "open" } })),
+            Some(&serde_json::json!({ "by_status": { "status": "open" } })),
         );
         assert_eq!(code, 200, "tasks view failed: {reply}");
         let tasks = reply["tasks"]["tasks"].as_array().expect("tasks array");
@@ -842,16 +842,16 @@ fn per_module_index_serves_ops_and_views() {
     assert_eq!(code, 200);
     let hits = hits_of(&reply);
     assert_eq!(hits.len(), 1, "post-restart blocks keep indexing");
-    assert_eq!(hits[0]["messageId"], "m2");
+    assert_eq!(hits[0]["message_id"], "m2");
 }
 
 #[test]
 fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["appHash"]
+    let genesis_hash = daemon.status()["app_hash"]
         .as_str()
-        .expect("appHash")
+        .expect("app_hash")
         .to_string();
 
     // sha256 as 64-char lowercase hex — the digest rendering the lane returns.
@@ -916,7 +916,7 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let status = daemon.status();
     assert_eq!(status["height"], 0, "blob puts must not commit blocks");
     assert_eq!(
-        status["appHash"].as_str(),
+        status["app_hash"].as_str(),
         Some(genesis_hash.as_str()),
         "blob puts must not move the app hash"
     );
@@ -935,9 +935,9 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
 fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["appHash"]
+    let genesis_hash = daemon.status()["app_hash"]
         .as_str()
-        .expect("appHash")
+        .expect("app_hash")
         .to_string();
 
     // refs on a fresh module: no head (the empty filesystem) and an empty window,
@@ -1005,7 +1005,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let after_stage = daemon.status();
     assert_eq!(after_stage["height"], 2, "two stages committed two blocks");
     assert_ne!(
-        after_stage["appHash"].as_str(),
+        after_stage["app_hash"].as_str(),
         Some(genesis_hash.as_str()),
         "staging moves the module root"
     );
@@ -1276,14 +1276,14 @@ fn metrics_stream_topic_pushes_the_scrape_over_ws() {
         "stream sample carries the block series: {text}"
     );
     assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
-    let time_ms = tail["item"]["timeMs"].as_u64().expect("sample instant");
+    let time_ms = tail["item"]["time_ms"].as_u64().expect("sample instant");
     assert_eq!(tail["cursor"], time_ms.to_string());
 
     // the next sample arrives on the heartbeat tick without any block moving.
     let tail2 = Daemon::ws_read_type(&mut ws, "tail");
     assert_eq!(tail2["topic"], "metrics");
     assert!(
-        tail2["item"]["timeMs"].as_u64().expect("second instant") >= time_ms,
+        tail2["item"]["time_ms"].as_u64().expect("second instant") >= time_ms,
         "tick samples advance monotonically"
     );
 }

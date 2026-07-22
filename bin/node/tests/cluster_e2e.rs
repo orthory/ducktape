@@ -305,7 +305,7 @@ fn cluster_lifecycle() {
     assert_eq!(op["target"], "directory");
     assert_eq!(op["disposition"], "applied");
     assert_eq!(
-        submitted["commitHash"], block["appHash"],
+        submitted["commit_hash"], block["app_hash"],
         "explorer commit hash must equal the held reply's app-hash"
     );
     assert_eq!(
@@ -385,7 +385,7 @@ fn cluster_lifecycle() {
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.
-    let op_hash = submitted["ops"][0]["opHash"].as_str().unwrap_or_default();
+    let op_hash = submitted["ops"][0]["op_hash"].as_str().unwrap_or_default();
     assert_eq!(
         op_hash.len(),
         64,
@@ -413,10 +413,10 @@ fn cluster_lifecycle() {
     );
     let (code, http_status) = cluster.http(2, "GET", "/v1/status", None);
     assert_eq!(code, 200, "app-surface status failed");
-    let http_hash = http_status["appHash"].as_str().unwrap_or_default();
+    let http_hash = http_status["app_hash"].as_str().unwrap_or_default();
     assert!(
         !http_hash.is_empty(),
-        "app-surface status carries appHash: {http_status}"
+        "app-surface status carries app_hash: {http_status}"
     );
     assert_eq!(
         cluster.status(2)["app_hash"].as_str().unwrap_or_default(),
@@ -432,7 +432,7 @@ fn cluster_lifecycle() {
         "status carries the current consensus set: {http_status}"
     );
     assert!(
-        http_status["operations"]["consensus"]["reachableValidators"]
+        http_status["operations"]["consensus"]["reachable_validators"]
             .as_u64()
             .zip(http_status["operations"]["consensus"]["quorum"].as_u64())
             .is_some_and(|(reachable, quorum)| reachable >= quorum),
@@ -457,7 +457,7 @@ fn cluster_lifecycle() {
     let (code, peer_sample) = cluster.http(0, "GET", "/v1/peers", None);
     assert_eq!(code, 200, "peer sample failed: {peer_sample}");
     assert!(
-        peer_sample["sampledAtMs"].as_u64().is_some_and(|ms| ms > 0),
+        peer_sample["sampled_at_ms"].as_u64().is_some_and(|ms| ms > 0),
         "peer sample carries its timestamp: {peer_sample}"
     );
     let listed = peer_sample["peers"]
@@ -472,7 +472,7 @@ fn cluster_lifecycle() {
     assert!(
         listed.iter().any(|peer| peer["connected"] == true
             && peer["role"] == "validator"
-            && peer["connectedSinceMs"].as_u64().is_some()),
+            && peer["connected_since_ms"].as_u64().is_some()),
         "a connected co-validator is listed with valset standing: {peer_sample}"
     );
     // the local rpc (`ducktape node peers`) answers with the SAME view.

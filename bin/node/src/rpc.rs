@@ -30,7 +30,6 @@ pub(crate) enum RpcRequest {
 /// onboarding vocabulary so the console renders it verbatim:
 /// `parked | admitted | synced | promoted`.
 #[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct JoinStateView {
     pub(crate) phase: String,
     pub(crate) detail: String,

@@ -142,8 +142,8 @@ else
     command -v node >/dev/null || die "node is required to read the node identity"
     NODE_ID=$(
       curl -fsS -m 5 "$BASE_URL/v1/status" |
-        node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const k=JSON.parse(s).publicKey||"";if(!/^[0-9a-f]{64}$/i.test(k))process.exit(1);process.stdout.write(k.toLowerCase())})'
-    ) || die "the node status has no valid publicKey"
+        node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const k=JSON.parse(s).public_key||"";if(!/^[0-9a-f]{64}$/i.test(k))process.exit(1);process.stdout.write(k.toLowerCase())})'
+    ) || die "the node status has no valid public_key"
     TREE_OID=$(git rev-parse "$SOURCE_OID^{tree}")
     EXPECTED_OID=$(
       GIT_AUTHOR_NAME="$NODE_ID" \

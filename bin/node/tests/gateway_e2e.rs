@@ -222,7 +222,7 @@ fn proxy_request(
                 "headers": headers,
                 "body_len": body.len(),
             },
-            "bodyB64": base64::engine::general_purpose::STANDARD.encode(body),
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
         })),
     )
 }
@@ -349,7 +349,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     assert_eq!(response["head"]["status"], 201);
     assert_eq!(
         base64::engine::general_purpose::STANDARD
-            .decode(response["bodyB64"].as_str().unwrap())
+            .decode(response["body_b64"].as_str().unwrap())
             .unwrap(),
         br#"{"ok":true}"#
     );

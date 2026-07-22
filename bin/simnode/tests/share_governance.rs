@@ -450,7 +450,7 @@ fn a_kv_script_is_deterministic_across_fresh_dirs() {
                 Some("writer"),
             );
         }
-        sim.status()["appHash"]
+        sim.status()["app_hash"]
             .as_str()
             .expect("app hash")
             .to_string()

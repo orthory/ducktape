@@ -14,7 +14,6 @@ use super::{EvmLog, EvmMsg, EvmResult, EvmTx, decode_msg};
 const DEFAULT_LIMIT: usize = 50;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ReceiptRow {
     pub height: u64,
     pub time: u64,
@@ -25,7 +24,6 @@ pub struct ReceiptRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LogRow {
     pub height: u64,
     pub time: u64,
@@ -37,18 +35,15 @@ pub struct LogRow {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum EvmViewQuery {
-    #[serde(rename_all = "camelCase")]
     Receipts {
         #[serde(default)]
         after: Option<String>,
         #[serde(default)]
         limit: Option<usize>,
     },
-    #[serde(rename_all = "camelCase")]
     Contract { address: String },
-    #[serde(rename_all = "camelCase")]
     Logs {
         #[serde(default)]
         address: Option<String>,
@@ -62,9 +57,8 @@ pub enum EvmViewQuery {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum EvmViewReply {
-    #[serde(rename_all = "camelCase")]
     Receipts {
         receipts: Vec<ReceiptRow>,
         has_more: bool,
@@ -72,7 +66,6 @@ pub enum EvmViewReply {
         next_after: Option<String>,
     },
     Contract(Option<ReceiptRow>),
-    #[serde(rename_all = "camelCase")]
     Logs {
         logs: Vec<LogRow>,
         has_more: bool,

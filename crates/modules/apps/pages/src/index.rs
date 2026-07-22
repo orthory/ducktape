@@ -35,7 +35,6 @@ const MAX_SEARCH_LIMIT: usize = 100;
 
 /// the stored row of one page block, as search results return it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct PageBlockRow {
     pub block_id: String,
     /// the page (root block id) this block belongs to; a root names itself.
@@ -53,7 +52,6 @@ pub struct PageBlockRow {
 
 /// a token posting's value: rank (time) plus the row address and its page.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TokRef {
     block_id: String,
     page_id: String,
@@ -61,11 +59,10 @@ struct TokRef {
 }
 
 /// pages' view requests, externally tagged:
-/// `{"search": {"text": "...", "pageId": "...", "limit": 20}}`.
+/// `{"search": {"text": "...", "page_id": "...", "limit": 20}}`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum PagesViewQuery {
-    #[serde(rename_all = "camelCase")]
     Search {
         text: String,
         #[serde(default)]
@@ -77,7 +74,7 @@ pub enum PagesViewQuery {
 
 /// pages' view replies: `{"hits": [<PageBlockRow>…]}`, newest first.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum PagesViewReply {
     Hits(Vec<PageBlockRow>),
 }
@@ -594,7 +591,7 @@ mod tests {
         assert_eq!(hits.len(), 2);
         let hits = search(
             &store,
-            serde_json::json!({"search": {"text": "shared", "pageId": "p2"}}),
+            serde_json::json!({"search": {"text": "shared", "page_id": "p2"}}),
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].block_id, "b2");

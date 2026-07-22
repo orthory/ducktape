@@ -42,7 +42,6 @@ pub const MAX_TAG_CHARS: usize = 64;
 /// one catalog row of the `Tags` reply: a label, how many live messages carry
 /// it (in the channel scope asked), and the newest such message's seq.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct TagRow {
     pub tag: String,
     pub count: u64,

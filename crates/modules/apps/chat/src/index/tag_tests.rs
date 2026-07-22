@@ -104,7 +104,7 @@ fn posts_index_tags_and_catalog() {
     // channel-scoped catalog: count desc, then tag asc; last_seq = newest live.
     let rows = tag_rows(
         &store,
-        serde_json::json!({"tags": {"channelId": "general"}}),
+        serde_json::json!({"tags": {"channel_id": "general"}}),
     );
     assert_eq!(
         rows,
@@ -130,11 +130,11 @@ fn posts_index_tags_and_catalog() {
     assert_eq!(rows[0].last_seq, 2);
 
     // tag search: exact label, newest first, channel scope honored.
-    let all = hits(&store, serde_json::json!({"tagSearch": {"tag": "rust"}}));
+    let all = hits(&store, serde_json::json!({"tag_search": {"tag": "rust"}}));
     assert_eq!(ids(&all), ["m3", "m2", "m1"]);
     let scoped = hits(
         &store,
-        serde_json::json!({"tagSearch": {"tag": "rust", "channelId": "general"}}),
+        serde_json::json!({"tag_search": {"tag": "rust", "channel_id": "general"}}),
     );
     assert_eq!(ids(&scoped), ["m2", "m1"]);
     // rows carry their tag sets.
@@ -151,7 +151,7 @@ fn tag_search_matches_exact_label_not_prefix() {
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "rust"}})
+            serde_json::json!({"tag_search": {"tag": "rust"}})
         )),
         ["m1"]
     );
@@ -159,7 +159,7 @@ fn tag_search_matches_exact_label_not_prefix() {
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "#Rust"}})
+            serde_json::json!({"tag_search": {"tag": "#Rust"}})
         )),
         ["m1"]
     );
@@ -171,12 +171,12 @@ fn hangul_tags_round_trip() {
     let store = store(dir.path());
     apply(&store, 1, vec![post("g", "m1", "이번 주 #한글-지원 작업")]);
 
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}}));
+    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(rows[0].tag, "한글-지원");
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "#한글-지원"}})
+            serde_json::json!({"tag_search": {"tag": "#한글-지원"}})
         )),
         ["m1"]
     );
@@ -208,10 +208,10 @@ fn code_blocks_and_link_spans_do_not_index_tags() {
         })],
     );
 
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}}));
+    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].tag, "yes");
-    assert!(hits(&store, serde_json::json!({"tagSearch": {"tag": "nope"}})).is_empty());
+    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "nope"}})).is_empty());
 }
 
 #[test]
@@ -221,23 +221,23 @@ fn edit_diffs_old_and_new_tag_sets() {
     apply(&store, 1, vec![post("g", "m1", "#old #keep")]);
     apply(&store, 2, vec![edit("g", 1, "#keep #new")]);
 
-    assert!(hits(&store, serde_json::json!({"tagSearch": {"tag": "old"}})).is_empty());
+    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "old"}})).is_empty());
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "keep"}})
+            serde_json::json!({"tag_search": {"tag": "keep"}})
         )),
         ["m1"]
     );
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "new"}})
+            serde_json::json!({"tag_search": {"tag": "new"}})
         )),
         ["m1"]
     );
     // the catalog moved by the diff: `old` is gone at count zero.
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}}));
+    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(
         rows,
         vec![
@@ -266,7 +266,7 @@ fn delete_removes_postings_and_decrements_catalog() {
     // the NEWEST tagged message died: count decrements AND last_seq falls
     // back to the surviving posting (the catalog stores no last_seq — it is
     // read off the newest live posting, so no stale maximum survives).
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}}));
+    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(
         rows,
         vec![TagRow {
@@ -278,15 +278,15 @@ fn delete_removes_postings_and_decrements_catalog() {
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "x"}})
+            serde_json::json!({"tag_search": {"tag": "x"}})
         )),
         ["m1"]
     );
 
     // deleting the last carrier drops the catalog entry entirely.
     apply(&store, 4, vec![delete("g", 1)]);
-    assert!(tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}})).is_empty());
-    assert!(hits(&store, serde_json::json!({"tagSearch": {"tag": "x"}})).is_empty());
+    assert!(tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}})).is_empty());
+    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "x"}})).is_empty());
 }
 
 #[test]
@@ -301,15 +301,15 @@ fn same_block_post_then_edit_folds_tags_through_the_overlay() {
             edit("g", 1, "#final words"),
         ],
     );
-    assert!(hits(&store, serde_json::json!({"tagSearch": {"tag": "draft"}})).is_empty());
+    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "draft"}})).is_empty());
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "final"}})
+            serde_json::json!({"tag_search": {"tag": "final"}})
         )),
         ["m1"]
     );
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}}));
+    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(
         rows,
         vec![TagRow {
@@ -329,14 +329,14 @@ fn sixteen_tag_cap_binds_at_the_fold() {
 
     let rows = tag_rows(
         &store,
-        serde_json::json!({"tags": {"channelId": "g", "limit": 100}}),
+        serde_json::json!({"tags": {"channel_id": "g", "limit": 100}}),
     );
     assert_eq!(rows.len(), tags::MAX_TAGS_PER_MESSAGE);
     assert_eq!(
-        hits(&store, serde_json::json!({"tagSearch": {"tag": "tag15"}})).len(),
+        hits(&store, serde_json::json!({"tag_search": {"tag": "tag15"}})).len(),
         1
     );
-    assert!(hits(&store, serde_json::json!({"tagSearch": {"tag": "tag16"}})).is_empty());
+    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "tag16"}})).is_empty());
 }
 
 // ── queries: clamps and validation ──────────────────────────────────────────
@@ -354,14 +354,14 @@ fn limits_default_and_clamp_like_search() {
     }
 
     // default page = 20, newest first.
-    let page = hits(&store, serde_json::json!({"tagSearch": {"tag": "hot"}}));
+    let page = hits(&store, serde_json::json!({"tag_search": {"tag": "hot"}}));
     assert_eq!(page.len(), 20);
     assert_eq!(page[0].message_id, "m24");
     // zero clamps up to one, oversize clamps down to the max (100 ≥ 25 = all).
     assert_eq!(
         hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "hot", "limit": 0}})
+            serde_json::json!({"tag_search": {"tag": "hot", "limit": 0}})
         )
         .len(),
         1
@@ -369,7 +369,7 @@ fn limits_default_and_clamp_like_search() {
     assert_eq!(
         hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "hot", "limit": 100000}})
+            serde_json::json!({"tag_search": {"tag": "hot", "limit": 100000}})
         )
         .len(),
         25
@@ -391,7 +391,7 @@ fn invalid_tag_queries_are_view_errors() {
     apply(&store, 1, vec![post("g", "m1", "#ok")]);
     let long = "a".repeat(65);
     for bad in ["", "#", "two words", long.as_str()] {
-        let req = serde_json::json!({"tagSearch": {"tag": bad}});
+        let req = serde_json::json!({"tag_search": {"tag": bad}});
         let err = store
             .view("chat", &serde_json::to_vec(&req).unwrap())
             .unwrap_err();
@@ -419,7 +419,7 @@ fn slash_channel_ids_do_not_leak_across_tag_scopes() {
     // catalog row, no count leak, and last_seq reads g's OWN newest posting
     // (a structural-prefix leak would report the sub-channel's seq 2).
     assert_eq!(
-        tag_rows(&store, serde_json::json!({"tags": {"channelId": "g"}})),
+        tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}})),
         vec![TagRow {
             tag: "shared".into(),
             count: 1,
@@ -428,7 +428,7 @@ fn slash_channel_ids_do_not_leak_across_tag_scopes() {
     );
     // Tags scoped to the sub-channel see exactly its own rows.
     assert_eq!(
-        tag_rows(&store, serde_json::json!({"tags": {"channelId": "g/0"}})),
+        tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g/0"}})),
         vec![
             TagRow {
                 tag: "shared".into(),
@@ -447,14 +447,14 @@ fn slash_channel_ids_do_not_leak_across_tag_scopes() {
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "shared", "channelId": "g"}})
+            serde_json::json!({"tag_search": {"tag": "shared", "channel_id": "g"}})
         )),
         ["m1"]
     );
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "shared", "channelId": "g/0"}})
+            serde_json::json!({"tag_search": {"tag": "shared", "channel_id": "g/0"}})
         )),
         ["m3"]
     );
@@ -466,7 +466,7 @@ fn slash_channel_ids_do_not_leak_across_tag_scopes() {
     assert_eq!(
         ids(&hits(
             &store,
-            serde_json::json!({"tagSearch": {"tag": "shared"}})
+            serde_json::json!({"tag_search": {"tag": "shared"}})
         )),
         ["m3", "m1"]
     );
@@ -591,8 +591,8 @@ async fn rebuild_reproduces_the_folded_tag_index() {
 
     // the catalog re-derives identically — per channel and aggregated.
     for req in [
-        serde_json::json!({"tags": {"channelId": "g"}}),
-        serde_json::json!({"tags": {"channelId": "q"}}),
+        serde_json::json!({"tags": {"channel_id": "g"}}),
+        serde_json::json!({"tags": {"channel_id": "q"}}),
         serde_json::json!({"tags": {}}),
     ] {
         assert_eq!(
@@ -602,7 +602,7 @@ async fn rebuild_reproduces_the_folded_tag_index() {
         );
     }
     assert_eq!(
-        tag_rows(&folded, serde_json::json!({"tags": {"channelId": "g"}})),
+        tag_rows(&folded, serde_json::json!({"tags": {"channel_id": "g"}})),
         vec![
             TagRow {
                 tag: "alpha".into(),
@@ -620,7 +620,7 @@ async fn rebuild_reproduces_the_folded_tag_index() {
     // the postings re-derive an exact hit set (rows differ only by `height`,
     // the rebuild's NAMED degradation — compare identity + tag sets).
     for tag in ["alpha", "beta", "gamma"] {
-        let req = serde_json::json!({"tagSearch": {"tag": tag}});
+        let req = serde_json::json!({"tag_search": {"tag": tag}});
         let a: Vec<_> = hits(&folded, req.clone())
             .into_iter()
             .map(|r| {
@@ -654,7 +654,7 @@ async fn rebuild_reproduces_the_folded_tag_index() {
     assert_eq!(
         ids(&hits(
             &folded,
-            serde_json::json!({"tagSearch": {"tag": "alpha"}})
+            serde_json::json!({"tag_search": {"tag": "alpha"}})
         )),
         ["m4", "m2", "m1"]
     );

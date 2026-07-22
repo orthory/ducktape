@@ -131,7 +131,6 @@ use crate::metrics::metrics;
 
 /// one finalized block, as reported to clients (http response + ws frame).
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BlockSummary {
     pub height: u64,
     pub app_hash: String,
@@ -143,7 +142,6 @@ pub struct BlockSummary {
 /// `GET /v1/files/blob/{op_hash}` serves them back: the hash is addressable,
 /// not just informational.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SubmitReceipt {
     pub height: u64,
     pub app_hash: String,
@@ -152,7 +150,6 @@ pub struct SubmitReceipt {
 
 /// one dispatch in a block's drain — the wire twin of `host::DispatchRecord`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct DispatchInfo {
     /// the module dispatched this step.
     pub module: String,
@@ -183,7 +180,6 @@ pub enum BlockDisposition {
 /// fans out over. a block now AGGREGATES the txs from its window, so it carries
 /// a vector of these in agreed (applied) order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RootOp {
     /// hex of this op's authenticated author origin (the frame's VERIFIED
     /// signer), or `"system"` / `"module:<id>"` for a non-external origin. on
@@ -212,7 +208,6 @@ pub struct RootOp {
 /// stored as the block's row in the index store's blocks database
 /// ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BlockRecord {
     pub height: u64,
     /// hex of the block's content address — the block's hash on this surface.
@@ -266,7 +261,6 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
 /// the status projection: daemon build version, global app-hash, and each
 /// registered module's root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct NodeStatus {
     pub version: String,
     pub app_hash: String,
@@ -345,7 +339,6 @@ impl NodePhase {
 /// `ducktape_*` metrics. Optional sections are absent when they do not apply to
 /// the selected role, rather than being filled with misleading zeroes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OperationalStatus {
     pub role: NodeRole,
     pub phase: NodePhase,
@@ -361,7 +354,6 @@ pub struct OperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ConsensusOperationalStatus {
     pub epoch: u64,
     pub view: u64,
@@ -374,7 +366,6 @@ pub struct ConsensusOperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SyncOperationalStatus {
     /// Source identity is useful in status and logs but intentionally not a
     /// metric label (peer identities are unbounded cardinality).
@@ -391,7 +382,6 @@ pub struct SyncOperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StorageOperationalStatus {
     pub checkpoint_height: u64,
     pub index_poisoned: bool,
@@ -399,14 +389,12 @@ pub struct StorageOperationalStatus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct IndexOperationalStatus {
     pub module: String,
     pub applied_height: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ModuleStatus {
     pub id: String,
     pub root: String,
@@ -442,7 +430,6 @@ impl ModuleCategory {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
@@ -458,7 +445,6 @@ pub struct SubmitRequest {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct QueryRequest {
     pub target: String,
     /// the module's `*Query` enum as a json value.
@@ -606,7 +592,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // managed checkouts under the injected root: create, commit (409 on a
         // structured conflict), delete. `None` root → 503.
         // ---- interactive terminal sessions (node-local, off-chain) ----
-        // create returns {sessionId, topic}; output rides the ws `term:<id>`
+        // create returns {session_id, topic}; output rides the ws `term:<id>`
         // topic. same trusted-local gate as the other mutating /v1 routes (see
         // term.rs). close is idempotent.
         .route("/v1/term/sessions", post(term::create_session))
@@ -922,7 +908,7 @@ mod tests {
     fn status_from_an_older_node_defaults_operational_state() {
         let status: NodeStatus = serde_json::from_value(serde_json::json!({
             "version": "0.1.0",
-            "appHash": "",
+            "app_hash": "",
             "height": 0,
             "modules": []
         }))
@@ -992,10 +978,10 @@ mod tests {
         assert_eq!(back.ops.len(), 2, "the block aggregated two member ops");
         assert_eq!(back.ops[0].proposer, "bb".repeat(32));
         assert_eq!(back.ops[1].op_hash, "ff".repeat(32));
-        // the wire keys stay camelCase — the app reads these fields verbatim.
+        // the wire keys are snake_case — clients read these fields verbatim.
         let json: serde_json::Value = serde_json::from_slice(&row).unwrap();
-        assert!(json.get("commitHash").is_some());
-        assert!(json["ops"][0].get("opHash").is_some());
+        assert!(json.get("commit_hash").is_some());
+        assert!(json["ops"][0].get("op_hash").is_some());
     }
 
     #[test]
