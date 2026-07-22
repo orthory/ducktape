@@ -23,7 +23,7 @@ pub use interface::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 
 /// per-secret ciphertext ceiling: a vault holds credentials, not blobs. keeps
@@ -136,9 +136,7 @@ impl Vaults {
     /// verify-then-adopt a peer snapshot; any error leaves every layer intact.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let decoded = decode_state(bytes)?;
-        if Self::root_of(&decoded) != expected {
-            return Err(Error::Module("snapshot root mismatch".into()));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&decoded), expected)?;
         self.vaults = decoded;
         self.pending.clear();
         Ok(())
@@ -155,8 +153,8 @@ impl Module for Vaults {
         Self::root_of(&self.vaults)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

@@ -46,7 +46,7 @@ use saga::{
     put_origin, take_origin,
 };
 use sdk::codec;
-use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
 /// the field separator inside composite dispatch keys and saga ids. rejected
@@ -844,11 +844,7 @@ impl DispatchModule {
     /// `expected` via the exact `root()` algorithm. all-or-nothing.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let committed = decode_committed(bytes)?;
-        if committed_root(&committed) != expected {
-            return Err(Error::Module(
-                "snapshot does not match expected root".into(),
-            ));
-        }
+        sdk::verify_snapshot_root(committed_root(&committed), expected)?;
         self.committed = committed;
         self.staged_recipes.clear();
         self.staged_dispatches.clear();
@@ -867,8 +863,8 @@ impl Module for DispatchModule {
         committed_root(&self.committed)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

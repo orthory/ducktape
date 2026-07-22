@@ -630,9 +630,7 @@ impl Automations {
     /// root) is byte-identical to before the call.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (rules, history) = decode_state(bytes)?;
-        if Self::root_of(&rules, &history) != expected {
-            return Err(Error::Module("snapshot root mismatch".into()));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&rules, &history), expected)?;
         self.rules = rules;
         self.history = history;
         self.pending_rules.clear();
@@ -945,8 +943,8 @@ impl Module for Automations {
     /// advertise the snapshot lane: [`Automations::snapshot`] is the exact
     /// preimage of `root()`, and [`Automations::install`] verifies before
     /// adopting — so a joiner can rebuild this module against the agreed root.
-    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, Error> {
-        Ok(sdk::StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

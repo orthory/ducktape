@@ -75,7 +75,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use sdk::codec::{Cursor, push_bytes, push_opt_str};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -441,12 +441,7 @@ impl Identity {
     /// before.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (accounts, clients) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&accounts, &clients);
-        if root != expected {
-            return Err(Error::Module(format!(
-                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
-            )));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&accounts, &clients), expected)?;
         self.node_index = Self::node_index_of(&accounts);
         self.member_index = Self::member_index_of(&accounts);
         self.accounts = accounts;
@@ -636,8 +631,8 @@ impl Module for Identity {
         Self::root_of(&self.accounts, &self.clients)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

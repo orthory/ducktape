@@ -50,7 +50,7 @@ pub use interface::*;
 use std::collections::BTreeMap;
 
 use sdk::codec::{Cursor, push_bytes};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 
 /// the minimum lead (in blocks) between the scheduling block and a pending
@@ -765,9 +765,7 @@ impl Lifecycle {
     /// mismatch — committed state and stage untouched on any error.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let decoded = decode_state(bytes)?;
-        if Self::root_of(&decoded) != expected {
-            return Err(Error::Module("snapshot root mismatch".into()));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&decoded), expected)?;
         self.committed = decoded;
         self.staged = None;
         Ok(())
@@ -784,8 +782,8 @@ impl Module for Lifecycle {
         Self::root_of(&self.committed)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

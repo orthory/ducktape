@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use sdk::codec;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
 
 /// a 32-byte ed25519 public key encoding.
@@ -184,12 +184,7 @@ impl Valset {
     /// replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (validators, residents) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&validators, &residents);
-        if root != expected {
-            return Err(Error::Module(format!(
-                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
-            )));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&validators, &residents), expected)?;
         self.validators = validators;
         self.residents = residents;
         self.pending.clear();
@@ -274,8 +269,8 @@ impl Module for Valset {
         Self::root_of(&self.validators, &self.residents)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

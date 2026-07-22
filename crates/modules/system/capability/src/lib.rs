@@ -67,7 +67,7 @@ pub use interface::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sdk::codec;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
@@ -280,12 +280,7 @@ impl CapabilityRegistry {
     /// state being replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (announced, class_claims) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&announced, &class_claims);
-        if root != expected {
-            return Err(Error::Module(format!(
-                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
-            )));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&announced, &class_claims), expected)?;
         self.announced = announced;
         self.class_claims = class_claims;
         self.pending.clear();
@@ -427,8 +422,8 @@ impl Module for CapabilityRegistry {
         Self::root_of(&self.announced, &self.class_claims)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
