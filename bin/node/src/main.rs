@@ -57,7 +57,6 @@ mod code_plane;
 mod term_plane;
 mod cli;
 mod cli_args;
-mod cli_flags;
 mod config;
 mod constants;
 mod drain_actions;
@@ -161,15 +160,6 @@ fn hold_macos_activity() {
     std::mem::forget(token);
 }
 
-/// `ducktape version` — the binary name, its crate version, and the highest
-/// protocol version this binary can execute.
-fn version_line() -> String {
-    format!(
-        "ducktape {} (protocol v{MAX_PROTOCOL_VERSION})",
-        env!("CARGO_PKG_VERSION")
-    )
-}
-
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
 // `FATAL:` wrapper in `main` stays for runtime death.
 #[derive(clap::Parser)]
@@ -186,9 +176,8 @@ pub(crate) struct Cli {
     family: Family,
 }
 
-/// the command families. `user`/`gateway`/`fs` keep their own hand-rolled
-/// grammars (including `--help`) — clap passes their argv through untouched;
-/// migrating them onto typed args is follow-up work, not a blocker here.
+/// the command families — every one a typed clap tree (the hand-rolled
+/// parsers are gone; each family's grammar lives beside its handlers).
 // parsed once on the stack and immediately consumed — variant size is noise.
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
@@ -196,29 +185,17 @@ enum Family {
     /// run a workspace node, plus operator verbs (init, invite, join, ...)
     #[command(subcommand)]
     Node(cli_args::NodeCmd),
-    /// user-identity keys and signing (own verbs: `ducktape user help`)
-    #[command(disable_help_flag = true)]
-    User {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// local loopback bindings for signed gateway routes (`ducktape gateway help`)
-    #[command(disable_help_flag = true)]
-    Gateway {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// the duckfs working-copy CLI (`ducktape fs help`)
-    #[command(disable_help_flag = true)]
-    Fs {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
+    /// user-identity keys and signing (init/restore, sign-*, redeem-invite, ...)
+    #[command(subcommand)]
+    User(userkey_cli::UserCmd),
+    /// local loopback bindings for signed gateway routes
+    #[command(subcommand)]
+    Gateway(gateway_routes::GatewayCmd),
+    /// the duckfs working-copy CLI
+    #[command(subcommand)]
+    Fs(fs_cli::FsCmd),
     /// the stdio MCP server an agent runner spawns
     Mcp,
-    /// print version (same as --version)
-    #[command(hide = true)]
-    Version,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -227,8 +204,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
         // flushing the stream `cat` wrote to); `mcp` is the stdio server the
         // agent runner spawns and holds until its stdin closes.
-        Family::Fs { args } => {
-            let code = fs_cli::run(&args);
+        Family::Fs(cmd) => {
+            let code = fs_cli::run(cmd);
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
             std::process::exit(code.into());
@@ -237,14 +214,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp::serve();
             Ok(())
         }
-        Family::User { args } => userkey_cli::run(&args),
-        Family::Gateway { args } => gateway_routes::run(&args),
+        Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
-        Family::Version => {
-            println!("{}", version_line());
-            Ok(())
-        }
     }
 }
 

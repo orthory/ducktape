@@ -254,16 +254,6 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the admission credential itself, kept off the wire by the sealed
     // first-contact intro; a client invite redeems over `user-redeem-invite`.
     let role = config::InviteRole::from(args.role);
-    // reject a stale `--target` loudly rather than silently ignoring it: the
-    // habit meant something in v1 and must not appear to still work.
-    if args.target.is_some() {
-        return Err(
-            "--target was removed: every invite is now bearer (무기명) — single-use, and \
-             (for a resident invite) sealed to the receiving member at first contact. \
-             drop --target and hand the blob to the invitee directly."
-                .into(),
-        );
-    }
     let ttl_days: u64 = match args.ttl_days {
         Some(v) => v,
         // a client invite defaults to a tight window; a resident invite keeps
@@ -1574,17 +1564,13 @@ mod tests {
         (bash, zsh)
     }
 
-    /// the drift guard: every node verb token and every non-hidden long flag
-    /// in the CLAP TREE (the grammar itself, not a parallel table) must appear
-    /// in BOTH completion files, and every family name too. renaming a verb or
+    /// the drift guard: every verb token and every non-hidden long flag in the
+    /// CLAP TREE (the grammar itself, not a parallel table) — across EVERY
+    /// family — must appear in BOTH completion files. renaming a verb or
     /// adding a flag without updating the hand-written completions fails here.
     #[test]
     fn completion_files_cover_the_verb_table() {
         let (bash, zsh) = completions();
-        for family in ["node", "user", "gateway", "fs", "mcp"] {
-            assert!(bash.contains(family), "ducktape.bash missing family {family:?}");
-            assert!(zsh.contains(family), "ducktape.zsh missing family {family:?}");
-        }
         fn walk(cmd: &clap::Command, bash: &str, zsh: &str) {
             for sub in cmd.get_subcommands() {
                 if sub.is_hide_set() {
@@ -1611,9 +1597,7 @@ mod tests {
                 walk(sub, bash, zsh);
             }
         }
-        let cmd = <crate::Cli as clap::CommandFactory>::command();
-        let node = cmd.find_subcommand("node").expect("node family exists");
-        walk(node, &bash, &zsh);
+        walk(&<crate::Cli as clap::CommandFactory>::command(), &bash, &zsh);
     }
 
     /// the grammar's own consistency check (conflicting ids, broken flatten,
