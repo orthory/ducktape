@@ -47,8 +47,10 @@ mod tests {
             "message_edit_draft",
             "reply_draft",
             "page_draft",
+            "subpage_draft",
             "active_page_title",
-            "paragraph_draft",
+            "block_draft",
+            "block_edit_draft",
         ];
         let overwrites_editable = refresh.lines().any(|line| {
             editable
@@ -94,6 +96,7 @@ mod tests {
                 blocks: Vec::new(),
                 active_page: String::new(),
                 active_page_title: String::new(),
+                active_page_parent: String::new(),
             },
         ));
         assert_eq!(app.status, "Live");
@@ -177,6 +180,29 @@ mod tests {
         }));
         assert_eq!(app.reply_draft, "retry reply");
         assert!(app.thread_messages.is_empty());
+        assert_eq!(app.mutation_phase, "idle");
+    }
+
+    #[test]
+    fn failed_block_insert_rolls_back_and_restores_the_draft() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_page = "welcome".into();
+        app.new_block_kind = "Heading 2".into();
+        app.block_draft = "retry heading".into();
+
+        let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
+        assert_eq!(app.mutation_phase, "block");
+        assert!(app.block_draft.is_empty());
+        assert_eq!(app.blocks[0].kind, "Heading 2");
+        assert!(app.blocks[0].pending);
+
+        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+            message: "rejected".into(),
+        }));
+        assert_eq!(app.block_draft, "retry heading");
+        assert!(app.blocks.is_empty());
         assert_eq!(app.mutation_phase, "idle");
     }
 }

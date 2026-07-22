@@ -1,4 +1,5 @@
 font ui family=sans weight=normal stretch=normal style=normal default=true
+font mono family="monospace" weight=normal stretch=normal style=normal
 
 app Ducktape
   title "Ducktape"
@@ -25,10 +26,10 @@ extern crate::backend
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, reactions:[ChatReaction])
   ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str)
   ThreadData(root_seq:i64, messages:[ChatMessage])
-  PageItem(id:str, title:str)
-  PageBlock(id:str, kind:str, text:str, pending:bool)
-  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str)
+  PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
+  PageBlock(id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64)
+  PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   LiveUpdate(kind:str, status:str, height:i64)
   AppError(message:str)
   HydrationError(generation:i64, message:str)
@@ -38,7 +39,7 @@ extern crate::backend
   retry_refresh(rpc:str, channel_id:str, page_id:str, generation:i64, attempt:i64) -> WorkspaceData ! HydrationError
   sync optimistic_message(messages:[ChatMessage], body:str) -> [ChatMessage]
   sync rollback_messages(messages:[ChatMessage]) -> [ChatMessage]
-  sync optimistic_paragraph(blocks:[PageBlock], text:str) -> [PageBlock]
+  sync optimistic_block(blocks:[PageBlock], kind:str, text:str) -> [PageBlock]
   sync rollback_blocks(blocks:[PageBlock]) -> [PageBlock]
   sync restore_draft(current:str, pending:str) -> str
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
@@ -51,8 +52,15 @@ extern crate::backend
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
+  create_child_page(rpc:str, password:str, parent:str, title:str) -> PagesData ! AppError
   rename_page(rpc:str, password:str, page_id:str, title:str) -> PagesData ! AppError
-  add_paragraph(rpc:str, password:str, page_id:str, text:str) -> PagesData ! AppError
+  move_page_top(rpc:str, password:str, page_id:str) -> PagesData ! AppError
+  delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
+  add_block(rpc:str, password:str, page_id:str, after_id:str, kind:str, text:str) -> PagesData ! AppError
+  save_block(rpc:str, password:str, page_id:str, block_id:str, kind:str, text:str) -> PagesData ! AppError
+  set_block_checked(rpc:str, password:str, page_id:str, block_id:str, checked:bool) -> PagesData ! AppError
+  move_block(rpc:str, password:str, page_id:str, block_id:str, direction:str) -> PagesData ! AppError
+  remove_block(rpc:str, password:str, page_id:str, block_id:str) -> PagesData ! AppError
 
 theme
   background #d8d8d880
@@ -107,10 +115,21 @@ state
   blocks:[PageBlock] = []
   active_page = ""
   active_page_title = ""
+  active_page_parent = ""
   page_draft = ""
   pending_page = ""
-  paragraph_draft = ""
-  pending_paragraph = ""
+  subpage_draft = ""
+  pending_subpage = ""
+  block_kinds = ["Text", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
+  new_block_kind = "Text"
+  block_draft = ""
+  pending_block = ""
+  selected_block_id = ""
+  selected_block_kind = ""
+  selected_block_checked = false
+  block_edit_draft = ""
+  page_delete_armed = false
+  block_delete_armed = false
 
 component Brand()
   row width=fill spacing=9.0 align=center
@@ -156,14 +175,20 @@ component PageButton(page:PageItem, selected:bool)
       button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
         row width=fill spacing=9.0 align=center
           text "□" width=18.0 size=13.0 align-x=center @text-foreground
+          text page.prefix size=11.0 wrapping=none @text-muted
           text page.title width=fill size=12.0 wrapping=none @text-foreground font-bold
+          if page.child_count > 0
+            text page.child_count size=10.0 @text-muted
         active background=linear(2.3, white/78@0.0, surface/58@1.0) text=foreground border=white/78 border-width=1.0 radius=10.0 shadow=black/8 shadow-y=1.0 shadow-blur=6.0
         pressed background=selection
     if !selected
       button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
         row width=fill spacing=9.0 align=center
           text "□" width=18.0 size=13.0 align-x=center @text-muted
+          text page.prefix size=11.0 wrapping=none @text-muted
           text page.title width=fill size=12.0 wrapping=none @text-muted
+          if page.child_count > 0
+            text page.child_count size=10.0 @text-muted
         active background=transparent text=muted radius=10.0
         hovered background=white/34 text=foreground
         pressed background=selection text=foreground
@@ -213,13 +238,69 @@ component ThreadMessageCard(message:ChatMessage)
         text message.meta size=10.0 @text-muted
       text message.body width=fill size=12.0 wrapping=word @text-foreground
 
-component BlockCard(block:PageBlock)
-  container width=fill padding=8.0 background=transparent radius=6.0
-    col width=fill spacing=3.0
-      row width=fill align=center
-        text block.kind width=fill size=11.0 @font-bold text-muted
-        text block.id size=11.0 wrapping=none @text-muted
-      text block.text width=fill size=14.0 wrapping=word @text-foreground
+component BlockContents(block:PageBlock)
+  row width=fill spacing=7.0 align=start
+    text block.prefix size=11.0 wrapping=none @text-muted
+    match block.kind
+      "Bullet"
+        text "•" width=16.0 size=13.0 align-x=center @text-muted
+      "Number"
+        text "1." width=16.0 size=11.0 align-x=center @text-muted
+      "Todo"
+        if block.checked
+          text "✓" width=16.0 size=11.0 align-x=center @font-bold text-foreground
+        if !block.checked
+          text "○" width=16.0 size=12.0 align-x=center @text-muted
+      "Toggle"
+        text "›" width=16.0 size=15.0 align-x=center @text-muted
+      "Quote"
+        text "│" width=16.0 size=15.0 align-x=center @text-muted
+      "Code"
+        text "{}" width=16.0 size=10.0 align-x=center font=mono @text-muted
+      "Callout"
+        text "!" width=16.0 size=10.0 align-x=center @font-bold text-muted
+      _
+        space width=0.0
+    col width=fill spacing=2.0
+      match block.kind
+        "Heading 1"
+          text block.text width=fill size=20.0 wrapping=word @font-bold text-foreground
+        "Heading 2"
+          text block.text width=fill size=17.0 wrapping=word @font-bold text-foreground
+        "Heading 3"
+          text block.text width=fill size=15.0 wrapping=word @font-bold text-foreground
+        "Code"
+          container width=fill padding=7.0 background=foreground/7 border=white/48 border-width=1.0 radius=7.0
+            text block.text width=fill size=11.0 wrapping=word font=mono @text-foreground
+        "Divider"
+          container width=fill height=1.0 background=separator
+            text ""
+        _
+          text block.text width=fill size=13.0 wrapping=word @text-foreground
+      if block.child_count > 0 || block.mark_count > 0
+        row width=fill spacing=7.0 align=center
+          if block.child_count > 0
+            text block.child_count size=10.0 @text-muted
+          if block.mark_count > 0
+            text "Formatted" size=10.0 @text-muted
+
+component BlockCard(block:PageBlock, selected:bool)
+  col width=fill
+    if block.pending
+      container width=fill padding=8.0 background=white/24 border=transparent border-width=1.0 radius=9.0
+        BlockContents block=block
+    if !block.pending && selected
+      button label=block.kind width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
+        BlockContents block=block
+        active background=linear(2.3, white/68@0.0, surface/48@1.0) text=foreground border=white/70 border-width=1.0 radius=9.0
+        hovered background=white/72 text=foreground
+        pressed background=selection text=foreground
+    if !block.pending && !selected
+      button label=block.kind width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
+        BlockContents block=block
+        active background=transparent text=foreground border=transparent border-width=1.0 radius=9.0
+        hovered background=white/30 text=foreground border=white/38
+        pressed background=selection text=foreground
 
 component EmptyState(title:str, detail:str)
   container width=fill height=fill align-x=center align-y=center
@@ -336,6 +417,7 @@ on workspace_connected(next)
   blocks = next.blocks
   active_page = next.active_page
   active_page_title = next.active_page_title
+  active_page_parent = next.active_page_parent
   connected = true
   loading = false
   mutation_phase = "idle"
@@ -357,6 +439,7 @@ on workspace_refreshed(next)
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
+  active_page_parent = next.active_page_parent
   error = ""
   return if !live_dirty
   live_dirty = false
@@ -552,6 +635,12 @@ on choose_page(id)
   hydration_retry_attempt = 0
   sync_phase = "idle"
   loading = true
+  selected_block_id = ""
+  selected_block_kind = ""
+  selected_block_checked = false
+  block_edit_draft = ""
+  page_delete_armed = false
+  block_delete_armed = false
   error = ""
   run load_page(connected_rpc, id) -> pages_updated _ | failed _
 
@@ -566,6 +655,17 @@ on create_page_submit
   error = ""
   run create_page(connected_rpc, password, pending_page) -> pages_mutated _ | mutation_failed _
 
+on create_child_page_submit
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(trim(subpage_draft))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "subpage"
+  pending_subpage = trim(subpage_draft)
+  subpage_draft = ""
+  error = ""
+  run create_child_page(connected_rpc, password, active_page, pending_subpage) -> pages_mutated _ | mutation_failed _
+
 on rename_page_submit
   return if loading || mutation_phase != "idle" || empty(active_page) || empty(trim(active_page_title))
   hydration_generation = hydration_generation + 1
@@ -575,23 +675,109 @@ on rename_page_submit
   error = ""
   run rename_page(connected_rpc, password, active_page, trim(active_page_title)) -> pages_mutated _ | mutation_failed _
 
-on add_paragraph_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(trim(paragraph_draft))
+on move_page_top_submit
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(active_page_parent)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
-  mutation_phase = "paragraph"
-  pending_paragraph = trim(paragraph_draft)
-  paragraph_draft = ""
-  blocks = optimistic_paragraph(blocks, pending_paragraph)
+  mutation_phase = "page-parent"
   error = ""
-  run add_paragraph(connected_rpc, password, active_page, pending_paragraph) -> pages_mutated _ | mutation_failed _
+  run move_page_top(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
+
+on arm_page_delete
+  return if loading || mutation_phase != "idle" || empty(active_page)
+  page_delete_armed = true
+
+on delete_page_submit
+  return if loading || mutation_phase != "idle" || empty(active_page) || !page_delete_armed
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "page-delete"
+  page_delete_armed = false
+  error = ""
+  run delete_page(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
+
+on new_block_kind_changed(next)
+  new_block_kind = next
+
+on add_block_submit
+  return if loading || mutation_phase != "idle" || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block"
+  pending_block = trim(block_draft)
+  block_draft = ""
+  blocks = optimistic_block(blocks, new_block_kind, pending_block)
+  error = ""
+  run add_block(connected_rpc, password, active_page, selected_block_id, new_block_kind, pending_block) -> pages_mutated _ | mutation_failed _
+
+on select_block(id, kind, text, checked)
+  return if mutation_phase != "idle"
+  selected_block_id = id
+  selected_block_kind = kind
+  selected_block_checked = checked
+  block_edit_draft = text
+  block_delete_armed = false
+
+on selected_block_kind_changed(next)
+  selected_block_kind = next
+
+on clear_block_selection
+  selected_block_id = ""
+  selected_block_kind = ""
+  selected_block_checked = false
+  block_edit_draft = ""
+  block_delete_armed = false
+
+on save_block_submit
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || (selected_block_kind != "Divider" && empty(trim(block_edit_draft)))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block-save"
+  error = ""
+  run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, trim(block_edit_draft)) -> pages_mutated _ | mutation_failed _
+
+on toggle_block_checked
+  return if loading || mutation_phase != "idle" || selected_block_kind != "Todo" || empty(selected_block_id)
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block-check"
+  error = ""
+  run set_block_checked(connected_rpc, password, active_page, selected_block_id, !selected_block_checked) -> pages_mutated _ | mutation_failed _
+
+on move_block_submit(direction)
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id)
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block-move"
+  error = ""
+  run move_block(connected_rpc, password, active_page, selected_block_id, direction) -> pages_mutated _ | mutation_failed _
+
+on arm_block_delete
+  return if loading || mutation_phase != "idle" || empty(selected_block_id)
+  block_delete_armed = true
+
+on remove_block_submit
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || !block_delete_armed
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block-delete"
+  block_delete_armed = false
+  error = ""
+  run remove_block(connected_rpc, password, active_page, selected_block_id) -> pages_mutated _ | mutation_failed _
 
 on pages_updated(next)
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
   active_page_title = next.active_page_title
+  active_page_parent = next.active_page_parent
   loading = false
   error = ""
   return if !live_dirty
@@ -605,8 +791,16 @@ on pages_mutated(next)
   blocks = next.blocks
   active_page = next.active_page
   active_page_title = next.active_page_title
+  active_page_parent = next.active_page_parent
   pending_page = ""
-  pending_paragraph = ""
+  pending_subpage = ""
+  pending_block = ""
+  selected_block_id = ""
+  selected_block_kind = ""
+  selected_block_checked = false
+  block_edit_draft = ""
+  page_delete_armed = false
+  block_delete_armed = false
   mutation_phase = "idle"
   error = ""
   return if !live_dirty
@@ -620,7 +814,8 @@ on mutation_failed(cause)
   channel_draft = restore_draft(channel_draft, pending_channel)
   message_draft = restore_draft(message_draft, pending_message)
   page_draft = restore_draft(page_draft, pending_page)
-  paragraph_draft = restore_draft(paragraph_draft, pending_paragraph)
+  subpage_draft = restore_draft(subpage_draft, pending_subpage)
+  block_draft = restore_draft(block_draft, pending_block)
   reply_draft = restore_draft(reply_draft, pending_reply)
   messages = rollback_messages(messages)
   thread_messages = rollback_messages(thread_messages)
@@ -628,7 +823,8 @@ on mutation_failed(cause)
   pending_channel = ""
   pending_message = ""
   pending_page = ""
-  pending_paragraph = ""
+  pending_subpage = ""
+  pending_block = ""
   pending_reply = ""
   error = cause.message
   return if !live_dirty
@@ -825,27 +1021,114 @@ view
                   hovered background=white/24
                   focused background=white/42 border=white/68 border-width=1.0
                   disabled value=muted
-              button "Save" label="Save title" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(active_page_title))) height=34.0 padding=7.0 -> rename_page_submit
+                button "Save" label="Save title" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(active_page_title))) height=34.0 padding=7.0 -> rename_page_submit
                   active background=white/58 text=foreground border=white/76 border-width=1.0 radius=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=7.0
                   hovered background=white/78
                   pressed background=selection
                   disabled background=white/22 text=muted
+              container width=fill padding=6.0 background=white/28 border=white/52 border-width=1.0 radius=11.0
+                row width=fill spacing=6.0 align=center
+                  input "" #subpage label="New subpage title" <-> subpage_draft hint="New subpage" disabled=(loading || !connected) submit=create_child_page_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
+                    active background=transparent border=transparent value=foreground placeholder=muted selection=foreground/18 border-width=0.0 radius=8.0
+                    focused background=white/42 border=white/64 border-width=1.0
+                    disabled value=muted
+                  button "Add subpage" disabled=(mutation_phase != "idle" || empty(trim(subpage_draft))) height=28.0 padding=6.0 -> create_child_page_submit
+                    active background=white/48 text=foreground border=white/62 border-width=1.0 radius=8.0
+                    hovered background=white/70
+                    pressed background=selection
+                    disabled background=white/20 text=muted
+                  if !empty(active_page_parent)
+                    button "Move top" disabled=(mutation_phase != "idle") height=28.0 padding=6.0 -> move_page_top_submit
+                      active background=white/48 text=foreground border=white/62 border-width=1.0 radius=8.0
+                      hovered background=white/70
+                      pressed background=selection
+                      disabled background=white/20 text=muted
+                  if !page_delete_armed
+                    button "Delete" disabled=(mutation_phase != "idle") height=28.0 padding=6.0 -> arm_page_delete
+                      active background=transparent text=muted border=white/48 border-width=1.0 radius=8.0
+                      hovered background=white/58 text=foreground
+                      pressed background=selection
+                  if page_delete_armed
+                    button "Confirm delete" disabled=(mutation_phase != "idle") height=28.0 padding=6.0 -> delete_page_submit
+                      active background=foreground/86 text=white border=white/24 border-width=1.0 radius=8.0
+                      hovered background=foreground/76
+                      pressed background=foreground
               container width=fill height=1.0 background=separator
                 text ""
               if empty(blocks)
-                EmptyState title="An empty page" detail="Add the first paragraph below."
+                EmptyState title="An empty page" detail="Add the first block below."
               if !empty(blocks)
                 scroll direction=vertical width=fill height=fill bar=hidden
                   col width=fill spacing=1.0
                     for block in blocks
-                      BlockCard block=block
+                      BlockCard block=block selected=(block.id == selected_block_id)
+              if !empty(selected_block_id)
+                container width=fill padding=7.0 background=linear(2.3, white/58@0.0, surface/38@1.0) border=white/62 border-width=1.0 radius=12.0
+                  col width=fill spacing=6.0
+                    row width=fill spacing=5.0 align=center
+                      pick block_kinds some(selected_block_kind) placeholder="Block type" width=124.0 menu-height=210.0 padding=6.0 text-size=11.0 line-height=1.2 -> selected_block_kind_changed _
+                        active text=foreground placeholder=muted handle=muted background=white/42 border=white/58 border-width=1.0 radius=8.0
+                        hovered text=foreground placeholder=muted handle=foreground background=white/58 border=white/72 border-width=1.0 radius=8.0
+                        opened text=foreground placeholder=muted handle=foreground background=white/66 border=white/76 border-width=1.0 radius=8.0
+                        menu text=foreground selected-text=foreground selected-background=white/78 background=surface border=white/72 border-width=1.0 radius=8.0 shadow=black/16 shadow-y=3.0 shadow-blur=10.0
+                      button "↑" label="Move block up" disabled=(mutation_phase != "idle") width=28.0 height=27.0 padding=5.0 -> move_block_submit("up")
+                        active background=white/44 text=foreground border=white/58 border-width=1.0 radius=8.0
+                        hovered background=white/68
+                        pressed background=selection
+                      button "↓" label="Move block down" disabled=(mutation_phase != "idle") width=28.0 height=27.0 padding=5.0 -> move_block_submit("down")
+                        active background=white/44 text=foreground border=white/58 border-width=1.0 radius=8.0
+                        hovered background=white/68
+                        pressed background=selection
+                      button "→" label="Indent block" disabled=(mutation_phase != "idle") width=28.0 height=27.0 padding=5.0 -> move_block_submit("indent")
+                        active background=white/44 text=foreground border=white/58 border-width=1.0 radius=8.0
+                        hovered background=white/68
+                        pressed background=selection
+                      button "←" label="Outdent block" disabled=(mutation_phase != "idle") width=28.0 height=27.0 padding=5.0 -> move_block_submit("outdent")
+                        active background=white/44 text=foreground border=white/58 border-width=1.0 radius=8.0
+                        hovered background=white/68
+                        pressed background=selection
+                      if selected_block_kind == "Todo"
+                        button "Check" disabled=(mutation_phase != "idle") height=27.0 padding=5.0 -> toggle_block_checked
+                          active background=white/44 text=foreground border=white/58 border-width=1.0 radius=8.0
+                          hovered background=white/68
+                          pressed background=selection
+                      space width=fill
+                      if !block_delete_armed
+                        button "Delete" disabled=(mutation_phase != "idle") height=27.0 padding=5.0 -> arm_block_delete
+                          active background=transparent text=muted border=white/46 border-width=1.0 radius=8.0
+                          hovered background=white/58 text=foreground
+                          pressed background=selection
+                      if block_delete_armed
+                        button "Confirm" disabled=(mutation_phase != "idle") height=27.0 padding=5.0 -> remove_block_submit
+                          active background=foreground/86 text=white border=white/24 border-width=1.0 radius=8.0
+                          hovered background=foreground/76
+                          pressed background=foreground
+                      button "×" label="Close block editor" disabled=(mutation_phase != "idle") width=27.0 height=27.0 padding=5.0 -> clear_block_selection
+                        active background=transparent text=muted radius=8.0
+                        hovered background=white/56 text=foreground
+                        pressed background=selection
+                    row width=fill spacing=6.0 align=center
+                      input "" #block-edit label="Edit block" <-> block_edit_draft hint="Block text" disabled=(mutation_phase != "idle" || selected_block_kind == "Divider") submit=save_block_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
+                        active background=white/38 border=white/55 value=foreground placeholder=muted selection=foreground/18 border-width=1.0 radius=8.0
+                        focused background=white/62 border=foreground/42
+                        disabled background=white/20 value=muted
+                      button "Save" disabled=(mutation_phase != "idle" || (selected_block_kind != "Divider" && empty(trim(block_edit_draft)))) height=28.0 padding=6.0 -> save_block_submit
+                        active background=foreground/88 text=white border=white/26 border-width=1.0 radius=9.0
+                        hovered background=foreground/78
+                        pressed background=foreground
+                        disabled background=foreground/24 text=white/58
               container width=fill padding=6.0 background=linear(2.3, white/64@0.0, surface/42@1.0) border=white/72 border-width=1.0 radius=14.0 shadow=black/10 shadow-y=2.0 shadow-blur=12.0
-                flex width=fill gap=6.0 align-items=center
-                  input "" #paragraph label="New paragraph" <-> paragraph_draft hint="Add a paragraph…" disabled=(loading || !connected) submit=add_paragraph_submit width=fill padding=7.0 text-size=12.0 line-height=1.2
+                row width=fill spacing=6.0 align=center
+                  pick block_kinds some(new_block_kind) placeholder="Block type" width=124.0 menu-height=210.0 padding=7.0 text-size=11.0 line-height=1.2 -> new_block_kind_changed _
+                    active text=foreground placeholder=muted handle=muted background=transparent border=transparent border-width=0.0 radius=8.0
+                    hovered text=foreground placeholder=muted handle=foreground background=white/38 border=white/55 border-width=1.0 radius=8.0
+                    opened text=foreground placeholder=muted handle=foreground background=white/52 border=white/68 border-width=1.0 radius=8.0
+                    menu text=foreground selected-text=foreground selected-background=white/78 background=surface border=white/72 border-width=1.0 radius=8.0 shadow=black/16 shadow-y=3.0 shadow-blur=10.0
+                  input "" #block label="New block" <-> block_draft hint="Add a block…" disabled=(loading || !connected || new_block_kind == "Divider") submit=add_block_submit width=fill padding=7.0 text-size=12.0 line-height=1.2
                     active background=transparent border=transparent value=foreground placeholder=muted selection=foreground/18 border-width=0.0 radius=9.0
                     focused background=white/38 border=white/66 border-width=1.0
-                    disabled value=muted
-                  button "Add" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(paragraph_draft))) height=30.0 padding=7.0 -> add_paragraph_submit
+                    disabled background=white/16 value=muted
+                  button "Add" disabled=(loading || mutation_phase != "idle" || !connected || (new_block_kind != "Divider" && empty(trim(block_draft)))) height=30.0 padding=7.0 -> add_block_submit
                     active background=foreground/90 text=white border=white/28 border-width=1.0 radius=10.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
                     hovered background=foreground/80 text=white
                     pressed background=foreground text=white

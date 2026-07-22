@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -71,14 +71,22 @@ pub struct ThreadData {
 pub struct PageItem {
     pub id: String,
     pub title: String,
+    pub parent: String,
+    pub prefix: String,
+    pub child_count: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageBlock {
     pub id: String,
+    pub parent: String,
     pub kind: String,
     pub text: String,
     pub pending: bool,
+    pub checked: bool,
+    pub prefix: String,
+    pub child_count: i64,
+    pub mark_count: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -87,6 +95,7 @@ pub struct PagesData {
     pub blocks: Vec<PageBlock>,
     pub active_page: String,
     pub active_page_title: String,
+    pub active_page_parent: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -103,6 +112,7 @@ pub struct WorkspaceData {
     pub blocks: Vec<PageBlock>,
     pub active_page: String,
     pub active_page_title: String,
+    pub active_page_parent: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -146,12 +156,17 @@ pub fn rollback_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     messages
 }
 
-pub fn optimistic_paragraph(mut blocks: Vec<PageBlock>, text: String) -> Vec<PageBlock> {
+pub fn optimistic_block(mut blocks: Vec<PageBlock>, kind: String, text: String) -> Vec<PageBlock> {
     blocks.push(PageBlock {
         id: "pending".into(),
-        kind: "Text · Saving…".into(),
+        parent: String::new(),
+        kind,
         text,
         pending: true,
+        checked: false,
+        prefix: String::new(),
+        child_count: 0,
+        mark_count: 0,
     });
     blocks
 }
@@ -534,6 +549,36 @@ pub async fn create_page(
     .map_err(app_error)
 }
 
+pub async fn create_child_page(
+    rpc: String,
+    password: String,
+    parent: String,
+    title: String,
+) -> Result<PagesData, AppError> {
+    async {
+        if parent.is_empty() {
+            return Err("choose a parent page first".to_string());
+        }
+        let title = bounded_text(title, "page title", 512)?;
+        let page_id = fresh_id("page");
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::CreatePage {
+                page_id: page_id.clone(),
+                title,
+                parent: Some(parent),
+            }),
+            password,
+        )
+        .await?;
+        load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
 pub async fn rename_page(
     rpc: String,
     password: String,
@@ -563,47 +608,215 @@ pub async fn rename_page(
     .map_err(app_error)
 }
 
-pub async fn add_paragraph(
+pub async fn move_page_top(
     rpc: String,
     password: String,
     page_id: String,
+) -> Result<PagesData, AppError> {
+    async {
+        if page_id.is_empty() {
+            return Err("choose a page first".to_string());
+        }
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::SetPageParent {
+                page_id: page_id.clone(),
+                parent: None,
+            }),
+            password,
+        )
+        .await?;
+        load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn delete_page(
+    rpc: String,
+    password: String,
+    page_id: String,
+) -> Result<PagesData, AppError> {
+    async {
+        if page_id.is_empty() {
+            return Err("choose a page first".to_string());
+        }
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::DeletePage {
+                page_id: page_id.clone(),
+            }),
+            password,
+        )
+        .await?;
+        load_pages_data(&rpc, None).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn add_block(
+    rpc: String,
+    password: String,
+    page_id: String,
+    after_id: String,
+    kind: String,
     text: String,
 ) -> Result<PagesData, AppError> {
     async {
         if page_id.is_empty() {
             return Err("choose a page first".to_string());
         }
-        let text = bounded_text(text, "paragraph", 64 * 1024)?;
+        let kind = parse_block_kind(&kind)?;
+        let text = bounded_block_text(kind, text)?;
         let rpc = rpc_client(&rpc)?;
-        let reply: PageReply = rpc
-            .query(
-                "pages",
-                &PageQuery::GetPage {
-                    page_id: page_id.clone(),
-                },
-            )
-            .await?;
-        let blocks = match reply {
-            PageReply::Page(Some(blocks)) => blocks,
-            _ => return Err("page was not found".into()),
-        };
+        let blocks = load_page_blocks(&rpc, &page_id).await?;
         let root = blocks
             .first()
             .filter(|block| block.kind == BlockKind::Page)
             .ok_or_else(|| "page has no root block".to_string())?;
+        let selected = blocks.iter().find(|block| block.id == after_id);
+        let parent = selected
+            .and_then(|block| block.parent.clone())
+            .unwrap_or_else(|| page_id.clone());
+        let after = selected
+            .map(|block| block.id.clone())
+            .or_else(|| root.children.last().cloned());
         signed_write(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::InsertBlock {
-                parent: page_id.clone(),
-                after: root.children.last().cloned(),
+                parent,
+                after,
                 block: NewBlock {
                     id: fresh_id("block"),
-                    kind: BlockKind::Paragraph,
+                    kind,
                     text,
                     marks: Vec::new(),
                 },
             }),
+            password,
+        )
+        .await?;
+        load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn save_block(
+    rpc: String,
+    password: String,
+    page_id: String,
+    block_id: String,
+    kind: String,
+    text: String,
+) -> Result<PagesData, AppError> {
+    async {
+        let kind = parse_block_kind(&kind)?;
+        let text = bounded_block_text(kind, text)?;
+        let rpc = rpc_client(&rpc)?;
+        let blocks = load_page_blocks(&rpc, &page_id).await?;
+        let block = blocks
+            .iter()
+            .find(|block| block.id == block_id && block.kind != BlockKind::Page)
+            .ok_or_else(|| "block was not found".to_string())?;
+        let text_changed = block.text != text;
+        let kind_changed = block.kind != kind;
+        if text_changed {
+            signed_write(
+                &rpc,
+                "pages",
+                pages::encode_msg(&PageMsg::UpdateText {
+                    block_id: block_id.clone(),
+                    text,
+                    marks: None,
+                }),
+                password.clone(),
+            )
+            .await?;
+        }
+        if kind_changed {
+            signed_write(
+                &rpc,
+                "pages",
+                pages::encode_msg(&PageMsg::SetKind { block_id, kind }),
+                password,
+            )
+            .await?;
+        }
+        load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn set_block_checked(
+    rpc: String,
+    password: String,
+    page_id: String,
+    block_id: String,
+    checked: bool,
+) -> Result<PagesData, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::SetChecked { block_id, checked }),
+            password,
+        )
+        .await?;
+        load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn move_block(
+    rpc: String,
+    password: String,
+    page_id: String,
+    block_id: String,
+    direction: String,
+) -> Result<PagesData, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let blocks = load_page_blocks(&rpc, &page_id).await?;
+        let (parent, after) = block_move(&blocks, &block_id, &direction)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::MoveBlock {
+                block_id,
+                parent,
+                after,
+            }),
+            password,
+        )
+        .await?;
+        load_pages_data(&rpc, Some(&page_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn remove_block(
+    rpc: String,
+    password: String,
+    page_id: String,
+    block_id: String,
+) -> Result<PagesData, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::RemoveBlock { block_id }),
             password,
         )
         .await?;
@@ -635,6 +848,7 @@ async fn load_workspace(
         blocks: pages.blocks,
         active_page: pages.active_page,
         active_page_title: pages.active_page_title,
+        active_page_parent: pages.active_page_parent,
     })
 }
 
@@ -783,17 +997,16 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
         PageReply::PageList(pages) => pages,
         _ => return Err("node returned an invalid page list".into()),
     };
-    let pages = wire_pages
-        .into_iter()
-        .map(|page| PageItem {
-            id: page.id,
-            title: page.title,
-        })
-        .collect::<Vec<_>>();
+    let pages = page_items(wire_pages);
     let active_page = requested
         .filter(|id| pages.iter().any(|page| page.id == *id))
         .map(str::to_string)
         .or_else(|| pages.first().map(|page| page.id.clone()))
+        .unwrap_or_default();
+    let active_page_parent = pages
+        .iter()
+        .find(|page| page.id == active_page)
+        .map(|page| page.parent.clone())
         .unwrap_or_default();
     if active_page.is_empty() {
         return Ok(PagesData {
@@ -801,32 +1014,31 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
             blocks: Vec::new(),
             active_page,
             active_page_title: String::new(),
+            active_page_parent,
         });
     }
-    let reply: PageReply = rpc
-        .query(
-            "pages",
-            &PageQuery::GetPage {
-                page_id: active_page.clone(),
-            },
-        )
-        .await?;
-    let wire_blocks = match reply {
-        PageReply::Page(Some(blocks)) => blocks,
-        _ => return Err("page was not found".into()),
-    };
+    let wire_blocks = load_page_blocks(rpc, &active_page).await?;
     let active_page_title = wire_blocks
         .first()
         .map(|block| block.text.clone())
         .unwrap_or_default();
+    let parents = wire_blocks
+        .iter()
+        .map(|block| (block.id.clone(), block.parent.clone()))
+        .collect::<BTreeMap<_, _>>();
     let blocks = wire_blocks
         .into_iter()
         .skip(1)
         .map(|block| PageBlock {
+            prefix: block_prefix(&block, &active_page, &parents),
             id: block.id,
+            parent: block.parent.unwrap_or_default(),
             kind: block_kind_name(block.kind).into(),
             text: block.text,
             pending: false,
+            checked: block.checked,
+            child_count: count_i64(block.children.len()),
+            mark_count: count_i64(block.marks.len()),
         })
         .collect();
     Ok(PagesData {
@@ -834,7 +1046,92 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
         blocks,
         active_page,
         active_page_title,
+        active_page_parent,
     })
+}
+
+async fn load_page_blocks(rpc: &RpcClient, page_id: &str) -> Result<Vec<pages::Block>, String> {
+    let reply: PageReply = rpc
+        .query(
+            "pages",
+            &PageQuery::GetPage {
+                page_id: page_id.to_string(),
+            },
+        )
+        .await?;
+    match reply {
+        PageReply::Page(Some(blocks)) => Ok(blocks),
+        _ => Err("page was not found".into()),
+    }
+}
+
+fn page_items(wire_pages: Vec<pages::PageMeta>) -> Vec<PageItem> {
+    let known = wire_pages
+        .iter()
+        .map(|page| page.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut children = BTreeMap::<Option<&str>, Vec<usize>>::new();
+    for (index, page) in wire_pages.iter().enumerate() {
+        let parent = page
+            .parent
+            .as_deref()
+            .filter(|parent| known.contains(parent));
+        children.entry(parent).or_default().push(index);
+    }
+    let mut stack = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|index| (*index, 0_usize))
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut pages = Vec::with_capacity(wire_pages.len());
+    while pages.len() < wire_pages.len() {
+        let Some((index, depth)) = stack.pop() else {
+            let Some(index) = wire_pages
+                .iter()
+                .position(|page| !visited.contains(page.id.as_str()))
+            else {
+                break;
+            };
+            stack.push((index, 0));
+            continue;
+        };
+        let page = &wire_pages[index];
+        if !visited.insert(page.id.as_str()) {
+            continue;
+        }
+        let page_children = children.get(&Some(page.id.as_str()));
+        pages.push(PageItem {
+            id: page.id.clone(),
+            title: page.title.clone(),
+            parent: page.parent.clone().unwrap_or_default(),
+            prefix: "  ".repeat(depth),
+            child_count: page_children.map_or(0, |children| count_i64(children.len())),
+        });
+        if let Some(page_children) = page_children {
+            stack.extend(page_children.iter().rev().map(|index| (*index, depth + 1)));
+        }
+    }
+    pages
+}
+
+fn block_prefix(
+    block: &pages::Block,
+    page_id: &str,
+    parents: &BTreeMap<String, Option<String>>,
+) -> String {
+    let mut depth = 0;
+    let mut parent = block.parent.as_deref();
+    while let Some(parent_id) = parent {
+        if parent_id == page_id || depth >= parents.len() {
+            break;
+        }
+        depth += 1;
+        parent = parents.get(parent_id).and_then(Option::as_deref);
+    }
+    "  ".repeat(depth)
 }
 
 async fn signed_write(
@@ -1077,6 +1374,84 @@ const fn block_kind_name(kind: BlockKind) -> &'static str {
     }
 }
 
+fn parse_block_kind(kind: &str) -> Result<BlockKind, String> {
+    match kind {
+        "Text" => Ok(BlockKind::Paragraph),
+        "Heading 1" => Ok(BlockKind::Heading1),
+        "Heading 2" => Ok(BlockKind::Heading2),
+        "Heading 3" => Ok(BlockKind::Heading3),
+        "Bullet" => Ok(BlockKind::Bulleted),
+        "Number" => Ok(BlockKind::Numbered),
+        "Todo" => Ok(BlockKind::Todo),
+        "Toggle" => Ok(BlockKind::Toggle),
+        "Quote" => Ok(BlockKind::Quote),
+        "Code" => Ok(BlockKind::Code),
+        "Callout" => Ok(BlockKind::Callout),
+        "Divider" => Ok(BlockKind::Divider),
+        _ => Err("choose a valid block type".into()),
+    }
+}
+
+fn bounded_block_text(kind: BlockKind, text: String) -> Result<String, String> {
+    if kind == BlockKind::Divider {
+        return Ok(String::new());
+    }
+    bounded_text(text, "block text", 64 * 1024)
+}
+
+fn block_move(
+    blocks: &[pages::Block],
+    block_id: &str,
+    direction: &str,
+) -> Result<(String, Option<String>), String> {
+    let block = blocks
+        .iter()
+        .find(|block| block.id == block_id && block.kind != BlockKind::Page)
+        .ok_or_else(|| "block was not found".to_string())?;
+    let parent_id = block
+        .parent
+        .as_deref()
+        .ok_or_else(|| "page roots cannot be moved".to_string())?;
+    let parent = blocks
+        .iter()
+        .find(|block| block.id == parent_id)
+        .ok_or_else(|| "block parent was not found".to_string())?;
+    let index = parent
+        .children
+        .iter()
+        .position(|child| child == block_id)
+        .ok_or_else(|| "block is missing from its parent".to_string())?;
+    match direction {
+        "up" if index > 0 => Ok((
+            parent.id.clone(),
+            index
+                .checked_sub(2)
+                .map(|index| parent.children[index].clone()),
+        )),
+        "down" if index + 1 < parent.children.len() => {
+            Ok((parent.id.clone(), Some(parent.children[index + 1].clone())))
+        }
+        "indent" if index > 0 => {
+            let new_parent = blocks
+                .iter()
+                .find(|block| block.id == parent.children[index - 1])
+                .ok_or_else(|| "previous block was not found".to_string())?;
+            Ok((new_parent.id.clone(), new_parent.children.last().cloned()))
+        }
+        "outdent" => {
+            let grandparent = parent
+                .parent
+                .clone()
+                .ok_or_else(|| "block is already at the top level".to_string())?;
+            Ok((grandparent, Some(parent.id.clone())))
+        }
+        "up" => Err("block is already first".into()),
+        "down" => Err("block is already last".into()),
+        "indent" => Err("block needs a previous sibling to indent under".into()),
+        _ => Err("choose a valid block move".into()),
+    }
+}
+
 fn bounded_detail(value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -1303,6 +1678,71 @@ mod tests {
         let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.messages[1].body, "a threaded reply");
+        submit_test(
+            &rpc,
+            &signer,
+            9,
+            "pages",
+            pages::encode_msg(&PageMsg::InsertBlock {
+                parent: "welcome".into(),
+                after: Some("intro".into()),
+                block: NewBlock {
+                    id: "heading".into(),
+                    kind: BlockKind::Heading2,
+                    text: "Nested work".into(),
+                    marks: Vec::new(),
+                },
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            10,
+            "pages",
+            pages::encode_msg(&PageMsg::InsertBlock {
+                parent: "heading".into(),
+                after: None,
+                block: NewBlock {
+                    id: "todo".into(),
+                    kind: BlockKind::Todo,
+                    text: "Ship the editor".into(),
+                    marks: Vec::new(),
+                },
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            11,
+            "pages",
+            pages::encode_msg(&PageMsg::SetChecked {
+                block_id: "todo".into(),
+                checked: true,
+            }),
+        )
+        .await;
+        submit_test(
+            &rpc,
+            &signer,
+            12,
+            "pages",
+            pages::encode_msg(&PageMsg::CreatePage {
+                page_id: "child".into(),
+                title: "Child page".into(),
+                parent: Some("welcome".into()),
+            }),
+        )
+        .await;
+
+        let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
+        assert_eq!(pages.pages[0].id, "welcome");
+        assert_eq!(pages.pages[1].id, "child");
+        assert_eq!(pages.pages[1].prefix, "  ");
+        assert_eq!(pages.blocks[2].id, "todo");
+        assert_eq!(pages.blocks[2].prefix, "  ");
+        assert!(pages.blocks[2].checked);
 
         let refreshed = refresh(origin, "general".into(), "welcome".into(), 7)
             .await
@@ -1318,6 +1758,43 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_secs(1));
         assert_eq!(retry_delay(3), Duration::from_secs(4));
         assert_eq!(retry_delay(99), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn block_moves_follow_visible_sibling_order() {
+        let block = |id: &str, parent: Option<&str>, kind, children: &[&str]| pages::Block {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+            page: "page".into(),
+            kind,
+            text: id.into(),
+            marks: Vec::new(),
+            checked: false,
+            children: children.iter().map(|child| (*child).into()).collect(),
+        };
+        let blocks = vec![
+            block("page", None, BlockKind::Page, &["a", "b"]),
+            block("a", Some("page"), BlockKind::Paragraph, &["c"]),
+            block("c", Some("a"), BlockKind::Paragraph, &[]),
+            block("b", Some("page"), BlockKind::Paragraph, &[]),
+        ];
+
+        assert_eq!(
+            block_move(&blocks, "b", "up").unwrap(),
+            ("page".into(), None)
+        );
+        assert_eq!(
+            block_move(&blocks, "a", "down").unwrap(),
+            ("page".into(), Some("b".into()))
+        );
+        assert_eq!(
+            block_move(&blocks, "b", "indent").unwrap(),
+            ("a".into(), Some("c".into()))
+        );
+        assert_eq!(
+            block_move(&blocks, "c", "outdent").unwrap(),
+            ("page".into(), Some("a".into()))
+        );
     }
 
     async fn submit_test(
