@@ -1,4 +1,4 @@
-//! TCP relay fallback for UDP-dead joiners (Join Protocol v2, item 2).
+//! TCP relay fallback for UDP-dead joiners (join ADR, item 2).
 //!
 //! The whole join path is UDP-only, so on a network that eats outbound UDP
 //! (hostile café wifi) a joiner can never deliver its sealed first-contact

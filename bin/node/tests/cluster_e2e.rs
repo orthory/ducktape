@@ -500,10 +500,8 @@ fn quorum_tolerates_one_fault() {
 /// the staged reachability plane must converge a mesh on a FRESH boot: both
 /// nodes fire their boot `Retarget` (and the initial `EndpointRecord` send it
 /// triggers) before the p2p actors have any live connection, so the plane's
-/// liveness may not depend on that first datagram surviving. fake effect —
-/// the protocol (records -> adverts -> verified mesh -> handshakes -> apply)
-/// is identical to the real path right up to the interface call, and two
-/// same-host nodes with the real effect would fight over one dt-* name.
+/// liveness may not depend on that first datagram surviving. each node runs
+/// the real userspace backend on its own distinct UDP port.
 #[test]
 fn reachability_plane_converges_mesh_on_boot() {
     let _serial = serial();

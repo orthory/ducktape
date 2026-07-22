@@ -1,5 +1,5 @@
 #compdef ducktape
-# ducktape zsh completion — hand-generated from bin/node/src/cli.rs NODE_VERBS.
+# ducktape zsh completion — hand-written; checked against the clap tree.
 # The node-bin drift guard (cli.rs tests::completion_files_cover_the_verb_table)
 # fails the build if a verb token or flag here drifts from the table.
 #
@@ -17,14 +17,15 @@ _ducktape() {
         --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen
         --wireguard-advertised --invite-listen --wireguard-effect --role --ttl-days)
 
+    local user_key=(init restore unlock reveal encrypt status)
     local user_verbs=(key sign-bind sign-unbind sign-possession sign-add-member
         sign-remove-member sign-gateway-route sign-frame sign-admin redeem-invite
         webauthn-challenge p256-payload help)
-    local user_flags=(--out --key --node -n --network)
+    local user_flags=(--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --seq --route-key)
     local gateway_verbs=(bind unbind list help)
     local gateway_flags=(--workspace -n --network --label --port)
     local fs_verbs=(ls cat stat history diff checkout status commit pin help)
-    local fs_flags=(-n --network --json --node --message -m --no-rebase --snapshot)
+    local fs_flags=(-n --network --json --node --message -m --no-rebase --snapshot --limit --prefix)
 
     if (( CURRENT == 2 )); then
         compadd -- $families
@@ -42,7 +43,12 @@ _ducktape() {
                 *)        compadd -- $node_verbs ;;
             esac
             ;;
-        user)    compadd -- $user_verbs $user_flags ;;
+        user)
+            case ${words[3]} in
+                key) compadd -- $user_key $user_flags ;;
+                *)   compadd -- $user_verbs $user_flags ;;
+            esac
+            ;;
         gateway) compadd -- $gateway_verbs $gateway_flags ;;
         fs)      compadd -- $fs_verbs $fs_flags ;;
     esac

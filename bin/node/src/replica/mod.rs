@@ -79,7 +79,6 @@ pub(crate) async fn run(
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: crate::config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     // the AMBIENT coordinator override + relay override + WireGuard
     // bind/advertise split (node.toml `primary_coordinator` /
@@ -138,7 +137,6 @@ pub(crate) async fn run(
         label.clone(),
         namespace.clone(),
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         chain_id,
         mesh_state_file,
@@ -166,7 +164,6 @@ pub(crate) async fn run(
         peers,
         validators,
         wireguard_listen,
-        wireguard_effect,
         checkpoint_blocks,
         sync_index,
         announce_capabilities,

@@ -1,6 +1,6 @@
 //! A sealed envelope to an X25519 recipient — a crypto_box-style sealed box.
 //!
-//! Join Protocol v2 makes every invite BEARER: the token IS the admission
+//! the join protocol makes every invite BEARER: the token IS the admission
 //! credential, so it must never cross a link in the clear (an on-path observer
 //! on café wifi would otherwise redeem it first). The joiner's first-contact
 //! intro is sealed to the receiving member's WireGuard X25519 public key —

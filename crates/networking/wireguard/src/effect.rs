@@ -1,14 +1,9 @@
 //! Effect adapter that takes a validated [`TunnelInstallPlan`](crate::TunnelInstallPlan)
-//! from the crate root's pure validation layer and actually configures a
-//! WireGuard interface: a `WireGuardEffect` trait behind which tests use a
-//! deterministic `FakeWireGuardEffect` (CI has no real WireGuard userspace
-//! runtime) and real runs use `DefguardWireGuardEffect`
-//! (`defguard_wireguard_rs` `WGApi::<Userspace>`).
-
-#[cfg(unix)]
-mod defguard_effect;
-#[cfg(unix)]
-pub use defguard_effect::DefguardWireGuardEffect;
+//! from the crate root's pure validation layer and applies it to the tunnel
+//! backend: a `WireGuardEffect` trait behind which tests use a deterministic
+//! `FakeWireGuardEffect` and real runs use the in-process userspace backend
+//! (`overlay-net`'s `UserspaceWireGuardEffect` — BoringTun `Tunn`s + smoltcp;
+//! the OS-interface Defguard backend is retired).
 
 mod wiring;
 pub use wiring::{
@@ -35,29 +30,26 @@ pub trait WireGuardEffect {
     fn remove_interface(&mut self) -> Result<(), Self::Error>;
 }
 
-/// Error produced by `FakeWireGuardEffect`. Unlike the real
-/// `DefguardWireGuardEffect` (whose `Error` is `WireguardInterfaceError`),
-/// the fake has no I/O to fail on its own — but it still must mirror the one
-/// lifecycle invariant the real `WGApi::<Userspace>` path enforces:
-/// `configure_interface` talks to `/var/run/wireguard/<ifname>.sock`, a
-/// socket that only exists once `create_interface` has run. A fake that
-/// accepted `apply` first would let tests pass against call sequences the
-/// real adapter rejects.
+/// Error produced by `FakeWireGuardEffect`. The fake has no I/O to fail on
+/// its own — but it still must mirror the one lifecycle invariant the real
+/// in-process backend (`UserspaceWireGuardEffect`) enforces: `apply` and
+/// `remove_interface` are only legal between `create_interface` and the
+/// matching teardown. A fake that accepted `apply` first would let tests
+/// pass against call sequences the real adapter rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeWireGuardEffectError {
     /// `apply` (or `remove_interface`) was called without a preceding,
     /// still-live `create_interface`.
     NotCreated,
     /// `create_interface` was called while the interface is already live.
-    /// The real userspace path fails the same way: `DeviceHandle::new`
-    /// cannot stand up a second TUN under a name that still exists — a
+    /// The real userspace backend fails the same way (`AlreadyCreated`) — a
     /// caller reconfiguring a live interface must `apply`, not re-create.
     AlreadyCreated,
     /// `apply` was rejected because `reject_next_apply` was armed. Stands in
-    /// for a real `configure_interface` rejection (e.g. Defguard's
-    /// `InterfaceConfiguration.prvkey` failing to decode to a 32-byte key)
-    /// so callers can test their handling of that failure without a real
-    /// WireGuard userspace runtime.
+    /// for a real backend rejecting a config (e.g. an
+    /// `InterfaceConfiguration.prvkey` that fails to decode to a 32-byte
+    /// key) so callers can test their handling of that failure without a
+    /// live tunnel backend.
     Rejected,
 }
 
@@ -160,12 +152,10 @@ mod tests {
 
     #[test]
     fn apply_before_create_interface_is_rejected_like_the_real_adapter() {
-        // The real `DefguardWireGuardEffect::apply` calls
-        // `WGApi::configure_interface`, which connects to
-        // `/var/run/wireguard/<ifname>.sock` — a socket `create_interface`
-        // creates. Calling `apply` first has nothing to connect to on the
-        // real path, so the fake must reject it too instead of recording a
-        // config for an interface that (per the real adapter) never came up.
+        // The real `UserspaceWireGuardEffect` rejects `apply` outside a
+        // live `create_interface` (`NotCreated`), so the fake must reject
+        // it too instead of recording a config for an interface that (per
+        // the real adapter) never came up.
         let mut fake = FakeWireGuardEffect::default();
 
         let err = fake.apply(&sample_config()).unwrap_err();
@@ -176,8 +166,8 @@ mod tests {
 
     #[test]
     fn create_interface_while_live_is_rejected_like_the_real_adapter() {
-        // The real path's `DeviceHandle::new` fails when a TUN of the same
-        // name already exists — reconfiguring a live interface goes through
+        // The real backend fails a second `create_interface` while live
+        // (`AlreadyCreated`) — reconfiguring a live interface goes through
         // `apply` (create-or-replace), never a second `create_interface`.
         let mut fake = FakeWireGuardEffect::default();
         fake.create_interface().unwrap();

@@ -51,13 +51,17 @@ fn network_shape_joiner_parks_until_promote() {
     );
 
     // opt the friend into the shipped-index warm start (indexable spec §7
-    // lane 2) the way an operator would: a hand-edited node-local policy
-    // line. the whole lane then rides this admission for real — the founder
-    // cuts and serves its index checkpoints over the mesh, the friend
-    // fetches and stages them, and the promoted reboot adopts the set.
+    // lane 2) the way an operator would: EDIT the generated line's value
+    // (the file is complete — every key already present, appends would be
+    // duplicate-key parse errors). the whole lane then rides this admission
+    // for real — the founder cuts and serves its index checkpoints over the
+    // mesh, the friend fetches and stages them, and the promoted reboot
+    // adopts the set.
     let cfg = cluster.config_file(1);
     let toml = std::fs::read_to_string(&cfg).expect("read friend node.toml");
-    std::fs::write(&cfg, format!("{toml}sync_index = true\n")).expect("write friend node.toml");
+    assert!(toml.contains("sync_index = false"), "generated file carries the key");
+    std::fs::write(&cfg, toml.replace("sync_index = false", "sync_index = true"))
+        .expect("write friend node.toml");
 
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));

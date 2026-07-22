@@ -17,7 +17,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
 
-use crate::config::{self, hex_bytes, unhex};
+use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_index, stage_shipped_index};
@@ -60,7 +60,6 @@ pub(super) async fn park(
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
     checkpoint_blocks: u64,
     sync_index: bool,
     announce_capabilities: bool,
@@ -110,7 +109,6 @@ pub(super) async fn park(
         node = %label
     );
     let media_peers = if wireguard_listen.is_some()
-        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
     {
         let tracked = crate::voice_plane::MediaPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
@@ -123,14 +121,14 @@ pub(super) async fn park(
             .expect("ed25519 keys are 32 bytes");
         crate::voice::spawn_hub(
             voice_requests,
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(&tracked),
             me,
             planes.clone(),
         );
         crate::agent_plane::spawn(
             label.clone(),
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(&tracked),
             me,
             bulk_pacer.clone(),
@@ -141,7 +139,7 @@ pub(super) async fn park(
         // ordered command log to peers, so a member on another node streams it.
         crate::term_plane::spawn(
             label.clone(),
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(&tracked),
             me,
             bulk_pacer.clone(),
@@ -153,7 +151,7 @@ pub(super) async fn park(
     } else {
         eprintln!(
             "[node {label}] realtime sessions are DISABLED on this node: the mesh overlay \
-             is unavailable (wireguard_listen unset, or the fake effect)"
+             is unavailable (wireguard_listen unset)"
         );
         drop(voice_requests);
         None
@@ -168,7 +166,7 @@ pub(super) async fn park(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+                factory: crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
                 pacer: bulk_pacer.clone(),
                 planes: planes.clone(),
                 commands: gateway_commands,

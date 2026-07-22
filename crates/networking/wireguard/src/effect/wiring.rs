@@ -138,10 +138,9 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
     );
     effect.create_interface()?;
     if let Err(err) = effect.apply(&config) {
-        // `create_interface` already stood up the interface (a real socket
-        // at `/var/run/wireguard/<ifname>.sock` on the Defguard path); don't
-        // leave it behind just because this config was rejected (e.g. a
-        // malformed private key). The `remove_interface` outcome is
+        // `create_interface` already stood up the interface; don't leave it
+        // behind just because this config was rejected (e.g. a malformed
+        // private key). The `remove_interface` outcome is
         // secondary to the `apply` failure that's actually being reported,
         // so it's intentionally dropped rather than allowed to shadow it.
         let _ = effect.remove_interface();
@@ -153,11 +152,11 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
 /// Re-apply the full peer set to an interface that is ALREADY live — the
 /// mid-epoch form of [`apply_peer_tunnels`]: no `create_interface`, one
 /// `apply` of the complete desired configuration. `WireGuardEffect::apply`
-/// is create-or-replace at the config level (the Defguard userspace path
-/// writes `replace_peers=true`, re-assigns addresses with netlink replace
-/// semantics, and tolerates already-present peer routes), so unchanged
-/// peers keep their sessions and the delta — an added standby tunnel, a
-/// re-advertised endpoint — lands without tearing the interface down.
+/// is create-or-replace at the config level (the userspace backend replaces
+/// the peer table wholesale while keeping live sessions for unchanged
+/// peers), so unchanged peers keep their sessions and the delta — an added
+/// standby tunnel, a re-advertised endpoint — lands without tearing the
+/// interface down.
 pub fn update_peer_tunnels<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
@@ -505,9 +504,8 @@ mod tests {
 
     #[test]
     fn removes_the_interface_it_just_created_when_apply_is_rejected() {
-        // Mirrors a real `DefguardWireGuardEffect` run where
-        // `create_interface` succeeds (the userspace socket comes up) but
-        // `configure_interface` then rejects the config — e.g. Defguard's
+        // Mirrors a real run where `create_interface` succeeds but the
+        // backend then rejects the config — e.g. an
         // `InterfaceConfiguration.prvkey` failing to decode to a 32-byte
         // key. `apply_tunnel_plan` must not leave that interface behind.
         let (plan, listen) = two_party_plan();

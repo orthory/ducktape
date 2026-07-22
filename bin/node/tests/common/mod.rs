@@ -79,15 +79,9 @@ pub struct Cluster {
     /// points bootstrap at a forwarder in front of node 0.
     pub bootstrap_addr_override: Option<String>,
     /// When true every config gets `wireguard_listen` on the node's distinct
-    /// UDP port. The default fake effect exercises orchestration only;
-    /// `wireguard_socket` upgrades it to the real, unprivileged userspace
-    /// encrypted transport. The OS-interface effect is intentionally absent
-    /// because same-host nodes would contend for one interface name.
+    /// UDP port — the reachability plane runs the real, unprivileged
+    /// userspace transport (the node's only backend).
     pub wireguard: bool,
-    /// Use the TUN-less in-process WireGuard stack instead of the fake effect.
-    /// Unlike the OS-interface backend this is safe for multiple same-host
-    /// nodes and exercises encrypted overlay sockets end to end.
-    pub wireguard_socket: bool,
     /// extra `node.toml` lines appended verbatim to EVERY node's generated
     /// config (`spawn` regenerates the file, so a hand-edit after the fact
     /// would not survive a respawn). set before the first spawn; empty by
@@ -154,7 +148,7 @@ impl NetworkShapeCluster {
     }
 
     pub fn init_founder(&self, name: &str) -> String {
-        // Join v2 refuses to mint an invite from a member with no reachability
+        // the join protocol refuses to mint an invite from a member with no reachability
         // plane, and this harness is deliberately coordinator-free — so every
         // founder carries a distinct-port WireGuard listen.
         let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
@@ -183,7 +177,6 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.rpc_ports[0]),
             ])
             .args(["--wireguard-listen", &wg_listen])
-            .args(["--wireguard-effect", "socket"])
             .output()
             .expect("run init");
         assert!(
@@ -211,7 +204,7 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    /// mint a bearer invite (Join v2: single-use, sealed to whoever redeems it
+    /// mint a bearer invite (the join protocol: single-use, sealed to whoever redeems it
     /// at first contact). Still pre-generates the friend identity so
     /// `join_friend` reuses one stable key across the ceremony.
     pub fn invite(&self) -> String {
@@ -281,8 +274,6 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.rpc_ports[1]),
                 "--wireguard-listen",
                 &format!("127.0.0.1:{}", alloc_ports(1)[0]),
-                "--wireguard-effect",
-                "socket",
                 // hermetic: without this the joined node registers with the
                 // LIVE public coordinator from inside the test.
                 "--primary-coordinator",
@@ -491,7 +482,7 @@ impl NetworkShapeCluster {
         }
     }
 
-    /// wait until node `idx` has COMMITTED STANDING as a member. Join v2 has
+    /// wait until node `idx` has COMMITTED STANDING as a member. the join protocol has
     /// two legitimate admission paths and which one lands first is a race:
     /// direct first contact prints "standing is committed" (replica/wiring),
     /// the announce-redeem park path prints "resident: standing granted".
@@ -575,7 +566,6 @@ impl Cluster {
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
             wireguard: false,
-            wireguard_socket: false,
             extra_toml: Vec::new(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
@@ -627,11 +617,6 @@ impl Cluster {
                 "wireguard_listen = \"127.0.0.1:{}\"\n",
                 self.p2p_ports[idx]
             ));
-            cfg.push_str(if self.wireguard_socket {
-                "wireguard_effect = \"socket\"\n"
-            } else {
-                "wireguard_effect = \"fake\"\n"
-            });
         }
         for line in &self.extra_toml {
             cfg.push_str(line);

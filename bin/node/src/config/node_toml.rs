@@ -1,156 +1,210 @@
-//! node.toml — the raw file shape (both config shapes in one struct) and
-//! the workspace plumbing merge that keeps init/join idempotent.
+//! node.toml — the raw file shapes and the workspace plumbing merge that
+//! keeps init/join idempotent.
+//!
+//! Two shapes, two structs, no unions:
+//! - [`NodeToml`] is the OPERATOR file (network shape). Every key is
+//!   REQUIRED: a file missing one refuses to parse loudly instead of
+//!   silently meaning something, and `deny_unknown_fields` refuses retired
+//!   keys the same way. init/join always write the complete set, so the
+//!   file is its own documentation — no bare node.toml.
+//! - [`DevSeedToml`] is the dev-seed harness shape (cluster e2e, wg-smoke):
+//!   seed-derived identities, no descriptor, minimal keys. Not an operator
+//!   surface.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use super::resolve::parse_wireguard_effect;
+use serde::Deserialize as _;
 
-#[derive(Default, serde::Deserialize)]
+use super::DEFAULT_PRIMARY_COORDINATOR;
+use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_PODMAN_IMAGE};
+
+/// the generated defaults: a fresh init/join with no flags yields a node
+/// with every surface up. Loopback for the operator surfaces (HTTP app
+/// API, browser gateway, admin RPC), dual-stack for the mesh, and the
+/// conventional WireGuard port for the tunnel plane.
+pub const DEFAULT_MESH_LISTEN: &str = "[::]:52200";
+pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:8844";
+pub const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:8845";
+/// port 0 on purpose: the browser gateway prints its bound port and its
+/// consumers re-read it per session; a fixed port would only collide.
+pub const DEFAULT_GATEWAY_LISTEN: &str = "127.0.0.1:0";
+pub const DEFAULT_WIREGUARD_LISTEN: &str = "0.0.0.0:51820";
+
+/// the operator node.toml — the network shape, every key required.
+///
+/// Where "unset" is a meaningful state it is an EXPLICIT value, never a
+/// missing key: `"none"` (primary_coordinator, coordinator_relay),
+/// `"auto"` (wireguard_advertised), `0` = probe (sandbox_cores,
+/// sandbox_mem_gb).
+#[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeToml {
-    // --- the network shape ---
-    /// path to the network descriptor; PRESENT means the network shape.
-    pub network: Option<String>,
-    /// path to the identity secret; default "identity.key" beside node.toml.
-    pub key_file: Option<String>,
+    /// path to the network descriptor, resolved beside this file.
+    pub network: String,
+    /// path to the identity secret, resolved beside this file.
+    pub key_file: String,
+    /// the p2p mesh listener.
+    pub listen: String,
+    /// what peers are told to dial: `"overlay"` (the chain-derived ULA —
+    /// the right value for a member behind NAT) or a concrete dialable
+    /// address.
+    pub advertised: String,
+    pub storage_dir: String,
+    /// the HTTP app API.
+    pub http_listen: String,
+    /// the least-privilege browser gateway; must bind 127.0.0.1.
+    pub gateway_listen: String,
+    /// the local admin RPC bridge.
+    pub rpc_listen: String,
+    /// the UDP endpoint of this node's WireGuard tunnel plane.
+    pub wireguard_listen: String,
+    /// the UDP invite intro listener (where a fresh joiner announces its
+    /// keys, token-authenticated, before any p2p).
+    pub invite_listen: String,
+    /// the advertised tunnel endpoint, independent of the bind:
+    /// `"host:port"`, or `"auto"` = derive from `wireguard_listen` (its IP
+    /// when concrete, endpoint-less/roaming when unspecified).
+    pub wireguard_advertised: String,
+    /// the ambient rendezvous coordinator: `"host:port"`, or `"none"` to
+    /// run without coordination.
+    pub primary_coordinator: String,
+    /// the TCP first-contact fallback relay: `"host:port"`, or `"none"`.
+    pub coordinator_relay: String,
+    /// sealed blocks between recovery checkpoints.
+    pub checkpoint_blocks: u64,
+    /// opt-in UNVERIFIABLE shipped-index warm start on join.
+    pub sync_index: bool,
+    /// whether this node publishes its provider set into the capability
+    /// registry; `false` = accept-lane-only provider.
+    pub announce_capabilities: bool,
+    /// provider run isolation: `"direct"`, `"podman"`, or `"tart"`.
+    pub sandbox: String,
+    /// the provider environment image (used by podman/tart; ignored for
+    /// direct).
+    pub sandbox_image: String,
+    /// announced sandbox capacity; `0` = probe the host.
+    pub sandbox_cores: u64,
+    /// announced sandbox capacity in GiB; `0` = probe the host.
+    pub sandbox_mem_gb: u64,
+}
 
-    // --- the dev-seed shape (legacy; see module docs) ---
-    pub id: Option<u64>,
-    pub namespace: Option<String>,
-    pub peer_seeds: Option<Vec<u64>>,
+impl NodeToml {
+    /// `wireguard_advertised` with the sentinel mapped back to the runtime
+    /// derivation: `"auto"` means "derive from `wireguard_listen`".
+    pub fn wireguard_advertised_value(&self) -> Option<&str> {
+        let is_auto = self.wireguard_advertised == "auto";
+        (!is_auto).then_some(self.wireguard_advertised.as_str())
+    }
+}
+
+/// the dev-seed harness shape: deterministic seed identities, no
+/// descriptor. node 0 bootstraps nobody; everyone else dials peer_seeds[0]
+/// at `bootstrapper_addr`. Only the test harnesses write this shape, so
+/// its plumbing stays optional — a harness file says exactly what the test
+/// needs and nothing else.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevSeedToml {
+    pub id: u64,
+    pub namespace: String,
+    pub peer_seeds: Vec<u64>,
     pub validator_seeds: Option<Vec<u64>>,
+    /// `None` for node 0 (bootstraps nobody) — a semantic state, not a
+    /// default.
     pub bootstrapper_addr: Option<String>,
-
-    // --- shared plumbing ---
     pub listen: String,
     pub advertised: Option<String>,
     pub storage_dir: Option<String>,
     pub rpc_listen: Option<String>,
     pub http_listen: Option<String>,
-    /// Dedicated, least-privilege browser gateway. It exposes no node API and
-    /// is normally loopback-only; route windows use per-session
-    /// `<token>.localhost` origins on this listener.
     pub gateway_listen: Option<String>,
-    /// sealed blocks between recovery checkpoints (node-local operator
-    /// policy — never part of the network descriptor). default 32.
     pub checkpoint_blocks: Option<u64>,
-    /// the UDP endpoint this node advertises for its WireGuard tunnel;
-    /// PRESENT stages the node-driven reachability plane (node-local
-    /// operator policy, like checkpoint_blocks). absent = plane off.
+    /// PRESENT = the reachability plane runs (userspace socket backend).
     pub wireguard_listen: Option<String>,
-    /// which `WireGuardEffect` the reachability plane drives: "tun"
-    /// (default — configure an actual interface via the userspace WireGuard
-    /// runtime; needs root/CAP_NET_ADMIN; "real" is the legacy alias),
-    /// "socket" (the ADR's TUN-less in-process backend: no privilege, no
-    /// host mutation — overlay reachability exists only inside this
-    /// process), or "fake" (record configs in memory; for dev/sim runs, and
-    /// for several same-chain nodes on one host, which would otherwise
-    /// fight over one interface name).
-    pub wireguard_effect: Option<String>,
-    /// the UDP endpoint this node's invite intro listener binds — where a
-    /// fresh joiner announces its keys (token-authenticated) so the tunnel
-    /// can come up before any p2p. defaults to `wireguard_listen` with the
-    /// port + 1; only meaningful when the plane runs.
     pub invite_listen: Option<String>,
-    /// opt-in shipped-index warm start when joining (node-local operator
-    /// policy, like checkpoint_blocks): fetch the sync source's derived
-    /// index checkpoints alongside state-sync. the derived tier has no
-    /// root, so these bytes are UNVERIFIABLE — off, the default, means the
-    /// index heals from verified state instead (indexable spec §7).
-    pub sync_index: Option<bool>,
-    /// whether this node publishes its discovered provider set into the
-    /// capability registry (node-local operator policy, like
-    /// checkpoint_blocks; default true). `false` makes an ACCEPT-LANE-ONLY
-    /// provider: the node still resolves and executes capabilities its host
-    /// carries, but never enters any tag's rendezvous pool — it serves only
-    /// UNASSIGNED announcements, by racing `SagaMsg::Accept` like any other
-    /// capable node. announcing stays truthful either way: this can hide a
-    /// real provider, never fabricate one.
-    pub announce_capabilities: Option<bool>,
-    /// the AMBIENT rendezvous coordinator this node's reachability plane
-    /// binds — never carried in an invite (see `coordinator_ingress`'s
-    /// doc). `"host:port"` overrides the compiled-in
-    /// `DEFAULT_PRIMARY_COORDINATOR`; `"none"`/`"off"`/`"direct"` disables
-    /// coordination outright; the key ABSENT (the pre-feature default)
-    /// re-derives the compiled default at runtime — bit-identical to today.
-    pub primary_coordinator: Option<String>,
-    /// the TCP relay a joiner's first-contact fallback dials when every UDP
-    /// path is dead (Join v2 item 2). `"host:port"` REPLACES the derived
-    /// list; `"none"`/`"off"`/`"direct"` disables the fallback outright
-    /// (mirroring `primary_coordinator`'s sentinels); the key ABSENT (the
-    /// zero-config joiner default) derives the relay from the ambient
-    /// coordinator — coordinator host, TCP/443.
-    pub coordinator_relay: Option<String>,
-    /// the UDP endpoint this node advertises for its WireGuard tunnel,
-    /// independent of `wireguard_listen` (which stays bind-only): a
-    /// concrete `"host:port"` (hostname resolved once at plane start, like
-    /// the mesh `advertised`) always wins; the key ABSENT falls back to
-    /// today's derivation (`wireguard_listen`'s IP when concrete, endpoint-
-    /// less/roaming when unspecified) — bit-identical to today.
     pub wireguard_advertised: Option<String>,
-
-    /// how provider runs are spawned (node-local operator policy, like
-    /// checkpoint_blocks). absent/`"direct"` = the plain host spawn (default);
-    /// `"podman"` = a rootless container that enforces each run's numeric
-    /// limits AND makes this node announce its probed capacity; `"tart"` uses
-    /// one ephemeral Apple-Silicon VM per run. any other value is a loud config
-    /// error.
+    pub primary_coordinator: Option<String>,
+    pub coordinator_relay: Option<String>,
+    pub sync_index: Option<bool>,
+    pub announce_capabilities: Option<bool>,
     pub sandbox: Option<String>,
-    /// the provider environment image: a container image for Podman or a VM
-    /// image for Tart. defaults to `docker.io/library/node:22-slim` for Podman
-    /// and the Cirrus Labs Sonoma base image for Tart. ignored for Direct.
     pub sandbox_image: Option<String>,
-    /// override the probed core count this node announces as sandbox capacity
-    /// (Podman or Tart). WINS over the `/proc`/sysctl probe.
     pub sandbox_cores: Option<u64>,
-    /// override the probed total-memory GiB this node announces as sandbox
-    /// capacity (Podman or Tart). WINS over the probe.
     pub sandbox_mem_gb: Option<u64>,
 }
 
-/// read a raw node.toml plus its base directory (which relative paths inside
-/// the file resolve against).
-pub fn load_node_toml(cfg_path: &Path) -> Result<(NodeToml, PathBuf), String> {
+/// both file shapes, discriminated by the `network` key: PRESENT means the
+/// operator (network) shape.
+pub enum RawNodeToml {
+    Network(NodeToml),
+    DevSeed(DevSeedToml),
+}
+
+/// read a raw node.toml plus its base directory (which relative paths
+/// inside the file resolve against). the `network` key picks the shape;
+/// each shape then parses STRICTLY (all required keys present, no unknown
+/// keys).
+pub fn load_raw_node_toml(cfg_path: &Path) -> Result<(RawNodeToml, PathBuf), String> {
     let text = std::fs::read_to_string(cfg_path).map_err(|e| format!("read {cfg_path:?}: {e}"))?;
-    let raw: NodeToml = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
+    let value: toml::Value = toml::from_str(&text).map_err(|e| format!("{cfg_path:?}: {e}"))?;
     let base = cfg_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
+    let is_network_shape = value.get("network").is_some();
+    let raw = if is_network_shape {
+        RawNodeToml::Network(
+            NodeToml::deserialize(value).map_err(|e| format!("{cfg_path:?}: {e}"))?,
+        )
+    } else {
+        RawNodeToml::DevSeed(
+            DevSeedToml::deserialize(value).map_err(|e| format!("{cfg_path:?}: {e}"))?,
+        )
+    };
     Ok((raw, base))
 }
 
-/// a workspace's plumbing (everything in node.toml that is not the network
-/// reference), merged from three layers: explicit flags win, else values an
-/// EXISTING node.toml already carries — network- or dev-shape alike, so
-/// joining inside the desktop app's solo dir inherits its http port instead
-/// of resetting it — else defaults. always writing the merged result makes
+/// read a network-shape node.toml, refusing the dev-seed shape — the
+/// workspace verbs (init/join/invite) only ever operate on operator files.
+pub fn load_node_toml(cfg_path: &Path) -> Result<(NodeToml, PathBuf), String> {
+    match load_raw_node_toml(cfg_path)? {
+        (RawNodeToml::Network(raw), base) => Ok((raw, base)),
+        (RawNodeToml::DevSeed(_), _) => Err(format!(
+            "{cfg_path:?} is a dev-seed (harness) config — the workspace verbs need the \
+             network shape"
+        )),
+    }
+}
+
+/// a workspace's COMPLETE plumbing (everything in node.toml that is not
+/// the network reference) — every field concrete, mirroring the required
+/// file 1:1. Built by [`merged_plumbing`] from three layers: explicit
+/// flags win, else the values an EXISTING network-shape node.toml already
+/// carries, else the WORKING defaults (`DEFAULT_*`: mesh, HTTP, gateway,
+/// RPC, and the WireGuard plane all up — a flagless init/join yields a
+/// node that works out of the box). always writing the merged result makes
 /// init/join idempotent AND partial-flag-safe (one flag never resets the
 /// others).
 pub struct Plumbing {
     pub listen: String,
-    pub advertised: Option<String>,
-    pub http_listen: Option<String>,
-    pub gateway_listen: Option<String>,
-    pub rpc_listen: Option<String>,
-    /// merged like the rest — a hand-edited storage_dir survives rewrites.
+    pub advertised: String,
     pub storage_dir: String,
-    /// merged from an existing file only (no flag); a WireGuard join seeds a
-    /// default AFTER the merge when the invite carries a tunnel bootstrap.
-    pub wireguard_listen: Option<String>,
-    /// merged from explicit flags or existing file; defaults from
-    /// `wireguard_listen` when absent.
-    pub invite_listen: Option<String>,
-    /// merged like the rest — a hand-set value survives; the desktop app
-    /// passes "socket" here (overlay-net ADR phase 4) while the parse
-    /// default for a file without the key stays `tun`.
-    pub wireguard_effect: Option<String>,
-    /// merged like the rest; see `NodeToml::primary_coordinator`. Absent
-    /// (`None`) preserves today's behavior exactly (the runtime re-derives
-    /// the compiled default / whatever the descriptor already encodes).
-    pub primary_coordinator: Option<String>,
-    /// merged like the rest; see `NodeToml::wireguard_advertised`.
-    pub wireguard_advertised: Option<String>,
+    pub http_listen: String,
+    pub gateway_listen: String,
+    pub rpc_listen: String,
+    pub wireguard_listen: String,
+    pub invite_listen: String,
+    pub wireguard_advertised: String,
+    pub primary_coordinator: String,
+    pub coordinator_relay: String,
+    pub checkpoint_blocks: u64,
+    pub sync_index: bool,
+    pub announce_capabilities: bool,
+    pub sandbox: String,
+    pub sandbox_image: String,
+    pub sandbox_cores: u64,
+    pub sandbox_mem_gb: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,98 +215,175 @@ pub fn merged_plumbing(
     http_listen: Option<&str>,
     gateway_listen: Option<&str>,
     rpc_listen: Option<&str>,
-    wireguard_effect: Option<&str>,
     wireguard_listen: Option<&str>,
     invite_listen: Option<&str>,
     primary_coordinator: Option<&str>,
     wireguard_advertised: Option<&str>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
+    // an existing file must be a VALID network-shape file to contribute —
+    // an incomplete or dev-seed file aborts the verb instead of being
+    // silently half-inherited.
     let existing: Option<NodeToml> = if path.exists() {
         Some(load_node_toml(&path)?.0)
     } else {
         None
     };
     let e = existing.as_ref();
-    // reject a typo'd effect value at the verb, before anything lands on disk
-    // — resolve() would only catch it on the node's NEXT boot.
-    parse_wireguard_effect(wireguard_effect)?;
+    let listen = listen
+        .map(str::to_string)
+        .or_else(|| e.map(|r| r.listen.clone()))
+        .unwrap_or_else(|| DEFAULT_MESH_LISTEN.into());
+    // "overlay" needs an IPv6 mesh listener (members reverse-dial the ULA
+    // over tunnels); a v4-only listen advertises its own socket address.
+    let derived_advertised = if listen.starts_with('[') {
+        "overlay".to_string()
+    } else {
+        listen.clone()
+    };
+    let wireguard_listen = wireguard_listen
+        .map(str::to_string)
+        .or_else(|| e.map(|r| r.wireguard_listen.clone()))
+        .unwrap_or_else(|| DEFAULT_WIREGUARD_LISTEN.into());
+    let derived_invite_listen = derive_invite_listen(&wireguard_listen)?;
+    let primary_coordinator = primary_coordinator
+        .map(str::to_string)
+        .or_else(|| e.map(|r| r.primary_coordinator.clone()))
+        .unwrap_or_else(|| DEFAULT_PRIMARY_COORDINATOR.into());
+    let derived_relay = derive_coordinator_relay(&primary_coordinator);
     Ok(Plumbing {
-        listen: listen
-            .map(str::to_string)
-            .or_else(|| e.map(|r| r.listen.clone()))
-            .unwrap_or_else(|| "127.0.0.1:0".into()),
         advertised: advertised
             .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.advertised.clone())),
+            .or_else(|| e.map(|r| r.advertised.clone()))
+            .unwrap_or(derived_advertised),
+        listen,
         http_listen: http_listen
             .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.http_listen.clone())),
+            .or_else(|| e.map(|r| r.http_listen.clone()))
+            .unwrap_or_else(|| DEFAULT_HTTP_LISTEN.into()),
         gateway_listen: gateway_listen
             .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.gateway_listen.clone())),
+            .or_else(|| e.map(|r| r.gateway_listen.clone()))
+            .unwrap_or_else(|| DEFAULT_GATEWAY_LISTEN.into()),
         rpc_listen: rpc_listen
             .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.rpc_listen.clone())),
+            .or_else(|| e.map(|r| r.rpc_listen.clone()))
+            .unwrap_or_else(|| DEFAULT_RPC_LISTEN.into()),
         storage_dir: e
-            .and_then(|r| r.storage_dir.clone())
+            .map(|r| r.storage_dir.clone())
             .unwrap_or_else(|| "storage".into()),
-        wireguard_listen: wireguard_listen
-            .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.wireguard_listen.clone())),
         invite_listen: invite_listen
             .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.invite_listen.clone())),
-        wireguard_effect: wireguard_effect
-            .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.wireguard_effect.clone())),
-        primary_coordinator: primary_coordinator
-            .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.primary_coordinator.clone())),
+            .or_else(|| e.map(|r| r.invite_listen.clone()))
+            .unwrap_or(derived_invite_listen),
         wireguard_advertised: wireguard_advertised
             .map(str::to_string)
-            .or_else(|| e.and_then(|r| r.wireguard_advertised.clone())),
+            .or_else(|| e.map(|r| r.wireguard_advertised.clone()))
+            .unwrap_or_else(|| "auto".into()),
+        coordinator_relay: e
+            .map(|r| r.coordinator_relay.clone())
+            .unwrap_or(derived_relay),
+        checkpoint_blocks: e
+            .map(|r| r.checkpoint_blocks)
+            .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
+        sync_index: e.map(|r| r.sync_index).unwrap_or(false),
+        announce_capabilities: e.map(|r| r.announce_capabilities).unwrap_or(false),
+        sandbox: e
+            .map(|r| r.sandbox.clone())
+            .unwrap_or_else(|| "direct".into()),
+        sandbox_image: e
+            .map(|r| r.sandbox_image.clone())
+            .unwrap_or_else(|| DEFAULT_PODMAN_IMAGE.into()),
+        sandbox_cores: e.map(|r| r.sandbox_cores).unwrap_or(0),
+        sandbox_mem_gb: e.map(|r| r.sandbox_mem_gb).unwrap_or(0),
+        wireguard_listen,
+        primary_coordinator,
     })
 }
 
-/// write a network-shape node.toml into a workspace dir (init/join). the file
-/// references its siblings relatively, so the whole dir is relocatable.
-/// replaces a dev-shape file wholesale (its plumbing survives via
-/// [`merged_plumbing`]) — a join must actually take effect.
+/// the intro listener default: `wireguard_listen`'s port + 1, computed at
+/// GENERATION time — the file always carries the concrete value.
+fn derive_invite_listen(wireguard_listen: &str) -> Result<String, String> {
+    let addr: std::net::SocketAddr = wireguard_listen
+        .parse()
+        .map_err(|e| format!("wireguard_listen {wireguard_listen:?}: {e}"))?;
+    let intro_port = addr
+        .port()
+        .checked_add(1)
+        .ok_or_else(|| format!("wireguard_listen {wireguard_listen:?}: no room for port + 1"))?;
+    Ok(format!("0.0.0.0:{intro_port}"))
+}
+
+/// the relay default: the coordinator's host on TCP/443, or `"none"` when
+/// coordination itself is off — computed at GENERATION time.
+fn derive_coordinator_relay(primary_coordinator: &str) -> String {
+    let coordination_off = matches!(primary_coordinator, "none" | "off" | "direct");
+    if coordination_off {
+        return "none".into();
+    }
+    let host = primary_coordinator
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(primary_coordinator);
+    format!("{host}:443")
+}
+
+/// one entry: a `# note` line ABOVE its live `key = value` line, blank-line
+/// separated — the file reads as its own reference sheet.
+fn keyline(s: &mut String, key: &str, value: std::fmt::Arguments<'_>, note: &str) {
+    let _ = writeln!(s, "\n# {note}\n{key} = {value}");
+}
+
+/// write the network-shape node.toml (init/join): the COMPLETE key set,
+/// every key live under a brief comment — the parser requires every key, so
+/// the file IS the reference: what each key does, and what its sentinel
+/// values mean. the file references its siblings relatively, so the whole
+/// dir is relocatable.
 pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     let mut s = String::from(
         "# ducktape node config (network shape) — see network.toml for the network.\n\
-         network = \"network.toml\"\nkey_file = \"identity.key\"\n",
+         # every key is required; edit values, don't delete lines (rewrites re-fill).\n",
     );
-    s += &format!("listen = \"{}\"\n", p.listen);
-    if let Some(a) = &p.advertised {
-        s += &format!("advertised = \"{a}\"\n");
-    }
-    s += &format!("storage_dir = '{}'\n", p.storage_dir);
-    if let Some(h) = &p.http_listen {
-        s += &format!("http_listen = \"{h}\"\n");
-    }
-    if let Some(d) = &p.gateway_listen {
-        s += &format!("gateway_listen = \"{d}\"\n");
-    }
-    if let Some(r) = &p.rpc_listen {
-        s += &format!("rpc_listen = \"{r}\"\n");
-    }
-    if let Some(w) = &p.wireguard_listen {
-        s += &format!("wireguard_listen = \"{w}\"\n");
-    }
-    if let Some(i) = &p.invite_listen {
-        s += &format!("invite_listen = \"{i}\"\n");
-    }
-    if let Some(w) = &p.wireguard_effect {
-        s += &format!("wireguard_effect = \"{w}\"\n");
-    }
-    if let Some(pc) = &p.primary_coordinator {
-        s += &format!("primary_coordinator = \"{pc}\"\n");
-    }
-    if let Some(wa) = &p.wireguard_advertised {
-        s += &format!("wireguard_advertised = \"{wa}\"\n");
-    }
+    keyline(&mut s, "network", format_args!("\"network.toml\""),
+        "the network descriptor, beside this file");
+    keyline(&mut s, "key_file", format_args!("\"identity.key\""),
+        "this node's identity secret, beside this file");
+    keyline(&mut s, "listen", format_args!("\"{}\"", p.listen),
+        "p2p mesh listener (dual-stack)");
+    keyline(&mut s, "advertised", format_args!("\"{}\"", p.advertised),
+        "what peers dial: \"overlay\" = the chain ULA, or host:port");
+    keyline(&mut s, "storage_dir", format_args!("'{}'", p.storage_dir),
+        "chain + module state, beside this file");
+    keyline(&mut s, "http_listen", format_args!("\"{}\"", p.http_listen),
+        "HTTP app API (keep loopback)");
+    keyline(&mut s, "gateway_listen", format_args!("\"{}\"", p.gateway_listen),
+        "browser gateway; loopback only, port 0 = pick free");
+    keyline(&mut s, "rpc_listen", format_args!("\"{}\"", p.rpc_listen),
+        "local admin RPC (keep loopback)");
+    keyline(&mut s, "wireguard_listen", format_args!("\"{}\"", p.wireguard_listen),
+        "the WireGuard tunnel plane (UDP)");
+    keyline(&mut s, "invite_listen", format_args!("\"{}\"", p.invite_listen),
+        "invite intro listener (UDP; convention: wireguard port + 1)");
+    keyline(&mut s, "wireguard_advertised", format_args!("\"{}\"", p.wireguard_advertised),
+        "tunnel endpoint peers dial; \"auto\" = derive from wireguard_listen");
+    keyline(&mut s, "primary_coordinator", format_args!("\"{}\"", p.primary_coordinator),
+        "ambient rendezvous coordinator; \"none\" disables");
+    keyline(&mut s, "coordinator_relay", format_args!("\"{}\"", p.coordinator_relay),
+        "TCP first-contact fallback; \"none\" disables");
+    keyline(&mut s, "checkpoint_blocks", format_args!("{}", p.checkpoint_blocks),
+        "sealed blocks between recovery checkpoints");
+    keyline(&mut s, "sync_index", format_args!("{}", p.sync_index),
+        "true: UNVERIFIABLE shipped-index warm start on join");
+    keyline(&mut s, "announce_capabilities", format_args!("{}", p.announce_capabilities),
+        "true: publish this node's provider set");
+    keyline(&mut s, "sandbox", format_args!("\"{}\"", p.sandbox),
+        "provider run isolation: \"direct\" | \"podman\" | \"tart\"");
+    keyline(&mut s, "sandbox_image", format_args!("\"{}\"", p.sandbox_image),
+        "provider image (podman/tart; unused for direct)");
+    keyline(&mut s, "sandbox_cores", format_args!("{}", p.sandbox_cores),
+        "announced capacity; 0 = probe the host");
+    keyline(&mut s, "sandbox_mem_gb", format_args!("{}", p.sandbox_mem_gb),
+        "announced capacity (GiB); 0 = probe the host");
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
@@ -272,42 +403,85 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn node_config_rejects_retired_duckdns_service_sections() {
-        let retired = r#"
-            listen = "127.0.0.1:1"
-            [[duckdns.services]]
-            scope = "account"
-            service = "huddle"
-        "#;
-        assert!(
-            toml::from_str::<NodeToml>(retired).is_err(),
-            "naming-only DuckDNS must not retain service configuration"
-        );
+    fn fresh_default_plumbing(dir: &Path) -> Plumbing {
+        merged_plumbing(dir, None, None, None, None, None, None, None, None, None)
+            .expect("fresh merge")
     }
 
+    /// the generated file round-trips through the strict parser and its
+    /// flagless defaults are a WORKING node: every surface up, every
+    /// derivation materialized concretely.
+    #[test]
+    fn generated_file_is_complete_and_defaults_are_working() {
+        let dir = tmp("full-print");
+        let p = fresh_default_plumbing(&dir);
+        write_node_toml(&dir, &p).expect("write");
+        let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("strict parse");
+        assert_eq!(raw.listen, DEFAULT_MESH_LISTEN);
+        assert_eq!(raw.advertised, "overlay");
+        assert_eq!(raw.http_listen, DEFAULT_HTTP_LISTEN);
+        assert_eq!(raw.rpc_listen, DEFAULT_RPC_LISTEN);
+        assert_eq!(raw.gateway_listen, DEFAULT_GATEWAY_LISTEN);
+        assert_eq!(raw.wireguard_listen, DEFAULT_WIREGUARD_LISTEN);
+        assert_eq!(raw.invite_listen, "0.0.0.0:51821");
+        assert_eq!(raw.wireguard_advertised, "auto");
+        assert_eq!(raw.primary_coordinator, DEFAULT_PRIMARY_COORDINATOR);
+        assert_eq!(
+            raw.coordinator_relay,
+            derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
+        );
+        assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
+        assert!(!raw.sync_index);
+        assert!(!raw.announce_capabilities);
+        assert_eq!(raw.sandbox, "direct");
+        assert_eq!(raw.sandbox_image, DEFAULT_PODMAN_IMAGE);
+        assert_eq!(raw.sandbox_cores, 0);
+        assert_eq!(raw.sandbox_mem_gb, 0);
+    }
+
+    /// nothing optional: a file missing ANY key refuses to parse, and the
+    /// retired `wireguard_effect` key is an unknown-field error — old files
+    /// break loudly instead of half-working.
+    #[test]
+    fn incomplete_or_retired_files_fail_loudly() {
+        let dir = tmp("strict");
+        let p = fresh_default_plumbing(&dir);
+        write_node_toml(&dir, &p).expect("write");
+        let full = std::fs::read_to_string(dir.join("node.toml")).expect("read");
+
+        // drop one required key → parse error naming it.
+        let missing: String = full
+            .lines()
+            .filter(|l| !l.starts_with("rpc_listen"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(dir.join("node.toml"), missing).expect("write");
+        let err = load_node_toml(&dir.join("node.toml")).expect_err("missing key must fail");
+        assert!(err.contains("rpc_listen"), "{err}");
+
+        // a retired key → unknown-field error.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{full}wireguard_effect = \"socket\"\n"),
+        )
+        .expect("write");
+        let err = load_node_toml(&dir.join("node.toml")).expect_err("retired key must fail");
+        assert!(err.contains("wireguard_effect"), "{err}");
+    }
+
+    /// flags win over an existing file; unflagged values survive a
+    /// re-merge byte-for-byte (idempotent, partial-flag-safe).
     #[test]
     fn plumbing_merges_flags_over_existing_file_over_defaults() {
         let dir = tmp("plumbing");
-        std::fs::write(
-            dir.join("node.toml"),
-            r#"id = 0
-listen = "127.0.0.1:0"
-namespace = "ducktape-local"
-peer_seeds = [0]
-http_listen = "127.0.0.1:8844"
-storage_dir = '/data/ducktape'
-"#,
-        )
-        .expect("write");
-        // one flag overrides ONLY its field; the http port AND a hand-edited
-        // storage_dir survive.
+        let p = fresh_default_plumbing(&dir);
+        write_node_toml(&dir, &p).expect("write defaults");
+
         let p = merged_plumbing(
             &dir,
             Some("127.0.0.1:53000"),
             None,
-            None,
-            None,
+            Some("127.0.0.1:53001"),
             None,
             None,
             None,
@@ -317,135 +491,60 @@ storage_dir = '/data/ducktape'
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
-        assert_eq!(p.http_listen.as_deref(), Some("127.0.0.1:8844"));
-        assert_eq!(p.storage_dir, "/data/ducktape");
-        assert!(p.rpc_listen.is_none());
-        // and the merged write is network-shape.
-        write_node_toml(&dir, &p).expect("write");
+        assert_eq!(p.http_listen, "127.0.0.1:53001");
+        // unflagged values came from the existing file, not re-derivation:
+        // advertised stays "overlay" (from the file) even though the new
+        // listen is v4.
+        assert_eq!(p.advertised, "overlay");
+        assert_eq!(p.rpc_listen, DEFAULT_RPC_LISTEN);
+        write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
-        assert_eq!(raw.network.as_deref(), Some("network.toml"));
-        assert_eq!(raw.http_listen.as_deref(), Some("127.0.0.1:8844"));
         assert_eq!(raw.listen, "127.0.0.1:53000");
-        assert_eq!(raw.storage_dir.as_deref(), Some("/data/ducktape"));
+        assert_eq!(raw.http_listen, "127.0.0.1:53001");
+        assert_eq!(raw.rpc_listen, DEFAULT_RPC_LISTEN);
     }
 
+    /// file-only keys (no CLI flag) survive every rewrite via the same
+    /// chain — a hand-edit is never silently reset.
     #[test]
-    fn plumbing_wireguard_effect_flag_wins_absence_preserves_and_typos_abort() {
-        let dir = tmp("plumbing-wg-effect");
-        // fresh dir + flag (the desktop app's init/join): written to disk.
-        let p = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("socket"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("merge");
-        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
-        write_node_toml(&dir, &p).expect("write");
-
-        // no flag: the hand-settable value on disk survives a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
-            .expect("re-merge");
-        assert_eq!(p.wireguard_effect.as_deref(), Some("socket"));
-
-        // the flag wins over the file (merged_plumbing's standing precedence).
-        let p = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("tun"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("override");
-        assert_eq!(p.wireguard_effect.as_deref(), Some("tun"));
-
-        // a typo aborts the verb before anything is written.
-        let err = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("sokcet"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .err()
-        .expect("a bad effect value must abort the merge");
-        assert!(err.contains("wireguard_effect"), "{err}");
-    }
-
-    /// Both change (1)/(3) keys ride the SAME `Plumbing` chain as
-    /// `wireguard_effect` above: a flag wins, an existing file's value
-    /// survives an unflagged re-merge, and `write_node_toml` round-trips it
-    /// verbatim (config.rs's "GOTCHA" — a key not in `Plumbing` is silently
-    /// dropped on rewrite; this pins that it is NOT dropped).
-    #[test]
-    fn plumbing_primary_coordinator_and_wireguard_advertised_flag_wins_and_absence_preserves() {
-        let dir = tmp("plumbing-coord-wgadv");
-        // fresh dir + flags (the desktop app's init/join shape): written to disk.
-        let p = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("203.0.113.9:3478"),
-            Some("198.51.100.5:41820"),
-        )
-        .expect("merge");
-        assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
-        assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
-        write_node_toml(&dir, &p).expect("write");
-
-        // no flags: the hand-settable values on disk survive a re-merge.
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None, None)
-            .expect("re-merge");
-        assert_eq!(p.primary_coordinator.as_deref(), Some("203.0.113.9:3478"));
-        assert_eq!(p.wireguard_advertised.as_deref(), Some("198.51.100.5:41820"));
-
-        // the flags win over the file (merged_plumbing's standing precedence).
-        let p = merged_plumbing(
-            &dir,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("none"),
-            Some("203.0.113.9:41821"),
-        )
-        .expect("override");
-        assert_eq!(p.primary_coordinator.as_deref(), Some("none"));
-        assert_eq!(p.wireguard_advertised.as_deref(), Some("203.0.113.9:41821"));
-
-        // and the round trip re-reads verbatim — the survives-rewrite chain.
-        write_node_toml(&dir, &p).expect("write");
+    fn hand_edited_values_survive_rewrite() {
+        let dir = tmp("hand-edit");
+        let p = fresh_default_plumbing(&dir);
+        write_node_toml(&dir, &p).expect("write defaults");
+        let edited = std::fs::read_to_string(dir.join("node.toml"))
+            .expect("read")
+            .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
+            .replace("sandbox = \"direct\"", "sandbox = \"podman\"")
+            .replace("sandbox_cores = 0", "sandbox_cores = 4");
+        std::fs::write(dir.join("node.toml"), edited).expect("write");
+        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
+            .expect("merge");
+        write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
-        assert_eq!(raw.primary_coordinator.as_deref(), Some("none"));
-        assert_eq!(raw.wireguard_advertised.as_deref(), Some("203.0.113.9:41821"));
+        assert_eq!(raw.checkpoint_blocks, 7);
+        assert_eq!(raw.sandbox, "podman");
+        assert_eq!(raw.sandbox_cores, 4);
+    }
+
+    /// the dev-seed shape parses through the same loader, discriminated by
+    /// the absent `network` key — and the workspace verbs refuse it.
+    #[test]
+    fn dev_seed_shape_parses_and_workspace_verbs_refuse_it() {
+        let dir = tmp("dev-seed");
+        std::fs::write(
+            dir.join("node.toml"),
+            "id = 0\nnamespace = \"demo\"\npeer_seeds = [0]\nlisten = \"127.0.0.1:0\"\n",
+        )
+        .expect("write");
+        let (raw, _) = load_raw_node_toml(&dir.join("node.toml")).expect("parse");
+        assert!(matches!(raw, RawNodeToml::DevSeed(_)));
+        let err = load_node_toml(&dir.join("node.toml")).expect_err("verbs refuse dev shape");
+        assert!(err.contains("dev-seed"), "{err}");
+    }
+
+    #[test]
+    fn derived_relay_follows_the_coordinator() {
+        assert_eq!(derive_coordinator_relay("coord.example:3478"), "coord.example:443");
+        assert_eq!(derive_coordinator_relay("none"), "none");
     }
 }

@@ -187,9 +187,6 @@ pub struct InviteArgs {
     pub ttl_days: Option<u64>,
     #[command(flatten)]
     pub selector: Selector,
-    /// removed in the join protocol — kept only to refuse loudly with the migration hint
-    #[arg(long, hide = true, value_name = "HEX-PUBKEY")]
-    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -276,7 +273,4 @@ pub struct PlumbingArgs {
     /// invite intro listener address
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub invite_listen: Option<String>,
-    /// how the WireGuard interface takes effect
-    #[arg(long, value_name = "EFFECT", value_parser = ["socket", "tun", "fake"], hide_short_help = true)]
-    pub wireguard_effect: Option<String>,
 }
