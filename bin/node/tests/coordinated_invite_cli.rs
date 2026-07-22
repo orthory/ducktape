@@ -417,7 +417,13 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     let founder = dir.path().join("founder");
 
     // a socket-mode network whose only coordinator is an unroutable blackhole
-    // (RFC5737 TEST-NET-3 — guaranteed never to answer).
+    // (RFC5737 TEST-NET-3 — guaranteed never to answer). every surface gets
+    // an explicit ephemeral-range port: init's working defaults (52200,
+    // 8844/8845, 51820) would collide with a real node on this host.
+    let ports = alloc_ports(3);
+    let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
+    let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
+    drop(wg_probe);
     let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
         .args([
             "init",
@@ -427,6 +433,16 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
             founder.to_str().expect("utf-8 founder dir"),
             "--primary-coordinator",
             "203.0.113.1:3478",
+            "--listen",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--advertised",
+            &format!("127.0.0.1:{}", ports[0]),
+            "--http",
+            &format!("127.0.0.1:{}", ports[1]),
+            "--rpc",
+            &format!("127.0.0.1:{}", ports[2]),
+            "--wireguard-listen",
+            &format!("127.0.0.1:{wg_port}"),
         ])
         .output()
         .expect("run init");

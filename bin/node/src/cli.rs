@@ -372,7 +372,10 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
-/// seed the genesis validator set with this identity.
+/// seed the genesis validator set with this identity. Every flag is optional:
+/// the generated config defaults to a WORKING node (mesh `[::]:52200`,
+/// overlay advertise, HTTP 8844, RPC 8845, gateway, WireGuard 51820) and
+/// prints every key, so the file itself documents what to change.
 fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (pos, flags) = parse_flags(args)?;
     if !pos.is_empty() {
@@ -416,24 +419,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("primary-coordinator").map(String::as_str),
         flags.get("wireguard-advertised").map(String::as_str),
     )?;
-    if primary_coordinator.is_some() {
-        if plumbing.wireguard_listen.is_none() {
-            plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
-        }
-        if !flags.contains_key("listen") {
-            let port: u16 = plumbing
-                .listen
-                .parse::<std::net::SocketAddr>()
-                .map(|a| a.port())
-                .unwrap_or(0);
-            if port == 0 || !plumbing.listen.starts_with('[') {
-                plumbing.listen = format!("[::]:{}", if port == 0 { 52200 } else { port });
-            }
-        }
-        if plumbing.advertised.is_none() {
-            plumbing.advertised = Some("overlay".into());
-        }
-    }
+    config::seed_reachability_defaults(&mut plumbing, flags.contains_key("listen"));
 
     let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
     let me = key.public_key();
@@ -1636,29 +1622,12 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         flags.get("primary-coordinator").map(String::as_str),
         flags.get("wireguard-advertised").map(String::as_str),
     )?;
+    config::seed_reachability_defaults(&mut plumbing, flags.contains_key("listen"));
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the
-        // dial path, so the joiner's defaults change shape: its own plane
-        // comes up (wireguard_listen), its mesh listens dual-stack on a
-        // CONCRETE port and advertises the overlay ULA (members reverse-dial
-        // it over the tunnels). explicit flags and an existing node.toml
-        // still win.
-        if plumbing.wireguard_listen.is_none() {
-            plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
-        }
-        if !flags.contains_key("listen") {
-            let port: u16 = plumbing
-                .listen
-                .parse::<std::net::SocketAddr>()
-                .map(|a| a.port())
-                .unwrap_or(0);
-            if port == 0 || !plumbing.listen.starts_with('[') {
-                plumbing.listen = format!("[::]:{}", if port == 0 { 52200 } else { port });
-            }
-        }
-        if plumbing.advertised.is_none() {
-            plumbing.advertised = Some("overlay".into());
-        }
+        // dial path: fold the inviter's (and every offered front's) overlay
+        // ULA into this joiner's reach hints so the mesh can dial them the
+        // moment a tunnel is up.
         {
             let wg = &invite.wireguard;
             let issuer_identity =
