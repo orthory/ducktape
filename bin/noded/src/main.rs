@@ -49,24 +49,11 @@ use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
 
-/// every module registered at genesis, in registry order. status reports use
-/// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 14] = [
-    "chat",
-    "saga",
-    "dispatch",
-    "tagging",
-    "tasks",
-    "inbox",
-    "automations",
-    "agent",
-    "runs",
-    "pages",
-    "forge",
-    "files",
-    "identity",
-    "gateway",
-];
+/// every module registered at genesis, in registry order — the `sim_base`
+/// selection of the single-source [`host::topology`] (identical to simnode's
+/// default set). status reports use this list; the genesis vec in `run_node`
+/// composes the same ids over native module structs.
+const MODULE_IDS: &[&str] = host::topology::SIM_BASE;
 
 mod oracle_pool;
 
@@ -102,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // <storage>/index/<module>/, with each module's view mapper registered.
     // an open failure is fatal-with-remedy rather than a silent no-index run:
     // the tier is rebuildable, so the fix is always "delete <storage>/index".
-    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+    let index = noded::open_index_store(&storage, MODULE_IDS)?;
 
     let log_ring = noded::LogRing::default();
     noded::log::init(Some(log_ring.clone()));

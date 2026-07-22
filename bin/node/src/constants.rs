@@ -137,39 +137,16 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
-/// every module in the production genesis set, in status-report order. pinned
-/// to the `host_state::ProductionModules` registry by the parity test in
-/// `host_state` — status endpoints report exactly these roots.
+/// every module in the production genesis set, in status-report order — the
+/// `production` selection of the single-source [`host::topology`]. pinned to the
+/// `host_state::ProductionModules` registry by the parity test in `host_state`;
+/// the topology's own tests pin the selection to today's 20.
 ///
 /// A module here is in the app-hash: every node must run it, agree on its root
 /// at every height, and keep doing so forever (the height-gated upgrade path
 /// flips `protocol_version` only — it cannot change the module SET). Experiments
 /// therefore live unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: [&str; 20] = [
-    "pages",
-    "chat",
-    "forge",
-    "valset",
-    "governance",
-    "lifecycle",
-    "hello",
-    "saga",
-    "capability",
-    "dispatch",
-    "tagging",
-    "tasks",
-    "identity",
-    // the MERGED gateway owns the whole `.duck` name → AccountId → route
-    // pipeline: the route plane PLUS the human-name handle plane that the
-    // retired `duckdns` module used to own separately.
-    "gateway",
-    "inbox",
-    "directory",
-    "automations",
-    "files",
-    "agent",
-    "runs",
-];
+pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;
 
 /// Canonical committed-state revisions for the production module set.
 ///

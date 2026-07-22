@@ -138,7 +138,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
-    let index = noded::open_index_store(storage, &MODULE_IDS)?;
+    let index = noded::open_index_store(storage, MODULE_IDS)?;
     stream_hub.prime(index.resume_height()?, String::new());
     // the realtime hub's session lane: /v1/call/ws and /v1/presence/ws ask for
     // sessions here. created up front because the app-surface thread starts

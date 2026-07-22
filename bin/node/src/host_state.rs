@@ -175,6 +175,7 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 ///     dispatch carries NO ctx-routed enrichment: the former `query_with`
 ///     assignee facade was retired when runs' `lease_holder` moved onto saga,
 ///     so the guest's ctx-less query is exactly faithful to the native surface.
+///
 /// its saga collaborator id ("saga") is genesis-constant, compiled into the guest.
 const DISPATCH_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/guests/dispatch-wasm/component.wasm");
@@ -1279,11 +1280,12 @@ mod tests {
     use super::*;
     use crate::constants::{MODULE_IDS, MODULE_STATE_SCHEMAS};
 
-    /// the registry ↔ `MODULE_IDS` parity pin. [`ProductionModules`] already
-    /// forces genesis, restore, and state sync onto one module set at compile
-    /// time; this test pins that set to the `constants::MODULE_IDS` copy the
-    /// status/index surfaces iterate, so adding a module to one but not the
-    /// other fails here instead of silently misreporting.
+    /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
+    /// genesis, restore, and state sync onto one module set at compile time;
+    /// this test pins that set to `MODULE_IDS` — the `production` selection of
+    /// the single-source `host::topology` the status/index surfaces iterate — so
+    /// adding a module to one but not the other fails here instead of silently
+    /// misreporting.
     #[test]
     fn genesis_registry_matches_module_ids() {
         let dir = tempfile::tempdir().expect("tempdir");

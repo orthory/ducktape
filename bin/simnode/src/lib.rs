@@ -148,34 +148,11 @@ use statesync::qmdb::QmdbStore;
 use lifecycle::Lifecycle;
 use valset::Valset;
 
-/// the DEFAULT module set registered at genesis, in registry order — noded's
-/// exact set, so status/roots and query targets match what the app expects of a
-/// daemon. the sim-parity conformance lane pins this list against noded; do not
-/// change it without also changing the daemon.
-const BASE_MODULE_IDS: [&str; 14] = [
-    "chat",
-    "saga",
-    "dispatch",
-    "tagging",
-    "tasks",
-    "inbox",
-    "automations",
-    "agent",
-    "runs",
-    "pages",
-    "forge",
-    "files",
-    "identity",
-    // the MERGED gateway owns both the `.duck` handle plane and the route plane.
-    "gateway",
-];
-
-/// the four system modules the opt-in `--with-valset` genesis appends AFTER the
-/// default 14, in registry order: the KV store, the membership registry seeded
-/// with the genesis validators, governance (the sole authorized author of
-/// valset change), and the lifecycle coordinator — whose mere registration makes
-/// the host-injected once-per-block boundary `Advance` ride every sim block.
-const VALSET_MODULE_IDS: [&str; 4] = ["kv", "valset", "governance", "lifecycle"];
+// the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
+// single-source `host::topology` — noded's exact 14-module default plus the
+// opt-in 4 system modules. changing the daemon set changes the topology, which
+// re-pins here and at node/demo. the native genesis vec below composes these
+// same ids over native module structs (the wasm/native root split is by design).
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
 
@@ -395,11 +372,11 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // the status module list and the index tier both extend only under valset
     // keys; the default path stays the exact 14-module set the parity lane pins.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
-        BASE_MODULE_IDS.to_vec()
+        host::topology::SIM_BASE.to_vec()
     } else {
-        BASE_MODULE_IDS
+        host::topology::SIM_BASE
             .iter()
-            .chain(VALSET_MODULE_IDS.iter())
+            .chain(host::topology::SIM_VALSET)
             .copied()
             .collect()
     };
@@ -737,7 +714,7 @@ struct Sim {
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
     /// the registered module ids, in registry order — the exact set `status`
-    /// reports (the default 14, or those plus VALSET_MODULE_IDS under the flag).
+    /// reports (topology `sim_base`, or that plus `sim_valset` under the flag).
     module_ids: Vec<&'static str>,
     /// the fabricated mesh identity `status` reports (`--node-key`), or empty
     /// for the default "no peer-routed features here". no mesh sits behind it.
@@ -776,8 +753,9 @@ fn run_sim(
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: noded's exact module set (keep in sync with BASE_MODULE_IDS)
-        // so app queries and status roots behave like a real daemon's.
+        // genesis: noded's exact module set (topology `sim_base`), composed here
+        // over native module structs so app queries and status roots behave like
+        // a real daemon's.
         let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");

@@ -86,7 +86,7 @@ impl ValidatorRuntime<'_> {
             },
             RpcRequest::Status => {
                 let mut modules = std::collections::BTreeMap::new();
-                for m in MODULE_IDS {
+                for &m in MODULE_IDS {
                     if let Some(root) = node.host().module_root(m) {
                         modules.insert(m.to_string(), hex(&root));
                     }

@@ -68,63 +68,15 @@ fn main() {
     let _ = std::fs::remove_dir_all(&duckfs_dir);
 
     deterministic::Runner::default().start(|context| async move {
-        // genesis: the module registry (would be consensus state on a real chain).
-        let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-        let directory = Directory::new("directory");
-        let greeter = Greeter::new("greeter");
-        let forge = Forge::init("forge", forge_repo.clone())
-            .expect("forge init")
-            .with_chat("chat");
-        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-            .with_tagging("tagging");
-        let valset = Valset::new("valset");
-        let saga = SagaModule::new("saga");
-        let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
-        let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
-        let tasks = Tasks::new("tasks");
-        // the deterministic user->nodes binding registry: no valset gating and
-        // a fixed demo chain id (the demo has no real network descriptor).
-        let identity = Identity::new("identity", None, "demo".into());
-        let gateway = Gateway::new("gateway", "identity", None, "demo");
-        let inbox = Inbox::new("inbox");
-        let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
-        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
-        let runs = RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2) — mandatory for envelope composition.
-        .with_files_module("files");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let mut host = Host::genesis(vec![
-            Box::new(kv),
-            Box::new(directory),
-            Box::new(greeter),
-            Box::new(forge),
-            Box::new(chat),
-            Box::new(valset),
-            Box::new(saga),
-            Box::new(dispatch),
-            Box::new(tagging),
-            Box::new(tasks),
-            Box::new(identity),
-            Box::new(gateway),
-            Box::new(inbox),
-            Box::new(files),
-            Box::new(agent),
-            Box::new(runs),
-            Box::new(automations),
-        ])
-        .expect("genesis");
+        // genesis: the module registry (would be consensus state on a real
+        // chain) — the `demo` selection of the single-source `host::topology`,
+        // composed over native module structs.
+        let mut host = demo_genesis(&context, &forge_repo, &duckfs_dir).await;
 
-        println!("=== super-app demo — 19 registered modules over one host ===");
+        println!(
+            "=== super-app demo — {} registered modules over one host ===",
+            host::topology::DEMO.len()
+        );
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -586,4 +538,95 @@ fn main() {
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());
     });
+}
+
+/// Compose the demo's native genesis host — the `demo` selection of the
+/// single-source `host::topology`, one native module struct per id. Kept a
+/// function (not inlined in `main`) so the parity test can compose the exact
+/// same set and pin it against the topology.
+async fn demo_genesis(
+    context: &deterministic::Context,
+    forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
+) -> Host {
+    let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let directory = Directory::new("directory");
+    let greeter = Greeter::new("greeter");
+    let forge = Forge::init("forge", forge_repo.to_path_buf())
+        .expect("forge init")
+        .with_chat("chat");
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
+        .with_tagging("tagging");
+    let valset = Valset::new("valset");
+    let saga = SagaModule::new("saga");
+    let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
+    let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
+    let tasks = Tasks::new("tasks");
+    // the deterministic user->nodes binding registry: no valset gating and
+    // a fixed demo chain id (the demo has no real network descriptor).
+    let identity = Identity::new("identity", None, "demo".into());
+    let gateway = Gateway::new("gateway", "identity", None, "demo");
+    let inbox = Inbox::new("inbox");
+    let files = Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open");
+    let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let runs = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        "agent",
+        Some("tasks".into()),
+        Some("tasks".into()),
+    )
+    // the duckfs/files module the portable (v3) composer pins its source
+    // head from (W2) — mandatory for envelope composition.
+    .with_files_module("files");
+    let automations = Automations::new("automations", "chat", "tasks", "inbox");
+    Host::genesis(vec![
+        Box::new(kv),
+        Box::new(directory),
+        Box::new(greeter),
+        Box::new(forge),
+        Box::new(chat),
+        Box::new(valset),
+        Box::new(saga),
+        Box::new(dispatch),
+        Box::new(tagging),
+        Box::new(tasks),
+        Box::new(identity),
+        Box::new(gateway),
+        Box::new(inbox),
+        Box::new(files),
+        Box::new(agent),
+        Box::new(runs),
+        Box::new(automations),
+    ])
+    .expect("genesis")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The demo genesis composes exactly the topology's `demo` selection — the
+    /// demo analogue of node's `genesis_registry_matches_module_ids`. Adding or
+    /// dropping a module here without updating `host::topology::DEMO` fails here.
+    #[test]
+    fn demo_genesis_matches_topology() {
+        let dir = std::env::temp_dir().join(format!("ducktape-demo-topo-{}", std::process::id()));
+        let forge_repo = dir.join("forge");
+        let duckfs_dir = dir.join("duckfs");
+        let _ = std::fs::remove_dir_all(&dir);
+        deterministic::Runner::default().start(|context| async move {
+            let host = demo_genesis(&context, &forge_repo, &duckfs_dir).await;
+            let mut got: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            got.sort_unstable();
+            let mut want: Vec<String> =
+                host::topology::DEMO.iter().map(|s| s.to_string()).collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "demo genesis set must equal host::topology::DEMO");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
