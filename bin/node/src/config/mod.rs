@@ -719,6 +719,14 @@ pub fn workspaces_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".ducktape").join("workspaces"))
 }
 
+/// the registry directory a chain-id's workspace materializes into:
+/// `<workspaces_root>/<chain-id>`. path separators in the id (a `--name` is
+/// arbitrary text) are made inert — the registry resolves by descriptor
+/// content, so the directory name is display-only.
+pub fn default_workspace_dir(chain_id: &str) -> Result<PathBuf, String> {
+    Ok(workspaces_root()?.join(chain_id.replace(std::path::MAIN_SEPARATOR, "-")))
+}
+
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
 /// registry for descriptors whose chain-id matches `needle` — exact first,
 /// else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`). ambiguity
