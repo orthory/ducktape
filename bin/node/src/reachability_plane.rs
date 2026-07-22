@@ -270,7 +270,10 @@ where
     std::thread::Builder::new()
         .name("reachability".into())
         .spawn(move || {
+            // default is one worker per core; this plane pumps a handful of
+            // control-plane sockets and never needs that fan-out.
             tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("reachability tokio runtime")
