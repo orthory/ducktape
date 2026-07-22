@@ -28,6 +28,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Admit(args) => cmd_admit(args),
         OpCmd::Join(cmd) => dispatch_join(cmd),
         OpCmd::List => cmd_list(),
+        OpCmd::Status(args) => cmd_node_status(args),
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
     }
@@ -74,6 +75,42 @@ fn cmd_list() -> CommandResult {
     for (chain_id, config_path) in workspaces {
         println!("{chain_id}\t{}", config_path.display());
     }
+    Ok(())
+}
+
+/// `status [--config <path> | -n <chain-id>] [--json]` — read the RUNNING
+/// node's tip off its local rpc and print one machine-parseable line to
+/// stdout:
+///
+/// ```text
+/// height=<h> app_hash=<hex>
+/// ```
+///
+/// `height=none` means no block has finalized yet. `--json` emits the rpc's
+/// full status object (height, app_hash, every module root). requires the
+/// node to be up — the same local rpc lane as `member status`.
+fn cmd_node_status(args: StatusArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let resolved = config::resolve(&cfg_path)?;
+    let rpc_addr = resolved
+        .rpc_listen
+        .clone()
+        .ok_or("node status reads the node's local rpc — set `rpc_listen` in node.toml")?;
+    let reply = rpc_call(&rpc_addr, &serde_json::json!({ "cmd": "status" }))?;
+    if reply["ok"] != true {
+        return Err(format!("status: {}", reply["error"]).into());
+    }
+    let status = &reply["status"];
+    if args.json {
+        println!("{status}");
+        return Ok(());
+    }
+    let height = match status["height"].as_u64() {
+        Some(h) => h.to_string(),
+        None => "none".into(),
+    };
+    let app_hash = status["app_hash"].as_str().unwrap_or("");
+    println!("height={height} app_hash={app_hash}");
     Ok(())
 }
 
