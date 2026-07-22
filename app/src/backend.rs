@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -7,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chat::{AuthorRef, ChatMsg, ChatQuery, ChatReply, PostPolicy};
-use ducktape_rpc::{Client as RpcClient, Status as NodeStatus};
+use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
+use iced::futures::StreamExt as _;
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
 use tokio::io::AsyncWriteExt as _;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -30,6 +32,7 @@ pub struct ChatMessage {
     pub author: String,
     pub meta: String,
     pub body: String,
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -50,6 +53,7 @@ pub struct PageBlock {
     pub id: String,
     pub kind: String,
     pub text: String,
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -62,6 +66,7 @@ pub struct PagesData {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct WorkspaceData {
+    pub generation: i64,
     pub rpc: String,
     pub status: String,
     pub height: i64,
@@ -75,14 +80,60 @@ pub struct WorkspaceData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
-pub struct BlockTip {
-    pub height: i64,
-    pub status: String,
+pub struct AppError {
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AppError {
+pub struct HydrationError {
+    pub generation: i64,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LiveUpdate {
+    pub kind: String,
+    pub status: String,
+    pub height: i64,
+}
+
+pub fn optimistic_message(mut messages: Vec<ChatMessage>, body: String) -> Vec<ChatMessage> {
+    messages.push(ChatMessage {
+        author: "You".into(),
+        meta: "Sending…".into(),
+        body,
+        pending: true,
+    });
+    messages
+}
+
+pub fn rollback_messages(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages.retain(|message| !message.pending);
+    messages
+}
+
+pub fn optimistic_paragraph(mut blocks: Vec<PageBlock>, text: String) -> Vec<PageBlock> {
+    blocks.push(PageBlock {
+        id: "pending".into(),
+        kind: "Text · Saving…".into(),
+        text,
+        pending: true,
+    });
+    blocks
+}
+
+pub fn rollback_blocks(mut blocks: Vec<PageBlock>) -> Vec<PageBlock> {
+    blocks.retain(|block| !block.pending);
+    blocks
+}
+
+pub fn restore_draft(current: String, pending: String) -> String {
+    if current.is_empty() { pending } else { current }
+}
+
+struct Tip {
+    height: i64,
+    status: String,
 }
 
 fn rpc_client(input: &str) -> Result<RpcClient, String> {
@@ -97,37 +148,127 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
 pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        load_workspace(&rpc, None, None).await
+        load_workspace(&rpc, None, None, 0).await
     }
     .await
     .map_err(app_error)
 }
 
-pub async fn block_tip(rpc: String) -> Result<BlockTip, AppError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        tip_from_status(rpc.status().await?)
+pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, LiveUpdate> {
+    struct State {
+        rpc: String,
+        cursors: BTreeMap<String, String>,
+        stream: Option<ducktape_rpc::ModuleEventStream>,
+        retry_attempt: u32,
     }
-    .await
-    .map_err(app_error)
+
+    iced::futures::stream::unfold(
+        State {
+            rpc,
+            cursors: BTreeMap::new(),
+            stream: None,
+            retry_attempt: 0,
+        },
+        |mut state| async move {
+            if state.stream.is_none() && state.retry_attempt > 0 {
+                tokio::time::sleep(retry_delay(state.retry_attempt)).await;
+            }
+            if state.stream.is_none() {
+                let connected = async {
+                    let rpc = rpc_client(&state.rpc)?;
+                    rpc.module_events(
+                        vec!["chat".to_string(), "pages".to_string()],
+                        state.cursors.clone(),
+                    )
+                    .await
+                    .map_err(Into::into)
+                }
+                .await;
+                match connected {
+                    Ok(stream) => state.stream = Some(stream),
+                    Err(error) => {
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                        return Some((live_retry(error), state));
+                    }
+                }
+            }
+            let event = state
+                .stream
+                .as_mut()
+                .expect("stream initialized above")
+                .next()
+                .await;
+            match event {
+                Some(Ok(ModuleEvent::Ready { cursors })) => {
+                    state.cursors = cursors;
+                    state.retry_attempt = 0;
+                    Some((live_update("ready", "Live", -1), state))
+                }
+                Some(Ok(ModuleEvent::Changed {
+                    module,
+                    cursor,
+                    height,
+                })) => {
+                    state.cursors.insert(format!("module:{module}"), cursor);
+                    let height = i64::try_from(height).unwrap_or(i64::MAX);
+                    Some((
+                        live_update("changed", &format!("Live · block {height}"), height),
+                        state,
+                    ))
+                }
+                Some(Ok(ModuleEvent::Lagged { module, cursor })) => {
+                    state.cursors.insert(format!("module:{module}"), cursor);
+                    Some((live_update("changed", "Live · resyncing", -1), state))
+                }
+                Some(Err(error)) => {
+                    state.stream = None;
+                    state.retry_attempt = state.retry_attempt.saturating_add(1);
+                    Some((live_retry(error.into()), state))
+                }
+                None => {
+                    state.stream = None;
+                    state.retry_attempt = state.retry_attempt.saturating_add(1);
+                    Some((live_retry("RPC stream closed".into()), state))
+                }
+            }
+        },
+    )
+    .boxed()
 }
 
 pub async fn refresh(
     rpc: String,
     channel_id: String,
     page_id: String,
-) -> Result<WorkspaceData, AppError> {
+    generation: i64,
+) -> Result<WorkspaceData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
         load_workspace(
             &rpc,
             (!channel_id.is_empty()).then_some(channel_id.as_str()),
             (!page_id.is_empty()).then_some(page_id.as_str()),
+            generation,
         )
         .await
     }
     .await
-    .map_err(app_error)
+    .map_err(|message| HydrationError {
+        generation,
+        message,
+    })
+}
+
+pub async fn retry_refresh(
+    rpc: String,
+    channel_id: String,
+    page_id: String,
+    generation: i64,
+    attempt: i64,
+) -> Result<WorkspaceData, HydrationError> {
+    let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
+    tokio::time::sleep(retry_delay(attempt)).await;
+    refresh(rpc, channel_id, page_id, generation).await
 }
 
 pub async fn load_chat(rpc: String, channel_id: String) -> Result<ChatData, AppError> {
@@ -314,11 +455,13 @@ async fn load_workspace(
     rpc: &RpcClient,
     channel_id: Option<&str>,
     page_id: Option<&str>,
+    generation: i64,
 ) -> Result<WorkspaceData, String> {
     let tip = tip_from_status(rpc.status().await?)?;
     let chat = load_chat_data(rpc, channel_id).await?;
     let pages = load_pages_data(rpc, page_id).await?;
     Ok(WorkspaceData {
+        generation,
         rpc: rpc.origin().to_string(),
         status: tip.status,
         height: tip.height,
@@ -332,9 +475,9 @@ async fn load_workspace(
     })
 }
 
-fn tip_from_status(status: NodeStatus) -> Result<BlockTip, String> {
+fn tip_from_status(status: NodeStatus) -> Result<Tip, String> {
     let height = i64::try_from(status.height).map_err(|_| "node height exceeds i64")?;
-    Ok(BlockTip {
+    Ok(Tip {
         height,
         status: format!("Connected · block {height}"),
     })
@@ -396,6 +539,7 @@ async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMess
             } else {
                 message_body(&message.head.blocks)
             },
+            pending: false,
         })
         .collect())
 }
@@ -449,6 +593,7 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
             id: block.id,
             kind: block_kind_name(block.kind).into(),
             text: block.text,
+            pending: false,
         })
         .collect();
     Ok(PagesData {
@@ -605,6 +750,27 @@ fn app_error(message: String) -> AppError {
     AppError { message }
 }
 
+fn retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4);
+    Duration::from_secs(1_u64 << exponent)
+}
+
+fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
+    LiveUpdate {
+        kind: kind.into(),
+        status: status.into(),
+        height,
+    }
+}
+
+fn live_retry(_message: String) -> LiveUpdate {
+    LiveUpdate {
+        kind: "retrying".into(),
+        status: "Reconnecting…".into(),
+        height: -1,
+    }
+}
+
 fn message_body(blocks: &[chat::Block]) -> String {
     blocks
         .iter()
@@ -718,6 +884,7 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use commonware_cryptography::{Signer as _, ed25519};
+    use iced::futures::StreamExt as _;
 
     use super::*;
 
@@ -819,6 +986,9 @@ mod tests {
 
         let origin = rpc.origin().to_string();
         let workspace = connect(origin.clone()).await.unwrap();
+        let mut live = live_events(origin.clone());
+        let ready = live.next().await.unwrap();
+        assert_eq!(ready.kind, "ready");
         submit_test(
             &rpc,
             &signer,
@@ -833,14 +1003,23 @@ mod tests {
             }),
         )
         .await;
-        let tip = block_tip(origin.clone()).await.unwrap();
-        assert!(tip.height > workspace.height);
-        let refreshed = refresh(origin, "general".into(), "welcome".into())
+        let changed = live.next().await.unwrap();
+        assert_eq!(changed.kind, "changed");
+        assert!(changed.height > workspace.height);
+        let refreshed = refresh(origin, "general".into(), "welcome".into(), 7)
             .await
             .unwrap();
+        assert_eq!(refreshed.generation, 7);
         assert_eq!(refreshed.messages[1].body, "arrived on the next block");
         assert_eq!(refreshed.active_page, "welcome");
         sim.shutdown();
+    }
+
+    #[test]
+    fn hydration_retry_is_capped() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(3), Duration::from_secs(4));
+        assert_eq!(retry_delay(99), Duration::from_secs(16));
     }
 
     async fn submit_test(

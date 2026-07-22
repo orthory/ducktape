@@ -54,7 +54,8 @@ mod tests {
                 .any(|name| line.trim_start().starts_with(&format!("{name} =")))
         });
         assert!(!overwrites_editable);
-        assert!(source.contains("run block_tip(connected_rpc)"));
+        assert!(source.contains("run live_events(connected_rpc) when connected"));
+        assert!(!source.contains("every 1s"));
         assert!(source.contains("run refresh(connected_rpc"));
     }
 
@@ -63,14 +64,23 @@ mod tests {
         let (mut app, _) = Ducktape::__boot();
         app.status = "current".into();
         app.sync_phase = "refreshing".into();
+        app.hydration_generation = 3;
         app.loading = false;
 
         let _ = app.__update(__DucktapeMessage::ChooseChannel("next".into()));
         assert_eq!(app.sync_phase, "idle");
-        app.loading = false;
+        assert_eq!(app.hydration_generation, 4);
+
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "changed".into(),
+            status: "Live".into(),
+            height: 99,
+        }));
+        assert!(app.live_dirty);
 
         let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
             backend::WorkspaceData {
+                generation: 3,
                 rpc: "http://stale".into(),
                 status: "stale".into(),
                 height: 99,
@@ -83,12 +93,56 @@ mod tests {
                 active_page_title: String::new(),
             },
         ));
-        assert_eq!(app.status, "current");
-
-        app.sync_phase = "polling".into();
-        let _ = app.__update(__DucktapeMessage::PollFailed(backend::AppError {
-            message: "offline".into(),
-        }));
+        assert_eq!(app.status, "Live");
         assert_eq!(app.sync_phase, "idle");
+    }
+
+    #[test]
+    fn optimistic_send_never_erases_the_next_draft() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.message_draft = "first".into();
+
+        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        assert_eq!(app.mutation_phase, "message");
+        assert!(app.message_draft.is_empty());
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.messages[0].pending);
+
+        app.message_draft = "second".into();
+        let _ = app.__update(__DucktapeMessage::ChatMutated(backend::ChatData {
+            channels: Vec::new(),
+            messages: vec![backend::ChatMessage {
+                author: "you".into(),
+                meta: "#1".into(),
+                body: "first".into(),
+                pending: false,
+            }],
+            active_channel: "general".into(),
+        }));
+        assert_eq!(app.message_draft, "second");
+        assert_eq!(app.mutation_phase, "idle");
+        assert!(!app.messages[0].pending);
+    }
+
+    #[test]
+    fn failed_optimistic_send_rolls_back_and_restores_the_draft() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.message_draft = "retry me".into();
+
+        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
+            message: "rejected".into(),
+        }));
+
+        assert_eq!(app.message_draft, "retry me");
+        assert!(app.messages.is_empty());
+        assert_eq!(app.error, "rejected");
+        assert_eq!(app.mutation_phase, "idle");
     }
 }

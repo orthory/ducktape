@@ -1,11 +1,13 @@
 //! Bounded async client for Ducktape's public node RPC surface.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
-use futures::StreamExt as _;
+use futures::{SinkExt as _, StreamExt as _};
 use reqwest::{Response, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio_tungstenite::tungstenite::Message;
 
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 4 * 1024;
@@ -38,6 +40,24 @@ impl From<Error> for String {
 /// Result returned by the RPC client.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A live module event from the node's resumable `/v1/ws` stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModuleEvent {
+    /// The requested topics are active. Cursors are suitable for reconnect.
+    Ready { cursors: BTreeMap<String, String> },
+    /// One committed operation changed a module.
+    Changed {
+        module: String,
+        cursor: String,
+        height: u64,
+    },
+    /// Replay history was unavailable; hydrate a fresh snapshot at this cursor.
+    Lagged { module: String, cursor: String },
+}
+
+/// One connected module-event session. Reconnect policy belongs to the caller.
+pub type ModuleEventStream = futures::stream::BoxStream<'static, Result<ModuleEvent>>;
+
 /// The stable portion of `GET /v1/status` needed by public clients.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Status {
@@ -56,6 +76,42 @@ pub struct Client {
 struct QueryRequest<'a, Q> {
     target: &'a str,
     query: &'a Q,
+}
+
+#[derive(Serialize)]
+struct SubscribeRequest {
+    op: &'static str,
+    topics: Vec<String>,
+    resume: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StreamFrame {
+    Subscribed {
+        topics: BTreeMap<String, Option<String>>,
+    },
+    Event {
+        topic: String,
+        cursor: String,
+        op: StreamOp,
+    },
+    Lagged {
+        topic: String,
+        cursor: String,
+    },
+    Heartbeat,
+    Error {
+        topic: String,
+        detail: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+struct StreamOp {
+    height: u64,
 }
 
 impl Client {
@@ -131,11 +187,124 @@ impl Client {
         Err(response_error(response).await)
     }
 
+    /// Connect to the node stream and subscribe to committed module changes.
+    pub async fn module_events(
+        &self,
+        modules: Vec<String>,
+        resume: BTreeMap<String, String>,
+    ) -> Result<ModuleEventStream> {
+        if modules.is_empty() {
+            return Err(Error::new("at least one module stream is required"));
+        }
+        let topics = modules
+            .into_iter()
+            .map(|module| format!("module:{module}"))
+            .collect::<Vec<_>>();
+        let expected = topics.iter().cloned().collect::<BTreeSet<_>>();
+        let subscribe = serde_json::to_string(&SubscribeRequest {
+            op: "subscribe",
+            topics,
+            resume,
+        })
+        .map_err(|error| Error::new(format!("could not encode stream subscription: {error}")))?;
+        let url = self.stream_url()?;
+        let (mut socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(&url))
+            .await
+            .map_err(|_| Error::new("RPC stream connection timed out"))?
+            .map_err(|error| Error::new(format!("RPC stream connection failed: {error}")))?;
+        tokio::time::timeout(TIMEOUT, socket.send(Message::Text(subscribe)))
+            .await
+            .map_err(|_| Error::new("RPC stream subscription timed out"))?
+            .map_err(|error| Error::new(format!("RPC stream subscription failed: {error}")))?;
+        Ok(socket
+            .filter_map(move |message| {
+                futures::future::ready(decode_stream_message(message, &expected))
+            })
+            .boxed())
+    }
+
     fn url(&self, path: &str) -> Result<Url> {
         self.base
             .join(path)
             .map_err(|_| Error::new("could not build RPC URL"))
     }
+
+    fn stream_url(&self) -> Result<String> {
+        let mut url = self.url("v1/ws")?;
+        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+        url.set_scheme(scheme)
+            .map_err(|_| Error::new("could not build RPC stream URL"))?;
+        Ok(url.to_string())
+    }
+}
+
+fn decode_stream_message(
+    message: std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+    expected: &BTreeSet<String>,
+) -> Option<Result<ModuleEvent>> {
+    let message = match message {
+        Ok(message) => message,
+        Err(error) => return Some(Err(Error::new(format!("RPC stream failed: {error}")))),
+    };
+    let Message::Text(text) = message else {
+        return match message {
+            Message::Close(_) => Some(Err(Error::new("RPC stream closed"))),
+            Message::Binary(_) => Some(Err(Error::new("RPC stream returned binary data"))),
+            _ => None,
+        };
+    };
+    if text.len() > MAX_JSON_BYTES {
+        return Some(Err(Error::new("RPC stream frame exceeds the client limit")));
+    }
+    let frame = match serde_json::from_str::<StreamFrame>(&text) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return Some(Err(Error::new(format!(
+                "RPC stream returned invalid JSON: {error}"
+            ))));
+        }
+    };
+    match frame {
+        StreamFrame::Subscribed { topics } => {
+            let complete = expected
+                .iter()
+                .all(|topic| topics.get(topic).is_some_and(|cursor| cursor.is_some()));
+            if !complete {
+                return Some(Err(Error::new(
+                    "RPC stream refused a required module topic",
+                )));
+            }
+            let cursors = topics
+                .into_iter()
+                .filter_map(|(topic, cursor)| cursor.map(|cursor| (topic, cursor)))
+                .collect();
+            Some(Ok(ModuleEvent::Ready { cursors }))
+        }
+        StreamFrame::Event { topic, cursor, op } => Some(module_name(&topic, expected).map(
+            |module| ModuleEvent::Changed {
+                module,
+                cursor,
+                height: op.height,
+            },
+        )),
+        StreamFrame::Lagged { topic, cursor } => {
+            Some(module_name(&topic, expected).map(|module| ModuleEvent::Lagged { module, cursor }))
+        }
+        StreamFrame::Error { topic, detail } => Some(Err(Error::new(format!(
+            "RPC stream topic {topic} failed: {detail}"
+        )))),
+        StreamFrame::Heartbeat | StreamFrame::Other => None,
+    }
+}
+
+fn module_name(topic: &str, expected: &BTreeSet<String>) -> Result<String> {
+    if !expected.contains(topic) {
+        return Err(Error::new("RPC stream returned an unexpected topic"));
+    }
+    topic
+        .strip_prefix("module:")
+        .map(str::to_string)
+        .ok_or_else(|| Error::new("RPC stream returned an invalid module topic"))
 }
 
 async fn decode_json<T: DeserializeOwned>(response: Response) -> Result<T> {
@@ -209,5 +378,32 @@ mod tests {
         ] {
             assert!(Client::new(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    #[test]
+    fn decodes_only_subscribed_module_topics() {
+        let expected = BTreeSet::from(["module:chat".to_string(), "module:pages".to_string()]);
+        let subscribed =
+            r#"{"type":"subscribed","topics":{"module:chat":"c1","module:pages":"p1"}}"#;
+        let ready = decode_stream_message(Ok(Message::Text(subscribed.into())), &expected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready,
+            ModuleEvent::Ready {
+                cursors: BTreeMap::from([
+                    ("module:chat".into(), "c1".into()),
+                    ("module:pages".into(), "p1".into()),
+                ]),
+            }
+        );
+
+        let unexpected =
+            r#"{"type":"event","topic":"module:files","cursor":"f1","op":{"height":7}}"#;
+        assert!(
+            decode_stream_message(Ok(Message::Text(unexpected.into())), &expected)
+                .unwrap()
+                .is_err()
+        );
     }
 }
