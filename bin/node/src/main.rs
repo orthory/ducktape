@@ -300,11 +300,13 @@ fn run_node_verb(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let log_ring = noded::LogRing::default();
-    // ONE filter over stderr (→ daemon.log) + the ring (→ the app's Logs tab).
-    // the old two-filter setup defaulted stderr to `EnvFilter::from_default_env()`,
-    // whose no-directive default is ERROR — so with RUST_LOG unset (which is how
-    // the desktop spawns us) nothing below error ever reached daemon.log at all.
-    noded::log::init(Some(log_ring.clone()));
+    // ONE filter over stderr + the ring (the ws `logs` topic) + the node's own
+    // `<workspace>/daemon.log` (no spawner tees for us any more). the old
+    // two-filter setup defaulted stderr to `EnvFilter::from_default_env()`,
+    // whose no-directive default is ERROR — so with RUST_LOG unset nothing
+    // below error was ever recorded at all.
+    let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
+    noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
 
     run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
 }

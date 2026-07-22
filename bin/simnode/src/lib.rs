@@ -418,7 +418,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // its own ring, nothing just feeds the global tracing layer.
     let (handle, cmd_rx, stream_hub) = if install_log {
         let log_ring = noded::LogRing::default();
-        noded::log::init(Some(log_ring.clone()));
+        noded::log::init(Some(log_ring.clone()), None);
         NodeHandle::channel_with_log_ring(log_ring)
     } else {
         NodeHandle::channel()
