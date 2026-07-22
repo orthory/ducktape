@@ -1,4 +1,3 @@
-use host::Host;
 use noded::projection::project_root_op;
 use sdk::StateRoot;
 
@@ -170,26 +169,20 @@ impl recovery::ReplaySink for IndexFold<'_> {
     }
 }
 
-/// re-derive every index module whose watermark trails `boundary` from the
-/// host's VERIFIED canonical state (checkpoint-restored, state-synced, or
-/// replay-verified — every boot caller sits after a root/app-hash check).
-/// failures poison the store and log; the node boots regardless.
-pub(crate) async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str) {
-    let meta = indexer::RebuildMeta {
-        height: boundary,
-        // the validator's consensus time IS the height.
-        time: boundary,
-    };
-    match noded::rebuild_stale_modules(index, host, meta).await {
-        Ok(rebuilt) => {
-            for (module, rows) in rebuilt {
+/// stamp every index module whose watermark trails `boundary` as backfilled
+/// (every boot caller sits after a root/app-hash check; history below the
+/// boundary re-enters only by replaying blocks through the feed). failures
+/// poison the store and log; the node boots regardless.
+pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str) {
+    match noded::stamp_stale_modules(index, boundary) {
+        Ok(stamped) => {
+            for module in stamped {
                 tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
                     module,
                     height = boundary,
-                    rows,
-                    "index for {module} re-derived from state at height {boundary} ({rows} rows)"
+                    "index for {module} stamped backfilled at height {boundary}"
                 );
             }
         }

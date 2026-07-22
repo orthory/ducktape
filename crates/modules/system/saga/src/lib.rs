@@ -70,11 +70,17 @@
 mod interface;
 pub use interface::*;
 
-// the usage ledger: a node-local derived index over this module's op stream.
-// native-only: `indexer` drags unix-only IO that cannot cross into the wasm
-// guest, and the ledger is a serving-binary view, never consensus state.
-#[cfg(feature = "native")]
+// the usage ledger: the PURE decision core (fold + view over
+// index_guest::StateRead), compiled everywhere and unit-tested natively.
+// the engine shell that runs it inside the module's index database is
+// `index_guest` below.
 pub mod index;
+
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
 
 use std::collections::{BTreeMap, BTreeSet};
 

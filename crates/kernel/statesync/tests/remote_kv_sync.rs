@@ -367,8 +367,14 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
     // no runtime context: the index store is plain-fs, the wire is a channel.
     futures::executor::block_on(async {
         let src_dir = tempfile::tempdir().expect("src dir");
-        let source =
-            indexer::IndexStore::open(src_dir.path(), &["chat", "tasks"]).expect("open source");
+        let source = indexer::IndexStore::open(
+            src_dir.path(),
+            &[
+                indexer::IndexModule::bare("chat"),
+                indexer::IndexModule::bare("tasks"),
+            ],
+        )
+        .expect("open source");
         for h in 1..=4u64 {
             source
                 .apply_block(&indexer::BlockOps {
@@ -401,7 +407,10 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
                 .await
                 .expect("index modules");
             assert_eq!(
-                entries.iter().map(|(db, _)| db.as_str()).collect::<Vec<_>>(),
+                entries
+                    .iter()
+                    .map(|(db, _)| db.as_str())
+                    .collect::<Vec<_>>(),
                 vec!["_blocks", "chat", "tasks"],
             );
             // the joiner's exact sequence: fetch, decode, stage, commit.
@@ -431,10 +440,7 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
                     let mut blobs = std::collections::BTreeMap::new();
                     for db in ["chat", "tasks", indexer::BLOCKS_DB_ID] {
                         let files = source_for_serve.checkpoint_files(db).expect("cut");
-                        blobs.insert(
-                            db.to_string(),
-                            statesync::encode_index_archive(&files),
-                        );
+                        blobs.insert(db.to_string(), statesync::encode_index_archive(&files));
                     }
                     server.attach_index(boundary, blobs).expect("attach");
                 }
@@ -448,13 +454,18 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
         let (dest_dir, ()) = futures::join!(join_side, server_side);
 
         // adoption at open: the shipped store equals the source and folds on.
-        let shipped = indexer::IndexStore::open(dest_dir.path().join("index"), &["chat", "tasks"])
-            .expect("open adopted store");
+        let shipped = indexer::IndexStore::open(
+            dest_dir.path().join("index"),
+            &[
+                indexer::IndexModule::bare("chat"),
+                indexer::IndexModule::bare("tasks"),
+            ],
+        )
+        .expect("open adopted store");
         assert_eq!(shipped.applied_height("chat").expect("chat wm"), 4);
         assert_eq!(shipped.applied_height("tasks").expect("tasks wm"), 4);
         assert_eq!(shipped.blocks_height().expect("blocks wm"), 4);
-        let rows =
-            |s: &indexer::IndexStore| s.scan("chat", b"", None, 1024).expect("scan").entries;
+        let rows = |s: &indexer::IndexStore| s.scan("chat", b"", None, 1024).expect("scan").entries;
         assert_eq!(rows(&source), rows(&shipped), "chat keys byte-identical");
         assert_eq!(
             source.recent_block_rows(10).expect("source rows"),

@@ -56,6 +56,7 @@ members = [
     "crates/kernel/sdk", "crates/kernel/sdk-testkit", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
+    "crates/kernel/index-guest",
     "crates/kernel/wasm-host",
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
@@ -195,8 +196,17 @@ zeroize = "1"
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
 # per-module indexer tier ONLY: nothing the app-hash commits to may live in it
 # (evaluated and rejected as a canonical substrate — see handoff/restart-recovery.md).
-# default-features = false drops the in-database WASM layer (wasmtime).
+# default-features = false keeps the base dep lean; the indexer crate turns the
+# `wasm` feature on — the in-database WASM layer (wasmtime) runs the per-module
+# index guests (fold triggers + view queries).
 fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
+# fluent-guest — fluent31's wasm32 guest SDK. NEVER a host-side dependency:
+# only the index-guest crate's `guest` feature pulls it, and only guest-builder's
+# synthesized wasm32 workspaces ever enable that feature.
+fluent-guest = { git = "https://github.com/orthory/fluent31", default-features = false }
+# borsh — the deterministic op-row envelope on the derived tier's fold feed
+# (host encodes, index guests decode; one byte layout, no map ordering games).
+borsh = { version = "1", default-features = false, features = ["derive", "std"] }
 
 # wasmtime — the frozen-substrate wasm runtime that executes hot-swappable
 # modules inside the host. pinned EXACTLY: the runtime IS the module execution
@@ -216,6 +226,10 @@ consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
+# keyed with the underscore ON PURPOSE: module crates declare a feature named
+# `index-guest` (the guest-builder --index contract), and cargo refuses a
+# feature sharing its name with a non-optional dependency key.
+index_guest = { path = "crates/kernel/index-guest", package = "index-guest" }
 capability-host = { path = "crates/modules/system/capability-host" }
 wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
@@ -269,3 +283,17 @@ rand_core = "0.6.4"
 # its uninhabited extern-static type is future-incompatible with Rust. Keep the
 # API/ABI identical and patch only that declaration locally.
 block = { path = "patches/block" }
+
+# dev/test builds compile wasm guests through cranelift (consensus components
+# in the kernel tests, index guests at every store open). unoptimized
+# cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
+# concurrently blows readiness deadlines — so the code generator itself is
+# always built optimized. build-time only; artifacts and semantics unchanged.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3

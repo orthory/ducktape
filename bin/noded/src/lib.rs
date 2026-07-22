@@ -85,11 +85,12 @@ mod term_consensus;
 // does: `command_blocks(line)` -> a `PostMessage` body, `command_text(blocks)`
 // -> the line, `session_channel(id)` -> the carrier channel.
 pub use term_consensus::{command_blocks, command_text, session_channel};
-// the derived-index tier: store construction, rebuilds, /v1/index/* + /v1/blocks.
+// the derived-index tier: store construction, boundary stamps, /v1/index/* +
+// /v1/blocks.
 mod index;
 pub use index::{
     BlocksParams, IndexScanParams, index_block_ops, index_origin, open_index_store,
-    rebuild_stale_modules,
+    stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;

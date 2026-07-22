@@ -32,8 +32,8 @@ Clone the `tasks` shape:
   `commit_block`) + `snapshot()`/`install()`. Re-export `interface` at root.
 - `tests/` — happy path, every rejection, snapshot→install root round-trip.
 - Root `Cargo.toml`: `members` entry + `[workspace.dependencies]` alias.
-- Native-only deps (derived index, unix IO, tokio) must sit behind a `native`
-  feature or be absent — the guest build compiles this same crate to wasm32.
+- Native-only deps (media engines, unix IO, tokio) must sit behind a `native`
+  feature or be absent — the guest builds compile this same crate to wasm32.
 
 ## 2. Wasm guest — `src/guest.rs` in the module crate, packaged by guest-builder
 
@@ -50,6 +50,24 @@ canonical COMMITTED `component.wasm` into the module directory.
 
 `Makefile`: add the module to `BUILDER_MODULES` — that one entry covers the
 build, the fixture `cp`, and the `wasm-modules-check` `cmp`.
+
+## 2b. Index guest (optional) — the module's derived-tier mapper
+
+A module that wants a materialized view (search, listings — anything qmdb's
+point lookups can't serve) ships a SECOND wasm artifact: the index guest
+(spec: `docs/records/specs/indexable-spec.md`). Same two-file shape in the
+module crate:
+- `src/index.rs` — the pure decision core: `fold_op`/`serve_view` over the
+  `index_guest` contract crate (dep `index_guest = { workspace = true }`,
+  never `indexer`). Unit-test natively against a `BTreeMap`.
+- `src/index_guest.rs` behind `index-guest = ["index_guest/guest"]` — the
+  ~15-line engine shell (`EngineRead`, `apply`, `index_guest::fold!`/`view!`).
+
+`guest-builder --index <module-dir>` writes the committed `index.wasm`; add
+the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
+`bin/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
+ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
+observably (`/v1/index/status` `fold.{module}`), never atomically.
 
 ## 3. Registration — four bins compose modules
 

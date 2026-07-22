@@ -120,7 +120,7 @@ pub(super) async fn restore(
             // journal-suffix fold lands contiguously on top instead of
             // folding forward over a pre-checkpoint hole.
             if let Some(ckpt_height) = manifest.height {
-                heal_index(index, &host, ckpt_height, label).await;
+                heal_index(index, ckpt_height, label);
             }
             let rec = match recovery
                 .recover_with_sink(&mut host, &manifest, Some(boot_fold))

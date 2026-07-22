@@ -1277,7 +1277,7 @@ dependencies = [
  "data-plane",
  "guest-adapter",
  "host",
- "indexer",
+ "index-guest",
  "opus-rs",
  "sdk",
  "sdk-testkit",
@@ -3216,9 +3216,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluent-guest"
+version = "0.1.0"
+source = "git+https://github.com/orthory/fluent31#0a1fd768101deb69ee50817167b9aedd6c026c51"
+dependencies = [
+ "fluent-guest-macros",
+]
+
+[[package]]
+name = "fluent-guest-macros"
+version = "0.1.0"
+source = "git+https://github.com/orthory/fluent31#0a1fd768101deb69ee50817167b9aedd6c026c51"
+
+[[package]]
 name = "fluent31"
 version = "0.1.0"
-source = "git+https://github.com/orthory/fluent31#442aaecc0e2d9555ff4d67e0262d1207583f4c99"
+source = "git+https://github.com/orthory/fluent31#0a1fd768101deb69ee50817167b9aedd6c026c51"
 dependencies = [
  "crc32fast",
  "crossbeam-skiplist",
@@ -3226,6 +3239,8 @@ dependencies = [
  "libc",
  "lz4_flex",
  "parking_lot",
+ "sha2",
+ "wasmtime",
 ]
 
 [[package]]
@@ -4470,16 +4485,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "index-guest"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "fluent-guest",
+ "serde",
+]
+
+[[package]]
 name = "indexer"
 version = "0.1.0"
 dependencies = [
- "async-trait",
+ "borsh",
  "fluent31",
+ "index-guest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -5329,6 +5354,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blobstore",
+ "borsh",
  "bytes",
  "capability-host",
  "chat",
@@ -6005,7 +6031,7 @@ dependencies = [
  "commonware-runtime",
  "guest-adapter",
  "host",
- "indexer",
+ "index-guest",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -7226,7 +7252,7 @@ dependencies = [
  "futures",
  "guest-adapter",
  "host",
- "indexer",
+ "index-guest",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -7987,7 +8013,7 @@ dependencies = [
  "futures",
  "guest-adapter",
  "host",
- "indexer",
+ "index-guest",
  "sdk",
  "sdk-testkit",
  "serde",
