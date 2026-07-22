@@ -52,7 +52,6 @@ const MAX_SEARCH_LIMIT: usize = 100;
 
 /// the stored head row of one message, as search results return it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct MsgRow {
     pub channel_id: String,
     pub seq: u64,
@@ -76,7 +75,6 @@ pub struct MsgRow {
 
 /// a token posting's value: enough to rank (time) and fetch the row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TokRef {
     channel_id: String,
     seq: u64,
@@ -85,11 +83,10 @@ struct TokRef {
 }
 
 /// chat's view requests. externally tagged json, matching the module wire
-/// style: `{"search": {"text": "...", "channelId": "...", "limit": 20}}`.
+/// style: `{"search": {"text": "...", "channel_id": "...", "limit": 20}}`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum ChatViewQuery {
-    #[serde(rename_all = "camelCase")]
     Search {
         text: String,
         #[serde(default)]
@@ -97,9 +94,8 @@ pub enum ChatViewQuery {
         #[serde(default)]
         limit: Option<usize>,
     },
-    /// the tag catalog: `{"tags": {"channelId": "...", "limit": 20}}`. no
+    /// the tag catalog: `{"tags": {"channel_id": "...", "limit": 20}}`. no
     /// channel aggregates every channel per label.
-    #[serde(rename_all = "camelCase")]
     Tags {
         #[serde(default)]
         channel_id: Option<String>,
@@ -107,8 +103,7 @@ pub enum ChatViewQuery {
         limit: Option<usize>,
     },
     /// live messages carrying one exact tag, newest first:
-    /// `{"tagSearch": {"tag": "rust", "channelId": "...", "limit": 20}}`.
-    #[serde(rename_all = "camelCase")]
+    /// `{"tag_search": {"tag": "rust", "channel_id": "...", "limit": 20}}`.
     TagSearch {
         tag: String,
         #[serde(default)]
@@ -121,7 +116,7 @@ pub enum ChatViewQuery {
 /// chat's view replies: `{"hits": [<MsgRow>…]}` newest first, or
 /// `{"tags": [<TagRow>…]}` count-ordered.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum ChatViewReply {
     Hits(Vec<MsgRow>),
     Tags(Vec<TagRow>),
@@ -596,7 +591,7 @@ mod tests {
 
         let hits = search(
             &store,
-            serde_json::json!({"search": {"text": "fluent", "channelId": "general"}}),
+            serde_json::json!({"search": {"text": "fluent", "channel_id": "general"}}),
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");
@@ -667,7 +662,7 @@ mod tests {
 
         let hits = search(
             &store,
-            serde_json::json!({"search": {"text": "test", "channelId": "general"}}),
+            serde_json::json!({"search": {"text": "test", "channel_id": "general"}}),
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");

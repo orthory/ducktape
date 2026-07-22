@@ -95,10 +95,13 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 }
                 NodeCommand::Peers { reply } => {
                     // answered as the real lanes answer it: a sample parsed
-                    // from an exposition — here one connected peer.
+                    // from an exposition — here one connected peer — stamped
+                    // with the fake's chain position.
                     let _ = reply.send(noded::peers::peers_from_exposition(
                         "network_tracker_directory_connected{peer=\"ab\"} 1000\n",
                         2000,
+                        41,
+                        Some(7),
                     ));
                 }
                 NodeCommand::Metrics { reply } => {
@@ -147,7 +150,7 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
     assert_eq!(body["height"], 7);
     // the fake actor echoes the stamped origin here — no origin sent, so the
     // daemon default applies
-    assert_eq!(body["appHash"], "noded");
+    assert_eq!(body["app_hash"], "noded");
 }
 
 #[tokio::test]
@@ -169,7 +172,7 @@ async fn submit_stamps_the_client_origin() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["appHash"], "jess");
+    assert_eq!(body["app_hash"], "jess");
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -218,12 +221,12 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     // the actor echoes the origin it VERIFIED — the signer's public key, which
     // no part of the request could have claimed.
     assert_eq!(
-        body["appHash"],
+        body["app_hash"],
         noded::hex_bytes(signer.public_key().as_ref())
     );
     // the receipt addresses the op PAYLOAD, exactly as the frameless lane does.
     assert_eq!(
-        body["opHash"].as_str().map(str::len),
+        body["op_hash"].as_str().map(str::len),
         Some(64),
         "the frame lane returns the same receipt shape"
     );
@@ -302,7 +305,7 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    let op_hash = body["opHash"].as_str().expect("receipt carries opHash");
+    let op_hash = body["op_hash"].as_str().expect("receipt carries op_hash");
     assert_eq!(op_hash.len(), 64);
     assert!(
         op_hash
@@ -385,7 +388,7 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["version"], "9.9.9");
-    assert_eq!(body["appHash"], "cd".repeat(32));
+    assert_eq!(body["app_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
@@ -393,7 +396,7 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["modules"][0]["category"], "workspace");
     assert_eq!(body["operations"]["role"], "validator");
     assert_eq!(body["operations"]["phase"], "validating");
-    assert_eq!(body["operations"]["phaseSince"], 1_720_000_000u64);
+    assert_eq!(body["operations"]["phase_since"], 1_720_000_000u64);
 }
 
 #[tokio::test]
@@ -413,10 +416,12 @@ async fn peers_reports_the_direct_peer_sample() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["sampledAtMs"], 2000);
+    assert_eq!(body["sampled_at_ms"], 2000);
+    assert_eq!(body["height"], 41);
+    assert_eq!(body["epoch"], 7);
     assert_eq!(body["peers"][0]["peer"], "ab");
     assert_eq!(body["peers"][0]["connected"], true);
-    assert_eq!(body["peers"][0]["connectedSinceMs"], 1000);
+    assert_eq!(body["peers"][0]["connected_since_ms"], 1000);
 }
 
 #[tokio::test]
@@ -837,7 +842,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                 "headers": [{ "name": "content-type", "value": "application/json" }],
                 "body_len": request_body.len(),
             },
-            "bodyB64": base64::engine::general_purpose::STANDARD.encode(request_body),
+            "body_b64": base64::engine::general_purpose::STANDARD.encode(request_body),
         }),
     );
     let response = noded::router(handle.with_gateway(lane))
@@ -849,7 +854,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     assert_eq!(body["head"]["status"], 201);
     assert_eq!(
         base64::engine::general_purpose::STANDARD
-            .decode(body["bodyB64"].as_str().unwrap())
+            .decode(body["body_b64"].as_str().unwrap())
             .unwrap(),
         br#"{"ok":true}"#
     );

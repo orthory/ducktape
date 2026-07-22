@@ -95,7 +95,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     );
 
     let before = sim.status();
-    let before_hash = before["appHash"].as_str().expect("app hash").to_string();
+    let before_hash = before["app_hash"].as_str().expect("app hash").to_string();
     let before_height = before["height"].as_u64().expect("height");
 
     // a USER post fires the rule; the rule's own reply is MODULE-authored, so
@@ -111,7 +111,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     // the block COMMITTED — the guard prevented the loop, so there was never a
     // BudgetExceeded abort (which would have rolled the app-hash back unchanged).
     assert_ne!(
-        sim.status()["appHash"].as_str().map(str::to_string),
+        sim.status()["app_hash"].as_str().map(str::to_string),
         Some(before_hash),
         "the triggering block committed atomically, not aborted"
     );
@@ -153,7 +153,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
 /// follow-up parks in the oracle queue. two follow-ups queue without coalescing;
 /// each `/sim/step` commits EXACTLY ONE as its own `oracle`-kind block; and a
 /// peer block wedged between two drains commits fine without disturbing queue
-/// order (`oracleQueued` tracks the count throughout).
+/// order (`oracle_queued` tracks the count throughout).
 #[test]
 fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -163,11 +163,11 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     // two peer blocks commit two triggers; each enqueues one worker follow-up.
     let b1 = sim.peer_block("saga", saga_trigger("s1", &spec), "peer");
     assert_eq!(b1["height"], 1, "first trigger committed: {b1}");
-    assert_eq!(sim.sim_state()["oracleQueued"], 1, "one follow-up queued");
+    assert_eq!(sim.sim_state()["oracle_queued"], 1, "one follow-up queued");
     let b2 = sim.peer_block("saga", saga_trigger("s2", &spec), "peer");
     assert_eq!(b2["height"], 2, "second trigger committed: {b2}");
     assert_eq!(
-        sim.sim_state()["oracleQueued"],
+        sim.sim_state()["oracle_queued"],
         2,
         "follow-ups queue behind each other — they never coalesce"
     );
@@ -180,7 +180,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     );
     assert_eq!(r["committed"]["height"], 3);
     assert_eq!(
-        sim.sim_state()["oracleQueued"],
+        sim.sim_state()["oracle_queued"],
         1,
         "one drained, one still queued"
     );
@@ -193,7 +193,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
         "the wedge committed ahead of the queue: {wedge}"
     );
     assert_eq!(
-        sim.sim_state()["oracleQueued"],
+        sim.sim_state()["oracle_queued"],
         1,
         "the peer wedge did not disturb the parked follow-up"
     );
@@ -202,7 +202,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let r = sim.step();
     assert_eq!(r["committed"]["kind"], "oracle");
     assert_eq!(r["committed"]["height"], 5);
-    assert_eq!(sim.sim_state()["oracleQueued"], 0, "queue drained");
+    assert_eq!(sim.sim_state()["oracle_queued"], 0, "queue drained");
 
     // nothing left: a further step commits nothing (both queues empty).
     let r = sim.step();
@@ -455,7 +455,7 @@ fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> 
         sim.await_sim_state("held", 1);
         let report = sim.step();
         hashes.push(
-            report["committed"]["appHash"]
+            report["committed"]["app_hash"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{target} did not commit: {report}"))
                 .to_string(),
@@ -475,7 +475,7 @@ fn run_auto(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
         .iter()
         .map(|(target, payload, origin)| {
             let receipt = sim.submit_ok(target, payload.clone(), origin.as_deref());
-            receipt["appHash"]
+            receipt["app_hash"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{target} receipt has no app hash: {receipt}"))
                 .to_string()
@@ -522,7 +522,7 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         let status = sim.status();
         (
             status["height"].as_u64().expect("height"),
-            status["appHash"].as_str().expect("app hash").to_string(),
+            status["app_hash"].as_str().expect("app hash").to_string(),
         )
         // the sim (and its child) drops here: Drop kills + waits, releasing the
         // storage before the respawn opens it.
@@ -538,7 +538,7 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "height resumed above the watermark, not restarted at 0: {status}"
     );
     assert_eq!(
-        status["appHash"].as_str(),
+        status["app_hash"].as_str(),
         Some(pre_hash.as_str()),
         "committed module state survived the restart (app-hash byte-identical)"
     );
@@ -559,7 +559,7 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "the new block continues the height: {receipt}"
     );
     assert_ne!(
-        sim.status()["appHash"].as_str(),
+        sim.status()["app_hash"].as_str(),
         Some(pre_hash.as_str()),
         "the new commit moved the app-hash off the resumed root"
     );

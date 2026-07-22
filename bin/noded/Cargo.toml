@@ -112,7 +112,6 @@ nettest = { path = "../../crates/testing/nettest" }
 tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-ts-rs = { version = "12.0.1", features = ["serde-compat", "serde-json-impl"] }
 tokio = { version = "1", features = ["test-util"] }
 # daemon_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"

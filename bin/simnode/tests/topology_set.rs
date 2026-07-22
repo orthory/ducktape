@@ -38,7 +38,7 @@ fn default_genesis_composes_topology_sim_base() {
         "sim default genesis composes topology sim_base, in registry order"
     );
     assert_eq!(
-        status["appHash"].as_str().expect("appHash is a string"),
+        status["app_hash"].as_str().expect("app_hash is a string"),
         DEFAULT_GENESIS_APP_HASH,
         "default sim genesis app-hash must be byte-identical across the topology swap"
     );

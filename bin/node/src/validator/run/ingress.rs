@@ -42,12 +42,15 @@ impl ValidatorRuntime<'_> {
         );
     }
 
-    /// one direct-peer sample: the exposition parse plus valset standing.
+    /// one direct-peer sample: the exposition parse plus valset standing,
+    /// stamped with this validator's own chain position.
     async fn peers_sample(&self) -> noded::peers::PeersView {
         let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
         let validators = hex_set(read_valset_members(self.node.host()).await);
         let residents = hex_set(read_valset_residents(self.node.host()).await);
-        noded::peers::peers_from_exposition(&self.context.encode(), unix_ms())
+        let height = self.node.finalized().map(|f| f.height).unwrap_or(0);
+        let epoch = Some(self.orchestrator.epoch());
+        noded::peers::peers_from_exposition(&self.context.encode(), unix_ms(), height, epoch)
             .with_roles(&validators, &residents)
     }
 

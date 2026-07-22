@@ -157,7 +157,7 @@ fn commit_posts_snake_case_and_parses_camelcase_block() {
         // the daemon answers a commit with a camelCase BlockSummary.
         (
             200,
-            serde_json::json!({ "height": 5, "appHash": "ab".repeat(32) }),
+            serde_json::json!({ "height": 5, "app_hash": "ab".repeat(32) }),
         )
     });
     let node = HttpNode::new(stub.url());

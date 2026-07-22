@@ -20,8 +20,8 @@ use crate::{NodeHandle, error_response, hex_bytes};
 // per D1) and its encode/decode functions live in `chat::call_wire` — the
 // single definition site this handler ports onto below. text frames are json
 // control: client→server `CallClientControl` (recipients / beacon /
-// keyframeRequest), server→client `CallServerControl` (keyframeRequest /
-// peerBeacon / rateHint).
+// keyframe_request), server→client `CallServerControl` (keyframe_request /
+// peer_beacon / rate_hint).
 //
 // the hub side lives with the mesh (validators and standing residents run one): it
 // fragments/reassembles the video ends over `Service::Video` and routes control
@@ -129,12 +129,7 @@ pub type CallLane = tokio::sync::mpsc::Sender<RealtimeSessionRequest>;
 
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum CallClientControl {
     /// replace the fan-out set with these hex node keys (self excluded —
     /// the client tracks the consensus huddle roster).
@@ -153,12 +148,7 @@ pub enum CallClientControl {
 
 /// server → client control messages on the call socket (text frames).
 #[derive(Debug, Serialize)]
-#[cfg_attr(test, derive(ts_rs::TS))]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum CallServerControl {
     /// a peer lost sync with US: encode the next frame as a keyframe.
     KeyframeRequest,
@@ -171,17 +161,12 @@ pub enum CallServerControl {
     },
     /// send at no more than this (min across peers' loss reports).
     RateHint {
-        #[cfg_attr(test, ts(type = "number"))]
         max_kbps: u32,
     },
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PresenceClientControl {
     Recipients {
         peers: Vec<String>,
@@ -194,11 +179,7 @@ pub enum PresenceClientControl {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PresenceServerControl {
     PeerCursor {
         peer: String,

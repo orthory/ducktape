@@ -714,7 +714,7 @@ fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRec
 /// the boot fold rebuilds a block's per-op rows from its sealed BATCH frame,
 /// re-staging each op's payload so `GET /v1/files/blob/{op_hash}` answers
 /// again after a restart. the block coordinates and every op's identity
-/// (proposer/target/payload/opHash) match the drain's live row; the only
+/// (proposer/target/payload/op_hash) match the drain's live row; the only
 /// difference is the per-op dispatch TRACE — recovery folds the block-level
 /// aggregate, not per-member, so a replayed op carries an empty trace (a
 /// documented degradation visible only when the index is rebuilt).
@@ -767,20 +767,20 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
     // block coordinates match the drain.
     assert_eq!(row["height"], 7);
     assert_eq!(row["hash"], noded::hex_bytes(&node::frame_id(&batch)));
-    assert_eq!(row["commitHash"], hex(&app_hash));
+    assert_eq!(row["commit_hash"], hex(&app_hash));
     assert_eq!(row["ops"].as_array().unwrap().len(), 1);
     // the op's identity matches the drain byte-for-byte.
     assert_eq!(row["ops"][0]["proposer"], drain["ops"][0]["proposer"]);
     assert_eq!(row["ops"][0]["target"], "directory");
     assert_eq!(row["ops"][0]["payload"], drain["ops"][0]["payload"]);
-    assert_eq!(row["ops"][0]["opHash"], drain["ops"][0]["opHash"]);
+    assert_eq!(row["ops"][0]["op_hash"], drain["ops"][0]["op_hash"]);
     // the fold carries an empty per-op trace (recovery folds the aggregate).
     assert_eq!(row["ops"][0]["operations"].as_array().unwrap().len(), 0);
 
     // the rebuild re-staged the payload: op_hash is dereferencable again
     // from the FOLD's (fresh, post-restart) blob store.
     let op_digest = drain_blobs.put_chunk(payload.clone());
-    assert_eq!(row["ops"][0]["opHash"], noded::hex_bytes(&op_digest));
+    assert_eq!(row["ops"][0]["op_hash"], noded::hex_bytes(&op_digest));
     assert!(fold_blobs.has_chunk(&op_digest));
 }
 

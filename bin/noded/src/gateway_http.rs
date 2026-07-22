@@ -112,14 +112,13 @@ pub(crate) struct BrowserGateway {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayProxyRequest {
     pub head: gateway::ProxyRequestHead,
     pub body_b64: String,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GatewayProxyReply {
     pub head: gateway::ProxyResponseHead,
     pub body_b64: String,

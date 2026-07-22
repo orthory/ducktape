@@ -1517,10 +1517,14 @@ mod tests {
         };
         let first = noded::peers::PeersView {
             sampled_at_ms: 10_000,
+            height: 5,
+            epoch: Some(1),
             peers: vec![sample(100, 1_000)],
         };
         let second = noded::peers::PeersView {
             sampled_at_ms: 12_000,
+            height: 6,
+            epoch: Some(1),
             peers: vec![sample(150, 3_000)],
         };
 

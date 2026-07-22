@@ -34,7 +34,6 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 
 /// the stored row of one task.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct TaskRow {
     pub task_id: String,
     pub title: String,
@@ -48,12 +47,11 @@ pub struct TaskRow {
 }
 
 /// tasks' view requests, externally tagged:
-/// `{"byStatus": {"status": "open", "after": "...", "limit": 50}}` or
-/// `{"task": {"taskId": "..."}}`.
+/// `{"by_status": {"status": "open", "after": "...", "limit": 50}}` or
+/// `{"task": {"task_id": "..."}}`.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum TasksViewQuery {
-    #[serde(rename_all = "camelCase")]
     ByStatus {
         status: TaskStatus,
         #[serde(default)]
@@ -61,15 +59,13 @@ pub enum TasksViewQuery {
         #[serde(default)]
         limit: Option<usize>,
     },
-    #[serde(rename_all = "camelCase")]
     Task { task_id: String },
 }
 
 /// tasks' view replies.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum TasksViewReply {
-    #[serde(rename_all = "camelCase")]
     Tasks {
         tasks: Vec<TaskRow>,
         has_more: bool,
@@ -315,7 +311,7 @@ mod tests {
         );
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "open"}}))
+            view(&store, serde_json::json!({"by_status": {"status": "open"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -332,7 +328,7 @@ mod tests {
         );
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "open"}}))
+            view(&store, serde_json::json!({"by_status": {"status": "open"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -340,7 +336,7 @@ mod tests {
         assert_eq!(tasks[0].task_id, "t2");
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "done"}}))
+            view(&store, serde_json::json!({"by_status": {"status": "done"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -365,7 +361,7 @@ mod tests {
         }
 
         let TasksViewReply::Task(Some(row)) =
-            view(&store, serde_json::json!({"task": {"taskId": "t3"}}))
+            view(&store, serde_json::json!({"task": {"task_id": "t3"}}))
         else {
             panic!("t3 exists")
         };
@@ -377,7 +373,7 @@ mod tests {
             next_after,
         } = view(
             &store,
-            serde_json::json!({"byStatus": {"status": "open", "limit": 2}}),
+            serde_json::json!({"by_status": {"status": "open", "limit": 2}}),
         )
         else {
             panic!("wrong reply shape")
@@ -386,7 +382,7 @@ mod tests {
         assert!(has_more);
         let TasksViewReply::Tasks { tasks, .. } = view(
             &store,
-            serde_json::json!({"byStatus": {"status": "open", "after": next_after.unwrap()}}),
+            serde_json::json!({"by_status": {"status": "open", "after": next_after.unwrap()}}),
         ) else {
             panic!("wrong reply shape")
         };
@@ -445,14 +441,14 @@ mod tests {
 
         // the stale fold row is gone; both partitions match canonical state.
         let TasksViewReply::Task(row) =
-            view(&store, serde_json::json!({"task": {"taskId": "stale"}}))
+            view(&store, serde_json::json!({"task": {"task_id": "stale"}}))
         else {
             panic!("wrong reply shape")
         };
         assert!(row.is_none(), "pre-rebuild rows do not survive");
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "open"}}))
+            view(&store, serde_json::json!({"by_status": {"status": "open"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -464,7 +460,7 @@ mod tests {
         assert_eq!(tasks[0].created_height, 40);
 
         let TasksViewReply::Tasks { tasks, .. } =
-            view(&store, serde_json::json!({"byStatus": {"status": "done"}}))
+            view(&store, serde_json::json!({"by_status": {"status": "done"}}))
         else {
             panic!("wrong reply shape")
         };
@@ -484,7 +480,7 @@ mod tests {
         );
         let TasksViewReply::Tasks { tasks, .. } = view(
             &store,
-            serde_json::json!({"byStatus": {"status": "in_progress"}}),
+            serde_json::json!({"by_status": {"status": "in_progress"}}),
         ) else {
             panic!("wrong reply shape")
         };

@@ -71,7 +71,7 @@ fn a_signed_frame_commits_under_its_verified_signer() {
     assert_eq!(receipt["height"], 1, "the frame's op landed in block 1");
     // the receipt addresses the op PAYLOAD, exactly as the frameless lane does.
     assert_eq!(
-        receipt["opHash"].as_str().map(str::len),
+        receipt["op_hash"].as_str().map(str::len),
         Some(64),
         "the frame lane returns the same receipt shape: {receipt}"
     );
@@ -384,7 +384,7 @@ fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
         "kv roots must differ: block structure is authenticated:\nA {a}\nB {b}"
     );
     assert_ne!(
-        a["appHash"], b["appHash"],
+        a["app_hash"], b["app_hash"],
         "the app-hash reflects the kv root gap"
     );
 }
@@ -409,7 +409,7 @@ fn kv_root(status: &serde_json::Value) -> String {
 
 // ── E4 — node-key seeding ───────────────────────────────
 
-/// `--node-key` fabricates a mesh identity `status().publicKey` serves back —
+/// `--node-key` fabricates a mesh identity `status().public_key` serves back —
 /// what a consensus op naming a node key (huddle membership) references. no mesh
 /// routes behind it.
 #[test]
@@ -418,7 +418,7 @@ fn node_key_seeds_status_public_key() {
     let key = "ab".repeat(32); // 64 hex, 32 bytes
     let sim = Sim::spawn(storage.path(), &["--node-key", &key]);
     assert_eq!(
-        sim.status()["publicKey"],
+        sim.status()["public_key"],
         key,
         "the seeded key is served verbatim"
     );
@@ -430,7 +430,7 @@ fn node_key_seeds_status_public_key() {
 fn without_node_key_public_key_stays_empty() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &[]);
-    assert_eq!(sim.status()["publicKey"], "", "no key seeded → empty");
+    assert_eq!(sim.status()["public_key"], "", "no key seeded → empty");
 }
 
 /// a malformed `--node-key` fails LOUD at startup rather than seeding junk a
@@ -579,7 +579,7 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     assert_eq!(a["height"], 1, "the batch is one block");
     assert_eq!(b["height"], n, "the singles are {n} blocks");
     assert_ne!(
-        a["appHash"], b["appHash"],
+        a["app_hash"], b["app_hash"],
         "the app-hash reflects the diverging roots"
     );
 

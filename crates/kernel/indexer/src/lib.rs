@@ -179,7 +179,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// who triggered a dispatch, flattened for the read model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OriginTag {
     pub kind: OriginKind,
     /// external: the submitter identity rendered by [`user_handle`] (printable
@@ -189,7 +188,7 @@ pub struct OriginTag {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum OriginKind {
     External,
     Module,
@@ -266,13 +265,12 @@ pub struct BlockOps {
 // the op row — the json envelope stored under `op/…`. module op payloads are
 // serde_json across the workspace, so the common case embeds the payload
 // verbatim (`payload`); bytes that are not valid json fall back to hex
-// (`payloadHex`), mirroring the codebase's hex-not-base64 convention.
+// (`payload_hex`), mirroring the codebase's hex-not-base64 convention.
 // ============================================================================
 
 /// the stored shape of one applied op. `height`/`seq` repeat the key so a row
 /// is self-describing when it travels without its key.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OpRow<'a> {
     pub height: u64,
     pub seq: u32,
@@ -550,7 +548,6 @@ pub trait ModuleIndexer: Send + Sync {
 /// one scan page. `next_after` feeds the next call's `after` for cursoring;
 /// it is only present when `has_more`.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Page {
     /// key/value pairs in key order. values are the raw stored bytes.
     #[serde(skip)]

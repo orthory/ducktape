@@ -56,16 +56,14 @@ const UNKNOWN: &str = "unknown";
 
 /// the stored trigger row: what a later `OracleResult` needs from its saga.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TriggerRow {
     capability: Option<String>,
     created_height: u64,
 }
 
 /// one finalized attempt, as folded. `height` is the block the result landed
-/// in — the `sinceHeight` filter cuts on it.
+/// in — the `since_height` filter cuts on it.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AttemptRow {
     pub executor_hex: String,
     pub capability: String,
@@ -84,12 +82,11 @@ pub struct AttemptRow {
     pub height: u64,
 }
 
-/// the view request: `{"usage": {"sinceHeight": 100}}`. `sinceHeight` keeps
+/// the view request: `{"usage": {"since_height": 100}}`. `since_height` keeps
 /// only attempts whose result landed at or after it; absent = all-time.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum UsageViewQuery {
-    #[serde(rename_all = "camelCase")]
     Usage {
         #[serde(default)]
         since_height: Option<u64>,
@@ -99,7 +96,7 @@ pub enum UsageViewQuery {
 /// the view reply: `{"usage": [<UsageRow>…]}` in (executor, capability,
 /// outcome) order.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum UsageViewReply {
     Usage(Vec<UsageRow>),
 }
@@ -107,7 +104,6 @@ pub enum UsageViewReply {
 /// one aggregated ledger line: runs and total duration for an (executor,
 /// capability, outcome) bucket.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct UsageRow {
     pub executor_hex: String,
     pub capability: String,
@@ -471,7 +467,7 @@ mod tests {
         apply(&store, 5, vec![]); // no-op guard against test drift
         apply(&store, 12, vec![result("aa11", "s1", 2, true)]);
 
-        let rows = usage(&store, serde_json::json!({"usage": {"sinceHeight": 12}}));
+        let rows = usage(&store, serde_json::json!({"usage": {"since_height": 12}}));
         assert_eq!(rows.len(), 1);
         assert!(rows[0].outcome_ok);
         assert_eq!(rows[0].runs, 1);

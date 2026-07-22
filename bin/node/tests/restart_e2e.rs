@@ -188,7 +188,7 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         .iter()
         .filter(|(_, r)| r["ops"][0]["target"] == "directory")
     {
-        let op_hash = row["ops"][0]["opHash"].as_str().expect("row opHash");
+        let op_hash = row["ops"][0]["op_hash"].as_str().expect("row op_hash");
         let (code, _) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
         assert_eq!(
             code, 200,

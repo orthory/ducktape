@@ -53,10 +53,13 @@ use std::time::Duration;
 /// plus whatever standing the lane can attest — the serving host's valset
 /// when one exists, else the announce-target member set alone (a parked
 /// joiner has no queryable valset yet, but it knows who the members are).
+/// `height` is the served boundary (0 pre-first-sync, like status); a parked
+/// lane runs no consensus, so the epoch stays absent.
 async fn peers_sample(
     exposition: String,
     host: Option<&host::Host>,
     announce_targets: &[ed25519::PublicKey],
+    height: u64,
 ) -> noded::peers::PeersView {
     use std::collections::BTreeSet;
     let (validators, residents): (BTreeSet<String>, BTreeSet<String>) = match host {
@@ -69,7 +72,7 @@ async fn peers_sample(
             BTreeSet::new(),
         ),
     };
-    noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms())
+    noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms(), height, None)
         .with_roles(&validators, &residents)
 }
 
@@ -709,6 +712,7 @@ pub(super) async fn park(
                                         context.encode(),
                                         serving.as_ref().map(|(_, node_r)| node_r.host()),
                                         &announce_targets,
+                                        serving.as_ref().map(|(h, _)| *h).unwrap_or(0),
                                     )
                                     .await,
                                 ),
@@ -733,7 +737,7 @@ pub(super) async fn park(
                         match cmd {
                             // `origin` is the caller's CLAIMED submitter — but
                             // this lane signs frames with THIS node's identity
-                            // (authorship = status.publicKey), so it is ignored.
+                            // (authorship = status.public_key), so it is ignored.
                             // WITH standing AND a boundary, relay and HOLD the
                             // oneshot keyed by the frame id; otherwise refuse.
                             noded::NodeCommand::Submit {
@@ -842,6 +846,7 @@ pub(super) async fn park(
                                         context.encode(),
                                         serving.as_ref().map(|(_, node_r)| node_r.host()),
                                         &announce_targets,
+                                        serving.as_ref().map(|(h, _)| *h).unwrap_or(0),
                                     )
                                     .await,
                                 );

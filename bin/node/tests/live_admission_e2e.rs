@@ -585,7 +585,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
                 rows.iter().any(|b| {
                     b["hash"] == serde_json::json!("")
                         && b["height"].as_u64().is_some_and(|h| h > 0)
-                        && !b["commitHash"].as_str().unwrap_or_default().is_empty()
+                        && !b["commit_hash"].as_str().unwrap_or_default().is_empty()
                 })
             })
     }));
