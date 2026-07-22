@@ -1,5 +1,5 @@
 //! the node-local worker behind lifecycle's code-swap byte-receipt gate: the state-driven
-//! twin of [`super::announce::ReadinessSignaller`] for CODE swaps.
+//! the per-swap byte-receipt readiness signaller for CODE swaps.
 //!
 //! it polls COMMITTED lifecycle module state each pump tick and, per pending swap,
 //! drives this validator to a truthful `LifecycleMsg::SwapReady`:
