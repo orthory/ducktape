@@ -51,7 +51,13 @@ carries a build cost; and this table is the map from each boundary to its real
 and swappable arms. Rationale and the full seam designs are in
 [`docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md`](docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md)
 (lands with PR #718). Rows tagged "(this campaign)" are the seams being added
-now; their PRs are open and unmerged.
+now; their PRs are open and unmerged. Rows tagged "(C-stage)" come from the
+block-apply reassembly campaign
+([`docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md`](docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md)):
+not swappable-arm traits but single shared paths that replace the old
+validator/noded/simnode triplication (block projection, worker reactor, genesis
+topology) plus the scripted-stepping ordering arm; their stacked PRs #724–#728
+are open and unmerged.
 
 | Contract (trait · crate) | Real arm(s) | Sim / test arm | Consumers |
 | --- | --- | --- | --- |
@@ -69,6 +75,10 @@ now; their PRs are open and unmerged.
 | `MeshCarrier` · `crates/kernel/consensus` — (this campaign, PR #719 — unmerged) | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
 | commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync — (this campaign, PR #720 — unmerged) | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
 | `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` — (this campaign, PR #718/#721 — unmerged) | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
+| `projection::project_block` · `noded` — (C-stage, PR #724 — unmerged) | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes across old/new paths | validator drain, replica park, noded submit lane, simnode — **flag day (PR #728): a rejected op now journals a block, validator parity** |
+| `Orderer` — scripted-stepping seam · `crates/kernel/node` — (C-stage, PR #725 — unmerged) | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
+| `worker::drive` · `crates/kernel/host` — (C-stage, PR #726 — unmerged) | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
+| `ModuleTopology` · `crates/kernel/host` — (C-stage, PR #727 — unmerged) | one genesis topology (ordered id set, wiring edges, genesis-config values; subsets `production` / `sim_base` / `sim_valset` / `demo`) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), demo |
 
 ## Quick Start
 
