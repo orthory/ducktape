@@ -4,7 +4,8 @@ app Ducktape
   bg app_background
   fg app_text
   id "dev.ducktape.app"
-  default-text-size 14
+  font "../../assets/InterVariable.ttf"
+  default-text-size 13
   antialiasing true
   window
     size 1120 720

@@ -1,3 +1,41 @@
+component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disabled:bool)
+  state
+    editing_page = ""
+    draft = ""
+    edit_rpc = ""
+    edit_password = ""
+    local_error = ""
+  on begin(id, current, next_rpc, next_password)
+    editing_page = id
+    draft = current
+    edit_rpc = next_rpc
+    edit_password = next_password
+    local_error = ""
+  on changed(next)
+    draft = next
+    return if empty(trim(draft))
+    local_error = ""
+    run latest autosave_page_title(edit_rpc, edit_password, editing_page, trim(draft)) -> saved _ | save_failed _
+  on saved(written)
+    return if !written
+    local_error = ""
+  on save_failed(cause)
+    local_error = cause.message
+  col width=fill spacing=2.0
+    if editing_page != page_id
+      button label=title width=fill padding=4.0 -> begin(page_id, title, rpc, password)
+        text title width=fill size=22.0 wrapping=none @font-bold text-fg
+        active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+        hovered bg=white/5 text=fg border=white/7
+        pressed bg=white/8 text=fg
+    if editing_page == page_id
+      input "" #title-input label="Page title" <-> draft change=changed hint="Untitled" disabled=disabled width=fill padding=4.0 text-size=22.0 line-height=1.15
+        active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+        focused bg=white/5 border=white/9 border-w=1.0
+        disabled value=muted
+    if !empty(local_error)
+      text local_error size=10.0 @text-muted
+
 component PageButton(page:PageItem, selected:bool)
   col width=fill
     if selected
@@ -8,7 +46,7 @@ component PageButton(page:PageItem, selected:bool)
           text page.title width=fill size=12.0 wrapping=none @text-fg font-bold
           if page.child_count > 0
             text page.child_count size=10.0 @text-muted
-        active bg=linear(2.3, white/78@0.0, surface/58@1.0) text=fg border=white/78 border-w=1.0 r=10.0 shadow=black/8 shadow-y=1.0 shadow-blur=6.0
+        active bg=linear(2.3, white/10@0.0, surface/72@1.0) text=fg border=white/16 border-w=1.0 r=10.0 shadow=black/8 shadow-y=1.0 shadow-blur=6.0
         pressed bg=selection
     if !selected
       button label=page.title width=fill height=34.0 padding=7.0 -> choose_page(page.id)
@@ -19,7 +57,7 @@ component PageButton(page:PageItem, selected:bool)
           if page.child_count > 0
             text page.child_count size=10.0 @text-muted
         active bg=transparent text=muted r=10.0
-        hovered bg=white/34 text=fg
+        hovered bg=white/6 text=fg
         pressed bg=selection text=fg
 
 component PageSearchResult(hit:PageSearchHit)
@@ -30,13 +68,15 @@ component PageSearchResult(hit:PageSearchHit)
         text hit.block_id size=10.0 wrapping=none @text-muted
       text hit.text width=fill size=11.0 wrapping=word @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-    hovered bg=white/48 text=fg border=white/52
+    hovered bg=white/9 text=fg border=white/10
     pressed bg=selection text=fg
 
 component BlockContents(block:PageBlock)
   row width=fill spacing=7.0 align=start
     text block.prefix size=11.0 wrapping=none @text-muted
     match block.kind
+      "Page"
+        text "□" width=16.0 size=12.0 align-x=center @text-muted
       "Bullet"
         text "•" width=16.0 size=13.0 align-x=center @text-muted
       "Number"
@@ -58,6 +98,10 @@ component BlockContents(block:PageBlock)
         space width=0.0
     col width=fill spacing=2.0
       match block.kind
+        "Page"
+          row width=fill spacing=6.0 align=center
+            text block.text width=fill size=13.0 wrapping=word @font-bold text-fg
+            text "›" size=14.0 @text-muted
         "Heading 1"
           text block.text width=fill size=20.0 wrapping=word @font-bold text-fg
         "Heading 2"
@@ -65,7 +109,7 @@ component BlockContents(block:PageBlock)
         "Heading 3"
           text block.text width=fill size=15.0 wrapping=word @font-bold text-fg
         "Code"
-          container width=fill padding=7.0 bg=fg/7 border=white/48 border-w=1.0 r=7.0
+          container width=fill padding=7.0 bg=fg/7 border=white/9 border-w=1.0 r=7.0
             text block.text width=fill size=11.0 wrapping=word font=mono @text-fg
         "Divider"
           container width=fill height=1.0 bg=separator
@@ -82,18 +126,17 @@ component BlockContents(block:PageBlock)
 component BlockCard(block:PageBlock, selected:bool)
   col width=fill
     if block.pending
-      container width=fill padding=8.0 bg=white/24 border=transparent border-w=1.0 r=9.0
+      container width=fill padding=8.0 bg=white/5 border=transparent border-w=1.0 r=9.0
         BlockContents block=block
     if !block.pending && selected
       button label=block.kind width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
         BlockContents block=block
-        active bg=linear(2.3, white/68@0.0, surface/48@1.0) text=fg border=white/70 border-w=1.0 r=9.0
-        hovered bg=white/72 text=fg
+        active bg=linear(2.3, white/15@0.0, surface/48@1.0) text=fg border=white/15 border-w=1.0 r=9.0
+        hovered bg=white/16 text=fg
         pressed bg=selection text=fg
     if !block.pending && !selected
       button label=block.kind width=fill padding=8.0 -> select_block(block.id, block.kind, block.text, block.checked)
         BlockContents block=block
         active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
-        hovered bg=white/30 text=fg border=white/38
+        hovered bg=white/6 text=fg border=white/7
         pressed bg=selection text=fg
-

@@ -2,7 +2,7 @@ on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
   page_searching = true
   error = ""
-  run search_pages(connected_rpc, active_page, trim(page_search_draft)) -> page_search_loaded _ | search_failed _
+  run search_pages(connected_rpc, "", trim(page_search_draft)) -> page_search_loaded _ | search_failed _
 
 on page_search_loaded(next)
   page_search_hits = next.hits
@@ -54,35 +54,6 @@ on create_page_submit
   error = ""
   run create_page(connected_rpc, password, pending_page) -> pages_mutated _ | mutation_failed _
 
-on create_child_page_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(trim(subpage_draft))
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  sync_phase = "idle"
-  mutation_phase = "subpage"
-  pending_subpage = trim(subpage_draft)
-  subpage_draft = ""
-  error = ""
-  run create_child_page(connected_rpc, password, active_page, pending_subpage) -> pages_mutated _ | mutation_failed _
-
-on rename_page_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(trim(active_page_title))
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  sync_phase = "idle"
-  mutation_phase = "page-title"
-  error = ""
-  run rename_page(connected_rpc, password, active_page, trim(active_page_title)) -> pages_mutated _ | mutation_failed _
-
-on move_page_top_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(active_page_parent)
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  sync_phase = "idle"
-  mutation_phase = "page-parent"
-  error = ""
-  run move_page_top(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
-
 on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)
   page_delete_armed = true
@@ -118,26 +89,41 @@ on select_block(id, kind, text, checked)
   selected_block_kind = kind
   selected_block_checked = checked
   block_edit_draft = text
+  block_autosave_status = "idle"
   block_delete_armed = false
 
 on selected_block_kind_changed(next)
+  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || next == selected_block_kind
   selected_block_kind = next
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block-kind"
+  error = ""
+  run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, trim(block_edit_draft)) -> pages_mutated _ | mutation_failed _
 
 on clear_block_selection
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
   block_edit_draft = ""
+  block_autosave_status = "idle"
   block_delete_armed = false
 
-on save_block_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || (selected_block_kind != "Divider" && empty(trim(block_edit_draft)))
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  sync_phase = "idle"
-  mutation_phase = "block-save"
+on block_text_changed(next)
+  block_edit_draft = next
+  return if loading || empty(selected_block_id) || selected_block_kind == "Divider" || empty(trim(block_edit_draft))
+  block_autosave_status = "saving"
   error = ""
-  run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, trim(block_edit_draft)) -> pages_mutated _ | mutation_failed _
+  run autosave_block_text(connected_rpc, password, selected_block_id, selected_block_kind, trim(block_edit_draft)) -> block_text_saved _ | block_text_save_failed _
+
+on block_text_saved(written)
+  return if !written
+  block_autosave_status = "saved"
+
+on block_text_save_failed(cause)
+  block_autosave_status = "error"
+  error = cause.message
 
 on toggle_block_checked
   return if loading || mutation_phase != "idle" || selected_block_kind != "Todo" || empty(selected_block_id)
@@ -192,12 +178,12 @@ on pages_mutated(next)
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   pending_page = ""
-  pending_subpage = ""
   pending_block = ""
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
   block_edit_draft = ""
+  block_autosave_status = "idle"
   page_delete_armed = false
   block_delete_armed = false
   mutation_phase = "idle"
@@ -207,4 +193,3 @@ on pages_mutated(next)
   hydration_generation = hydration_generation + 1
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
-

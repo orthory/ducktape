@@ -1,7 +1,7 @@
 state
   app_theme = "app"
-  app_background = "#d8d8d880"
-  app_text = "#202020"
+  app_background = "#101012ee"
+  app_text = "#f2f2f4"
   rpc = ""
   connected_rpc = ""
   password = ""
@@ -19,6 +19,13 @@ state
   messages:[ChatMessage] = []
   active_channel = ""
   active_channel_name = ""
+  active_channel_archived = false
+  active_channel_members_only = false
+  active_channel_huddle_count:i64 = 0
+  channel_members:[ChatMember] = []
+  channel_settings_open = false
+  channel_name_draft = ""
+  member_key_draft = ""
   selected_message_seq:i64 = 0
   selected_message_rev:i64 = 0
   message_edit_draft = ""
@@ -41,9 +48,7 @@ state
   active_page_parent = ""
   page_draft = ""
   pending_page = ""
-  subpage_draft = ""
-  pending_subpage = ""
-  block_kinds = ["Text", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
+  block_kinds = ["Text", "Page", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
   new_block_kind = "Text"
   block_draft = ""
   pending_block = ""
@@ -51,9 +56,9 @@ state
   selected_block_kind = ""
   selected_block_checked = false
   block_edit_draft = ""
+  block_autosave_status = "idle"
   page_delete_armed = false
   block_delete_armed = false
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false
-

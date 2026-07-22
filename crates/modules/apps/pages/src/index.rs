@@ -22,12 +22,12 @@
 //! `height` and `time` collapse to the boundary — hit sets stay exact,
 //! ranking among rebuilt rows falls back to id order.
 
+use crate::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
 use indexer::search::{self, DEFAULT_POSTING_CAP};
 use indexer::{
     ApplyCtx, Backfill, Derived, Error, ModuleIndexer, OpMeta, RebuildMeta, Result, StateReader,
     ViewReader,
 };
-use crate::{BlockKind, PageMsg, PageQuery, PageReply, decode_msg, decode_reply, encode_query};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -37,7 +37,7 @@ const MAX_SEARCH_LIMIT: usize = 100;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageBlockRow {
     pub block_id: String,
-    /// the page (root block id) this block belongs to; a root names itself.
+    /// the owning page block id; `Page` blocks name themselves.
     pub page_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -179,10 +179,9 @@ impl ModuleIndexer for PagesIndex {
         out: &mut Derived,
     ) -> Result<()> {
         match decode_msg(payload).map_err(Error::Mapper)? {
-            PageMsg::CreatePage { page_id, title, parent: _ } => {
+            PageMsg::CreatePage { page_id, title } => {
                 // idempotence mirror: re-creating an existing page is a no-op
-                // that does NOT overwrite the title. the folder parent is not
-                // searchable, so the index ignores it.
+                // that does NOT overwrite the title.
                 if read_row(ctx, &page_id)?.is_some() {
                     return Ok(());
                 }
@@ -204,9 +203,14 @@ impl ModuleIndexer for PagesIndex {
                 let Some(mut parent_row) = read_row(ctx, &parent)? else {
                     return Ok(());
                 };
+                let page_id = if block.kind == BlockKind::Page {
+                    block.id.clone()
+                } else {
+                    parent_row.page_id.clone()
+                };
                 let row = PageBlockRow {
                     block_id: block.id.clone(),
-                    page_id: parent_row.page_id.clone(),
+                    page_id,
                     parent: Some(parent.clone()),
                     kind: block.kind,
                     text: block.text,
@@ -240,8 +244,9 @@ impl ModuleIndexer for PagesIndex {
             PageMsg::MoveBlock {
                 block_id, parent, ..
             } => {
-                // same-page move (the module rejects the rest): re-home the
-                // membership edge, page and text unchanged.
+                // Re-home the membership edge. Page rows keep their own page
+                // id while non-page rows are constrained to their page by the
+                // consensus module.
                 let Some(mut row) = read_row(ctx, &block_id)? else {
                     return Ok(());
                 };
@@ -250,7 +255,7 @@ impl ModuleIndexer for PagesIndex {
                 // special-cases it too). re-reading the parent below would see
                 // the pre-op row (this op's staged writes are invisible to
                 // read_row) and re-push a duplicate child — so: no-op.
-                if row.parent.as_deref() == Some(parent.as_str()) {
+                if row.parent == parent {
                     return Ok(());
                 }
                 if let Some(old_parent) = &row.parent
@@ -259,11 +264,13 @@ impl ModuleIndexer for PagesIndex {
                     old.children.retain(|c| c != &block_id);
                     put_row(out, &old)?;
                 }
-                if let Some(mut new_parent) = read_row(ctx, &parent)? {
+                if let Some(parent) = &parent
+                    && let Some(mut new_parent) = read_row(ctx, parent)?
+                {
                     new_parent.children.push(block_id.clone());
                     put_row(out, &new_parent)?;
                 }
-                row.parent = Some(parent);
+                row.parent = parent;
                 put_row(out, &row)
             }
             PageMsg::RemoveBlock { block_id } => {
@@ -289,20 +296,6 @@ impl ModuleIndexer for PagesIndex {
             | PageMsg::EditComment { .. }
             | PageMsg::DeleteComment { .. }
             | PageMsg::ResolveThread { .. } => Ok(()),
-            // folder nesting carries no searchable text — the block tree (and
-            // thus every row) is unchanged.
-            PageMsg::SetPageParent { .. } => Ok(()),
-            PageMsg::DeletePage { page_id } => {
-                // drop the page root and its whole block subtree (rows +
-                // postings), exactly like RemoveBlock but starting from a root.
-                // child PAGES are separate roots (the folder relation is not
-                // mirrored in this index's membership set), so they survive —
-                // matching the module's promote-children semantics.
-                let Some(row) = read_row(ctx, &page_id)? else {
-                    return Ok(());
-                };
-                delete_subtree(ctx, out, row)
-            }
         }
     }
 
@@ -326,7 +319,9 @@ impl ModuleIndexer for PagesIndex {
                 .filter(|r: &TokRef| page_id.as_ref().is_none_or(|p| &r.page_id == p))
                 .collect();
         refs.sort_by(|a, b| (b.time, &b.block_id).cmp(&(a.time, &a.block_id)));
-        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT);
+        let limit = limit
+            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .clamp(1, MAX_SEARCH_LIMIT);
         let mut hits = Vec::new();
         for r in refs.into_iter().take(limit) {
             if let Some(bytes) = reader.get(blk_key(&r.block_id).as_bytes())? {
@@ -390,8 +385,8 @@ impl ModuleIndexer for PagesIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
     use crate::{NewBlock, encode_msg};
+    use indexer::{AppliedOp, BlockOps, IndexStore, OriginTag};
 
     fn store(dir: &std::path::Path) -> IndexStore {
         IndexStore::open(dir, &["pages"])
@@ -451,7 +446,6 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "roadmap draft".into(),
-                    parent: None,
                 }),
                 insert("p1", "b1", "quarter goals"),
                 insert("b1", "b2", "nested milestone detail"),
@@ -472,7 +466,6 @@ mod tests {
             vec![op(&PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "usurper".into(),
-                parent: None,
             })],
         );
         assert!(search(&store, serde_json::json!({"search": {"text": "usurper"}})).is_empty());
@@ -480,6 +473,49 @@ mod tests {
             search(&store, serde_json::json!({"search": {"text": "roadmap"}})).len(),
             1
         );
+    }
+
+    #[test]
+    fn page_blocks_start_and_remove_their_own_search_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        apply(
+            &store,
+            1,
+            vec![
+                op(&PageMsg::CreatePage {
+                    page_id: "root".into(),
+                    title: "root document".into(),
+                }),
+                op(&PageMsg::InsertBlock {
+                    parent: "root".into(),
+                    after: None,
+                    block: NewBlock {
+                        id: "child".into(),
+                        kind: BlockKind::Page,
+                        text: "child document".into(),
+                        marks: Vec::new(),
+                    },
+                }),
+                insert("child", "inside", "nested body"),
+            ],
+        );
+
+        for term in ["child", "nested"] {
+            let hits = search(&store, serde_json::json!({"search": {"text": term}}));
+            assert_eq!(hits.len(), 1, "{term}");
+            assert_eq!(hits[0].page_id, "child", "{term}");
+        }
+
+        apply(
+            &store,
+            2,
+            vec![op(&PageMsg::RemoveBlock {
+                block_id: "child".into(),
+            })],
+        );
+        assert!(search(&store, serde_json::json!({"search": {"text": "child"}})).is_empty());
+        assert!(search(&store, serde_json::json!({"search": {"text": "nested"}})).is_empty());
     }
 
     #[test]
@@ -493,7 +529,6 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
-                    parent: None,
                 }),
                 insert("p1", "b1", "toggle section"),
                 insert("b1", "b2", "hidden inner text"),
@@ -527,7 +562,6 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
-                    parent: None,
                 }),
                 insert("p1", "b1", "first"),
                 insert("p1", "b2", "second"),
@@ -540,7 +574,7 @@ mod tests {
             2,
             vec![op(&PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: Some("b2".into()),
             })],
         );
@@ -549,7 +583,7 @@ mod tests {
             3,
             vec![op(&PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: None,
             })],
         );
@@ -575,12 +609,10 @@ mod tests {
                 op(&PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "alpha".into(),
-                    parent: None,
                 }),
                 op(&PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "beta".into(),
-                    parent: None,
                 }),
                 insert("p1", "b1", "shared term"),
                 insert("p2", "b2", "shared term"),
@@ -596,7 +628,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].block_id, "b2");
 
-        // renaming the page root retokenizes the title.
+        // renaming the page block retokenizes the title.
         apply(
             &store,
             2,
@@ -667,7 +699,6 @@ mod tests {
             vec![op(&PageMsg::CreatePage {
                 page_id: "stale".into(),
                 title: "vanishing title".into(),
-                parent: None,
             })],
         );
 
@@ -680,13 +711,41 @@ mod tests {
             },
             vec![
                 canonical_block("p1", None, "p1", BlockKind::Page, "roadmap", &["b1", "b3"]),
-                canonical_block("b1", Some("p1"), "p1", BlockKind::Paragraph, "toggle section", &["b2"]),
-                canonical_block("b2", Some("b1"), "p1", BlockKind::Paragraph, "hidden inner text", &[]),
-                canonical_block("b3", Some("p1"), "p1", BlockKind::Paragraph, "sibling survivor", &[]),
+                canonical_block(
+                    "b1",
+                    Some("p1"),
+                    "p1",
+                    BlockKind::Paragraph,
+                    "toggle section",
+                    &["b2"],
+                ),
+                canonical_block(
+                    "b2",
+                    Some("b1"),
+                    "p1",
+                    BlockKind::Paragraph,
+                    "hidden inner text",
+                    &[],
+                ),
+                canonical_block(
+                    "b3",
+                    Some("p1"),
+                    "p1",
+                    BlockKind::Paragraph,
+                    "sibling survivor",
+                    &[],
+                ),
             ],
         )]);
         store
-            .rebuild_module("pages", &state, indexer::RebuildMeta { height: 20, time: 0 })
+            .rebuild_module(
+                "pages",
+                &state,
+                indexer::RebuildMeta {
+                    height: 20,
+                    time: 0,
+                },
+            )
             .await
             .expect("rebuild");
 

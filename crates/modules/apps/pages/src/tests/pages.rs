@@ -20,7 +20,6 @@ fn create_page_is_idempotent_and_preserves_the_title() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "stale title".into(),
-                parent: None,
             },
         )
         .await;
@@ -46,7 +45,6 @@ fn list_pages_enumerates_sorted_with_live_titles() {
                 &PageMsg::CreatePage {
                     page_id: id.into(),
                     title: title.into(),
-                    parent: None,
                 },
             )
             .await;
@@ -74,7 +72,6 @@ fn reserved_index_id_is_rejected() {
             &PageMsg::CreatePage {
                 page_id: PAGE_INDEX_KEY.into(),
                 title: "clobber".into(),
-                parent: None,
             },
             "reserved block id",
         )
@@ -98,10 +95,10 @@ fn reserved_index_id_is_rejected() {
     });
 }
 
-// ── nested pages (folder relation in the index) ──
+// ── nested pages (Page blocks in the document tree) ──
 
 #[test]
-fn create_with_parent_records_folder_edge() {
+fn inserting_page_block_records_document_and_index_edges() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         apply_commit(
@@ -109,59 +106,75 @@ fn create_with_parent_records_folder_edge() {
             &PageMsg::CreatePage {
                 page_id: "root".into(),
                 title: "Root".into(),
-                parent: None,
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::CreatePage {
-                page_id: "child".into(),
-                title: "Child".into(),
-                parent: Some("root".into()),
+            &PageMsg::InsertBlock {
+                parent: "root".into(),
+                after: None,
+                block: page("child", "Child"),
             },
         )
         .await;
         let pages = list_pages(&p).await;
         let child = pages.iter().find(|m| m.id == "child").unwrap();
         assert_eq!(child.parent.as_deref(), Some("root"));
+        let child_block = get_block(&p, "child").await.unwrap();
+        assert_eq!(child_block.parent.as_deref(), Some("root"));
+        assert_eq!(child_block.page, "child");
+        assert_eq!(ids(&get_page(&p, "root").await.unwrap()), ["root", "child"]);
         let root = pages.iter().find(|m| m.id == "root").unwrap();
         assert_eq!(root.parent, None);
     });
 }
 
 #[test]
-fn create_under_missing_or_nonpage_parent_is_rejected() {
+fn page_block_accepts_any_real_block_parent() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         seed_page(&mut p, "p1").await; // p1 + blocks b1,b2,b3
         // parent does not exist
         apply_expect_err(
             &mut p,
-            &PageMsg::CreatePage {
-                page_id: "x".into(),
-                title: "x".into(),
-                parent: Some("ghost".into()),
+            &PageMsg::InsertBlock {
+                parent: "ghost".into(),
+                after: None,
+                block: page("x", "x"),
             },
-            "parent page not found",
+            "parent block not found",
         )
         .await;
-        // parent exists but is a non-page block
-        apply_expect_err(
+        // A subpage can sit under any block, not only another Page block.
+        apply_commit(
             &mut p,
-            &PageMsg::CreatePage {
-                page_id: "y".into(),
-                title: "y".into(),
-                parent: Some("b1".into()),
+            &PageMsg::InsertBlock {
+                parent: "b1".into(),
+                after: None,
+                block: page("y", "y"),
             },
-            "parent page not found",
         )
         .await;
+        assert_eq!(
+            get_block(&p, "y").await.unwrap().parent.as_deref(),
+            Some("b1")
+        );
+        assert_eq!(
+            list_pages(&p)
+                .await
+                .into_iter()
+                .find(|meta| meta.id == "y")
+                .unwrap()
+                .parent
+                .as_deref(),
+            Some("p1")
+        );
     });
 }
 
 #[test]
-fn set_page_parent_renests_and_rejects_cycles() {
+fn moving_page_blocks_renests_and_rejects_cycles() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         for id in ["a", "b", "c"] {
@@ -170,7 +183,6 @@ fn set_page_parent_renests_and_rejects_cycles() {
                 &PageMsg::CreatePage {
                     page_id: id.into(),
                     title: id.into(),
-                    parent: None,
                 },
             )
             .await;
@@ -178,17 +190,19 @@ fn set_page_parent_renests_and_rejects_cycles() {
         // b under a, c under b.
         apply_commit(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "b".into(),
+            &PageMsg::MoveBlock {
+                block_id: "b".into(),
                 parent: Some("a".into()),
+                after: None,
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "c".into(),
+            &PageMsg::MoveBlock {
+                block_id: "c".into(),
                 parent: Some("b".into()),
+                after: None,
             },
         )
         .await;
@@ -201,59 +215,67 @@ fn set_page_parent_renests_and_rejects_cycles() {
         // a under c would cycle (a -> c -> b -> a).
         apply_expect_err(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "a".into(),
+            &PageMsg::MoveBlock {
+                block_id: "a".into(),
                 parent: Some("c".into()),
+                after: None,
             },
-            "page cycle",
+            "inside the moved subtree",
         )
         .await;
         // self-parent cycles too.
         apply_expect_err(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "a".into(),
+            &PageMsg::MoveBlock {
+                block_id: "a".into(),
                 parent: Some("a".into()),
+                after: None,
             },
-            "page cycle",
+            "inside the moved subtree",
         )
         .await;
         // detach to top level.
         apply_commit(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "b".into(),
+            &PageMsg::MoveBlock {
+                block_id: "b".into(),
                 parent: None,
+                after: None,
             },
         )
         .await;
         assert_eq!(parent_of(&list_pages(&p).await, "b"), None);
-        // target must be a page root.
+        // Only Page blocks can detach to the top level.
         seed_page(&mut p, "pg").await;
         apply_expect_err(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "b1".into(),
+            &PageMsg::MoveBlock {
+                block_id: "b1".into(),
                 parent: None,
+                after: None,
             },
-            "not a page",
+            "only page blocks",
         )
         .await;
-        // parent must be a page.
-        apply_expect_err(
+        // A page may move under a regular content block.
+        apply_commit(
             &mut p,
-            &PageMsg::SetPageParent {
-                page_id: "a".into(),
+            &PageMsg::MoveBlock {
+                block_id: "a".into(),
                 parent: Some("b1".into()),
+                after: None,
             },
-            "parent page not found",
         )
         .await;
+        assert_eq!(
+            get_block(&p, "a").await.unwrap().parent.as_deref(),
+            Some("b1")
+        );
     });
 }
 
 #[test]
-fn delete_page_removes_subtree_and_promotes_children() {
+fn removing_page_block_removes_its_entire_nested_subtree() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         // grand -> parent -> child ; parent also has a content block pb1.
@@ -262,25 +284,24 @@ fn delete_page_removes_subtree_and_promotes_children() {
             &PageMsg::CreatePage {
                 page_id: "grand".into(),
                 title: "G".into(),
-                parent: None,
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::CreatePage {
-                page_id: "parent".into(),
-                title: "P".into(),
-                parent: Some("grand".into()),
+            &PageMsg::InsertBlock {
+                parent: "grand".into(),
+                after: None,
+                block: page("parent", "P"),
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::CreatePage {
-                page_id: "child".into(),
-                title: "C".into(),
-                parent: Some("parent".into()),
+            &PageMsg::InsertBlock {
+                parent: "parent".into(),
+                after: None,
+                block: page("child", "C"),
             },
         )
         .await;
@@ -296,8 +317,8 @@ fn delete_page_removes_subtree_and_promotes_children() {
 
         apply_commit(
             &mut p,
-            &PageMsg::DeletePage {
-                page_id: "parent".into(),
+            &PageMsg::RemoveBlock {
+                block_id: "parent".into(),
             },
         )
         .await;
@@ -306,21 +327,10 @@ fn delete_page_removes_subtree_and_promotes_children() {
         assert!(get_block(&p, "parent").await.is_none());
         assert!(get_block(&p, "pb1").await.is_none());
         assert!(get_page(&p, "parent").await.is_none());
-        // … child was PROMOTED to grand (parent's parent), not deleted.
+        // Nested Page blocks are part of the removed subtree too.
         let pages = list_pages(&p).await;
         assert!(pages.iter().all(|m| m.id != "parent"));
-        let child = pages.iter().find(|m| m.id == "child").unwrap();
-        assert_eq!(child.parent.as_deref(), Some("grand"));
-
-        // deleting a non-page id is rejected.
-        seed_page(&mut p, "pg").await;
-        apply_expect_err(
-            &mut p,
-            &PageMsg::DeletePage {
-                page_id: "b1".into(),
-            },
-            "not a page",
-        )
-        .await;
+        assert!(pages.iter().all(|m| m.id != "child"));
+        assert!(get_block(&p, "child").await.is_none());
     });
 }

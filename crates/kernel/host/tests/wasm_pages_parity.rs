@@ -190,7 +190,7 @@ fn same_ops_identical_roots_block_by_block() {
         assert!(native.resolver_backed_ids().contains("pages"));
         assert!(wasm.resolver_backed_ids().contains("pages"));
 
-        // every op family, one block each: tree edits, folder nesting, the
+        // every op family, one block each: tree edits, page nesting, the
         // comment plane (which also emits the tagging follow-up), and subtree
         // removal. `moves` marks blocks that must change the pages root.
         let ops: Vec<(Vec<u8>, PageMsg)> = vec![
@@ -199,7 +199,6 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 },
             ),
             (
@@ -252,23 +251,24 @@ fn same_ops_identical_roots_block_by_block() {
                 alice.clone(),
                 PageMsg::MoveBlock {
                     block_id: "b2".into(),
-                    parent: "b3".into(),
+                    parent: Some("b3".into()),
                     after: None,
                 },
             ),
             (
                 alice.clone(),
-                PageMsg::CreatePage {
-                    page_id: "notes".into(),
-                    title: "Notes".into(),
-                    parent: Some("home".into()),
+                PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b3".into()),
+                    block: nb("notes", BlockKind::Page, "Notes"),
                 },
             ),
             (
                 alice.clone(),
-                PageMsg::SetPageParent {
-                    page_id: "notes".into(),
+                PageMsg::MoveBlock {
+                    block_id: "notes".into(),
                     parent: None,
+                    after: None,
                 },
             ),
             // the comment plane: authorship derives from origin, the staged
@@ -329,8 +329,8 @@ fn same_ops_identical_roots_block_by_block() {
             ),
             (
                 alice.clone(),
-                PageMsg::DeletePage {
-                    page_id: "notes".into(),
+                PageMsg::RemoveBlock {
+                    block_id: "notes".into(),
                 },
             ),
         ];
@@ -455,7 +455,6 @@ fn rejections_match_and_leave_no_trace() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 }),
             )
             .await
@@ -492,26 +491,27 @@ fn rejections_match_and_leave_no_trace() {
                 "duplicate block id",
             ),
             (
-                PageMsg::InsertBlock {
-                    parent: "home".into(),
-                    after: None,
-                    block: nb("p", BlockKind::Page, "sneaky page"),
+                PageMsg::SetKind {
+                    block_id: "b1".into(),
+                    kind: BlockKind::Page,
                 },
-                "created by CreatePage",
+                "page blocks cannot",
             ),
             (
                 PageMsg::MoveBlock {
                     block_id: "home".into(),
-                    parent: "b1".into(),
+                    parent: Some("b1".into()),
                     after: None,
                 },
-                "page roots cannot",
+                "inside the moved subtree",
             ),
             (
-                PageMsg::RemoveBlock {
-                    block_id: "home".into(),
+                PageMsg::MoveBlock {
+                    block_id: "b1".into(),
+                    parent: None,
+                    after: None,
                 },
-                "page roots cannot",
+                "only page blocks",
             ),
             (
                 PageMsg::EditComment {
@@ -580,7 +580,6 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 }),
             ),
             (

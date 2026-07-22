@@ -128,8 +128,8 @@ impl Module for Pages {
                 Ok(encode_reply(&PageReply::Block(block)))
             }
             PageQuery::ListPages => {
-                // id -> folder parent straight from the reserved index entry;
-                // titles read from the live roots so a rename shows without
+                // id -> containing page straight from the reserved index entry;
+                // titles read from live Page blocks so a rename shows without
                 // touching the index.
                 let index = self.load_index().await?;
                 let mut pages = Vec::with_capacity(index.len());

@@ -48,7 +48,11 @@ fn inline_marks_persist_and_rebase_in_utf16() {
         .await;
         assert_eq!(
             get_block(&p, "b1").await.unwrap().marks,
-            vec![SpanMark { start: 3, end: 5, kind: InlineMark::Bold }]
+            vec![SpanMark {
+                start: 3,
+                end: 5,
+                kind: InlineMark::Bold
+            }]
         );
         apply_commit(
             &mut p,
@@ -65,7 +69,11 @@ fn inline_marks_persist_and_rebase_in_utf16() {
         .await;
         assert_eq!(
             get_block(&p, "b1").await.unwrap().marks,
-            vec![SpanMark { start: 0, end: 6, kind: InlineMark::Italic }]
+            vec![SpanMark {
+                start: 0,
+                end: 6,
+                kind: InlineMark::Italic
+            }]
         );
     });
 }
@@ -162,7 +170,6 @@ fn block_ids_are_globally_unique_across_pages() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "two".into(),
-                parent: None,
             },
         )
         .await;
@@ -194,7 +201,6 @@ fn block_ids_are_globally_unique_across_pages() {
             &PageMsg::CreatePage {
                 page_id: "b1".into(),
                 title: "steal".into(),
-                parent: None,
             },
             "duplicate block id",
         )
@@ -271,24 +277,24 @@ fn set_kind_and_checked_enforce_their_domains() {
             "todo",
         )
         .await;
-        // pages come only from CreatePage — no converting to Page …
+        // Page membership is structural: SetKind cannot enter or leave it.
         apply_expect_err(
             &mut p,
             &PageMsg::SetKind {
                 block_id: "b2".into(),
                 kind: BlockKind::Page,
             },
-            "CreatePage",
+            "page blocks",
         )
         .await;
-        // … and no converting a root away from Page.
+        // Nor can it convert a Page block away from Page.
         apply_expect_err(
             &mut p,
             &PageMsg::SetKind {
                 block_id: "p1".into(),
                 kind: BlockKind::Paragraph,
             },
-            "page roots",
+            "page blocks",
         )
         .await;
     });
@@ -304,7 +310,7 @@ fn move_reorders_within_a_parent() {
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: Some("b3".into()),
             },
         )
@@ -318,7 +324,7 @@ fn move_reorders_within_a_parent() {
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: None,
             },
         )
@@ -332,7 +338,7 @@ fn move_reorders_within_a_parent() {
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: Some("b1".into()),
             },
         )
@@ -363,7 +369,7 @@ fn move_reparents_a_subtree() {
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b2".into(),
-                parent: "b1".into(),
+                parent: Some("b1".into()),
                 after: None,
             },
         )
@@ -389,7 +395,6 @@ fn illegal_moves_are_rejected() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "two".into(),
-                parent: None,
             },
         )
         .await;
@@ -407,7 +412,7 @@ fn illegal_moves_are_rejected() {
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "c1".into(),
+                parent: Some("c1".into()),
                 after: None,
             },
             "inside the moved subtree",
@@ -418,29 +423,32 @@ fn illegal_moves_are_rejected() {
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p2".into(),
+                parent: Some("p2".into()),
                 after: None,
             },
             "cross-page",
         )
         .await;
-        // a page root.
-        apply_expect_err(
+        // Page blocks may become subpages under any content block.
+        apply_commit(
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "p2".into(),
-                parent: "b1".into(),
+                parent: Some("b1".into()),
                 after: None,
             },
-            "page roots",
         )
         .await;
+        assert_eq!(
+            get_block(&p, "p2").await.unwrap().parent.as_deref(),
+            Some("b1")
+        );
         // a bad sibling anchor.
         apply_expect_err(
             &mut p,
             &PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: Some("ghost".into()),
             },
             "after-anchor",
@@ -487,14 +495,15 @@ fn remove_deletes_the_whole_subtree() {
         let page = get_page(&p, "p1").await.unwrap();
         assert_eq!(ids(&page), ["p1", "b2", "b3"]);
 
-        // roots are not removable.
-        apply_expect_err(
+        // A root Page uses the same removal wire and drops its remaining tree.
+        apply_commit(
             &mut p,
             &PageMsg::RemoveBlock {
                 block_id: "p1".into(),
             },
-            "page roots",
         )
         .await;
+        assert!(get_page(&p, "p1").await.is_none());
+        assert!(list_pages(&p).await.is_empty());
     });
 }

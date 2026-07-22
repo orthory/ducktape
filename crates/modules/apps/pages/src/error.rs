@@ -17,12 +17,11 @@ pub(super) enum PageError {
     CycleMove,
     /// a move whose new parent belongs to a different page.
     CrossPageMove,
-    /// move/remove/convert targeted a page root — roots are managed solely by
-    /// `CreatePage` (and renames via `UpdateText`).
-    PageRootImmutable,
-    /// a block op tried to insert or convert to kind `Page` — pages come only
-    /// from `CreatePage`, which is what keeps the enumeration index exact.
-    PageViaBlockOp,
+    /// `SetKind` tried to convert to or from `Page`. Page membership changes
+    /// only through insert/move/remove so the enumeration index stays exact.
+    PageKindImmutable,
+    /// a non-page block tried to move without a parent.
+    TopLevelNonPage,
     /// `SetChecked` on a non-`Todo` block.
     NotTodo,
     /// an inline mark/comment anchor is empty, outside the target text, or
@@ -40,12 +39,6 @@ pub(super) enum PageError {
     Corrupt,
     /// an op named the reserved [`PAGE_INDEX_KEY`] sentinel.
     ReservedId,
-    /// a create/set-parent named a `parent` that is not an existing page root.
-    ParentPageNotFound,
-    /// set-parent/delete targeted an id that is not an existing page root.
-    NotAPage,
-    /// a set-parent would nest a page inside its own folder subtree.
-    PageCycle,
     // ── comments ──
     /// a comment op arrived with an empty (pre-consensus) origin.
     EmptyOrigin,
@@ -87,17 +80,14 @@ impl core::fmt::Display for PageError {
             PageError::AnchorNotFound => "after-anchor not found",
             PageError::CycleMove => "move target is inside the moved subtree",
             PageError::CrossPageMove => "cross-page move",
-            PageError::PageRootImmutable => "page roots cannot be moved, removed, or converted",
-            PageError::PageViaBlockOp => "a page block can only be created by CreatePage",
+            PageError::PageKindImmutable => "page blocks cannot be converted to another kind",
+            PageError::TopLevelNonPage => "only page blocks may move to the top level",
             PageError::NotTodo => "checked applies only to todo blocks",
             PageError::InvalidTextRange => "invalid text range",
             PageError::TooManySpanMarks => "too many inline marks",
             PageError::BlockTooLarge => "block too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
-            PageError::ParentPageNotFound => "parent page not found",
-            PageError::NotAPage => "not a page",
-            PageError::PageCycle => "page cycle",
             PageError::EmptyOrigin => "empty origin",
             PageError::EmptyAgent => "empty as_agent",
             PageError::AgentNeedsModuleOrigin => "as_agent requires a module origin",

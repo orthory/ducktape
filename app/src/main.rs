@@ -45,14 +45,17 @@ mod tests {
             "rpc",
             "password",
             "channel_draft",
+            "channel_name_draft",
+            "member_key_draft",
             "message_draft",
             "message_edit_draft",
             "reply_draft",
+            "chat_search_draft",
             "page_draft",
-            "subpage_draft",
             "active_page_title",
             "block_draft",
             "block_edit_draft",
+            "page_search_draft",
         ];
         let overwrites_editable = refresh.lines().any(|line| {
             editable
@@ -94,6 +97,10 @@ mod tests {
                 messages: Vec::new(),
                 active_channel: String::new(),
                 active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
                 pages: Vec::new(),
                 blocks: Vec::new(),
                 active_page: String::new(),
@@ -138,6 +145,10 @@ mod tests {
             }],
             active_channel: "general".into(),
             active_channel_name: "general".into(),
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            active_channel_huddle_count: 0,
+            channel_members: Vec::new(),
         }));
         assert_eq!(app.message_draft, "second");
         assert_eq!(app.mutation_phase, "idle");

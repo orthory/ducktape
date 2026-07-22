@@ -10,7 +10,7 @@ component ChannelButton(channel:ChatChannel, selected:bool)
           text channel.name width=fill size=12.0 wrapping=none @text-fg font-bold
           if channel.huddle_count > 0
             text channel.huddle_count size=10.0 @text-muted
-        active bg=linear(2.3, white/78@0.0, surface/58@1.0) text=fg border=white/78 border-w=1.0 r=10.0 shadow=black/8 shadow-y=1.0 shadow-blur=6.0
+        active bg=linear(2.3, white/18@0.0, surface/58@1.0) text=fg border=white/18 border-w=1.0 r=10.0 shadow=black/8 shadow-y=1.0 shadow-blur=6.0
         pressed bg=selection
     if !selected
       button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
@@ -25,8 +25,16 @@ component ChannelButton(channel:ChatChannel, selected:bool)
           if !channel.archived && channel.huddle_count > 0
             text channel.huddle_count size=10.0 @text-muted
         active bg=transparent text=muted r=10.0
-        hovered bg=white/34 text=fg
+        hovered bg=white/6 text=fg
         pressed bg=selection text=fg
+
+component ChatMemberRow(member:ChatMember, disabled:bool)
+  row width=fill spacing=6.0 align=center
+    text member.label width=fill size=10.0 @text-muted
+    button "Remove" label=member.label disabled=disabled height=24.0 padding=4.0 -> remove_channel_member_submit(member.key)
+      active bg=transparent text=muted r=6.0
+      hovered bg=white/10 text=fg
+      pressed bg=white/15
 
 component MessageContents(message:ChatMessage)
   col width=fill spacing=4.0
@@ -37,12 +45,12 @@ component MessageContents(message:ChatMessage)
     if message.reply_count > 0 || !empty(message.reactions)
       row width=fill spacing=5.0 align=center
         if message.reply_count > 0
-          container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/38 border=white/55 border-w=1.0 r=8.0
+          container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/7 border=white/11 border-w=1.0 r=8.0
             row spacing=4.0 align=center
               text "Thread" size=10.0 @font-bold text-muted
               text message.reply_count size=10.0 @text-muted
         for reaction in message.reactions
-          container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/38 border=white/55 border-w=1.0 r=8.0
+          container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/7 border=white/11 border-w=1.0 r=8.0
             row spacing=4.0 align=center
               text reaction.emoji size=10.0 @text-fg
               text reaction.count size=10.0 @text-muted
@@ -55,14 +63,14 @@ component MessageCard(message:ChatMessage, selected:bool)
     if !message.deleted && selected
       button label=message.body width=fill padding=8.0 -> select_message(message.seq, message.body, message.rev)
         MessageContents message=message
-        active bg=linear(2.3, white/70@0.0, surface/52@1.0) text=fg border=white/72 border-w=1.0 r=10.0
-        hovered bg=white/74 text=fg
+        active bg=linear(2.3, white/15@0.0, surface/52@1.0) text=fg border=white/16 border-w=1.0 r=10.0
+        hovered bg=white/16 text=fg
         pressed bg=selection text=fg
     if !message.deleted && !selected
       button label=message.body width=fill padding=8.0 -> select_message(message.seq, message.body, message.rev)
         MessageContents message=message
         active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
-        hovered bg=white/34 text=fg border=white/42
+        hovered bg=white/6 text=fg border=white/8
         pressed bg=selection text=fg
 
 component ThreadMessageCard(message:ChatMessage)
@@ -81,6 +89,5 @@ component ChatSearchResult(hit:ChatSearchHit)
         text hit.meta size=10.0 @text-muted
       text hit.text width=fill size=11.0 wrapping=word @text-fg
     active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-    hovered bg=white/48 text=fg border=white/52
+    hovered bg=white/9 text=fg border=white/10
     pressed bg=selection text=fg
-

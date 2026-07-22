@@ -1,6 +1,6 @@
 component Brand()
   row width=fill spacing=9.0 align=center
-    container width=28.0 height=28.0 align-x=center align-y=center bg=linear(2.3, white/85@0.0, surface/55@1.0) border=white/90 border-w=1.0 r=8.0 shadow=black/12 shadow-y=2.0 shadow-blur=8.0
+    container width=28.0 height=28.0 align-x=center align-y=center bg=linear(2.3, white/20@0.0, surface/55@1.0) border=white/22 border-w=1.0 r=8.0 shadow=black/12 shadow-y=2.0 shadow-blur=8.0
       text "D" size=13.0 @font-bold text-fg
     col width=fill spacing=0.0
       text "Ducktape" size=13.0 @font-bold text-fg
@@ -19,9 +19,9 @@ component WorkspaceTabs(status:str, loading:bool)
     tab = "chat"
   on select_tab(next)
     tab = next
-  container width=fill height=fill clip=true bg=linear(2.35, white/48@0.0, bg/78@0.55, surface/58@1.0) border=white/65 border-w=1.0 r=20.0 shadow=black/18 shadow-y=8.0 shadow-blur=28.0 px-snap=true
+  container width=fill height=fill clip=true bg=linear(2.35, elevated/76@0.0, bg/98@0.55, surface/90@1.0) border=white/14 border-w=1.0 r=20.0 shadow=black/18 shadow-y=8.0 shadow-blur=28.0 px-snap=true
     row width=fill height=fill
-      container width=242.0 height=fill padding=12.0 padding-top=38.0 bg=linear(2.25, white/62@0.0, sidebar/80@0.48, bg/66@1.0) border=white/58 border-w=1.0 r-tr=18.0 r-br=18.0 shadow=black/10 shadow-x=4.0 shadow-blur=18.0 clip=true
+      container width=242.0 height=fill padding=12.0 padding-top=38.0 bg=linear(2.25, surface/78@0.0, sidebar/98@0.48, bg/96@1.0) border=white/12 border-w=1.0 r-tr=18.0 r-br=18.0 shadow=black/10 shadow-x=4.0 shadow-blur=18.0 clip=true
         col width=fill height=fill spacing=8.0
           Brand
           space height=6.0
@@ -34,14 +34,14 @@ component WorkspaceTabs(status:str, loading:bool)
                   row width=fill spacing=9.0 align=center
                     text "#" width=18.0 size=14.0 align-x=center @font-bold text-fg
                     text "Chat" width=fill size=12.0 @font-bold text-fg
-                  active bg=linear(2.3, white/85@0.0, surface/66@1.0) text=fg border=white/85 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
+                  active bg=linear(2.3, white/12@0.0, surface/76@1.0) text=fg border=white/18 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
                   pressed bg=selection
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill spacing=9.0 align=center
                     text "□" width=18.0 size=14.0 align-x=center @text-muted
                     text "Pages" width=fill size=12.0 @text-muted
                   active bg=transparent text=muted r=10.0
-                  hovered bg=white/38 text=fg
+                  hovered bg=white/7 text=fg
                   pressed bg=selection text=fg
             _
               col width=fill spacing=3.0
@@ -50,13 +50,13 @@ component WorkspaceTabs(status:str, loading:bool)
                     text "#" width=18.0 size=14.0 align-x=center @text-muted
                     text "Chat" width=fill size=12.0 @text-muted
                   active bg=transparent text=muted r=10.0
-                  hovered bg=white/38 text=fg
+                  hovered bg=white/7 text=fg
                   pressed bg=selection text=fg
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill spacing=9.0 align=center
                     text "□" width=18.0 size=14.0 align-x=center @font-bold text-fg
                     text "Pages" width=fill size=12.0 @font-bold text-fg
-                  active bg=linear(2.3, white/85@0.0, surface/66@1.0) text=fg border=white/85 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
+                  active bg=linear(2.3, white/12@0.0, surface/76@1.0) text=fg border=white/18 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
                   pressed bg=selection
           container width=fill height=1.0 bg=separator
             text ""
@@ -92,4 +92,3 @@ component WorkspaceTabs(status:str, loading:bool)
               slot chat
             _
               slot pages
-

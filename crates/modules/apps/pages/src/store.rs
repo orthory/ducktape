@@ -62,21 +62,32 @@ impl Pages {
     }
 
     /// delete a whole subtree depth-first, purging each block's comments and
-    /// staging its delete (the shared RemoveBlock/DeletePage walk). a child
+    /// staging its delete (the shared `RemoveBlock` walk). a child
     /// listed but absent from the store is a broken invariant, surfaced loudly.
     pub(super) async fn delete_subtree(&mut self, root: Block) -> Result<(), PageError> {
         let mut stack = vec![root];
+        let mut removed_pages = Vec::new();
         while let Some(cur) = stack.pop() {
             for child in &cur.children {
                 stack.push(self.require_block(child, PageError::Corrupt).await?);
             }
             self.purge_comments_for_target(&cur.id).await?;
+            if cur.kind == BlockKind::Page {
+                removed_pages.push(cur.id.clone());
+            }
             self.delete_block(&cur.id);
+        }
+        if !removed_pages.is_empty() {
+            let mut index = self.load_index().await.map_err(to_page_err)?;
+            for page_id in removed_pages {
+                index.remove(&page_id);
+            }
+            self.stage_index(&index)?;
         }
         Ok(())
     }
 
-    /// load the enumeration index — page id → folder parent — through the
+    /// load the enumeration index — page id → containing page — through the
     /// staged-over-committed overlay. absent reads as the empty map; a decode
     /// failure is corruption. `BTreeMap` serializes with SORTED keys, so the
     /// bytes are canonical and every validator commits the same index root.
@@ -111,6 +122,20 @@ impl Pages {
         Ok(())
     }
 
+    /// update one existing page's containing-page relation.
+    pub(super) async fn index_set_parent(
+        &mut self,
+        page_id: &str,
+        parent: Option<String>,
+    ) -> Result<(), PageError> {
+        let mut index = self.load_index().await.map_err(to_page_err)?;
+        if !index.contains_key(page_id) {
+            return Err(PageError::Corrupt);
+        }
+        index.insert(page_id.to_string(), parent);
+        self.stage_index(&index)
+    }
+
     /// load a block that MUST exist (`missing` names the error when it does
     /// not) — the shared shape of every "look up then edit" op.
     pub(super) async fn require_block(
@@ -124,7 +149,7 @@ impl Pages {
             .ok_or(missing)
     }
 
-    /// walk parent pointers from `start` to the page root, erroring with
+    /// walk parent pointers from `start` to the top-level page, erroring with
     /// [`PageError::CycleMove`] if `forbidden` appears on the path (that would
     /// reparent a block inside its own subtree). the [`MAX_DEPTH`] cap turns a
     /// corrupt (looping) parent chain into a loud error instead of a hang.
@@ -147,33 +172,9 @@ impl Pages {
         Err(PageError::Corrupt)
     }
 
-    /// walk FOLDER parents (the index map) up from `start`, erroring with
-    /// [`PageError::PageCycle`] if `forbidden` is met — that would nest a page
-    /// inside its own folder subtree. [`MAX_DEPTH`] turns a corrupt (looping)
-    /// folder chain into a loud error instead of a hang.
-    pub(super) async fn folder_ancestry_excludes(
-        &self,
-        start: &str,
-        forbidden: &str,
-    ) -> Result<(), PageError> {
-        let index = self.load_index().await.map_err(to_page_err)?;
-        let mut cur = Some(start.to_string());
-        for _ in 0..MAX_DEPTH {
-            match cur {
-                None => return Ok(()),
-                Some(id) => {
-                    if id == forbidden {
-                        return Err(PageError::PageCycle);
-                    }
-                    cur = index.get(&id).cloned().flatten();
-                }
-            }
-        }
-        Err(PageError::Corrupt)
-    }
-    /// assemble a whole page in PREORDER (root first, each block's subtree
+    /// assemble one page in PREORDER (root first, each block's subtree
     /// before its next sibling), through the staged overlay. `None` when no
-    /// PAGE lives at `page_id` (a non-root block id reads as absent here —
+    /// PAGE lives at `page_id` (a non-page block id reads as absent here —
     /// `GetBlock` is the by-id surface).
     pub(super) async fn load_page(&self, page_id: &str) -> Result<Option<Vec<Block>>, Error> {
         let corrupt = || Error::Module(PageError::Corrupt.to_string());
@@ -181,13 +182,17 @@ impl Pages {
             Some(b) if b.kind == BlockKind::Page => b,
             _ => return Ok(None),
         };
+        let root_id = root.id.clone();
         let mut out = Vec::new();
         let mut stack = vec![root];
         while let Some(cur) = stack.pop() {
-            // push children reversed so the leftmost child is popped next —
-            // that is what makes the flat output preorder.
-            for child in cur.children.iter().rev() {
-                stack.push(self.load_block(child).await?.ok_or_else(corrupt)?);
+            // A nested Page is visible as one block in its parent document;
+            // its own content belongs to the page opened by that block.
+            let is_nested_page = cur.kind == BlockKind::Page && cur.id != root_id;
+            if !is_nested_page {
+                for child in cur.children.iter().rev() {
+                    stack.push(self.load_block(child).await?.ok_or_else(corrupt)?);
+                }
             }
             out.push(cur);
         }

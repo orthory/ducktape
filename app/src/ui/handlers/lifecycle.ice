@@ -22,6 +22,10 @@ on workspace_connected(next)
   messages = next.messages
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
+  active_channel_archived = next.active_channel_archived
+  active_channel_members_only = next.active_channel_members_only
+  active_channel_huddle_count = next.active_channel_huddle_count
+  channel_members = next.channel_members
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
@@ -45,6 +49,10 @@ on workspace_refreshed(next)
   messages = next.messages
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
+  active_channel_archived = next.active_channel_archived
+  active_channel_members_only = next.active_channel_members_only
+  active_channel_huddle_count = next.active_channel_huddle_count
+  channel_members = next.channel_members
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
@@ -88,7 +96,6 @@ on mutation_failed(cause)
   channel_draft = restore_draft(channel_draft, pending_channel)
   message_draft = restore_draft(message_draft, pending_message)
   page_draft = restore_draft(page_draft, pending_page)
-  subpage_draft = restore_draft(subpage_draft, pending_subpage)
   block_draft = restore_draft(block_draft, pending_block)
   reply_draft = restore_draft(reply_draft, pending_reply)
   messages = rollback_messages(messages)
@@ -97,7 +104,6 @@ on mutation_failed(cause)
   pending_channel = ""
   pending_message = ""
   pending_page = ""
-  pending_subpage = ""
   pending_block = ""
   pending_reply = ""
   error = cause.message
@@ -117,4 +123,3 @@ on failed(cause)
   sync_phase = "idle"
   status = "Offline"
   error = cause.message
-

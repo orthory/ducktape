@@ -2,7 +2,7 @@ on search_chat_submit
   return if chat_searching || empty(trim(chat_search_draft))
   chat_searching = true
   error = ""
-  run search_chat(connected_rpc, active_channel, trim(chat_search_draft)) -> chat_search_loaded _ | search_failed _
+  run search_chat(connected_rpc, "", trim(chat_search_draft)) -> chat_search_loaded _ | search_failed _
 
 on chat_search_loaded(next)
   chat_search_hits = next.hits
@@ -37,6 +37,9 @@ on choose_channel(id)
   selected_message_seq = 0
   selected_message_rev = 0
   message_edit_draft = ""
+  channel_settings_open = false
+  channel_name_draft = ""
+  member_key_draft = ""
   active_thread_seq = 0
   thread_messages = []
   reply_draft = ""
@@ -55,8 +58,76 @@ on create_channel_submit
   error = ""
   run create_channel(connected_rpc, password, pending_channel) -> chat_mutated _ | mutation_failed _
 
+on toggle_channel_settings
+  return if empty(active_channel)
+  channel_settings_open = !channel_settings_open
+  channel_name_draft = active_channel_name
+
+on rename_channel_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(channel_name_draft))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "channel-rename"
+  error = ""
+  run rename_channel(connected_rpc, password, active_channel, trim(channel_name_draft)) -> chat_mutated _ | mutation_failed _
+
+on archive_channel_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "channel-archive"
+  error = ""
+  run archive_channel(connected_rpc, password, active_channel) -> chat_mutated _ | mutation_failed _
+
+on unarchive_channel_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || !active_channel_archived
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "channel-unarchive"
+  error = ""
+  run unarchive_channel(connected_rpc, password, active_channel) -> chat_mutated _ | mutation_failed _
+
+on add_channel_member_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(member_key_draft))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "channel-member"
+  error = ""
+  run add_channel_member(connected_rpc, password, active_channel, trim(member_key_draft)) -> chat_mutated _ | mutation_failed _
+
+on remove_channel_member_submit(key)
+  return if loading || mutation_phase != "idle" || empty(active_channel)
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "channel-member"
+  error = ""
+  run remove_channel_member(connected_rpc, password, active_channel, key) -> chat_mutated _ | mutation_failed _
+
+on join_huddle_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "huddle"
+  error = ""
+  run join_huddle(connected_rpc, password, active_channel) -> chat_mutated _ | mutation_failed _
+
+on leave_huddle_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_huddle_count <= 0
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "huddle"
+  error = ""
+  run leave_huddle(connected_rpc, password, active_channel) -> chat_mutated _ | mutation_failed _
+
 on send_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(message_draft))
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || empty(trim(message_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -72,6 +143,10 @@ on chat_updated(next)
   messages = next.messages
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
+  active_channel_archived = next.active_channel_archived
+  active_channel_members_only = next.active_channel_members_only
+  active_channel_huddle_count = next.active_channel_huddle_count
+  channel_members = next.channel_members
   loading = false
   error = ""
   return if !live_dirty
@@ -85,6 +160,12 @@ on chat_mutated(next)
   messages = next.messages
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
+  active_channel_archived = next.active_channel_archived
+  active_channel_members_only = next.active_channel_members_only
+  active_channel_huddle_count = next.active_channel_huddle_count
+  channel_members = next.channel_members
+  channel_name_draft = next.active_channel_name
+  member_key_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_edit_draft = ""
@@ -139,7 +220,7 @@ on close_thread
   pending_reply = ""
 
 on edit_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0 || empty(trim(message_edit_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -148,7 +229,7 @@ on edit_message_submit
   run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft)) -> chat_mutated _ | mutation_failed _
 
 on delete_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -157,7 +238,7 @@ on delete_message_submit
   run delete_message(connected_rpc, password, active_channel, selected_message_seq) -> chat_mutated _ | mutation_failed _
 
 on add_reaction_submit(emoji)
-  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -166,7 +247,7 @@ on add_reaction_submit(emoji)
   run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_mutated _ | mutation_failed _
 
 on send_reply_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_thread_seq <= 0 || empty(trim(reply_draft))
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -187,4 +268,3 @@ on thread_mutated(next)
   hydration_generation = hydration_generation + 1
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
-

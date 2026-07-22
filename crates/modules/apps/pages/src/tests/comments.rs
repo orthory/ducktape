@@ -35,13 +35,7 @@ fn exact_comment_anchor_rebases_with_target_text() {
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
             *anchor = Some(RelativeAnchor { start: 0, end: 99 });
         }
-        apply_err_as(
-            &mut p,
-            &anchored,
-            user("alice"),
-            "invalid text range",
-        )
-        .await;
+        apply_err_as(&mut p, &anchored, user("alice"), "invalid text range").await;
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
             *anchor = Some(RelativeAnchor { start: 0, end: 2 });
         }
@@ -569,14 +563,13 @@ fn deleting_a_block_purges_its_comment_threads() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "keep".into(),
-                parent: None,
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::DeletePage {
-                page_id: "p1".into(),
+            &PageMsg::RemoveBlock {
+                block_id: "p1".into(),
             },
         )
         .await;

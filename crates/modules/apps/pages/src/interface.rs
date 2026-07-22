@@ -1,8 +1,8 @@
 //! the pages module's public wire surface — types plus thin `sdk::wire` codec
 //! delegates.
 //!
-//! a page is a TREE of [`Block`]s (notion's model, simplified): the page itself
-//! is the root block, every block carries an ordered `children` list, and every
+//! a page is a TREE of [`Block`]s (notion's model, simplified): a `Page` block
+//! starts a document, every block carries an ordered `children` list, and every
 //! block id is GLOBALLY UNIQUE within the module — not merely unique inside its
 //! page. that global uniqueness is the addressability contract: a block is
 //! resolvable by id alone ([`PageQuery::GetBlock`] takes no page context), so a
@@ -12,9 +12,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// the kind of a block. `Page` is a kind like any other (a page IS a block),
-/// but only [`PageMsg::CreatePage`] may mint one — block ops that try to
-/// insert or convert to `Page` are rejected.
+/// the kind of a block. `Page` is a kind like any other (a page IS a block):
+/// [`PageMsg::CreatePage`] creates a top-level one and [`PageMsg::InsertBlock`]
+/// creates a subpage in the parent page's content flow.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
@@ -66,18 +66,18 @@ pub struct RelativeAnchor {
 
 /// one block of a page, as stored and as returned by queries.
 ///
-/// the tree shape lives here: `parent` points up (None only for a page root),
-/// `children` is the ordered list of ids below, and `page` names the root
-/// block of the page this block belongs to (a root names itself). `page` and
-/// `parent` are DERIVED by the module on insert/move — writers never supply
-/// them (see [`NewBlock`]).
+/// the tree shape lives here: `parent` points up (`None` only for a top-level
+/// page), `children` is the ordered list of ids below, and `page` names the
+/// `Page` block whose document owns this block (`Page` blocks name themselves).
+/// `page` and `parent` are DERIVED by the module on insert/move — writers never
+/// supply them (see [`NewBlock`]).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// globally unique within the module — the addressable handle.
     pub id: String,
-    /// the parent block id; `None` only for a page root.
+    /// the parent block id; `None` only for a top-level page.
     pub parent: Option<String>,
-    /// the page (root block id) this block belongs to; a root names itself.
+    /// the owning page block id; `Page` blocks name themselves.
     pub page: String,
     pub kind: BlockKind,
     /// the text payload — the page title for `Page`, empty for `Divider`.
@@ -111,27 +111,20 @@ pub struct NewBlock {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageMsg {
-    /// create a page: a root block of kind `Page` whose text is `title`.
-    /// `parent`, when `Some`, nests this page under another page (a folder
-    /// relation stored only in the enumeration index — content blocks are
-    /// untouched). idempotent: re-creating an existing page is a benign no-op
-    /// that changes neither the title NOR the parent. `page_id` is a block id
-    /// and shares the global-uniqueness rule.
-    CreatePage {
-        page_id: String,
-        title: String,
-        parent: Option<String>,
-    },
+    /// create a top-level page block. Subpages use `InsertBlock` with kind
+    /// `Page`, so their position is part of the containing document tree.
+    /// Idempotent: re-creating an existing page is a benign no-op that does
+    /// not clobber its title or position.
+    CreatePage { page_id: String, title: String },
     /// insert `block` under `parent` after the given sibling anchor (see the
-    /// `after` rule). the parent may be the page root or any block — nesting
-    /// is what makes toggles/indent work. rejected when `block.kind` is
-    /// `Page` (pages come only from `CreatePage`).
+    /// `after` rule). the parent may be a page block or any content block — nesting
+    /// is what makes toggles, indentation, and inline subpages work.
     InsertBlock {
         parent: String,
         after: Option<String>,
         block: NewBlock,
     },
-    /// replace a block's text. on a page root this renames the page.
+    /// replace a block's text. On a `Page` block this renames the page.
     UpdateText {
         block_id: String,
         text: String,
@@ -151,31 +144,22 @@ pub enum PageMsg {
         active: bool,
     },
     /// convert a block to another kind (markdown-shortcut conversions). both
-    /// converting TO `Page` and converting a page root away are rejected.
+    /// converting TO `Page` and converting a `Page` block away are rejected.
     SetKind { block_id: String, kind: BlockKind },
     /// flip a `Todo` block's checked state. rejected on any other kind.
     SetChecked { block_id: String, checked: bool },
-    /// move a block under a (possibly new) parent within the SAME page (see
-    /// the `after` rule). rejected on page roots, across pages, and when the
-    /// new parent sits inside the moved block's own subtree.
+    /// move a block under a (possibly new) parent (see the `after` rule).
+    /// `None` promotes a `Page` block to the top level and is rejected for
+    /// every other kind. Non-page blocks stay within their page; page blocks
+    /// may move between pages when that does not form a cycle.
     MoveBlock {
         block_id: String,
-        parent: String,
+        parent: Option<String>,
         after: Option<String>,
     },
-    /// remove a block AND its whole subtree. rejected on page roots.
+    /// remove a block AND its whole subtree. Removing a `Page` also removes
+    /// every nested page from the enumeration index.
     RemoveBlock { block_id: String },
-    /// re-nest a page under a (possibly new) parent page, or to top level with
-    /// `None`. rejected when the target is not a page root, the parent is not a
-    /// page, or the move would form a cycle in the folder forest.
-    SetPageParent {
-        page_id: String,
-        parent: Option<String>,
-    },
-    /// delete a page: remove its root and whole block subtree, and PROMOTE its
-    /// direct child pages to the deleted page's parent (no cascade). rejected
-    /// when the id is not a page root.
-    DeletePage { page_id: String },
 
     // ── comments ──
     // a comment thread anchors to a `target` (a block id or a page id in THIS
@@ -261,7 +245,8 @@ pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
 /// exactly and the count × length caps hold. legit ids (uuids, path/hex
 /// forms) never contain these chars.
 pub fn id_is_index_safe(s: &str) -> bool {
-    !s.chars().any(|c| c == '"' || c == '\\' || (c as u32) < 0x20)
+    !s.chars()
+        .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20)
 }
 
 /// who authored a comment — derived from `Env.origin`, never a payload. own
@@ -359,7 +344,7 @@ pub enum PageQuery {
 pub struct PageMeta {
     pub id: String,
     pub title: String,
-    /// the containing page id (folder parent), or `None` for a top-level page.
+    /// the containing page id, or `None` for a top-level page.
     pub parent: Option<String>,
 }
 
@@ -393,36 +378,33 @@ mod interface_tests {
     use super::*;
 
     #[test]
-    fn create_page_carries_optional_parent() {
+    fn page_blocks_use_block_tree_wire() {
         let m = PageMsg::CreatePage {
-            page_id: "p2".into(),
-            title: "child".into(),
-            parent: Some("p1".into()),
+            page_id: "p1".into(),
+            title: "root".into(),
         };
         let round: PageMsg = decode_msg(&encode_msg(&m)).unwrap();
         assert_eq!(round, m);
-        // top-level create serializes parent as null.
-        let top = PageMsg::CreatePage {
-            page_id: "p1".into(),
-            title: "root".into(),
-            parent: None,
+        let nested = PageMsg::InsertBlock {
+            parent: "p1".into(),
+            after: None,
+            block: NewBlock {
+                id: "p2".into(),
+                kind: BlockKind::Page,
+                text: "child".into(),
+                marks: Vec::new(),
+            },
         };
-        assert!(String::from_utf8(encode_msg(&top)).unwrap().contains("\"parent\":null"));
-    }
-
-    #[test]
-    fn set_parent_and_delete_round_trip() {
-        for m in [
-            PageMsg::SetPageParent { page_id: "p2".into(), parent: None },
-            PageMsg::DeletePage { page_id: "p2".into() },
-        ] {
-            assert_eq!(decode_msg(&encode_msg(&m)).unwrap(), m);
-        }
+        assert_eq!(decode_msg(&encode_msg(&nested)).unwrap(), nested);
     }
 
     #[test]
     fn page_meta_carries_parent() {
-        let meta = PageMeta { id: "p2".into(), title: "t".into(), parent: Some("p1".into()) };
+        let meta = PageMeta {
+            id: "p2".into(),
+            title: "t".into(),
+            parent: Some("p1".into()),
+        };
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, meta);
@@ -464,8 +446,14 @@ mod interface_tests {
         );
 
         // a reply / block-level comment (the runs agent emits exactly this).
-        let wire = br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
-        let PageMsg::AddComment { anchor, mentions, as_agent, .. } = decode_msg(wire).unwrap()
+        let wire =
+            br#"{"add_comment":{"thread_id":"t1","comment_id":"c1","target":"b1","text":"note"}}"#;
+        let PageMsg::AddComment {
+            anchor,
+            mentions,
+            as_agent,
+            ..
+        } = decode_msg(wire).unwrap()
         else {
             panic!("expected AddComment")
         };

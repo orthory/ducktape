@@ -26,6 +26,10 @@ fn para(id: &str, text: &str) -> NewBlock {
     nb(id, BlockKind::Paragraph, text)
 }
 
+fn page(id: &str, title: &str) -> NewBlock {
+    nb(id, BlockKind::Page, title)
+}
+
 fn msg(m: &PageMsg) -> Msg {
     Msg {
         target: "pages".into(),
@@ -37,7 +41,9 @@ use sdk_testkit::TestCtx;
 
 // drive one op through execute + commit_block (one op per block-height).
 async fn apply_commit(p: &mut Pages, m: &PageMsg) {
-    p.execute(&mut TestCtx::at_height(0), &msg(m)).await.unwrap();
+    p.execute(&mut TestCtx::at_height(0), &msg(m))
+        .await
+        .unwrap();
     p.commit_block().await.unwrap();
 }
 
@@ -155,7 +161,6 @@ async fn seed_page(p: &mut Pages, page: &str) {
         &PageMsg::CreatePage {
             page_id: page.into(),
             title: format!("{page} title"),
-            parent: None,
         },
     )
     .await;

@@ -1,7 +1,7 @@
 //! qmdb-backed pages module — a notion-like block tree, one block per key.
 //!
-//! a page is a TREE of [`Block`]s: the page itself is the root block (kind
-//! `Page`, text == title), every block carries an ordered `children` list, and
+//! a page is a TREE of [`Block`]s: a `Page` block starts the document (its text
+//! is the title), every block carries an ordered `children` list, and
 //! every block id is GLOBALLY UNIQUE within the module. unlike the document
 //! module's whole-doc-per-key layout, the store key here is `sha256(block_id)`
 //! and the value is ONE serialized block — so the merkle root commits to every
@@ -26,12 +26,12 @@
 //! ## enumeration via a reserved index entry
 //!
 //! one extra store entry is reserved: the sentinel logical key
-//! [`PAGE_INDEX_KEY`] whose value is the serialized SORTED set of every page
-//! (root block) id. its leading NUL makes it uncollidable with a client-minted
-//! block id, and every op that names it is rejected before any storage touch.
-//! only [`PageMsg::CreatePage`] grows the index; block edits never touch it —
-//! and because block ops can neither insert nor convert to kind `Page`,
-//! removal of a subtree can never orphan an index entry.
+//! [`PAGE_INDEX_KEY`] whose value is the serialized SORTED map from every page
+//! block id to its containing page. its leading NUL makes it uncollidable with
+//! a client-minted block id, and every op that names it is rejected before any
+//! storage touch. top-level pages enter through [`PageMsg::CreatePage`]; nested
+//! pages are ordinary `Page` blocks, so insert/move/remove update this index in
+//! the same staged transaction as the block tree.
 //!
 //! ## host-lent staging (the kv/document pattern, plus deletes)
 //!
@@ -90,8 +90,8 @@ use error::{PageError, to_page_err};
 pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 
 /// the reserved logical key under which the page-enumeration INDEX rides in
-/// the same store. its value is a serialized sorted `Vec<String>` of every
-/// page (root block) id. the leading NUL makes it UNCOLLIDABLE with a real
+/// the same store. its value is a serialized sorted map from every page block
+/// id to its containing page. the leading NUL makes it UNCOLLIDABLE with a real
 /// block id (clients mint uuids), and every op that names it is rejected
 /// ([`PageError::ReservedId`]) before it can reach storage.
 const PAGE_INDEX_KEY: &str = "\u{0}page-index";

@@ -38,6 +38,12 @@ pub struct ChatReaction {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatMember {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
     pub seq: i64,
@@ -59,6 +65,10 @@ pub struct ChatData {
     pub messages: Vec<ChatMessage>,
     pub active_channel: String,
     pub active_channel_name: String,
+    pub active_channel_archived: bool,
+    pub active_channel_members_only: bool,
+    pub active_channel_huddle_count: i64,
+    pub channel_members: Vec<ChatMember>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -135,6 +145,10 @@ pub struct WorkspaceData {
     pub messages: Vec<ChatMessage>,
     pub active_channel: String,
     pub active_channel_name: String,
+    pub active_channel_archived: bool,
+    pub active_channel_members_only: bool,
+    pub active_channel_huddle_count: i64,
+    pub channel_members: Vec<ChatMember>,
     pub pages: Vec<PageItem>,
     pub blocks: Vec<PageBlock>,
     pub active_page: String,
@@ -382,6 +396,183 @@ pub async fn create_channel(
     .map_err(app_error)
 }
 
+pub async fn rename_channel(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    name: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let name = bounded_text(name, "channel name", 128)?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::RenameChannel {
+                channel_id: channel_id.clone(),
+                name,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn archive_channel(
+    rpc: String,
+    password: String,
+    channel_id: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::SetChannelArchived {
+                channel_id: channel_id.clone(),
+                archived: true,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn unarchive_channel(
+    rpc: String,
+    password: String,
+    channel_id: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::SetChannelArchived {
+                channel_id: channel_id.clone(),
+                archived: false,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn add_channel_member(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    member_key: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let user = public_key(&member_key, "member public key")?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::SetMembership {
+                channel_id: channel_id.clone(),
+                user,
+                member: true,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn remove_channel_member(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    member_key: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let user = public_key(&member_key, "member public key")?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::SetMembership {
+                channel_id: channel_id.clone(),
+                user,
+                member: false,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn join_huddle(
+    rpc: String,
+    password: String,
+    channel_id: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let rpc = rpc_client(&rpc)?;
+        let status = rpc.status().await?;
+        let node = public_key(&status.public_key, "node public key")?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::JoinHuddle {
+                channel_id: channel_id.clone(),
+                node,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn leave_huddle(
+    rpc: String,
+    password: String,
+    channel_id: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let channel_id = required_id(channel_id, "channel")?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::LeaveHuddle {
+                channel_id: channel_id.clone(),
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id)).await
+    }
+    .await
+    .map_err(app_error)
+}
+
 pub async fn send_message(
     rpc: String,
     password: String,
@@ -605,7 +796,6 @@ pub async fn create_page(
             pages::encode_msg(&PageMsg::CreatePage {
                 page_id: page_id.clone(),
                 title,
-                parent: None,
             }),
             password,
         )
@@ -616,86 +806,34 @@ pub async fn create_page(
     .map_err(app_error)
 }
 
-pub async fn create_child_page(
-    rpc: String,
-    password: String,
-    parent: String,
-    title: String,
-) -> Result<PagesData, AppError> {
-    async {
-        if parent.is_empty() {
-            return Err("choose a parent page first".to_string());
-        }
-        let title = bounded_text(title, "page title", 512)?;
-        let page_id = fresh_id("page");
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::CreatePage {
-                page_id: page_id.clone(),
-                title,
-                parent: Some(parent),
-            }),
-            password,
-        )
-        .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
-    }
-    .await
-    .map_err(app_error)
-}
-
-pub async fn rename_page(
+pub async fn autosave_page_title(
     rpc: String,
     password: String,
     page_id: String,
     title: String,
-) -> Result<PagesData, AppError> {
+) -> Result<bool, AppError> {
     async {
         if page_id.is_empty() {
             return Err("choose a page first".to_string());
         }
         let title = bounded_text(title, "page title", 512)?;
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::UpdateText {
-                block_id: page_id.clone(),
-                text: title,
-                marks: None,
-            }),
-            password,
-        )
-        .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        debounced_page_text(rpc, password, page_id, title).await
     }
     .await
     .map_err(app_error)
 }
 
-pub async fn move_page_top(
+pub async fn autosave_block_text(
     rpc: String,
     password: String,
-    page_id: String,
-) -> Result<PagesData, AppError> {
+    block_id: String,
+    kind: String,
+    text: String,
+) -> Result<bool, AppError> {
     async {
-        if page_id.is_empty() {
-            return Err("choose a page first".to_string());
-        }
-        let rpc = rpc_client(&rpc)?;
-        signed_write(
-            &rpc,
-            "pages",
-            pages::encode_msg(&PageMsg::SetPageParent {
-                page_id: page_id.clone(),
-                parent: None,
-            }),
-            password,
-        )
-        .await?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        let kind = parse_block_kind(&kind)?;
+        let text = bounded_block_text(kind, text)?;
+        debounced_page_text(rpc, password, block_id, text).await
     }
     .await
     .map_err(app_error)
@@ -714,8 +852,8 @@ pub async fn delete_page(
         signed_write(
             &rpc,
             "pages",
-            pages::encode_msg(&PageMsg::DeletePage {
-                page_id: page_id.clone(),
+            pages::encode_msg(&PageMsg::RemoveBlock {
+                block_id: page_id.clone(),
             }),
             password,
         )
@@ -745,7 +883,7 @@ pub async fn add_block(
         let root = blocks
             .first()
             .filter(|block| block.kind == BlockKind::Page)
-            .ok_or_else(|| "page has no root block".to_string())?;
+            .ok_or_else(|| "page block was not found".to_string())?;
         let selected = blocks.iter().find(|block| block.id == after_id);
         let parent = selected
             .and_then(|block| block.parent.clone())
@@ -760,7 +898,11 @@ pub async fn add_block(
                 parent,
                 after,
                 block: NewBlock {
-                    id: fresh_id("block"),
+                    id: fresh_id(if kind == BlockKind::Page {
+                        "page"
+                    } else {
+                        "block"
+                    }),
                     kind,
                     text,
                     marks: Vec::new(),
@@ -790,7 +932,7 @@ pub async fn save_block(
         let blocks = load_page_blocks(&rpc, &page_id).await?;
         let block = blocks
             .iter()
-            .find(|block| block.id == block_id && block.kind != BlockKind::Page)
+            .find(|block| block.id == block_id)
             .ok_or_else(|| "block was not found".to_string())?;
         let text_changed = block.text != text;
         let kind_changed = block.kind != kind;
@@ -948,6 +1090,10 @@ async fn load_workspace(
         messages: chat.messages,
         active_channel: chat.active_channel,
         active_channel_name: chat.active_channel_name,
+        active_channel_archived: chat.active_channel_archived,
+        active_channel_members_only: chat.active_channel_members_only,
+        active_channel_huddle_count: chat.active_channel_huddle_count,
+        channel_members: chat.channel_members,
         pages: pages.pages,
         blocks: pages.blocks,
         active_page: pages.active_page,
@@ -991,6 +1137,19 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         .find(|channel| channel.id == active_channel)
         .map(|channel| channel.name.clone())
         .unwrap_or_default();
+    let active_wire_channel = wire_channels
+        .iter()
+        .find(|channel| channel.id == active_channel);
+    let active_channel_archived = active_wire_channel.is_some_and(|channel| channel.archived);
+    let active_channel_members_only =
+        active_wire_channel.is_some_and(|channel| channel.post_policy == PostPolicy::MembersOnly);
+    let active_channel_huddle_count =
+        active_wire_channel.map_or(0, |channel| count_i64(channel.huddle.len()));
+    let channel_members = if active_channel.is_empty() {
+        Vec::new()
+    } else {
+        load_channel_members(rpc, &active_channel).await?
+    };
     let messages = if active_channel.is_empty() {
         Vec::new()
     } else {
@@ -1001,7 +1160,36 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         messages,
         active_channel,
         active_channel_name,
+        active_channel_archived,
+        active_channel_members_only,
+        active_channel_huddle_count,
+        channel_members,
     })
+}
+
+async fn load_channel_members(
+    rpc: &RpcClient,
+    channel_id: &str,
+) -> Result<Vec<ChatMember>, String> {
+    let reply: ChatReply = rpc
+        .query(
+            "chat",
+            &ChatQuery::Members {
+                channel_id: channel_id.to_string(),
+            },
+        )
+        .await?;
+    let members = match reply {
+        ChatReply::Members(members) => members,
+        _ => return Err("node returned an invalid channel member list".into()),
+    };
+    Ok(members
+        .into_iter()
+        .map(|member| ChatMember {
+            label: short_hex(&member),
+            key: hex_encode(&member),
+        })
+        .collect())
 }
 
 async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMessage>, String> {
@@ -1380,6 +1568,19 @@ fn bounded_text(value: String, field: &str, limit: usize) -> Result<String, Stri
     Ok(value.to_string())
 }
 
+fn required_id(value: String, subject: &str) -> Result<String, String> {
+    bounded_text(value, &format!("{subject} id"), 512)
+}
+
+fn public_key(value: &str, field: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim();
+    let expected = chat::HUDDLE_NODE_KEY_BYTES * 2;
+    if value.len() != expected {
+        return Err(format!("{field} must be {expected} hexadecimal characters"));
+    }
+    hex_decode(value).map_err(|_| format!("{field} must be hexadecimal"))
+}
+
 fn positive_sequence(value: i64) -> Result<u64, String> {
     u64::try_from(value)
         .ok()
@@ -1480,6 +1681,7 @@ const fn block_kind_name(kind: BlockKind) -> &'static str {
 
 fn parse_block_kind(kind: &str) -> Result<BlockKind, String> {
     match kind {
+        "Page" => Ok(BlockKind::Page),
         "Text" => Ok(BlockKind::Paragraph),
         "Heading 1" => Ok(BlockKind::Heading1),
         "Heading 2" => Ok(BlockKind::Heading2),
@@ -1500,22 +1702,84 @@ fn bounded_block_text(kind: BlockKind, text: String) -> Result<String, String> {
     if kind == BlockKind::Divider {
         return Ok(String::new());
     }
+    if kind == BlockKind::Page {
+        return bounded_text(text, "page title", 512);
+    }
     bounded_text(text, "block text", 64 * 1024)
+}
+
+async fn debounced_page_text(
+    rpc: String,
+    mut password: String,
+    block_id: String,
+    text: String,
+) -> Result<bool, String> {
+    let key = format!("{rpc}\0{block_id}");
+    let ticket = begin_autosave(&key);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    if !autosave_is_current(&key, ticket) {
+        password.zeroize();
+        return Ok(false);
+    }
+    let result = async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::UpdateText {
+                block_id,
+                text: text.clone(),
+                marks: None,
+            }),
+            password,
+        )
+        .await
+    }
+    .await;
+    finish_autosave(&key, ticket);
+    result?;
+    Ok(true)
+}
+
+fn autosaves() -> &'static std::sync::Mutex<BTreeMap<String, u64>> {
+    static AUTOSAVES: OnceLock<std::sync::Mutex<BTreeMap<String, u64>>> = OnceLock::new();
+    AUTOSAVES.get_or_init(Default::default)
+}
+
+fn begin_autosave(key: &str) -> u64 {
+    static TICKET: AtomicU64 = AtomicU64::new(1);
+    let ticket = TICKET.fetch_add(1, Ordering::Relaxed);
+    autosaves()
+        .lock()
+        .expect("autosave lock poisoned")
+        .insert(key.to_string(), ticket);
+    ticket
+}
+
+fn autosave_is_current(key: &str, ticket: u64) -> bool {
+    autosaves().lock().expect("autosave lock poisoned").get(key) == Some(&ticket)
+}
+
+fn finish_autosave(key: &str, ticket: u64) {
+    let mut autosaves = autosaves().lock().expect("autosave lock poisoned");
+    if autosaves.get(key) == Some(&ticket) {
+        autosaves.remove(key);
+    }
 }
 
 fn block_move(
     blocks: &[pages::Block],
     block_id: &str,
     direction: &str,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(Option<String>, Option<String>), String> {
     let block = blocks
         .iter()
-        .find(|block| block.id == block_id && block.kind != BlockKind::Page)
+        .find(|block| block.id == block_id)
         .ok_or_else(|| "block was not found".to_string())?;
     let parent_id = block
         .parent
         .as_deref()
-        .ok_or_else(|| "page roots cannot be moved".to_string())?;
+        .ok_or_else(|| "top-level pages cannot move inside their own document".to_string())?;
     let parent = blocks
         .iter()
         .find(|block| block.id == parent_id)
@@ -1527,27 +1791,35 @@ fn block_move(
         .ok_or_else(|| "block is missing from its parent".to_string())?;
     match direction {
         "up" if index > 0 => Ok((
-            parent.id.clone(),
+            Some(parent.id.clone()),
             index
                 .checked_sub(2)
                 .map(|index| parent.children[index].clone()),
         )),
-        "down" if index + 1 < parent.children.len() => {
-            Ok((parent.id.clone(), Some(parent.children[index + 1].clone())))
-        }
+        "down" if index + 1 < parent.children.len() => Ok((
+            Some(parent.id.clone()),
+            Some(parent.children[index + 1].clone()),
+        )),
         "indent" if index > 0 => {
             let new_parent = blocks
                 .iter()
                 .find(|block| block.id == parent.children[index - 1])
                 .ok_or_else(|| "previous block was not found".to_string())?;
-            Ok((new_parent.id.clone(), new_parent.children.last().cloned()))
+            Ok((
+                Some(new_parent.id.clone()),
+                new_parent.children.last().cloned(),
+            ))
         }
         "outdent" => {
+            let promotes_page = block.kind == BlockKind::Page && parent.parent.is_none();
+            if promotes_page {
+                return Ok((None, None));
+            }
             let grandparent = parent
                 .parent
                 .clone()
                 .ok_or_else(|| "block is already at the top level".to_string())?;
-            Ok((grandparent, Some(parent.id.clone())))
+            Ok((Some(grandparent), Some(parent.id.clone())))
         }
         "up" => Err("block is already first".into()),
         "down" => Err("block is already last".into()),
@@ -1682,7 +1954,6 @@ mod tests {
             pages::encode_msg(&PageMsg::CreatePage {
                 page_id: "welcome".into(),
                 title: "Welcome".into(),
-                parent: None,
             }),
         )
         .await;
@@ -1832,10 +2103,15 @@ mod tests {
             &signer,
             12,
             "pages",
-            pages::encode_msg(&PageMsg::CreatePage {
-                page_id: "child".into(),
-                title: "Child page".into(),
-                parent: Some("welcome".into()),
+            pages::encode_msg(&PageMsg::InsertBlock {
+                parent: "welcome".into(),
+                after: Some("heading".into()),
+                block: NewBlock {
+                    id: "child".into(),
+                    kind: BlockKind::Page,
+                    text: "Child page".into(),
+                    marks: Vec::new(),
+                },
             }),
         )
         .await;
@@ -1865,6 +2141,17 @@ mod tests {
     }
 
     #[test]
+    fn autosave_keeps_only_the_latest_ticket() {
+        let key = "autosave-test";
+        let first = begin_autosave(key);
+        let latest = begin_autosave(key);
+        assert!(!autosave_is_current(key, first));
+        assert!(autosave_is_current(key, latest));
+        finish_autosave(key, latest);
+        assert!(!autosave_is_current(key, latest));
+    }
+
+    #[test]
     fn block_moves_follow_visible_sibling_order() {
         let block = |id: &str, parent: Option<&str>, kind, children: &[&str]| pages::Block {
             id: id.into(),
@@ -1885,19 +2172,26 @@ mod tests {
 
         assert_eq!(
             block_move(&blocks, "b", "up").unwrap(),
-            ("page".into(), None)
+            (Some("page".into()), None)
         );
         assert_eq!(
             block_move(&blocks, "a", "down").unwrap(),
-            ("page".into(), Some("b".into()))
+            (Some("page".into()), Some("b".into()))
         );
         assert_eq!(
             block_move(&blocks, "b", "indent").unwrap(),
-            ("a".into(), Some("c".into()))
+            (Some("a".into()), Some("c".into()))
         );
         assert_eq!(
             block_move(&blocks, "c", "outdent").unwrap(),
-            ("page".into(), Some("a".into()))
+            (Some("page".into()), Some("a".into()))
+        );
+
+        let page = block("child-page", Some("page"), BlockKind::Page, &[]);
+        let parent = block("page", None, BlockKind::Page, &["child-page"]);
+        assert_eq!(
+            block_move(&[parent, page], "child-page", "outdent").unwrap(),
+            (None, None)
         );
     }
 

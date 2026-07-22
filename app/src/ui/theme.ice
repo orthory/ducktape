@@ -1,19 +1,18 @@
-font ui family=sans weight=normal stretch=normal style=normal default=true
-font mono family="monospace" weight=normal stretch=normal style=normal
+font ui family="Inter" weight=normal stretch=normal style=normal default=true
+font mono family=mono weight=normal stretch=normal style=normal
 
 theme
-  bg #d8d8d880
-  surface    #f2f2f2a6
-  sidebar    #e8e8e896
-  elevated   #ffffffb8
-  fg #202020
-  muted      #686868
-  primary    #383838
-  danger     #4a4a4a
-  success    #5c5c5c
-  border     #ffffffb3
-  subtle     #ffffff66
-  selection  #ffffffa8
-  separator  #68686833
-  shadow     #00000026
-
+  bg #101012ee
+  surface #202023d8
+  sidebar #18181bdc
+  elevated #29292ddc
+  fg #f2f2f4
+  muted #a0a0a7
+  primary #d8d8dc
+  danger #b8b8be
+  success #c4c4c8
+  border #ffffff24
+  subtle #ffffff10
+  selection #ffffff20
+  separator #ffffff16
+  shadow #00000090
