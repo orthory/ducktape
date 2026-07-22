@@ -254,6 +254,43 @@ pub async fn members(ctx: &dyn Ctx, valset: &str) -> Result<Vec<Vec<u8>>, Error>
     }
 }
 
+/// the CURRENT validator set UNION resident set of the valset module at
+/// `valset`, both queried live from its staged-over-committed projection — an
+/// op is admitted for EITHER standing, so a joined (not-yet-promoted) resident
+/// still passes. the shared read behind identity's and capability's bind gates.
+pub async fn members_and_residents(
+    ctx: &dyn Ctx,
+    valset: &str,
+) -> Result<BTreeSet<Vec<u8>>, Error> {
+    let validators = match decode_reply(
+        &ctx.query(valset, &encode_query(&ValsetQuery::Validators))
+            .await?,
+    )
+    .map_err(Error::Module)?
+    {
+        ValsetReply::Validators(v) => v,
+        other => {
+            return Err(Error::Module(format!(
+                "valset answered a Validators query with {other:?}"
+            )));
+        }
+    };
+    let residents = match decode_reply(
+        &ctx.query(valset, &encode_query(&ValsetQuery::Residents))
+            .await?,
+    )
+    .map_err(Error::Module)?
+    {
+        ValsetReply::Residents(o) => o,
+        other => {
+            return Err(Error::Module(format!(
+                "valset answered a Residents query with {other:?}"
+            )));
+        }
+    };
+    Ok(validators.into_iter().chain(residents).collect())
+}
+
 #[async_trait::async_trait(?Send)]
 impl Module for Valset {
     fn id(&self) -> ModuleId {
