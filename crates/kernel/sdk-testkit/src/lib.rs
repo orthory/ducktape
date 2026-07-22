@@ -192,17 +192,12 @@ impl MerkleStore for MemStore {
     fn root(&self) -> StateRoot {
         // sha256 over the sorted (k, v) pairs — the exact preimage shape
         // `WasmModule::encode_state` uses for `StateBacking::Map` (count, then
-        // len-prefixed key + len-prefixed value per pair). BTreeMap iterates
-        // in sorted key order, so this is deterministic.
-        let mut h = Sha256::new();
-        h.update((self.map.len() as u64).to_le_bytes());
-        for (k, v) in &self.map {
-            h.update((k.len() as u64).to_le_bytes());
-            h.update(k);
-            h.update((v.len() as u64).to_le_bytes());
-            h.update(v);
-        }
-        StateRoot(h.finalize().into())
+        // len-prefixed key + len-prefixed value per pair). Both now share the
+        // one `sdk::hash::encode_pairs` byte contract, so this test double and
+        // the production map-backed root can never silently diverge. The
+        // sha256 stays here: `sdk` is dep-free by design, so the hash step
+        // lives with each caller.
+        StateRoot(Sha256::digest(sdk::hash::encode_pairs(&self.map)).into())
     }
 
     async fn sync_target(&self) -> Result<ResolverSyncTarget, Error> {
@@ -301,5 +296,51 @@ mod tests {
         block_on(a.commit_batch(vec![(key, None)])).expect("delete");
         assert_eq!(block_on(a.get(&key)).expect("get"), None);
         assert_eq!(a.root(), empty_root);
+    }
+
+    /// BEFORE/AFTER map-hash root golden: the new `MemStore::root` routes its
+    /// preimage through the shared `sdk::hash::encode_pairs`; this reproduces
+    /// the exact pre-refactor inline formula (count, then per sorted pair
+    /// `len(k)|k|len(v)|v`), hashes it the old way, and asserts the SAME root.
+    /// If the shared helper ever drifts from this formula, every map-backed
+    /// module root — and the app-hash — moves, and this fails.
+    #[test]
+    fn memstore_root_matches_the_pre_refactor_inline_formula() {
+        let entries = vec![
+            (vec![0xEEu8; 40], b"kilo".to_vec()),
+            (vec![0x01u8; 3], vec![]), // empty value, non-empty key
+            (b"ab".to_vec(), vec![9u8, 9, 9]),
+        ];
+        let mut store = MemStore::new();
+        for (k, v) in &entries {
+            let mut key = [0u8; 32];
+            let n = k.len().min(32);
+            key[..n].copy_from_slice(&k[..n]);
+            block_on(store.commit_batch(vec![(key, Some(v.clone()))])).expect("commit");
+        }
+
+        // the OLD inline preimage + hash, byte-for-byte as it was before this
+        // refactor (BTreeMap sorts, so replay the store's own sorted view).
+        let sorted: BTreeMap<Vec<u8>, Vec<u8>> = {
+            let mut m = BTreeMap::new();
+            for (k, v) in &entries {
+                let mut key = vec![0u8; 32];
+                let n = k.len().min(32);
+                key[..n].copy_from_slice(&k[..n]);
+                m.insert(key, v.clone());
+            }
+            m
+        };
+        let mut old_h = Sha256::new();
+        old_h.update((sorted.len() as u64).to_le_bytes());
+        for (k, v) in &sorted {
+            old_h.update((k.len() as u64).to_le_bytes());
+            old_h.update(k);
+            old_h.update((v.len() as u64).to_le_bytes());
+            old_h.update(v);
+        }
+        let old_root = StateRoot(old_h.finalize().into());
+
+        assert_eq!(store.root(), old_root, "shared helper must reproduce the old root");
     }
 }

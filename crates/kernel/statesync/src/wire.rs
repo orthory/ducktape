@@ -71,14 +71,17 @@ pub fn take_str(buf: &mut &[u8]) -> Result<String, WireError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| WireError::BadUtf8)
 }
 
-pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-pub fn put_str(out: &mut Vec<u8>, s: &str) {
-    put_bytes(out, s.as_bytes());
-}
+// the WRITE side IS the shared `sdk::codec` primitive verbatim (`u64`-LE length
+// prefix + bytes). re-export it rather than keep a second copy of the exact same
+// byte-producing code — this is the encoded-bytes contract, so byte-identity is
+// not merely preserved, it is the same function. the READ side below stays
+// statesync's own: it carries a typed [`WireError`] woven through ~40 sites and
+// >100 call sites, and every decoder already applies its own count cap
+// (`MAX_OPS_PER_BATCH`, `MAX_PROOF_DIGESTS`) — stricter than a generic cursor
+// bound — plus `expect_empty` trailing rejection, so converting the readers to
+// `sdk::codec::Cursor` would trade the typed error model for a stringly one with
+// zero byte benefit.
+pub use sdk::codec::{push_bytes as put_bytes, push_str as put_str};
 
 pub fn expect_empty(buf: &[u8]) -> Result<(), WireError> {
     if buf.is_empty() {
