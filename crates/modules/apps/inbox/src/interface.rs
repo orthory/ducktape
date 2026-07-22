@@ -92,25 +92,25 @@ pub enum InboxReply {
 }
 
 pub fn encode_msg(m: &InboxMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 
 pub fn decode_msg(b: &[u8]) -> Result<InboxMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_query(q: &InboxQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 
 pub fn decode_query(b: &[u8]) -> Result<InboxQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_reply(r: &InboxReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 
 pub fn decode_reply(b: &[u8]) -> Result<InboxReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

@@ -290,40 +290,40 @@ pub enum DispatchReply {
 // ---- codecs ---------------------------------------------------------------------
 
 pub fn encode_msg(m: &DispatchMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<DispatchMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_work_spec(s: &WorkSpec) -> Vec<u8> {
-    serde_json::to_vec(s).expect("serializable")
+    sdk::wire::encode(s)
 }
 /// decode a [`WorkSpec`] and check its self-description: bytes whose `kind`
 /// is not [`WORK_SPEC_KIND`] are somebody else's spec, reported as such.
 pub fn decode_work_spec(b: &[u8]) -> Result<WorkSpec, String> {
-    let spec: WorkSpec = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+    let spec: WorkSpec = sdk::wire::decode(b)?;
     if spec.kind != WORK_SPEC_KIND {
         return Err(format!("not a dispatch work spec (kind {:?})", spec.kind));
     }
     Ok(spec)
 }
 pub fn encode_result_event(e: &ResultEvent) -> Vec<u8> {
-    serde_json::to_vec(e).expect("serializable")
+    sdk::wire::encode(e)
 }
 pub fn decode_result_event(b: &[u8]) -> Result<ResultEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_query(q: &DispatchQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<DispatchQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &DispatchReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<DispatchReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 #[cfg(test)]
