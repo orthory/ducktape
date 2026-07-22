@@ -8,37 +8,71 @@ version.workspace = true
 # modules (`global_root` — sha2 is its one hashing dep). depends on sdk (the
 # contract); it knows nothing of any concrete module beyond `dyn Module`.
 [dependencies]
+# module non-determinism is the most fork-relevant event the kernel can see.
+tracing = { workspace = true }
 sdk = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
-# WIRE-TYPES-ONLY dep: `Host::effective_version` decodes the upgrade module's
-# `Status` reply and applies the shared version derivation. host uses only
-# the crate-root wire types — it never constructs or registers the module impl
-# (same shape as governance reading valset's wire types).
-upgrade = { workspace = true }
+# WIRE-TYPES-ONLY dep: `Host::effective_version` decodes the lifecycle module's
+# `UpgradeStatus` reply and applies the shared version derivation, and the
+# boundary code-swap realization reads its committed active/pending hashes and
+# injects the shared `Advance` tick. host uses only the crate-root wire types —
+# it never constructs or registers the module impl (same shape as governance
+# reading valset's wire types).
+lifecycle = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
 dispatch = { workspace = true }
-# WIRE-TYPES-ONLY dep, same shape: the boundary code-swap realization reads the
-# code registry's committed active/pending hashes and injects its Advance tick.
-# host never constructs or registers the modreg impl — only its crate-root types.
-modreg = { workspace = true }
 
 [dev-dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 # the live-code-update proof stands a real wasm module on the host and swaps its
-# component across a code-registry activation boundary (modreg is a normal dep).
+# component across a code-registry activation boundary (lifecycle is a normal dep).
 wasm-host = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
 kv = { workspace = true }
 directory = { workspace = true }
+# the STORE-BACKED parity proofs drive the SAME op matrix through the native
+# pages/chat modules over QmdbStore and their wasm ports over
+# `WasmModule::with_store(QmdbStore)`, pinning IDENTICAL roots block-by-block
+# (root-continuous cutover — revision stays 1).
+pages = { workspace = true }
+chat = { workspace = true }
+inbox = { workspace = true }
+tasks = { workspace = true }
+tagging = { workspace = true }
+capability = { workspace = true }
+duckdns = { workspace = true }
+identity = { workspace = true }
+# the gateway/governance parity proofs stand the native modules (and their
+# native identity/valset/lifecycle siblings) beside the wasm ports.
+gateway = { workspace = true }
+governance = { workspace = true }
 greeter = { workspace = true }
-# the deterministic-activation drain-injection test stands the real upgrade +
+# the identity parity proof synthesizes WebAuthn passkey assertions exactly as
+# identity's own tests do (deterministic RFC-6979 P-256 signatures — no OS
+# randomness inside a consensus proof).
+p256 = { workspace = true }
+base64 = { workspace = true }
+# the deterministic-activation drain-injection test stands the real lifecycle +
 # valset modules on the host and drives a block across an activation boundary.
 valset = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
 # next to a stub receiver.
 saga = { workspace = true }
+# the agent/automations adapter-port parity proofs stand the native modules
+# (and their native saga / chat+tasks+inbox siblings) beside the wasm ports.
+agent = { workspace = true }
+automations = { workspace = true }
+# the runs adapter-port parity proof drives the REAL collaboration loop —
+# chat-over-QmdbStore, pages-over-QmdbStore, tagging, saga, dispatch (native
+# by design), agent, tasks, files — through the native runs module and
+# its wasm port side by side. files needs an on-disk odb dir (tempfile).
+runs = { workspace = true }
+files = { workspace = true }
+tempfile = "3"
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }
 serde_json = "1"

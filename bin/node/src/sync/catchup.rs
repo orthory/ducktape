@@ -9,7 +9,7 @@ use statesync::{fetch_frames, fetch_manifest};
 use crate::constants::{BOOT_SYNC_REQUEST_TIMEOUT, CUTOVER_DELAY};
 use crate::explorer::IndexFold;
 use crate::sync::serve::to_node_disposition;
-use crate::util::{diag_log, hex};
+use crate::util::hex;
 
 pub(crate) async fn apply_verified_suffix_frame(
     host: &mut Host,
@@ -17,8 +17,6 @@ pub(crate) async fn apply_verified_suffix_frame(
     code_source: &dyn host::CodeSource,
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
-    let protocol_version = host.effective_version(served.height).await;
-    host.set_active_version(protocol_version);
     // CODE-SWAP REALIZATION, mirroring the live drain and recovery replay: a
     // frame sealed after a code-registry swap executed on the NEW component, so
     // catch-up must swap before re-applying or the served roots cannot
@@ -26,38 +24,29 @@ pub(crate) async fn apply_verified_suffix_frame(
     host.realize_module_swaps(served.height, code_source)
         .await
         .map_err(|e| format!("code-swap realization at height {}: {e}", served.height))?;
-    // the served frame is a BATCH: decode its members and apply as ONE block,
-    // exactly like the live drain and recovery replay, so the disposition,
-    // roots, and app-hash reproduce what the peer served. disposition is
-    // DRAIN-based (any member applied or a System injection ran), never
-    // app-hash-based.
+    // the served frame is a BATCH: decode its members (an envelope
+    // re-applies WITH its continuation) and apply as ONE block, exactly like
+    // the live drain and recovery replay, so the disposition, roots, and
+    // app-hash reproduce what the peer served. disposition is DRAIN-based
+    // (any member or released continuation applied, or a System injection
+    // ran), never app-hash-based.
     let (outcome, dispatches) = match node::decode_batch(&served.frame) {
         Ok(members) => {
             let mut ops = Vec::new();
             for member in &members {
-                if let Ok(pair) = node::decode_frame(member) {
-                    ops.push(pair);
+                if let Ok(op) = node::decode_member(member) {
+                    ops.push(op);
                 }
             }
             let ctx = host::BlockContext {
-                protocol_version,
                 height: served.height,
                 consensus_time: served.height,
                 origin: sdk::Origin::System,
             };
-            match host.submit_block(ctx, ops).await {
+            match host.submit_block_ops(ctx, ops).await {
                 Ok(batch) => {
-                    let mut dispatches = Vec::new();
-                    let mut any_applied = false;
-                    for member in batch.members {
-                        if let host::MemberOutcome::Applied { dispatches: d } = member {
-                            any_applied = true;
-                            dispatches.extend(d);
-                        }
-                    }
-                    let has_system = !batch.system_dispatches.is_empty();
-                    dispatches.extend(batch.system_dispatches);
-                    let outcome = if any_applied || has_system {
+                    let (ran, dispatches) = batch.into_trace();
+                    let outcome = if ran {
                         node::Disposition::Applied
                     } else {
                         node::Disposition::Rejected
@@ -248,8 +237,6 @@ where
         target.participants.clone(),
         target.residents.clone(),
         pending_cutover_view,
-        target.current_version,
-        target.pending_upgrade.clone(),
         pos,
         next_seq,
     )
@@ -258,7 +245,11 @@ where
         .write_manifest(&ckpt)
         .await
         .map_err(|e| format!("catch-up checkpoint write: {e}"))?;
-    diag_log(format!("DIAG catchup_checkpoint height={}", target.height));
+    tracing::debug!(
+        target: "ducktape::statesync",
+        height = target.height,
+        "catch-up checkpoint captured"
+    );
     Ok(ckpt)
 }
 
@@ -315,10 +306,13 @@ where
                     hex(&host.app_hash())
                 )));
             }
-            diag_log(format!(
-                "DIAG post_reboot_catchup from={} to={} frames={}",
-                recovered_height, current_height, total_frames
-            ));
+            tracing::debug!(
+                target: "ducktape::statesync",
+                from = recovered_height,
+                to = current_height,
+                frames = total_frames,
+                "post-reboot catch-up planned"
+            );
             return Ok(PostRebootCatchup {
                 from_height: recovered_height,
                 to_height: current_height,
@@ -337,6 +331,21 @@ where
                 requested_after,
                 retained_from,
             }) => {
+                // the follower side of the same wedge (#493, macOS "missing blocks").
+                // it printed the SAME impossible range on every certificate, which is
+                // indistinguishable from healthy catch-up — and so it read as boot
+                // noise for days. `permanent` is the word that ends the guessing: this
+                // does not heal by waiting, because the source can only prune FURTHER
+                // ahead of us.
+                tracing::error!(
+                    target: "ducktape::statesync",
+                    requested_after,
+                    retained_from,
+                    gap_blocks = retained_from.saturating_sub(requested_after),
+                    permanent = true,
+                    "catch-up IMPOSSIBLE — the source pruned past our height; waiting will \
+                     never fix this, we must full-sync from a fresh checkpoint"
+                );
                 return Err(PostRebootCatchupError::RangePruned {
                     target: Box::new(tip),
                     requested_after,
@@ -373,10 +382,13 @@ where
         target = Some(tip);
     }
 
-    diag_log(format!(
-        "DIAG post_reboot_catchup from={} to={} frames={}",
-        recovered_height, current_height, total_frames
-    ));
+    tracing::debug!(
+        target: "ducktape::statesync",
+        from = recovered_height,
+        to = current_height,
+        frames = total_frames,
+        "post-reboot catch-up planned"
+    );
     Ok(PostRebootCatchup {
         from_height: recovered_height,
         to_height: current_height,
@@ -396,6 +408,11 @@ where
     server: ed25519::PublicKey,
     receiver: std::sync::Arc<tokio::sync::Mutex<Option<R>>>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// the real-key standing proof (ADR §5.1). the restore/promoted-boot node's
+    /// real key IS in the committed valset (validators ∪ residents), so the
+    /// serving peer's fail-closed gate admits it.
+    requester: [u8; 32],
+    proof: [u8; 64],
 }
 
 impl<S, R> Clone for BootP2pSyncClient<S, R>
@@ -409,8 +426,19 @@ where
             server: self.server.clone(),
             receiver: std::sync::Arc::clone(&self.receiver),
             next_id: std::sync::Arc::clone(&self.next_id),
+            requester: self.requester,
+            proof: self.proof,
         }
     }
+}
+
+// the boot client is PINNED to its one sync source, so an honest blob miss
+// has nowhere to rotate to — retries re-ask the same (manifest-serving) peer.
+impl<S, R> crate::blob_fetch::SourceRotate for BootP2pSyncClient<S, R>
+where
+    S: P2pSender<PublicKey = ed25519::PublicKey>,
+    R: P2pReceiver<PublicKey = ed25519::PublicKey>,
+{
 }
 
 impl<S, R> BootP2pSyncClient<S, R>
@@ -418,12 +446,20 @@ where
     S: P2pSender<PublicKey = ed25519::PublicKey>,
     R: P2pReceiver<PublicKey = ed25519::PublicKey>,
 {
-    pub(crate) fn new(sender: S, receiver: R, server: ed25519::PublicKey) -> Self {
+    pub(crate) fn new(
+        sender: S,
+        receiver: R,
+        server: ed25519::PublicKey,
+        requester: [u8; 32],
+        proof: [u8; 64],
+    ) -> Self {
         Self {
             sender,
             server,
             receiver: std::sync::Arc::new(tokio::sync::Mutex::new(Some(receiver))),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            requester,
+            proof,
         }
     }
 
@@ -452,6 +488,8 @@ where
         let mut sender = self.sender.clone();
         let server = self.server.clone();
         let receiver = std::sync::Arc::clone(&self.receiver);
+        let requester = self.requester;
+        let proof = self.proof;
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -460,7 +498,8 @@ where
             let receiver = guard.as_mut().ok_or_else(|| {
                 statesync::SyncError::Transport("boot statesync receiver closed".into())
             })?;
-            let frame = statesync::encode_rpc(id, &statesync::encode_request(&req));
+            let frame =
+                statesync::encode_rpc_authed(&requester, &proof, id, &statesync::encode_request(&req));
             let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
             if attempted.is_empty() {
                 return Err(statesync::SyncError::Transport(
@@ -487,7 +526,9 @@ where
                     continue;
                 }
                 let bytes: Vec<u8> = msg.into();
-                let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                // replies carry zero-filled auth fields; only id + body matter.
+                let Ok((_requester, _proof, rpc_id, body)) = statesync::decode_rpc_authed(&bytes)
+                else {
                     continue;
                 };
                 if rpc_id != id {

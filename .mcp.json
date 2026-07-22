@@ -1,8 +1,3 @@
 {
-  "mcpServers": {
-    "tauri-agent": {
-      "command": "app/scripts/tauri-agent-mcp",
-      "args": []
-    }
-  }
+  "mcpServers": {}
 }

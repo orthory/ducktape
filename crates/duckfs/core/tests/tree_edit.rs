@@ -33,6 +33,7 @@ fn edit_builds_shared_cow_trees() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, None);
         e.put(&store, &segs("/shared/a.txt"), leaf([1; 32]))
@@ -50,6 +51,7 @@ fn edit_builds_shared_cow_trees() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, Some(root1));
         e.put(&store, &segs("/shared/a.txt"), leaf([3; 32]))
@@ -68,6 +70,7 @@ fn edit_builds_shared_cow_trees() {
     let store = Store {
         store: &odb,
         pending: &[],
+        budget: None,
     };
     let deep2 = entry_at(&store, Some(root2), &segs("/shared/deep"))
         .unwrap()
@@ -84,6 +87,7 @@ fn edit_rules() {
     let store = Store {
         store: &odb,
         pending: &[],
+        budget: None,
     };
     let mut e = TreeEdit::load(&store, None);
     assert!(e.rm(&store, &segs("/shared/nope")).is_err(), "rm absent");
@@ -116,6 +120,7 @@ fn build_reencodes_only_the_touched_spine() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, None);
         e.put(&store, &segs("/shared/s1/f"), leaf([1; 32])).unwrap();
@@ -134,6 +139,7 @@ fn build_reencodes_only_the_touched_spine() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         (
             entry_at(&store, Some(root1), &segs("/shared/s1"))
@@ -150,6 +156,7 @@ fn build_reencodes_only_the_touched_spine() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, Some(root1));
         e.put(&store, &segs("/shared/s2/f"), leaf([9; 32])).unwrap();
@@ -168,6 +175,7 @@ fn build_reencodes_only_the_touched_spine() {
     let store = Store {
         store: &odb,
         pending: &[],
+        budget: None,
     };
     let s1_after = entry_at(&store, Some(root2), &segs("/shared/s1"))
         .unwrap()
@@ -195,6 +203,7 @@ fn mv_modified_subtree_leaves_no_dangling_ids() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, None);
         e.put(&store, &segs("/a/x"), leaf([1; 32])).unwrap();
@@ -211,6 +220,7 @@ fn mv_modified_subtree_leaves_no_dangling_ids() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, Some(root1));
         e.put(&store, &segs("/a/z"), leaf([3; 32])).unwrap();
@@ -224,6 +234,7 @@ fn mv_modified_subtree_leaves_no_dangling_ids() {
     let store = Store {
         store: &odb,
         pending: &[],
+        budget: None,
     };
     // /a is gone; the modified subtree lives at /b with all three children.
     assert!(
@@ -265,6 +276,7 @@ fn mv_rejects_absent_source_present_dest_and_missing_dest_parent() {
         let store = Store {
             store: &odb,
             pending: &[],
+            budget: None,
         };
         let mut e = TreeEdit::load(&store, None);
         e.put(&store, &segs("/a/x"), leaf([1; 32])).unwrap();
@@ -277,6 +289,7 @@ fn mv_rejects_absent_source_present_dest_and_missing_dest_parent() {
     let store = Store {
         store: &odb,
         pending: &[],
+        budget: None,
     };
     let mut e = TreeEdit::load(&store, Some(root1));
     // source absent → reject.
@@ -301,6 +314,7 @@ fn empty_root_builds_to_none_and_round_trips() {
     let store = Store {
         store: &odb,
         pending: &[],
+        budget: None,
     };
 
     // a fresh empty edit is the empty filesystem: build stages nothing and

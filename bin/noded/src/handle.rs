@@ -51,6 +51,12 @@ pub enum NodeCommand {
     Status {
         reply: oneshot::Sender<NodeStatus>,
     },
+    /// sample the direct-peer projection (`GET /v1/peers`): the actor owns
+    /// the metrics registry the sample is parsed from, so this read crosses
+    /// the command lane like every other.
+    Peers {
+        reply: oneshot::Sender<crate::peers::PeersView>,
+    },
     /// encode the runtime's Prometheus registry (commonware runtime metrics plus
     /// the daemon's own `ducktape_*` series) to the OpenMetrics text exposition.
     /// the actor owns the commonware context that holds the registry, so this,
@@ -67,7 +73,7 @@ pub enum NodeCommand {
 pub struct NodeHandle {
     pub(crate) cmds: mpsc::Sender<NodeCommand>,
     pub(crate) hub: StreamHub,
-    pub(crate) shutdown: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) shutdown: tokio::sync::watch::Sender<bool>,
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
     /// node-local by design (never consensus state, never an op), so the http
     /// handlers read/write this store directly.
@@ -101,6 +107,18 @@ pub struct NodeHandle {
     /// like `forge_repo`; `None` on a handle that never serves the seam (the
     /// router tests' fake handle), which makes `/v1/fs/workspaces` a clean 503.
     pub(crate) duckfs_workspaces: Option<PathBuf>,
+    /// the node's code-plane stage lane (module-code fan-out). `None` on a
+    /// daemon without a mesh — the admin stage route answers 503 there.
+    pub(crate) code_stage: Option<crate::module_code::CodeStageLane>,
+    /// the owner-gated control namespace's exposure + ownership config (ADR
+    /// A2/A5). the default (`Loopback`, no node key) is the embedded daemon's
+    /// loopback-trust surface; the full node overrides it via [`Self::with_admin`].
+    pub(crate) admin: crate::admin::AdminConfig,
+    /// the node-local interactive terminal-session manager. `None` on a handle
+    /// that never wires one (router tests, an embedder that omits it) — the
+    /// `/v1/term/*` routes answer 503 there and ws `TermInput`/`TermResize` are
+    /// no-ops. off-chain, node-local: never consensus state.
+    pub(crate) terminals: Option<crate::term::TerminalSessions>,
 }
 
 impl NodeHandle {
@@ -120,7 +138,7 @@ impl NodeHandle {
         let handle = Self {
             cmds: cmd_tx,
             hub: hub.clone(),
-            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            shutdown: tokio::sync::watch::channel(false).0,
             blobs: crate::blobs::BlobHandle::default(),
             forge_repo: None,
             index: None,
@@ -128,6 +146,9 @@ impl NodeHandle {
             gateway: None,
             browser_gateway: None,
             duckfs_workspaces: None,
+            code_stage: None,
+            admin: crate::admin::AdminConfig::default(),
+            terminals: None,
         };
         (handle, cmd_rx, hub)
     }
@@ -167,6 +188,37 @@ impl NodeHandle {
     pub fn with_call(mut self, call: CallLane) -> Self {
         self.call = Some(call);
         self
+    }
+
+    /// point this handle at the node's code-plane stage lane so the
+    /// module-code admin route can fan staged artifacts out to members.
+    /// only the p2p validator wires one — it owns the overlay the plane rides.
+    pub fn with_code_stage(mut self, lane: crate::module_code::CodeStageLane) -> Self {
+        self.code_stage = Some(lane);
+        self
+    }
+
+    /// configure the owner-gated control namespace (ADR A2/A5). the full node
+    /// passes its own consensus key (the `BindNode` subject ownership resolves
+    /// against) and the exposure the operator chose; a daemon that leaves this
+    /// at the default serves the loopback-trust surface.
+    pub fn with_admin(mut self, admin: crate::admin::AdminConfig) -> Self {
+        self.admin = admin;
+        self
+    }
+
+    /// wire the node-local interactive terminal-session manager so the
+    /// `/v1/term/*` routes and the ws `TermInput`/`TermResize` handlers can
+    /// reach it. only the daemon wires one; a handle without it 503s the
+    /// routes.
+    pub fn with_terminals(mut self, terminals: crate::term::TerminalSessions) -> Self {
+        self.terminals = Some(terminals);
+        self
+    }
+
+    /// the terminal-session manager, if one is wired.
+    pub(crate) fn terminals(&self) -> Option<&crate::term::TerminalSessions> {
+        self.terminals.as_ref()
     }
 
     /// Point gateway requests at the full node's authenticated overlay
@@ -217,11 +269,19 @@ impl NodeHandle {
         self.index.clone()
     }
 
-    /// resolves once a client asked the daemon to exit (POST /v1/shutdown).
-    /// `Notify` stores the permit, so a request that lands before anyone awaits
-    /// is not lost.
+    /// Publish a durable shutdown state to every current and future surface.
+    /// Request graceful shutdown; embedders (simnode lib) call this for teardown.
+    pub fn request_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+
+    /// resolves once a client asked the daemon to exit (POST /v1/admin/shutdown).
     pub async fn shutdown_requested(&self) {
-        self.shutdown.notified().await;
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow() {
+            return;
+        }
+        let _ = shutdown.changed().await;
     }
 
     pub(crate) async fn send(&self, cmd: NodeCommand) -> Result<(), Response> {

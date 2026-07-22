@@ -46,23 +46,25 @@
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-use std::path::PathBuf;
 
 use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
-use tracing_subscriber::prelude::*;
 
 mod agent_plane;
 mod blob_fetch;
 mod boot;
+mod code_plane;
+mod term_plane;
 mod cli;
-mod cli_flags;
+mod cli_args;
 mod config;
 mod constants;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
+mod fs_cli;
 mod gateway_plane;
+mod airlock_serve;
 mod gateway_routes;
 mod host_reads;
 mod host_resources;
@@ -72,6 +74,7 @@ mod joiner_mesh_tests;
 mod lobby;
 #[cfg(test)]
 mod main_tests;
+mod mcp;
 mod oracle_pool;
 mod overlay_book;
 mod plane_metrics;
@@ -93,11 +96,10 @@ mod validator;
 mod voice;
 mod voice_plane;
 use config::Resolved;
-use constants::*;
-#[cfg(test)]
-use explorer::explorer_root_op;
 #[cfg(test)]
 use explorer::sealed_frame_block_row;
+#[cfg(test)]
+use noded::projection::project_root_op;
 #[cfg(test)]
 use replica::promotion::{
     PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
@@ -110,10 +112,8 @@ use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
 use util::hex;
 #[cfg(test)]
-use validator::announce::ReadinessSignaller;
-
-#[cfg(test)]
 use directory::{DirQuery, DirReply, decode_reply, encode_query};
+use crate::util::fatal;
 use duckfs_disk::SyncScratch;
 use recovery::Recovery;
 #[cfg(test)]
@@ -121,6 +121,8 @@ use sdk::{Msg, StateRoot};
 
 fn main() {
     resource_limits::raise_open_file_limit();
+    #[cfg(target_os = "macos")]
+    hold_macos_activity();
     // Convert any terminal error into the same stable `FATAL:` marker the node
     // already prints for its other fatal paths (recovery, admission, promotion),
     // plus a non-zero exit. This closes the run-path boot failures (bind
@@ -134,79 +136,102 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(command) = args.first()
-        && let Some(result) = cli::dispatch(command, &args[1..])
-    {
-        return result;
-    }
-
-    // the run path: `--config <path> | -n/--network <chain id> [--sync-only]`.
-    let mut cfg_path: Option<PathBuf> = None;
-    let mut network: Option<String> = None;
-    let mut sync_only = false;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--config" => cfg_path = it.next().map(PathBuf::from),
-            "-n" | "--network" => network = it.next().cloned(),
-            "--sync-only" => sync_only = true,
-            other => {
-                return Err(format!(
-                    "unexpected arg {other:?} (want a subcommand — \
-                     keygen|user-key|user-sign-bind|user-sign-unbind|\
-                     user-sign-possession|user-sign-add-member|user-sign-remove-member|\
-                     user-sign-gateway-route|gateway-route-bind|gateway-route-unbind|\
-                     gateway-route-list|\
-                     user-webauthn-challenge|user-p256-payload|\
-                     init|invite|admit|\
-                     invite-accept|promote|resident-remove|\
-                     join-requests|member-remove|member-leave|member-status|join|\
-                     upgrade-status — or \
-                     --config <path> | -n/--network <chain id> [--sync-only])"
-                )
-                .into());
-            }
-        }
-    }
-    // `--network` addresses a workspace by its chain id through the registry;
-    // `--config` stays the explicit path. exactly one selects the node.
-    let cfg_path = match (network, cfg_path) {
-        (Some(needle), None) => config::find_workspace_config(&needle)?,
-        (None, Some(path)) => path,
-        (Some(_), Some(_)) => {
-            return Err("pass either --network <chain id> or --config <path>, not both".into());
-        }
-        (None, None) => {
-            return Err("missing --config <path> (or -n/--network <chain id>)".into());
-        }
-    };
-
-    let log_ring = noded::LogRing::default();
-    init_tracing(log_ring.clone());
-
-    run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
+/// macOS: opt this process out of App Nap for its whole life. the desktop
+/// shell spawns the node detached but the child stays in the app's darwin
+/// coalition, and the app hides to the menu bar with zero visible windows —
+/// exactly the state macOS answers with timer coalescing and I/O throttling.
+/// a 1s-block consensus follower cannot survive either. the option set
+/// deliberately ALLOWS idle system sleep (a node must never turn a laptop
+/// into a space heater); `LatencyCritical` additionally asks for full timer
+/// precision. the returned token re-enables the nap when it deallocates, so
+/// it is forgotten, never dropped.
+#[cfg(target_os = "macos")]
+fn hold_macos_activity() {
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+    let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+            | NSActivityOptions::LatencyCritical,
+        &NSString::from_str("ducktape follows 1s consensus blocks"),
+    );
+    std::mem::forget(token);
 }
 
-fn init_tracing(log_ring: noded::LogRing) {
-    // opt-in internals visibility: RUST_LOG=commonware_p2p=debug etc.
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_filter(tracing_subscriber::EnvFilter::from_default_env());
-    // the stream's `logs` topic: info floor by default so hot-path debug/trace
-    // events never pay per-event formatting into the ring; RUST_LOG overrides.
-    let ring_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(log_ring)
-        .with_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        );
-    let _ = tracing_subscriber::registry()
-        .with(stderr_layer)
-        .with(ring_layer)
-        .try_init();
+// clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
+// `FATAL:` wrapper in `main` stays for runtime death.
+#[derive(clap::Parser)]
+#[command(
+    name = "ducktape",
+    about = "one workspace-network node and its operator tools",
+    // clap prints "<name> <version>", so the version string must NOT repeat
+    // the binary name the way `version_line()` (the `version` verb) does.
+    version = env!("CARGO_PKG_VERSION"),
+    arg_required_else_help = true
+)]
+pub(crate) struct Cli {
+    #[command(subcommand)]
+    family: Family,
+}
+
+/// the command families — every one a typed clap tree (the hand-rolled
+/// parsers are gone; each family's grammar lives beside its handlers).
+// parsed once on the stack and immediately consumed — variant size is noise.
+#[allow(clippy::large_enum_variant)]
+#[derive(clap::Subcommand)]
+enum Family {
+    /// run a workspace node, plus operator verbs (init, invite, join, ...)
+    #[command(subcommand)]
+    Node(cli_args::NodeCmd),
+    /// user-identity keys and signing (init/restore, sign-*, redeem-invite, ...)
+    #[command(subcommand)]
+    User(userkey_cli::UserCmd),
+    /// local loopback bindings for signed gateway routes
+    #[command(subcommand)]
+    Gateway(gateway_routes::GatewayCmd),
+    /// the duckfs working-copy CLI
+    #[command(subcommand)]
+    Fs(fs_cli::FsCmd),
+    /// the stdio MCP server an agent runner spawns
+    Mcp,
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = <Cli as clap::Parser>::parse();
+    match cli.family {
+        // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
+        // flushing the stream `cat` wrote to); `mcp` is the stdio server the
+        // agent runner spawns and holds until its stdin closes.
+        Family::Fs(cmd) => {
+            let code = fs_cli::run(cmd);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code.into());
+        }
+        Family::Mcp => {
+            mcp::serve();
+            Ok(())
+        }
+        Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Gateway(cmd) => gateway_routes::run(cmd),
+        Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
+        Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
+    }
+}
+
+/// `ducktape node run` — the canonical node-boot path.
+fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = args.selector.config_path()?;
+    let sync_only = args.sync_only;
+
+    let log_ring = noded::LogRing::default();
+    // ONE filter over stderr + the ring (the ws `logs` topic) + the node's own
+    // `<workspace>/daemon.log` (no spawner tees for us any more). the old
+    // two-filter setup defaulted stderr to `EnvFilter::from_default_env()`,
+    // whose no-directive default is ERROR — so with RUST_LOG unset nothing
+    // below error was ever recorded at all.
+    let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
+    noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
+
+    run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -221,7 +246,6 @@ fn gateway_can_start(
     gateway_listen: Option<&str>,
     http_listen: Option<&str>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
 ) -> bool {
     let api_is_loopback = http_listen
         .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
@@ -229,17 +253,18 @@ fn gateway_can_start(
     // a configured gateway suppressed ONLY by a non-loopback app surface is a
     // silent degradation — say why, or the operator debugs a dead listener.
     if !sync_only && gateway_listen.is_some() && !api_is_loopback && http_listen.is_some() {
-        eprintln!(
-            "gateway disabled: http_listen {:?} is not loopback — the browser gateway only \
-             starts when the node API binds a loopback address",
-            http_listen.unwrap_or_default()
+        tracing::warn!(
+            target: "ducktape::gateway",
+            http_listen = http_listen.unwrap_or_default(),
+            reason = "api_not_loopback",
+            "gateway disabled; the browser gateway only starts when the node API binds a \
+             loopback address"
         );
     }
     !sync_only
         && gateway_listen.is_some()
         && api_is_loopback
         && wireguard_listen.is_some()
-        && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake)
 }
 
 fn run_node(
@@ -263,7 +288,6 @@ fn run_node(
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         invite_token,
@@ -273,6 +297,7 @@ fn run_node(
         coord_cap,
         workspace,
         primary_coordinator,
+        coordinator_relay,
         wireguard_advertised,
         sync_candidates,
         chain_id,
@@ -292,7 +317,6 @@ fn run_node(
         gateway_listen.as_deref(),
         http_listen.as_deref(),
         wireguard_listen,
-        wireguard_effect,
     );
 
     let boot::surfaces::Surfaces {
@@ -301,14 +325,19 @@ fn run_node(
         stream_hub,
         index,
         voice_requests,
+        code_stage_requests,
         blobs,
         agent_provisioner,
         gateway_requests,
         gateway_commands,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
+        joiner,
         label: &label,
         storage: &storage,
+        // the config dir where gateway-routes.json lives (= storage in the dev
+        // shape); an embedded airlock gateway registers its port here.
+        workspace: &workspace,
         rpc_listen,
         http_listen,
         gateway_listen,
@@ -318,6 +347,15 @@ fn run_node(
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
         forge_committer: config::hex_bytes(signer.public_key().as_ref()),
+        // the owner-gated admin namespace resolves ownership against this node's
+        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
+        node_key: signer.public_key().as_ref().to_vec(),
+        admin_exposure: noded::AdminExposure::from_env(),
+        // the resolved node.toml sandbox backend: the interactive terminal plane
+        // uses the SAME backend + identity as this node's real agent runs, so a
+        // Direct node has no terminal plane and Podman reaping stays consistent.
+        // cloned — the validator/resident arms below consume the original.
+        sandbox: sandbox.clone(),
     })?;
 
     // run on commonware's OWN tokio runtime, rooted at our per-process storage dir.
@@ -333,7 +371,11 @@ fn run_node(
     // which is out of <storage>; the pre-existing non-portable D7 gap is a
     // separate, migration-aware hardening (tracked as a follow-up).
     let agent_dirs = capability_host::AgentDirs::under(&storage);
-    let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
+    // 15s instead of commonware's 60s default: this read/write deadline is
+    // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
+    let rt_cfg = commonware_runtime::tokio::Config::default()
+        .with_storage_directory(storage)
+        .with_read_write_timeout(constants::MESH_IO_TIMEOUT);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     // the seam's stack handle (socket mode): one slot for the process,
@@ -349,6 +391,8 @@ fn run_node(
             metrics,
             plane_monitor,
             plane_metrics,
+            sync_monitor,
+            sync_metrics,
             mesh_participants,
             status_public_key,
             sync_sources,
@@ -364,21 +408,21 @@ fn run_node(
             peers.clone(),
             validators.clone(),
             sync_candidates,
-            joiner,
             listen,
             advertised,
             bootstrappers,
-            wireguard_effect,
+            wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
         // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
         let bulk_pacer = overlay_book::shared_bulk_pacer();
-        // The `ducktape_dataplane_*` series unregister when this handle
-        // drops — pin it to the whole node future (both role arms await
-        // inside this block).
+        // The `ducktape_dataplane_*` / `ducktape_statesync_serve_*` series
+        // unregister when these handles drop — pin them to the whole node
+        // future (both role arms await inside this block).
         let _plane_metrics = plane_metrics;
+        let _sync_metrics = sync_metrics;
 
         if sync_only {
             boot::sync_only::run(
@@ -387,8 +431,10 @@ fn run_node(
                 network,
                 oracle,
                 quota,
+                &signer,
                 mesh_participants,
                 sync_sources,
+                metrics.clone(),
                 storage_for_sync,
                 namespace,
                 identity_chain_id,
@@ -407,21 +453,30 @@ fn run_node(
         let mut recovery = match Recovery::open(context.child("recovery")).await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: cannot open the recovery store: {e}");
-                std::process::exit(1);
+                fatal!(label, "cannot open the recovery store: {e}");
             }
         };
         // code-registry swaps realize through the blob plane: replay, catch-up,
         // and the live drain (which lifts this off the recovery sink) all fetch
         // committed component bytes from the node's content-addressed store.
-        recovery.set_code_source(std::sync::Arc::new(host_state::BlobCodeSource(blobs.clone())));
+        recovery.set_code_source(std::sync::Arc::new(host_state::BlobCodeSource(
+            std::sync::Arc::new(blobs.clone()),
+        )));
         let manifest = match recovery.manifest() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: recovery checkpoint is damaged: {e}");
-                std::process::exit(1);
+                fatal!(label, "recovery checkpoint is damaged: {e}");
             }
         };
+        // breadcrumb between the surface binds and the mesh/plane wiring: a
+        // long journal replay is silent local disk io, and a boot log that
+        // ends at "rpc listening" is otherwise indistinguishable from a hang.
+        tracing::info!(
+            target: "ducktape::recovery",
+            node = %label,
+            checkpoint = if manifest.is_some() { "present" } else { "none" },
+            "recovery store open"
+        );
         let forge_repo = storage_for_sync.join("forge-repo");
         let duckfs_dir = storage_for_sync.join("duckfs");
         // boot sweep (#219): no sync attempt is in flight yet, so any leftover
@@ -464,9 +519,9 @@ fn run_node(
                 peers,
                 validators,
                 wireguard_listen,
-                wireguard_effect,
                 wireguard_key_file,
                 primary_coordinator,
+                coordinator_relay,
                 wireguard_advertised,
                 &invite_token,
                 &invite_wireguard,
@@ -486,6 +541,7 @@ fn run_node(
                 gateway_commands.clone(),
                 &stream_hub,
                 index,
+                metrics.clone(),
                 voice_requests,
                 blobs,
                 &agent_provisioner,
@@ -518,7 +574,6 @@ fn run_node(
             validators,
             coordinated,
             wireguard_listen,
-            wireguard_effect,
             wireguard_key_file,
             primary_coordinator,
             wireguard_advertised,
@@ -540,12 +595,14 @@ fn run_node(
             stream_hub,
             index,
             voice_requests,
+            code_stage_requests,
             blobs,
             agent_provisioner,
             agent_dirs,
             overlay_slot,
             bulk_pacer,
             plane_monitor,
+            sync_monitor,
             workspace,
             recovery,
             manifest,

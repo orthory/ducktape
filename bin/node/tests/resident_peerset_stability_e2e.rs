@@ -52,7 +52,7 @@ fn a_parked_resident_tracks_residents_and_never_churns_discovery() {
     assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
-    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     // let the parked resident run several discovery rounds at the post-grant

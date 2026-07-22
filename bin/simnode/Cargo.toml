@@ -10,11 +10,21 @@ version.workspace = true
 # concurrent-writer blocks, persona switches (local daemon vs networked
 # validator wire shapes), stepwise oracle drains. dev/test tool only; it is
 # never part of a release.
+
+# the engine (boot()/SimOpts/SimHandle) is a library so it can be embedded —
+# e.g. from the iced app's tests — without spawning the binary. the binary is
+# a thin `main` over it.
+[lib]
+name = "simnode"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ducktape-simnode"
 path = "src/main.rs"
 
 [dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
@@ -24,7 +34,6 @@ duckdns = { workspace = true }
 gateway = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
-jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 dispatch = { workspace = true }
@@ -33,9 +42,32 @@ saga = { workspace = true }
 pages = { workspace = true }
 forge = { workspace = true }
 files = { workspace = true }
+# the opt-in `--with-valset` governance genesis: the KV store, the membership
+# registry, the sole authorized author of valset change, and the upgrade
+# coordinator whose registration makes the host-injected boundary tick ride.
+kv = { workspace = true }
+valset = { workspace = true }
+governance = { workspace = true }
+lifecycle = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
+# variable-length hex decode for the `hex:` origin escape and `--with-valset`
+# genesis keys (raw ed25519 bytes the JSON-string origin lane cannot express).
+duckfs-core = { workspace = true }
+# the sim installs the SAME subscriber the real node does (noded::log), so a
+# scenario sees the module breadcrumbs a wasm guest has no other way to emit.
 noded = { path = "../noded" }
+tracing = { workspace = true }
+# the replication layer: the sim actor runs on `OrderedNode<StepOrderer,
+# NullSink>` — the SAME apply/drain/projection engine the validator uses, with
+# a scripted FIFO orderer and a logical-clock time policy. `sim` toggles the
+# pre-decoded ingress (`submit_decoded`) for the UNSIGNED /sim/peer-block +
+# hex: lanes; the wire op-frame codec gains no unsigned variant. `node::
+# decode_frame` still verifies a signed frame's signature and yields the
+# VERIFIED signer as the op origin — the SAME function every validator and the
+# embedded daemon use (also available to the frame/batch tests for composing
+# frames via `node::encode_frame`).
+node = { workspace = true, features = ["sim"] }
 # the durable block index — /v1/blocks and /v1/index/* read it, the sim actor
 # feeds it block-by-block exactly like the real daemons.
 indexer = { workspace = true }
@@ -45,10 +77,19 @@ commonware-runtime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-futures = "0.3"
+# `executor` powers the SimHandle's synchronous methods: block_on a futures
+# oneshot reply from the caller's (runtime-less) thread — the same seam
+# noded's actor_api uses.
+futures = { version = "0.3", features = ["executor"] }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
+# the shared raw-http/port/poll harness helpers (was a local copy in harness/).
+nettest = { path = "../../crates/testing/nettest" }
+# the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
+identity = { workspace = true, features = ["testkit"] }
 # sim_e2e spawns the real binary and needs isolated storage roots.
 tempfile = "3"
+# core_scenarios signs identity member-consent certificates.
+commonware-cryptography = { workspace = true }

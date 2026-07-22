@@ -10,10 +10,12 @@ version.workspace = true
 # host::Host, and prints its evolving app-hash so a demo script can assert two
 # OS processes converge over real sockets.
 [[bin]]
-name = "ducktape-node"
+name = "ducktape"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
+clap = { workspace = true }
 host = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }
@@ -26,12 +28,11 @@ directory = { workspace = true }
 valset = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
-# the no-downtime upgrade module + its wire surface (read_upgrade_state reads the
-# committed boundary snapshot; the module itself is genesis-wired post-retrofit).
-upgrade = { workspace = true }
-# the module code registry + the wasm runtime it governs: genesis-wired, with
-# height-gated live code swaps realized through the blobstore-backed CodeSource.
-modreg = { workspace = true }
+# the network lifecycle module: the no-downtime protocol-version coordinator AND
+# the module code registry, one genesis-wired module. read_upgrade_state reads
+# its committed boundary snapshot; height-gated live code swaps are realized
+# through the blobstore-backed CodeSource.
+lifecycle = { workspace = true }
 wasm-host = { workspace = true }
 saga = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side
@@ -46,20 +47,24 @@ forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
-vaults = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
 gateway = { workspace = true }
+# a credential-provider node embeds an airlock gateway in-process (server) and
+# seeds its credential; the compute-side broker path also uses the client. See
+# src/airlock_serve.rs.
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server"] }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
 # duckfs reusable core and disk scratch helpers; the `files` crate above remains
 # the consensus module adapter.
 duckfs-core = { workspace = true }
+# the `ducktape fs` verb family drives the checkout/commit engine + HttpNode.
+duckfs-client = { workspace = true }
 duckfs-disk = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
-jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 # the staged node-driven WireGuard plane: the reachability orchestrator runs
@@ -80,6 +85,7 @@ data-plane = { workspace = true }
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }
 futures = "0.3"
+bytes = "1"
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # compact, url-safe text encoding for the invite blob (replaces hex-of-toml).
@@ -120,29 +126,55 @@ bip39 = { workspace = true }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 zeroize = { workspace = true }
-# stderr tracing for the p2p/consensus internals (RUST_LOG=commonware_p2p=debug).
+# the node's own events (noded::log installs the subscriber). the p2p/consensus
+# internals ride the same filter: RUST_LOG=commonware_p2p=debug.
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Raise the node's inherited open-file soft limit before opening module stores.
 libc = "0.2"
 
-# the process-level e2e suite (tests/) spawns REAL `ducktape-node` binaries and
+# App Nap opt-out (see main.rs `hold_macos_activity`): a desktop-spawned node
+# lives in the GUI app's coalition and would otherwise be timer-coalesced the
+# moment the app hides to the menu bar. already in the workspace lockfile via
+# another workspace dependency — this adds no new supply chain.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
+
+# the process-level e2e suite (tests/) spawns REAL `ducktape` binaries and
 # drives them through the rpc with TYPED interface-crate payloads — payload
 # drift fails to compile instead of rotting silently like the old bash demo.
 [dev-dependencies]
+# the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
+nettest = { path = "../../crates/testing/nettest" }
+# the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
+# hand-mirrored the NodeCommand actor). dev-only feature: resolver v2 keeps it
+# out of the production `ducktape` binary build.
+noded = { path = "../noded", features = ["testkit"] }
+# the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
+# dev-only feature: resolver v2 keeps it out of the production binary build.
+identity = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
+# paused-clock unit tests (`#[tokio::test(start_paused = true)]`) — the
+# first-contact window guard proves "a mute plane cannot hang the race"
+# in milliseconds of wall time instead of minutes.
+tokio = { version = "1", features = ["test-util", "macros"] }
 tempfile = "3"
+# the streaming e2e feeds an SSE upstream through a channel-backed Body.
+tokio-stream = "0.1"
+# airlock is also a runtime dependency (see [dependencies] — src/airlock_serve.rs);
+# tests additionally need the real verifier + the minted-chain testkit. axum
+# serves the in-process mock upstream airlock_gateway_e2e swaps into.
+airlock = { path = "../../crates/modules/system/airlock", features = ["client", "server", "verify", "testkit"] }
+axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
-# loopback (the crates/system/overlay-net/tests/loopback_pair harness shape) to
+# loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
 # prove huddle media crosses the REAL overlay headless — this supplies the WG
 # interface config types; the boringtun crypto rides overlay-net (a dep above).
 defguard_wireguard_rs = { workspace = true }
 # replica::tests assembles real finalization certificates (sign -> assemble)
 # to exercise the cert-lane decode + fold planner.
 commonware-parallel = { workspace = true }
-# the phase-3 proof: duckfs_client_e2e drives the checkout/commit engine (as a
-# library, over each node's real http surface) across a two-validator cluster.
-duckfs-client = { workspace = true }
 # coordinated_invite_cli seeds a signed mesh-state.json so `invite` bundles
 # member fronts, building the persisted adverts with the same crates the node
 # already depends on (reachability::store + wireguard advert types +

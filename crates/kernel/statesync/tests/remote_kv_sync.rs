@@ -15,7 +15,7 @@ use host::{FinalizedBlock, Host};
 use kv::Kv;
 use kv::{KvMsg, encode as kv_encode};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
-use statesync::qmdb::RemoteQmdbResolver;
+use statesync::qmdb::{QmdbStore, RemoteQmdbResolver};
 use statesync::{
     CHUNK_LEN, ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse,
     SyncServer, decode_response, encode_request, fetch_manifest, fetch_snapshot,
@@ -130,7 +130,11 @@ impl Module for BigSnapshot {
 fn joiner_rebuilds_kv_over_the_wire_protocol() {
     deterministic::Runner::default().start(|context| async move {
         // ---- SOURCE: real committed kv content through the host op path ----
-        let kv = Kv::init(context.child("source_kv"), "kv").await;
+        // built the way a host does: concrete store first, injected as a box.
+        let kv = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("source_kv"), "kv").await),
+        );
         let mut host =
             Host::genesis(vec![Box::new(kv), Box::new(BigSnapshot::new())]).expect("genesis");
 
@@ -181,10 +185,12 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             );
 
             // rebuild ENTIRELY through the wire: every op batch crosses the
-            // channel as proof-carrying bytes and is merkle-verified.
-            let rebuilt = Kv::sync_from(joiner_ctx, "kv-rebuilt", target, resolver)
+            // channel as proof-carrying bytes and is merkle-verified. the
+            // synced store then backs a fresh module, the joiner-host shape.
+            let store = QmdbStore::sync_from(joiner_ctx, "kv-rebuilt", target, resolver)
                 .await
                 .expect("sync_from");
+            let rebuilt = Kv::new("kv-rebuilt", Box::new(store));
             assert_eq!(rebuilt.root(), src_kv_root, "synced root == source root");
             assert_eq!(
                 rebuilt.get(b"motd").await.as_deref(),
@@ -218,7 +224,10 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
 #[test]
 fn stale_capture_requests_are_refused_not_mis_served() {
     deterministic::Runner::default().start(|context| async move {
-        let kv = Kv::init(context.child("kv"), "kv").await;
+        let kv = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("kv"), "kv").await),
+        );
         let mut host = Host::genesis(vec![Box::new(kv)]).expect("genesis");
         host.submit(Msg {
             target: "kv".into(),
@@ -287,7 +296,10 @@ fn byzantine_op_batches_fail_verification_not_installation() {
     use statesync::qmdb::{QmdbSyncReq, decode_ops_envelope, encode_qmdb_req};
 
     deterministic::Runner::default().start(|context| async move {
-        let kv = Kv::init(context.child("kv"), "kv").await;
+        let kv = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("kv"), "kv").await),
+        );
         let mut host = Host::genesis(vec![Box::new(kv)]).expect("genesis");
         host.submit(Msg {
             target: "kv".into(),
@@ -401,9 +413,9 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
                     .expect("index blob");
                 assert_eq!(blob.len() as u64, *len, "{db} blob length matches");
                 let files = statesync::decode_index_archive(&blob).expect("archive decodes");
-                indexer::stage_shipped_db(&dest_base, db, &files).expect("stage");
+                indexer::stage_shipped_db(&indexer::DiskFs, &dest_base, db, &files).expect("stage");
             }
-            indexer::commit_staged(&dest_base).expect("commit");
+            indexer::commit_staged(&indexer::DiskFs, &dest_base).expect("commit");
             dest_dir
         };
 

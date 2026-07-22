@@ -4,6 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 host = { workspace = true }
 kv = { workspace = true }
 directory = { workspace = true }
@@ -22,7 +24,6 @@ gateway = { workspace = true }
 automations = { workspace = true }
 inbox = { workspace = true }
 files = { workspace = true }
-jobs = { workspace = true }
 valset = { workspace = true }
 sdk = { workspace = true }
 commonware-runtime = { workspace = true }

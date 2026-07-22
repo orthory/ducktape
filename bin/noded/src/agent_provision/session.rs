@@ -1,6 +1,5 @@
-//! the per-run AGENT SESSION KEY: one fresh ed25519 keypair per portable run
-//! that has an agent, bound to that run in consensus before the run starts, and
-//! handed to the run's tool plane as `DUCKTAPE_RUN_SESSION_KEY`.
+//! The per-run agent session signer. One fresh ed25519 keypair is bound to the
+//! run in consensus, but its private half stays in this host process.
 //!
 //! why a key at all: an agent's mid-run writes have to be attributable, and the
 //! frameless `/v1/submit` lane cannot carry attribution — its `origin` is a
@@ -18,36 +17,10 @@
 //! owner's grant is already committed as `AgentRecord { owner, allowed_actions,
 //! caps }`. the session adds proof of ORIGIN, not authority.
 //!
-//! ## the key is a BEARER CREDENTIAL; the SANDBOX is the boundary
-//!
-//! `DUCKTAPE_RUN_SESSION_KEY` is a raw ed25519 PRIVATE key in the child's
-//! environment, and under codex the agent has a shell that can read it. so be
-//! exact about what it confers: whoever holds it can sign ANY `Msg` to ANY
-//! module, not just `RunsMsg::AgentAction`. consensus gates the ACTION lane —
-//! `allowed_actions`, caps, the bound session — it does not gate the KEY. off
-//! that lane the key is simply an unknown external submitter, and
-//! `chat::author_from_origin` maps any non-empty `Origin::External` to
-//! `AuthorRef::User(key)`: an `Open` channel admits it with no
-//! `chat.post_message` grant at all, and channels, tasks and the rest are
-//! equally open to it. the grant lane bounds what an agent may do AS the agent;
-//! it never bounded this key.
-//!
-//! nor is the key bounded in TIME the way the session is. pruning the session
-//! with its run only closes the `AgentAction` lane; the keypair stays a valid
-//! signer forever. a leaked one is a leaked user key, not a spent ticket.
-//!
-//! what actually contains it is the codex SANDBOX the run executes under
-//! (`--sandbox workspace-write`, no network): a shell the model runs cannot
-//! reach the node's HTTP submit lane to use the key at all. the MCP server that
-//! CAN reach the node is a separate process outside that sandbox, exposing only
-//! the vetted tool surface. so the containment is the sandbox — say it plainly,
-//! because a comment claiming the key is harmless is the one that gets a future
-//! reader to hand it somewhere the sandbox is not.
-//!
-//! what the split with the NODE key still buys is real: the node key signs
-//! validator votes, valset ops, every op the human makes, and it must never
-//! enter that process tree. a session key's blast radius is one unprivileged
-//! external identity; the node key's is the node.
+//! The child receives only a random token for a host endpoint. That endpoint
+//! accepts `AgentAction` and `DelegateRun` for exactly this run, signs them, and
+//! dies with the provisioned workspace. A shell can therefore exercise the
+//! committed agent grant but can never recover a general-purpose frame signer.
 //!
 //! a failed open is NOT a failed run (W-degrade): the run proceeds with no
 //! session vars set, which is precisely the pre-session behaviour — a read-only
@@ -58,25 +31,55 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use dispatch_oracle::WorkspaceSpec;
 use futures::channel::oneshot;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, Response, StatusCode};
+use axum::routing::post;
+use axum::{Json, Router};
+use serde::Deserialize;
 
 use crate::{NodeCommand, NodeHandle, ORACLE_ORIGIN};
 
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
+const ACTION_HEADER: &str = "x-ducktape-run-action";
+const MAX_ACTION_REQUEST_BYTES: usize = agent::MAX_ACTIONS_BYTES + agent::MAX_DELEGATIONS_BYTES;
 
-/// an OPENED session: the private half the run's tool server signs its ops with.
-/// only ever constructed after the bind COMMITTED — a `RunSession` in hand means
-/// consensus has the matching public key against this run.
+pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
+pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
+
+/// An opened, host-owned signer and its narrow child-facing endpoint.
 pub(super) struct RunSession {
-    /// the ed25519 private key as lowercase hex — the SAME encoding the node's
-    /// own key file uses, so `ed25519::PrivateKey::decode(unhex(..))` reads it
-    /// back and there is one key format in the system, not two.
-    pub(super) private_hex: String,
-    /// the run this session is bound to, in the ONLY id space `runs` resolves:
-    /// [`WorkspaceSpec::consensus_run_id`], never the spec's host-local
-    /// `run_id`. it is what the bind named, so it is what every action the run
-    /// signs must name too — the key and this id are one credential.
     pub(super) run_id: String,
+    pub(super) action_url: String,
+    pub(super) action_token: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RunSession {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.abort();
+    }
+}
+
+struct ActionState {
+    handle: NodeHandle,
+    signer: ed25519::PrivateKey,
+    run_id: String,
+    token: String,
+    seq: tokio::sync::Mutex<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionRequest {
+    message: runs::RunsMsg,
 }
 
 /// mint a session keypair for `spec` and bind its public half to the run.
@@ -95,10 +98,13 @@ pub(super) async fn open(handle: &NodeHandle, spec: &WorkspaceSpec) -> Option<Ru
     // pre-field envelope: degrade to the read-only plane, loudly, exactly as a
     // refused bind does.
     let Some(run_id) = spec.consensus_run_id.clone() else {
-        eprintln!(
-            "[oracle] the run envelope for {} ({agent}) names no consensus run id — no agent \
-             session is opened (a read-only tool plane); the run still returns a response",
-            spec.run_id
+        tracing::warn!(
+            target: "ducktape::agent",
+            event = "agent_session_unavailable",
+            run_id = spec.run_id.as_str(),
+            agent_id = agent.as_str(),
+            reason = "missing_consensus_run_id",
+            "agent session unavailable"
         );
         return None;
     };
@@ -114,20 +120,139 @@ pub(super) async fn open(handle: &NodeHandle, spec: &WorkspaceSpec) -> Option<Ru
         session_key: key.public_key().as_ref().to_vec(),
     });
     match submit(handle, payload).await {
-        // the private half never leaves this host: it goes into the run's env
-        // and nowhere else — not into the op, not into a log, not to a peer.
-        Ok(()) => Some(RunSession {
-            private_hex: duckfs_core::to_hex(&seed),
-            run_id,
-        }),
+        Ok(()) => match start_action_server(handle.clone(), key, run_id.clone()).await {
+            Ok(session) => Some(session),
+            Err(detail) => {
+                tracing::warn!(
+                    target: "ducktape::agent",
+                    event = "agent_session_unavailable",
+                    run_id = run_id.as_str(),
+                    agent_id = agent.as_str(),
+                    reason = "signer_endpoint_failed",
+                    detail = detail.as_str(),
+                    "agent session unavailable"
+                );
+                None
+            }
+        },
         Err(detail) => {
-            eprintln!(
-                "[oracle] agent session for run {run_id} ({agent}) did not open: {detail} — the \
-                 run proceeds WITHOUT one (a read-only tool plane); it can still return a response"
+            tracing::warn!(
+                target: "ducktape::agent",
+                event = "agent_session_unavailable",
+                run_id = run_id.as_str(),
+                agent_id = agent.as_str(),
+                reason = "bind_rejected",
+                detail = detail.as_str(),
+                "agent session unavailable"
             );
             None
         }
     }
+}
+
+async fn start_action_server(
+    handle: NodeHandle,
+    signer: ed25519::PrivateKey,
+    run_id: String,
+) -> Result<RunSession, String> {
+    // Bind the host interfaces so Tart guests can reach the same run-scoped
+    // endpoint through their private NAT gateway. Direct and Podman children
+    // still receive a 127.0.0.1 URL; the 256-bit token and closed message/run
+    // scope are the boundary, not an ambient network listener.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .await
+        .map_err(|error| format!("bind scoped action signer: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("read scoped action signer address: {error}"))?;
+    let mut secret = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
+    let token = duckfs_core::to_hex(&secret);
+    let state = Arc::new(ActionState {
+        handle,
+        signer,
+        run_id: run_id.clone(),
+        token: token.clone(),
+        seq: tokio::sync::Mutex::new(0),
+    });
+    let app = Router::new()
+        .route("/v1/run-action", post(run_action))
+        .layer(DefaultBodyLimit::max(MAX_ACTION_REQUEST_BYTES))
+        .with_state(state);
+    let (shutdown, rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    Ok(RunSession {
+        run_id,
+        action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
+        action_token: token,
+        shutdown: Some(shutdown),
+        task,
+    })
+}
+
+async fn run_action(
+    State(state): State<Arc<ActionState>>,
+    headers: HeaderMap,
+    Json(request): Json<ActionRequest>,
+) -> Response<Body> {
+    let authorized = headers
+        .get(ACTION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some(state.token.as_str());
+    if !authorized {
+        return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
+    }
+    let names_bound_run = match &request.message {
+        runs::RunsMsg::AgentAction { run_id, .. } | runs::RunsMsg::DelegateRun { run_id, .. } => {
+            run_id == &state.run_id
+        }
+        _ => false,
+    };
+    if !names_bound_run {
+        return action_response(
+            StatusCode::FORBIDDEN,
+            "message is outside this run's action scope",
+        );
+    }
+    let msg = sdk::Msg {
+        target: RUNS_MODULE.into(),
+        payload: runs::encode_msg(&request.message),
+    };
+    // The frame lane is ordered by (origin, seq). Axum may serve requests
+    // concurrently even though normal MCP clients are serial, so keep frames
+    // from overtaking each other at the actor boundary.
+    let mut next_seq = state.seq.lock().await;
+    let frame = node::encode_frame(&state.signer, *next_seq, &msg, None);
+    *next_seq += 1;
+    let (reply, rx) = oneshot::channel();
+    if state
+        .handle
+        .send(NodeCommand::SubmitFrame { frame, reply })
+        .await
+        .is_err()
+    {
+        return action_response(StatusCode::SERVICE_UNAVAILABLE, "node actor unavailable");
+    }
+    match rx.await {
+        Ok(Ok(_)) => action_response(StatusCode::OK, "ok"),
+        Ok(Err(error)) => action_response(StatusCode::BAD_REQUEST, &error),
+        Err(_) => action_response(StatusCode::SERVICE_UNAVAILABLE, "node actor dropped reply"),
+    }
+}
+
+fn action_response(status: StatusCode, message: &str) -> Response<Body> {
+    let body = serde_json::json!({"message": message}).to_string();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .expect("static scoped action response")
 }
 
 /// submit the bind on the node's ordinary actor lane.

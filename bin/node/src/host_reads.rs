@@ -37,6 +37,26 @@ pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
+/// read the current CLIENT set — the submit-door ACL, now a facet of the
+/// identity account plane (committed state — called between drains, outside any
+/// block). the submit door admits a client's own-signed frame; this is a
+/// SEPARATE read from the valset residents (client standing is structurally
+/// distinct from valset), so a client's standing can never leak into the
+/// statesync/mesh reads keyed off valset.
+pub(crate) async fn read_clients(host: &Host) -> Vec<Vec<u8>> {
+    use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
+    let Ok(reply) = host
+        .query("identity", &encode_query(&IdentityQuery::Clients))
+        .await
+    else {
+        return Vec::new();
+    };
+    match decode_reply(&reply) {
+        Ok(IdentityReply::Clients(v)) => v,
+        _ => Vec::new(),
+    }
+}
+
 /// the transport-mesh set a parked joiner tracks at a manifest's epoch. it MUST
 /// be the same set every member tracks at that epoch — a validator tracks
 /// `descriptor_mesh ∪ members ∪ residents` (see the `mesh_at` closure in the
@@ -65,89 +85,6 @@ pub(crate) fn joiner_epoch_mesh(
     }
     Set::try_from(union.into_iter().collect::<Vec<_>>())
         .expect("a btree-set union has no duplicates")
-}
-
-/// read the upgrade module's committed state as the boundary snapshot the
-/// orchestrator reads at a finalized boundary (committed state — called between
-/// drains, outside any block). the readiness keys are projected into decoded
-/// ed25519 pubkeys (an undecodable key is dropped — dead weight, exactly like the
-/// module). falls back to the baseline (no pending) when the module is absent
-/// (pre-retrofit) or the reply is unreadable, so this never forks on a decode slip
-/// — matching `Host::effective_version`'s graceful fallback.
-pub(crate) async fn read_upgrade_state(host: &Host) -> consensus::BoundaryUpgrade<ed25519::PublicKey> {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
-    let baseline = || consensus::BoundaryUpgrade::baseline(host::BASELINE_VERSION);
-    let Ok(reply) = host
-        .query("upgrade", &encode_query(&UpgradeQuery::Status))
-        .await
-    else {
-        return baseline();
-    };
-    let reply = match decode_reply(&reply) {
-        Ok(r) => r,
-        Err(_) => return baseline(),
-    };
-    let UpgradeReply::Status(status) = reply;
-    let pending = status.pending.map(|up| {
-        let ready: std::collections::BTreeSet<ed25519::PublicKey> = status
-            .ready
-            .iter()
-            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-            .collect();
-        consensus::PendingUpgrade {
-            name: up.name,
-            activation_height: up.activation_height,
-            to_version: up.to_version,
-            ready,
-        }
-    });
-    consensus::BoundaryUpgrade {
-        current_version: status.current_version,
-        pending,
-    }
-}
-
-/// read the upgrade module's committed `current_version` + single pending upgrade
-/// as the manifest MIRROR the recovery/statesync captures carry (committed state —
-/// called between drains, outside any block). falls back to the baseline (version 0,
-/// no pending) when the module is absent (pre-retrofit) or the reply is unreadable,
-/// so a checkpoint is never mis-stamped into a decode slip. keeping this a pure
-/// committed read (not the raw orchestrator state) means a checkpoint captures the
-/// same fields a live node would derive at that height.
-pub(crate) async fn read_upgrade_version_fields(host: &Host) -> (u32, Option<sdk::UpgradeCoords>) {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
-    let baseline = (host::BASELINE_VERSION, None);
-    let Ok(reply) = host
-        .query("upgrade", &encode_query(&UpgradeQuery::Status))
-        .await
-    else {
-        return baseline;
-    };
-    let reply = match decode_reply(&reply) {
-        Ok(r) => r,
-        Err(_) => return baseline,
-    };
-    let UpgradeReply::Status(status) = reply;
-    let pending = status.pending.map(|up| sdk::UpgradeCoords {
-        name: up.name,
-        activation_height: up.activation_height,
-        to_version: up.to_version,
-    });
-    (status.current_version, pending)
-}
-
-/// read the upgrade module's raw committed [`UpgradeStatus`] (committed state,
-/// between drains). `None` when the module is absent (pre-retrofit) or the reply
-/// is unreadable — so the transition-marker latches degrade to silent on a
-/// baseline net, never panicking.
-pub(crate) async fn read_upgrade_status_raw(host: &Host) -> Option<upgrade::UpgradeStatus> {
-    use upgrade::{UpgradeQuery, UpgradeReply, decode_reply, encode_query};
-    let reply = host
-        .query("upgrade", &encode_query(&UpgradeQuery::Status))
-        .await
-        .ok()?;
-    let UpgradeReply::Status(status) = decode_reply(&reply).ok()?;
-    Some(status)
 }
 
 /// read the governance module's committed invite redemptions — the

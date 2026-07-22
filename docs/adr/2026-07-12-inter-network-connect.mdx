@@ -21,8 +21,10 @@ belongs to exactly one of them by construction:
 - Overlay meshes are disjoint — the WireGuard ULA prefix and member addresses
   derive from the chain namespace (`crates/system/wireguard/src/lib.rs:540,555`).
 - Multi-network per machine is already the product: one workspace = one
-  network = one node process (`app/src-tauri/src/workspaces/mod.rs:1-9`), one
-  user key shared across all of them (`app/src-tauri/src/user_identity.rs:1-4`).
+  network = one node process
+  (`app/src-iced/src/backend/workspace_service.rs`), with the desktop user's
+  identity shared across those workspaces
+  (`app/src-iced/src/backend/identity.rs`).
 
 The requirement this ADR answers: **Slack-Connect-style federation.** Two
 networks connect so that members of one can converse with — and specifically

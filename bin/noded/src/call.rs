@@ -23,7 +23,7 @@ use crate::{NodeHandle, error_response, hex_bytes};
 // keyframeRequest), server→client `CallServerControl` (keyframeRequest /
 // peerBeacon / rateHint).
 //
-// the hub side lives with the mesh (only the p2p validator runs one): it
+// the hub side lives with the mesh (validators and standing residents run one): it
 // fragments/reassembles the video ends over `Service::Video` and routes control
 // (keyframe kicks, presence beacons, rate hints — see `chat::video`).
 
@@ -59,6 +59,25 @@ pub enum CallControlOut {
     RateHint { max_kbps: u32 },
 }
 
+/// One editor's ephemeral caret/selection inside a page. `block_id=None`
+/// means the peer is viewing the page without a body-block caret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageCursor {
+    pub block_id: Option<String>,
+    pub anchor: u32,
+    pub head: u32,
+}
+
+/// page-presence control from the webview to the overlay hub.
+pub enum PresenceControlIn {
+    Cursor(PageCursor),
+}
+
+/// page-presence control from a mesh peer to the webview.
+pub enum PresenceControlOut {
+    PeerCursor { peer: [u8; 32], cursor: PageCursor },
+}
+
 /// one live huddle session's channel ends, hub ↔ websocket handler / gateway.
 pub struct CallSession {
     /// captured mic frames, exactly [`chat::voice::FRAME_SAMPLES`] samples each.
@@ -85,8 +104,28 @@ pub struct CallSessionRequest {
     pub reply: tokio::sync::oneshot::Sender<Result<CallSession, String>>,
 }
 
-/// the request lane into the call hub.
-pub type CallLane = tokio::sync::mpsc::Sender<CallSessionRequest>;
+/// A lean Pages presence session. It shares the authenticated overlay control
+/// plane with huddles but owns a separate flow and carries no media.
+pub struct PresenceSession {
+    pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
+    pub control_in: tokio::sync::mpsc::Sender<PresenceControlIn>,
+    pub control_out: tokio::sync::mpsc::Receiver<PresenceControlOut>,
+}
+
+pub struct PresenceSessionRequest {
+    pub page_id: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<PresenceSession, String>>,
+}
+
+/// Both live, off-consensus session types share one request lane into the
+/// overlay hub. The hub keeps one huddle and one Pages session concurrently.
+pub enum RealtimeSessionRequest {
+    Call(CallSessionRequest),
+    Presence(PresenceSessionRequest),
+}
+
+/// the request lane into the realtime overlay hub.
+pub type CallLane = tokio::sync::mpsc::Sender<RealtimeSessionRequest>;
 
 /// client → server control messages on the call socket (text frames).
 #[derive(Debug, Deserialize)]
@@ -138,8 +177,45 @@ pub enum CallServerControl {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PresenceClientControl {
+    Recipients {
+        peers: Vec<String>,
+    },
+    Cursor {
+        block_id: Option<String>,
+        anchor: u32,
+        head: u32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PresenceServerControl {
+    PeerCursor {
+        peer: String,
+        block_id: Option<String>,
+        anchor: u32,
+        head: u32,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CallParams {
     channel: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PresenceParams {
+    page: String,
 }
 
 pub(crate) async fn call_ws(
@@ -168,10 +244,15 @@ pub(crate) async fn call_ws(
 /// session — dropping the ends is the teardown signal the hub watches.
 async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
     let (reply, opened) = tokio::sync::oneshot::channel();
-    let request = CallSessionRequest { channel_id, reply };
+    let request = RealtimeSessionRequest::Call(CallSessionRequest { channel_id, reply });
     // every refusal path says WHY as a text frame before closing — the client
     // surfaces it as a session error instead of a silent no-op.
-    const NO_HUB: &str = "calls are not available on this node (no live call hub)";
+    // Both lane-closed cases in one sentence, because the handler cannot tell
+    // them apart — and "no live call hub" alone left the user with a red
+    // "Voice connection failed." and nothing to act on.
+    const NO_HUB: &str = "this node runs no call hub, so it cannot host a huddle: it has no mesh \
+                          overlay (wireguard_listen unset, or the fake effect — huddle media \
+                          rides the overlay), is a sync-only observer, or its hub stopped.";
     let session = match call.send(request).await {
         Ok(()) => match opened.await {
             Ok(Ok(session)) => session,
@@ -280,6 +361,97 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
                         }
                     };
                     let text = serde_json::to_string(&message).expect("serializable control");
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                None => break,
+            },
+        }
+    }
+}
+
+pub(crate) async fn presence_ws(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<PresenceParams>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(call) = handle.call.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "presence is not available on this node (no mesh realtime hub)",
+        );
+    };
+    if params.page.is_empty() || params.page.len() > 256 {
+        return error_response(StatusCode::BAD_REQUEST, "page must be 1..256 bytes");
+    }
+    upgrade.on_upgrade(move |socket| presence_session(socket, call, params.page))
+}
+
+async fn presence_session(mut socket: WebSocket, call: CallLane, page_id: String) {
+    let (reply, opened) = tokio::sync::oneshot::channel();
+    let request = RealtimeSessionRequest::Presence(PresenceSessionRequest { page_id, reply });
+    const NO_HUB: &str = "this node runs no mesh realtime hub, so Pages presence is unavailable";
+    let session = match call.send(request).await {
+        Ok(()) => match opened.await {
+            Ok(Ok(session)) => session,
+            Ok(Err(refusal)) => {
+                let _ = socket.send(Message::Text(refusal.into())).await;
+                return;
+            }
+            Err(_) => {
+                let _ = socket.send(Message::Text(NO_HUB.into())).await;
+                return;
+            }
+        },
+        Err(_) => {
+            let _ = socket.send(Message::Text(NO_HUB.into())).await;
+            return;
+        }
+    };
+    let PresenceSession {
+        recipients,
+        control_in,
+        mut control_out,
+    } = session;
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => match inbound {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<PresenceClientControl>(&text) {
+                        Ok(PresenceClientControl::Recipients { peers }) => {
+                            let keys = peers
+                                .iter()
+                                .filter_map(|hex| duckfs_core::from_hex_32(hex))
+                                .collect();
+                            let _ = recipients.send(keys);
+                        }
+                        Ok(PresenceClientControl::Cursor { block_id, anchor, head })
+                            if block_id
+                                .as_ref()
+                                .is_none_or(|id| !id.is_empty() && id.len() <= 256) =>
+                        {
+                            let _ = control_in.try_send(PresenceControlIn::Cursor(PageCursor {
+                                block_id,
+                                anchor,
+                                head,
+                            }));
+                        }
+                        Ok(PresenceClientControl::Cursor { .. }) | Err(_) => {}
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            },
+            control = control_out.recv() => match control {
+                Some(PresenceControlOut::PeerCursor { peer, cursor }) => {
+                    let message = PresenceServerControl::PeerCursor {
+                        peer: hex_bytes(&peer),
+                        block_id: cursor.block_id,
+                        anchor: cursor.anchor,
+                        head: cursor.head,
+                    };
+                    let text = serde_json::to_string(&message).expect("serializable presence");
                     if socket.send(Message::Text(text.into())).await.is_err() {
                         break;
                     }

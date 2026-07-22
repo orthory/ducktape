@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
 
-use crate::config::{self, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, hex_bytes};
 use crate::constants::NUDGE_INTERVAL;
 use crate::lobby;
 
@@ -16,48 +18,111 @@ pub(crate) enum IntroPath {
     Coordinated,
 }
 
-/// One inviter-side intro datagram, shared by BOTH doorbells: decode →
+/// One inviter-side intro datagram, shared by BOTH doorbells: OPEN → decode →
 /// verify → install → ack, in that order — the ack is only emitted after the
 /// `InstallInvitePeer` reply settles, so "acked" can never outrun
-/// "installed". `ack` abstracts the reply transport (the direct listener
-/// answers on its own socket, the coordinated receiver via
-/// `SendResolverDatagram`). Returns `false` once the plane's command channel
-/// is gone, telling the caller to exit its receive loop.
-pub(crate) async fn handle_intro<F, Fut>(
-    bytes: &[u8],
+/// "installed". The datagram arrives SEALED to this member's WireGuard X25519
+/// key (join ADR, item 5): a bearer token never crosses the wire in
+/// the clear, so `open` decrypts it with the member's secret before anything
+/// else. `ack` abstracts the reply transport (the direct listener answers on
+/// its own socket, the coordinated receiver via `SendResolverDatagram`).
+/// Returns `false` once the plane's command channel is gone, telling the
+/// caller to exit its receive loop.
+/// the shared gate-outcome map (joiner key → its resolved [`lobby::IntroReply`]):
+/// the run loop's drain WRITES the settled outcome, the intro doorbell READS it
+/// on the joiner's next retransmit and seals it back down the tunnel.
+pub(crate) type GateOutcomes =
+    std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, lobby::IntroReply>>>;
+
+/// The member side's link from the intro doorbell (reachability-plane thread)
+/// to its validator run loop (§4). The doorbell FORWARDS a verified gate request
+/// to the loop, which submits `Redeem` and settles; the loop's drain writes the
+/// resolved outcome into `outcomes`, which the doorbell reads on the joiner's
+/// next retransmit and seals back. A joiner's own plane carries `None`.
+#[derive(Clone)]
+pub(crate) struct GateHook {
+    pub(crate) forward: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(crate) outcomes: GateOutcomes,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_intro<F, Fut, O>(
+    sealed: &[u8],
     src: std::net::SocketAddr,
     binding: &[u8],
     label: &str,
     path: IntroPath,
     cmds: &tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>,
+    open: O,
+    gate: Option<&GateHook>,
     ack: F,
 ) -> bool
 where
     F: FnOnce(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = ()>,
+    O: FnOnce(&[u8]) -> Result<Vec<u8>, String>,
 {
-    let Ok(msg) = lobby::decode_intro(bytes) else {
-        return true; // junk on the doorbell — drop.
+    // OPEN the sealed envelope to THIS member's WG key. A datagram that does not
+    // open — an observer's junk, or an intro sealed to a different member — is
+    // dropped silently: no nonce to echo, no answer earned.
+    let Ok(plaintext) = open(sealed) else {
+        return true;
     };
-    let ack_bytes = |installed: bool, detail: String| {
+    let Ok(msg) = lobby::decode_intro(&plaintext) else {
+        return true;
+    };
+    let nonce = msg.nonce.clone();
+    // a pre-verify refusal goes out in the CLEAR (no joiner key trusted yet).
+    let refuse_cleartext = |detail: String| {
         lobby::encode_intro_ack(&lobby::IntroAck {
-            nonce: msg.nonce.clone(),
-            installed,
-            detail,
+            nonce: nonce.clone(),
+            reply: lobby::IntroReply::Refused { detail },
         })
     };
     let verified = match lobby::verify_intro(&msg, binding) {
         Ok(v) => v,
         Err(e) => {
-            // the direct doorbell answers a failed verification; the
-            // coordinated path drops it silently (preserved pre-extraction
-            // behavior — an unverified src has earned no resolver datagram).
             if path == IntroPath::Direct {
-                ack(ack_bytes(false, e)).await;
+                ack(refuse_cleartext(e)).await;
             }
             return true;
         }
     };
+    // past verification we hold the joiner's WG key: every reply from here is
+    // SEALED to it, so an `Admitted`'s coordinator capability never crosses the
+    // wire in the clear.
+    let joiner_wg = verified.wg_public_key;
+    let sealed_reply = |reply: lobby::IntroReply| {
+        let bytes = lobby::encode_intro_ack(&lobby::IntroAck {
+            nonce: nonce.clone(),
+            reply,
+        });
+        reachability::seal(&joiner_wg, &bytes)
+    };
+    // V4 expiry, on this member's wall clock (signature-covered field).
+    if nat_traversal::now_secs() >= msg.expires_unix_secs {
+        if path == IntroPath::Direct {
+            ack(sealed_reply(lobby::IntroReply::Refused {
+                detail: "invite expired — ask the inviter for a fresh one".into(),
+            }))
+            .await;
+        }
+        return true;
+    }
+    // V8 role: only `Resident` gates here; a `Client` token redeems via
+    // `user-redeem-invite` and must not obtain a tunnel (R2). V6/V7 need
+    // committed state — those run at the loop (`on_gate_forward`).
+    if msg.role != config::InviteRole::Resident.as_u8() {
+        if path == IntroPath::Direct {
+            ack(sealed_reply(lobby::IntroReply::Refused {
+                detail: "a client invite is not redeemable at a node join — it grants submit \
+                         access; redeem it with `ducktape user redeem-invite`"
+                    .into(),
+            }))
+            .await;
+        }
+        return true;
+    }
     let Some(cmds) = cmds.upgrade() else {
         return false;
     };
@@ -73,27 +138,82 @@ where
     }
     match reply_rx.await {
         Ok(Ok(())) => {
-            let flavor = match path {
-                IntroPath::Direct => "",
-                IntroPath::Coordinated => "coordinated ",
+            let via = match path {
+                IntroPath::Direct => "direct",
+                IntroPath::Coordinated => "coordinated",
             };
-            println!(
-                "[node {label}] invite intro: {flavor}tunnel peer installed for {}",
-                config::hex_bytes(&verified.joiner.as_ref()[..4])
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
+                via,
+                "invite intro tunnel peer installed"
             );
-            ack(ack_bytes(true, "tunnel installed".into())).await;
+            // THE GATE (§4): the sealed intro IS the gate request. Forward it to
+            // the run loop and ack the CURRENT outcome — `Installed` while it
+            // settles, or the resolved `Admitted`/`Rejected` a later retransmit
+            // picks up from the shared map.
+            let reply = gate_reply(gate, &verified.joiner, &msg).await;
+            ack(sealed_reply(reply)).await;
         }
-        Ok(Err(e)) => ack(ack_bytes(false, e)).await,
-        Err(_) => ack(ack_bytes(false, "plane exited".into())).await,
+        Ok(Err(e)) => ack(sealed_reply(lobby::IntroReply::Refused { detail: e })).await,
+        Err(_) => {
+            ack(sealed_reply(lobby::IntroReply::Refused {
+                detail: "plane exited".into(),
+            }))
+            .await;
+        }
     }
     true
 }
 
+/// Resolve the gate for a just-installed joiner: return the settled outcome if
+/// the run loop already wrote one (a later retransmit), else forward the request
+/// (the loop dedups per joiner) and report `Installed` while it settles. A
+/// `None` gate always reports `Installed`.
+///
+/// outcome consumption is deliberate: `Admitted` STAYS in the map (idempotent
+/// success — a lost ack's retransmit re-reads it for free), everything else is
+/// taken ONE-SHOT — a joiner that retries this member later (a failed-over
+/// `Busy`, a new attempt) must re-run the gate, not eat a stale refusal forever.
+async fn gate_reply(
+    gate: Option<&GateHook>,
+    joiner: &ed25519::PublicKey,
+    msg: &lobby::IntroRequest,
+) -> lobby::IntroReply {
+    let Some(hook) = gate else {
+        return lobby::IntroReply::Installed;
+    };
+    let joiner_key = joiner.as_ref().to_vec();
+    let settled = {
+        let mut outcomes = hook.outcomes.lock().expect("gate outcomes lock");
+        match outcomes.get(&joiner_key) {
+            Some(admitted @ lobby::IntroReply::Admitted { .. }) => Some(admitted.clone()),
+            Some(_) => outcomes.remove(&joiner_key),
+            None => None,
+        }
+    };
+    if let Some(outcome) = settled {
+        return outcome;
+    }
+    let _ = hook
+        .forward
+        .send(lobby::GateForward {
+            issuer: msg.issuer.clone(),
+            nonce: msg.nonce.clone(),
+            token_sig: msg.token_sig.clone(),
+            joiner: joiner_key,
+            proof: msg.proof.clone(),
+            role: msg.role,
+            expires_unix_secs: msg.expires_unix_secs,
+        })
+        .await;
+    lobby::IntroReply::Installed
+}
+
 /// the reachability plane's thread body: derive the plane's endpoints, bind
 /// the nat client against the coordinated-reach coordinators, and drive
-/// `reachability::run` with the configured WireGuard effect — real (an
-/// actual interface via the userspace WireGuard runtime) by default,
-/// in-memory fake when `wireguard_effect = "fake"` opts out. every failure
+/// `reachability::run` on the in-process userspace backend. every failure
 /// path prints and returns — the plane is an overlay on a working node,
 /// never a reason to take the node down.
 /// Wire the staged WireGuard reachability plane onto an already-registered
@@ -113,7 +233,6 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_key_file: &std::path::Path,
     mesh_state_file: &std::path::Path,
     wireguard_listen: std::net::SocketAddr,
-    wireguard_effect: WireGuardEffectKind,
     overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
     // an explicit WireGuard advertise override (node.toml
@@ -126,6 +245,10 @@ pub(crate) fn wire_reachability_plane<S, R>(
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
+    // the member side's gate hook (§4): the intro doorbells forward verified
+    // gate requests to the validator run loop through it and answer settled
+    // outcomes from its shared map. a joiner's own plane passes `None`.
+    gate: Option<GateHook>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
@@ -139,6 +262,7 @@ where
     let thread_label = label.to_string();
     let reach_signer = signer.clone();
     let reach_coord_cap = coord_cap;
+    let reach_gate = gate;
     let plane_chain_id = chain_id.to_string();
     let key_file = wireguard_key_file.to_path_buf();
     let state_file = mesh_state_file.to_path_buf();
@@ -157,13 +281,13 @@ where
                     key_file,
                     state_file,
                     wireguard_listen,
-                    wireguard_effect,
                     overlay_slot,
                     advertised,
                     wireguard_advertised,
                     coordinators,
                     intro_listen,
                     reach_coord_cap,
+                    reach_gate,
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
@@ -191,84 +315,111 @@ where
     {
         let pump_label = label.to_string();
         let mut tx = reach_p2p_tx;
-        context.child("reachability_out").spawn(move |_ctx| async move {
-            while let Some(event) = ev_rx.recv().await {
-                match event {
-                    reachability::ReachabilityEvent::Send { to, bytes } => {
-                        let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
-                    }
-                    reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
-                        println!(
-                            "[node {pump_label}] reachability: epoch {epoch} mesh verified"
-                        )
-                    }
-                    reachability::ReachabilityEvent::TunnelsApplied {
-                        epoch,
-                        interface,
-                        peers,
-                    } => match wireguard_effect {
-                        WireGuardEffectKind::Tun => println!(
-                            "[node {pump_label}] reachability: epoch {epoch} tunnels applied \
-                             on {interface} ({peers} peer(s))"
+        context
+            .child("reachability_out")
+            .spawn(move |_ctx| async move {
+                while let Some(event) = ev_rx.recv().await {
+                    match event {
+                        reachability::ReachabilityEvent::Send { to, bytes } => {
+                            let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                        }
+                        reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, epoch,
+                                "mesh verified"
+                            )
+                        }
+                        reachability::ReachabilityEvent::TunnelsApplied {
+                            epoch,
+                            interface,
+                            peers,
+                        } => {
+                            // NB: this proves only that the EFFECT ACCEPTED A CONFIG. The
+                            // completed-handshake half — the difference between "the
+                            // overlay never came up" and "the overlay is up but the peer
+                            // is dark" — is reported separately by `spawn_handshake_sampler`
+                            // as `peer handshake COMPLETE` / `peer DARK`. Read them together:
+                            // tunnels applied WITHOUT a matching handshake for a peer is
+                            // precisely the "peer dark" bug.
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, epoch, %interface, peers,
+                                "tunnels applied (config accepted — the handshake is reported \
+                                 separately)"
+                            )
+                        }
+                        reachability::ReachabilityEvent::StandbyTunnelsApplied {
+                            epoch,
+                            interface,
+                            peers,
+                        } => tracing::info!(
+                            target: "ducktape::reachability",
+                            node = %pump_label, epoch, %interface, peers,
+                            "standby pre-warm tunnels applied"
                         ),
-                        // socket mode has no OS interface: {interface} is the
-                        // orchestrator's label for the in-process backend.
-                        WireGuardEffectKind::Socket => println!(
-                            "[node {pump_label}] reachability: epoch {epoch} tunnels applied \
-                             on {interface} ({peers} peer(s); userspace socket backend)"
+                        reachability::ReachabilityEvent::InvitePeerInstalled {
+                            peer,
+                            interface,
+                        } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %interface,
+                                "invite tunnel installed"
+                            )
+                        }
+                        reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
+                            // the peer is DARK. media to it will silently go nowhere.
+                            tracing::warn!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %reason,
+                                "peer unreachable — traffic to it will go nowhere"
+                            )
+                        }
+                        reachability::ReachabilityEvent::EpochFailed { epoch, reason } => {
+                            tracing::error!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, epoch, %reason,
+                                "epoch FAILED — the mesh did not assemble"
+                            )
+                        }
+                        reachability::ReachabilityEvent::MeshRestored {
+                            epoch,
+                            interface,
+                            peers,
+                        } => tracing::info!(
+                            target: "ducktape::reachability",
+                            node = %pump_label, epoch, %interface, peers,
+                            "persisted mesh restored — awaiting live assembly"
                         ),
-                        WireGuardEffectKind::Fake => println!(
-                            "[node {pump_label}] reachability: epoch {epoch} tunnel config \
-                             staged on {interface} ({peers} peer(s); fake effect — no real \
-                             interface)"
-                        ),
-                    },
-                    reachability::ReachabilityEvent::StandbyTunnelsApplied {
-                        epoch,
-                        interface,
-                        peers,
-                    } => println!(
-                        "[node {pump_label}] reachability: epoch {epoch} standby pre-warm \
-                         tunnels on {interface} ({peers} peer(s))"
-                    ),
-                    reachability::ReachabilityEvent::InvitePeerInstalled { peer, interface } => {
-                        println!(
-                            "[node {pump_label}] reachability: invite tunnel to {} on {interface}",
-                            hex_bytes(&peer.as_ref()[..4])
-                        )
-                    }
-                    reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
-                        println!(
-                            "[node {pump_label}] reachability: peer {}: {reason}",
-                            hex_bytes(&peer.as_ref()[..4])
-                        )
-                    }
-                    reachability::ReachabilityEvent::EpochFailed { epoch, reason } => println!(
-                        "[node {pump_label}] reachability: epoch {epoch} failed: {reason}"
-                    ),
-                    reachability::ReachabilityEvent::MeshRestored {
-                        epoch,
-                        interface,
-                        peers,
-                    } => println!(
-                        "[node {pump_label}] reachability: persisted mesh (epoch {epoch}) \
-                         restored on {interface} ({peers} peer(s)) — awaiting live assembly"
-                    ),
-                    reachability::ReachabilityEvent::RestoreFailed { reason } => {
-                        println!(
-                            "[node {pump_label}] reachability: persisted mesh not restored \
-                             ({reason}); continuing on live assembly only"
-                        )
-                    }
-                    reachability::ReachabilityEvent::PersistFailed { reason } => {
-                        println!(
-                            "[node {pump_label}] reachability: WARNING: mesh state not \
-                             persisted ({reason}) — a cold restart will not restore this epoch"
-                        )
+                        reachability::ReachabilityEvent::RestoreFailed { reason } => {
+                            // #471: this was an unlevelled println that read like startup
+                            // chatter — which is exactly why it sat there being ignored
+                            // while restart-reconnect was dead. it is not chatter: the
+                            // persisted mesh is GONE for this whole boot.
+                            tracing::error!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, %reason,
+                                consequence = "restart reconnect is dead for this boot; \
+                                               live assembly only",
+                                "persisted mesh NOT restored"
+                            )
+                        }
+                        reachability::ReachabilityEvent::PersistFailed { reason } => {
+                            tracing::warn!(
+                                target: "ducktape::reachability",
+                                node = %pump_label, %reason,
+                                consequence = "a cold restart will not restore this epoch",
+                                "mesh state NOT persisted"
+                            )
+                        }
                     }
                 }
-            }
-        });
+            });
     }
     cmd_tx
 }
@@ -283,7 +434,6 @@ async fn reachability_plane(
     // re-applies it from at boot (the cold-restart path).
     mesh_state_file: PathBuf,
     wireguard_listen: std::net::SocketAddr,
-    effect_kind: WireGuardEffectKind,
     // the seam's stack handle (socket mode): created by the node so the mesh
     // context and the data-plane factory hold it BEFORE this thread exists;
     // the socket-mode effect publishes/clears the live stack through it.
@@ -299,6 +449,9 @@ async fn reachability_plane(
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
+    // the member side's gate hook (§4), cloned into both intro doorbells;
+    // `None` on a joiner's plane.
+    gate: Option<GateHook>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
@@ -316,9 +469,16 @@ async fn reachability_plane(
             .and_then(|mut addrs| addrs.next()),
     };
     let Some(control_addr) = resolve_ingress(&advertised) else {
-        eprintln!(
-            "[node {label}] reachability: advertised {advertised:?} did not resolve — plane \
-             not started"
+        // the plane never starts and the node runs on forever with NO overlay:
+        // no tunnels, no hub, every huddle failing with a string that names none
+        // of this. it does not self-heal and nothing else reports it.
+        tracing::error!(
+            target: "ducktape::reachability",
+            node = %label,
+            advertised = ?advertised,
+            reason = "advertised_unresolvable",
+            "reachability plane NOT started — this node has no overlay for the rest of \
+             this boot (set `advertised` to a resolvable address)"
         );
         return;
     };
@@ -330,9 +490,13 @@ async fn reachability_plane(
     ) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            eprintln!(
-                "[node {label}] reachability: advertised control endpoint rejected ({err:?}) — \
-                 set `advertised` to a dialable address; plane not started"
+            tracing::error!(
+                target: "ducktape::reachability",
+                node = %label,
+                error = ?err,
+                reason = "control_endpoint_rejected",
+                "reachability plane NOT started — this node has no overlay for the rest of \
+                 this boot (set `advertised` to a dialable address)"
             );
             return;
         }
@@ -344,9 +508,11 @@ async fn reachability_plane(
     // (WireGuard roams to the authenticated source). A concrete address
     // advertises exactly as before.
     if wireguard_listen.port() == 0 {
-        eprintln!(
-            "[node {label}] reachability: wireguard_listen needs a concrete UDP port — plane \
-             not started"
+        tracing::error!(
+            target: "ducktape::reachability",
+            node = %label,
+            reason = "wireguard_port_zero",
+            "reachability plane NOT started; wireguard_listen needs a concrete UDP port"
         );
         return;
     }
@@ -364,17 +530,23 @@ async fn reachability_plane(
             ) {
                 Ok(endpoint) => Some(endpoint),
                 Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: wireguard_advertised rejected ({err:?}) — \
-                         plane not started"
+                    tracing::error!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = ?err,
+                        reason = "wireguard_advertised_rejected",
+                        "reachability plane NOT started"
                     );
                     return;
                 }
             },
             None => {
-                eprintln!(
-                    "[node {label}] reachability: wireguard_advertised {ingress:?} did not \
-                     resolve — plane not started"
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    advertised = ?ingress,
+                    reason = "wireguard_advertised_unresolvable",
+                    "reachability plane NOT started"
                 );
                 return;
             }
@@ -390,9 +562,12 @@ async fn reachability_plane(
         ) {
             Ok(endpoint) => Some(endpoint),
             Err(err) => {
-                eprintln!(
-                    "[node {label}] reachability: wireguard_listen rejected ({err:?}) — plane \
-                     not started"
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    node = %label,
+                    error = ?err,
+                    reason = "wireguard_listen_rejected",
+                    "reachability plane NOT started"
                 );
                 return;
             }
@@ -403,51 +578,51 @@ async fn reachability_plane(
         match resolve_ingress(ingress) {
             Some(addr) if !coords.contains(&addr) => coords.push(addr),
             Some(_) => {}
-            None => eprintln!(
-                "[node {label}] reachability: coordinator {ingress:?} did not resolve — skipped"
+            None => tracing::warn!(
+                target: "ducktape::reachability",
+                node = %label,
+                coordinator = ?ingress,
+                reason = "coordinator_unresolvable",
+                "coordinator skipped"
             ),
         }
     }
     let me = reachability::node_key(reachability::identity_of(&signer.public_key()));
-    // socket mode owns the underlay socket from PLANE START, not first
+    // the plane owns the underlay socket from PLANE START, not first
     // apply: the NAT client below rides it (reflexive discovery,
     // registration, keepalives, and the punch all originate from the
     // tunnel's own 5-tuple — the pinhole a punch opens is only good for the
     // socket it originated from), and it survives interface rebuilds so the
     // coordinator mapping stays warm while a tunnel is torn down/re-applied.
-    let socket_underlay = match effect_kind {
-        WireGuardEffectKind::Socket => {
-            match overlay_net::userspace::UnderlaySocket::bind(
-                &tokio::runtime::Handle::current(),
-                wireguard_listen.port(),
-            ) {
-                Ok(underlay) => Some(underlay),
-                Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: underlay udp/{} bind failed: {err} — \
-                         plane not started",
-                        wireguard_listen.port()
-                    );
-                    return;
-                }
-            }
+    let socket_underlay = match overlay_net::userspace::UnderlaySocket::bind(
+        &tokio::runtime::Handle::current(),
+        wireguard_listen.port(),
+    ) {
+        Ok(underlay) => underlay,
+        Err(err) => {
+            tracing::error!(
+                target: "ducktape::reachability",
+                node = %label,
+                port = wireguard_listen.port(),
+                error = %err,
+                reason = "underlay_bind_failed",
+                "reachability plane NOT started"
+            );
+            return;
         }
-        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => None,
     };
-    let (invite_intro_tx, mut invite_intro_rx) =
-        if socket_underlay.is_some() && intro_listen.is_some() {
-            let (tx, rx) = tokio::sync::mpsc::channel(32);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+    // the coordinated intro lane rides the shared underlay socket —
+    // INCLUDING on a node that binds no direct intro listener below (a
+    // NAT'd desktop's only join door is this lane).
+    let (invite_intro_tx, invite_intro_rx) = tokio::sync::mpsc::channel(32);
+    let (invite_intro_tx, mut invite_intro_rx) = (Some(invite_intro_tx), Some(invite_intro_rx));
     // authenticate every coordinator request: the node signs a
     // proof-of-possession with its identity key and, in private coordination,
     // carries the genesis-issued cap. A fully-open coordinator ignores the
     // authenticator; a public/private one requires it. With no coordinators
     // configured `bind` short-circuits to pass-through and never touches this.
     let resolver = match &socket_underlay {
-        Some(underlay) if !coords.is_empty() => {
+        underlay if !coords.is_empty() => {
             let bypass = underlay
                 .take_bypass()
                 .expect("a fresh underlay socket still holds its bypass lane");
@@ -461,34 +636,29 @@ async fn reachability_plane(
                         coord_cap,
                     )
                 });
-            let resolver = match client {
-                Ok(client) => {
-                    reachability::NatResolver::from_client_with_datagram_sink(
-                        client,
-                        reachability::RENDEZVOUS_KEEPALIVE,
-                        invite_intro_tx,
-                    )
-                    .await
-                }
-                Err(err) => Err(err),
-            };
-            match resolver {
-                Ok(resolver) => resolver,
-                // An unreachable coordinator must NOT take down the whole plane.
-                // The WireGuard underlay is already bound, and DIRECT / front
-                // candidates (InstallInvitePeer + this node's own initiations)
-                // need no rendezvous at all. Degrade to the pass-through
-                // resolver so those paths still come up; only COORDINATED
-                // (by-identity) candidates go dark until a coordinator responds.
-                // This keeps a fully-direct / self-hosted join working even when
-                // the ambient default coordinator is firewalled, down, or a
-                // founder disabled coordination outright.
+            match client {
+                // Establishment (reflexive discovery + registration) happens
+                // inside the resolver's own task, retried with backoff — a
+                // coordinator that is dark AT BOOT (machine woke before its
+                // network, coordinator restarting) no longer costs this
+                // process its rendezvous for life.
+                Ok(client) => reachability::NatResolver::from_client_with_datagram_sink(
+                    client,
+                    reachability::RENDEZVOUS_KEEPALIVE,
+                    invite_intro_tx,
+                ),
+                // A LOCAL wiring failure of the shared-socket seam itself —
+                // not a network condition. Rendezvous cannot exist on this
+                // socket, so degrade to pass-through: DIRECT / front
+                // candidates (InstallInvitePeer + this node's own
+                // initiations) need no rendezvous at all.
                 Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: coordinator rendezvous unavailable \
-                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
-                         work; coordinated-by-identity paths disabled until a coordinator \
-                         responds)"
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = %err,
+                        reason = "rendezvous_socket_unusable",
+                        "continuing without rendezvous; direct/front paths still work"
                     );
                     reachability::NatResolver::bind(me, Vec::new(), None)
                         .await
@@ -500,14 +670,15 @@ async fn reachability_plane(
             let auth = Some((signer.clone(), coord_cap));
             match reachability::NatResolver::bind(me, coords.clone(), auth).await {
                 Ok(resolver) => resolver,
-                // Same degrade-don't-die rule on the TUN/fake path: a dead
-                // coordinator disables coordinated candidates, never direct ones.
+                // bind can only fail LOCALLY now (its own UDP socket); an
+                // unreachable coordinator is retried inside the resolver.
                 Err(err) => {
-                    eprintln!(
-                        "[node {label}] reachability: coordinator rendezvous unavailable \
-                         ({err}) — continuing WITHOUT rendezvous (direct/front paths still \
-                         work; coordinated-by-identity paths disabled until a coordinator \
-                         responds)"
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = %err,
+                        reason = "rendezvous_socket_unusable",
+                        "continuing without rendezvous; direct/front paths still work"
                     );
                     reachability::NatResolver::bind(me, Vec::new(), None)
                         .await
@@ -516,15 +687,61 @@ async fn reachability_plane(
             }
         }
     };
-    if let Some(reflexive) = resolver.reflexive() {
-        println!("[node {label}] reachability: coordinator-observed reflexive {reflexive}");
+    // Establishment is asynchronous: narrate its transitions — one loud line
+    // if the coordinator is dark at boot (so a self-healing plane is never
+    // mistaken for a silently degraded one), then the reflexive when it
+    // lands, however late.
+    if let Some(mut status) = resolver.status() {
+        let status_label = label.clone();
+        tokio::spawn(async move {
+            loop {
+                let current = *status.borrow_and_update();
+                match current {
+                    reachability::RendezvousStatus::Ready { reflexive } => {
+                        tracing::info!(
+                            target: "ducktape::reachability",
+                            node = %status_label,
+                            %reflexive,
+                            "coordinator-observed reflexive"
+                        );
+                        return;
+                    }
+                    reachability::RendezvousStatus::Unavailable { attempts: 1 } => {
+                        tracing::warn!(
+                            target: "ducktape::reachability",
+                            node = %status_label,
+                            attempts = 1,
+                            reason = "coordinator_unavailable",
+                            "coordinator rendezvous unavailable; retrying in the background"
+                        );
+                    }
+                    _ => {}
+                }
+                if status.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
     }
-    // a parked standby's gossip arrives under the network's derived lobby
-    // identity (its own key is untracked until the grant cutover) — admit
-    // that ingress; content signatures still authenticate every message.
-    // the namespace is a TOML-sourced string, so `as_bytes` reproduces the
-    // exact bytes the transport derived the lobby key from.
-    let gossip_ingress = Some(config::lobby_identity(chain_id.as_bytes()).public_key());
+    // this member's WG keypair, shared into the intro doorbells so they can
+    // OPEN a joiner's sealed first-contact intro (item 5). `load_or_generate`
+    // is idempotent — the orchestrator below loads the same file, so a failure
+    // here means the plane is unusable for inbound joins; log and disable the
+    // listeners rather than take the node down (the plane is an overlay).
+    let intro_keypair = match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
+        Ok((keypair, _)) => Some(std::sync::Arc::new(keypair)),
+        Err(e) => {
+            tracing::warn!(
+                target: "ducktape::join",
+                node = %label,
+                path = %wireguard_key_file.display(),
+                error = %e,
+                reason = "wireguard_key_unreadable",
+                "inbound joins via this node's invites are disabled"
+            );
+            None
+        }
+    };
     let config = reachability::ReachabilityConfig {
         chain_id,
         signer,
@@ -535,7 +752,10 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
         persist_file: Some(mesh_state_file),
-        gossip_ingress,
+        // the derived lobby transport identity is RETIRED (join ADR §4): a
+        // joiner's gossip arrives under its REAL key — the mesh re-track at
+        // its Redeem grant is what admits it.
+        gossip_ingress: None,
     };
     // the invite intro listener: a fresh joiner's first contact. one
     // datagram carries the token, the joiner's identity + proof, and its
@@ -546,9 +766,20 @@ async fn reachability_plane(
     // membership is NOT checked here (this task has no state access) — the
     // in-consensus redemption enforces it; a revoked member's token can at
     // worst open a tunnel that admits nothing.
-    if let Some(intro_addr) = intro_listen {
+    if intro_listen.is_none() {
+        // resolve.rs already decided this config can never mint a direct
+        // intro endpoint — say so once at boot instead of binding a
+        // wildcard socket no joiner could ever reach.
+        tracing::info!(
+            target: "ducktape::join",
+            node = %label,
+            "no direct invite intro listener; intros arrive via the coordinated path"
+        );
+    }
+    if let (Some(intro_addr), Some(intro_keypair)) = (intro_listen, intro_keypair.clone()) {
         let intro_cmds = nudges.clone().downgrade();
         let intro_label = label.clone();
+        let intro_gate = gate.clone();
         // `chain_id` (the namespace string) moved into the plane config
         // above; the binding tokens sign over is those same bytes.
         let binding = config.chain_id.clone().into_bytes();
@@ -556,14 +787,23 @@ async fn reachability_plane(
             let socket = match tokio::net::UdpSocket::bind(intro_addr).await {
                 Ok(socket) => socket,
                 Err(err) => {
-                    eprintln!(
-                        "[node {intro_label}] invite intro listener bind {intro_addr} failed: \
-                         {err} — joins via this node's invites need another member"
+                    tracing::error!(
+                        target: "ducktape::join",
+                        node = %intro_label,
+                        listen = %intro_addr,
+                        error = %err,
+                        reason = "intro_bind_failed",
+                        "invite intro listener stopped; joins need another member"
                     );
                     return;
                 }
             };
-            println!("[node {intro_label}] invite intro listening on udp/{intro_addr}");
+            tracing::info!(
+                target: "ducktape::join",
+                node = %intro_label,
+                listen = %intro_addr,
+                "invite intro listening"
+            );
             let mut buf = vec![0u8; 4096];
             loop {
                 let Ok((n, src)) = socket.recv_from(&mut buf).await else {
@@ -582,6 +822,8 @@ async fn reachability_plane(
                     &intro_label,
                     IntroPath::Direct,
                     &intro_cmds,
+                    |sealed| intro_keypair.open_sealed(sealed),
+                    intro_gate.as_ref(),
                     ack,
                 )
                 .await
@@ -591,9 +833,12 @@ async fn reachability_plane(
             }
         });
     }
-    if let Some(mut invite_intro_rx) = invite_intro_rx.take() {
+    if let (Some(mut invite_intro_rx), Some(intro_keypair)) =
+        (invite_intro_rx.take(), intro_keypair.clone())
+    {
         let intro_cmds = nudges.clone().downgrade();
         let intro_label = label.clone();
+        let intro_gate = gate.clone();
         let binding = config.chain_id.clone().into_bytes();
         tokio::spawn(async move {
             while let Some((src, bytes)) = invite_intro_rx.recv().await {
@@ -617,6 +862,8 @@ async fn reachability_plane(
                     &intro_label,
                     IntroPath::Coordinated,
                     &intro_cmds,
+                    |sealed| intro_keypair.open_sealed(sealed),
+                    intro_gate.as_ref(),
                     ack,
                 )
                 .await
@@ -656,72 +903,97 @@ async fn reachability_plane(
             }
         }
     });
-    match effect_kind {
-        WireGuardEffectKind::Fake => {
-            println!(
-                "[node {label}] reachability: wireguard_effect = \"fake\" — tunnel configs are \
-                 recorded in memory; no real interface is touched"
-            );
-            if let Err(err) = reachability::run(
-                config,
-                wireguard::effect::FakeWireGuardEffect::default(),
-                resolver,
-                commands,
-                events,
-            )
-            .await
-            {
-                eprintln!("[node {label}] reachability plane exited: {err}");
-            }
-        }
-        WireGuardEffectKind::Socket => {
-            let underlay = socket_underlay.expect("bound above for socket mode");
-            println!(
-                "[node {label}] reachability: driving the userspace socket backend (TUN-less; \
-                 no interface, no privilege — overlay reachability lives inside this process)"
-            );
-            let effect = overlay_net::userspace::UserspaceWireGuardEffect::with_shared_underlay(
-                tokio::runtime::Handle::current(),
-                overlay_slot,
-                underlay,
-            );
-            if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
-                eprintln!("[node {label}] reachability plane exited: {err}");
-            }
-        }
-        WireGuardEffectKind::Tun => {
-            #[cfg(unix)]
-            {
-                // same name the orchestrator writes into every
-                // InterfaceConfiguration it applies — the WGApi handle and
-                // the configs it receives must agree on the interface.
-                let ifname = reachability::interface_name(&config.chain_id);
-                let effect = match wireguard::effect::DefguardWireGuardEffect::new(&ifname) {
-                    Ok(effect) => effect,
-                    Err(err) => {
-                        eprintln!(
-                            "[node {label}] reachability: wireguard api handle for {ifname:?} \
-                             failed ({err}) — plane not started; set wireguard_effect = \
-                             \"fake\" to run without a real interface"
-                        );
-                        return;
-                    }
-                };
-                println!("[node {label}] reachability: driving wireguard interface {ifname}");
-                if let Err(err) =
-                    reachability::run(config, effect, resolver, commands, events).await
-                {
-                    eprintln!("[node {label}] reachability plane exited: {err}");
+    let underlay = socket_underlay;
+    tracing::info!(
+        target: "ducktape::reachability",
+        node = %label,
+        backend = "userspace_socket",
+        "reachability backend ready"
+    );
+    let effect = overlay_net::userspace::UserspaceWireGuardEffect::with_shared_underlay(
+        tokio::runtime::Handle::current(),
+        overlay_slot,
+        underlay,
+    );
+    // take the probe BEFORE the effect is moved into the orchestrator.
+    spawn_handshake_sampler(effect.probe_slot(), label.clone());
+    if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
+        tracing::error!(
+            target: "ducktape::reachability",
+            node = %label,
+            error = %err,
+            "reachability plane EXITED — this node has no overlay for the rest of \
+             this boot"
+        );
+    }
+}
+
+/// how long without a completed handshake before a peer is called DARK.
+///
+/// WireGuard rekeys well inside this (REKEY_AFTER_TIME is 120s and the timer
+/// pump drives retransmits), so exceeding it means the crypto handshake is not
+/// completing at all — not that traffic is merely idle.
+const HANDSHAKE_DARK_AFTER: Duration = Duration::from_secs(180);
+
+/// Watch whether WireGuard handshakes actually COMPLETE, and say so on transition.
+///
+/// `TunnelsApplied` proves only that the effect ACCEPTED A CONFIG. Nothing in this
+/// system proved a handshake ever completed — which is precisely the difference
+/// between "the overlay never came up" and "the overlay is up but the peer is
+/// dark". Those are two different bugs, and they presented as one string
+/// ("Voice connection failed.") for days.
+///
+/// `WgDevice::time_since_last_handshake` existed the whole time — its doc even says
+/// "for handshake probes" — but it was only ever called from tests, because the
+/// device is owned by the effect and the effect is moved into the orchestrator.
+/// `ProbeSlot` is the seam that fixes that (it mirrors the existing `StackSlot`).
+///
+/// Cost: this rides the EXISTING nudge tick and emits ONLY on a state transition.
+/// Nothing is logged per packet, per handshake, or per tick.
+fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: String) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(NUDGE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // peer -> was it live at the last sample? the transition IS the event.
+        let mut live: HashMap<std::net::Ipv6Addr, bool> = HashMap::new();
+        loop {
+            tick.tick().await;
+            let Some(probe) = probes.get() else {
+                // no backend yet: the overlay has not come up at all. that absence
+                // is already reported by the plane's own bind/apply events; do not
+                // duplicate it here every tick.
+                continue;
+            };
+            let peers = probe.peers();
+            for (ip, since) in &peers {
+                let is_live = since.is_some_and(|elapsed| elapsed < HANDSHAKE_DARK_AFTER);
+                match live.insert(*ip, is_live) {
+                    Some(was) if was == is_live => {}
+                    // first sight of a peer that is already handshaking, or a peer
+                    // that recovered.
+                    _ if is_live => tracing::info!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        peer_ula = %ip,
+                        since_handshake_s = since.map(|d| d.as_secs()),
+                        "peer handshake COMPLETE — the tunnel is actually carrying traffic"
+                    ),
+                    // first sight of a peer that has never handshaked, or one that
+                    // went dark. THIS is the line that was missing: config applied,
+                    // crypto never completed, media silently going nowhere.
+                    _ => tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        peer_ula = %ip,
+                        since_handshake_s = since.map(|d| d.as_secs()),
+                        ever_handshaked = since.is_some(),
+                        "peer DARK — its tunnel config is applied but no WireGuard \
+                         handshake has completed; traffic to it is going nowhere"
+                    ),
                 }
             }
-            #[cfg(not(unix))]
-            {
-                eprintln!(
-                    "[node {label}] reachability: the real wireguard effect needs a unix host — \
-                     plane not started; set wireguard_effect = \"fake\" to run without a real \
-                     interface"
-                );
-            }
+            // a peer removed from the table (epoch change) is not a transition.
+            live.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
         }
-    }
+    });
 }

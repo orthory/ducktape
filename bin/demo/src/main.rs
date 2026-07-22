@@ -7,6 +7,7 @@
 //!
 //! run: `cargo run -p demo`
 
+use statesync::qmdb::QmdbStore;
 use agent::AgentModule;
 use agent::{
     ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
@@ -28,7 +29,6 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
-use duckdns::DuckDns;
 use gateway::Gateway;
 use files::Files;
 use forge::Forge;
@@ -44,10 +44,10 @@ use inbox::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
-use jobs::Jobs;
 use saga::SagaModule;
 use saga::{
-    SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
+    SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
+    encode_query as saga_encode_query,
 };
 use sdk::{Msg, Origin};
 use tasks::Tasks;
@@ -68,68 +68,15 @@ fn main() {
     let _ = std::fs::remove_dir_all(&duckfs_dir);
 
     deterministic::Runner::default().start(|context| async move {
-        // genesis: the module registry (would be consensus state on a real chain).
-        let kv = kv::Kv::init(context.child("kv"), "kv").await;
-        let directory = Directory::new("directory");
-        let greeter = Greeter::new("greeter");
-        let forge = Forge::init("forge", forge_repo.clone())
-            .expect("forge init")
-            .with_chat("chat");
-        let chat = Chat::init(context.child("chat"), "chat")
-            .await
-            .with_tagging("tagging");
-        let valset = Valset::new("valset");
-        let saga = SagaModule::new("saga");
-        let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
-        let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
-        let tasks = Tasks::new("tasks");
-        // the deterministic user->nodes binding registry: no valset gating and
-        // a fixed demo chain id (the demo has no real network descriptor).
-        let identity = Identity::new("identity", None, "demo".into());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
-        let gateway = Gateway::new("gateway", "identity", None, "demo");
-        let inbox = Inbox::new("inbox");
-        let files = Files::open("files", duckfs_dir.clone()).expect("duckfs open");
-        let jobs = Jobs::new("jobs");
-        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
-        let runs = RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("jobs".into()),
-        )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2) — mandatory for envelope composition.
-        .with_files_module("files");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let mut host = Host::genesis(vec![
-            Box::new(kv),
-            Box::new(directory),
-            Box::new(greeter),
-            Box::new(forge),
-            Box::new(chat),
-            Box::new(valset),
-            Box::new(saga),
-            Box::new(dispatch),
-            Box::new(tagging),
-            Box::new(tasks),
-            Box::new(identity),
-            Box::new(duckdns),
-            Box::new(gateway),
-            Box::new(inbox),
-            Box::new(files),
-            Box::new(jobs),
-            Box::new(agent),
-            Box::new(runs),
-            Box::new(automations),
-        ])
-        .expect("genesis");
+        // genesis: the module registry (would be consensus state on a real
+        // chain) — the `demo` selection of the single-source `host::topology`,
+        // composed over native module structs.
+        let mut host = demo_genesis(&context, &forge_repo, &duckfs_dir).await;
 
-        println!("=== super-app demo — 20 registered modules over one host ===");
+        println!(
+            "=== super-app demo — {} registered modules over one host ===",
+            host::topology::DEMO.len()
+        );
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis app-hash : {:?}", host.app_hash());
         println!(
@@ -171,38 +118,36 @@ fn main() {
         println!("\n[block 2] greeter(name): query directory -> write greeting to directory + kv");
         println!("  app-hash       : {:?}", out.app_hash);
 
-        // block 3: a typed Commit to the GIT-backed forge module. this writes a
-        // file + makes a real (deterministic) git commit; forge's root moves to
-        // the new HEAD oid, which folds straight into the app-hash.
+        // block 3: tracker state is consensus-owned; Git objects are built by
+        // clients and enter through the node's PushRefs data-plane lane, which
+        // this in-process Host demo deliberately does not emulate.
         let out = host
             .submit(Msg {
                 target: "forge".into(),
-                payload: forge_encode_msg(&ForgeMsg::Commit {
-                    // empty repo -> the default repo (back-compat wire).
-                    repo: String::new(),
-                    path: "README.md".into(),
-                    content: "# hello from a git-backed module\n".into(),
-                    message: "forge: initial commit".into(),
+                payload: forge_encode_msg(&ForgeMsg::OpenIssue {
+                    repo: "demo".into(),
+                    title: "Ship the first pushed commit".into(),
+                    body: "Git objects travel through the data plane".into(),
                 }),
             })
             .await
             .expect("submit block 3");
-        println!("\n[block 3] forge <- Commit(README.md) — a real git commit");
+        println!("\n[block 3] forge <- OpenIssue — consensus-owned tracker state");
         println!("  app-hash       : {:?}", out.app_hash);
         println!(
             "  forge root     : {:?}",
             host.module_root("forge").unwrap()
         );
 
-        // read forge's HEAD back out (typed query) — the sha1 git oid hex. this hex is
-        // the sha256 PREIMAGE of the forge root: a git commit addressing the app-hash.
+        // read the consensus-owned tracker projection back out.
         let reply = host
-            .query("forge", &forge_encode_query(&ForgeQuery::Head))
+            .query("forge", &forge_encode_query(&ForgeQuery::ListItems {
+                repo: "demo".into(),
+            }))
             .await
             .expect("query forge");
-        if let ForgeReply::Head(Some(oid)) = forge_decode_reply(&reply).unwrap() {
-            println!("  forge git HEAD : {oid}");
-            println!("  (^ the 40-char sha1 oid is the sha256 preimage of the forge root above)");
+        if let ForgeReply::Items(items) = forge_decode_reply(&reply).unwrap() {
+            println!("  forge items    : {}", items.len());
         }
 
         // read the derived greeting back out of the directory (sync typed query).
@@ -249,7 +194,7 @@ fn main() {
             .public_key()
             .as_ref()
             .to_vec();
-        let as_demo_user = || BlockContext { protocol_version: 0,
+        let as_demo_user = || BlockContext {
             height: 0,
             consensus_time: 0,
             origin: Origin::External(demo_user.clone()),
@@ -364,7 +309,7 @@ fn main() {
         // orchestration lane genesis seeding uses.
         let out = host
             .submit_at(
-                host::BlockContext { protocol_version: 0,
+                host::BlockContext {
                     height: 0,
                     consensus_time: 0,
                     origin: sdk::Origin::System,
@@ -476,8 +421,11 @@ fn main() {
             "\n[block 7] agent <- Register; runs <- EnableJobWorker(true); runs <- Watch(Mention); chat <- PostMessage(@quackbot)"
         );
         println!(
-            "  effects        : {} WorkerRequest (the off-consensus LLM seam)",
-            out.effects.len()
+            "  work orders    : {} WorkerRequest (the off-consensus LLM seam)",
+            out.events
+                .iter()
+                .filter(|e| decode_worker_request(&e.payload).is_ok())
+                .count()
         );
         let run_id = run_id_for("general", 3, "quackbot");
         let reply = host
@@ -539,7 +487,7 @@ fn main() {
         // path (no external push service). the queue holds it as consensus state.
         let out = host
             .submit_at(
-                BlockContext { protocol_version: 0,
+                BlockContext {
                     height: 0,
                     consensus_time: 9,
                     // the submitter's id — the inbox derives `source` from this
@@ -588,4 +536,95 @@ fn main() {
         }
         println!("\nfinal app-hash   : {:?}", host.app_hash());
     });
+}
+
+/// Compose the demo's native genesis host — the `demo` selection of the
+/// single-source `host::topology`, one native module struct per id. Kept a
+/// function (not inlined in `main`) so the parity test can compose the exact
+/// same set and pin it against the topology.
+async fn demo_genesis(
+    context: &deterministic::Context,
+    forge_repo: &std::path::Path,
+    duckfs_dir: &std::path::Path,
+) -> Host {
+    let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let directory = Directory::new("directory");
+    let greeter = Greeter::new("greeter");
+    let forge = Forge::init("forge", forge_repo.to_path_buf())
+        .expect("forge init")
+        .with_chat("chat");
+    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
+        .with_tagging("tagging");
+    let valset = Valset::new("valset");
+    let saga = SagaModule::new("saga");
+    let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
+    let tagging = tagging::TaggingModule::new("tagging").with_direct_owner("runs");
+    let tasks = Tasks::new("tasks");
+    // the deterministic user->nodes binding registry: no valset gating and
+    // a fixed demo chain id (the demo has no real network descriptor).
+    let identity = Identity::new("identity", None, "demo".into());
+    let gateway = Gateway::new("gateway", "identity", None, "demo");
+    let inbox = Inbox::new("inbox");
+    let files = Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open");
+    let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let runs = RunsModule::new(
+        "runs",
+        "chat",
+        "saga",
+        "tagging",
+        "dispatch",
+        "agent",
+        Some("tasks".into()),
+        Some("tasks".into()),
+    )
+    // the duckfs/files module the portable (v3) composer pins its source
+    // head from (W2) — mandatory for envelope composition.
+    .with_files_module("files");
+    let automations = Automations::new("automations", "chat", "tasks", "inbox");
+    Host::genesis(vec![
+        Box::new(kv),
+        Box::new(directory),
+        Box::new(greeter),
+        Box::new(forge),
+        Box::new(chat),
+        Box::new(valset),
+        Box::new(saga),
+        Box::new(dispatch),
+        Box::new(tagging),
+        Box::new(tasks),
+        Box::new(identity),
+        Box::new(gateway),
+        Box::new(inbox),
+        Box::new(files),
+        Box::new(agent),
+        Box::new(runs),
+        Box::new(automations),
+    ])
+    .expect("genesis")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The demo genesis composes exactly the topology's `demo` selection — the
+    /// demo analogue of node's `genesis_registry_matches_module_ids`. Adding or
+    /// dropping a module here without updating `host::topology::DEMO` fails here.
+    #[test]
+    fn demo_genesis_matches_topology() {
+        let dir = std::env::temp_dir().join(format!("ducktape-demo-topo-{}", std::process::id()));
+        let forge_repo = dir.join("forge");
+        let duckfs_dir = dir.join("duckfs");
+        let _ = std::fs::remove_dir_all(&dir);
+        deterministic::Runner::default().start(|context| async move {
+            let host = demo_genesis(&context, &forge_repo, &duckfs_dir).await;
+            let mut got: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            got.sort_unstable();
+            let mut want: Vec<String> =
+                host::topology::DEMO.iter().map(|s| s.to_string()).collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "demo genesis set must equal host::topology::DEMO");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

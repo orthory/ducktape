@@ -16,23 +16,26 @@
 //! - Two per-use [`DataPlane`]s over the overlay ([`crate::voice_plane`]),
 //!   built lazily once the reachability plane has the interface up.
 //! - An [`AdmissionPolicy`] over the node's ACTIVE flows, keyed by
-//!   `(Service, FlowId)`: this node receives (and emits) call media only for
-//!   flows its own operator has a live huddle session on — the mic and control
-//!   flows on `Service::Voice`, the camera flow on `Service::Video`. The
-//!   overlay already authenticates every peer by its source `/128`;
-//!   roster-level gating is the client's job (it steers the fan-out from
-//!   consensus state), and unadmitted traffic drops counted at the plane per
-//!   its default-deny contract.
-//! - The hub loop — drains [`noded::CallSessionRequest`]s from the app
-//!   surface and runs AT MOST ONE session at a time (Slack semantics: you are
-//!   in one huddle). A session owns a [`VoiceEngine`] on the channel-derived
-//!   audio flow plus datagram flows for camera video and call control, and
+//!   `(Service, FlowId)` and carrying each flow's ROSTER: this node receives
+//!   (and emits) call media only for flows its own operator has a live huddle
+//!   session on — the mic and control flows on `Service::Voice`, the camera
+//!   flow on `Service::Video` — and only from/to peers the session's
+//!   `recipients` watch lists. The overlay authenticates every peer by its
+//!   source `/128` (identity); the roster is the authorization on top: flow
+//!   ids are derivable from public channel ids, so without it any network
+//!   member could inject media into a call it is not part of. Unadmitted
+//!   traffic drops counted at the plane per its default-deny contract.
+//! - The hub loop — drains [`noded::RealtimeSessionRequest`]s from the app
+//!   surface and runs one huddle plus one Pages-presence session at a time.
+//!   A huddle owns a [`VoiceEngine`] on the channel-derived audio flow plus
+//!   datagram flows for camera video and call control, and
 //!   pumps: websocket pcm in → encode + fan-out; a 20 ms tick → mixed playout
 //!   → websocket out; captured camera frames → fragment + fan-out; inbound
 //!   fragments → reassemble → webview; and the call-control machinery
 //!   (keyframe requests, 1 Hz presence beacons, the sender/receiver bitrate
-//!   ladder). Dropping the webview ends tears the session down; a new request
-//!   replaces the current session.
+//!   ladder). Pages presence owns one lean control flow and does not disturb
+//!   the huddle. Dropping a webview tears down its session; a new request of
+//!   the same kind replaces the current one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -79,10 +82,17 @@ fn ctl_flow(channel_id: &str) -> FlowId {
     FlowId::derive(format!("callctl-channel:{channel_id}").as_bytes())
 }
 
+/// Pages presence is control-only and deliberately uses a distinct domain so
+/// opening a document can coexist with the one active huddle.
+fn presence_flow(page_id: &str) -> FlowId {
+    FlowId::derive(format!("pages-presence:{page_id}").as_bytes())
+}
+
 /// Stand up the call runtime on its own OS thread. The hub binds the voice and
 /// video overlay planes on that thread's runtime (retrying until the overlay
-/// `/128` is up) and serves one huddle session at a time over them. `requests`
-/// is the app surface's session lane ([`noded::NodeHandle::with_call`]);
+/// `/128` is up) and serves one huddle plus one Pages-presence session over
+/// them. `requests` is the app surface's session lane
+/// ([`noded::NodeHandle::with_call`]);
 /// `factory`/`peers`/`me` are the overlay socket seam, the tracked media peer
 /// set (refreshed by the host on valset cutover), and this node's own key.
 ///
@@ -90,7 +100,7 @@ fn ctl_flow(channel_id: &str) -> FlowId {
 /// (the overlay-only cutover, no mesh fallback), so the host spawns the hub
 /// only where the overlay is reachable.
 pub fn spawn_hub(
-    requests: mpsc::Receiver<noded::CallSessionRequest>,
+    requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
@@ -109,26 +119,60 @@ pub fn spawn_hub(
         .expect("spawn voice-hub thread")
 }
 
-/// The `(service, flow)` pairs this node's operator is live on. Shared between
-/// the plane's admission checks (per datagram) and the hub (session
-/// open/close). A session admits three: mic + control on `Service::Voice`,
-/// camera on `Service::Video`.
+/// one flow's roster: the raw ed25519 keys its session currently lists.
+type Roster = HashSet<[u8; 32]>;
+
+/// The `(service, flow)` pairs this node's operator is live on, each carrying
+/// the flow's roster — the peers the session's `recipients` watch currently
+/// lists. Shared between the plane's admission checks (per datagram) and the
+/// hub (session open/close/roster change). A session admits three: mic +
+/// control on `Service::Voice`, camera on `Service::Video`.
+///
+/// The roster is what makes admission PEER-aware: the overlay authenticates a
+/// sender's `/128`, but membership alone must not admit media into a call —
+/// any member can derive a channel's flow ids, so a member outside the huddle
+/// could otherwise inject straight into a live mix. Sender-side fan-out
+/// discipline is no defence (an adversary does not run our fan-out), so the
+/// roster is enforced HERE, on receive, at demux: not in the roster → dropped,
+/// counted rogue, never queued.
 #[derive(Default)]
-struct ActiveFlows(Mutex<HashSet<(Service, FlowId)>>);
+struct ActiveFlows(Mutex<HashMap<(Service, FlowId), Roster>>);
 
 impl ActiveFlows {
+    /// register a flow with an EMPTY roster: everything drops until the
+    /// session's first `recipients` update lands (mirrors the send side,
+    /// which also fans out to nobody until the roster arrives).
     fn insert(&self, key: (Service, FlowId)) {
-        self.0.lock().expect("flows lock").insert(key);
+        self.0
+            .lock()
+            .expect("flows lock")
+            .insert(key, HashSet::new());
     }
 
     fn remove(&self, key: &(Service, FlowId)) {
         self.0.lock().expect("flows lock").remove(key);
     }
+
+    /// replace the roster on every one of a session's flows (mic, camera and
+    /// control move together — one huddle, one roster).
+    fn set_roster(&self, keys: &[(Service, FlowId)], roster: &[[u8; 32]]) {
+        let allowed: Roster = roster.iter().copied().collect();
+        let mut flows = self.0.lock().expect("flows lock");
+        for key in keys {
+            if let Some(entry) = flows.get_mut(key) {
+                entry.clone_from(&allowed);
+            }
+        }
+    }
 }
 
 impl AdmissionPolicy for ActiveFlows {
-    fn permits(&self, _peer: PeerId, service: Service, flow: FlowId) -> bool {
-        self.0.lock().expect("flows lock").contains(&(service, flow))
+    fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
+        self.0
+            .lock()
+            .expect("flows lock")
+            .get(&(service, flow))
+            .is_some_and(|allowed| allowed.contains(&peer.0))
     }
 }
 
@@ -136,8 +180,9 @@ impl AdmissionPolicy for ActiveFlows {
 /// the video/control flow handles, releasing their plane registrations.
 struct SessionGuard {
     task: tokio::task::JoinHandle<()>,
-    /// the three `(service, flow)` admissions this session opened.
-    registered: [(Service, FlowId); 3],
+    /// the `(service, flow)` admissions this session opened (three for a call,
+    /// one for Pages presence).
+    registered: Vec<(Service, FlowId)>,
     flows: Arc<ActiveFlows>,
 }
 
@@ -153,63 +198,178 @@ impl SessionGuard {
     }
 }
 
-/// Build the two overlay media planes on the hub runtime (blocking until the
-/// overlay is up), then serve sessions over them. One shared active-flow set
-/// answers admission for both planes.
+/// `call-session.ts`'s `CONNECT_TIMEOUT_MS`: how long the webview waits for its
+/// first inbound frame before giving up on its own and reporting a generic
+/// connection failure. A refusal that arrives after this is one nobody sees.
+/// Exists to be asserted against below (tests shrink the grace, so the
+/// assertion — and this — are for the real build).
+#[cfg(not(test))]
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long a join may wait on an overlay that is still coming up before the
+/// hub stops holding it and starts refusing. The bind normally lands in a few
+/// seconds, so this window keeps the "joined the instant the node booted" case
+/// working; past it, the honest answer is a refusal.
+#[cfg(not(test))]
+const OVERLAY_GRACE: Duration = Duration::from_secs(8);
+/// Tests shrink the window so the refusal path runs in milliseconds instead of
+/// sleeping through the real one — the state machine under test is the same.
+#[cfg(test)]
+const OVERLAY_GRACE: Duration = Duration::from_millis(20);
+
+// The refusal is worthless if the client has already given up: the grace window
+// must leave room for the refusal to cross. Checked at COMPILE time, so nobody
+// can raise the grace past the webview's patience without hearing about it.
+// (`as_secs`, not `as_millis` — const-evaluating the u128 form segfaults
+// clippy-driver on the pinned toolchain.)
+#[cfg(not(test))]
+const _: () = assert!(
+    OVERLAY_GRACE.as_secs() < CLIENT_CONNECT_TIMEOUT.as_secs(),
+    "OVERLAY_GRACE must stay inside call-session.ts's CONNECT_TIMEOUT_MS, or the client times \
+     out first and the user never sees the reason"
+);
+
+/// Why a join is refused while the overlay is down. Media rides ONLY the
+/// overlay, so with no interface there is no call. Names the log line rather
+/// than a cause: the overlay may simply be slow to come up on a correctly
+/// configured node, and telling that operator to change a setting that is
+/// already right is worse than telling them where to look.
+const OVERLAY_DOWN: &str = "the mesh overlay is not up on this node yet, and huddle media rides \
+                            the overlay — no call can start. retry in a moment; if it keeps \
+                            failing, the node log's [voice-plane] line says why the overlay \
+                            never came up (one common cause: an unprivileged `tun` effect, \
+                            which cannot bring an interface up — use `socket`).";
+const PRESENCE_OVERLAY_DOWN: &str = "the mesh overlay is not up on this node yet, and live Pages \
+                                    cursors ride the overlay. retry in a moment; if it keeps \
+                                    failing, the node log's [voice-plane] line says why the \
+                                    overlay never came up.";
+
+/// Build the two overlay media planes on the hub runtime, then serve sessions
+/// over them. One shared active-flow set answers admission for both planes.
+///
+/// The bind waits on the overlay `/128`, which usually takes a few seconds but
+/// can take FOREVER (an unprivileged tun, an epoch that never applies). The
+/// request lane is drained throughout: a request left to rot in it is a huddle
+/// that hangs in "connecting" until the client's own timer gives up — with no
+/// reason on the wire and none in the ui. So joins wait out [`OVERLAY_GRACE`],
+/// and past it every join is refused with [`OVERLAY_DOWN`] until the bind lands.
 async fn hub_loop(
-    requests: mpsc::Receiver<noded::CallSessionRequest>,
+    mut requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     factory: Arc<dyn SocketFactory>,
     peers: Arc<MediaPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
 ) {
     let flows = Arc::new(ActiveFlows::default());
-    let (voice_plane, video_plane) = crate::voice_plane::bind_media_planes(
+    let binding = crate::voice_plane::bind_media_planes(
         factory,
         peers,
         me,
         flows.clone() as Arc<dyn AdmissionPolicy>,
-    )
-    .await;
+    );
+    tokio::pin!(binding);
+    let bound = tokio::select! {
+        bound = &mut binding => Some(bound),
+        () = tokio::time::sleep(OVERLAY_GRACE) => None,
+    };
+    let (voice_plane, video_plane) = match bound {
+        Some(bound) => bound,
+        // The overlay is late (or never coming). Whatever queued during the
+        // grace window is answered here, as is every join until the bind lands.
+        None => loop {
+            tokio::select! {
+                bound = &mut binding => break bound,
+                request = requests.recv() => match request {
+                    Some(request) => {
+                        refuse_request(request);
+                    }
+                    // the app surface dropped its lane (shutdown).
+                    None => return,
+                },
+            }
+        },
+    };
     // huddle media is the chat module's: both planes report under it.
     planes.register("chat", Service::Voice, voice_plane.watch());
     planes.register("chat", Service::Video, video_plane.watch());
     serve_sessions(requests, voice_plane, video_plane, flows).await;
 }
 
-/// The session request loop: run AT MOST ONE session at a time (Slack
-/// semantics), each over the shared voice + video planes. Generic over the
-/// transport so tests drive it over an in-memory link.
+fn refuse_request(request: noded::RealtimeSessionRequest) {
+    match request {
+        noded::RealtimeSessionRequest::Call(request) => {
+            let _ = request.reply.send(Err(OVERLAY_DOWN.to_string()));
+        }
+        noded::RealtimeSessionRequest::Presence(request) => {
+            let _ = request.reply.send(Err(PRESENCE_OVERLAY_DOWN.to_string()));
+        }
+    }
+}
+
+/// The session request loop: run one huddle and one Pages-presence session at
+/// a time over the shared voice + video planes. A newer request replaces only
+/// the session of its own kind. Generic over the transport so tests drive it
+/// over an in-memory link.
 async fn serve_sessions<T: DataPlaneTransport>(
-    mut requests: mpsc::Receiver<noded::CallSessionRequest>,
+    mut requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     voice_plane: DataPlane<T>,
     video_plane: DataPlane<T>,
     flows: Arc<ActiveFlows>,
 ) {
-    let mut active: Option<SessionGuard> = None;
+    let mut active_call: Option<SessionGuard> = None;
+    let mut active_presence: Option<SessionGuard> = None;
     while let Some(request) = requests.recv().await {
-        // one huddle at a time: a new join replaces the current session.
-        if let Some(previous) = active.take() {
-            previous.teardown().await;
-        }
-        let (session, guard) =
-            match open_session(&voice_plane, &video_plane, &flows, &request.channel_id).await {
-                Ok(opened) => opened,
-                Err(refusal) => {
-                    let _ = request.reply.send(Err(refusal));
+        match request {
+            noded::RealtimeSessionRequest::Call(request) => {
+                // one huddle at a time: a new join replaces only the call.
+                if let Some(previous) = active_call.take() {
+                    previous.teardown().await;
+                }
+                let (session, guard) = match open_session(
+                    &voice_plane,
+                    &video_plane,
+                    &flows,
+                    &request.channel_id,
+                )
+                .await
+                {
+                    Ok(opened) => opened,
+                    Err(refusal) => {
+                        let _ = request.reply.send(Err(refusal));
+                        continue;
+                    }
+                };
+                if request.reply.send(Ok(session)).is_err() {
+                    guard.teardown().await;
                     continue;
                 }
-            };
-        if request.reply.send(Ok(session)).is_err() {
-            // the websocket died before the session opened.
-            guard.teardown().await;
-            continue;
+                active_call = Some(guard);
+            }
+            noded::RealtimeSessionRequest::Presence(request) => {
+                // one open Pages document per app; never disturb its huddle.
+                if let Some(previous) = active_presence.take() {
+                    previous.teardown().await;
+                }
+                let (session, guard) =
+                    match open_presence_session(&voice_plane, &flows, &request.page_id).await {
+                        Ok(opened) => opened,
+                        Err(refusal) => {
+                            let _ = request.reply.send(Err(refusal));
+                            continue;
+                        }
+                    };
+                if request.reply.send(Ok(session)).is_err() {
+                    guard.teardown().await;
+                    continue;
+                }
+                active_presence = Some(guard);
+            }
         }
-        active = Some(guard);
     }
-    // the app surface dropped its lane (shutdown): end the live session so
-    // the runtime can wind down.
-    if let Some(previous) = active.take() {
+    if let Some(previous) = active_call.take() {
+        previous.teardown().await;
+    }
+    if let Some(previous) = active_presence.take() {
         previous.teardown().await;
     }
 }
@@ -289,7 +449,7 @@ async fn open_session<T: DataPlaneTransport>(
     let engine = VoiceEngine::new(mic_dgram, VoiceConfig::default())
         .map_err(|e| format!("voice codec init failed: {e}"))?;
 
-    let registered = [
+    let registered = vec![
         (Service::Voice, mic_flow),
         (Service::Video, cam_flow),
         (Service::Voice, control_flow),
@@ -307,6 +467,7 @@ async fn open_session<T: DataPlaneTransport>(
     let (control_out_tx, control_out_rx) = mpsc::channel(CTL_LANE);
 
     let task = tokio::spawn(run_session(
+        channel_id.to_string(),
         engine,
         cam_dgram,
         ctl_dgram,
@@ -318,7 +479,7 @@ async fn open_session<T: DataPlaneTransport>(
         control_out_tx,
         recipients_rx,
         flows.clone(),
-        registered,
+        registered.clone(),
     ));
     Ok((
         noded::CallSession {
@@ -336,6 +497,159 @@ async fn open_session<T: DataPlaneTransport>(
             flows: flows.clone(),
         },
     ))
+}
+
+async fn open_presence_session<T: DataPlaneTransport>(
+    voice_plane: &DataPlane<T>,
+    flows: &Arc<ActiveFlows>,
+    page_id: &str,
+) -> Result<(noded::PresenceSession, SessionGuard), String> {
+    let flow = presence_flow(page_id);
+    let datagram = register_datagram_flow(
+        voice_plane,
+        Service::Voice,
+        flow,
+        CTL_FLOW_QUEUE,
+        page_id,
+        "presence",
+    )
+    .await?;
+    let registered = vec![(Service::Voice, flow)];
+    flows.insert(registered[0]);
+
+    let (recipients_tx, recipients_rx) = watch::channel(Vec::new());
+    let (control_in_tx, control_in_rx) = mpsc::channel(CTL_LANE);
+    let (control_out_tx, control_out_rx) = mpsc::channel(CTL_LANE);
+    let task = tokio::spawn(run_presence_session(
+        datagram,
+        control_in_rx,
+        control_out_tx,
+        recipients_rx,
+        flows.clone(),
+        registered.clone(),
+    ));
+    Ok((
+        noded::PresenceSession {
+            recipients: recipients_tx,
+            control_in: control_in_tx,
+            control_out: control_out_rx,
+        },
+        SessionGuard {
+            task,
+            registered,
+            flows: flows.clone(),
+        },
+    ))
+}
+
+const PRESENCE_VERSION: u8 = 1;
+const PRESENCE_HEADER: usize = 11; // version + block len + anchor + head
+
+fn encode_page_cursor(cursor: &noded::PageCursor) -> Option<Vec<u8>> {
+    let block = cursor.block_id.as_deref().unwrap_or("").as_bytes();
+    if block.len() > 256 {
+        return None;
+    }
+    let len = u16::try_from(block.len()).ok()?;
+    let mut frame = Vec::with_capacity(PRESENCE_HEADER + block.len());
+    frame.push(PRESENCE_VERSION);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&cursor.anchor.to_be_bytes());
+    frame.extend_from_slice(&cursor.head.to_be_bytes());
+    frame.extend_from_slice(block);
+    Some(frame)
+}
+
+fn decode_page_cursor(frame: &[u8]) -> Option<noded::PageCursor> {
+    if frame.len() < PRESENCE_HEADER || frame[0] != PRESENCE_VERSION {
+        return None;
+    }
+    let len = u16::from_be_bytes(frame[1..3].try_into().ok()?) as usize;
+    if len > 256 || frame.len() != PRESENCE_HEADER + len {
+        return None;
+    }
+    let anchor = u32::from_be_bytes(frame[3..7].try_into().ok()?);
+    let head = u32::from_be_bytes(frame[7..11].try_into().ok()?);
+    let block_id = if len == 0 {
+        None
+    } else {
+        Some(
+            std::str::from_utf8(&frame[PRESENCE_HEADER..])
+                .ok()?
+                .to_string(),
+        )
+    };
+    Some(noded::PageCursor {
+        block_id,
+        anchor,
+        head,
+    })
+}
+
+async fn send_page_cursor<T: DataPlaneTransport>(
+    datagram: &DatagramFlow<T>,
+    recipients: &watch::Receiver<Vec<[u8; 32]>>,
+    cursor: &noded::PageCursor,
+) {
+    let Some(frame) = encode_page_cursor(cursor) else {
+        return;
+    };
+    let peers: Vec<PeerId> = recipients.borrow().iter().copied().map(PeerId).collect();
+    for peer in peers {
+        let _ = datagram.send_to(peer, &frame).await;
+    }
+}
+
+async fn run_presence_session<T: DataPlaneTransport>(
+    datagram: DatagramFlow<T>,
+    mut control_in: mpsc::Receiver<noded::PresenceControlIn>,
+    control_out: mpsc::Sender<noded::PresenceControlOut>,
+    mut recipients: watch::Receiver<Vec<[u8; 32]>>,
+    flows: Arc<ActiveFlows>,
+    registered: Vec<(Service, FlowId)>,
+) {
+    let mut cursor = noded::PageCursor {
+        block_id: None,
+        anchor: 0,
+        head: 0,
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = recipients.changed() => {
+                let Ok(()) = changed else { break };
+                flows.set_roster(&registered, &recipients.borrow());
+            }
+            inbound = datagram.recv() => {
+                let (peer, frame) = inbound;
+                // demux already roster-gates (set_roster above); this re-check
+                // covers datagrams queued before a roster SHRINK drained.
+                if !recipients.borrow().contains(&peer.0) {
+                    continue;
+                }
+                let Some(cursor) = decode_page_cursor(&frame) else { continue };
+                let _ = control_out.try_send(noded::PresenceControlOut::PeerCursor {
+                    peer: peer.0,
+                    cursor,
+                });
+            }
+            state = control_in.recv() => {
+                let Some(noded::PresenceControlIn::Cursor(next)) = state else { break };
+                cursor = next;
+                send_page_cursor(&datagram, &recipients, &cursor).await;
+            }
+            _ = tick.tick() => {
+                if control_out.is_closed() {
+                    break;
+                }
+                send_page_cursor(&datagram, &recipients, &cursor).await;
+            }
+        }
+    }
+    for key in &registered {
+        flows.remove(key);
+    }
 }
 
 /// per-sending-peer receive state on the video/control flows.
@@ -371,6 +685,7 @@ impl PeerLane {
 /// drops its lane ends.
 #[allow(clippy::too_many_arguments)]
 async fn run_session<T: DataPlaneTransport>(
+    channel_id: String,
     mut engine: VoiceEngine<T>,
     video: DatagramFlow<T>,
     ctl: DatagramFlow<T>,
@@ -380,13 +695,24 @@ async fn run_session<T: DataPlaneTransport>(
     video_out: mpsc::Sender<chat::call_wire::PeerFrame>,
     mut control_in: mpsc::Receiver<noded::CallControlIn>,
     control_out: mpsc::Sender<noded::CallControlOut>,
-    recipients: watch::Receiver<Vec<[u8; 32]>>,
+    mut recipients: watch::Receiver<Vec<[u8; 32]>>,
     flows: Arc<ActiveFlows>,
-    registered: [(Service, FlowId); 3],
+    registered: Vec<(Service, FlowId)>,
 ) {
+    tracing::info!(target: "ducktape::voice", channel_id, "call session opened");
     let mut tick = tokio::time::interval(Duration::from_millis(FRAME_MILLIS));
     // audio has no catch-up: a missed tick's frame is gone, do not burst.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // the three counters that separate the three bugs behind "Voice connection
+    // failed." NOTHING here logs per frame, at any level — they are summarised on
+    // the EXISTING 1 Hz control tick, where every field is already computed.
+    let (mut frames_sent, mut frames_discarded, mut send_errors) = (0u64, 0u64, 0u64);
+    // the "roster never arrived" tell: we are capturing audio and throwing every
+    // frame away because we believe we are alone. warned ONCE per session, on the
+    // transition — the failure is client-side and the node should say so.
+    let mut no_recipients_warned = false;
+    let session_start = Instant::now();
 
     let mut frame_no: u32 = 0;
     let mut peer_lanes: HashMap<[u8; 32], PeerLane> = HashMap::new();
@@ -403,6 +729,13 @@ async fn run_session<T: DataPlaneTransport>(
 
     loop {
         tokio::select! {
+            changed = recipients.changed() => {
+                // the roster IS the receive gate: push it into admission so
+                // demux admits exactly the huddle's peers. Err = the client
+                // dropped its lane; the session is over either way.
+                let Ok(()) = changed else { break };
+                flows.set_roster(&registered, &recipients.borrow());
+            }
             captured = pcm_in.recv() => {
                 let Some(captured) = captured else { break };
                 if captured.len() != FRAME_SAMPLES {
@@ -414,13 +747,34 @@ async fn run_session<T: DataPlaneTransport>(
                     .map(|raw| PeerId(*raw))
                     .collect();
                 if peers.is_empty() {
-                    continue; // alone in the huddle — nothing to send
+                    // alone in the huddle — nothing to send. but if we are STILL
+                    // alone seconds in, the roster never arrived: everything else
+                    // is green (bound, session open, tunnels up) and the user hears
+                    // silence. that failure was 100% invisible node-side.
+                    frames_discarded += 1;
+                    let elapsed = session_start.elapsed();
+                    if !no_recipients_warned && elapsed > Duration::from_secs(3) {
+                        no_recipients_warned = true;
+                        tracing::warn!(
+                            target: "ducktape::voice",
+                            channel_id,
+                            elapsed_s = elapsed.as_secs(),
+                            frames_discarded,
+                            "call has NO recipients — every captured frame is being \
+                             discarded; the roster never reached this node"
+                        );
+                    }
+                    continue;
                 }
                 let mut frame = [0i16; FRAME_SAMPLES];
                 frame.copy_from_slice(&captured);
                 // a send failure (peer unreachable, admission flapped) must
                 // not end the session — the next frame just tries again.
-                let _ = engine.send_frame(&frame, &peers).await;
+                if engine.send_frame(&frame, &peers).await.is_err() {
+                    send_errors += 1;
+                } else {
+                    frames_sent += 1;
+                }
             }
             _ = tick.tick() => {
                 if mixed_out.is_closed() {
@@ -531,6 +885,25 @@ async fn run_session<T: DataPlaneTransport>(
                 }
             }
             _ = ctl_tick.tick() => {
+                // rides the EXISTING 1 Hz beacon tick — every field here was already
+                // computed and thrown away. debug, not info: at a 1s block this would
+                // otherwise be one info per block, and the ring would hold ~68 minutes
+                // of nothing but call stats.
+                //
+                // read it by channel_id and the three failure modes separate:
+                //   frames_sent=0, peers=0   -> the roster never arrived (client-side)
+                //   frames_sent>0, received=0 -> overlay up, peer dark
+                //   no session line at all    -> the overlay never came up
+                tracing::debug!(
+                    target: "ducktape::voice",
+                    channel_id,
+                    peers = recipients.borrow().len(),
+                    frames_sent,
+                    frames_discarded,
+                    send_errors,
+                    effective_kbps,
+                    "call.stats"
+                );
                 send_beacon(&ctl, &recipients, muted, camera_on, sharing).await;
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
@@ -551,6 +924,15 @@ async fn run_session<T: DataPlaneTransport>(
             }
         }
     }
+    tracing::info!(
+        target: "ducktape::voice",
+        channel_id,
+        elapsed_s = session_start.elapsed().as_secs(),
+        frames_sent,
+        frames_discarded,
+        send_errors,
+        "call session closed"
+    );
     for key in &registered {
         flows.remove(key);
     }
@@ -657,7 +1039,108 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_plane::{PlaneConfig, TransportError};
+    use data_plane::{BoxFuture, DatagramSocket, PlaneConfig, PlaneStream, StreamListener, TransportError};
+    use std::net::{IpAddr, SocketAddr};
+
+    #[test]
+    fn page_cursor_wire_round_trips_and_rejects_truncation() {
+        let cursor = noded::PageCursor {
+            block_id: Some("block-1".into()),
+            anchor: 3,
+            head: 9,
+        };
+        let frame = encode_page_cursor(&cursor).unwrap();
+        assert_eq!(decode_page_cursor(&frame), Some(cursor));
+        assert!(decode_page_cursor(&frame[..8]).is_none());
+        assert!(decode_page_cursor(&[9; PRESENCE_HEADER]).is_none());
+        assert!(encode_page_cursor(&noded::PageCursor {
+            block_id: Some("x".repeat(257)),
+            anchor: 0,
+            head: 0,
+        })
+        .is_none());
+    }
+
+    /// A socket factory whose binds NEVER succeed — the overlay interface that
+    /// never arrives (an unprivileged `tun`, an epoch that never applies). The
+    /// hub cannot serve a call over it, and the point of the test below is that
+    /// it must SAY so rather than sit on the request.
+    struct DeadFactory;
+
+    fn no_interface<T>() -> std::io::Result<T> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "overlay interface is not up",
+        ))
+    }
+
+    impl SocketFactory for DeadFactory {
+        fn bind_udp(&self, _addr: SocketAddr) -> BoxFuture<'_, std::io::Result<Box<dyn DatagramSocket>>> {
+            Box::pin(async { no_interface() })
+        }
+
+        fn bind_listener(
+            &self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'_, std::io::Result<Box<dyn StreamListener>>> {
+            Box::pin(async { no_interface() })
+        }
+
+        fn dial_from<'a>(
+            &'a self,
+            _local_ip: IpAddr,
+            _dest: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<PlaneStream>> {
+            Box::pin(async { no_interface() })
+        }
+    }
+
+    /// The regression this whole change exists for: the hub used to await the
+    /// overlay bind BEFORE it ever drained its request lane, so against an
+    /// overlay that never comes up a join rotted in the mpsc unanswered — a
+    /// silent hang that only the webview's own 12 s timer ever ended, leaving
+    /// the user a bare "Voice connection failed." and no reason anywhere. The
+    /// hub must ANSWER a join it cannot serve, and say why.
+    #[tokio::test]
+    async fn a_dead_overlay_refuses_the_join_instead_of_letting_it_rot() {
+        let (requests_tx, requests_rx) = mpsc::channel(4);
+        tokio::spawn(hub_loop(
+            requests_rx,
+            Arc::new(DeadFactory),
+            crate::voice_plane::MediaPeers::new("test-namespace".into()),
+            [7u8; 32],
+            data_plane::PlaneMonitor::default(),
+        ));
+
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        requests_tx
+            .send(noded::RealtimeSessionRequest::Call(
+                noded::CallSessionRequest {
+                    channel_id: "general".into(),
+                    reply,
+                },
+            ))
+            .await
+            .expect("hub alive");
+
+        // Bounded so a REGRESSION (the hub going back to binding before it
+        // drains) fails the test instead of hanging it forever.
+        let answer = tokio::time::timeout(Duration::from_secs(30), opened)
+            .await
+            .expect("the hub must ANSWER a join it cannot serve — never leave it to rot")
+            .expect("the hub keeps the reply lane");
+        // `CallSession` is not Debug (it is a bundle of channel ends), so match
+        // rather than expect_err.
+        let refusal = match answer {
+            Ok(_) => panic!("a dead overlay cannot serve a call, yet the hub opened a session"),
+            Err(refusal) => refusal,
+        };
+        assert!(
+            refusal.contains("overlay"),
+            "the refusal must say WHY — it is what the ui shows instead of a bare \
+             'Voice connection failed.': {refusal}"
+        );
+    }
 
     /// Per-hub in-memory single-service transport (test only). Production media
     /// rides two OVERLAY sockets, one per service; tests wire two hubs over a
@@ -724,7 +1207,7 @@ mod tests {
         voice_in: mpsc::Receiver<(PeerId, Vec<u8>)>,
         video_out: mpsc::Sender<(PeerId, Vec<u8>)>,
         video_in: mpsc::Receiver<(PeerId, Vec<u8>)>,
-    ) -> mpsc::Sender<noded::CallSessionRequest> {
+    ) -> noded::CallLane {
         let flows = Arc::new(ActiveFlows::default());
         let voice_plane = media_plane(voice_out, voice_in, flows.clone());
         let video_plane = media_plane(video_out, video_in, flows.clone());
@@ -733,16 +1216,127 @@ mod tests {
         req_tx
     }
 
+    /// a loud 500 Hz square wave — NOT a constant frame: Opus's SILK high-pass
+    /// strips DC, so a constant stimulus carries energy only in the encoder's
+    /// first few (step-transient) packets. A receiver admitted mid-stream —
+    /// exactly what roster-gated admission produces — would then hear silence
+    /// forever, failing the test on a codec artifact real mic audio never has.
+    /// A tone keeps every packet energetic, so lateness never matters.
+    fn loud_frame() -> Vec<i16> {
+        (0..FRAME_SAMPLES)
+            .map(|i| if (i / 48) % 2 == 0 { 8000 } else { -8000 })
+            .collect()
+    }
+
+    /// pump loud frames from `a` until `b` plays out energy — proves the whole
+    /// path (a's send admission, the link, b's receive admission) is open.
+    /// Doubles as the gate barrier ahead of one-shot video/control sends:
+    /// roster updates reach admission asynchronously, so a test must not
+    /// one-shot a frame it cannot resend until audio proves the gate open.
+    async fn wait_audio_crosses(
+        session_a: &noded::CallSession,
+        session_b: &mut noded::CallSession,
+    ) {
+        let loud = loud_frame();
+        let heard = async {
+            loop {
+                let _ = session_a.pcm_in.send(loud.clone()).await;
+                let Some(mixed) = session_b.mixed_out.recv().await else {
+                    panic!("receiving session ended early");
+                };
+                if mixed.iter().any(|s| s.abs() > 1000) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), heard)
+            .await
+            .expect("audio must cross the hubs");
+    }
+
     /// open (or replace) a session on channel "general" over a hub lane.
-    async fn open(lane: mpsc::Sender<noded::CallSessionRequest>) -> noded::CallSession {
+    async fn open(lane: noded::CallLane) -> noded::CallSession {
         let (reply, opened) = tokio::sync::oneshot::channel();
-        lane.send(noded::CallSessionRequest {
-            channel_id: "general".into(),
-            reply,
-        })
+        lane.send(noded::RealtimeSessionRequest::Call(
+            noded::CallSessionRequest {
+                channel_id: "general".into(),
+                reply,
+            },
+        ))
         .await
         .expect("hub alive");
         opened.await.expect("hub replies").expect("session opens")
+    }
+
+    async fn open_presence(lane: &noded::CallLane) -> noded::PresenceSession {
+        let (reply, opened) = tokio::sync::oneshot::channel();
+        lane.send(noded::RealtimeSessionRequest::Presence(
+            noded::PresenceSessionRequest {
+                page_id: "page-1".into(),
+                reply,
+            },
+        ))
+        .await
+        .expect("hub alive");
+        opened.await.expect("hub replies").expect("presence opens")
+    }
+
+    #[tokio::test]
+    async fn pages_presence_does_not_replace_the_active_huddle() {
+        let (voice_out, _voice_out_rx) = mpsc::channel(32);
+        let (_voice_in_tx, voice_in) = mpsc::channel(32);
+        let (video_out, _video_out_rx) = mpsc::channel(32);
+        let (_video_in_tx, video_in) = mpsc::channel(32);
+        let lane = hub_over(voice_out, voice_in, video_out, video_in);
+        let call = open(lane.clone()).await;
+        let presence = open_presence(&lane).await;
+
+        assert!(
+            !call.pcm_in.is_closed(),
+            "presence must not tear down the call"
+        );
+        assert!(!presence.control_in.is_closed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn page_cursors_cross_between_two_hubs() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (lane_a, lane_b) = two_hubs(key_a, key_b, |_| true);
+        let presence_a = open_presence(&lane_a).await;
+        let mut presence_b = open_presence(&lane_b).await;
+        presence_a.recipients.send(vec![key_b]).unwrap();
+
+        let cursor = noded::PageCursor {
+            block_id: Some("block-7".into()),
+            anchor: 2,
+            head: 8,
+        };
+        presence_a
+            .control_in
+            .send(noded::PresenceControlIn::Cursor(cursor.clone()))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), presence_b.control_out.recv())
+                .await
+                .is_err(),
+            "an unlisted peer must be dropped"
+        );
+
+        presence_b.recipients.send(vec![key_a]).unwrap();
+        presence_a
+            .control_in
+            .send(noded::PresenceControlIn::Cursor(cursor.clone()))
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), presence_b.control_out.recv())
+            .await
+            .expect("cursor crosses before timeout")
+            .expect("presence lane stays open");
+        let noded::PresenceControlOut::PeerCursor { peer, cursor: got } = received;
+        assert_eq!(peer, key_a);
+        assert_eq!(got, cursor);
     }
 
     /// two hubs wired back-to-back through their per-service links: a frame
@@ -763,23 +1357,15 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
+        // symmetric roster: receive admission is roster-gated, so B hears A
+        // only once B lists A.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         // a loud constant frame from a — b must eventually play out energy.
-        let loud = vec![8000i16; FRAME_SAMPLES];
-        let heard = async {
-            loop {
-                let _ = session_a.pcm_in.send(loud.clone()).await;
-                let Some(mixed) = session_b.mixed_out.recv().await else {
-                    panic!("session b ended early");
-                };
-                if mixed.iter().any(|s| s.abs() > 1000) {
-                    break;
-                }
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(10), heard)
-            .await
-            .expect("audio must cross the hubs");
+        wait_audio_crosses(&session_a, &mut session_b).await;
 
         // replace a's session with a new one on the SAME channel: teardown
         // must release the flows so the re-open succeeds.
@@ -788,6 +1374,110 @@ mod tests {
             !session_a2.pcm_in.is_closed(),
             "replacement session must be live"
         );
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// receive admission is what a flow's roster means: unknown flow denies,
+    /// a live flow with no roster denies everyone, and only currently
+    /// rostered peers pass.
+    #[test]
+    fn admission_requires_both_a_live_flow_and_a_rostered_peer() {
+        let flows = ActiveFlows::default();
+        let key = (Service::Voice, channel_flow("general"));
+        let (peer_a, peer_b) = (PeerId([1; 32]), PeerId([2; 32]));
+
+        assert!(!flows.permits(peer_a, key.0, key.1), "unknown flow admits");
+        flows.insert(key);
+        assert!(
+            !flows.permits(peer_a, key.0, key.1),
+            "an empty roster (pre-first-update) must deny everyone"
+        );
+        flows.set_roster(&[key], &[[1; 32]]);
+        assert!(flows.permits(peer_a, key.0, key.1));
+        assert!(
+            !flows.permits(peer_b, key.0, key.1),
+            "membership alone must not admit — only the roster does"
+        );
+        flows.set_roster(&[key], &[[2; 32]]);
+        assert!(!flows.permits(peer_a, key.0, key.1), "a removed peer stays");
+        assert!(flows.permits(peer_b, key.0, key.1));
+        flows.remove(&key);
+        assert!(!flows.permits(peer_b, key.0, key.1), "teardown must close");
+    }
+
+    /// the receive gate end-to-end: a network member whose datagrams reach
+    /// this node's media ports but who is NOT in the session's roster must
+    /// never surface — not in the audio mix, not as a video frame, not as a
+    /// control beacon. Sender-side fan-out discipline is no defence (an
+    /// adversary does not run our fan-out; flow ids derive from public
+    /// channel ids), so the roster is enforced at receive demux. Listing the
+    /// peer afterwards proves the drop was the gate and nothing else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn media_from_a_member_outside_the_roster_never_surfaces() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        // A fans out to B, but B does NOT list A: on the wire this is exactly
+        // a member injecting into a call whose roster excludes it.
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+
+        // audio: pump loud frames through ~1 s of B's playout; every mixed
+        // frame must stay silent.
+        let loud = loud_frame();
+        let mut quiet_frames = 0;
+        while quiet_frames < 50 {
+            let _ = session_a.pcm_in.send(loud.clone()).await;
+            match tokio::time::timeout(Duration::from_secs(2), session_b.mixed_out.recv()).await {
+                Ok(Some(mixed)) => {
+                    assert!(
+                        mixed.iter().all(|s| s.abs() <= 1000),
+                        "an unlisted member's audio reached the mix"
+                    );
+                    quiet_frames += 1;
+                }
+                Ok(None) => panic!("session b ended early"),
+                Err(_) => panic!("playout stalled"),
+            }
+        }
+
+        // video: a keyframe from A must never reach B's webview...
+        session_a
+            .video_in
+            .send(chat::call_wire::CapturedFrame {
+                keyframe: true,
+                ts_ms: 7,
+                data: vec![0xA0; 5000],
+            })
+            .await
+            .expect("session a alive");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), session_b.video_out.recv())
+                .await
+                .is_err(),
+            "an unlisted member's video reached the webview"
+        );
+        // ...and neither must A's 1 Hz control beacon (the second of quiet
+        // playout above means at least one beacon was sent and dropped).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), session_b.control_out.recv())
+                .await
+                .is_err(),
+            "an unlisted member's control message reached the webview"
+        );
+
+        // list A → the same traffic crosses: the drops above were the roster
+        // gate, not plumbing.
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
+        wait_audio_crosses(&session_a, &mut session_b).await;
         drop((req_a_tx, req_b_tx));
     }
 
@@ -801,10 +1491,7 @@ mod tests {
         key_a: [u8; 32],
         key_b: [u8; 32],
         mut a_to_b: impl FnMut(&[u8]) -> bool + Send + 'static,
-    ) -> (
-        mpsc::Sender<noded::CallSessionRequest>,
-        mpsc::Sender<noded::CallSessionRequest>,
-    ) {
+    ) -> (noded::CallLane, noded::CallLane) {
         let (a_id, b_id) = (PeerId(key_a), PeerId(key_b));
         // each hub's egress lanes and each hub's ingress lanes, per service.
         let (a_voice_out, mut a_voice_out_rx) = mpsc::channel::<(PeerId, Vec<u8>)>(LANE);
@@ -873,13 +1560,16 @@ mod tests {
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
-        // B lists A too: a real huddle roster is symmetric, and B's 1 Hz ctl
-        // tick evicts receive lanes for peers NOT in its recipients — without
-        // this, a tick landing mid-keyframe would drop A's in-progress frame.
+        // B lists A too: a real huddle roster is symmetric, receive admission
+        // is roster-gated, and B's 1 Hz ctl tick evicts receive lanes for
+        // peers NOT in its recipients — without this, a tick landing
+        // mid-keyframe would drop A's in-progress frame.
         session_b
             .recipients
             .send(vec![key_a])
             .expect("session b alive");
+        // gate barrier: the video sends below are one-shot.
+        wait_audio_crosses(&session_a, &mut session_b).await;
 
         // position-dependent fills (not uniform bytes) so a fragment-ordering
         // or reassembly regression in the hub path shows up — a reordered or
@@ -962,6 +1652,11 @@ mod tests {
             .recipients
             .send(vec![key_a])
             .expect("session b alive");
+        // gate barrier BEFORE any video flows: if frame 0 raced the roster
+        // into a closed gate, the loss filter's one dropped fragment would be
+        // wasted on a frame the demux discarded whole, and no keyframe
+        // request would ever fire.
+        wait_audio_crosses(&session_a, &mut session_b).await;
         let mut control_a = session_a.control_out;
 
         // frame 0 loses a fragment (incomplete); frame 1 completes.
@@ -1021,11 +1716,16 @@ mod tests {
 
         let session_a = open(req_a_tx.clone()).await;
         let mut session_b = open(req_b_tx.clone()).await;
-        // A beacons to its recipients — B must be one of them.
+        // A beacons to its recipients — B must be one of them; B's receive
+        // admission is roster-gated, so B must list A right back.
         session_a
             .recipients
             .send(vec![key_b])
             .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         session_a
             .control_in
@@ -1243,7 +1943,7 @@ mod tests {
 
 /// Headless end-to-end proof that huddle audio crosses the REAL userspace
 /// WireGuard overlay — no TUN, no root, no mics, no GUI (the
-/// `crates/system/overlay-net/tests/loopback_pair` harness shape). Two voice
+/// `crates/networking/overlay-net/tests/loopback_pair` harness shape). Two voice
 /// hubs run on their OWN runtimes (`spawn_hub`) and bind the per-service
 /// overlay sockets over two loopback-peered virtual stacks; audio fed into one
 /// comes out the other, Opus-decoded. Unlike the in-memory tests above, this
@@ -1354,10 +2054,7 @@ mod overlay_e2e {
 
     /// spawn a hub over a node's overlay stack (its OWN runtime binds the media
     /// sockets; the stack keeps polling on this test's runtime).
-    fn spawn_over(
-        node: &OverlayNode,
-        peers: Arc<MediaPeers>,
-    ) -> mpsc::Sender<noded::CallSessionRequest> {
+    fn spawn_over(node: &OverlayNode, peers: Arc<MediaPeers>) -> noded::CallLane {
         let (req_tx, req_rx) = mpsc::channel(4);
         let factory: Arc<dyn SocketFactory> =
             Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));
@@ -1371,12 +2068,14 @@ mod overlay_e2e {
         req_tx
     }
 
-    async fn open(lane: &mpsc::Sender<noded::CallSessionRequest>) -> noded::CallSession {
+    async fn open(lane: &noded::CallLane) -> noded::CallSession {
         let (reply, opened) = tokio::sync::oneshot::channel();
-        lane.send(noded::CallSessionRequest {
-            channel_id: "general".into(),
-            reply,
-        })
+        lane.send(noded::RealtimeSessionRequest::Call(
+            noded::CallSessionRequest {
+                channel_id: "general".into(),
+                reply,
+            },
+        ))
         .await
         .expect("hub alive");
         opened.await.expect("hub replies").expect("session opens")
@@ -1402,12 +2101,16 @@ mod overlay_e2e {
             .send(vec![a.raw_key])
             .expect("session b alive");
 
-        // loud constant audio from A must surface as energy in B's mixed
+        // loud tonal audio from A must surface as energy in B's mixed
         // playout, having crossed: A's hub runtime → its overlay socket → the
         // WireGuard tunnel → B's overlay socket → B's jitter buffer → Opus
         // decode → mix. A generous deadline covers the handshake + the bind
-        // retry loop.
-        let loud = vec![8000i16; FRAME_SAMPLES];
+        // retry loop. A 500 Hz square, not a constant frame: SILK's high-pass
+        // strips DC, so with roster-gated admission a receiver that misses
+        // the encoder's first packets would otherwise hear converged silence.
+        let loud: Vec<i16> = (0..FRAME_SAMPLES)
+            .map(|i| if (i / 48) % 2 == 0 { 8000 } else { -8000 })
+            .collect();
         let heard = async {
             loop {
                 let _ = session_a.pcm_in.send(loud.clone()).await;

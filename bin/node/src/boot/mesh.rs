@@ -4,14 +4,14 @@ use commonware_p2p::authenticated::discovery::{self, Network};
 use commonware_runtime::{Quota, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 
-use crate::config::{self, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, hex_bytes};
 use crate::constants::MAX_MESSAGE_SIZE;
 
 /// `run_node`'s shared runtime head (phase P3): the head of the async
 /// closure `executor.start(|context| async move { … })` runs on — metrics
-/// registration, the tracked mesh set, the statesync source pick, the lobby
-/// transport identity, discovery's config, the overlay-net seam, and the
-/// real `Network`/`Oracle` pair. Ends before the `if sync_only {` branch,
+/// registration, the tracked mesh set, the statesync source pick,
+/// discovery's config, the overlay-net seam, and the real
+/// `Network`/`Oracle` pair. Ends before the `if sync_only {` branch,
 /// which stays in `run_node` (that's the sync-only-vs-validator fork).
 pub(crate) struct MeshHead {
     /// the closure's own root context, round-tripped: `commonware_runtime`'s
@@ -27,6 +27,12 @@ pub(crate) struct MeshHead {
     /// The registered `ducktape_dataplane_*` series — dropping this
     /// unregisters them, so it must live as long as the node runs.
     pub(crate) plane_metrics: crate::plane_metrics::PlaneMetrics,
+    /// The statesync serve-lane registry the validator's serve task records
+    /// every answered request into; `sync_metrics` reads it at scrape time.
+    pub(crate) sync_monitor: statesync::monitor::ServeMonitor,
+    /// The registered `ducktape_statesync_serve_*` series — same lifetime
+    /// contract as `plane_metrics`.
+    pub(crate) sync_metrics: crate::sync::metrics::SyncServeMetrics,
     pub(crate) mesh_participants: Set<ed25519::PublicKey>,
     pub(crate) status_public_key: String,
     pub(crate) sync_sources: Vec<ed25519::PublicKey>,
@@ -46,11 +52,10 @@ pub(crate) fn build(
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     sync_candidates: Vec<(ed25519::PublicKey, Ingress)>,
-    joiner: bool,
     listen: std::net::SocketAddr,
     advertised: Ingress,
     bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
-    wireguard_effect: WireGuardEffectKind,
+    overlay_enabled: bool,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> MeshHead {
     // the validator's own `ducktape_*` Prometheus series, registered on the
@@ -66,6 +71,13 @@ pub(crate) fn build(
     // the live counters straight off the monitor.
     let plane_monitor = data_plane::PlaneMonitor::default();
     let plane_metrics = crate::plane_metrics::PlaneMetrics::register(&context, &plane_monitor);
+
+    // the statesync serve-lane registry + its `ducktape_statesync_serve_*`
+    // series: statesync rides the mesh carrier (never a data plane), so the
+    // monitor above can't see it — the validator's serve task records every
+    // answered request here instead, per requesting peer.
+    let sync_monitor = statesync::monitor::ServeMonitor::new(context.child("statesync_monitor"));
+    let sync_metrics = crate::sync::metrics::SyncServeMetrics::register(&context, &sync_monitor);
 
     // the authorized MESH set, SORTED — what discovery tracks. the
     // consensus scheme uses the (possibly smaller) validator set derived
@@ -94,24 +106,13 @@ pub(crate) fn build(
     // forwarded connection from a private source IP — use a public-IP sentry
     // or a reverse tunnel then.
     //
-    // TRANSPORT IDENTITY: a parked joiner's own key is usually untracked
-    // on every member (that is what admission changes), so it would be
-    // bounced at the handshake and could neither announce itself nor poll
-    // the statesync manifest. such a joiner connects AS the network's
-    // derived LOBBY identity — the one key every member tracks that any
-    // invite holder can derive. its REAL key still signs everything that
-    // matters (the join proof, and consensus after the promotion reboot).
-    // the door only exists where the mesh tracks it: the network shape
-    // folds the lobby key into every member's mesh, so `peers` carries it
-    // here too (both sides derive the same mesh). a mesh WITHOUT a lobby
-    // key (the dev-seed shape) keeps the old behavior — the joiner parks
-    // under its real identity, refused until the cutover re-tracks it.
-    let lobby = config::lobby_identity(&namespace);
-    let p2p_signer = if joiner && peers.contains(&lobby.public_key()) {
-        lobby
-    } else {
-        signer.clone()
-    };
+    // TRANSPORT IDENTITY: every node — a parked joiner included — connects
+    // under its REAL key (join ADR §4; the derived lobby identity is retired).
+    // a fresh joiner's key is untracked on every member until its `Redeem`
+    // grant, when the members' drains re-track it onto the mesh immediately
+    // (ahead of the epoch cutover) — pre-admission it needs no mesh at all:
+    // the join gate rides the WireGuard-tunnel doorbell, not a channel.
+    let p2p_signer = signer.clone();
     // the staged reachability plane derives its advertised control
     // endpoint from the mesh `advertised`; keep a copy — discovery's
     // config consumes the original.
@@ -137,19 +138,31 @@ pub(crate) fn build(
     let overlay_router = overlay_net::OverlayRouter::for_prefix48(
         wireguard::ula_v6_prefix(&String::from_utf8_lossy(&namespace)),
     );
-    // ADR phase 3: the backend follows `wireguard_effect`. socket mode
-    // routes overlay dials/binds into the in-process virtual stack (and
-    // gives the wildcard mesh listener its virtual leg); tun AND fake
-    // keep the OS pass-through — fake stages no data plane at all, so
-    // pass-through preserves its long-standing "overlay dials just fail
-    // like a downed interface" behavior.
-    let overlay_backend = match wireguard_effect {
-        WireGuardEffectKind::Socket => {
-            overlay_net::OverlayBackend::Userspace(overlay_slot.clone())
+    // ADR phase 3: the backend follows the reachability plane. a
+    // configured plane routes overlay dials/binds into the in-process
+    // virtual stack (and gives the wildcard mesh listener its virtual
+    // leg); no plane keeps the OS pass-through, so overlay dials just fail
+    // like a downed interface.
+    //
+    // socket mode's wildcard mesh bind normally carries the kernel OS leg
+    // beside the virtual one — but a node that advertises ONLY its overlay
+    // ULA hands out no underlay address anywhere (no bootstrap hint is
+    // minted, gossip carries the ULA), so its kernel leg could never
+    // receive a legitimate dial. it would sit unreachable as a wildcard
+    // listener the host firewall alarms on (macOS prompts about every
+    // wildcard bind) — such a node keeps the virtual leg only.
+    let underlay_ingress = match &advertised_reach {
+        Ingress::Socket(addr) => !overlay_router.is_overlay(addr),
+        // a hostname advertisement is an underlay address by construction.
+        Ingress::Dns { .. } => true,
+    };
+    let overlay_backend = if overlay_enabled {
+        overlay_net::OverlayBackend::Userspace {
+            slot: overlay_slot.clone(),
+            underlay_ingress,
         }
-        WireGuardEffectKind::Tun | WireGuardEffectKind::Fake => {
-            overlay_net::OverlayBackend::Tun
-        }
+    } else {
+        overlay_net::OverlayBackend::Passthrough
     };
     let (network, oracle) = Network::new(
         overlay_net::OverlayContext::with_backend(
@@ -167,6 +180,8 @@ pub(crate) fn build(
         metrics,
         plane_monitor,
         plane_metrics,
+        sync_monitor,
+        sync_metrics,
         mesh_participants,
         status_public_key,
         sync_sources,

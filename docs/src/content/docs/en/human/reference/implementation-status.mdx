@@ -1,0 +1,103 @@
+---
+title: "Implementation Status"
+audience: human
+---
+
+This status page is grounded in checked-in code, tests, and binaries.
+
+Related: [Product Modules](/en/human/modules/product-modules) expands module
+behavior, [Repository Map](/en/human/reference/repository-map) locates source
+crates, [State Sync](/en/human/architecture/state-sync) explains rebuild proofs,
+and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
+
+## Platform Spine
+
+- `sdk` defines the module contract and deterministic system API, including the
+  `serve_sync` state-sync serve surface.
+- `host` owns registry dispatch, FIFO follow-up drain, block commit/abort, and
+  the composition of module roots into an order-independent app-hash, with a
+  fail-stop boundary contract: a `commit_block`/`abort_block` fault is a
+  node-local `SubmitError::Fatal`, distinct from a deterministic rejection.
+- `node` bridges host application to transport and ordered delivery. Op frames
+  are ed25519-signed and verified on decode, so an applied op's origin is
+  authenticated authorship. `OrderedNode` supports epoch cutover (engine
+  respawn with a deterministic discard ceiling and rebased app heights) and an
+  observation barrier: drain batches end at a watched module's root change, so
+  membership changes are observed at the same view on every validator.
+- `consensus` contains the commonware Simplex-backed orderer with bounded
+  payload memory (pinned own submissions, FIFO-capped peer cache) and the
+  `ValsetOrchestrator` for epoch scheduling — cutovers armed at the changing
+  block's view, the next participant set read from state at the boundary.
+- `lifecycle` is registered in the node module set as the module code registry:
+  it registers module wasm code and schedules height-gated code swaps, with
+  validators self-signaling swap readiness. There is no protocol versioning —
+  while no live network exists, breaking changes re-genesis.
+- `statesync` defines the network state-sync wire protocol (manifest with the
+  boundary's consensus coordinates and finalization floor, chunked snapshots,
+  remote qmdb resolver) and the p2p transport binding.
+- `host::worker` closes the non-deterministic worker boundary: workers claim
+  effects and their results re-enter as ordinary messages; each binary drives
+  its own loop.
+
+## Module State
+
+- QMDB-backed modules (kv, pages, chat) expose real authenticated roots
+  and answer network state-sync over `serve_sync`; pages stores nested page
+  trees, blocks, and comment threads together, while chat stores one record per
+  entity (no whole-history value, no 1 MiB commit bomb) with computed-key
+  pagination.
+- Forge derives a 32-byte state root from git state and verifies object closure
+  before install.
+- Snapshot-style modules use canonical bytes where that fits the module: valset,
+  saga, tasks, directory, governance, vaults, inbox, automations, files/duckfs,
+  jobs, identity, DuckDNS, agent, and runs.
+- System governance gates the validator set (member-only proposals, deterministic
+  tally, follow-up membership ops); valset rejects external membership writes.
+- Vaults replicate opaque secret ciphertext with owner-gated write integrity.
+- Agent is a pure state machine holding the agent registry, channel watches, and
+  run records; automations evaluates user-authored chat posts against operator
+  rules with probe-before-emit follow-up actions.
+- The module wave rounds out the workplace surface: inbox delivers notifications
+  as follow-up ops atomic with their cause (P2), files is duckfs — a
+  consensus-replicated filesystem with content-addressed objects, refs, snapshots,
+  pins, and workspace paths — and jobs is a first-claim-wins work board with view
+  leases and permissionless reclaim. duckfs absorbed the old shared workspace
+  surface: agent workspaces are ordinary files with `duck://files/...` evidence.
+
+## Verification Surface
+
+- `cargo test --workspace` exercises the Rust workspace.
+- `cargo run -p demo` runs the in-process multi-module walkthrough.
+- `cargo test -p demo --test network_joiner_full` proves a joiner rebuilds every
+  module purely over the state-sync wire protocol and matches the source
+  app-hash.
+- `bin/node/examples/demo-invite.sh` drives a human-runnable onboarding ceremony
+  over real sockets: founder `init`, invite, friend `join`, founder `admit`, a
+  refreshed invite, then both nodes booting one network and converging an
+  RPC-submitted directory op.
+- `cargo test -p node-bin --test cluster_e2e` is the automated real-socket node
+  lifecycle gate: three-validator convergence, an RPC-submitted message crossing
+  consensus, a cross-node governance vote, a live epoch cutover, and a sync-only
+  joiner rebuilding the post-cutover state over real sockets.
+- `cargo test -p node-bin --test restart_e2e` crashes a solo validator process
+  with SIGKILL and shuts it down gracefully; each respawn over the same storage
+  dir recovers the byte-identical app-hash without re-running genesis and keeps
+  finalizing over its reopened consensus journal.
+- `cargo test -p node-bin --test invite_e2e` proves invite-after-genesis over
+  real sockets: an uninvited key parks on the mesh, a member's `invite-accept`
+  passes governance, the epoch cutover re-tracks the mesh, and the joiner syncs
+  and promotes itself into a voting validator — both onto a stalled solo
+  network (epoch genesis floor) and onto a live 3-validator quorum (mid-epoch
+  boundary with its served finalization floor certificate).
+
+## Still Open
+
+- A demoted validator degrading to a sync-server rather than halting.
+- Per-origin replay nonces in state (cross-epoch frame replay currently gated by
+  the per-engine finalization dedup).
+- Origin-bound message authorship and richer agent product behavior. The live
+  node already registers `agent`, `runs`, `dispatch`, `saga`, `capability`,
+  `jobs`, and `tasks`; the remaining gap is packaged UX and durable workflows,
+  not the basic execution seam.
+- A privileged e2e that brings up a real WireGuard interface (the mesh contract
+  itself now lives in `crates/system/wireguard`; `valset::mesh` was deleted).

@@ -15,15 +15,15 @@ use crate::objects::{
 use crate::paths::{canonical, check_authority};
 use crate::state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
 use crate::store::ObjectStore;
-use crate::tree::{Store, TreeEdit, entry_at, snapshot_root_tree};
+use crate::tree::{ReadBudget, Store, TreeEdit, entry_at, snapshot_root_tree};
 use crate::wire::{
     CHUNK_SIZE, Change, Content, FilesQuery, FilesReply, FilesSyncReq, FilesSyncResp,
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
     MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
-    MAX_META_VALUE_BYTES, MAX_PIN_NAME_BYTES, MAX_PINS, MAX_STAGING_ENTRIES,
-    MAX_STAGING_ENTRIES_PER_OWNER, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS, MAX_SYNC_REPLY_BYTES,
-    MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject,
-    from_hex_32, to_hex,
+    MAX_META_VALUE_BYTES, MAX_OBJECT_READS_PER_OP, MAX_PIN_NAME_BYTES, MAX_PINS,
+    MAX_STAGING_ENTRIES, MAX_STAGING_ENTRIES_PER_OWNER, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS,
+    MAX_SYNC_REPLY_BYTES, MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES,
+    STAGING_TTL_BLOCKS, SyncObject, from_hex_32, to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -56,6 +56,13 @@ pub struct Fs<S: ObjectStore> {
     /// per-owner boundary is exercised cheaply. bounds one owner's share of the
     /// global table.
     pub(crate) staging_entry_cap_per_owner: usize,
+    /// per-op DISTINCT committed-store read cap — [`MAX_OBJECT_READS_PER_OP`] in
+    /// production, lowered only by the `#[doc(hidden)]` test override so the
+    /// object-read budget boundary is exercised with a handful of pre-existing
+    /// directories instead of 4096. `commit` reads it into the per-op
+    /// [`ReadBudget`]; the guest inherits it (same core) so both runtimes reject
+    /// the identical oversized commit.
+    pub(crate) object_read_cap: usize,
 }
 
 /// a block's staged objects — `(kind, body)` pairs the glue flushes into the
@@ -98,6 +105,35 @@ pub struct Notification {
     pub snapshot: String,
 }
 
+impl Notification {
+    /// the `duckfs_notify` follow-up payload bytes. TYPED serialization on
+    /// purpose: a `serde_json::json!` map's key order depends on the build's
+    /// serde_json features (`preserve_order` keeps insertion order, default
+    /// sorts), and these bytes land in a sibling module's app-hashed state —
+    /// the native module and the wasm guest must emit byte-identical wire
+    /// regardless of how each build resolved serde_json.
+    pub fn payload(&self) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            prefix: &'a str,
+            path: &'a str,
+            snapshot: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct Envelope<'a> {
+            duckfs_notify: Body<'a>,
+        }
+        serde_json::to_vec(&Envelope {
+            duckfs_notify: Body {
+                prefix: &self.prefix,
+                path: &self.path,
+                snapshot: &self.snapshot,
+            },
+        })
+        .expect("a notification serializes")
+    }
+}
+
 /// remove every staging entry whose ttl has elapsed at `height`. the condition
 /// is `expires_at <= height` (encoded as the `> height` retain predicate): a
 /// chunk staged at block h with ttl T (so `expires_at = h + T`) is swept the
@@ -125,6 +161,7 @@ impl<S: ObjectStore> Fs<S> {
             window_cap: HISTORY_WINDOW,
             staging_entry_cap: MAX_STAGING_ENTRIES,
             staging_entry_cap_per_owner: MAX_STAGING_ENTRIES_PER_OWNER,
+            object_read_cap: MAX_OBJECT_READS_PER_OP,
         }
     }
 
@@ -163,6 +200,15 @@ impl<S: ObjectStore> Fs<S> {
     pub fn set_staging_entry_caps_for_tests(&mut self, global: usize, per_owner: usize) {
         self.staging_entry_cap = global;
         self.staging_entry_cap_per_owner = per_owner;
+    }
+
+    /// `#[doc(hidden)]` test seam: shrink the per-op distinct-object-read cap so
+    /// the budget boundary is exercised with a handful of pre-existing
+    /// directories instead of staging or walking [`MAX_OBJECT_READS_PER_OP`] of
+    /// them. production never calls this — the cap stays [`MAX_OBJECT_READS_PER_OP`].
+    #[doc(hidden)]
+    pub fn set_object_read_budget_for_tests(&mut self, cap: usize) {
+        self.object_read_cap = cap;
     }
 
     /// `#[doc(hidden)]` test seam: the gc mark set over COMMITTED refs — the
@@ -215,6 +261,17 @@ impl<S: ObjectStore> Fs<S> {
 
     pub fn refs(&self) -> &Refs {
         &self.refs
+    }
+
+    /// read-only access to the object store — the `&self` twin of
+    /// [`Fs::store_mut`]. the host-side odb backing ([`files::FilesOdbBacking`])
+    /// serves its `HostOdb::stat`/`get` (a `&self` surface) by reading committed
+    /// object bodies straight off the concrete `S`, reusing the store's verified
+    /// read rather than forking the disk-read logic. glue/test plumbing, not the
+    /// semantic surface (all consensus reads/writes go through the typed methods).
+    #[doc(hidden)]
+    pub fn store(&self) -> &S {
+        &self.store
     }
 
     /// direct access to the object store — the native glue (`module.rs`) needs
@@ -370,9 +427,10 @@ impl<S: ObjectStore> Fs<S> {
         changes: Vec<Change>,
     ) -> Result<Vec<Notification>, String> {
         self.require_pending(height);
-        // read the window cap before borrowing pending — commit_apply needs it to
-        // bound the history window, and it is a plain Copy field.
+        // read the plain Copy caps before borrowing pending — commit_apply needs
+        // the window cap, and the object-read budget needs its ceiling.
         let window_cap = self.window_cap;
+        let object_read_cap = self.object_read_cap;
         // the scratch refs every commit mutation lands in — a clone of the pending
         // view, swept at the top. merged back into pending only on full success.
         let scratch = self
@@ -388,9 +446,15 @@ impl<S: ObjectStore> Fs<S> {
         // is discarded untouched on any reject.
         let built = {
             let pending = self.pending.as_ref().expect("require_pending set it");
+            // the per-op object-read consensus cap ([`MAX_OBJECT_READS_PER_OP`]):
+            // counts this commit's DISTINCT committed-store reads over the
+            // block-local index, so native and the wasm tenant reject the same
+            // oversized commit (the guest hits it before the kernel's equal cap).
+            let budget = ReadBudget::new(&pending.object_ids, object_read_cap);
             let store = Store {
                 store: &self.store,
                 pending: &pending.objects,
+                budget: Some(&budget),
             };
             commit_apply(
                 &store,
@@ -594,6 +658,40 @@ impl<S: ObjectStore> Fs<S> {
 
     pub fn abort_block(&mut self) {
         self.pending = None;
+    }
+
+    /// seed this block's object index into a fresh pending BEFORE an op is
+    /// applied — the wasm-guest's reconstruction of the block-local
+    /// [`Pending::object_ids`] the native module keeps in-memory across a whole
+    /// block. an adapter guest is rebuilt per dispatch, so it re-seeds this each
+    /// dispatch (from its staged-only `__block_objects` state key) so a later
+    /// same-block op's availability/dedup ([`chunk_stat`], putblob's dedup) sees
+    /// an earlier dispatch's staged objects EXACTLY as native does — the
+    /// root-continuity fix for same-block inline-chunk references.
+    ///
+    /// ADDITIVE: the native module NEVER calls this (it keeps its live
+    /// `pending` alive across the block), so no decision logic changes and the
+    /// native path is byte-for-byte unaffected. reuses [`require_pending`] to
+    /// build the pending (refs forked from committed, empty objects), then
+    /// overwrites only the index — the ONE field the guest must carry.
+    pub fn seed_block_objects(&mut self, height: u64, index: BTreeMap<ObjectId, (Kind, u64)>) {
+        self.require_pending(height);
+        self.pending
+            .as_mut()
+            .expect("require_pending set the pending")
+            .object_ids = index;
+    }
+
+    /// this block's accumulated object index (prior-dispatch objects seeded via
+    /// [`seed_block_objects`] plus everything the just-applied op staged), for
+    /// the guest to persist under `__block_objects`. empty when no op staged a
+    /// pending. clones the map the guest round-trips; it never enters the root
+    /// or the wire.
+    pub fn block_objects(&self) -> BTreeMap<ObjectId, (Kind, u64)> {
+        self.pending
+            .as_ref()
+            .map(|p| p.object_ids.clone())
+            .unwrap_or_default()
     }
 
     // ---- read + sync surface (tasks 11/12/14) --------------------------------
@@ -907,8 +1005,13 @@ fn commit_apply(
                         if inline_bytes > MAX_INLINE_COMMIT_BYTES {
                             return Err("files: inline commit budget exceeded".into());
                         }
-                        let chunk_ids =
-                            chunk_bytes(&bytes, store, pending_ids, &mut objects, &mut staged_ids);
+                        let chunk_ids = chunk_bytes(
+                            &bytes,
+                            store,
+                            pending_ids,
+                            &mut objects,
+                            &mut staged_ids,
+                        )?;
                         let fileobj_id = stage_fileobj(
                             bytes.len() as u64,
                             &chunk_ids,
@@ -917,7 +1020,7 @@ fn commit_apply(
                             pending_ids,
                             &mut objects,
                             &mut staged_ids,
-                        );
+                        )?;
                         (fileobj_id, chunk_ids, bytes.len() as u64)
                     }
                     Content::Chunks { size, chunks } => {
@@ -934,7 +1037,7 @@ fn commit_apply(
                             pending_ids,
                             &mut objects,
                             &mut staged_ids,
-                        );
+                        )?;
                         (fileobj_id, ids, *size)
                     }
                 };
@@ -996,7 +1099,7 @@ fn commit_apply(
                     pending_ids,
                     &mut objects,
                     &mut staged_ids,
-                );
+                )?;
                 let fileobj = FileObj {
                     size: target.len() as u64,
                     chunks: vec![chunk_id],
@@ -1009,7 +1112,7 @@ fn commit_apply(
                     pending_ids,
                     &mut objects,
                     &mut staged_ids,
-                );
+                )?;
                 chunk_refs.push(chunk_id);
                 touched.push((joined, segs.clone()));
                 plan.push(EditOp::Put {
@@ -1079,10 +1182,8 @@ fn commit_apply(
             }
             .encode();
             let id = object_id(Kind::Tree, &body);
-            if !staged_ids.contains_key(&id)
-                && !pending_ids.contains_key(&id)
-                && !store.store.has(&id)
-            {
+            let already = staged_ids.contains_key(&id) || pending_ids.contains_key(&id);
+            if !already && !store.has_committed(&id)? {
                 staged_ids.insert(id, (Kind::Tree, body.len() as u64));
                 objects.push((Kind::Tree, body));
             }
@@ -1280,9 +1381,9 @@ fn chunk_bytes(
     pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     objects: &mut StagedObjects,
     staged_ids: &mut BTreeMap<ObjectId, (Kind, u64)>,
-) -> Vec<ObjectId> {
+) -> Result<Vec<ObjectId>, String> {
     if bytes.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     bytes
         .chunks(CHUNK_SIZE as usize)
@@ -1308,7 +1409,7 @@ fn stage_fileobj(
     pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     objects: &mut StagedObjects,
     staged_ids: &mut BTreeMap<ObjectId, (Kind, u64)>,
-) -> ObjectId {
+) -> Result<ObjectId, String> {
     let fileobj = FileObj {
         size,
         chunks: chunks.to_vec(),
@@ -1328,7 +1429,10 @@ fn stage_fileobj(
 /// skips the push when the bytes are already reachable (odb, a prior block-pending
 /// object, or already staged by this commit) — so an inline chunk that matches a
 /// putblob'd or prior-committed chunk is never buffered twice. its quota is still
-/// reclaimed by the caller via `chunk_refs`.
+/// reclaimed by the caller via `chunk_refs`. the committed-odb presence probe
+/// (`object-stat`) is charged against the per-op object-read budget, so a commit
+/// that stages past [`MAX_OBJECT_READS_PER_OP`] new objects rejects identically on
+/// both runtimes.
 fn stage_object(
     kind: Kind,
     body: Vec<u8>,
@@ -1336,13 +1440,16 @@ fn stage_object(
     pending_ids: &BTreeMap<ObjectId, (Kind, u64)>,
     objects: &mut StagedObjects,
     staged_ids: &mut BTreeMap<ObjectId, (Kind, u64)>,
-) -> ObjectId {
+) -> Result<ObjectId, String> {
     let id = object_id(kind, &body);
-    if !staged_ids.contains_key(&id) && !pending_ids.contains_key(&id) && !store.store.has(&id) {
+    // dedup against this commit's stages and the block-local index FIRST (no odb
+    // read, no charge); only a genuinely-new object probes the committed odb.
+    let already = staged_ids.contains_key(&id) || pending_ids.contains_key(&id);
+    if !already && !store.has_committed(&id)? {
         staged_ids.insert(id, (kind, body.len() as u64));
         objects.push((kind, body));
     }
-    id
+    Ok(id)
 }
 
 // finding #1: a consensus op's outcome must be a pure function of AGREED state
@@ -1431,6 +1538,176 @@ mod consensus_uniformity {
         assert!(
             ra.is_err(),
             "an unstaged, not-in-block chunk is unavailable — regardless of a local odb orphan"
+        );
+    }
+}
+
+// the per-op distinct-object-read consensus cap ([`MAX_OBJECT_READS_PER_OP`]):
+// a commit's committed-store reads are bounded so the native `Files` module and
+// the wasm files tenant (which runs THIS core) reject the identical oversized
+// commit. driven at the shrunk cap through the `#[doc(hidden)]` test seam — the
+// same pattern the staging-quota / window / entry-cap boundary tests use — so a
+// handful of pre-existing directories exercises the boundary instead of 4096.
+#[cfg(test)]
+mod object_read_budget {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+
+    use crate::fs::Fs;
+    use crate::state::Refs;
+    use crate::store::{MemStore, ObjectStore};
+    use crate::wire::{Change, Content};
+
+    fn new_fs() -> Fs<MemStore> {
+        Fs::new(MemStore::new(), Refs::default())
+    }
+
+    /// drain the pending block, flush its objects, adopt — the pure-core twin of
+    /// `module.rs commit_block`.
+    fn commit_block(fs: &mut Fs<MemStore>) {
+        if let Some((refs, _height, objects)) = fs.commit_block() {
+            for (kind, body) in &objects {
+                fs.store_mut().put(*kind, body).unwrap();
+            }
+            fs.adopt_refs(refs);
+        }
+    }
+
+    fn put_inline(path: &str, content: &[u8]) -> Change {
+        Change::Put {
+            path: path.into(),
+            exec: false,
+            meta: Default::default(),
+            content: Content::Inline {
+                b64: STANDARD.encode(content),
+            },
+        }
+    }
+
+    /// three distinct pre-existing directories (distinct file content ⇒ distinct
+    /// dir tree objects), committed and adopted — the walkable state the budget
+    /// test reads over. returns the committed head hex (the CAS base a follow-up
+    /// commit threads so it can touch the existing paths without a conflict).
+    fn seed_three_dirs(fs: &mut Fs<MemStore>) -> String {
+        let seed = fs
+            .commit(
+                "system",
+                1,
+                1,
+                None,
+                "seed".into(),
+                vec![
+                    put_inline("/d0/f0", b"alpha"),
+                    put_inline("/d1/f1", b"bravo"),
+                    put_inline("/d2/f2", b"charlie"),
+                ],
+            )
+            .expect("seed commits");
+        assert!(seed.is_empty());
+        commit_block(fs);
+        fs.committed_head_for_test().expect("head present")
+    }
+
+    /// a commit whose committed-store reads exceed the cap is REJECTED with the
+    /// stable `object-read budget` reason, and the committed root does NOT move —
+    /// the native half of the both-runtimes proof (`wasm_files_parity` pins the
+    /// wasm half on the real cap).
+    #[test]
+    fn over_budget_commit_is_rejected_and_root_unmoved() {
+        let mut fs = new_fs();
+        let head = seed_three_dirs(&mut fs);
+        // reading the base snapshot + root tree + d0 is already 3 distinct
+        // committed reads, so a cap of 2 trips deterministically before the walk
+        // finishes. (removing the three files touches all three distinct dirs.)
+        fs.set_object_read_budget_for_tests(2);
+        let root_before = fs.root_bytes();
+
+        let err = fs
+            .commit(
+                "system",
+                2,
+                2,
+                Some(head),
+                "rm".into(),
+                vec![
+                    Change::Rm { path: "/d0/f0".into() },
+                    Change::Rm { path: "/d1/f1".into() },
+                    Change::Rm { path: "/d2/f2".into() },
+                ],
+            )
+            .map(|_| ())
+            .expect_err("over-budget commit must reject");
+        assert!(
+            err.contains("object-read budget"),
+            "reason must carry the shared needle, got: {err}"
+        );
+        assert_eq!(
+            fs.root_bytes(),
+            root_before,
+            "a rejected over-budget commit must not move the committed root"
+        );
+    }
+
+    /// the SAME commit under a cap that covers its ~5 distinct reads succeeds and
+    /// moves the root — the boundary is a real ceiling, not an unconditional
+    /// rejection (non-vacuous: proves the reads are counted, not just refused).
+    #[test]
+    fn within_budget_commit_succeeds() {
+        let mut fs = new_fs();
+        let head = seed_three_dirs(&mut fs);
+        fs.set_object_read_budget_for_tests(64);
+        let root_before = fs.root_bytes();
+
+        fs.commit(
+            "system",
+            2,
+            2,
+            Some(head),
+            "rm".into(),
+            vec![
+                Change::Rm { path: "/d0/f0".into() },
+                Change::Rm { path: "/d1/f1".into() },
+                Change::Rm { path: "/d2/f2".into() },
+            ],
+        )
+        .expect("within-budget commit must succeed");
+        commit_block(&mut fs);
+        assert_ne!(
+            fs.root_bytes(),
+            root_before,
+            "the within-budget commit must move the committed root"
+        );
+    }
+
+    /// the stat class too: a commit STAGING more than the cap of new objects
+    /// (each inline file = a chunk + a fileobj object-stat probe) rejects with the
+    /// same needle, with ZERO pre-existing state to walk — the object-stat half of
+    /// the budget (mirroring the kernel counting stats + gets in one bound).
+    #[test]
+    fn over_budget_by_staged_objects_is_rejected() {
+        let mut fs = new_fs();
+        // cap 3: the first inline file stages a chunk (1) + a fileobj (2), the
+        // second stages a chunk (3) then a fileobj (4) — the 4th distinct stat
+        // trips. distinct content keeps every id distinct.
+        fs.set_object_read_budget_for_tests(3);
+        let err = fs
+            .commit(
+                "system",
+                1,
+                1,
+                None,
+                "flood".into(),
+                vec![
+                    put_inline("/a", b"one"),
+                    put_inline("/b", b"two"),
+                    put_inline("/c", b"three"),
+                ],
+            )
+            .map(|_| ())
+            .expect_err("staging past the cap must reject");
+        assert!(
+            err.contains("object-read budget"),
+            "reason must carry the shared needle, got: {err}"
         );
     }
 }

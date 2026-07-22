@@ -19,7 +19,7 @@ use sdk::Msg;
 
 use crate::constants::{CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
 use crate::host_reads::resume_resident_keys;
-use crate::util::{diag_log, epoch_floor, hex};
+use crate::util::{epoch_floor, fatal, hex};
 
 pub(super) struct EpochSpawner<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -64,12 +64,17 @@ impl<'a> EpochSpawner<'a> {
         .get_mut(epoch.checked_sub(self.bank_base).expect("epochs never rebase down") as usize)
         .and_then(|s| s.take())
         .unwrap_or_else(|| {
-            eprintln!(
-                "[node {}] FATAL: epoch {epoch} exhausts the pre-registered                          channel bank ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank", self.label
+            fatal!(
+                self.label,
+                "epoch {epoch} exhausts the pre-registered channel bank \
+                 ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
             );
-            std::process::exit(1);
         });
-        let (vote, certificate, resolver, payload, fetch) = slot;
+        // bundle this epoch's discovery channel slot + the oracle behind the mesh
+        // carrier seam — the swap point where the sim arm substitutes an
+        // in-process `simulated::Network` (crates/kernel/consensus/tests/
+        // in_process_cluster.rs) for this real encrypted-TCP transport.
+        let carrier = super::DiscoveryMesh::new(slot, self.oracle.clone());
         // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
         // rekey/respawn contract for what a scheme migration would take.
         let scheme =
@@ -84,8 +89,7 @@ impl<'a> EpochSpawner<'a> {
                 |bytes| match consensus::decode_finalization(&scheme, &bytes) {
                     Ok(f) => f,
                     Err(e) => {
-                        eprintln!("[node {}] FATAL: {e}", self.label);
-                        std::process::exit(1);
+                        fatal!(self.label, "{e}");
                     }
                 },
             );
@@ -97,11 +101,10 @@ impl<'a> EpochSpawner<'a> {
         // silently drop that op's slot and wedge/fork the node. the
         // resolver fetches missing bytes by digest from the tracked mesh
         // (the oracle is provider AND blocker) and fills the ordered slot.
-        SimplexOrderer::spawn_with_resolver(
+        SimplexOrderer::spawn_with_carrier(
             self.context.child(label),
             scheme,
-            self.oracle.clone(),
-            self.oracle.clone(),
+            carrier,
             self.signer.public_key(),
             format!("{}-e{epoch}", self.signer.public_key()),
             Epoch::new(epoch),
@@ -111,11 +114,6 @@ impl<'a> EpochSpawner<'a> {
             // down epoch die with it (in-flight ops are resubmitted). a
             // RESTART's store arrives pre-seeded from the recovery journal.
             store,
-            vote,
-            certificate,
-            resolver,
-            payload,
-            fetch,
             false,
         )
     }
@@ -157,8 +155,7 @@ pub(super) async fn resume(
     let boot_floor = match recovery.floor_cert() {
         Ok(cert) => cert.filter(|c| c.epoch == resume_epoch),
         Err(e) => {
-            eprintln!("[node {label}] FATAL: persisted finalization floor is damaged: {e}");
-            std::process::exit(1);
+            fatal!(label, "persisted finalization floor is damaged: {e}");
         }
     };
     let last_cert_height = boot_floor.as_ref().map(|c| c.height);
@@ -179,11 +176,14 @@ pub(super) async fn resume(
         .as_ref()
         .map(|floor| floor.height.to_string())
         .unwrap_or_else(|| "none".to_string());
-    diag_log(format!(
-        "DIAG promotion_recovered recovered_height={} recovered_hash={} replayed={} \
-     boot_floor_height={}",
-        recovered_height, recovered_hash, replayed, boot_floor_height
-    ));
+    tracing::debug!(
+        target: "ducktape::recovery",
+        recovered_height,
+        recovered_hash = %recovered_hash,
+        replayed,
+        boot_floor_height = %boot_floor_height,
+        "promotion recovered"
+    );
     let orderer = epoch_spawner.spawn(
         resume_epoch,
         participants.clone(),
@@ -223,8 +223,7 @@ pub(super) async fn resume(
     let resident_keys = match resume_resident_keys(resumed) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {e}");
-            std::process::exit(1);
+            fatal!(label, "{e}");
         }
     };
     let orchestrator = consensus::ValsetOrchestrator::resume(
@@ -237,9 +236,12 @@ pub(super) async fn resume(
     );
     if let Some(ceiling) = pending_boot {
         node.set_view_ceiling(ceiling);
-        println!(
-            "[node {label}] re-armed pending cutover at view {ceiling} (epoch {})",
-            resume_epoch + 1
+        tracing::info!(
+            target: "ducktape::consensus",
+            node = %label,
+            cutover_view = ceiling,
+            epoch = resume_epoch + 1,
+            "pending cutover re-armed"
         );
     }
 
@@ -248,7 +250,10 @@ pub(super) async fn resume(
     // a RESTORED boot prints its recovered line above instead.
     if resumed.is_none() {
         let genesis_hash = node.app_hash();
-        println!("[node {label}] genesis app_hash={}", hex(&genesis_hash));
+        tracing::info!(
+            target: "ducktape::consensus",
+            "node={label} genesis app_hash={}", hex(&genesis_hash)
+        );
     }
 
     // introduce a DISTINCT op per process: node N writes directory key "kN" =

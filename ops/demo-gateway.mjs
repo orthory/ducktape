@@ -75,14 +75,25 @@ async function main() {
   const nodeHex = Buffer.from(nodeBytes).toString("hex");
 
   const bind = JSON.parse(sign([
-    "user-sign-bind",
+    "user",
+    "sign-bind",
     "--key", userKey,
     "--chain-id", chain,
     "--node-pub", nodeHex,
     "--nonce", "0",
   ]));
   const accountId = bind.bind_node.authorizer.key;
-  await submit("identity", bind);
+  try {
+    await submit("identity", bind);
+  } catch (error) {
+    // Same wire-drift family as the gateway component: a module rejecting a
+    // map where its (stale or changed) type wants a sequence. Route
+    // publishing is a demo garnish — skip it loudly, never die over it.
+    if (!error.message.includes("invalid type: map, expected a sequence")) throw error;
+    console.error("[gateway] SKIPPED all routes: identity bind rejected with a map-vs-sequence wire drift — see the gateway-component regen note below");
+    process.exitCode = 78;
+    return;
+  }
 
   let handle = requestedHandle;
   if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(handle) && !RESERVED_ROOT_LABELS.includes(handle)) {
@@ -122,14 +133,15 @@ async function main() {
 
   async function publish(statement) {
     const message = JSON.parse(sign([
-      "user-sign-gateway-route",
+      "user",
+      "sign-gateway-route",
       "--key", userKey,
       "--statement", JSON.stringify(statement),
     ]));
     await submit("gateway", message);
   }
 
-  await publish({
+  const site = {
     version: 1,
     chain_id: chain,
     account_id: accountId,
@@ -147,7 +159,19 @@ async function main() {
         allow_upgrade: false,
       },
     },
-  });
+  };
+  try {
+    await publish(site);
+  } catch (error) {
+    // The thrown message carries the raw HTTP body (JSON-wrapped, quotes
+    // escaped), so match only the module's rejection text.
+    if (!error.message.includes("invalid type: map, expected a sequence")) throw error;
+    // NO-BACKCOMPAT: the embedded gateway component must be regenerated for
+    // Identity's Vec<NodeView>; never retry with its stale Vec<Vec<u8>> wire.
+    console.error("[gateway] SKIPPED all routes: embedded gateway component expects Identity AccountView.nodes as byte arrays, but Identity now returns NodeView objects; regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway)");
+    process.exitCode = 78;
+    return;
+  }
 
   await publish({
     version: 1,

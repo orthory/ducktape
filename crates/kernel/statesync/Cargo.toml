@@ -19,6 +19,8 @@ version.workspace = true
 sdk = { workspace = true }
 host = { workspace = true }
 thiserror = { workspace = true }
+# QmdbStore implements the object-safe `sdk::MerkleStore` (async methods boxed).
+async-trait = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
@@ -35,6 +37,7 @@ futures = "0.3"
 
 [dev-dependencies]
 kv = { workspace = true }
+sdk-testkit = { workspace = true }
 # the duckfs-odb resolver path proof: a real `files` module drives the generic
 # object-possession loop over an in-process ModuleLane (dev-only; statesync
 # never depends on an app crate at build time).

@@ -32,10 +32,11 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
 
-    // the joiner's announce reaches the founder, which redeems it — NO verb
-    // runs anywhere in this window.
-    cluster.wait_marker(1, "invite announce sent to member", Duration::from_secs(90));
-    cluster.wait_marker(0, "invite redemption submitted:", Duration::from_secs(90));
+    // the joiner reaches the founder on its own (the join protocol first contact or the
+    // announce fallback), and the founder redeems it — NO verb runs anywhere
+    // in this window.
+    cluster.wait_admitted(1, Duration::from_secs(90));
+    cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
 
     // the redemption lands in consensus state: the friend holds RESIDENT
     // standing (a full node), while the quorum still seats only the founder.
@@ -94,7 +95,7 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     let invite = cluster.invite();
     let friend_key = cluster.join_friend(&invite);
     cluster.spawn(1);
-    cluster.wait_marker(0, "invite redemption submitted:", Duration::from_secs(90));
+    cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
     let expected = vec![common::unhex(&friend_key)];
     poll_until("the redemption to grant resident standing", CONVERGE, || {
         cluster
@@ -106,21 +107,28 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
             })
     });
 
-    // second redeemer: the SAME blob under a fresh identity — the shared-blob
-    // mistake. before the loud-failure fix this spun forever on "redemption
-    // not landed yet" while the member blindly resubmitted the doomed Redeem.
+    // second redeemer: the SAME blob under a FRESH identity — the shared-blob
+    // mistake. a bearer invite (join ADR) mints the workspace locally without
+    // complaint — there is no targeted key for the CLI to check — and the
+    // single-use invariant lands TERMINALLY at first contact: the founder's
+    // gate sees the spent nonce and refuses permanently, and the joiner stops
+    // loudly instead of parking forever.
     cluster.kill(1);
     std::fs::remove_dir_all(&cluster.friend_dir).expect("wipe first redeemer");
-    let second_key = cluster.join_friend(&invite);
-    assert_ne!(second_key, friend_key, "a wiped dir mints a fresh identity");
-    cluster.spawn(1);
-
-    // the member refuses PERMANENTLY (never resubmits the Redeem op) ...
-    cluster.wait_marker(0, "ALREADY-REDEEMED", Duration::from_secs(120));
-    // ... and the joiner stops retrying with the app/operator FATAL marker.
-    let fatal = cluster.wait_marker(1, "FATAL", Duration::from_secs(120));
+    let out = cluster.try_join_friend(&invite);
     assert!(
-        fatal.contains("invite already redeemed"),
-        "the fatal line names the cause: {fatal}"
+        out.status.success(),
+        "a bearer join mints the workspace locally; the refusal is at first contact:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    cluster.spawn(1);
+    cluster.wait_marker(
+        0,
+        "ALREADY-REDEEMED invite",
+        std::time::Duration::from_secs(90),
+    );
+    cluster.wait_marker(1, "join gate refused", std::time::Duration::from_secs(90));
+    // the refusal is terminal: the joiner exits instead of spinning.
+    cluster.wait_exit(1, std::time::Duration::from_secs(60));
+    let _ = friend_key;
 }

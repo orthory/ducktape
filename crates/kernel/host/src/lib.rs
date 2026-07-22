@@ -31,11 +31,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sdk::{
-    Ctx, Effect, Env, Error, Event, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
-    StateSyncHandle,
+    Continuation, Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, Relay,
+    ResolverSyncTarget, StateRoot, StateSyncHandle,
 };
 use sha2::{Digest, Sha256};
 
+pub mod topology;
 pub mod worker;
 
 /// compute the global app-hash over `modules` — the composition consensus
@@ -91,22 +92,17 @@ pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, 
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
-/// the genesis-constant module id the `upgrade` module registers under. read by
-/// [`Host::effective_version`] to derive the block's protocol version; absent
-/// before the coordinated retrofit, in which case the derivation falls back to
-/// [`BASELINE_VERSION`].
-pub const UPGRADE_MODULE_ID: &str = "upgrade";
+/// the genesis-constant module id the `lifecycle` module registers under. read
+/// by the boundary code-swap realization ([`Host::realize_module_swaps`]) and by
+/// the drain's [`Host::pending_lifecycle_advance`] injection; absent on a host
+/// without the module (e.g. a test registry), in which case no swap is ever
+/// realized or injected.
+pub const LIFECYCLE_MODULE_ID: &str = lifecycle::DEFAULT_LIFECYCLE_ID;
 
 /// the genesis-constant module id the `dispatch` module registers under. read
 /// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
 /// a net without the module, in which case nothing is ever injected.
 const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
-
-/// the genesis-constant module id the `modreg` code registry registers under.
-/// read by the boundary code-swap realization ([`Host::realize_module_swaps`])
-/// and the drain's [`Host::pending_modreg_advance`] injection; absent on a net
-/// without the module, in which case no swap is ever realized or injected.
-pub const MODREG_MODULE_ID: &str = modreg::DEFAULT_MODREG_ID;
 
 /// the out-of-band source of component BYTES for a code swap.
 ///
@@ -118,9 +114,13 @@ pub const MODREG_MODULE_ID: &str = modreg::DEFAULT_MODREG_ID;
 /// `fetch` returns `None` when this node does not (yet) hold the bytes for a
 /// hash — a fail-closed miss that stops the boundary, never a fork.
 /// `Send + Sync` because the ordered lane holds its source across an executor.
+/// `fetch` is async (`?Send`, like every host-side future — the host itself is
+/// `!Send`): a node-side source may go to the mesh for bytes its local store
+/// lacks before answering, and only a still-missing digest is a `None`.
+#[async_trait::async_trait(?Send)]
 pub trait CodeSource: Send + Sync {
     /// component bytes for a content hash, or `None` if absent on this node.
-    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
 }
 
 /// the no-source default: a node wired without any code source. every fetch
@@ -128,10 +128,22 @@ pub trait CodeSource: Send + Sync {
 /// than silently running stale code — and a net with no swaps never notices.
 pub struct NoCodeSource;
 
+#[async_trait::async_trait(?Send)]
 impl CodeSource for NoCodeSource {
-    fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
+    async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         None
     }
+}
+
+/// instantiates a freshly-ADMITTED module from its verified component bytes at
+/// the activation boundary — the constructor twin of [`CodeSource`]. the node
+/// wires the wasm runtime's `from_bytes` here; the host itself stays
+/// wasm-runtime-agnostic. a host without a factory FAILS CLOSED (loudly) when
+/// an admission arms, and a net that never admits modules never notices.
+pub trait ModuleFactory: Send + Sync {
+    /// a module instance for `id` from component bytes already verified
+    /// against the committed code hash.
+    fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Box<dyn Module>, Error>;
 }
 
 /// sha256 content hash of component bytes — the verify side of a code swap.
@@ -142,11 +154,7 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 
 /// lowercase hex of a hash, for fail-closed error messages.
 fn hex32(bytes: &[u8]) -> String {
-    use core::fmt::Write;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    sdk::hash::hex_lower(bytes)
 }
 
 /// the block-constant consensus context for one [`Host::submit_at`]: the agreed
@@ -160,31 +168,16 @@ pub struct BlockContext {
     pub consensus_time: u64,
     /// the root op's real submitter. follow-ups override with `Origin::Module`.
     pub origin: Origin,
-    /// the effective protocol version for this block — `effective_version(height)`
-    /// derived from committed upgrade-module state and stamped by the node layer
-    /// (see [`Host::effective_version`]). copied verbatim into every dispatch's
-    /// [`Env::protocol_version`]. a read-only dispatch input: it is NEVER folded
-    /// into any module `root()` preimage, op/wire encoding, or the app-hash
-    /// composition. defaults to [`BASELINE_VERSION`].
-    pub protocol_version: u32,
 }
 
-/// the baseline protocol version — the version every node runs before any upgrade
-/// activates, and the graceful fallback when the `upgrade` module is not yet
-/// registered (a host without the module, e.g. a test registry). Matches the `upgrade` module's uninitialized
-/// `current_version == 0`, so a fresh module and a module-absent host agree.
-pub const BASELINE_VERSION: u32 = 0;
-
 impl Default for BlockContext {
-    /// the pre-consensus default: height/time 0, an empty external origin, and the
-    /// baseline protocol version, so [`Host::submit`] is byte-for-byte the old
-    /// hardcoded behavior.
+    /// the pre-consensus default: height/time 0 and an empty external origin,
+    /// so [`Host::submit`] is byte-for-byte the old hardcoded behavior.
     fn default() -> Self {
         Self {
             height: 0,
             consensus_time: 0,
             origin: Origin::External(Vec::new()),
-            protocol_version: BASELINE_VERSION,
         }
     }
 }
@@ -218,10 +211,9 @@ pub struct DispatchRecord {
 pub struct BlockOutcome {
     /// the app-hash over the registry after the drain settled.
     pub app_hash: StateRoot,
-    /// observability events emitted during the block, in dispatch order.
+    /// events emitted during the block, in dispatch order — observability, and
+    /// the lane the host-owned worker seam claims off-consensus work from.
     pub events: Vec<Event>,
-    /// effect intents emitted during the block — stub sink this slice.
-    pub effects: Vec<Effect>,
     /// the deterministic dispatch trace: one entry per module dispatched this
     /// block, in drain order. the "what happened" spine the node layer tags with
     /// node-local timing for its metrics.
@@ -242,15 +234,56 @@ pub struct BatchOutcome {
     pub app_hash: StateRoot,
     /// one outcome per input op, in input order.
     pub members: Vec<MemberOutcome>,
-    /// aggregate observability events, in drain order: every applied member's
-    /// trace in input order, then the once-per-block injections.
+    /// derived continuation members, `(parent input index, outcome)` in
+    /// release order (a parent's continuation releases immediately after that
+    /// parent's disposition settles). NOT counted in [`members`](Self::members)
+    /// — the 1:1 input-order contract there holds; a continuation is envelope-
+    /// derived work, dispatched `Origin::Module(parent_target)` with the relay
+    /// slot populated, and isolated exactly like a member (a rejecting
+    /// continuation never takes its parent's committed stage down). empty when
+    /// no input op carried a continuation.
+    pub continuations: Vec<(usize, MemberOutcome)>,
+    /// aggregate events, in drain order: every applied member's trace in input
+    /// order (each parent's accepted continuation immediately after it), then
+    /// the once-per-block injections.
     pub events: Vec<Event>,
-    /// aggregate effect intents, in the same order.
-    pub effects: Vec<Effect>,
     /// the dispatch trace from the once-per-block System injections
-    /// (`pending_advance` / `pending_modreg_advance` / `pending_deliveries`),
+    /// (`pending_lifecycle_advance` / `pending_deliveries`),
     /// drained once after the members.
     pub system_dispatches: Vec<DispatchRecord>,
+}
+
+impl BatchOutcome {
+    /// flatten this outcome into the block-level facts the replay paths seal
+    /// and fold from: whether the block RAN REAL WORK (any member applied, any
+    /// released continuation applied, or a once-per-block System injection
+    /// dispatched — the live drain's seal-disposition rule), and the aggregate
+    /// dispatch trace in the live index order — each applied member in input
+    /// order with its applied continuation immediately after it, then the
+    /// System injections. recovery replay and suffix catch-up fold THIS exact
+    /// order, so a re-derived per-module op index matches the live one row for
+    /// row.
+    pub fn into_trace(self) -> (bool, Vec<DispatchRecord>) {
+        let mut cont_by_parent: Vec<Option<MemberOutcome>> =
+            self.members.iter().map(|_| None).collect();
+        for (parent, cont) in self.continuations {
+            cont_by_parent[parent] = Some(cont);
+        }
+        let mut dispatches = Vec::new();
+        let mut ran = !self.system_dispatches.is_empty();
+        for (member, cont) in self.members.into_iter().zip(cont_by_parent) {
+            if let MemberOutcome::Applied { dispatches: d } = member {
+                ran = true;
+                dispatches.extend(d);
+            }
+            if let Some(MemberOutcome::Applied { dispatches: d }) = cont {
+                ran = true;
+                dispatches.extend(d);
+            }
+        }
+        dispatches.extend(self.system_dispatches);
+        (ran, dispatches)
+    }
 }
 
 /// the outcome of one member op in a [`BatchOutcome`].
@@ -262,6 +295,79 @@ pub enum MemberOutcome {
     /// the accepted members replayed, so it left no trace on committed state. the
     /// reason is the drain [`Error`] rendered to a string.
     Rejected { reason: String },
+}
+
+/// one submitted op at the batch seam: the verified origin and root msg the
+/// `(Origin, Msg)` pair always carried, plus the envelope's optional
+/// continuation and its content id. [`Host::submit_block`] wraps bare pairs
+/// into continuation-free `BlockOp`s, so pre-envelope callers are untouched;
+/// the node's frame drain builds these directly.
+#[derive(Clone, Debug)]
+pub struct BlockOp {
+    /// the frame's verified authorship — the envelope AUTHOR, threaded into
+    /// the continuation relay's `author` slot.
+    pub origin: Origin,
+    /// the root msg (the PARENT op of any attached continuation).
+    pub msg: Msg,
+    /// the envelope's `continue` body, released after the parent's
+    /// disposition settles. depth 1 by shape ([`sdk::Continuation`]).
+    pub continuation: Option<Continuation>,
+    /// the envelope's content id (frame id), threaded into the relay slot for
+    /// correlation. all-zero for pre-envelope callers — a relay never
+    /// materializes without a continuation, so the placeholder is unread.
+    pub frame: [u8; 32],
+}
+
+impl BlockOp {
+    /// a continuation-free op — the [`Host::submit_block`] wrapping.
+    pub fn bare(origin: Origin, msg: Msg) -> Self {
+        Self {
+            origin,
+            msg,
+            continuation: None,
+            frame: [0; 32],
+        }
+    }
+}
+
+/// one accepted drain unit (a member op or a released continuation) inside
+/// [`Host::apply_block`]'s per-op isolation: the inputs needed to REPLAY it
+/// verbatim after an isolation rollback, plus its authoritative trace.
+struct AcceptedUnit {
+    origin: Origin,
+    msg: Msg,
+    /// the relay the unit's root dispatch carried (continuations only) —
+    /// captured at first execution and reused verbatim on replay (determinism
+    /// makes recapture equal; reuse is the cheaper identity).
+    relay: Option<Relay>,
+    /// where the unit's outcome lands in the [`BatchOutcome`].
+    slot: UnitSlot,
+    events: Vec<Event>,
+    dispatches: Vec<DispatchRecord>,
+}
+
+/// the [`BatchOutcome`] slot an [`AcceptedUnit`]'s trace is written to.
+enum UnitSlot {
+    /// `members[i]` — an input op.
+    Member(usize),
+    /// `continuations[row]` — a derived continuation unit.
+    Continuation(usize),
+}
+
+/// cap a parent rejection reason for the relay's `Err` arm at
+/// [`sdk::MAX_RELAY_ERROR_BYTES`], truncating on a char boundary — identical
+/// on every node (the string itself is deterministic; the cap keeps a prose
+/// reason from bloating a consensus op).
+fn cap_relay_reason(reason: &Error) -> String {
+    let mut s = reason.to_string();
+    if s.len() > sdk::MAX_RELAY_ERROR_BYTES {
+        let mut cut = sdk::MAX_RELAY_ERROR_BYTES;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+    s
 }
 
 /// a finalized consensus boundary the host is allowed to serve from.
@@ -438,13 +544,23 @@ impl std::error::Error for SnapshotError {}
 pub struct Host {
     /// deterministic iteration order is load-bearing for snapshot + app-hash.
     registry: BTreeMap<ModuleId, Box<dyn Module>>,
+    /// instantiates post-genesis ADMISSIONS at the activation boundary.
+    /// `None` fails closed the moment an admission arms — never before.
+    module_factory: Option<Box<dyn ModuleFactory>>,
 }
 
 impl Host {
     pub fn new() -> Self {
         Self {
             registry: BTreeMap::new(),
+            module_factory: None,
         }
+    }
+
+    /// wire the constructor for post-genesis module admissions (the node
+    /// injects the wasm runtime's `from_bytes`; same shape as `CodeSource`).
+    pub fn set_module_factory(&mut self, factory: Box<dyn ModuleFactory>) {
+        self.module_factory = Some(factory);
     }
 
     /// register a module under its own [`Module::id`]. genesis-time wiring.
@@ -497,9 +613,6 @@ impl Host {
                         consensus_time: 0,
                         origin: Origin::System,
                         me: target.clone(),
-                        // an out-of-block external read has no block version; it
-                        // reads committed state under the baseline format.
-                        protocol_version: BASELINE_VERSION,
                     },
                     snapshot: &snapshot,
                     registry: &self.registry,
@@ -530,92 +643,33 @@ impl Host {
         }
     }
 
-    /// the effective protocol version governing block `height`, derived from the
-    /// committed `upgrade`-module state (the pure `effective_version` derivation,
-    /// not the raw stored `current_version`). the node layer stamps this onto
-    /// [`BlockContext::protocol_version`] so dispatch and hashing agree that block
-    /// `height` runs one version.
+    /// the SYSTEM-ORIGIN lifecycle `Advance` the drain injects in-block at a
+    /// finalized code-swap boundary, or `None` when there is nothing to
+    /// reconcile.
     ///
-    /// this is a read-only, out-of-block committed read (routed like any external
-    /// [`Host::query`]). the `upgrade` module is a genesis constant on an upgraded
-    /// net, but is ABSENT before the coordinated retrofit — so a missing module,
-    /// an undecodable reply, or any query error gracefully falls back to
-    /// [`BASELINE_VERSION`] rather than panicking or erroring. behavior is
-    /// therefore unchanged until the module is registered and a pending upgrade
-    /// arms at its activation height.
-    pub async fn effective_version(&self, height: u64) -> u32 {
-        let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
-        match self.query(UPGRADE_MODULE_ID, &req).await {
-            Ok(bytes) => match upgrade::decode_reply(&bytes) {
-                Ok(upgrade::UpgradeReply::Status(s)) => {
-                    // the ONE shared predicate — the host stamps EXACTLY what the
-                    // module's Advance arm check computes (both route through
-                    // upgrade::effective_version), so dispatch and hashing
-                    // can never diverge at the boundary (risk R4).
-                    upgrade::effective_version(
-                        height,
-                        s.current_version,
-                        s.pending.as_ref(),
-                        &s.members,
-                        |member| {
-                            s.ready
-                                .binary_search_by(|ready| ready.as_slice().cmp(member))
-                                .is_ok()
-                        },
-                    )
-                }
-                // module present but reply unreadable — never fork on a decode slip.
-                Err(_) => BASELINE_VERSION,
-            },
-            // module absent or unreadable — baseline, never error.
-            Err(_) => BASELINE_VERSION,
-        }
-    }
-
-    /// drive the agreed boundary protocol version into EVERY registered module at
-    /// the finalized activation boundary (design §4). the version is read from
-    /// frozen boundary state (the orchestrator's `RespawnPlan::boundary_version`),
-    /// identical on every honest node, so this is a deterministic self-transition —
-    /// never a wall-clock/IO/RNG input. a no-op for modules that don't override
-    /// [`Module::set_active_version`] (only dual-path modules do), and
-    /// `version` is a NON-hashed branch selector — it never enters any `root()`
-    /// preimage, so `app_hash()` is unmoved by this call alone (the app-hashed
-    /// reconciliation of the upgrade module's own `current_version` rides the
-    /// in-block System `Advance` the drain injects at the same height).
-    pub fn set_active_version(&mut self, version: u32) {
-        for m in self.registry.values_mut() {
-            m.set_active_version(version);
-        }
-    }
-
-    /// the SYSTEM-ORIGIN `Advance` the drain injects in-block at a finalized
-    /// activation boundary, or `None` when there is nothing to reconcile.
-    ///
-    /// this is the replay-safe realization of the design's "arm/abort is a
-    /// deterministic self-transition evaluated exactly once at `H`": because it
-    /// rides the SAME [`Host::submit_at`] drain that recovery-replay and
-    /// state-sync-install also run, the `current_version` flip + pending clear
-    /// reconstruct byte-for-byte on every node (never a respawn side-effect,
-    /// invisible to replay). keyed purely on committed upgrade state + `height`:
-    /// injected iff the committed `upgrade` module holds a pending upgrade whose
-    /// `activation_height` has been reached. idempotent — the first block at/after
-    /// `H` clears the pending, so later blocks inject nothing. ABSENT until the
-    /// module is registered (the `Status` query errors → `None`), so the drain is
+    /// this is the replay-safe realization of "arm/abort is a deterministic
+    /// self-transition evaluated exactly once at `H`": because it rides the
+    /// SAME [`Host::submit_at`] drain that recovery-replay and
+    /// state-sync-install also run, the committed active-hash flip +
+    /// pending-swap clear reconstruct byte-for-byte on every node (never a
+    /// respawn side-effect, invisible to replay). keyed purely on committed
+    /// lifecycle state + `height`: injected iff the committed module holds an
+    /// armed swap (ready + height reached). idempotent — the first block
+    /// at/after `H` clears it, so later blocks inject nothing. ABSENT until
+    /// the module is registered (the query errors → `None`), so the drain is
     /// byte-identical on a net without the module.
-    async fn pending_advance(&self, height: u64) -> Option<Msg> {
-        let req = upgrade::encode_query(&upgrade::UpgradeQuery::Status);
-        let bytes = self.query(UPGRADE_MODULE_ID, &req).await.ok()?;
-        let upgrade::UpgradeReply::Status(status) =
-            upgrade::decode_reply(&bytes).ok()?;
-        let pending = status.pending?;
-        if height >= pending.activation_height {
-            Some(Msg {
-                target: UPGRADE_MODULE_ID.into(),
-                payload: upgrade::encode_msg(&upgrade::UpgradeMsg::Advance),
+    async fn pending_lifecycle_advance(&self, height: u64) -> Option<Msg> {
+        let swap_armed = self.lifecycle_module_status().await.is_some_and(|modules| {
+            modules.iter().any(|m| {
+                m.pending
+                    .as_ref()
+                    .is_some_and(|p| p.ready && height >= p.activation_height)
             })
-        } else {
-            None
-        }
+        });
+        swap_armed.then(|| Msg {
+            target: LIFECYCLE_MODULE_ID.into(),
+            payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::Advance),
+        })
     }
 
     /// the SYSTEM-ORIGIN `DeliverPending` the drain injects when the
@@ -656,40 +710,16 @@ impl Host {
         self.pending_deliveries().await.is_some()
     }
 
-    /// the SYSTEM-ORIGIN modreg `Advance` the drain injects in-block, or `None`
-    /// when the committed code registry has no armed swap to activate. mirrors
-    /// [`Host::pending_advance`]: it rides the SAME drain that recovery-replay and
-    /// state-sync-install also run, so the committed active-hash flip + pending
-    /// clear reconstruct byte-for-byte on every node (folded into the app-hash —
-    /// the consensus commitment to WHICH code is active). keyed purely on
-    /// committed registry state + `height`: injected iff the committed registry
-    /// holds a pending swap whose `activation_height` has been reached. idempotent
-    /// — the first block at/after `H` clears the pending, so later blocks inject
-    /// nothing. ABSENT until the module is registered (`Status` errors → `None`),
-    /// so the drain is byte-identical on a net without the code registry.
-    async fn pending_modreg_advance(&self, height: u64) -> Option<Msg> {
-        let modules = self.modreg_status().await?;
-        let any_armed = modules.iter().any(|m| {
-            m.pending
-                .as_ref()
-                .is_some_and(|p| height >= p.activation_height)
-        });
-        any_armed.then(|| Msg {
-            target: MODREG_MODULE_ID.into(),
-            payload: modreg::encode_msg(&modreg::ModregMsg::Advance),
-        })
-    }
-
-    /// the code registry's committed per-module code state, or `None` when the
+    /// the lifecycle module's committed per-module code state, or `None` when the
     /// module is absent / its reply is unreadable — the shared out-of-block
-    /// committed read behind [`Host::pending_modreg_advance`] and
-    /// [`Host::realize_module_swaps`] (mirrors [`Host::effective_version`]'s
-    /// graceful fallback: a missing registry is never an error, just nothing to do).
-    async fn modreg_status(&self) -> Option<Vec<modreg::ModuleCode>> {
-        let req = modreg::encode_query(&modreg::ModregQuery::Status);
-        let bytes = self.query(MODREG_MODULE_ID, &req).await.ok()?;
-        match modreg::decode_reply(&bytes).ok()? {
-            modreg::ModregReply::Status { modules } => Some(modules),
+    /// committed read behind [`Host::pending_lifecycle_advance`] and
+    /// [`Host::realize_module_swaps`] (a missing registry is never an error,
+    /// just nothing to do).
+    async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
+        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
+        let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
+        match lifecycle::decode_reply(&bytes).ok()? {
+            lifecycle::LifecycleReply::ModuleStatus { modules } => Some(modules),
             _ => None,
         }
     }
@@ -710,7 +740,7 @@ impl Host {
     /// reconcile every hot-swappable module's RUNNING code against the code
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;
-    /// the consensus half is the in-block [`Host::pending_modreg_advance`] tick
+    /// the consensus half is the in-block [`Host::pending_lifecycle_advance`] tick
     /// that flips the committed active hash into the app-hash. code is invisible
     /// to `root()`, so a swap keeps the module's state and the app-hash is
     /// byte-continuous across it.
@@ -724,7 +754,7 @@ impl Host {
     ///
     /// the target hash for a module at `height` is a pending hash that has reached
     /// activation (`activation_height <= height`), else its committed ACTIVE hash
-    /// — the SAME predicate modreg's `Advance` arm-check applies, so this
+    /// — the SAME predicate lifecycle's `Advance` arm-check applies, so this
     /// out-of-block realization and the in-block commit never disagree on the arm
     /// set. reading ACTIVE (not only the armed pending) is what lets a state-sync
     /// joiner — which installs post-activation state with no pending left to arm —
@@ -739,26 +769,41 @@ impl Host {
         height: u64,
         src: &dyn CodeSource,
     ) -> Result<(), Error> {
-        let Some(modules) = self.modreg_status().await else {
+        let Some(modules) = self.lifecycle_module_status().await else {
             return Ok(());
         };
         for m in modules {
-            // the SAME arm predicate as modreg::handle_advance (height >=
+            // the SAME arm predicate as lifecycle::handle_advance (height >=
             // activation_height): pending-if-armed, else the committed active hash.
             let target = match m.pending {
-                Some(p) if height >= p.activation_height => p.code_hash,
+                // the SAME arm predicate as lifecycle: ready (full byte receipt,
+                // latched in committed state) AND the height floor reached.
+                Some(p) if p.ready && height >= p.activation_height => p.code_hash,
                 _ => m.active_code_hash,
             };
             // only reconcile a module this node actually runs AS a hot-swappable
-            // component: an absent id, or a native module (no `code_hash`), is
-            // nothing to realize — its registry entry, if any, is a genesis concern.
-            let Some(current) = self.registry.get(&m.module_id).and_then(|x| x.code_hash()) else {
-                continue;
+            // component: a native module (no `code_hash`) is nothing to realize —
+            // its registry entry is a genesis concern. an id absent from the
+            // registry whose committed target is NON-empty is a post-genesis
+            // ADMISSION this boundary must realize by instantiating the module
+            // from its verified bytes; an empty target is an admission not yet
+            // armed.
+            let current = match self.registry.get(&m.module_id) {
+                Some(module) => match module.code_hash() {
+                    Some(current) => Some(current),
+                    None => continue, // native module — genesis concern.
+                },
+                None => {
+                    if target.is_empty() {
+                        continue;
+                    }
+                    None // admission to realize below.
+                }
             };
-            if current == target {
+            if current.as_ref() == Some(&target) {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(&target).ok_or_else(|| {
+            let bytes = src.fetch(&target).await.ok_or_else(|| {
                 Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,
@@ -772,7 +817,31 @@ impl Host {
                     hex32(&target),
                 )));
             }
-            self.swap_module_code(&m.module_id, &bytes)?;
+            match current {
+                Some(_) => self.swap_module_code(&m.module_id, &bytes)?,
+                None => {
+                    // the admission path: registration changes app-hash by
+                    // construction (the registry set is what `app_hash`
+                    // composes over), which is exactly why it rides the same
+                    // readiness/height gate as a swap and realizes at one
+                    // deterministic boundary on every validator.
+                    let Some(factory) = &self.module_factory else {
+                        return Err(Error::Module(format!(
+                            "module {} admitted but no module factory is wired — fail-closed",
+                            m.module_id,
+                        )));
+                    };
+                    let module = factory.instantiate(&m.module_id, &bytes)?;
+                    if module.id() != m.module_id {
+                        return Err(Error::Module(format!(
+                            "module factory instantiated `{}` for admission `{}` — fail-closed",
+                            module.id(),
+                            m.module_id,
+                        )));
+                    }
+                    self.registry.insert(module.id(), module);
+                }
+            }
         }
         Ok(())
     }
@@ -923,7 +992,7 @@ impl Host {
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
 
         match self.drain(ctx, msg, &mut touched).await {
-            Ok((events, effects, dispatches)) => {
+            Ok((events, dispatches)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
                 // app-hash AFTER. a commit failure is FATAL, not a rejection: the
@@ -943,7 +1012,6 @@ impl Host {
                 Ok(BlockOutcome {
                     app_hash: self.app_hash(),
                     events,
-                    effects,
                     dispatches,
                 })
             }
@@ -996,6 +1064,22 @@ impl Host {
         ctx: BlockContext,
         ops: Vec<(Origin, Msg)>,
     ) -> Result<BatchOutcome, SubmitError> {
+        let ops = ops
+            .into_iter()
+            .map(|(origin, msg)| BlockOp::bare(origin, msg))
+            .collect();
+        self.apply_block(ctx, ops, None).await
+    }
+
+    /// [`Host::submit_block`] over full [`BlockOp`]s — the entry for envelope
+    /// ops that may carry a continuation. a parent's continuation is released
+    /// immediately after that parent's disposition settles, as its own
+    /// isolated unit (see [`BatchOutcome::continuations`]).
+    pub async fn submit_block_ops(
+        &mut self,
+        ctx: BlockContext,
+        ops: Vec<BlockOp>,
+    ) -> Result<BatchOutcome, SubmitError> {
         self.apply_block(ctx, ops, None).await
     }
 
@@ -1007,10 +1091,12 @@ impl Host {
     /// but whose in-memory cohort was rolled back to the checkpoint; replay re-runs
     /// the frame and commits ONLY the at-pre cohort, aborting the durable substrate
     /// (re-committing it would move its op-log root and fork). NOT the live path.
+    /// takes full [`BlockOp`]s: a journaled envelope frame's continuation must re-run
+    /// on the heal exactly as it ran live, or the sealed roots cannot reproduce.
     pub async fn submit_block_committing(
         &mut self,
         ctx: BlockContext,
-        ops: Vec<(Origin, Msg)>,
+        ops: Vec<BlockOp>,
         commit_only: &BTreeSet<ModuleId>,
     ) -> Result<BatchOutcome, SubmitError> {
         self.apply_block(ctx, ops, Some(commit_only)).await
@@ -1023,67 +1109,80 @@ impl Host {
     async fn apply_block(
         &mut self,
         ctx: BlockContext,
-        ops: Vec<(Origin, Msg)>,
+        ops: Vec<BlockOp>,
         commit_only: Option<&BTreeSet<ModuleId>>,
     ) -> Result<BatchOutcome, SubmitError> {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
-        let protocol_version = ctx.protocol_version;
 
         // 1. the once-per-block System injections, computed ONCE against PRE-batch
         // committed state — the "results staged by this very block are invisible
         // here" invariant, evaluated BEFORE any member stages. same order as the
-        // single-op drain: upgrade `Advance`, then modreg `Advance`, then
-        // `DeliverPending`. drained once, after every member, below (step 4).
+        // single-op drain: the lifecycle `Advance` (one tick reconciling every
+        // armed code swap), then `DeliverPending`. drained once, after every
+        // member, below (step 4).
         let mut injections: VecDeque<(Origin, Msg)> = VecDeque::new();
-        if let Some(advance) = self.pending_advance(height).await {
-            injections.push_back((Origin::System, advance));
-        }
-        // the code-registry boundary tick: flip every armed swap's committed
-        // active hash so the app-hash commits to the new code (the per-node
-        // realization of the actual swap is out-of-block, in realize_module_swaps).
-        if let Some(advance) = self.pending_modreg_advance(height).await {
+        if let Some(advance) = self.pending_lifecycle_advance(height).await {
             injections.push_back((Origin::System, advance));
         }
         if let Some(deliver) = self.pending_deliveries().await {
             injections.push_back((Origin::System, deliver));
         }
 
-        // 2. per-op isolation. `touched` and the modules' own staging accumulate
-        // ACROSS members (never committed mid-batch); a member that rejects rolls
-        // the whole stage back and replays the accepted members, so its rejection
-        // leaves no trace on committed state.
+        // 2. per-op isolation, over UNITS: each input op is one unit, and its
+        // envelope continuation (if any) is a DERIVED unit released right
+        // after the parent's disposition settles — with the SAME isolation (a
+        // rejecting continuation rolls back and the accepted units replay, so
+        // it never takes its parent's stage down). `touched` and the modules'
+        // own staging accumulate ACROSS units (never committed mid-batch);
+        // accepted units (parents AND continuations) all replay on a later
+        // rejection — one shared stage.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
-        // accepted members and their authoritative traces, parallel arrays in
-        // input order; `acc_pos[k]` is the input index of accepted member `k`.
-        let mut accepted: Vec<(Origin, Msg)> = Vec::new();
-        let mut acc_traces: Vec<(Vec<Event>, Vec<Effect>, Vec<DispatchRecord>)> = Vec::new();
-        let mut acc_pos: Vec<usize> = Vec::new();
+        let mut accepted: Vec<AcceptedUnit> = Vec::new();
         let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
+        let mut continuations: Vec<(usize, MemberOutcome)> = Vec::new();
 
-        for (i, (origin, msg)) in ops.into_iter().enumerate() {
+        for (i, op) in ops.into_iter().enumerate() {
+            let BlockOp {
+                origin,
+                msg,
+                continuation,
+                frame,
+            } = op;
+
+            // the parent unit.
             let mut ev: Vec<Event> = Vec::new();
-            let mut ef: Vec<Effect> = Vec::new();
             let mut di: Vec<DispatchRecord> = Vec::new();
             let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
+            // the relay outcome the continuation (if any) will carry: the
+            // parent's declared output on accept, its capped deterministic
+            // rejection string on reject. the CONTINUATION ALWAYS FIRES —
+            // dropping it on failure would strand the very reentry flow the
+            // envelope composed it for.
+            let relay_outcome: Result<Vec<u8>, String>;
             match self
                 .drain_queue(
                     height,
                     consensus_time,
-                    protocol_version,
                     queue,
+                    None,
                     &mut touched,
                     &mut ev,
-                    &mut ef,
                     &mut di,
                 )
                 .await
             {
-                Ok(()) => {
-                    accepted.push((origin, msg));
-                    acc_traces.push((ev, ef, di));
-                    acc_pos.push(i);
+                Ok(output) => {
+                    relay_outcome = Ok(output.unwrap_or_default());
+                    accepted.push(AcceptedUnit {
+                        origin: origin.clone(),
+                        msg: msg.clone(),
+                        relay: None,
+                        slot: UnitSlot::Member(i),
+                        events: ev,
+                        dispatches: di,
+                    });
                     // authoritative trace is written after the loop (step 3);
                     // this placeholder is overwritten there.
                     results[i] = Some(MemberOutcome::Applied {
@@ -1091,57 +1190,108 @@ impl Host {
                     });
                 }
                 Err(reason) => {
-                    // ISOLATE: this member's partial stage is entangled with the
-                    // accepted members' stage (one shared per-module stage), so
+                    // ISOLATE: this unit's partial stage is entangled with the
+                    // accepted units' stage (one shared per-module stage), so
                     // roll the WHOLE stage back, then replay only the accepted
-                    // members to rebuild their writes without this one.
+                    // units to rebuild their writes without this one.
                     self.abort_all(&mut touched).await?;
-                    for (k, (o, m)) in accepted.iter().enumerate() {
-                        let mut rev: Vec<Event> = Vec::new();
-                        let mut ref_: Vec<Effect> = Vec::new();
-                        let mut rdi: Vec<DispatchRecord> = Vec::new();
-                        let rq: VecDeque<(Origin, Msg)> = VecDeque::from([(o.clone(), m.clone())]);
-                        // an accepted member drained Ok in this same context
-                        // before; a reject on replay is NON-DETERMINISM → fatal.
-                        self.drain_queue(
-                            height,
-                            consensus_time,
-                            protocol_version,
-                            rq,
-                            &mut touched,
-                            &mut rev,
-                            &mut ref_,
-                            &mut rdi,
-                        )
-                        .await
-                        .map_err(|re| {
-                            SubmitError::Fatal(FatalError {
-                                module: m.target.clone(),
-                                phase: BoundaryPhase::Abort,
-                                source: Error::Module(format!(
-                                    "non-deterministic reject replaying accepted batch \
-                                     member during per-op isolation: {re}"
-                                )),
-                            })
-                        })?;
-                        acc_traces[k] = (rev, ref_, rdi);
-                    }
+                    self.replay_accepted(
+                        height,
+                        consensus_time,
+                        &mut accepted,
+                        &mut touched,
+                    )
+                    .await?;
+                    relay_outcome = Err(cap_relay_reason(&reason));
                     results[i] = Some(MemberOutcome::Rejected {
                         reason: reason.to_string(),
                     });
                 }
             }
+
+            // the derived continuation unit: `Origin::Module(parent_target)`
+            // is the sending LANE; the authenticated AUTHOR travels in the
+            // relay slot (the authorization rule — attaching a continuation
+            // grants nothing).
+            let Some(cont) = continuation else { continue };
+            let relay = Relay {
+                author: origin,
+                parent_target: msg.target.clone(),
+                parent_frame: frame,
+                outcome: relay_outcome,
+            };
+            let corigin = Origin::Module(msg.target);
+            let cmsg = Msg {
+                target: cont.target,
+                payload: cont.payload,
+            };
+            let mut cev: Vec<Event> = Vec::new();
+            let mut cdi: Vec<DispatchRecord> = Vec::new();
+            let cqueue: VecDeque<(Origin, Msg)> =
+                VecDeque::from([(corigin.clone(), cmsg.clone())]);
+            match self
+                .drain_queue(
+                    height,
+                    consensus_time,
+                    cqueue,
+                    Some(relay.clone()),
+                    &mut touched,
+                    &mut cev,
+                    &mut cdi,
+                )
+                .await
+            {
+                Ok(_cont_output) => {
+                    // a continuation's own declared output has no consumer —
+                    // depth 1 by shape means nothing continues IT.
+                    let row = continuations.len();
+                    continuations.push((
+                        i,
+                        MemberOutcome::Applied {
+                            dispatches: Vec::new(),
+                        },
+                    ));
+                    accepted.push(AcceptedUnit {
+                        origin: corigin,
+                        msg: cmsg,
+                        relay: Some(relay),
+                        slot: UnitSlot::Continuation(row),
+                        events: cev,
+                        dispatches: cdi,
+                    });
+                }
+                Err(reason) => {
+                    self.abort_all(&mut touched).await?;
+                    self.replay_accepted(
+                        height,
+                        consensus_time,
+                        &mut accepted,
+                        &mut touched,
+                    )
+                    .await?;
+                    continuations.push((
+                        i,
+                        MemberOutcome::Rejected {
+                            reason: reason.to_string(),
+                        },
+                    ));
+                }
+            }
         }
 
-        // 3. write each accepted member's authoritative trace and accumulate the
-        // aggregate events/effects in input order (accepted / acc_traces / acc_pos
-        // are all in input order).
+        // 3. write each accepted unit's authoritative trace into its slot and
+        // accumulate the aggregate events in execution order (input order,
+        // each parent's accepted continuation immediately after it).
         let mut events: Vec<Event> = Vec::new();
-        let mut effects: Vec<Effect> = Vec::new();
-        for ((ev, ef, di), pos) in acc_traces.into_iter().zip(acc_pos.iter()) {
-            events.extend(ev);
-            effects.extend(ef);
-            results[*pos] = Some(MemberOutcome::Applied { dispatches: di });
+        for unit in accepted {
+            events.extend(unit.events);
+            let outcome = MemberOutcome::Applied {
+                dispatches: unit.dispatches,
+            };
+            match unit.slot {
+                UnitSlot::Member(pos) => results[pos] = Some(outcome),
+                UnitSlot::Continuation(row) => continuations[row].1 = outcome,
+            }
         }
 
         // 4. drain the once-per-block injections ONCE, on top of the accepted
@@ -1150,16 +1300,14 @@ impl Host {
         // abort fault, else the deterministic rejection.
         let mut system_dispatches: Vec<DispatchRecord> = Vec::new();
         let mut sys_events: Vec<Event> = Vec::new();
-        let mut sys_effects: Vec<Effect> = Vec::new();
         if let Err(reason) = self
             .drain_queue(
                 height,
                 consensus_time,
-                protocol_version,
                 injections,
+                None,
                 &mut touched,
                 &mut sys_events,
-                &mut sys_effects,
                 &mut system_dispatches,
             )
             .await
@@ -1168,7 +1316,6 @@ impl Host {
             return Err(SubmitError::Rejected(reason));
         }
         events.extend(sys_events);
-        effects.extend(sys_effects);
 
         // 5. COMMIT once — the single boundary for the whole batch. the live path
         // commits every touched module; recovery partitions on `commit_only`
@@ -1216,8 +1363,8 @@ impl Host {
         Ok(BatchOutcome {
             app_hash: self.app_hash(),
             members: results.into_iter().map(Option::unwrap).collect(),
+            continuations,
             events,
-            effects,
             system_dispatches,
         })
     }
@@ -1246,6 +1393,62 @@ impl Host {
         }
     }
 
+    /// replay every accepted unit (member op or released continuation) after
+    /// an isolation rollback, rebuilding their staged writes and overwriting
+    /// their authoritative traces. an accepted unit drained Ok in this same
+    /// context before, so a reject on replay is NON-DETERMINISM → fatal.
+    async fn replay_accepted(
+        &mut self,
+        height: u64,
+        consensus_time: u64,
+        accepted: &mut [AcceptedUnit],
+        touched: &mut BTreeSet<ModuleId>,
+    ) -> Result<(), SubmitError> {
+        for unit in accepted.iter_mut() {
+            let mut rev: Vec<Event> = Vec::new();
+            let mut rdi: Vec<DispatchRecord> = Vec::new();
+            let rq: VecDeque<(Origin, Msg)> =
+                VecDeque::from([(unit.origin.clone(), unit.msg.clone())]);
+            self.drain_queue(
+                height,
+                consensus_time,
+                rq,
+                unit.relay.clone(),
+                touched,
+                &mut rev,
+                &mut rdi,
+            )
+            .await
+            .map_err(|re| {
+                // the kernel's ONLY in-band detector of module
+                // non-determinism, and the most fork-relevant event that
+                // can occur — a module that rejects on replay what it
+                // accepted on first execution. it was being wrapped into
+                // a FatalError mislabelled as an Abort-phase boundary
+                // fault and returned in SILENCE.
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    module = %unit.msg.target,
+                    error = %re,
+                    "NON-DETERMINISTIC module: rejected on replay what it \
+                     accepted during per-op isolation — this node's state \
+                     may diverge from its peers"
+                );
+                SubmitError::Fatal(FatalError {
+                    module: unit.msg.target.clone(),
+                    phase: BoundaryPhase::Abort,
+                    source: Error::Module(format!(
+                        "non-deterministic reject replaying accepted batch \
+                         member during per-op isolation: {re}"
+                    )),
+                })
+            })?;
+            unit.events = rev;
+            unit.dispatches = rdi;
+        }
+        Ok(())
+    }
+
     /// the block's dispatch DRAIN: route the root op, run its `execute`, and
     /// re-dispatch every emitted follow-up FIFO until the queue empties or the
     /// dispatch budget is hit. modules only STAGE here — nothing is committed;
@@ -1257,38 +1460,25 @@ impl Host {
         ctx: BlockContext,
         msg: Msg,
         touched: &mut BTreeSet<ModuleId>,
-    ) -> Result<(Vec<Event>, Vec<Effect>, Vec<DispatchRecord>), Error> {
+    ) -> Result<(Vec<Event>, Vec<DispatchRecord>), Error> {
         // block-constant across every dispatch this block — the agreed values.
         let height = ctx.height;
         let consensus_time = ctx.consensus_time;
-        // effective_version(height) for this block — stamped constant across the
-        // root op and every FIFO follow-up; a read-only dispatch input, NEVER hashed.
-        let protocol_version = ctx.protocol_version;
 
         // the root op carries the real submitter's origin; follow-ups override.
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
 
-        // DETERMINISTIC ACTIVATION INJECTION (design §4 / plan Task 6.3). at a
-        // finalized boundary where the committed `upgrade` module holds a pending
-        // upgrade that has reached its activation height, append EXACTLY ONE
-        // System-origin `Advance` so the module reconciles its own app-hashed state
-        // in-block (ARM: `current_version = to_version` + clear pending/readiness;
-        // ABORT: clear only) at the SAME finalized view on every node. it rides this
-        // drain (not the respawn side-path), so live, recovery-replay, and
-        // state-sync nodes all reconstruct it byte-for-byte. this is what frees the
+        // DETERMINISTIC ACTIVATION INJECTION. at a finalized boundary where the
+        // committed `lifecycle` module holds an armed code swap, append EXACTLY
+        // ONE System-origin `Advance` so the module reconciles its own
+        // app-hashed state in-block (flip every armed active hash — the
+        // consensus commitment to the new code; the actual component swap is
+        // realized out-of-block by `realize_module_swaps`). it rides this drain
+        // (not the respawn side-path), so live, recovery-replay, and state-sync
+        // nodes all reconstruct it byte-for-byte, and it frees the
         // at-most-one-pending slot after activation. INERT until the module is
-        // registered — `pending_advance` returns `None` when the module is absent.
-        if let Some(advance) = self.pending_advance(height).await {
-            queue.push_back((Origin::System, advance));
-        }
-        // DETERMINISTIC CODE-SWAP ACTIVATION INJECTION: when the committed code
-        // registry holds a pending swap that has reached its activation height,
-        // append EXACTLY ONE System-origin modreg `Advance` so the registry flips
-        // the armed active hash in-block (folded into the app-hash) at the SAME
-        // finalized view on every node — the consensus commitment to the new code.
-        // the actual component swap is realized out-of-block by
-        // `realize_module_swaps`. INERT until the module is registered.
-        if let Some(advance) = self.pending_modreg_advance(height).await {
+        // registered — `pending_lifecycle_advance` returns `None` when absent.
+        if let Some(advance) = self.pending_lifecycle_advance(height).await {
             queue.push_back((Origin::System, advance));
         }
         // DETERMINISTIC DELIVERY INJECTION: when the committed dispatch
@@ -1306,20 +1496,18 @@ impl Host {
         // drain into fresh trace vecs. the extracted queue-runner is what
         // submit_block reuses — once per member, then once for the injections.
         let mut events: Vec<Event> = Vec::new();
-        let mut effects: Vec<Effect> = Vec::new();
         let mut dispatches: Vec<DispatchRecord> = Vec::new();
         self.drain_queue(
             height,
             consensus_time,
-            protocol_version,
             queue,
+            None,
             touched,
             &mut events,
-            &mut effects,
             &mut dispatches,
         )
         .await?;
-        Ok((events, effects, dispatches))
+        Ok((events, dispatches))
     }
 
     /// the extracted dispatch-loop queue-runner: pop `(origin, msg)` FIFO, run
@@ -1328,29 +1516,37 @@ impl Host {
     /// ops until the queue empties or [`MAX_DISPATCHES`] is hit. modules only
     /// STAGE; the caller owns the commit/abort boundary. staged writes and
     /// `touched` accumulate across calls, so `submit_block` can drain members one
-    /// at a time on top of one another. `events` / `effects` / `dispatches` are
-    /// appended to (never cleared), so a caller can thread one set of sinks across
-    /// several calls or hand in fresh ones per call. the dispatch budget is
-    /// per-call: each queue-run gets a fresh [`MAX_DISPATCHES`].
+    /// at a time on top of one another. `events` / `dispatches` are appended to
+    /// (never cleared), so a caller can thread one set of sinks across several
+    /// calls or hand in fresh ones per call. the dispatch budget is per-call:
+    /// each queue-run gets a fresh [`MAX_DISPATCHES`].
+    ///
+    /// `relay` rides ONLY the queue's ROOT dispatch (a released continuation);
+    /// follow-ups never inherit it — the relay slot marks "this dispatch IS
+    /// the continuation", nothing downstream. the return is the root
+    /// dispatch's declared output ([`Ctx::set_output`]) — what a parent's
+    /// continuation relays on its `Ok` arm; `None` when the root declared
+    /// nothing (relayed as empty).
     #[allow(clippy::too_many_arguments)]
     async fn drain_queue(
         &mut self,
         height: u64,
         consensus_time: u64,
-        protocol_version: u32,
         mut queue: VecDeque<(Origin, Msg)>,
+        mut relay: Option<Relay>,
         touched: &mut BTreeSet<ModuleId>,
         events: &mut Vec<Event>,
-        effects: &mut Vec<Effect>,
         dispatches: &mut Vec<DispatchRecord>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<Vec<u8>>, Error> {
         let mut n: u32 = 0;
+        let mut root_output: Option<Vec<u8>> = None;
 
         while let Some((origin, msg)) = queue.pop_front() {
             n += 1;
             if n > MAX_DISPATCHES {
                 return Err(Error::BudgetExceeded);
             }
+            let is_root = n == 1;
 
             // remove → owned module, decoupled from the map's borrow.
             let mut me = self
@@ -1378,13 +1574,15 @@ impl Host {
                     consensus_time,
                     origin: trigger.clone(),
                     me: msg.target.clone(),
-                    protocol_version,
                 },
                 snapshot,
                 registry: &self.registry, // the rest — for query routing
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
-                out_effects: Vec::new(),
+                // the relay rides the root dispatch only: `take` empties the
+                // slot after the first iteration, so follow-ups see `None`.
+                relay: if is_root { relay.take() } else { None },
+                out_output: None,
             };
 
             // owned `me` (&mut) and `ctx` (holding &rest) are disjoint borrows,
@@ -1395,13 +1593,29 @@ impl Host {
             let HostCtx {
                 out_msgs,
                 out_events,
-                out_effects,
+                out_output,
                 ..
             } = ctx;
 
             // reinsert BEFORE propagating any error — a module never vanishes.
             self.registry.insert(msg.target.clone(), me);
             res?;
+
+            // an oversized declared output is a deterministic REJECTION of the
+            // op, never a truncation (the saga oversize discipline: bytes that
+            // would ride a consensus lane are capped loudly at the source).
+            if let Some(out) = &out_output
+                && out.len() > sdk::MAX_OUTPUT_BYTES
+            {
+                return Err(Error::Module(format!(
+                    "op output exceeds cap ({} > {})",
+                    out.len(),
+                    sdk::MAX_OUTPUT_BYTES
+                )));
+            }
+            if is_root {
+                root_output = out_output;
+            }
 
             // record this (successful) dispatch for the deterministic trace. only
             // committed blocks yield a BlockOutcome, so a later abort discards the
@@ -1416,15 +1630,14 @@ impl Host {
             });
 
             // local-only re-entry: emitted msgs become follow-up ops, never
-            // re-broadcast. events/effects leave the state machine.
+            // re-broadcast. events leave the state machine.
             for m in out_msgs {
                 queue.push_back((Origin::Module(msg.target.clone()), m));
             }
             events.extend(out_events);
-            effects.extend(out_effects);
         }
 
-        Ok(())
+        Ok(root_output)
     }
 }
 
@@ -1437,7 +1650,11 @@ struct HostCtx<'a> {
     registry: &'a BTreeMap<ModuleId, Box<dyn Module>>,
     out_msgs: Vec<Msg>,
     out_events: Vec<Event>,
-    out_effects: Vec<Effect>,
+    /// the relay slot — `Some` iff THIS dispatch is a released continuation.
+    relay: Option<Relay>,
+    /// the op's declared output ([`Ctx::set_output`]), staged with the
+    /// dispatch; the drain caps it and threads the root's into the relay.
+    out_output: Option<Vec<u8>>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1463,7 +1680,6 @@ impl Ctx for HostCtx<'_> {
                         consensus_time: self.env.consensus_time,
                         origin: self.env.origin.clone(),
                         me: target.clone(),
-                        protocol_version: self.env.protocol_version,
                     },
                     snapshot: &self.snapshot,
                     registry: self.registry,
@@ -1479,12 +1695,16 @@ impl Ctx for HostCtx<'_> {
         self.out_msgs.push(msg);
     }
 
-    fn emit_event(&mut self, ev: Event) {
-        self.out_events.push(ev);
+    fn relay(&self) -> Option<&Relay> {
+        self.relay.as_ref()
     }
 
-    fn request_effect(&mut self, eff: Effect) {
-        self.out_effects.push(eff);
+    fn set_output(&mut self, bytes: Vec<u8>) {
+        self.out_output = Some(bytes);
+    }
+
+    fn emit_event(&mut self, ev: Event) {
+        self.out_events.push(ev);
     }
 }
 
@@ -1525,7 +1745,6 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
                         consensus_time: self.env.consensus_time,
                         origin: self.env.origin.clone(),
                         me: target,
-                        protocol_version: self.env.protocol_version,
                     },
                     snapshot: self.snapshot,
                     registry: self.registry,
@@ -1540,8 +1759,6 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
     fn emit_msg(&mut self, _msg: Msg) {}
 
     fn emit_event(&mut self, _ev: Event) {}
-
-    fn request_effect(&mut self, _eff: Effect) {}
 }
 
 #[cfg(test)]

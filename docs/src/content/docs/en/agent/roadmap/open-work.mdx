@@ -1,0 +1,80 @@
+---
+title: "Open Work"
+---
+
+This page tracks implementation gaps that agents should not accidentally present
+as finished.
+
+Related: [human What Is Left](/en/human/roadmap/what-is-left) is the reader
+version, [Product Modules](/en/human/modules/product-modules) explains built
+module behavior, [Coordination](/en/human/network/coordination) covers
+rendezvous, and [Implementation Status](/en/human/reference/implementation-status)
+is the built/tested checklist.
+
+## WireGuard Tunnel Runtime
+
+`crates/system/wireguard` (validation at the crate root, the apply layer at
+`wireguard::effect`; the former `wireguard-upgrade` and `wireguard-effect`
+crates, merged) is no longer a protocol leaf: the node's reachability plane
+applies validated `TunnelInstallPlan`s through a configured `WireGuardEffect`,
+and the parallel `valset::mesh` contract was deleted rather than unified. A
+privileged Linux netns e2e that creates a real WireGuard interface is still
+deliberately descoped.
+
+## Demotion And Promotion Edges
+
+A validator removed at epoch cutover still halts instead of staying online as a
+sync/resident. Joiner promotion itself has shipped: a parked joiner can sync an
+admitting boundary, write a promotion checkpoint, reboot, and vote. Do not list
+that as missing.
+
+The remaining promotion-adjacent operator work is the stale local-state story:
+pre-recovery or damaged recovery directories fail loudly rather than migrating,
+and demoted nodes do not yet fall back into a resident role automatically.
+
+## Replay Nonces
+
+The ordered frame carries `(origin, seq)`, but replicated state does not enforce
+per-origin nonce monotonicity. A byte-identical cross-epoch replay is currently
+gated only by the per-engine finalization dedup; committed nonce state is the
+planned durable replacement.
+
+## Restart-Recovery Compatibility
+
+Restart recovery is live: checkpoints, op-journal replay, cutover records, and
+floor certificates recover current nodes. The edge is an older/pre-recovery
+storage directory: if local state exists without a recovery checkpoint, boot
+fails loudly and tells the operator to wipe/re-sync rather than migrating in
+place.
+
+## Agent Product Path
+
+The live node now includes `agent`, `runs`, `jobs`, `dispatch`, `saga`,
+`capability`, and `tagging` in its module set. It discovers local capability
+providers, announces the truthful tag set, and runs a dispatch worker over
+leases assigned to its own key. The remaining product work is not the basic
+agent execution loop; it is richer operator UX and package-level behavior:
+packaged agents and harnesses, broader action vocabularies, task obligations,
+and durable agent workflows that feel native rather than a debug surface.
+
+## duckfs Client Stack
+
+duckfs Phases 1–2 are shipped: the rebuilt `files` module (staging, atomic
+per-path-CAS commits, snapshots, pins, watches, snapshot-addressed reads),
+resolver-backed state sync to full possession, restart durability, and the
+noded HTTP surface are present. The client side is also built: `crates/duckfs/client`
+owns the checkout/status/commit engine, `ducktape-fs` ships read verbs plus
+checkout/status/commit/pin, and `mount` exists behind the `fuse` cargo feature.
+Do not list the engine, CLI, or mount as missing. Remaining work is the app
+FilesView/UX rebuilt on duckfs verbs. The old memory/workspace surface was
+absorbed by duckfs snapshots and `duck://files/...` evidence. Filesystem-change
+automations would return as a new duckfs-watch trigger, a fresh feature, not a
+migration.
+
+## Module Integration Wave
+
+The next module wave is integration work across modules that already exist:
+automations deliver to inbox via `Deliver`; automations can trigger from duckfs
+(files) watches; agents can claim jobs; package harnesses can own agents and
+action routes; and tasks can become obligations with deadline state,
+cure/escalation lineage, and atomic cross-module creation.

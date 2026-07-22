@@ -1,0 +1,52 @@
+[package]
+name = "identity"
+edition.workspace = true
+version.workspace = true
+
+# the account registry as replicated state: an ACCOUNT (an umbrella keyed by
+# its founding key) collects many MEMBER KEYS of different schemes and owns
+# many NODES (each a mesh/valset identity). depends on sdk + valset wire types
+# (to member-gate binds) + commonware-cryptography (to verify ed25519/p256
+# member certificates deterministically) + p256/base64 (for the bespoke
+# WebAuthn passkey envelope, which commonware's namespaced signer can't cover).
+[dependencies]
+# wasm-only, behind `guest`: the port harness. a standalone-workspace path
+# crate, pulled only when the guest build compiles this crate for wasm32.
+guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
+sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+valset = { workspace = true }
+commonware-cryptography = { workspace = true }
+# union_unique: the exact namespaced signing preimage commonware's native
+# verify hashes -- exposed so the enrollment side hands a phone the precise
+# bytes to ECDSA-sign for a P256 member (the page never reframes them).
+commonware-utils = { workspace = true }
+# required for the PublicKey/Signature-from-bytes api (DecodeExt) -- same
+# reason valset depends on it.
+commonware-codec = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+# the WebAuthn (passkey) member-key kind verifies a raw ECDSA-P256 assertion
+# envelope (authData ‖ SHA256(clientDataJSON)), NOT commonware's namespaced
+# signer -- so it uses the RustCrypto p256/ecdsa primitives directly. both are
+# already compiled into the tree transitively via commonware-cryptography; this
+# only promotes them to direct deps. deterministic (pure-Rust verify on every
+# arch), so consensus-safe.
+p256 = { workspace = true }
+# base64url-decoding the WebAuthn challenge out of clientDataJSON.
+base64 = { workspace = true }
+
+[features]
+# the wasm-guest port (src/guest.rs): the dispatch shell over
+# guest-adapter. non-default and wasm-only — enabled solely by the
+# guest-builder's synthesized cdylib workspace, never by the native gate.
+guest = ["dep:guest-adapter"]
+# test-only member-auth builders (`identity::testkit`). no extra deps — just
+# gates the module so a shipping build never compiles it. consumers enable it
+# as a dev-dependency feature.
+testkit = []
+
+[dev-dependencies]
+futures = { workspace = true }
+sdk-testkit = { workspace = true }

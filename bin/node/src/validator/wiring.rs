@@ -15,15 +15,16 @@ use commonware_utils::ordered::Set;
 
 use host::Host;
 
+use crate::blob_fetch;
 use crate::config;
 use crate::constants::*;
 use crate::explorer::heal_index;
-use crate::host_reads::read_upgrade_state;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
-use crate::reachability_plane::wire_reachability_plane;
+use crate::lobby;
+use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
-use crate::{blob_fetch, voice, voice_plane};
+use crate::{voice, voice_plane};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -35,12 +36,16 @@ pub(super) struct PreWiring {
     pub(super) channel_bank: super::ChannelBank,
     pub(super) sync_tx: super::MeshSender,
     pub(super) sync_rx: super::MeshReceiver,
-    pub(super) lobby_tx: super::MeshSender,
-    pub(super) lobby_rx: super::MeshReceiver,
     pub(super) relay_tx: super::MeshSender,
     pub(super) relay_rx: super::MeshReceiver,
     pub(super) media_peers: Option<Arc<voice_plane::MediaPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
+    /// the join GATE's loop end (join ADR §4): forwarded requests arrive here…
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    /// …kept open by this never-sending clone even when no plane was wired…
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    /// …and settled outcomes go back through this shared map.
+    pub(super) gate_outcomes: GateOutcomes,
 }
 
 pub(super) struct RuntimeWiring {
@@ -53,9 +58,13 @@ pub(super) struct RuntimeWiring {
     pub(super) channel_bank: super::ChannelBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
-    pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
+    /// unix seconds of the last served state-sync request — the drain reads it
+    /// to defer oplog pruning while a syncer is actively pulling (the sync
+    /// retention lease, see sync/serve.rs).
+    pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
 }
 
@@ -72,10 +81,11 @@ pub(super) async fn finish(
     label: String,
     peers: Vec<ed25519::PublicKey>,
     namespace: Vec<u8>,
-    wireguard_effect: config::WireGuardEffectKind,
+    overlay_enabled: bool,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
+    sync_monitor: statesync::monitor::ServeMonitor,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
@@ -87,7 +97,6 @@ pub(super) async fn finish(
     mut channel_bank: super::ChannelBank,
     sync_tx: super::MeshSender,
     sync_rx: super::MeshReceiver,
-    lobby_rx: super::MeshReceiver,
     relay_rx: super::MeshReceiver,
 ) -> RuntimeWiring {
     // the FINAL index heal, at the boot tip every path converged on:
@@ -102,14 +111,21 @@ pub(super) async fn finish(
     let member_keys = match resume_member_keys(resumed, validators) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {e}");
+            tracing::error!(
+                target: "ducktape::node",
+                node = %label,
+                error = %e,
+                "FATAL: recovered validator set is invalid"
+            );
             std::process::exit(1);
         }
     };
     if !member_keys.contains(&signer.public_key()) {
-        println!(
-            "[node {label}] this identity is not in the recovered validator set — \
-             halting (restart with --sync-only to observe)"
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            reason = "not_in_recovered_validator_set",
+            "halting; restart with --sync-only to observe"
         );
         std::process::exit(0);
     }
@@ -121,10 +137,13 @@ pub(super) async fn finish(
         super::wiring::mesh_at(&peers, &member_keys.iter().cloned().collect()),
     );
     if resume_epoch < bank_base || resume_epoch >= bank_base + EPOCH_CHANNEL_BANK {
-        eprintln!(
-            "[node {label}] FATAL: recovered epoch {resume_epoch} outside the \
-             pre-registered channel bank [{bank_base}, {})",
-            bank_base + EPOCH_CHANNEL_BANK
+        tracing::error!(
+            target: "ducktape::node",
+            node = %label,
+            epoch = resume_epoch,
+            bank_base,
+            bank_end = bank_base + EPOCH_CHANNEL_BANK,
+            "FATAL: recovered epoch outside the pre-registered channel bank"
         );
         std::process::exit(1);
     }
@@ -150,25 +169,9 @@ pub(super) async fn finish(
                 .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
-    let mut pending_boot = recovery_manifest_for_resume
+    let pending_boot = recovery_manifest_for_resume
         .zip(resumed.as_ref())
         .and_then(|(manifest, rec)| derive_pending_boot(manifest, rec));
-    // If no membership cutover already claimed the resume slot, re-arm a
-    // pending upgrade at the same deterministic activation boundary an
-    // uninterrupted node would use. This runs after post-reboot catch-up, so
-    // it reads the freshest recovered host/record.
-    if pending_boot.is_none()
-        && let Some(rec) = resumed.as_ref()
-    {
-        pending_boot = read_upgrade_state(host).await.pending.and_then(|p| {
-            let crossed = rec.height.is_some_and(|h| h >= p.activation_height);
-            if crossed {
-                None
-            } else {
-                p.activation_height.checked_sub(rec.view_base)
-            }
-        });
-    }
 
     // the statesync INGRESS task: owns the channel receiver and loops a
     // clean `recv().await`, forwarding frames into a local bounded queue.
@@ -179,21 +182,6 @@ pub(super) async fn finish(
     // flood degrades to retries instead of unbounded memory.
     let (bridge_tx, sync_ingress) =
         futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-    // the blob fetch-on-miss lane (the #298 prompt-blob cross-node gap):
-    // the oracle pool's resolver asks current peers for a digest its own
-    // store lacks, over this same statesync channel. the pending map is
-    // the serve loop's demux — frames answering OUR fetches never enter
-    // the request path — and the peer set follows every cutover re-track
-    // beside the other planes' books.
-    let blob_pending: blob_fetch::PendingMap = Default::default();
-    let blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
-        std::sync::Arc::new(std::sync::RwLock::new(
-            initial_member_keys
-                .iter()
-                .chain(initial_resident_keys.iter())
-                .cloned()
-                .collect(),
-        ));
     context.child("sync_ingress").spawn(move |_ctx| {
         let mut receiver = sync_rx;
         let mut bridge_tx = bridge_tx;
@@ -227,7 +215,7 @@ pub(super) async fn finish(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+                factory: crate::overlay_book::socket_factory(overlay_enabled, &overlay_slot),
                 pacer: bulk_pacer,
                 planes,
                 commands: gateway_commands,
@@ -244,71 +232,219 @@ pub(super) async fn finish(
     // bounded state touches crossing `sync_state_tx`; when the loop is
     // busy the serve lane backpressures, never the reverse.
     let (sync_state_tx, sync_state_rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
+    // the blob code lane (wasm code distribution): the pending map is the
+    // serve loop's demux for THIS validator's own fetches, and the peer book
+    // follows every cutover re-track beside the other planes' books.
+    let blob_pending: blob_fetch::PendingMap = Default::default();
+    let blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
+        Arc::new(std::sync::RwLock::new(
+            initial_member_keys
+                .iter()
+                .chain(initial_resident_keys.iter())
+                .cloned()
+                .collect(),
+        ));
+    let sync_blobs = blobs.clone();
+    // the serve-lane blob co-client: this validator's own fetch side of the
+    // blob lane. sends ride a sender clone under this node's OWN standing
+    // proof (a validator's key is in the committed valset); answers route
+    // back through the pending-map demux the serve loop below runs.
+    let (blob_requester, blob_proof) = statesync::sign_sync_proof(&signer, &namespace);
+    let blob_client = blob_fetch::ServeLaneBlobClient::new(
+        sync_tx.clone(),
+        blob_pending.clone(),
+        blob_peers.clone(),
+        blob_requester,
+        blob_proof,
+    );
+    let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let state_tx = sync_state_tx;
+        let sync_lease_serve = sync_lease.clone();
         let mut sync_tx = sync_tx;
         let mut ingress = sync_ingress;
         let blob_pending = blob_pending.clone();
-        let sync_blobs = blobs.clone();
+        // the genesis namespace the standing proof is bound to (ADR §5.1).
+        let serve_namespace = namespace.clone();
         context
             .child("statesync_serve")
             .spawn(move |_ctx| async move {
                 let mut server = SyncServer::new();
+                // every refusal below is a SILENT DROP: "why is this joiner never
+                // syncing?" is unanswerable from the serving side, because
+                // standing-refused, proof-invalid and malformed all look identical
+                // (nothing) to both parties. these paths are peer-drivable and a
+                // blocked joiner retries forever, so they latch instead of flooding.
+                static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
                 while let Some((peer, bytes)) = ingress.next().await {
-                    // mesh frames ride an rpc envelope (multiplexed
-                    // channel — the id correlates).
-                    let Ok((rpc_id, body)) = statesync::decode_rpc(&bytes) else {
+                    // mesh frames ride the AUTHENTICATED rpc envelope
+                    // (requester ‖ proof ‖ id ‖ body — the id correlates).
+                    let Ok((requester, proof, rpc_id, body)) =
+                        statesync::decode_rpc_authed(&bytes)
+                    else {
+                        if let Some(attempts) = REFUSED.hit("malformed_rpc_envelope") {
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "malformed_rpc_envelope",
+                                attempts,
+                                "statesync request dropped"
+                            );
+                        }
                         continue; // malformed rpc envelope: drop, never crash.
                     };
-                    // the mesh demux: OUR fetch answers are consumed,
-                    // stray responses (a blob answer landing after its
-                    // fan-out's sweep) and unparseable frames are
-                    // DROPPED — answering either is how two serve
-                    // loops bounce Error frames forever. only a real
-                    // request proceeds.
-                    let req = match blob_fetch::classify_mesh_frame(&blob_pending, rpc_id, body) {
-                        blob_fetch::MeshFrame::OurResponse
-                        | blob_fetch::MeshFrame::StrayResponse
-                        | blob_fetch::MeshFrame::Junk => continue,
-                        blob_fetch::MeshFrame::Request(req) => req,
+                    // OUR blob-fetch answers ride the same authed envelope with
+                    // ZEROED auth fields (the transport authenticates replies):
+                    // complete the pending waiter by id BEFORE the proof gate
+                    // below, which would otherwise drop them. a malformed body
+                    // on a matched id drops the waiter — that fetch times out
+                    // and rotates, never misreads as a peer's request.
+                    if let Some(waiter) = blob_pending
+                        .lock()
+                        .expect("pending blob lock")
+                        .remove(&rpc_id)
+                    {
+                        if let Ok(resp) = statesync::decode_response(body) {
+                            let _ = waiter.send(resp);
+                        }
+                        continue; // ours — never a request to serve.
+                    }
+                    // FAIL-CLOSED (ADR §5.1). a transport-key standing gate is
+                    // IMPOSSIBLE at this seam: a pre-admission joiner and an
+                    // admitted resident share the derived LOBBY key on this
+                    // channel (boot/mesh.rs), so their peer identity is the
+                    // SAME. enforcement is a REQUEST-LEVEL real-key proof:
+                    //  (1) the proof must verify — the requester signed
+                    //      SYNC_AUTH_NAMESPACE over the genesis namespace with a
+                    //      key it holds. sound as a STATIC per-session proof: the
+                    //      mesh transport is authenticated+encrypted, so the
+                    //      proof is not wire-capturable, and a pre-admission
+                    //      joiner can only sign for its own non-standing key.
+                    //  (2) that key must be in COMMITTED standing (validators ∪
+                    //      residents), read fresh per request through the loop
+                    //      seam. a valid targeted invite alone yields no standing
+                    //      key ⇒ leaks ZERO chain state (R4). the restore path
+                    //      and validator backfill dial under their real keys —
+                    //      which ARE in the valset — so they still sync; an
+                    //      admitted resident's key enters residents at its Redeem
+                    //      block, so it syncs the instant it is admitted, still
+                    //      under the shared lobby transport key.
+                    // a failed check DROPS the request (deny-by-default, like the
+                    // malformed/non-request drops), never a reply.
+                    if !statesync::verify_sync_proof(requester, proof, &serve_namespace) {
+                        if let Some(attempts) = REFUSED.hit("sync_proof_invalid") {
+                            tracing::warn!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                requester = %noded::hex_bytes(&requester.as_ref()[..4]),
+                                reason = "sync_proof_invalid",
+                                attempts,
+                                "statesync request REFUSED — the requester's standing proof \
+                                 did not verify against this genesis namespace"
+                            );
+                        }
+                        continue;
+                    }
+                    let requester = *requester;
+                    // only a decodable REQUEST proceeds. everything else —
+                    // a stray response, version skew, junk — is DROPPED,
+                    // never answered: answering non-requests is how two
+                    // serve loops bounce Error frames forever.
+                    let Ok(req) = statesync::decode_request(body) else {
+                        continue;
                     };
+                    // the COMMITTED-standing check gates the STATE-BEARING lanes
+                    // (Manifest/Chunk/Module/Frames/Index*), fresh per request via
+                    // the loop-owned seam (a just-Redeemed resident is admitted
+                    // immediately; see SyncStateRequest::Standing). the TipCoords
+                    // DETECTION lane is EXEMPT: it carries coordinates (height,
+                    // app_hash, epoch, membership), never state bytes, and a node
+                    // that has LOST standing (a revoked resident) or awaits an
+                    // out-of-band grant needs it to detect its own transition — a
+                    // poll its own revocation would otherwise refuse, wedging it
+                    // forever (it never learns to fall back to a parked joiner).
+                    // the PoP above still gates it (only a real key-holder polls),
+                    // and every STATE lane stays refused, so ZERO chain state
+                    // crosses to a standing-less key.
+                    if !matches!(req, statesync::SyncRequest::TipCoords) {
+                        let (standing_tx, standing_rx) = tokio::sync::oneshot::channel();
+                        let mut probe = state_tx.clone();
+                        if futures::SinkExt::send(
+                            &mut probe,
+                            SyncStateRequest::Standing {
+                                requester,
+                                reply: standing_tx,
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            continue; // state owner shutting down.
+                        }
+                        if !standing_rx.await.unwrap_or(false) {
+                            // THE one that makes a joiner sync forever in silence.
+                            // Both sides see nothing: the joiner just never converges,
+                            // and this node never says it was the one refusing.
+                            if let Some(attempts) = REFUSED.hit("not_in_committed_standing") {
+                                tracing::warn!(
+                                    target: "ducktape::statesync",
+                                    requester = %noded::hex_bytes(&requester.as_ref()[..4]),
+                                    reason = "not_in_committed_standing",
+                                    attempts,
+                                    "statesync REFUSED — the requester is not in committed \
+                                     standing (it must be admitted before it can sync state)"
+                                );
+                            }
+                            continue; // not in committed standing: refuse (drop).
+                        }
+                    }
+                    let req_kind = req.kind_name();
                     let resp = match req {
                         // blob fetches are host state — answered from the
                         // node-local store, never routed into SyncServer.
+                        // standing-gated above like every state lane (code
+                        // components are consensus-pinned content).
                         statesync::SyncRequest::Blob { digest } => {
                             blob_fetch::serve_blob(&sync_blobs, &digest)
                         }
-                        req => drive_sync_request(&mut server, &state_tx, req).await,
+                        statesync::SyncRequest::BlobInfo { digest } => {
+                            blob_fetch::serve_blob_info(&sync_blobs, &digest)
+                        }
+                        statesync::SyncRequest::BlobRange {
+                            digest,
+                            offset,
+                            len,
+                        } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
+                        req => {
+                            // renew the sync retention lease: this node is
+                            // actively serving a syncer, so the drain defers
+                            // oplog pruning until the lease lapses.
+                            sync_lease_serve.store(
+                                crate::sync::serve::unix_now_secs(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            drive_sync_request(&mut server, &state_tx, req).await
+                        }
                     };
-                    let resp = statesync::encode_response(&resp);
-                    let _ = sync_tx.send(
-                        Recipients::One(peer),
-                        IoBuf::from(statesync::encode_rpc(rpc_id, &resp)),
-                        false,
+                    let framed = statesync::encode_rpc_authed(
+                        &[0u8; 32],
+                        &[0u8; 64],
+                        rpc_id,
+                        &statesync::encode_response(&resp),
                     );
+                    // the serve-lane observation (`ducktape_statesync_serve_*`):
+                    // who pulled what, and the progression the response
+                    // itself proves (served boundary / frame heights).
+                    sync_monitor.record(
+                        &config::hex_bytes(peer.as_ref()),
+                        req_kind,
+                        &resp,
+                        framed.len() as u64,
+                    );
+                    let _ = sync_tx.send(Recipients::One(peer), IoBuf::from(framed), false);
                 }
             });
     }
-    // the lobby lane rides the same bridge pattern: announces are consumed
-    // by the pump between drains. drop-on-full is doubly safe here — a
-    // parked joiner re-announces every few seconds anyway.
-    let (lobby_bridge_tx, lobby_ingress) =
-        futures::channel::mpsc::channel::<(ed25519::PublicKey, Vec<u8>)>(64);
-    context.child("lobby_ingress").spawn(move |_ctx| {
-        let mut receiver = lobby_rx;
-        let mut bridge_tx = lobby_bridge_tx;
-        async move {
-            loop {
-                match receiver.recv().await {
-                    Ok((peer, msg)) => {
-                        let bytes: Vec<u8> = msg.into();
-                        let _ = bridge_tx.try_send((peer, bytes));
-                    }
-                    Err(_) => return,
-                }
-            }
-        }
-    });
     // the submit-relay lane rides the same bounded drop-on-full bridge: a
     // dropped relay degrades to the resident client's honest timeout +
     // re-submit, so flood pressure never blocks the pump.
@@ -339,8 +475,9 @@ pub(super) async fn finish(
         channel_bank,
         gateway_book,
         blob_peers,
+        blob_client,
         sync_state_rx,
-        lobby_ingress,
+        sync_lease,
         relay_ingress,
     }
 }
@@ -371,7 +508,6 @@ pub(super) async fn wire(
     label: String,
     coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
@@ -380,7 +516,7 @@ pub(super) async fn wire(
     wireguard_advertised: Option<Ingress>,
     invite_listen: Option<std::net::SocketAddr>,
     coord_cap: Option<nat_traversal::CoordCap>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
     planes: data_plane::PlaneMonitor,
 ) -> PreWiring {
@@ -392,14 +528,21 @@ pub(super) async fn wire(
     let initial_member_keys = match resume_member_keys(resumed, &validators) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {e}");
+            tracing::error!(
+                target: "ducktape::node",
+                node = %label,
+                error = %e,
+                "FATAL: recovered validator set is invalid"
+            );
             std::process::exit(1);
         }
     };
     if !initial_member_keys.contains(&signer.public_key()) {
-        println!(
-            "[node {label}] this identity is not in the recovered validator set — \
-             halting (restart with --sync-only to observe)"
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            reason = "not_in_recovered_validator_set",
+            "halting; restart with --sync-only to observe"
         );
         std::process::exit(0);
     }
@@ -476,10 +619,6 @@ pub(super) async fn wire(
         })
         .collect();
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
-    // the lobby lane: parked joiners announce their keys here (connected
-    // as the derived lobby identity); this member verifies each announce
-    // against the invite token it carries and RECORDS it for approval.
-    let (lobby_tx, lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
     // the submit-relay lane: a resident-standing node ships its own
     // signed frame here; this validator takes custody and answers on
     // drain/expiry. bound `mut` because the pump uses `relay_tx` from BOTH
@@ -495,8 +634,7 @@ pub(super) async fn wire(
         // reachability plane unconfigured) there is no media transport at
         // all (the overlay-only cutover — no mesh fallback), so drop the
         // session lane and huddle joins refuse fast instead of hanging.
-        let overlay_capable = wireguard_listen.is_some()
-            && !matches!(wireguard_effect, config::WireGuardEffectKind::Fake);
+        let overlay_capable = wireguard_listen.is_some();
         if overlay_capable {
             // tracked media set = transport members ∪ residents, refreshed
             // on every valset cutover (below, beside the statesync book).
@@ -515,13 +653,21 @@ pub(super) async fn wire(
                 .expect("ed25519 keys are 32 bytes");
             voice::spawn_hub(
                 voice_requests,
-                crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+                crate::overlay_book::socket_factory(overlay_capable, &overlay_slot),
                 std::sync::Arc::clone(&peers),
                 me,
                 planes,
             );
             Some(peers)
         } else {
+            // Say it at boot: an operator whose node can never host a huddle
+            // otherwise learns it one failed join at a time, from the webview.
+            tracing::warn!(
+                target: "ducktape::voice",
+                node = %label,
+                reason = "overlay_unavailable",
+                "calls disabled; set wireguard_listen to enable huddles"
+            );
             drop(voice_requests);
             None
         }
@@ -535,6 +681,14 @@ pub(super) async fn wire(
     // the mesh through the two pump tasks below.
     let (reach_p2p_tx, mut reach_p2p_rx) =
         network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+    // the join GATE's two connectors between the intro doorbell (the plane's
+    // thread) and the validator run loop (join ADR §4): verified gate requests
+    // forward in over the channel; resolved outcomes ride back through the
+    // shared map. created whether or not the plane runs — the loop's select
+    // arm stays wired either way (the keepalive sender keeps it pending, not
+    // None-spinning, when no doorbell exists to ring it).
+    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<lobby::GateForward>(256);
+    let gate_outcomes = GateOutcomes::default();
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
         match wireguard_listen {
             Some(wg_addr) => {
@@ -552,9 +706,12 @@ pub(super) async fn wire(
                         }
                     }
                     Ok(None) => {}
-                    Err(e) => eprintln!(
-                        "[node {label}] reachability: ambient coordinator unusable ({e}) — \
-                         registering with descriptor-hinted coordinators only"
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        error = %e,
+                        reason = "ambient_coordinator_unusable",
+                        "registering with descriptor-hinted coordinators only"
                     ),
                 }
                 Some(wire_reachability_plane(
@@ -565,15 +722,22 @@ pub(super) async fn wire(
                     &wireguard_key_file,
                     &mesh_state_file,
                     wg_addr,
-                    wireguard_effect,
                     overlay_slot.clone(),
                     advertised_reach,
                     wireguard_advertised,
                     coordinators,
                     // members serve the invite intro: a fresh joiner's
                     // tunnel comes up against this listener before any p2p.
+                    // None when this config mints no direct intro endpoint —
+                    // coordinated intros ride the plane's shared socket.
                     invite_listen,
                     coord_cap.clone(),
+                    // MEMBER side: the doorbells ring the join gate through
+                    // to this validator's run loop (§4).
+                    Some(GateHook {
+                        forward: gate_fwd_tx.clone(),
+                        outcomes: gate_outcomes.clone(),
+                    }),
                     reach_p2p_tx,
                     reach_p2p_rx,
                 ))
@@ -615,11 +779,12 @@ pub(super) async fn wire(
         channel_bank,
         sync_tx,
         sync_rx,
-        lobby_tx,
-        lobby_rx,
         relay_tx,
         relay_rx,
         media_peers,
         reach_cmd,
+        gate_fwd_rx,
+        gate_fwd_keepalive: gate_fwd_tx,
+        gate_outcomes,
     }
 }

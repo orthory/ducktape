@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # make dogfood-forge — host ducktape's OWN source in ducktape's forge module.
+# This flows GitHub origin/dev -> Forge dev without moving release-only main.
+# Use ops/mirror-forge-pr.sh for canonical Forge PR -> GitHub delivery.
 #
 # Registers a static git remote `ducktape-dev` pointing at the local dev node's
 # forge git smart-HTTP endpoint, fetches the canonical development branch, then
-# pushes that exact commit into Forge `main`. From then on, re-running this
-# command refreshes Forge from the canonical source before any agent dispatch.
+# synchronizes that exact history into Forge `dev`. Re-running this command
+# refreshes Forge before agent work. A fast-forward is direct; equal-tree
+# mirror divergence is joined with a two-parent bridge; differing trees fail
+# closed for a reviewed reconciliation.
 #
 # This is the INTENDED big-repo path: `git-receive-pack` lifts the body cap to
 # 512 MB and stores the whole packfile node-locally, submitting only a tiny
@@ -97,8 +101,8 @@ log "source commit: $SOURCE_OID ($SRC_REF)"
 # a healthy node is required (git-receive-pack is served off the node's http
 # surface). fail fast with an actionable message rather than a git transport error.
 if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
-  die "no node responding at $BASE_URL — start the dev app/node first \
-(\`make dev\`), or set DUCKTAPE_DEV_FORGE_URL to a running node."
+  die "no node responding at $BASE_URL — start a node first (\
+`cargo run -p noded`), or set DUCKTAPE_DEV_FORGE_URL to a running node."
 fi
 
 # idempotent remote wiring: add, or re-point if it already exists.
@@ -115,22 +119,56 @@ else
   log "added remote '$FORGE_REMOTE' -> $REMOTE_URL"
 fi
 
-# Forge only accepts refs/heads/main. Push the immutable OID verified above;
-# do not resolve a mutable ref again after network and health checks have run.
-log "pushing '$SOURCE_OID' -> $FORGE_REMOTE main (whole-repo pack over git-receive-pack)"
-git push "$FORGE_REMOTE" "$SOURCE_OID:refs/heads/main"
+FORGE_REF=refs/heads/dev
+FORGE_OID="$(git ls-remote "$REMOTE_URL" "$FORGE_REF" | awk 'NR == 1 { print $1 }')"
+EXPECTED_OID=$SOURCE_OID
 
-# A successful git process is not enough evidence for the next dispatch. Read
-# the committed Forge ref back through the same smart-HTTP boundary and require
-# exact equality with the source commit we just selected.
-FORGE_OID="$(git ls-remote "$REMOTE_URL" refs/heads/main | awk 'NR == 1 { print $1 }')"
 if [ -z "$FORGE_OID" ]; then
-  die "Forge main is missing after push"
-fi
-if [ "$FORGE_OID" != "$SOURCE_OID" ]; then
-  die "Forge main verification failed: expected $SOURCE_OID, got $FORGE_OID"
+  log "creating Forge dev at $SOURCE_OID"
+  git push "$FORGE_REMOTE" "$SOURCE_OID:$FORGE_REF"
+else
+  TMP_REF="refs/dogfood-sync/$$/forge-dev"
+  trap 'git update-ref -d "$TMP_REF" >/dev/null 2>&1 || true' EXIT
+  git fetch --no-tags "$FORGE_REMOTE" "$FORGE_REF:$TMP_REF"
+  if [ "$FORGE_OID" = "$SOURCE_OID" ]; then
+    log "Forge dev already matches GitHub dev"
+  elif git merge-base --is-ancestor "$FORGE_OID" "$SOURCE_OID"; then
+    log "fast-forwarding Forge dev to GitHub dev"
+    git push "$FORGE_REMOTE" "$SOURCE_OID:$FORGE_REF"
+  elif git merge-base --is-ancestor "$SOURCE_OID" "$FORGE_OID"; then
+    log "Forge dev already contains GitHub dev"
+    EXPECTED_OID=$FORGE_OID
+  elif git diff --quiet "$FORGE_OID" "$SOURCE_OID"; then
+    command -v node >/dev/null || die "node is required to read the node identity"
+    NODE_ID=$(
+      curl -fsS -m 5 "$BASE_URL/v1/status" |
+        node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const k=JSON.parse(s).publicKey||"";if(!/^[0-9a-f]{64}$/i.test(k))process.exit(1);process.stdout.write(k.toLowerCase())})'
+    ) || die "the node status has no valid publicKey"
+    TREE_OID=$(git rev-parse "$SOURCE_OID^{tree}")
+    EXPECTED_OID=$(
+      GIT_AUTHOR_NAME="$NODE_ID" \
+      GIT_AUTHOR_EMAIL="$NODE_ID@nodes.duck" \
+      GIT_COMMITTER_NAME="$NODE_ID" \
+      GIT_COMMITTER_EMAIL="$NODE_ID@nodes.duck" \
+        git commit-tree "$TREE_OID" -p "$FORGE_OID" -p "$SOURCE_OID" <<EOF
+Synchronize GitHub dev into Forge dev
+
+Join provenance-equivalent development histories without rewriting either side.
+EOF
+    )
+    log "joining provenance-equivalent dev histories at $EXPECTED_OID"
+    git push "$FORGE_REMOTE" "$EXPECTED_OID:$FORGE_REF"
+  else
+    die "Forge dev $FORGE_OID and GitHub dev $SOURCE_OID diverged with different trees; reconcile them in a reviewed PR"
+  fi
 fi
 
-log "verified Forge main at $FORGE_OID"
-log "done. ducktape now hosts the canonical dev source in Forge."
+# A successful git process is not enough evidence for the next dispatch.
+VERIFIED_OID="$(git ls-remote "$REMOTE_URL" "$FORGE_REF" | awk 'NR == 1 { print $1 }')"
+if [ "$VERIFIED_OID" != "$EXPECTED_OID" ]; then
+  die "Forge dev verification failed: expected $EXPECTED_OID, got ${VERIFIED_OID:-missing}"
+fi
+
+log "verified Forge dev at $VERIFIED_OID"
+log "release-only Forge main was not changed."
 log "re-run \`make dogfood-forge\` before creating agent work."

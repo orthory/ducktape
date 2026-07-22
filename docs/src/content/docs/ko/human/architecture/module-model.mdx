@@ -1,0 +1,92 @@
+---
+title: "Module Model"
+audience: human
+---
+
+import { ArchitectureStack } from '../../../../../components/diagram/ArchitectureStack.client'
+import { ModuleLifecycle } from '../../../../../components/diagram/ModuleLifecycle.client'
+
+module은 작은 native Rust contract 뒤에 있는 격리 상태 머신이다. isolation
+shape는 CosmWasm과 비슷하지만, 현재 구현은 Wasm이 아니라 native Rust다.
+
+<ArchitectureStack client:visible />
+
+## Contract
+
+`sdk`는 공유 surface를 정의한다.
+
+- `ModuleId`는 genesis state 안의 module name이다.
+- `StateRoot`는 호스트에 노출되는 32바이트 인증 commitment다.
+- `Msg`는 target module로 향하는 write intent다.
+- `Event`는 observability를 위해 state machine 밖으로 나간다.
+- `Effect`는 host-owned worker seam에 non-deterministic work를 요청한다.
+- `Env`는 agreed height, agreed time, origin, active module id를 담는다.
+- `Ctx`는 host-routed read와 intent emission을 노출한다.
+- `Module`은 `id`, `root`, `execute`, read projection, `commit_block`,
+  `abort_block`을 제공한다.
+
+## Lifecycle
+
+module lifecycle은 genesis registration에서 committed state transition까지 이어지는
+host-owned 경로다. Ducktape에는 아직 runtime install/enable/disable row가 없다.
+genesis에 등록된 module은 모두 active이고, module set 변경은 새 genesis의
+영역이다. 등록된 module의 wasm code를 제자리에서 swap하는 것은 별개이며,
+lifecycle code registry가 agreed height에 스케줄한다.
+
+<ModuleLifecycle client:visible />
+
+운영 lifecycle은 다음 순서다.
+
+1. **Register.** genesis가 module instance를 안정적인 `ModuleId` 아래에 wiring한다.
+   초기 `root()`는 첫 global app-hash에 포함된다.
+2. **Read committed state.** block 사이에서 `query`, `query_with`, `serve_sync`,
+   `state_sync_handle`은 committed state만 설명하거나 읽는다. staged write를
+   관측하면 안 된다.
+3. **Execute and stage.** agreed `Msg`마다 host가 deterministic `Env`와 `Ctx`를
+   넘겨 `execute`를 호출한다. module은 payload를 검증하고, 자기 substrate를 읽고,
+   host에 read-only projection을 요청할 수 있으며, durable write는 private overlay에
+   stage한다.
+4. **Drain follow-ups.** emit된 `Msg`는 host queue에 들어가 같은 block 안에서 local
+   follow-up으로 나중에 dispatch된다. 이것이 module boundary를 넘는 유일한 write
+   path다.
+5. **Close the block.** drain이 clean하게 끝나면 host는 touched module마다 registry
+   order로 `commit_block`을 한 번 호출한다. 반환 후 `root()`는 staged write를
+   포함해야 한다. dispatch가 reject되거나 dispatch budget을 초과하면 host는 touched
+   module에 `abort_block`을 호출하고 실패한 block은 root를 바꾸지 않는다.
+6. **Serve finalized state.** finalized boundary에서 node는 각 module의 committed
+   sync surface를 capture하거나 serve할 수 있다. snapshot module은 install 가능한
+   bytes를 내보내고, resolver-backed module은 committed root로 검증되는
+   backend-specific path를 노출한다.
+
+`commit_block` 또는 `abort_block` 내부 failure는 deterministic rejected operation이
+아니다. node-local boundary fault이므로, registry가 peer와 달라졌을 수 있어 node는
+block 적용을 멈춰야 한다.
+
+## State Ownership
+
+각 module은 자기 작업에 맞는 state substrate를 고른다.
+
+- QMDB-backed module은 authenticated key-value state를 저장한다.
+- Forge는 git object를 저장하고 git head에서 root를 계산한다.
+- Snapshot-style module은 canonical byte를 commit할 수 있다.
+
+호스트는 내부 schema를 해석하지 않는다. root를 요청하고 그 root를 global
+app-hash에 fold한다.
+
+## Cross-Module Interaction
+
+interface crate는 합법적인 cross-module vocabulary다. module은 다른 module로
+typed payload를 emit할 수 있지만, 호스트는 byte를 opaque하게 다루고 target
+module id로만 route한다.
+
+read path는 state-machine 관점에서 synchronous하다. module은 다른 module의
+read projection을 호스트에 요청할 수 있지만 target을 직접 mutate할 수 없다.
+따라서 module boundary는 review 가능하게 유지되고, follow-up message만 write
+crossing이 된다.
+
+## Native Rust Boundary
+
+현재 module boundary는 native Rust다. host, consensus, state-sync, product
+seam이 아직 움직이는 동안 platform을 다루기 쉽게 유지하기 위한 선택이다.
+미래의 sandbox boundary도 typed interface, module 간 구현 참조 금지, host 아래
+결정적 execution이라는 같은 contract를 보존해야 한다.

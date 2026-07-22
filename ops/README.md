@@ -1,68 +1,47 @@
-# Fleet QA
+# Operator scripts
 
-Multi-instance desktop QA is owned by
-[`tauri-agent-fleet`](https://github.com/byeongsu-hong/tauri-agent-fleet).
-Ducktape retains only its application config and suites under `.tauri-agent/`
-plus its CEF build/instance hooks under `qa/fleet/`.
+Repo-side helpers for running, seeding, and maintaining a ducktape node. There
+is no desktop app in this tree anymore — the native iced shell was removed; the
+runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
+`simnode`, and the UDP coordinator. Most scripts here back a `make` target; see
+the repository `Makefile`.
 
-## Quick start
+## Demo network
 
 ```bash
-cd app && bun install
-cd ..
-FLEET="${FLEET:-app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js}"
-"$FLEET" up HEAD
-"$FLEET" status
-"$FLEET" dashboard
-"$FLEET" down
+make demo-seed   # ops/demo-seed.sh  — seed a solo "demo" workspace with sample data
+make demo-app    # ops/demo-app.sh   — serve the user-hosted app behind its gateway route
+make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 ```
 
-During Fleet development, point `FLEET` at a locally built `dist/cli.js`.
-Update Ducktape's dependency pin only after that Fleet revision is reviewed.
+`demo-gateway.mjs` and `demo-kanban.mjs` publish the demo's gateway web-app
+routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
-The dashboard is read-oriented and polls Fleet's live instance/run state. It
-shows the revision, CEF runtime, lifecycle and suite state, agent health,
-tokens/cost, artifacts, and the available observation capability. Linux exposes
-a loopback-routed noVNC screen. macOS launches the native window and reports VNC
-as unavailable instead of advertising a fake route. Lifecycle stays in the CLI.
+## Forge
 
-## How it works
+- `dogfood-forge.sh` (`make dogfood-forge`) — mirror GitHub `origin/dev` into
+  the local node's Forge `dev` without moving release-only `main`; needs a
+  running node.
+- `mirror-forge-pr.sh` — deliver a merged canonical Forge PR onto GitHub `dev`
+  (`mirror-forge-pr.test.sh` is its test).
 
-```
-source revision → cached CEF debug artifact → isolated instance(s) → run(s)
-                                              ├─ tauri-agent direct client
-                                              ├─ Linux: Xvfb + loopback x11vnc
-                                              └─ macOS: native app window
-```
+## Node operator CLI
 
-- `qa/fleet/build-cef.sh` builds once and stages the debug desktop plus node
-  sidecar in Fleet's immutable artifact directory. macOS receives a complete
-  CEF `.app` bundle; Linux retains its flat executable and CEF resources. Debug
-  is deliberate: the tauri-agent endpoint is absent from release builds.
-- `qa/fleet/prepare-instance.sh` seeds a solo Ducktape workspace using the
-  cached sidecar. `qa/fleet/cleanup-instance.ts` verifies the workspace pidfile,
-  executable, config path, and start identity before stopping the detached node
-  group. Fleet owns HOME, XDG/data/display/port isolation and its desktop
-  process group. Linux additionally owns the VNC and X process groups; macOS
-  uses `display=native` and `vncPort=0`.
-- **Stop the instance before deleting its worktree.** `cleanupInstance` is a
-  path *inside* the worktree, while the workspace, pidfile, and detached node
-  live outside it under `FLEET_HOME` — so removing the worktree first destroys
-  the only thing that could stop the node, and it survives forever, unreachable
-  by `fleet down`. `ops/worktree-clean.sh` does the sequence in the right order
-  (dry-run by default, `--yes` to act): it reaps orphaned instances, then
-  removes worktrees whose branch is fully merged into `origin/dev`, and refuses
-  any that is dirty or carries an unmerged commit.
-- Ducktape's desktop is CEF-only on `dev`; the suite declares `runtime: cef`.
-- The dashboard and Linux VNC server bind to loopback unless an operator
-  explicitly chooses another dashboard host. Use an SSH/Tailscale tunnel for
-  remote Linux viewing. macOS has no Fleet VNC route.
+- `agent-system` — a compact operator CLI over a running node's module surface
+  (raw query/submit, agent list/pause/resume); reads the selected node from
+  `~/.ducktape/agent-system-url`.
+- `completions/` — shell completions for the `ducktape` CLI.
 
-## Notes
+## Networking and media harnesses
 
-- Run the deterministic CEF smoke with
-  `app/node_modules/@byeongsu-hong/tauri-agent-fleet/dist/cli.js test cef-smoke`.
-- `status --json` is the authoritative way to find an instance ID, display,
-  runtime directory, agent health, and artifact path.
-- On Linux hosts where x11vnc is staged rather than installed, set
-  `FLEET_VNC_COMMAND` and its required `LD_LIBRARY_PATH` before invoking Fleet.
+- `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
+  coordinator (see `coordinator/README.md`).
+- `wg-smoke/` — WireGuard smoke, interop, and bench harnesses.
+
+## Worktree cleanup
+
+Current native QA has no Fleet configuration or external instance manager.
+`ops/worktree-clean.sh` intentionally retains a self-contained, identity-
+verified reaper for homes left by the retired Fleet workflow. Always dry-run it
+before removing merged worktrees, then pass `--yes`; it refuses dirty or
+unmerged work and never uses `pkill -f`.

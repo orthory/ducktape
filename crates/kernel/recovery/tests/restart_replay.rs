@@ -62,7 +62,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         // genesis checkpoint: height 0 = nothing applied.
         let pos = node.sink_mut().oplog_pos().await;
         let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1).expect("capture");
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1).expect("capture");
         assert_eq!(manifest.app_hash, genesis_hash);
         node.sink_mut()
             .write_manifest(&manifest)
@@ -92,11 +92,8 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
             vec![],
             vec![],
             None,
-            0,
-            None,
             pos,
-            2,
-        )
+            2,)
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -224,7 +221,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
             .await
             .expect("open recovery");
         let host = fresh_host();
-        let manifest = Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, None, 0, 1).expect("capture");
+        let manifest = Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, 1).expect("capture");
         recovery
             .write_manifest(&manifest)
             .await
@@ -242,7 +239,7 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
         // the torn write: pre_apply lands, the apply does not. the journaled
         // block record is a BATCH super-frame (single member here), exactly what
         // the live drain pins before it mutates state.
-        let frame = node::encode_batch(&[node::encode_frame(&signer, 1, &set("b", "2"))]);
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 1, &set("b", "2"), None)]);
         {
             use node::BlockSink as _;
             node.sink_mut()
@@ -345,11 +342,8 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
             vec![],
             vec![],
             None,
-            0,
-            None,
             pos,
-            2,
-        )
+            2,)
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -358,7 +352,7 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
 
         // each op is flushed as its OWN single-member batch, so the finalized
         // block bytes read back are the BATCH super-frame wrapping that member.
-        let frame2 = node::encode_batch(&[node::encode_frame(&signer, 2, &set("k2", "v2"))]);
+        let frame2 = node::encode_batch(&[node::encode_frame(&signer, 2, &set("k2", "v2"), None)]);
         let frame3 = node::encode_batch(&[node::encode_frame(
             &signer,
             3,
@@ -366,7 +360,8 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
                 target: "no-such-module".into(),
                 payload: vec![1],
             },
-        )]);
+        None,
+    )]);
         node.submit(&signer, 2, set("k2", "v2"))
             .await
             .expect("submit");
@@ -402,11 +397,53 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
         assert_eq!(frames[1].frame, frame2);
         assert_eq!(frames[1].disposition, Disposition::Applied);
 
-        let err = node
+        // a checkpoint alone does NOT refuse: the journal still physically
+        // holds block 1, and the retention floor is the journal's own — not
+        // the manifest height, which advances even when pruning is deferred
+        // (the sync retention lease would otherwise be useless).
+        let still_served = node
             .sink_mut()
             .read_finalized_frames(0, 3)
             .await
-            .expect_err("range below checkpoint is pruned");
+            .expect("frames below the checkpoint are served while retained");
+        assert_eq!(still_served.len(), 3);
+        assert_eq!(still_served[0].height, 1);
+
+        let _ = pos;
+    });
+}
+
+#[test]
+fn range_read_refuses_below_the_retained_floor() {
+    // a journal whose first retained block is height 2 — a pruned prefix's
+    // exact shape (journal pruning is section-granular, so a small journal
+    // cannot be pruned in place; this constructs the post-prune shape
+    // directly). below the floor is a genuine gap, and the reported floor is
+    // the lowest anchorable height (first retained - 1). its own runner:
+    // deterministic storage partitions are global per runner, so a second
+    // Recovery in the same test would share the first one's journal.
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        use node::BlockSink as _;
+        let mut pruned = Recovery::open(context.child("floor"))
+            .await
+            .expect("open pruned-shape recovery");
+        let signer = sk(9);
+        let frame = node::encode_batch(&[node::encode_frame(&signer, 9, &set("k9", "v9"), None)]);
+        pruned.pre_apply(2, &frame).await.expect("wal record");
+        pruned
+            .seal(&node::BlockSeal {
+                height: 2,
+                disposition: Disposition::Applied,
+                roots: vec![],
+                app_hash: sdk::StateRoot([0u8; 32]),
+            })
+            .await
+            .expect("seal");
+        let err = pruned
+            .read_finalized_frames(0, 2)
+            .await
+            .expect_err("range below the retained floor is refused");
         assert!(matches!(
             err,
             recovery::Error::RangePruned {
@@ -414,5 +451,13 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
                 retained_start: 1
             }
         ));
+        // at the floor itself the journal serves: the gap is real, not a
+        // manifest-proxy refusal.
+        let frames = pruned
+            .read_finalized_frames(1, 2)
+            .await
+            .expect("the retained frame serves");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].height, 2);
     });
 }

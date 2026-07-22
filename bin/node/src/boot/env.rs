@@ -7,7 +7,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
 
-use crate::config::{self, Resolved, WireGuardEffectKind, hex_bytes};
+use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
@@ -29,7 +29,6 @@ pub(crate) struct BootEnv {
     pub(crate) http_listen: Option<String>,
     pub(crate) gateway_listen: Option<String>,
     pub(crate) wireguard_listen: Option<SocketAddr>,
-    pub(crate) wireguard_effect: WireGuardEffectKind,
     pub(crate) wireguard_key_file: PathBuf,
     pub(crate) invite_listen: Option<SocketAddr>,
     pub(crate) invite_token: Option<config::InviteToken>,
@@ -42,6 +41,10 @@ pub(crate) struct BootEnv {
     /// raw — resolved via `config::coordinator_ingress` at each plane-wiring
     /// site so a bad value degrades there instead of aborting boot.
     pub(crate) primary_coordinator: Option<String>,
+    /// the TCP relay override (`node.toml coordinator_relay`), raw — consumed
+    /// by the joiner's first-contact wiring (join ADR item 2); `None` derives
+    /// the relay from the ambient coordinator there.
+    pub(crate) coordinator_relay: Option<String>,
     /// the WireGuard bind/advertise split (`node.toml wireguard_advertised`),
     /// threaded into `wire_reachability_plane` at both plane-wiring sites.
     pub(crate) wireguard_advertised: Option<Ingress>,
@@ -85,7 +88,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         dev_demo,
@@ -99,6 +101,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coord_cap,
         workspace,
         primary_coordinator,
+        coordinator_relay,
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
@@ -121,20 +124,18 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
     if joiner {
         if invite_token.is_some() {
-            println!(
-                "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: announcing this key with the invite token; a member node redeems it \
-                 automatically (the mint was the approval) and full-node standing lands at \
-                 the next block",
-                hex_bytes(signer.public_key().as_ref())
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                invited = true,
+                "joiner mode: announcing this key for automatic invite redemption"
             );
         } else {
-            println!(
-                "[node {label}] identity {} is not in the genesis validator set — joiner \
-                 mode: no invite token on disk, so a member must grant standing manually \
-                 (`ducktape-node invite-accept {}`)",
-                hex_bytes(signer.public_key().as_ref()),
-                hex_bytes(signer.public_key().as_ref())
+            tracing::info!(
+                target: "ducktape::join",
+                node = %label,
+                invited = false,
+                "joiner mode: no invite token on disk; a member must grant standing manually"
             );
         }
     }
@@ -165,9 +166,11 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         && coord_cap.is_none()
         && !validators.contains(&signer.public_key())
     {
-        eprintln!(
-            "[node {label}] reachability: private coordination but no coord.cap and not a \
-             genesis validator — rendezvous will be denied; provide coord.cap or use a \
+        tracing::warn!(
+            target: "ducktape::reachability",
+            node = %label,
+            reason = "coord_cap_missing",
+            "private coordinator rendezvous will be denied; provide coord.cap or use a \
              fronted/direct reach hint"
         );
     }
@@ -190,10 +193,12 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
                     })
                     .collect();
                 if !seeds.is_empty() {
-                    println!(
-                        "[node {label}] {} mesh dial seed(s) from the persisted mesh (epoch {})",
-                        seeds.len(),
-                        mesh.epoch
+                    tracing::info!(
+                        target: "ducktape::reachability",
+                        node = %label,
+                        seeds = seeds.len(),
+                        epoch = mesh.epoch,
+                        "persisted mesh dial seeds restored"
                     );
                 }
                 seeds
@@ -204,18 +209,46 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         bootstrappers.into_iter().chain(mesh_dial_seeds).collect();
 
     for (i, pk) in peers.iter().enumerate() {
-        println!(
-            "[node {label}] peer[{i}] identity={}",
-            hex_bytes(pk.as_ref())
+        tracing::debug!(
+            target: "ducktape::node",
+            node = %label,
+            index = i,
+            peer = %hex_bytes(pk.as_ref()),
+            "mesh peer"
         );
     }
-    println!(
-        "[node {label}] starting on {listen} ({} mesh peers, {} validators{}), namespace {}, storage {}",
-        peers.len(),
-        validators.len(),
-        if sync_only { ", sync-only" } else { "" },
-        String::from_utf8_lossy(&namespace),
-        storage.display()
+    // the first line of every node's life, and the one that ends a whole incident
+    // class: a stale uplifted binary has faked at least four "regressions" here,
+    // and the standing workaround was `strings <bin> | grep <a symbol you just
+    // added>` — binaries were being dated by which bug they exhibited.
+    //
+    // deliberately NOT a build.rs git sha: cargo will not re-run a build script on
+    // a commit, so the sha bakes in and goes STALE — it would lie during exactly
+    // the stale-binary incident it exists to prevent (and `.git` is a FILE in every
+    // worktree here, so the usual rerun-if-changed fix is fragile too). the exe's
+    // own path + mtime is the mechanical equivalent of the manual workaround, and
+    // it cannot go stale.
+    let exe = std::env::current_exe().unwrap_or_default();
+    let built_unix = std::fs::metadata(&exe)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs());
+    tracing::info!(
+        target: "ducktape::node",
+        node = %label,
+        version = env!("CARGO_PKG_VERSION"),
+        profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+        binary = %exe.display(),
+        built_unix,
+        pid = std::process::id(),
+        listen = %listen,
+        namespace = %String::from_utf8_lossy(&namespace),
+        storage = %storage.display(),
+        peers = peers.len(),
+        validators = validators.len(),
+        sync_only,
+        "node boot"
     );
     // coordinated reach targets are split OUT of the TCP mesh dialer (a
     // coordinator's UDP rendezvous port is not a TCP mesh peer — dialing it
@@ -232,51 +265,41 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     // config — surface that loudly rather than park silently.
     if !coordinated.is_empty() {
         if bootstrappers.is_empty() {
-            println!(
-                "[node {label}] WARNING: {} coordinated reach target(s) but NO direct/fronted \
-                 bootstrap link and no persisted mesh — tunnel bring-up gossip has no path to \
-                 ride, so these peers stay unreachable. add at least one direct/fronted hint \
-                 (an ephemeral ingress is enough) for the join window; after the first \
-                 converged mesh, restarts ride the persisted state.",
-                coordinated.len()
+            tracing::warn!(
+                target: "ducktape::reachability",
+                node = %label,
+                targets = coordinated.len(),
+                reason = "no_bootstrap_link",
+                "coordinated targets UNREACHABLE — add a direct/fronted bootstrap hint for the \
+                 first join"
             );
         } else {
-            println!(
-                "[node {label}] {} coordinated reach target(s): mesh traffic flows over the \
-                 WireGuard tunnel once the reachability plane converges.",
-                coordinated.len()
+            tracing::info!(
+                target: "ducktape::reachability",
+                node = %label,
+                targets = coordinated.len(),
+                "coordinated reach configured"
             );
         }
         for (target, coord, _coord_key) in &coordinated {
-            println!(
-                "[node {label}]   coordinated target {} via coordinator {coord:?}",
-                hex_bytes(&target.as_ref()[..4])
+            tracing::debug!(
+                target: "ducktape::reachability",
+                node = %label,
+                peer = %hex_bytes(&target.as_ref()[..4]),
+                coordinator = ?coord,
+                "coordinated target"
             );
         }
     }
     if let Some(wg) = &wireguard_listen {
-        let advertise = if wg.ip().is_unspecified() {
-            format!(
-                "endpoint-less on udp port {} (roaming: peers learn this node's address from its own initiations)",
-                wg.port()
-            )
-        } else {
-            format!("advertising WireGuard endpoint udp/{wg}")
-        };
-        match wireguard_effect {
-            WireGuardEffectKind::Tun => {
-                println!("[node {label}] reachability plane: {advertise}")
-            }
-            WireGuardEffectKind::Socket => println!(
-                "[node {label}] reachability plane: {advertise}; userspace socket backend \
-                 (TUN-less — overlay reachability lives inside this process)"
-            ),
-            WireGuardEffectKind::Fake => println!(
-                "[node {label}] reachability plane: {advertise}; \
-                 records, advertisements, and tunnel handshakes run for real, the interface \
-                 effect is the in-memory fake (no real tunnel)."
-            ),
-        }
+        // the backend is always the userspace socket stack now — no field.
+        tracing::info!(
+            target: "ducktape::reachability",
+            node = %label,
+            listen = %wg,
+            endpoint_less = wg.ip().is_unspecified(),
+            "reachability plane configured"
+        );
     }
 
     BootEnv {
@@ -295,7 +318,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         http_listen,
         gateway_listen,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         invite_listen,
         invite_token,
@@ -305,6 +327,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coord_cap,
         workspace,
         primary_coordinator,
+        coordinator_relay,
         wireguard_advertised,
         sync_candidates,
         chain_id,

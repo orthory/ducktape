@@ -71,9 +71,9 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     assert_eq!(friend_key.len(), 64, "join prints the friend's pubkey hex");
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
-    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{out}");
+    cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "replica: following the head", CONVERGE);
 
     // ---- the BUSY regime: a writer keeping a real op in every block window
@@ -94,7 +94,7 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     std::fs::remove_dir_all(cluster.friend_dir.join("storage"))
         .expect("wipe the friend's storage");
     cluster.spawn(1);
-    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "replica: bootstrapping at boundary", CONVERGE);
     cluster.wait_marker(1, "replica: following the head", CONVERGE);
 

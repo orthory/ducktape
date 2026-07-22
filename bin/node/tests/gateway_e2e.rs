@@ -17,11 +17,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use common::{Cluster, hex, poll_until, serial};
 use commonware_cryptography::{Signer as _, ed25519};
-use duckdns::{DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply};
 use gateway::{
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
-    RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement,
-    RouteTarget,
+    DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
+    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
 };
 use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 
@@ -29,19 +27,7 @@ const READY: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    MemberAuth {
-        key: member.public_key().as_ref().to_vec(),
-        kind: identity::KeyKind::Ed25519,
-        proof: identity::MemberProof::Signature {
-            sig: member
-                .sign(
-                    identity::IDENTITY_BIND_NS,
-                    &identity::bind_preimage(chain, node, 0),
-                )
-                .as_ref()
-                .to_vec(),
-        },
-    }
+    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
 }
 
 fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
@@ -54,22 +40,22 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
     )?;
     match identity::decode_reply(&bytes).ok()? {
         IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
+        IdentityReply::Accounts(_) | IdentityReply::Clients(_) => None,
     }
 }
 
 fn resolve_alice(cluster: &Cluster, reader: usize) -> Option<Vec<u8>> {
     let bytes = cluster.query(
         reader,
-        "duckdns",
-        &duckdns::encode_query(&DuckDnsQuery::Resolve {
+        "gateway",
+        &gateway::encode_query(&GatewayQuery::Resolve {
             name: DuckDnsName {
                 handle: "alice".into(),
             },
         }),
     )?;
-    match duckdns::decode_reply(&bytes).ok()? {
-        DuckDnsReply::Resolved(Some(account)) => Some(account.account_id),
+    match gateway::decode_reply(&bytes).ok()? {
+        GatewayReply::Resolved(Some(account)) => Some(account.account_id),
         _ => None,
     }
 }
@@ -133,7 +119,7 @@ fn route_revision(cluster: &Cluster, reader: usize) -> Option<u64> {
             .as_ref()
             .as_ref()
             .map(|record| record.statement.revision),
-        GatewayReply::Routes(_) => None,
+        _ => None,
     }
 }
 
@@ -272,14 +258,13 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.wireguard_socket = true;
     for index in 0..2 {
         cluster.spawn(index);
     }
     for index in 0..2 {
         cluster.wait_marker(index, "rpc listening on", READY);
         cluster.wait_marker(index, "converged app_hash=", READY);
-        cluster.wait_marker(index, "1 peer(s); userspace socket backend", READY);
+        cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
 
@@ -306,8 +291,8 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
 
     cluster.submit(
         0,
-        "duckdns",
-        &duckdns::encode_msg(&DuckDnsMsg::SetHandle {
+        "gateway",
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
         }),
     );
@@ -325,7 +310,8 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     );
     let workspace = cluster.workspace(0);
     let (ok, output) = cluster.run_verb(&[
-        "gateway-route-bind",
+        "gateway",
+        "bind",
         "--workspace",
         workspace.to_str().unwrap(),
         "--label",
@@ -397,7 +383,11 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     assert!(lower_headers.contains(&format!("connect-src duck://{authority}")));
     assert!(lower_headers.contains("worker-src 'none'"));
     assert!(lower_headers.contains("webrtc 'block'"));
-    assert!(!lower_headers.contains("set-cookie:"));
+    // the browser lane forwards Set-Cookie like the programmatic lane above:
+    // the pane's document origin is duck://<authority> (see the CSP asserts),
+    // so the embedded browser scopes cookies per route authority exactly like
+    // the web — and a self-hosted app behind a route needs its session cookie.
+    assert!(lower_headers.contains("set-cookie:"));
     assert!(String::from_utf8_lossy(&html).contains("<title>Alice</title>"));
 
     // A page whose Origin does not match the forwarded authority is rejected.

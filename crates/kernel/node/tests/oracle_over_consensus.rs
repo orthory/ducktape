@@ -8,7 +8,7 @@
 //!
 //! 1. a `Trigger` op is agreed -> submitted to every validator's order. draining
 //!    it leaves every node's saga at `Pending` and surfaces one `WorkerRequest`
-//!    effect per node (the host's effect sink, now readable via `take_effects`).
+//!    event per node (the ordered lane's event queue, readable via `take_events`).
 //! 2. ONE assigned node runs the (mock, non-deterministic-in-spirit) worker on its
 //!    effect and produces an `OracleResult` OP. (rendezvous assignment is deferred;
 //!    a fixed assignee suffices, and the saga's idempotent OracleResult handler is
@@ -32,7 +32,7 @@ use saga::{
     SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView, decode_reply, decode_worker_request,
     encode_msg, encode_query,
 };
-use sdk::{Effect, Msg};
+use sdk::{Event, Msg};
 
 fn trigger(id: &str, spec: &[u8]) -> Msg {
     Msg {
@@ -56,8 +56,8 @@ fn trigger(id: &str, spec: &[u8]) -> Msg {
 /// (reversing the spec — a pure transform here, MODELING opaque external work),
 /// and return the `OracleResult` op that carries it back through the normal
 /// path, echoing the request's `(saga_id, attempt)` idempotency key.
-fn mock_worker(eff: &Effect) -> Option<Msg> {
-    let wr = decode_worker_request(&eff.0).ok()?;
+fn mock_worker(ev: &Event) -> Option<Msg> {
+    let wr = decode_worker_request(&ev.payload).ok()?;
     let result: Vec<u8> = wr.spec.iter().rev().copied().collect();
     Some(Msg {
         target: "saga".into(),
@@ -142,14 +142,14 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
             pending, genesis,
             "creating the pending saga moved the app-hash off genesis"
         );
-        let effects_per_node: Vec<Vec<Effect>> =
-            nodes.iter_mut().map(|n| n.take_effects()).collect();
+        let events_per_node: Vec<Vec<Event>> =
+            nodes.iter_mut().map(|n| n.take_events()).collect();
         for (i, n) in nodes.iter().enumerate() {
             assert_eq!(n.app_hash(), pending, "all validators converge at Pending");
             assert_eq!(
-                effects_per_node[i].len(),
+                events_per_node[i].len(),
                 1,
-                "each node surfaced one WorkerRequest effect"
+                "each node surfaced one WorkerRequest event"
             );
             assert_eq!(
                 saga_view(n, "s1").await.unwrap().status,
@@ -158,10 +158,10 @@ fn oracle_result_over_consensus_converges_all_validators_to_done() {
             );
         }
 
-        // (2) exactly ONE assigned node runs the worker on its effect.
+        // (2) exactly ONE assigned node runs the worker on its event.
         let assignee = 0;
         let oracle_op =
-            mock_worker(&effects_per_node[assignee][0]).expect("worker claims the effect");
+            mock_worker(&events_per_node[assignee][0]).expect("worker claims the event");
 
         // (3) the OracleResult op is agreed -> submit to every validator's order, drain.
         broadcast(&mut nodes, &sk(2), 0, &oracle_op).await;

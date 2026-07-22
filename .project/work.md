@@ -13,9 +13,6 @@
   `.codex/worktrees`. Large build outputs must remain on the same disk-backed
   filesystem; a tmpfs target consumes RAM and swap instead of disk.
 - After implementation and verification, submit a PR against `dev`.
-- Review the PR from a clean context before merge: inspect the diff against
-  `dev`, look for scope creep and missing verification, and resolve actionable
-  feedback.
 - Merge to `dev` only when confidence is high. If confidence is medium or low,
   keep the PR open and report the remaining risks, failed checks, or review
   needed instead of merging by default.

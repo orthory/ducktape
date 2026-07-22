@@ -153,6 +153,8 @@ fn joiner_enters_through_a_sentry() {
     let friend_hex = hex(&Cluster::identity(1));
     let cfg = cluster.config_file(0);
     let (ok, out) = cluster.run_verb(&[
+        "node",
+        "member",
         "promote",
         &friend_hex,
         "--config",

@@ -14,16 +14,17 @@ use sdk::Msg;
 use super::super::announce::{dispatch_pending_deliveries, saga_next_expiry};
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
-use crate::drain_actions::{BlockAction, CutoverTrigger, EpochActions, block_actions};
+use crate::drain_actions::{CutoverTrigger, EpochActions};
+use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
-    read_upgrade_state, read_upgrade_status_raw, read_upgrade_version_fields, read_valset_members,
-    read_valset_residents,
+    read_valset_members, read_valset_residents,
 };
-use crate::relay;
-use crate::util::{hex, participant_bytes, resident_bytes};
+use crate::{lobby, relay};
+use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_drain(&mut self) {
+
         let Self {
             context,
             node,
@@ -37,12 +38,14 @@ impl ValidatorRuntime<'_> {
             blob_peers,
             reach_cmd,
             relay_tx,
+            gate_outcomes,
             next_seq,
             prev_ckpt,
             signer,
             label,
             peers,
             checkpoint_blocks,
+            sync_lease,
             stream_hub,
             index,
             blobs,
@@ -50,6 +53,8 @@ impl ValidatorRuntime<'_> {
             applied,
             pending_submits,
             pending_relays,
+            pending_gates,
+            gating,
             validator_relay,
             last_published,
             blocks_since_checkpoint,
@@ -70,8 +75,7 @@ impl ValidatorRuntime<'_> {
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("[node {label}] FATAL: {e} — halting");
-                std::process::exit(1);
+                fatal!(label, "{e} — halting");
             }
         };
         *applied += drained_count;
@@ -91,7 +95,14 @@ impl ValidatorRuntime<'_> {
             && node.orderer().pending_len() == 0
             && let Err(e) = node.sink_mut().sync().await
         {
-            eprintln!("[node {label}] tip-seal sync failed: {e}");
+            // the idle-transition durability sync: losing it turns the tip into a
+            // TRAILING block, which on a SOLO node can brick a self-reading op.
+            tracing::warn!(
+                target: "ducktape::consensus",
+                node = %label,
+                error = %e,
+                "tip-seal sync failed — the tip block may not be durable"
+            );
         }
         // resolve held app-surface submits against what this
         // drain finished with; every disposition is deterministic,
@@ -109,16 +120,17 @@ impl ValidatorRuntime<'_> {
             .len() as u64;
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
-        for action in block_actions(&drained, node.take_system_dispatches(), blobs) {
-            let BlockAction {
+        for projection in project_block(&drained, node.take_system_dispatches(), blobs) {
+            let BlockProjection {
                 height,
                 dispatches,
                 record,
                 applied,
                 latency_us,
-                op_count,
+                applied_ops,
+                rejected_ops,
                 ..
-            } = action;
+            } = projection;
             // one block per height: an APPLIED block records fully
             // (count, this node's summed apply latency, per-module
             // dispatch counters); an all-rejected block (the idle nop
@@ -129,19 +141,11 @@ impl ValidatorRuntime<'_> {
             } else {
                 metrics.record_height(height);
             }
-            metrics.record_ops(op_count);
+            metrics.record_op_outcomes(applied_ops, rejected_ops);
             // this lane's agreed clock IS the height: the drain stamps
-            // BlockContext { consensus_time: height } for every block.
-            let ops = indexer::BlockOps {
-                record,
-                ..noded::index_block_ops(height, height, &dispatches)
-            };
-            if let Err(err) = index.apply_block(&ops) {
-                eprintln!(
-                    "[node {label}] module index apply failed at height {height}: {err} \
-                             — wipe <storage>/index to rebuild"
-                );
-            }
+            // BlockContext { consensus_time: height } for every block. the
+            // shared index-fold epilogue owns the STALE-index error log.
+            noded::projection::apply_block_to_index(index, height, height, record, &dispatches);
         }
         for d in drained {
             // a DISCARD is not this hold's outcome: the cutover
@@ -150,6 +154,83 @@ impl ValidatorRuntime<'_> {
             // frame finalizes there (or SUBMIT_HOLD expires into
             // the truthful re-query reply).
             if d.disposition == node::Disposition::Discarded {
+                continue;
+            }
+            // resolve a HELD JOIN GATE (ADR §3.2 / join ADR §4): the joiner's
+            // outcome was held against this Redeem frame — now the drain knows
+            // its consensus fate. Applied ⇒ the AUTHORITATIVE Admitted at the
+            // committed height (carrying the coord cap); Rejected ⇒ map the
+            // module reason to a code + terminal bit (chiefly a spent-nonce
+            // race the pre-filter missed). the outcome goes into the shared
+            // `gate_outcomes` map, where the intro doorbell answers the
+            // joiner's next tunnel retransmit — this loop owns no doorbell
+            // socket. a gate frame is EXCLUSIVELY a gate, so resolve and move
+            // on.
+            if let Some(gate) = pending_gates.remove(&d.id) {
+                gating.remove(&gate.joiner);
+                let reply = match d.disposition {
+                    node::Disposition::Applied => lobby::IntroReply::Admitted {
+                        height: d.height,
+                        cap: gate.cap,
+                    },
+                    node::Disposition::Rejected => {
+                        // settle-race guard: this member's Redeem lost to a
+                        // SIBLING member's grant for the same joiner (a slow
+                        // settle swept us to Busy, the joiner failed over, and
+                        // both Redeems batched — governance answers "already
+                        // redeemed" to the loser). the joiner IS admitted; a
+                        // terminal Spent here would `exit(1)` a granted join.
+                        // if the joiner now holds resident standing, answer
+                        // Admitted, not Spent.
+                        let admitted = read_valset_residents(node.host())
+                            .await
+                            .iter()
+                            .any(|r| r.as_slice() == gate.joiner.as_slice());
+                        if admitted {
+                            lobby::IntroReply::Admitted {
+                                height: d.height,
+                                cap: gate.cap,
+                            }
+                        } else {
+                            let (code, terminal) =
+                                lobby::redeem_reject_outcome(d.reason.as_deref());
+                            lobby::IntroReply::Rejected {
+                                code,
+                                detail: d.reason.clone().unwrap_or_else(|| {
+                                    "invite redemption rejected in consensus".into()
+                                }),
+                                terminal,
+                            }
+                        }
+                    }
+                    node::Disposition::Discarded => unreachable!("filtered at the loop top"),
+                };
+                // on a GRANT, re-track the just-admitted resident onto the
+                // mesh oracle IMMEDIATELY (blessed decision #1): its real key
+                // must complete the discovery handshake to dial statesync,
+                // and the epoch cutover that formally re-tracks it lands a
+                // few views later — a gap the joiner would spend bounced at
+                // the door. every validator resolves this same Applied block
+                // in its own drain, so the widened set converges within a
+                // beat (the same transient the reboot-inside-cutover window
+                // already tolerates).
+                if let lobby::IntroReply::Admitted { .. } = &reply
+                    && let Ok(joiner_pk) = ed25519::PublicKey::decode(gate.joiner.as_slice())
+                {
+                    let mut transport: std::collections::BTreeSet<ed25519::PublicKey> =
+                        orchestrator
+                            .current_members()
+                            .iter()
+                            .chain(orchestrator.current_residents())
+                            .cloned()
+                            .collect();
+                    transport.insert(joiner_pk);
+                    mesh_oracle.track(
+                        orchestrator.epoch(),
+                        super::super::wiring::mesh_at(peers, &transport),
+                    );
+                }
+                super::settle_gate(gate_outcomes, gate.joiner, reply);
                 continue;
             }
             // resolve a relayed hold FIRST: a relayed frame has no
@@ -184,6 +265,32 @@ impl ValidatorRuntime<'_> {
                     false,
                 );
             }
+            // BEFORE the pending_submits lookup, deliberately. An op rejected in
+            // consensus produced no record ANYWHERE: the submitter's own log says
+            // SUCCESS (the submit was accepted) while the state machine says NO.
+            //
+            // and the internal submits — oracle results, capability announces,
+            // upgrade readiness, code-ready signals — are fire-and-forget and never
+            // enter `pending_submits` at all, so the `continue` below swallows their
+            // rejection whole. That is exactly how an announcer that latches on
+            // submit-Ok wedges FOREVER: silently out of every rendezvous pool, the
+            // upgrade stuck at R<n, and nothing anywhere saying why.
+            let module = d.op.as_ref().map_or("system", |op| op.target.as_str());
+            // the idle-chain NOP filler is rejected BY DESIGN — it targets a module
+            // that deliberately does not exist. warning on it would fire every block
+            // forever on an idle chain, evicting the whole 4096-line ring in ~68
+            // minutes and drowning the very evidence someone came to read.
+            if d.disposition == node::Disposition::Rejected && module != NOP_TARGET {
+                tracing::warn!(
+                    target: "ducktape::submit",
+                    node = %label,
+                    frame = %noded::hex_bytes(&d.id),
+                    height = d.height,
+                    module,
+                    reason = %d.reason.as_deref().unwrap_or("deterministic_no_op"),
+                    "op rejected in consensus"
+                );
+            }
             let Some((reply, _)) = pending_submits.remove(&d.id) else {
                 continue;
             };
@@ -207,11 +314,11 @@ impl ValidatorRuntime<'_> {
                 node::Disposition::Discarded => continue,
             });
         }
-        validator_relay.expire(std::time::Instant::now(), relay_tx);
+        validator_relay.expire(context.current(), relay_tx);
         // expire holds the mesh never finalized in time. the op may
         // still land later — clients re-query on block events.
         if !pending_submits.is_empty() {
-            let now = std::time::Instant::now();
+            let now = context.current();
             let expired: Vec<node::FrameId> = pending_submits
                 .iter()
                 .filter(|(_, (_, deadline))| *deadline <= now)
@@ -229,7 +336,7 @@ impl ValidatorRuntime<'_> {
         // finalized in time, so answer the resident truthfully — the
         // op may still land, it re-queries on the next block.
         if !pending_relays.is_empty() {
-            let now = std::time::Instant::now();
+            let now = context.current();
             let expired: Vec<node::FrameId> = pending_relays
                 .iter()
                 .filter(|(_, (_, deadline))| *deadline <= now)
@@ -248,6 +355,34 @@ impl ValidatorRuntime<'_> {
                         Recipients::One(peer),
                         IoBuf::from(relay::encode_msg(&msg)),
                         false,
+                    );
+                }
+            }
+        }
+        // held join gates that never settled within GATE_SETTLE_TIMEOUT: write
+        // Busy (NON-terminal, §3.2) into the outcome map so the joiner's next
+        // retransmit reads it and fails over to another member rather than
+        // exiting. the Redeem may still land later — a re-forward then hits
+        // the V9 idempotent Admitted.
+        if !pending_gates.is_empty() {
+            let now = context.current();
+            let expired: Vec<node::FrameId> = pending_gates
+                .iter()
+                .filter(|(_, g)| g.deadline <= now)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in expired {
+                if let Some(gate) = pending_gates.remove(&k) {
+                    gating.remove(&gate.joiner);
+                    super::settle_gate(
+                        gate_outcomes,
+                        gate.joiner,
+                        lobby::IntroReply::Rejected {
+                            code: lobby::RejectCode::Busy,
+                            detail: "the gate could not settle in time — trying another member"
+                                .into(),
+                            terminal: false,
+                        },
                     );
                 }
             }
@@ -297,7 +432,13 @@ impl ValidatorRuntime<'_> {
                         *last_cert_height = Some(height);
                         *latest_floor = Some(fc);
                     }
-                    Err(e) => eprintln!("[node {label}] floor cert write failed (will retry): {e}"),
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::recovery",
+                        node = %label,
+                        height,
+                        error = %e,
+                        "floor cert write failed; retrying"
+                    ),
                 }
             }
         }
@@ -310,7 +451,6 @@ impl ValidatorRuntime<'_> {
             && let Some(f) = node.finalized()
         {
             let pos = node.sink_mut().oplog_pos().await;
-            let (cv, pu) = read_upgrade_version_fields(node.host()).await;
             let captured = Manifest::capture(
                 node.host(),
                 Some(f.height),
@@ -319,8 +459,6 @@ impl ValidatorRuntime<'_> {
                 participant_bytes(orchestrator),
                 resident_bytes(orchestrator),
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                cv,
-                pu,
                 pos,
                 *next_seq,
             );
@@ -333,16 +471,54 @@ impl ValidatorRuntime<'_> {
                             Ok(Some(fc))
                                 if prev_ckpt.0.is_none_or(|h| fc.height >= h)
                         );
-                        if floor_passed
+                        let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
+                        if floor_passed && lease_active {
+                            // a syncer is actively pulling from this node:
+                            // pruning now would yank its boundary away and put
+                            // it on the rebootstrap treadmill. defer — the
+                            // next checkpoint prunes once the lease lapses.
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                node = %label,
+                                reason = "sync_lease_active",
+                                "oplog prune deferred"
+                            );
+                        } else if floor_passed
                             && let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await
                         {
-                            eprintln!("[node {label}] oplog prune failed: {e}");
+                            tracing::warn!(
+                                target: "ducktape::recovery",
+                                node = %label,
+                                error = %e,
+                                "oplog prune failed"
+                            );
                         }
                         *prev_ckpt = (m.height, pos);
+                        tracing::info!(
+                            target: "ducktape::recovery",
+                            event = "node_checkpoint_written",
+                            node = %label,
+                            height = m.height.unwrap_or_default()
+                        );
                     }
-                    Err(e) => eprintln!("[node {label}] checkpoint write failed (will retry): {e}"),
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "node_checkpoint_failed",
+                            node = %label,
+                            stage = "write",
+                            error = %e
+                        );
+                    }
                 },
-                Err(e) => eprintln!("[node {label}] checkpoint capture failed (will retry): {e}"),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ducktape::recovery",
+                        event = "node_checkpoint_failed",
+                        node = %label,
+                        stage = "capture",
+                        error = %e
+                    );
+                }
             }
         }
 
@@ -403,36 +579,17 @@ impl ValidatorRuntime<'_> {
             let mut actions =
                 EpochActions::new(orchestrator, engine_view, observed, observed_residents);
             if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
-                println!(
-                    "[node {label}] membership change observed at view {} — cutover to epoch {} at view {}",
-                    cutover.observed_view(),
-                    cutover.next_epoch(),
-                    cutover.cutover_view()
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    observed_view = cutover.observed_view(),
+                    next_epoch = cutover.next_epoch(),
+                    cutover_view = cutover.cutover_view(),
+                    "membership change observed"
                 );
                 node.set_view_ceiling(cutover.cutover_view());
             }
-            // a pending upgrade arms the SAME single cutover slot at its
-            // activation height (design §"One boundary carries both
-            // concerns") — never a competing arm: when a membership
-            // cutover already holds the slot `observe_upgrade` returns
-            // Pending and the version flip rides that boundary via the
-            // boundary read in `respawn_if_due`. inert until the module is
-            // registered (`read_upgrade_state` returns baseline/no-pending).
-            let boundary_upgrade = read_upgrade_state(node.host()).await;
-            if let Some(CutoverTrigger::Upgrade {
-                cutover,
-                name,
-                activation_height,
-            }) = actions.observe_upgrade(&boundary_upgrade)
-            {
-                println!(
-                    "[node {label}] upgrade '{name}' armed — cutover to epoch {} at view {} (activation height {activation_height})",
-                    cutover.next_epoch(),
-                    cutover.cutover_view()
-                );
-                node.set_view_ceiling(cutover.cutover_view());
-            }
-            if let Some(plan) = actions.respawn(boundary_upgrade) {
+            if let Some(plan) = actions.respawn() {
                 let members = plan.valset().consensus_members();
                 let member_bytes: Vec<Vec<u8>> =
                     members.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -466,8 +623,9 @@ impl ValidatorRuntime<'_> {
                 if let Some(peers) = &media_peers {
                     peers.set_peers(plan.valset().transport_members().iter());
                 }
-                // the blob fetch-on-miss lane fans out to the same
-                // tracked set — follow the re-track.
+                // the blob code lane's peer book follows the same
+                // cutover — a fetch after a membership change asks
+                // the members that actually exist.
                 *blob_peers.write().expect("blob peers lock") =
                     plan.valset().transport_members().iter().cloned().collect();
                 // the reachability plane retunnels for the new
@@ -494,9 +652,11 @@ impl ValidatorRuntime<'_> {
                     });
                 }
                 if !members.contains(&signer.public_key()) {
-                    println!(
-                        "[node {label}] demoted from the validator set at epoch {} — halting (restart to serve as sync/resident)",
-                        plan.epoch()
+                    tracing::info!(
+                        target: "ducktape::consensus",
+                        node = %label,
+                        epoch = plan.epoch(),
+                        "demoted from the validator set; halting"
                     );
                     std::process::exit(0);
                 }
@@ -521,49 +681,23 @@ impl ValidatorRuntime<'_> {
                     // every locally-accepted op the old epoch
                     // never resolved was re-proposed into the
                     // new engine.
-                    Ok(carried) if carried > 0 => println!(
-                        "[node {label}] carried {carried} accepted ops across the cutover into epoch {}",
-                        plan.epoch()
+                    Ok(carried) if carried > 0 => tracing::info!(
+                        target: "ducktape::consensus",
+                        node = %label,
+                        carried,
+                        epoch = plan.epoch(),
+                        "accepted ops carried across the cutover"
                     ),
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("[node {label}] FATAL: {e} — halting");
-                        std::process::exit(1);
+                        fatal!(label, "{e} — halting");
                     }
-                }
-                // ACTIVATION (design §4): realize the agreed boundary
-                // protocol version into every dual-path module's
-                // active_version (branch selector) at H. driven ONLY by
-                // the agreed `plan.boundary_version()` — deterministic,
-                // non-hashed. the upgrade module's OWN committed
-                // reconciliation (current_version flip + pending clear on
-                // ARM, clear-only on ABORT) is NOT done here: it rides the
-                // single in-block System `Advance` the host drain injects
-                // at the same finalized view (Task 6.3), so both concerns
-                // land at ONE boundary and every node agrees. do NOT branch
-                // a separate abort-only follow-up — the one Advance owns both.
-                node.host_mut().set_active_version(plan.boundary_version());
-                match plan.upgrade_verdict() {
-                    consensus::UpgradeVerdict::Armed { name, to_version } => println!(
-                        "[node {label}] upgrade activated name={name} version={to_version} at height {}",
-                        plan.cutover_app_height()
-                    ),
-                    consensus::UpgradeVerdict::Abort { name } => println!(
-                        "[node {label}] upgrade aborted name={name} (unmet readiness) at height {} — network continues on version {}",
-                        plan.cutover_app_height(),
-                        plan.boundary_version()
-                    ),
-                    consensus::UpgradeVerdict::None => {}
                 }
                 // checkpoint IMMEDIATELY: the manifest must record
                 // the new epoch's participant set (the journal's
                 // cutover record alone covers only the crash
                 // window until this write lands).
                 let pos = node.sink_mut().oplog_pos().await;
-                // post-boundary committed version fields: after an armed
-                // Advance the module holds `current_version = to_version`
-                // + no pending, so this checkpoint stamps the new baseline.
-                let (cv, pu) = read_upgrade_version_fields(node.host()).await;
                 let captured = Manifest::capture(
                     node.host(),
                     node.finalized().map(|f| f.height),
@@ -572,8 +706,6 @@ impl ValidatorRuntime<'_> {
                     participant_bytes(orchestrator),
                     resident_bytes(orchestrator),
                     None,
-                    cv,
-                    pu,
                     pos,
                     *next_seq,
                 );
@@ -583,30 +715,40 @@ impl ValidatorRuntime<'_> {
                             *blocks_since_checkpoint = 0;
                             *prev_ckpt = (m.height, pos);
                         }
-                        Err(e) => eprintln!(
-                            "[node {label}] post-cutover checkpoint write failed \
-                                     (the journal's cutover record covers a restart): {e}"
+                        Err(e) => tracing::warn!(
+                            target: "ducktape::recovery",
+                            node = %label,
+                            error = %e,
+                            "post-cutover checkpoint write failed; the cutover journal record \
+                             covers a restart"
                         ),
                     },
-                    Err(e) => eprintln!(
-                        "[node {label}] post-cutover checkpoint capture failed \
-                                 (the journal's cutover record covers a restart): {e}"
+                    Err(e) => tracing::warn!(
+                        target: "ducktape::recovery",
+                        node = %label,
+                        error = %e,
+                        "post-cutover checkpoint capture failed; the cutover journal record \
+                         covers a restart"
                     ),
                 }
-                println!(
-                    "[node {label}] cutover complete: epoch {} with {} validators (app height base {})",
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    epoch = plan.epoch(),
+                    validators = members.len(),
+                    base_height = plan.cutover_app_height(),
+                    "cutover complete: epoch {} with {} validators",
                     plan.epoch(),
-                    members.len(),
-                    plan.cutover_app_height()
+                    members.len()
                 );
             }
         }
 
         // the state-driven pumps, each its own method below: block
-        // cadence/heartbeat, upgrade readiness, capability announce,
+        // cadence/heartbeat, code readiness, capability announce,
         // saga crank, dispatch delivery nudge.
         self.pump_heartbeat().await;
-        self.pump_readiness_signal().await;
+        self.pump_code_readiness().await;
         self.pump_capability_announce().await;
         self.pump_saga_crank().await;
         self.pump_dispatch_nudge().await;
@@ -621,84 +763,53 @@ impl ValidatorRuntime<'_> {
             applied,
             converged,
             workers,
-            upgrade_armed_latch,
-            upgrade_pending_seen,
             ..
         } = self;
         let dev_demo = *dev_demo;
         let expected = *expected;
 
-        // UPGRADE TRANSITION MARKERS (one-shot, committed-state driven):
-        // the greppable proof surface the e2e keys on. `armed` is the
-        // module's own R==n verdict (pending set, boundary non-empty,
-        // every current member signaled), so this fires exactly when
-        // readiness first reaches the full set — before H is crossed.
-        if let Some(st) = read_upgrade_status_raw(node.host()).await {
-            match &st.pending {
-                Some(up) => {
-                    *upgrade_pending_seen = Some(up.name.clone());
-                    let key = (up.name.clone(), up.to_version);
-                    if st.armed && upgrade_armed_latch.as_ref() != Some(&key) {
-                        println!(
-                            "[node {label}] upgrade armed name={} to_version={} height={}",
-                            up.name, up.to_version, up.activation_height
-                        );
-                        *upgrade_armed_latch = Some(key);
-                    }
-                }
-                None => {
-                    if let Some(name) = upgrade_pending_seen.take() {
-                        // the boundary Advance reconciled the pending
-                        // (ARM flip or ABORT clear) — the slot is free.
-                        println!("[node {label}] upgrade cleared name={name}");
-                        *upgrade_armed_latch = None;
-                    }
-                }
-            }
-        }
-
-        // the reactor seam: offer each finalized block's effects to
+        // the reactor seam: offer each finalized block's events to
         // the host-owned workers; a claiming worker's follow-up op
         // re-enters through the ordered lane as its own block (the
-        // oracle-as-op). unclaimed effects are logged, not silently
-        // dropped — a saga stuck Pending should be visible.
-        for eff in node.take_effects() {
-            let mut claimed = false;
-            for w in workers.iter() {
-                match w.run(&eff).await {
-                    Ok(host::worker::WorkOutcome::Handled(Some(follow))) => {
-                        let seq = *next_seq;
-                        *next_seq += 1;
-                        if let Err(e) = node.submit(signer, seq, follow).await {
-                            eprintln!("[node {label}] worker follow-up submit failed: {e}");
-                        }
-                        claimed = true;
-                        break;
-                    }
-                    // a deliberate skip (e.g. leased to another
-                    // node): claimed, nothing to submit.
-                    Ok(host::worker::WorkOutcome::Handled(None)) => {
-                        claimed = true;
-                        break;
-                    }
-                    Ok(host::worker::WorkOutcome::NotMine) => {}
-                    Err(e) => {
-                        eprintln!("[node {label}] worker error: {e}");
-                        claimed = true; // errored ≠ unclaimed; don't double-log
-                        break;
-                    }
-                }
-            }
-            if !claimed {
-                println!(
-                    "[node {label}] effect with no worker ({} bytes) — dropped",
-                    eff.0.len()
+        // oracle-as-op). events no worker claims are the plain
+        // observability stream — only decodable-but-unhandled worker
+        // requests would indicate a saga stuck Pending.
+        // one drain can apply MANY blocks; the events accumulated across all of
+        // them, so stamp them with the drain's finalized tip.
+        let height = node.finalized().map_or(0, |f| f.height);
+        // the same worker routing the noded submit lane and the sim run — but
+        // each claimed follow-up re-enters the ORDERED lane as its own batch
+        // (not an inline block), so this lane SUBMITS the follows rather than
+        // inline-draining them: the continuous block cadence carries them.
+        let host::worker::Offered { follows, unclaimed } =
+            host::worker::offer(workers.as_slice(), node.take_events()).await;
+        for follow in follows {
+            let seq = *next_seq;
+            *next_seq += 1;
+            if let Err(e) = node.submit(signer, seq, follow).await {
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    height,
+                    error = %e,
+                    "worker follow-up submit failed"
                 );
             }
         }
+        // an unclaimed event is the module's ONLY diagnostic channel (a wasm
+        // guest cannot log) — unless it decodes as a worker request, which
+        // means a saga is stuck Pending.
+        let mut notes = noded::log::ModuleNotes::new(height);
+        for eff in &unclaimed {
+            notes.unclaimed(eff);
+        }
+        notes.finish();
         if dev_demo && !*converged && *applied >= expected {
             let h = node.app_hash();
-            println!("[node {label}] converged app_hash={}", hex(&h));
+            tracing::info!(
+                target: "ducktape::consensus",
+                "node={label} converged app_hash={}", hex(&h)
+            );
             // dump every directory key so the demo can eyeball the ops
             // (each node ends holding the op it originated AND the peer's).
             for k in 0..expected {
@@ -713,7 +824,13 @@ impl ValidatorRuntime<'_> {
                     .await
                     .expect("directory query");
                 if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                    println!("[node {label}]   directory k{k}={v:?}");
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        key = %format_args!("k{k}"),
+                        value = ?v,
+                        "demo directory value"
+                    );
                 }
             }
             *converged = true;
@@ -743,6 +860,7 @@ impl ValidatorRuntime<'_> {
     // blocks). real ops are never gated — they must not wait.
     async fn pump_heartbeat(&mut self) {
         let Self {
+            context,
             node,
             next_seq,
             signer,
@@ -751,8 +869,10 @@ impl ValidatorRuntime<'_> {
             heartbeat_disabled,
             ..
         } = self;
-        if !*heartbeat_disabled && last_flush.elapsed() >= consensus::BLOCK_TIME {
-            *last_flush = std::time::Instant::now();
+        let now = context.current();
+        let flush_due = now.duration_since(*last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
+        if !*heartbeat_disabled && flush_due {
+            *last_flush = now;
             if node.pending_batch_len() == 0 && node.orderer().pending_len() == 0 {
                 let seq = *next_seq;
                 *next_seq += 1;
@@ -767,48 +887,116 @@ impl ValidatorRuntime<'_> {
                     )
                     .await
                 {
-                    eprintln!("[node {label}] heartbeat nop submit failed: {e}");
+                    tracing::debug!(
+                        target: "ducktape::submit",
+                        node = %label,
+                        error = %e,
+                        "heartbeat nop submit failed"
+                    );
                 }
             }
             // flush the window: no-op when `pending_batch` is empty
             // (idle with a batch already in flight — wait for it).
             if let Err(e) = node.flush_batch().await {
-                eprintln!("[node {label}] batch flush failed: {e}");
+                tracing::debug!(
+                    target: "ducktape::submit",
+                    node = %label,
+                    error = %e,
+                    "batch flush failed"
+                );
             }
         }
     }
 
-    // READINESS SIGNAL (design §3 / plan Task 7.1): a current
-    // boundary member whose binary can execute the pending upgrade
-    // self-submits ONE `SignalReady`. gated to a current member (the
-    // R = n readiness denominator); the signaller's own committed
-    // read + local latch keep it idempotent. inert on a baseline net.
-    async fn pump_readiness_signal(&mut self) {
+    // CODE READINESS: the byte-receipt half of a pending modreg swap.
+    // a current boundary member checks the committed pending swaps against
+    // its LOCAL blob store: verified-resident bytes earn one truthful
+    // validator-origin `SignalReady` (the covering signal latches the swap
+    // `ready` in consensus); missing bytes spawn one ranged mesh fetch
+    // (the custodian's data-plane push normally lands first — this heals a
+    // node the push missed). state-driven and idempotent; inert while
+    // nothing is pending.
+    async fn pump_code_readiness(&mut self) {
         let Self {
             node,
             orchestrator,
             next_seq,
             signer,
             label,
-            signaller,
+            code_signaller,
+            blob_client,
+            blobs,
+            fetch_done_tx,
+            fetch_done_rx,
             ..
         } = self;
-        if orchestrator
+        // reap finished fetch tasks first, so a failed fetch retries.
+        while let Ok(digest) = fetch_done_rx.try_recv() {
+            code_signaller.fetching.remove(&digest);
+        }
+        if !orchestrator
             .current_members()
             .contains(&signer.public_key())
-            && let Some((msg, name, to_version)) = signaller.maybe_signal(node.host()).await
         {
+            return;
+        }
+        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
+        let Ok(bytes) = node.host().query(host::LIFECYCLE_MODULE_ID, &req).await else {
+            return; // registry absent: byte-identical drain on a baseline net.
+        };
+        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) = lifecycle::decode_reply(&bytes)
+        else {
+            return;
+        };
+        // residency is a VERIFYING read (content re-hashed on the disk path):
+        // signing ready must mean sha256(local bytes) == committed hash.
+        let actions = code_signaller.decide(&modules, |digest| blobs.has_chunk(digest));
+        for digest in actions.fetches {
+            let client = blob_client.clone();
+            let blobs = blobs.clone();
+            let done = fetch_done_tx.clone();
+            let label = label.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::blob_fetch::fetch_blob(
+                    &client,
+                    &blobs,
+                    &digest,
+                    crate::constants::MAX_MODULE_CODE_BYTES,
+                    crate::constants::BLOB_FETCH_ATTEMPTS,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        digest = %crate::config::hex_bytes(&digest),
+                        error = %e,
+                        "pending-swap code fetch failed"
+                    );
+                }
+                let _ = done.send(digest);
+            });
+        }
+        for (key, msg) in actions.signals {
             let seq = *next_seq;
             *next_seq += 1;
             match node.submit(signer, seq, msg).await {
-                Ok(_) => {
-                    println!("[node {label}] signaled ready name={name} to_version={to_version}")
-                }
+                Ok(_) => tracing::info!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    module = %key.0,
+                    swap = key.1,
+                    "code-ready signaled"
+                ),
                 Err(e) => {
-                    // un-latch so a transient submit failure retries on
-                    // the next tick (the module stays idempotent).
-                    signaller.signaled = None;
-                    eprintln!("[node {label}] readiness signal submit failed: {e}");
+                    // un-latch so a transient submit failure retries next tick.
+                    code_signaller.unlatch(&key);
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        error = %e,
+                        "code readiness submit failed; retrying"
+                    );
                 }
             }
         }
@@ -843,14 +1031,21 @@ impl ValidatorRuntime<'_> {
             let seq = *next_seq;
             *next_seq += 1;
             match node.submit(signer, seq, msg).await {
-                Ok(_) => println!(
-                    "[node {label}] announced capabilities {:?}",
-                    announcer.capabilities
+                Ok(_) => tracing::info!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    capabilities = ?announcer.capabilities,
+                    "capabilities announced"
                 ),
                 Err(e) => {
                     // un-latch so a transient submit failure retries.
                     announcer.announced = None;
-                    eprintln!("[node {label}] capability announce submit failed: {e}");
+                    tracing::debug!(
+                        target: "ducktape::modules",
+                        node = %label,
+                        error = %e,
+                        "capability announce submit failed; retrying"
+                    );
                 }
             }
         }
@@ -867,6 +1062,7 @@ impl ValidatorRuntime<'_> {
     // cranks from other nodes are deterministic no-ops.
     async fn pump_saga_crank(&mut self) {
         let Self {
+            context,
             node,
             next_seq,
             signer,
@@ -874,12 +1070,14 @@ impl ValidatorRuntime<'_> {
             last_crank,
             ..
         } = self;
-        if last_crank.elapsed() >= consensus::BLOCK_TIME
+        let now = context.current();
+        let crank_due = now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
+        if crank_due
             && let Some(finalized_height) = node.finalized().map(|f| f.height)
             && let Some(expiry) = saga_next_expiry(node.host()).await
             && expiry <= finalized_height
         {
-            *last_crank = std::time::Instant::now();
+            *last_crank = now;
             let seq = *next_seq;
             *next_seq += 1;
             if let Err(e) = node
@@ -893,11 +1091,19 @@ impl ValidatorRuntime<'_> {
                 )
                 .await
             {
-                eprintln!("[node {label}] saga crank submit failed: {e}");
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    error = %e,
+                    "saga crank submit failed"
+                );
             } else {
-                println!(
-                    "[node {label}] saga crank submitted \
-                             (next expiry {expiry} <= height {finalized_height})"
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    next_expiry = expiry,
+                    finalized_height,
+                    "saga crank submitted"
                 );
             }
         }
@@ -914,6 +1120,7 @@ impl ValidatorRuntime<'_> {
     // from other nodes are free.
     async fn pump_dispatch_nudge(&mut self) {
         let Self {
+            context,
             node,
             next_seq,
             signer,
@@ -921,10 +1128,10 @@ impl ValidatorRuntime<'_> {
             last_nudge,
             ..
         } = self;
-        if last_nudge.elapsed() >= consensus::BLOCK_TIME
-            && dispatch_pending_deliveries(node.host()).await > 0
-        {
-            *last_nudge = std::time::Instant::now();
+        let now = context.current();
+        let nudge_due = now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
+        if nudge_due && dispatch_pending_deliveries(node.host()).await > 0 {
+            *last_nudge = now;
             let seq = *next_seq;
             *next_seq += 1;
             if let Err(e) = node
@@ -938,9 +1145,18 @@ impl ValidatorRuntime<'_> {
                 )
                 .await
             {
-                eprintln!("[node {label}] dispatch nudge submit failed: {e}");
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    error = %e,
+                    "dispatch delivery nudge submit failed"
+                );
             } else {
-                println!("[node {label}] dispatch delivery nudge submitted");
+                tracing::debug!(
+                    target: "ducktape::saga",
+                    node = %label,
+                    "dispatch delivery nudge submitted"
+                );
             }
         }
     }

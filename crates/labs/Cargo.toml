@@ -1,30 +1,46 @@
 [package]
 name = "labs"
-edition.workspace = true
-version.workspace = true
+edition = "2024"
+version = "0.1.0"
 
 # Consensus modules that are NOT in any shipping network's genesis set. Nothing
 # in this repo registers them (see src/lib.rs for why that matters), and their
 # heavy dependencies -- revm, alloy, k256 -- are quarantined here so the
 # shipping node never builds them.
+#
+# labs is a STANDALONE crate: EXCLUDED from the root workspace (see the root
+# Cargo.toml `exclude`) with its own [workspace] table and Cargo.lock, so the
+# revm dep tree stops taxing every workspace gate. The sibling crates below are
+# path deps into the root workspace and stay members there (they resolve their
+# own workspace inheritance against the root). The direct-pinned external deps
+# mirror the versions that used to live in the root [workspace.dependencies].
 [dependencies]
-sdk = { workspace = true }
-kv = { workspace = true }
-valset = { workspace = true }
-indexer = { workspace = true }
-revm = { workspace = true }
-alloy-primitives = { workspace = true, features = ["k256"] }
+sdk = { path = "../kernel/sdk" }
+kv = { path = "../modules/system/kv" }
+valset = { path = "../modules/system/valset" }
+indexer = { path = "../kernel/indexer" }
+revm = { version = "41", default-features = false, features = ["std"] }
+alloy-primitives = { version = "1.6", default-features = false, features = ["std", "k256"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
-zeroize = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-async-trait = { workspace = true }
-sha2 = { workspace = true }
-commonware-runtime = { workspace = true }
-commonware-storage = { workspace = true }
+zeroize = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
-host = { workspace = true }
-tempfile = { workspace = true }
+host = { path = "../kernel/host" }
+sdk-testkit = { path = "../kernel/sdk-testkit" }
+# the tests drive the EVM module the way a host does: construct the concrete
+# QmdbStore on the deterministic runtime and inject it as `Box<dyn MerkleStore>`.
+statesync = { path = "../kernel/statesync" }
+commonware-runtime = "2026.5.0"
+tempfile = "3"
 futures = "0.3"
 hex = "0.4"
+
+# Empty [workspace] table: makes labs a standalone workspace root with its own
+# Cargo.lock so its quarantined revm/alloy dep tree never enters the shipping
+# workspace build. Path deps above still resolve their inheritance against the
+# root workspace, where those crates remain members.
+[workspace]

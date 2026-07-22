@@ -1,4 +1,4 @@
-//! the agent dogfooding loop (M1), end to end on REAL `ducktape-node`
+//! the agent dogfooding loop (M1), end to end on REAL `ducktape`
 //! validators: issue mention → forge-worktree run → PR, then the PR channel
 //! as a SESSION, then a deterministic concurrent-advance rebase.
 //!
@@ -6,9 +6,9 @@
 //!      channel `forge:<repo>:1`); the agent is registered with forge caps
 //!      and the channel is watched.
 //!   2. mentioning the agent runs the provider INSIDE a real git worktree of
-//!      the repo at the pinned main tip; the host commits + pushes branch
+//!      the repo at the pinned dev tip; the host commits + pushes branch
 //!      `agent/item-1` through consensus and the PR sink opens a PR whose
-//!      title is the first line of the reply's message facet.
+//!      title is the bound Forge issue title.
 //!   3. re-mentioning in the PR's OWN channel forks the branch TIP: a second
 //!      commit lands on the SAME branch (parent = the first), and the
 //!      duplicate guard opens NO second PR.
@@ -46,9 +46,9 @@ const ROUND_TRIP: Duration = Duration::from_secs(120);
 const AGENT_ID: &str = "quacker-dogfood";
 const REPO: &str = "dogfood";
 const WORK_BRANCH: &str = "agent/item-1";
-/// the worker script's single-line reply — and therefore the PR title the
-/// sink derives from the message facet's first line.
+/// the worker script's single-line reply; it belongs in the published body.
 const REPLY_TITLE: &str = "Dogfood loop proof";
+const ISSUE_TITLE: &str = "prove the dogfood loop";
 const RACE_REPLY: &str = "raced an interloper";
 
 /// one script-backed provider standing in for a coding agent. the script FILE
@@ -505,13 +505,13 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     std::fs::write(seed.path().join("README.md"), "the dogfood repo\n").expect("write readme");
     git_ok(seed.path(), &["add", "README.md"]);
     git_ok(seed.path(), &["commit", "-m", "seed"]);
-    let main_tip = git_stdout(seed.path(), &["rev-parse", "HEAD"]);
+    let dev_tip = git_stdout(seed.path(), &["rev-parse", "HEAD"]);
     let seed_url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[0]);
     git_ok(seed.path(), &["remote", "add", "origin", &seed_url]);
-    git_ok(seed.path(), &["push", "origin", "main"]);
+    git_ok(seed.path(), &["push", "origin", "HEAD:dev"]);
     // committed on the EXECUTING node before any run pins it.
     poll_until("the seed push to finalize on node 1", CONVERGE, || {
-        (branch_tip(&cluster, 1, "main")? == main_tip).then_some(())
+        (branch_tip(&cluster, 1, "dev")? == dev_tip).then_some(())
     });
 
     // ---- the issue: item #1 and its hidden channel `forge:dogfood:1`.
@@ -520,7 +520,7 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
         "forge",
         &forge::encode_msg(&forge::ForgeMsg::OpenIssue {
             repo: REPO.into(),
-            title: "prove the dogfood loop".into(),
+            title: ISSUE_TITLE.into(),
             body: "mention the duck, get a PR".into(),
         }),
     );
@@ -573,8 +573,8 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     };
     watch(&issue_channel);
 
-    // ---- run 1: issue mention → worktree at the pinned main tip → branch
-    //      `agent/item-1` born → a PR titled by the reply's first line.
+    // ---- run 1: issue mention → worktree at the pinned dev tip → branch
+    //      `agent/item-1` born → a PR titled by the bound Forge issue.
     post_mention(&cluster, 0, &issue_channel, "m1");
     let run_1 = runs::run_id_for(&issue_channel, seq_of(&cluster, 0, &issue_channel, "m1"), AGENT_ID);
     assert_eq!(
@@ -583,12 +583,23 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
         "run 1 replies in the issue channel"
     );
 
-    let run1_oid = poll_until("branch agent/item-1 to be born", FINALIZE, || {
-        branch_tip(&cluster, 0, WORK_BRANCH)
-    });
-    assert_ne!(run1_oid, main_tip, "the run pushed a NEW commit");
+    let run1_oid = {
+        let deadline = std::time::Instant::now() + FINALIZE;
+        loop {
+            if let Some(oid) = branch_tip(&cluster, 0, WORK_BRANCH) {
+                break oid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "branch {WORK_BRANCH} never born;\n{}",
+                cluster.all_log_tails(80)
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    assert_ne!(run1_oid, dev_tip, "the run pushed a NEW commit");
 
-    // the provider ran in a REAL worktree: DETACHED at the pinned main tip
+    // the provider ran in a REAL worktree: DETACHED at the pinned dev tip
     // (the work branch is push-time only), under the operator-rooted run tree.
     let trace = provider.trace();
     assert_eq!(trace.len(), 1, "one provider execution so far: {trace:?}");
@@ -598,9 +609,9 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
         "the worktree honors DUCKTAPE_AGENT_RUNS_ROOT: {cwd}"
     );
     assert_eq!(head_ref, "HEAD", "the worktree is DETACHED at the pin");
-    assert_eq!(head, main_tip, "run 1 forks the pinned main tip");
+    assert_eq!(head, dev_tip, "run 1 forks the pinned dev tip");
 
-    // the PR: opened by the sink, titled from the message facet's first line.
+    // the PR: opened by the sink, titled from verified bound issue metadata.
     let pr_number = poll_until("the PR to open", FINALIZE, || {
         tracker_items(&cluster, 0)
             .iter()
@@ -609,9 +620,12 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     });
     let pr = tracker_item(&cluster, 0, pr_number).expect("the PR item");
     assert_eq!(pr.summary.state, forge::ItemState::Open);
-    assert_eq!(pr.summary.title, REPLY_TITLE, "PR title = the reply's first line");
+    assert_eq!(
+        pr.summary.title, ISSUE_TITLE,
+        "PR title = the bound issue title"
+    );
     assert_eq!(pr.source_branch.as_deref(), Some(WORK_BRANCH));
-    assert_eq!(pr.target_branch.as_deref(), Some("main"));
+    assert_eq!(pr.target_branch.as_deref(), Some("dev"));
     let pr_channel = pr.channel_id.clone();
     assert_eq!(pr_channel, format!("forge:{REPO}:{pr_number}"));
 
@@ -654,7 +668,7 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     );
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run2_oid);
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD^"]), run1_oid, "run 2's parent is run 1's commit");
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), main_tip);
+    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), dev_tip);
 
     assert_eq!(open_pr_count(&cluster, 0), 1, "the duplicate guard opened NO second PR");
     let record = poll_until("run 2 in the delivered-runs ring", FINALIZE, || {

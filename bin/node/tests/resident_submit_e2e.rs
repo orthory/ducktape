@@ -91,12 +91,12 @@ fn resident_posts_to_chat_with_its_own_authorship() {
         "the refusal names the joining/no-standing contract: {refused}"
     );
 
-    // grant RESIDENT standing (invite-accept = AddResident), then wait for the
+    // grant RESIDENT standing (resident accept = AddResident), then wait for the
     // follow arm to grant standing AND pre-sync a boundary — the write gate
     // needs both (serving is Some only after the first boundary).
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
-    cluster.wait_marker(1, "resident: standing granted", CONVERGE);
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{out}");
+    cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     // (2) THE POINT: the resident posts through its OWN surface and the reply is
@@ -223,12 +223,15 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     );
     // the reply carries the governance module's OWN rejection reason verbatim
     // (the drain's DrainedFrame.reason lane): proof the op reached execute and
-    // was deterministically rejected there — a door refusal says "standing".
+    // was deterministically rejected there. governance gates in two steps —
+    // "holds no validator-set standing" when the submitter has no member node
+    // bound at all (the v2-joined resident's shape), "not a current
+    // validator-set member" when it has a node outside the set — and either
+    // one is the deterministic no-authority reject this test pins.
+    let reason = gov["error"].as_str().unwrap_or_default();
     assert!(
-        gov["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("not a current validator-set member"),
+        reason.contains("holds no validator-set standing")
+            || reason.contains("not a current validator-set member"),
         "the op finalized and was deterministically Rejected (not refused at the door): {gov}"
     );
 

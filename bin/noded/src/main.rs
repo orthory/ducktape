@@ -7,7 +7,7 @@
 //! thread and only ever talks to the actor over the command channel. every app
 //! build is a client: the web build dials this directly; the desktop shell
 //! spawns it detached (an orphan — it outlives the window) and connects the
-//! same way. POST /v1/shutdown is how a client retires it: no pid handshake,
+//! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
 //! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
@@ -18,7 +18,6 @@
 //! heights stay monotonic across restarts (a counter restarting at 0 would
 //! make every new block look already-indexed and be silently skipped).
 
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,50 +29,31 @@ use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use duckdns::DuckDns;
 use gateway::Gateway;
 use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use host::{BlockContext, DispatchRecord, Host, SubmitError};
+use host::{BlockContext, Host, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
-use jobs::Jobs;
 use noded::{
-    BlockDisposition, BlockRecord, BlockSummary, DispatchInfo, ModuleCategory, ModuleStatus,
-    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
-    hex_bytes, hex_root, payload_preview,
+    BlockDisposition, BlockRecord, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row, hex_root,
 };
 use pages::Pages;
-use host::worker::MAX_WORKER_ROUNDS;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use tasks::Tasks;
-use tracing_subscriber::prelude::*;
+use statesync::qmdb::QmdbStore;
 
-/// every module registered at genesis, in registry order. status reports use
-/// this list; keep it in sync with the genesis vec in `run_node`.
-const MODULE_IDS: [&str; 16] = [
-    "chat",
-    "saga",
-    "dispatch",
-    "tagging",
-    "tasks",
-    "inbox",
-    "automations",
-    "jobs",
-    "agent",
-    "runs",
-    "pages",
-    "forge",
-    "files",
-    "identity",
-    "duckdns",
-    "gateway",
-];
+/// every module registered at genesis, in registry order — the `sim_base`
+/// selection of the single-source [`host::topology`] (identical to simnode's
+/// default set). status reports use this list; the genesis vec in `run_node`
+/// composes the same ids over native module structs.
+const MODULE_IDS: &[&str] = host::topology::SIM_BASE;
 
 mod oracle_pool;
 
@@ -109,10 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // <storage>/index/<module>/, with each module's view mapper registered.
     // an open failure is fatal-with-remedy rather than a silent no-index run:
     // the tier is rebuildable, so the fix is always "delete <storage>/index".
-    let index = noded::open_index_store(&storage, &MODULE_IDS)?;
+    let index = noded::open_index_store(&storage, MODULE_IDS)?;
 
     let log_ring = noded::LogRing::default();
-    init_tracing(log_ring.clone());
+    noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));
 
     let (handle, cmd_rx, stream_hub) = NodeHandle::channel_with_log_ring(log_ring);
     let handle = handle
@@ -123,7 +103,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_index_store(index.clone())
         // the duckfs workspace RPC materializes managed checkouts here (disk
         // state, separate from the module's own `<storage>/duckfs` dir).
-        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        // the single-writer daemon has no consensus and no on-chain owner, so
+        // admin stays loopback-trust (ADR A2/A5); `DUCKTAPE_ADMIN=off` still
+        // removes the control surface entirely.
+        .with_admin(noded::AdminConfig {
+            exposure: noded::AdminExposure::from_env(),
+            node_key: None,
+            ..Default::default()
+        });
 
     // the node actor gets its own thread: commonware's tokio runner owns that
     // thread's runtime, and the host must never leave it. the blob handle is
@@ -140,6 +128,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // duckfs checkout/commit over this SAME actor lane (the /v1/fs/workspaces
     // transport). cheap — NodeHandle is a command-lane sender + a few Arcs.
     let actor_handle = handle.clone();
+
+    // the node-local, off-chain interactive terminal-session plane (lives in the
+    // daemon like the stream hub — never consensus). Podman-only: interactive
+    // spawn refuses the Direct backend, so this is available ONLY when the
+    // operator configured a sandbox image (DUCKTAPE_SANDBOX_IMAGE); with none,
+    // create returns a clear error rather than a Direct spawn. The identity +
+    // agent dirs mirror the oracle pool's (ORACLE_ORIGIN, AgentDirs under
+    // <storage>). The manager shares the StreamHub's terminal ring so its pump
+    // appends where the ws catch-up reads.
+    let term_ring = handle.stream_hub().terminals();
+    let term_cmd_ring = handle.stream_hub().term_commands();
+    let interactive = noded::term::discover_interactive(
+        ORACLE_ORIGIN,
+        capability_host::AgentDirs::under(&storage),
+        noded::term::backend_from_env(),
+    );
+    tracing::info!(
+        target: "ducktape::term",
+        enabled = interactive.is_some(),
+        "terminal_plane_ready"
+    );
+    let handle = handle.with_terminals(noded::TerminalSessions::new(
+        interactive,
+        capability_host::execution_node_id(ORACLE_ORIGIN),
+        storage.join("term-sessions"),
+        term_ring,
+        term_cmd_ring,
+    ));
     std::thread::Builder::new()
         .name("node-actor".into())
         .spawn(move || {
@@ -157,9 +173,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         })?;
 
-    println!(
-        "[noded] listening on {listen}, storage {}",
-        storage.display()
+    tracing::info!(
+        target: "ducktape::node",
+        %listen,
+        storage = %storage.display(),
+        "noded listening"
     );
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -169,22 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             noded::serve(listener, handle).await?;
             // in-flight requests drained; blocks commit at the block boundary,
             // so exiting here loses nothing.
-            println!("[noded] shutdown requested, exiting");
+            tracing::info!(target: "ducktape::node", "noded shutdown requested; exiting");
             Ok(())
         })
-}
-
-fn init_tracing(log_ring: noded::LogRing) {
-    // the stream's `logs` topic: info floor by default so debug/trace events
-    // never pay per-event formatting into the ring; RUST_LOG overrides.
-    let ring_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(log_ring)
-        .with_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        );
-    let _ = tracing_subscriber::registry().with(ring_layer).try_init();
 }
 
 /// own the host for the process lifetime: genesis the module set, then apply
@@ -227,8 +232,7 @@ fn run_node(
         // automations bridging chat events into chat/tasks/inbox follow-ups,
         // jobs for deferred work, pages + forge for the substrate-backed
         // stores, and files (duckfs) for the content plane.
-        let chat = Chat::init(context.child("chat"), "chat")
-            .await
+        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         // the task plane: recipe manifests + capability dispatch with
@@ -239,7 +243,6 @@ fn run_node(
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let jobs = Jobs::new("jobs");
         let agent = AgentModule::new("agent", "saga", Some("runs".into()));
         let runs = RunsModule::new(
             "runs",
@@ -249,7 +252,7 @@ fn run_node(
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )
         // the duckfs/files module the portable (v3) composer pins its source
         // head from (W2). its presence is what selects the v3 composer; unwired,
@@ -263,8 +266,7 @@ fn run_node(
         // the pages effects lane (pages.comment / pages.set_checked) writes
         // to; unwired, both degrade to breadcrumbs.
         .with_pages_module("pages");
-        let pages = Pages::init(context.child("pages"), "pages")
-            .await
+        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
             .with_tagging("tagging");
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
@@ -283,7 +285,9 @@ fn run_node(
         // chain-unscoped certs are an acceptable surface here). It also owns
         // the canonical account display name.
         let identity = Identity::new("identity", None, String::new());
-        let duckdns = DuckDns::new("duckdns", "identity", None);
+        // the MERGED gateway owns both the `.duck` handle plane and the route
+        // plane; the single-node daemon carries no valset (ungated) and a
+        // dev-only chain id.
         let gateway = Gateway::new("gateway", "identity", None, "local");
         let mut host = Host::genesis(vec![
             Box::new(chat),
@@ -293,24 +297,27 @@ fn run_node(
             Box::new(tasks),
             Box::new(inbox),
             Box::new(automations),
-            Box::new(jobs),
             Box::new(agent),
             Box::new(runs),
             Box::new(pages),
             Box::new(forge),
             Box::new(files),
             Box::new(identity),
-            Box::new(duckdns),
             Box::new(gateway),
         ])
         .expect("genesis");
 
-        println!("[noded] genesis app_hash={}", hex_root(&host.app_hash()));
+        tracing::info!(
+            target: "ducktape::consensus",
+            app_hash = %hex_root(&host.app_hash()),
+            "noded genesis"
+        );
 
         // register the daemon's `ducktape_*` series on the runtime registry —
         // one `context.encode()` then serves them alongside commonware's own
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
+        metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
 
         // OFF-LOOP execution: the pool gates effects inline but runs the
         // provider CLI on spawned tasks; a completed run re-enters as a
@@ -332,7 +339,11 @@ fn run_node(
         let mut height = index.resume_height().expect("read index watermarks");
         stream_hub.prime(height, hex_root(&host.app_hash()));
         if height > 0 {
-            println!("[noded] module index resumes at height {height}");
+            tracing::info!(
+                target: "ducktape::modules",
+                height,
+                "noded module index resumed"
+            );
         }
         // heal modules whose watermark trails the resume floor — a wiped (or
         // torn) per-module database that forward folding can never refill,
@@ -348,17 +359,24 @@ fn run_node(
         {
             Ok(rebuilt) => {
                 for (module, rows) in rebuilt {
-                    println!(
-                        "[noded] module index for {module} re-derived from state at height {height} ({rows} rows)"
+                    tracing::info!(
+                        target: "ducktape::modules",
+                        module,
+                        height,
+                        rows,
+                        "noded module index re-derived from state"
                     );
                 }
             }
             Err(err) => {
                 // poisoned, not fatal: reads stay up, writes refuse, and the
                 // wipe-to-rebuild remedy is the same one the fold error names.
-                eprintln!(
-                    "[noded] module index rebuild failed: {err} — wipe {} to rebuild",
-                    index.base().display()
+                tracing::error!(
+                    target: "ducktape::consensus",
+                    error = %err,
+                    index = %index.base().display(),
+                    "module index rebuild FAILED — the app's views are STALE; wipe the \
+                     index directory to rebuild"
                 );
             }
         }
@@ -395,7 +413,14 @@ fn run_node(
                     // would never produce. it decodes exactly as the validator's
                     // ordered drain does instead.
                     let result = match node::decode_frame(&frame) {
-                        Ok((origin, msg)) => {
+                        // the embedded daemon's single-op lane has no batch
+                        // path to release a continuation on — refuse loudly
+                        // rather than silently strip it off a signed frame.
+                        Ok((_origin, _msg, Some(_cont))) => Err(
+                            "continuation envelopes are not supported on the embedded daemon lane"
+                                .to_string(),
+                        ),
+                        Ok((origin, msg, None)) => {
                             submit_and_drain(
                                 &mut host,
                                 &workers,
@@ -424,6 +449,13 @@ fn run_node(
                     let _ = reply.send(result);
                 }
                 NodeCommand::Status { reply } => {
+                    metrics.update_storage(
+                        0,
+                        index.is_poisoned(),
+                        MODULE_IDS.iter().map(|id| {
+                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                        }),
+                    );
                     let modules = MODULE_IDS
                         .iter()
                         .map(|id| ModuleStatus {
@@ -443,9 +475,25 @@ fn run_node(
                         // the embedded daemon has no mesh identity — clients
                         // treat an empty key as "no peer-routed features here".
                         public_key: String::new(),
+                        operations: metrics.operational_status(),
                     });
                 }
+                NodeCommand::Peers { reply } => {
+                    // the embedded daemon has no mesh, so the exposition
+                    // carries no peer families and the honest sample is empty.
+                    let _ = reply.send(noded::peers::peers_from_exposition(
+                        &context.encode(),
+                        unix_millis(),
+                    ));
+                }
                 NodeCommand::Metrics { reply } => {
+                    metrics.update_storage(
+                        0,
+                        index.is_poisoned(),
+                        MODULE_IDS.iter().map(|id| {
+                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                        }),
+                    );
                     // the context owns the registry; encode it to OpenMetrics text.
                     let _ = reply.send(context.encode());
                 }
@@ -479,65 +527,93 @@ async fn submit_and_drain(
     origin: Origin,
     msg: Msg,
 ) -> Result<BlockSummary, String> {
-    let (included, effects) =
+    let (included, events) =
         match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await
     {
-        Ok(out) => out,
-        Err(SubmitError::Fatal(err)) => {
-            eprintln!("[noded] FATAL: {err} — halting");
+            Ok(out) => out,
+            Err(SubmitError::Fatal(err)) => {
+                tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
                 std::process::exit(1);
             }
             Err(err @ SubmitError::Rejected(_)) => return Err(err.to_string()),
         };
 
-    let mut queue = VecDeque::new();
-    offer_effects(workers, effects, &mut queue).await;
-    let mut rounds = 1u32;
-
-    loop {
-        let Some(follow) = queue.pop_front() else {
-            // the never-pop-stack tail: results committed into the dispatch
-            // mailbox deliver in a LATER block, and this block-per-op daemon
-            // ticks no other blocks — nudge one flush block per pending batch.
-            if !host.has_pending_deliveries().await {
-                break;
-            }
-            queue.push_back(Msg {
-                target: dispatch::DEFAULT_DISPATCH_TARGET.into(),
-                payload: dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {}),
-            });
-            continue;
-        };
-        rounds += 1;
-        if rounds > MAX_WORKER_ROUNDS {
-            return Err("worker-round budget exceeded".into());
+    // the shared reactor loop settles worker follow-ups through this lane's own
+    // 1-op-1-block submit path (each its own block), nudging a stranded dispatch
+    // mailbox and bounding a self-retriggering worker.
+    let mut lane = OracleLane {
+        host: &mut *host,
+        height: &mut *height,
+        index,
+        blobs,
+        stream_hub,
+        metrics,
+    };
+    let unclaimed = match host::worker::drive(workers, events, &mut lane).await {
+        Ok(unclaimed) => unclaimed,
+        Err(host::worker::Error::Fatal(err)) => {
+            tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
+            std::process::exit(1);
         }
+        Err(err) => return Err(err.to_string()),
+    };
+
+    // an unclaimed event is a module's ONLY diagnostic channel (a wasm guest
+    // cannot log) — unless it decodes as a worker request, which means a saga
+    // is stuck Pending.
+    let mut notes = noded::log::ModuleNotes::new(*height);
+    for eff in &unclaimed {
+        notes.unclaimed(eff);
+    }
+    notes.finish();
+
+    Ok(included)
+}
+
+/// the noded submit lane behind the shared reactor [`host::worker::drive`]: each
+/// worker follow-up commits as its own block through [`submit_one`] under the
+/// oracle origin. a deterministic rejection is logged and skipped (the oracle's
+/// result never landed); only a fatal block-boundary fault propagates.
+struct OracleLane<'a> {
+    host: &'a mut Host,
+    height: &'a mut u64,
+    index: &'a IndexStore,
+    blobs: &'a noded::blobs::BlobHandle,
+    stream_hub: &'a StreamHub,
+    metrics: &'a NodeMetrics,
+}
+
+#[async_trait::async_trait(?Send)]
+impl host::worker::Lane for OracleLane<'_> {
+    async fn submit(&mut self, follow: Msg) -> Result<Vec<Event>, host::worker::Error> {
         match submit_one(
-            host,
-            height,
-            index,
-            blobs,
-            stream_hub,
-            metrics,
+            self.host,
+            self.height,
+            self.index,
+            self.blobs,
+            self.stream_hub,
+            self.metrics,
             Origin::External(ORACLE_ORIGIN.to_vec()),
             follow,
         )
         .await
         {
-            Ok((_block, effects)) => {
-                offer_effects(workers, effects, &mut queue).await;
-            }
-            Err(SubmitError::Fatal(err)) => {
-                eprintln!("[noded] FATAL: {err} — halting");
-                std::process::exit(1);
-            }
+            Ok((_block, events)) => Ok(events),
+            Err(SubmitError::Fatal(err)) => Err(host::worker::Error::Fatal(err)),
             Err(err @ SubmitError::Rejected(_)) => {
-                eprintln!("[noded] worker follow-up rejected: {err}");
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %err,
+                    "worker follow-up REJECTED — the oracle's result never landed"
+                );
+                Ok(Vec::new())
             }
         }
     }
 
-    Ok(included)
+    async fn pending(&self) -> bool {
+        self.host.has_pending_deliveries().await
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,29 +626,18 @@ async fn submit_one(
     metrics: &NodeMetrics,
     origin: Origin,
     msg: Msg,
-) -> Result<(BlockSummary, Vec<Effect>), SubmitError> {
+) -> Result<(BlockSummary, Vec<Event>), SubmitError> {
     let consensus_time = unix_millis();
-    // the explorer row's identity: capture the root op's coordinates before
-    // ctx/msg consume them. this lane frames and signs nothing, so the
-    // "proposer" is the SUBMITTER's origin bytes, hex like the networked
-    // lane's keys (identity maps bound node keys to account display names).
-    let proposer = match &origin {
-        Origin::External(id) => hex_bytes(id),
-        Origin::Module(id) => format!("module:{id}"),
-        Origin::System => "system".into(),
-    };
+    // the row's coordinates, captured before ctx/msg consume them. this lane
+    // frames and signs nothing, so the shared projection renders the SUBMITTER's
+    // origin as the row `proposer` (hex like the networked lane's keys — identity
+    // maps bound node keys to account display names).
     let target = msg.target.clone();
-    let payload = payload_preview(&msg.payload);
-    // staging IS hashing: put_chunk keys the blob by sha256, so this both
-    // computes the op's content address and keeps it dereferencable via
-    // GET /v1/files/blob/{op_hash} — receipt-parity with the submit reply,
-    // and coverage for worker follow-ups no client ever POSTed.
-    let op_hash = hex_bytes(&blobs.put_chunk(msg.payload.clone()));
+    let payload = msg.payload.clone();
     let ctx = BlockContext {
-        protocol_version: 0,
         height: *height + 1,
         consensus_time,
-        origin,
+        origin: origin.clone(),
     };
     // node-local wall-clock cost of applying this block — the metrics plane's
     // one non-deterministic signal (the apply-latency histogram). measured HERE
@@ -587,99 +652,42 @@ async fn submit_one(
         height: *height,
         app_hash: hex_root(&out.app_hash),
     };
-    let operations: Vec<DispatchInfo> = out.dispatches.iter().map(dispatch_info).collect();
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
-    metrics.record_ops(1); // this lane is one member op per block
+    metrics.record_op_outcomes(1, 0); // this lane is one applied member op per block
 
     // fold the block into the derived per-module index LAST: canonical state
     // is already committed, so an index failure degrades the read models and
-    // never the block. the store poisons itself on error (contiguity over
-    // coverage) and stays loud on every later block until rebuilt.
-    let block_ops = indexer::BlockOps {
-        // the explorer row. every block on this lane is applied — a rejected
-        // submit never increments the height, so it never was a block. the
-        // frame hash stays empty: nothing is framed on this lane, and an
-        // invented digest would claim a verification that never happened.
-        record: Some(block_row(&BlockRecord {
-            height: *height,
-            hash: String::new(),
-            commit_hash: hex_root(&out.app_hash),
-            // the embedded daemon lane is 1-op-1-block (one host.submit per
-            // block), so the block carries exactly one member op.
-            ops: vec![noded::RootOp {
-                proposer,
-                disposition: BlockDisposition::Applied,
-                target,
-                operations,
-                payload,
-                op_hash,
-            }],
-        })),
-        ..noded::index_block_ops(*height, consensus_time, &out.dispatches)
-    };
-    if let Err(err) = index.apply_block(&block_ops) {
-        eprintln!(
-            "[noded] module index apply failed at height {}: {err} — wipe <storage>/index to rebuild",
-            *height
-        );
-    }
+    // never the block. the explorer row via the shared projection seam — RootOp
+    // assembly, dispatch trace, payload preview, and op-hash staging (put_chunk
+    // keys the blob by sha256, keeping it dereferencable via
+    // GET /v1/files/blob/{op_hash}) in ONE shape with the validator lane. every
+    // block on this lane is applied (a rejected submit never increments the
+    // height, so it never was a block); the frame hash stays empty — nothing is
+    // framed here, and an invented digest would claim a verification that never
+    // happened.
+    let record = Some(block_row(&BlockRecord {
+        height: *height,
+        hash: String::new(),
+        commit_hash: hex_root(&out.app_hash),
+        // the embedded daemon lane is 1-op-1-block (one host.submit per block),
+        // so the block carries exactly one member op.
+        ops: vec![noded::projection::project_root_op(
+            blobs,
+            &origin,
+            &target,
+            &payload,
+            &out.dispatches,
+            BlockDisposition::Applied,
+        )],
+    }));
+    // the shared index-fold epilogue (store poisons itself on error, staying
+    // loud on every later block until rebuilt).
+    noded::projection::apply_block_to_index(index, *height, consensus_time, record, &out.dispatches);
 
     // fan the block out live after the derived index had its chance to
     // materialize rows. no subscribers is fine.
     stream_hub.publish_block(block.height, block.app_hash.clone());
 
-    Ok((block, out.effects))
-}
-
-/// map a deterministic dispatch record to its explorer wire twin (the block
-/// record's `operations`).
-fn dispatch_info(record: &DispatchRecord) -> DispatchInfo {
-    DispatchInfo {
-        module: record.module.clone(),
-        origin: origin_tag(&record.origin),
-        emitted_msgs: record.emitted_msgs,
-        emitted_events: record.emitted_events,
-    }
-}
-
-/// a compact, human-legible tag for what triggered a dispatch.
-fn origin_tag(origin: &Origin) -> String {
-    match origin {
-        Origin::External(name) if name.is_empty() => "external".to_string(),
-        Origin::External(name) => format!("external:{}", String::from_utf8_lossy(name)),
-        Origin::Module(id) => format!("module:{id}"),
-        Origin::System => "system".to_string(),
-    }
-}
-
-async fn offer_effects(
-    workers: &[Box<dyn host::worker::Worker>],
-    effects: Vec<Effect>,
-    queue: &mut VecDeque<Msg>,
-) {
-    for eff in effects {
-        let mut claimed = false;
-        for w in workers {
-            match w.run(&eff).await {
-                Ok(host::worker::WorkOutcome::Handled(follow)) => {
-                    queue.extend(follow);
-                    claimed = true;
-                    break;
-                }
-                Ok(host::worker::WorkOutcome::NotMine) => {}
-                Err(err) => {
-                    eprintln!("[noded] worker error: {err}");
-                    claimed = true;
-                    break;
-                }
-            }
-        }
-        if !claimed {
-            println!(
-                "[noded] effect with no worker ({} bytes) — dropped",
-                eff.0.len()
-            );
-        }
-    }
+    Ok((block, out.events))
 }

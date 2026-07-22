@@ -14,14 +14,14 @@ use super::{
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
 /// network re-mints invites on a format change, and a stale paste fails loudly
-/// at decode — the old `ducktape:` / `ducktape-invite-v*:` prefixes no longer
-/// decode at all.
+/// at decode.
 const INVITE_PREFIX: &str = "🦆";
 
-/// Joining through coordinated reach needs the local reachability plane even
-/// when the invite does not contain a direct inviter-hosted tunnel bootstrap.
-pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
-    invite.wireguard.is_some() || invite.descriptor.has_coordinated_reach().unwrap_or(false)
+/// the WireGuard/overlay plane is MANDATORY, so an invite always brings up
+/// the joiner's reachability plane. Kept as a named predicate
+/// (call sites read as intent) rather than inlining a bare `true`.
+pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
+    true
 }
 
 // ============================================================================
@@ -35,30 +35,46 @@ pub fn invite_requires_reachability_defaults(invite: &Invite) -> bool {
 // ============================================================================
 
 pub use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof, verify_invite_token,
-    verify_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, grant_preimage,
+    sign_join_proof, verify_invite_token, verify_join_proof,
 };
 
-/// mint a token binding an invite to `binding` (the genesis namespace): fresh
-/// OS randomness for the nonce, signed by this member's identity.
-pub fn mint_invite_token(signer: &ed25519::PrivateKey, binding: &[u8]) -> InviteToken {
+/// mint a BEARER invite token binding an invite to `binding` (the genesis
+/// namespace), with `role` and `expires_unix_secs`: fresh OS randomness for the
+/// nonce, signed by this member's identity. minting IS the admission decision —
+/// there is no target (기명 dropped — see the join ADR); whoever presents a
+/// valid join proof for the nonce first redeems it, single-use.
+pub fn mint_invite_token(
+    signer: &ed25519::PrivateKey,
+    binding: &[u8],
+    role: InviteRole,
+    expires_unix_secs: u64,
+) -> InviteToken {
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let msg = [binding, &nonce].concat();
+    // sign the SAME preimage every verifier checks (`grant_preimage` is `pub`
+    // from the governance crate) — no restated shape to drift.
+    let msg = grant_preimage(binding, &nonce, role, expires_unix_secs);
     InviteToken {
         issuer: signer.public_key(),
         nonce,
+        role,
+        expires_unix_secs,
         sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
-const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 64;
+/// packed token: `issuer(32) ‖ nonce(16) ‖ role(1) ‖ expires_le(8) ‖
+/// sig(64)` — a fixed 121 bytes (every invite is bearer; no kind, no target).
+const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 8 + 64;
 
 fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
     let mut out = Vec::with_capacity(INVITE_TOKEN_LEN);
     out.extend_from_slice(t.issuer.as_ref());
     out.extend_from_slice(&t.nonce);
+    out.push(t.role.as_u8());
+    out.extend_from_slice(&t.expires_unix_secs.to_le_bytes());
     out.extend_from_slice(t.sig.encode().as_ref());
     out
 }
@@ -74,9 +90,20 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
         .map_err(|e| format!("invite token issuer: {e}"))?;
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     nonce.copy_from_slice(&bytes[32..32 + INVITE_NONCE_LEN]);
-    let sig = ed25519::Signature::decode(&bytes[32 + INVITE_NONCE_LEN..])
+    let mut pos = 32 + INVITE_NONCE_LEN;
+    let role = InviteRole::from_u8(bytes[pos])?;
+    pos += 1;
+    let expires_unix_secs = u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
+    pos += 8;
+    let sig = ed25519::Signature::decode(&bytes[pos..])
         .map_err(|e| format!("invite token signature: {e}"))?;
-    Ok(InviteToken { issuer, nonce, sig })
+    Ok(InviteToken {
+        issuer,
+        nonce,
+        role,
+        expires_unix_secs,
+        sig,
+    })
 }
 
 /// persist the token a `join` received beside the descriptor (0600 like the
@@ -95,6 +122,24 @@ pub fn save_invite_token(dir: &Path, token: &InviteToken) -> Result<(), String> 
     let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
     f.write_all(format!("{}\n", hex_bytes(&pack_invite_token(token))).as_bytes())
         .map_err(|e| format!("write {path:?}: {e}"))
+}
+
+/// delete the stored invite token — a CONSUMED credential must not survive to
+/// confuse a later boot (ADR §6). called once the join gate reports `Admitted`:
+/// the invite has done its one job. best-effort; a missing file is success.
+pub fn delete_invite_token(dir: &Path) {
+    let path = dir.join(INVITE_TOKEN_FILE);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            target: "ducktape::join",
+            path = %path.display(),
+            error = %e,
+            reason = "spent_token_delete_failed",
+            "spent invite token retained"
+        ),
+    }
 }
 
 /// the token a previous `join` stored, if any — a missing file is the normal
@@ -245,8 +290,7 @@ pub fn load_invite_fronts(dir: &Path) -> Result<Vec<Front>, String> {
 // the invite blob — the whole join credential packed into one signed line.
 //
 // ONE format, unversioned (bootstrapping posture — a format change re-mints
-// invites; the older `ducktape-invite-v*:` generations no longer decode). the
-// blob is a CAPABILITY, not a doorbell: it carries the descriptor (chain-id +
+// invites). the blob is a CAPABILITY, not a doorbell: it carries the descriptor (chain-id +
 // genesis validators + typed reach hints), the inviter's WireGuard bootstrap
 // (when the inviter runs the reachability plane), an expiry, and the invite
 // token whose mint IS the admission decision. the whole envelope is signed by
@@ -263,6 +307,11 @@ pub const INVITE_ENVELOPE_NAMESPACE: &[u8] = b"ducktape-invite-envelope";
 /// otherwise. single-use bounds the damage of a leaked blob; expiry bounds a
 /// LOST one.
 pub const DEFAULT_INVITE_TTL_DAYS: u64 = 7;
+
+/// bearer invites default MUCH shorter: anyone holding the blob can redeem
+/// it until its single use is spent, so the unredeemed-leak window stays a
+/// day, not a week. `--ttl-days` still overrides.
+pub const DEFAULT_BEARER_INVITE_TTL_DAYS: u64 = 1;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -347,12 +396,15 @@ pub fn fronts_from_adverts(
 pub struct Invite {
     pub descriptor: NetworkDescriptor,
     pub token: InviteToken,
-    /// `None` when the inviter runs no reachability plane (a TCP-reachable
-    /// network) — the joiner then rides the descriptor's reach hints alone.
-    pub wireguard: Option<InviteWireGuard>,
+    /// The inviter's WireGuard bootstrap — MANDATORY in v2 (the WG/overlay
+    /// plane is required; data planes ride the overlay only). The `endpoint`
+    /// inside stays reachability-dependent (a fully-NAT'd inviter has none and
+    /// is reached by identity via the coordinator), but the key material is
+    /// always present so the joiner can seal its first-contact intro.
+    pub wireguard: InviteWireGuard,
     /// additional first-contact paths the inviter offers (its reachable
-    /// members). Empty on a pre-feature blob or when the inviter has no
-    /// persisted mesh state. Never part of `genesis_namespace`.
+    /// members). Empty when the inviter has no persisted mesh state. Never part
+    /// of `genesis_namespace`.
     pub fronts: Vec<Front>,
     pub expires_unix_secs: u64,
 }
@@ -362,16 +414,15 @@ pub struct Invite {
 pub fn encode_invite(
     descriptor: &NetworkDescriptor,
     token: &InviteToken,
-    wireguard: Option<&InviteWireGuard>,
+    wireguard: &InviteWireGuard,
     fronts: &[Front],
-    expires_unix_secs: u64,
     signer: &ed25519::PrivateKey,
 ) -> Result<String, String> {
     use base64::Engine as _;
     if signer.public_key() != token.issuer {
         return Err("invite envelope must be signed by the token's issuer".into());
     }
-    let mut out = pack_invite(descriptor, token, wireguard, fronts, expires_unix_secs)?;
+    let mut out = pack_invite(descriptor, token, wireguard, fronts)?;
     let sig = signer.sign(INVITE_ENVELOPE_NAMESPACE, &out);
     out.extend_from_slice(sig.encode().as_ref());
     Ok(format!("{INVITE_PREFIX}{}", INVITE_B64.encode(out)))
@@ -398,11 +449,7 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
         .trim()
         .strip_prefix(INVITE_PREFIX)
         .ok_or_else(|| {
-            format!(
-                "not a ducktape invite (expected {INVITE_PREFIX}...); an older \
-                 ducktape:/ducktape-invite-v*: blob no longer decodes — ask for a \
-                 fresh invite"
-            )
+            format!("not a ducktape invite (expected {INVITE_PREFIX}...) — ask for a fresh invite")
         })?;
     let bytes = INVITE_B64
         .decode(body)
@@ -440,9 +487,8 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
 fn pack_invite(
     d: &NetworkDescriptor,
     token: &InviteToken,
-    wireguard: Option<&InviteWireGuard>,
+    wireguard: &InviteWireGuard,
     fronts: &[Front],
-    expires_unix_secs: u64,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
 
@@ -477,21 +523,23 @@ fn pack_invite(
         }
     }
 
-    match wireguard {
-        Some(wg) if wg.endpoint.is_some() && wg.intro.is_some() => {
+    // the WireGuard bootstrap is MANDATORY in v2. flag 1 = a direct underlay
+    // endpoint (+ intro), flag 2 = coordinated (key material only, reached by
+    // identity via the coordinator). there is no flag-0 "no wireguard" shape.
+    match (&wireguard.endpoint, &wireguard.intro) {
+        (Some(endpoint), Some(intro)) => {
             out.push(1);
-            out.extend_from_slice(&wg.public_key);
-            put_str_u8(&mut out, wg.endpoint.as_ref().expect("checked"))?;
-            put_str_u8(&mut out, wg.intro.as_ref().expect("checked"))?;
-            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+            out.extend_from_slice(&wireguard.public_key);
+            put_str_u8(&mut out, endpoint)?;
+            put_str_u8(&mut out, intro)?;
+            out.extend_from_slice(&wireguard.mesh_port.to_le_bytes());
         }
-        Some(wg) if wg.endpoint.is_none() && wg.intro.is_none() => {
+        (None, None) => {
             out.push(2);
-            out.extend_from_slice(&wg.public_key);
-            out.extend_from_slice(&wg.mesh_port.to_le_bytes());
+            out.extend_from_slice(&wireguard.public_key);
+            out.extend_from_slice(&wireguard.mesh_port.to_le_bytes());
         }
-        Some(_) => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
-        None => out.push(0),
+        _ => return Err("wireguard invite must carry both endpoint and intro, or neither".into()),
     }
 
     // the coordination-mode echo: one byte inside the SIGNED envelope,
@@ -503,8 +551,13 @@ fn pack_invite(
         Coordination::Private => 1,
     });
 
-    out.extend_from_slice(&expires_unix_secs.to_le_bytes());
-    out.extend_from_slice(&pack_invite_token(token));
+    // the token now carries its OWN expiry (no separate blob-level field) —
+    // decode enforces it from `token.expires_unix_secs`.
+    // length-prefixed: the token is variable-width (bearer carries no
+    // target bytes), so the reader learns how much to take.
+    let tok = pack_invite_token(token);
+    out.push(u8::try_from(tok.len()).expect("a packed token fits u8"));
+    out.extend_from_slice(&tok);
 
     // the fronts block rides AFTER the fixed-length token, inside the signed
     // envelope, but is NEVER fed to `genesis_namespace` (advisory reachability,
@@ -573,31 +626,39 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     }
     reach.sort();
 
+    // the WireGuard bootstrap is MANDATORY (v2): flag 0 ("no wireguard") no
+    // longer decodes — an old WG-less blob fails loudly at the reader.
     let wireguard = match r.u8()? {
-        0 => None,
         1 => {
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(r.take(32)?);
             let endpoint = r.take_str_u8()?;
             let intro = r.take_str_u8()?;
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
-            Some(InviteWireGuard {
+            InviteWireGuard {
                 public_key,
                 endpoint: Some(endpoint),
                 intro: Some(intro),
                 mesh_port,
-            })
+            }
         }
         2 => {
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(r.take(32)?);
             let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
-            Some(InviteWireGuard {
+            InviteWireGuard {
                 public_key,
                 endpoint: None,
                 intro: None,
                 mesh_port,
-            })
+            }
+        }
+        0 => {
+            return Err(
+                "this invite carries no WireGuard bootstrap — v2 requires the reachability \
+                 plane; ask for a fresh invite from a plane-enabled member"
+                    .into(),
+            );
         }
         other => return Err(format!("unknown wireguard flag {other} in invite")),
     };
@@ -610,11 +671,14 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         other => return Err(format!("unknown coordination mode {other} in invite")),
     };
 
-    let expires_unix_secs = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
+    // the token carries its own expiry now (no separate blob-level field);
+    // enforce it against the injected clock right after unpacking.
+    let tok_len = r.u8()? as usize;
+    let token = unpack_invite_token(r.take(tok_len)?)?;
+    let expires_unix_secs = token.expires_unix_secs;
     if now_unix_secs >= expires_unix_secs {
         return Err("this invite has expired — ask for a fresh one".into());
     }
-    let token = unpack_invite_token(r.take(INVITE_TOKEN_LEN)?)?;
 
     // the optional fronts block. A pre-feature blob has nothing after the
     // token (`r.done()`), decoding to an empty set; a feature blob carries a
@@ -752,14 +816,30 @@ mod tests {
         );
     }
 
-    /// mint + encode with the test defaults: issuer-signed, far-future expiry.
+    /// a minimal coordinated (endpoint-less) WireGuard bootstrap — the default a
+    /// test invite carries when it does not specify one (v2: WG is mandatory).
+    fn coordinated_test_wg() -> InviteWireGuard {
+        InviteWireGuard {
+            public_key: [0u8; 32],
+            endpoint: None,
+            intro: None,
+            mesh_port: 52200,
+        }
+    }
+
+    /// mint + encode with the test defaults: issuer-signed, bearer Resident,
+    /// far-future expiry. A caller that passes no WireGuard gets the minimal
+    /// coordinated default, since v2 invites always carry a bootstrap.
     fn encode_test_invite(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
-        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
-        encode_invite(d, &token, wireguard, &[], u64::MAX, issuer).expect("encode")
+        let token =
+            mint_invite_token(issuer, d.genesis_namespace().as_bytes(), InviteRole::Resident, u64::MAX);
+        let default_wg = coordinated_test_wg();
+        let wg = wireguard.unwrap_or(&default_wg);
+        encode_invite(d, &token, wg, &[], issuer).expect("encode")
     }
 
     #[test]
@@ -784,7 +864,7 @@ mod tests {
             d.reach_hints().expect("source hints"),
             "the dial hints survive as typed reach hints"
         );
-        assert_eq!(invite.wireguard, None);
+        assert_eq!(invite.wireguard, coordinated_test_wg());
         let binding = d.genesis_namespace();
         assert!(verify_invite_token(&invite.token, binding.as_bytes()));
 
@@ -818,6 +898,50 @@ mod tests {
     }
 
     #[test]
+    fn a_bearer_client_token_roundtrips_the_file_and_blob_codecs() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let me = issuer.public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "127.0.0.1:52200");
+        let binding = d.genesis_namespace();
+        let token = mint_invite_token(&issuer, binding.as_bytes(), InviteRole::Client, u64::MAX);
+        assert_eq!(token.role, InviteRole::Client);
+        assert!(verify_invite_token(&token, binding.as_bytes()));
+
+        // packed-token codec: fixed width, exact roundtrip.
+        let packed = pack_invite_token(&token);
+        assert_eq!(packed.len(), INVITE_TOKEN_LEN);
+        assert_eq!(unpack_invite_token(&packed).expect("token roundtrip"), token);
+
+        // token FILE roundtrip (the joining side persists it 0600).
+        let dir = tmp("bearer-token-file");
+        save_invite_token(&dir, &token).expect("save");
+        assert_eq!(load_invite_token(&dir).expect("load"), Some(token.clone()));
+
+        // full blob roundtrip: the variable-width token rides length-prefixed.
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
+        let invite = decode_invite(&blob).expect("decode");
+        assert_eq!(invite.token, token);
+
+        // ANY key may prove possession against a bearer token.
+        let redeemer = ed25519::PrivateKey::from_seed(11);
+        let proof = sign_join_proof(&redeemer, binding.as_bytes(), &invite.token);
+        assert!(verify_join_proof(
+            &redeemer.public_key(),
+            binding.as_bytes(),
+            &invite.token,
+            &proof
+        ));
+    }
+
+    #[test]
     fn invite_blob_carries_the_wireguard_bootstrap() {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
@@ -838,20 +962,28 @@ mod tests {
             mesh_port: 52200,
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, Some(&wg))).expect("decode");
-        assert_eq!(invite.wireguard, Some(wg));
+        assert_eq!(invite.wireguard, wg);
         // a wireguard invite with no fronts decodes to an empty set.
         assert!(invite.fronts.is_empty());
     }
 
-    /// mint + encode with the test defaults, carrying a set of fronts.
+    /// mint + encode with the test defaults, carrying a set of fronts. A caller
+    /// that passes no WireGuard gets the minimal coordinated default (v2).
     fn encode_test_invite_with_fronts(
         d: &NetworkDescriptor,
         issuer: &ed25519::PrivateKey,
         wireguard: Option<&InviteWireGuard>,
         fronts: &[Front],
     ) -> String {
-        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes());
-        encode_invite(d, &token, wireguard, fronts, u64::MAX, issuer).expect("encode")
+        let token = mint_invite_token(
+            issuer,
+            d.genesis_namespace().as_bytes(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
+        let default_wg = coordinated_test_wg();
+        let wg = wireguard.unwrap_or(&default_wg);
+        encode_invite(d, &token, wg, fronts, issuer).expect("encode")
     }
 
     fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
@@ -940,7 +1072,6 @@ mod tests {
             wireguard_public_key: X25519PublicKey([octet; 32]),
             control_endpoint: endpoint(443, Transport::Tcp),
             wireguard_endpoint: wireguard_endpoint.map(|port| endpoint(port, Transport::Udp)),
-            expires_at_view: 50,
             nonce: 1,
         };
         wireguard::EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
@@ -1031,10 +1162,16 @@ mod tests {
             reach: vec![],
             coordination: None,
         };
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        // the token carries its OWN expiry now (no separate blob param).
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            InviteRole::Resident,
+            1_000,
+        );
 
         // expiry is enforced at decode, deterministically via the injected clock.
-        let blob = encode_invite(&d, &token, None, &[], 1_000, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
         assert!(decode_invite_at(&blob, 999).is_ok());
         let err = decode_invite_at(&blob, 1_000).expect_err("expired");
         assert!(err.contains("expired"), "{err}");
@@ -1054,11 +1191,10 @@ mod tests {
         // an envelope signed by someone other than the token's issuer is
         // refused at encode (and would fail decode's issuer verify anyway).
         let outsider = ed25519::PrivateKey::from_seed(8);
-        assert!(encode_invite(&d, &token, None, &[], u64::MAX, &outsider).is_err());
+        assert!(encode_invite(&d, &token, &coordinated_test_wg(), &[], &outsider).is_err());
 
-        // the old versioned prefixes are gone: a stale paste fails loudly
-        // with re-mint guidance.
-        let err = decode_invite_at("ducktape-invite-v2:AAAA", 0).expect_err("stale prefix");
+        // a non-invite paste fails loudly with re-mint guidance.
+        let err = decode_invite_at("not-an-invite:AAAA", 0).expect_err("bad prefix");
         assert!(err.contains("fresh invite"), "{err}");
     }
 
@@ -1114,7 +1250,12 @@ mod tests {
         // identity (endpoint None) — survive the signed envelope byte-for-byte.
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
         let fronts = vec![
             Front {
                 member_key: [11u8; 32],
@@ -1129,8 +1270,7 @@ mod tests {
                 endpoint: None,
             },
         ];
-        let blob =
-            encode_invite(&d, &token, None, &fronts, u64::MAX, &issuer).expect("encode");
+        let blob = encode_invite(&d, &token, &coordinated_test_wg(), &fronts, &issuer).expect("encode");
         let invite = decode_invite(&blob).expect("decode");
         assert_eq!(invite.fronts, fronts, "fronts roundtrip through the envelope");
     }
@@ -1143,10 +1283,14 @@ mod tests {
         // on a "missing" block.
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes());
+        let token = mint_invite_token(
+            &issuer,
+            d.genesis_namespace().as_bytes(),
+            InviteRole::Resident,
+            u64::MAX,
+        );
 
-        let empty_blob =
-            encode_invite(&d, &token, None, &[], u64::MAX, &issuer).expect("encode");
+        let empty_blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
         let invite = decode_invite(&empty_blob).expect("decode pre-feature-shaped blob");
         assert!(invite.fronts.is_empty(), "no fronts block => empty fronts");
 
@@ -1155,14 +1299,13 @@ mod tests {
         let with_front = encode_invite(
             &d,
             &token,
-            None,
+            &coordinated_test_wg(),
             &[Front {
                 member_key: [1u8; 32],
                 wireguard_public_key: [2u8; 32],
                 mesh_port: 1,
                 endpoint: None,
             }],
-            u64::MAX,
             &issuer,
         )
         .expect("encode");
@@ -1177,7 +1320,12 @@ mod tests {
         let dir = tmp("invitetoken");
         assert_eq!(load_invite_token(&dir).expect("absent is fine"), None);
         let issuer = ed25519::PrivateKey::from_seed(7);
-        let token = mint_invite_token(&issuer, b"net#00000000@feedface");
+        let token = mint_invite_token(
+            &issuer,
+            b"net#00000000@feedface",
+            InviteRole::Resident,
+            u64::MAX,
+        );
         save_invite_token(&dir, &token).expect("save");
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token));
     }

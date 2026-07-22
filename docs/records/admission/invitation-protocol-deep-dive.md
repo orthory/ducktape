@@ -8,7 +8,7 @@
 > [../../deploy/private-cutover-integration-gap.md](../../deploy/private-cutover-integration-gap.md)
 > for the current join recipe.
 
-> 노드 초대(invitation) 프로토콜의 구조 분석. `bin/node`(CLI + joiner 런타임), `crates/system`(on-chain admission),
+> 노드 초대(invitation) 프로토콜의 구조 분석. `bin/node`(CLI + joiner 런타임), `crates/modules/system`(on-chain admission),
 > `crates/kernel/consensus`(epoch cutover), `app/src-tauri`(desktop 래퍼)를 가로질러 추적한 결과.
 > 모든 `path:line` 참조는 분석 시점 기준.
 
@@ -31,7 +31,7 @@ genesis 전에는 초대가 **파일 편집**(founder가 자기 `network.toml`�
 
 - `bin/node/src/config.rs` — wire format + `NetworkDescriptor` + genesis fingerprint
 - `bin/node/src/main.rs` — CLI verbs + joiner 런타임
-- `crates/system/{governance,valset,valset-mesh-interface}` — on-chain admission
+- `crates/modules/system/{governance,valset,valset-mesh-interface}` — on-chain admission
 - `crates/kernel/consensus/src/valset_orchestrator.rs` — epoch cutover 스케줄링
 - `app/src-tauri/src/workspaces.rs` — desktop 래퍼
 
@@ -182,14 +182,14 @@ genesis 후엔 파일 편집이 봉인되고, `invite-accept`가 **running 노�
 5. **execute-if-decidable**: `majority = members/2 + 1`. 미달이면 에러 아니라 `Ok(())`로 안내만(부분 quorum은
    정상 중간상태). 결정타를 던진 실행만 `GovMsg::Execute`.
 
-governance 모듈(`crates/system/governance/src/lib.rs`)의 보증: `handle_propose/vote/execute`는 모두 **현재
+governance 모듈(`crates/modules/system/governance/src/lib.rs`)의 보증: `handle_propose/vote/execute`는 모두 **현재
 valset member**(`Origin::External`, 암호학적으로 검증된 frame signer)만 허용, 재투표는 last-vote-wins,
 execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영). pass 시 같은 블록 follow-up으로
 `ValsetMsg::Join{key}` emit — **governance가 valset membership 변경의 유일한 authorized 채널**.
 
 ### (b) Join → epoch cutover → mesh re-track
 
-1. valset 모듈(`crates/system/valset/src/lib.rs`)의 `execute`가 origin을 `Module`/`System`으로 강제(External
+1. valset 모듈(`crates/modules/system/valset/src/lib.rs`)의 `execute`가 origin을 `Module`/`System`으로 강제(External
    절대 불가) → `stage_add` → `commit_block`에서 `validators: BTreeSet`에 병합. `root()`는 정렬된 set의 sha256.
 2. `node.watch_module("valset")`(`main.rs:2140`)로 모든 validator가 membership 변경을 **동일 view**에서 관측하도록 배치.
 3. `ValsetOrchestrator::observe_members` (`valset_orchestrator.rs:209`)가 관측 set이 엔진의 현재 participant
@@ -200,7 +200,7 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
    그들에게 뭘 기대할 수 있음) → 그 다음 `spawn_epoch` + `node.cutover` → 즉시 checkpoint →
    `"cutover complete: epoch N …"` (테스트가 기다리는 마커).
 
-> ⚠️ `crates/system/valset-mesh-interface`는 **아직 런타임에 배선 안 됨.** 이 crate는
+> ⚠️ `crates/modules/system/valset-mesh-interface`는 **아직 런타임에 배선 안 됨.** 이 crate는
 > `(epoch, admission_root, validators) → MeshView`의 deterministic projection contract(모든 validator에게
 > `validator_owned()` capability, content-addressed `MeshVersion`)를 정의하지만, 실제 cutover 경로는
 > `main.rs`의 inline `mesh_at` 클로저가 commonware `discovery::Set`에 직접 track한다.
@@ -256,7 +256,7 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
    QMDB target을 frozen manifest root와 post-hoc 대조하던 부분이었다. 현재 state sync
    wire는 `BoundaryId { height, app_hash }`, leased captures, pinned resolver targets,
    floor-bound manifests, post-sync revalidation, post-reboot frame catch-up을 사용한다.
-   maintained summary는 Vocs의 State Sync와 Implementation Status page에 있다.
+   maintained summary는 Nimbus의 State Sync와 Implementation Status page에 있다.
 2. **테스트 커버리지 갭** — pre-genesis `admit` verb를 end-to-end로 구동하는 Rust e2e가 **없다.**
    `invite_e2e.rs`/`live_admission_e2e.rs`는 둘 다 post-genesis `invite-accept`(governance) 경로만 검증.
    pre-genesis는 `demo-invite.sh`(shell)와 `config.rs` 단위테스트로만 커버.
@@ -273,9 +273,9 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
 | CLI verbs | `bin/node/src/main.rs:744-970` | `cmd_keygen` / `cmd_init` / `cmd_invite` / `cmd_admit` |
 | Join + joiner 런타임 | `bin/node/src/main.rs:1230-1758` | `cmd_join` / `cmd_invite_accept` / joiner park·sync·promote |
 | Epoch cutover | `crates/kernel/consensus/src/valset_orchestrator.rs` | `observe_members` / `respawn_if_due` / `ScheduledCutover` / `RespawnPlan` |
-| Governance | `crates/system/governance/src/lib.rs:200-328` | `handle_propose` / `handle_vote` / `handle_execute` |
-| Valset | `crates/system/valset/src/lib.rs:233-276` | `execute` origin gate / `Join` / `commit_block` |
-| Mesh 계약(미배선) | `crates/system/valset-mesh-interface/src/lib.rs` | `derive_mesh` / `MeshView` / `MeshVersion` |
+| Governance | `crates/modules/system/governance/src/lib.rs:200-328` | `handle_propose` / `handle_vote` / `handle_execute` |
+| Valset | `crates/modules/system/valset/src/lib.rs:233-276` | `execute` origin gate / `Join` / `commit_block` |
+| Mesh 계약(미배선) | `crates/modules/system/valset-mesh-interface/src/lib.rs` | `derive_mesh` / `MeshView` / `MeshVersion` |
 | Desktop 래퍼 | `app/src-tauri/src/workspaces.rs` | `workspace_create/join/invite_blob/admit` / `advertised_addr` / `classify` |
 | Desktop UI | `app/src/console/views/onboarding/{OnboardingGate,JoinProgress}.tsx`, `views/settings/SettingsView.tsx` | invite 생성·복붙·admit UI |
 | 테스트 | `bin/node/tests/{invite_e2e,live_admission_e2e}.rs`, `bin/node/examples/demo-invite.sh` | admission 마커 시퀀스 |

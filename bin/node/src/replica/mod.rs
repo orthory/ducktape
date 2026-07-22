@@ -79,12 +79,13 @@ pub(crate) async fn run(
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: crate::config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
-    // the AMBIENT coordinator override + WireGuard bind/advertise split
-    // (node.toml `primary_coordinator` / `wireguard_advertised`), consumed
-    // by `wiring::wire`'s reachability-plane bring-up.
+    // the AMBIENT coordinator override + relay override + WireGuard
+    // bind/advertise split (node.toml `primary_coordinator` /
+    // `coordinator_relay` / `wireguard_advertised`), consumed by
+    // `wiring::wire`'s reachability-plane bring-up.
     primary_coordinator: Option<String>,
+    coordinator_relay: Option<String>,
     wireguard_advertised: Option<Ingress>,
     invite_token: &Option<crate::config::InviteToken>,
     invite_wireguard: &Option<crate::config::StoredInviteWireGuard>,
@@ -104,9 +105,10 @@ pub(crate) async fn run(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    metrics: noded::NodeMetrics,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &Option<dispatch_oracle::SharedProvisioner>,
+    agent_provisioner: &dispatch_oracle::SharedProvisioner,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -135,19 +137,19 @@ pub(crate) async fn run(
         label.clone(),
         namespace.clone(),
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         chain_id,
         mesh_state_file,
         advertised_reach,
         primary_coordinator,
+        coordinator_relay,
         wireguard_advertised,
         coord_cap,
         invite_token,
         invite_wireguard,
         invite_fronts,
-        voice_requests,
         workspace.clone(),
+        voice_requests,
         overlay_slot.clone(),
     )
     .await;
@@ -162,8 +164,6 @@ pub(crate) async fn run(
         peers,
         validators,
         wireguard_listen,
-        wireguard_effect,
-        invite_token,
         checkpoint_blocks,
         sync_index,
         announce_capabilities,
@@ -178,6 +178,7 @@ pub(crate) async fn run(
         gateway_commands,
         stream_hub,
         index,
+        metrics,
         blobs,
         agent_provisioner,
         agent_dirs,
@@ -206,12 +207,19 @@ fn reboot_self() -> ! {
         let err = std::process::Command::new(exe)
             .args(std::env::args_os().skip(1))
             .exec();
-        eprintln!("FATAL: validator reboot exec failed: {err}");
+        tracing::error!(
+            target: "ducktape::node",
+            error = %err,
+            "FATAL: validator reboot exec failed"
+        );
         std::process::exit(1);
     }
     #[cfg(not(unix))]
     {
-        println!("promoted — restart this node to run as a validator");
+        tracing::info!(
+            target: "ducktape::node",
+            "promoted — restart this node to run as a validator"
+        );
         std::process::exit(0);
     }
 }

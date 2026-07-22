@@ -68,9 +68,10 @@ use std::collections::BTreeMap;
 
 use commonware_codec::DecodeExt as _;
 use host::{FinalizedBlock, Host};
-use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle, UpgradeCoords};
+use sdk::{ModuleId, ROOT_LEN, StateRoot, StateSyncHandle};
 
 pub mod dataplane;
+pub mod monitor;
 pub mod p2p;
 pub mod qmdb;
 pub mod wire;
@@ -274,18 +275,6 @@ pub struct Manifest {
     /// the epoch has not finalized past its base — the joiner then spawns on
     /// the epoch's genesis floor instead).
     pub floor_cert: Option<Vec<u8>>,
-    /// the agreed protocol version active at `height`. an UNAUTHENTICATED
-    /// serving hint under the untrusted-server model — a lying value can at
-    /// worst mis-preflight a joiner (refuse-to-boot, or boot-then-halt at the
-    /// app-hash), never fork.
-    pub current_version: u32,
-    /// the single upgrade armed but not yet activated at `height`, if any.
-    /// same trust caveat as `current_version`.
-    pub pending_upgrade: Option<UpgradeCoords>,
-    /// the highest protocol version any block at or after `height` needs — the
-    /// joiner's boot preflight fence (`to_version` once `height >=
-    /// pending.activation_height`, else `current_version`).
-    pub required_min_version: u32,
     /// Canonical ordered module/state-schema fingerprint of the serving
     /// binary. A joiner checks this before opening any destination substrate.
     pub state_schema: [u8; 32],
@@ -302,15 +291,6 @@ impl Manifest {
             height: self.height,
             app_hash: self.app_hash,
         }
-    }
-
-    /// boot preflight: fail loud when the local build's `max_supported`
-    /// protocol version is below this boundary's `required_min_version`. an
-    /// early, actionable refusal instead of an opaque post-rebuild app-hash
-    /// mismatch. wired into every join lane (park, sync-only boot, validator
-    /// recovery).
-    pub fn preflight(&self, max_supported: u32) -> Result<(), sdk::UnsupportedVersion> {
-        sdk::check_required_version(self.required_min_version, max_supported)
     }
 }
 
@@ -362,6 +342,40 @@ pub enum SyncRequest {
     /// re-hashes the bytes and drops a mismatch, so no trust attaches to
     /// which peer answered.
     Blob { digest: [u8; 32] },
+    /// the blob's total length — the discovery half of the RANGED fetch lane
+    /// for host-staged artifacts too large for one mesh frame (wasm module
+    /// components, quack capsules). same host-layer serving and honest-miss
+    /// semantics as [`SyncRequest::Blob`].
+    BlobInfo { digest: [u8; 32] },
+    /// one bounded window of a blob, `[offset, offset+len)` clamped to the
+    /// blob's tail. ranges carry no per-window proof — the requester stages
+    /// the assembled whole and re-hashes it against the digest, dropping a
+    /// mismatch (fail-closed), so no trust attaches to which peer answered.
+    BlobRange {
+        digest: [u8; 32],
+        offset: u64,
+        len: u64,
+    },
+}
+
+impl SyncRequest {
+    /// the request's kind as a wire-stable snake_case label — the
+    /// [`monitor::ServeMonitor`]'s per-kind attribution (and thus a metric
+    /// label value downstream), so renaming a variant must not rename these.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Chunk { .. } => "chunk",
+            Self::Module { .. } => "module",
+            Self::Frames { .. } => "frames",
+            Self::IndexModules { .. } => "index_modules",
+            Self::IndexChunk { .. } => "index_chunk",
+            Self::TipCoords => "tip_coords",
+            Self::Blob { .. } => "blob",
+            Self::BlobInfo { .. } => "blob_info",
+            Self::BlobRange { .. } => "blob_range",
+        }
+    }
 }
 
 /// the tip's consensus coordinates without a captured boundary — the
@@ -415,6 +429,13 @@ pub enum SyncResponse {
     /// (the requester's fan-out treats a miss and an old peer's `Error`
     /// identically: try the next peer).
     Blob { bytes: Option<Vec<u8>> },
+    /// the [`SyncRequest::BlobInfo`] answer: the blob's total length when
+    /// held, `None` on an honest miss.
+    BlobInfo { len: Option<u64> },
+    /// the [`SyncRequest::BlobRange`] answer: the window's bytes when held
+    /// (shorter than asked at the blob's tail, empty past it), `None` on an
+    /// honest miss.
+    BlobRange { bytes: Option<Vec<u8>> },
 }
 
 impl SyncResponse {
@@ -428,6 +449,8 @@ impl SyncResponse {
             Self::IndexModules { .. } => "IndexModules",
             Self::TipCoords(_) => "TipCoords",
             Self::Blob { .. } => "Blob",
+            Self::BlobInfo { .. } => "BlobInfo",
+            Self::BlobRange { .. } => "BlobRange",
             Self::Error(_) => "Error",
         }
     }
@@ -490,6 +513,20 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.push(7u8);
             out.extend_from_slice(digest);
         }
+        SyncRequest::BlobInfo { digest } => {
+            out.push(8u8);
+            out.extend_from_slice(digest);
+        }
+        SyncRequest::BlobRange {
+            digest,
+            offset,
+            len,
+        } => {
+            out.push(9u8);
+            out.extend_from_slice(digest);
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
     }
     out
 }
@@ -537,6 +574,14 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
         7 => SyncRequest::Blob {
             digest: wire::take_array::<32>(&mut buf)?,
         },
+        8 => SyncRequest::BlobInfo {
+            digest: wire::take_array::<32>(&mut buf)?,
+        },
+        9 => SyncRequest::BlobRange {
+            digest: wire::take_array::<32>(&mut buf)?,
+            offset: wire::take_u64(&mut buf)?,
+            len: wire::take_u64(&mut buf)?,
+        },
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
     wire::expect_empty(buf)?;
@@ -563,20 +608,6 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 }
                 None => out.push(0),
             }
-            // version fields (wire-format bump — see decode). placed before the
-            // trailing entries so the entries forged-count guard sees an
-            // accurate remaining-buffer bound.
-            out.extend_from_slice(&m.current_version.to_le_bytes());
-            match &m.pending_upgrade {
-                Some(u) => {
-                    out.push(1);
-                    wire::put_str(&mut out, &u.name);
-                    out.extend_from_slice(&u.activation_height.to_le_bytes());
-                    out.extend_from_slice(&u.to_version.to_le_bytes());
-                }
-                None => out.push(0),
-            }
-            out.extend_from_slice(&m.required_min_version.to_le_bytes());
             out.extend_from_slice(&m.state_schema);
             out.extend_from_slice(&(m.entries.len() as u64).to_le_bytes());
             for e in &m.entries {
@@ -652,6 +683,26 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 None => out.push(0),
             }
         }
+        SyncResponse::BlobInfo { len } => {
+            out.push(9u8);
+            match len {
+                Some(l) => {
+                    out.push(1);
+                    out.extend_from_slice(&l.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+        SyncResponse::BlobRange { bytes } => {
+            out.push(10u8);
+            match bytes {
+                Some(b) => {
+                    out.push(1);
+                    wire::put_bytes(&mut out, b);
+                }
+                None => out.push(0),
+            }
+        }
         SyncResponse::TipCoords(c) => {
             out.push(7u8);
             out.extend_from_slice(&c.height.to_le_bytes());
@@ -699,17 +750,6 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
                 t => return Err(WireError::BadTag("floor_cert", t)),
             };
-            let current_version = wire::take_u32(&mut buf)?;
-            let pending_upgrade = match wire::take_u8(&mut buf)? {
-                0 => None,
-                1 => Some(UpgradeCoords {
-                    name: wire::take_str(&mut buf)?,
-                    activation_height: wire::take_u64(&mut buf)?,
-                    to_version: wire::take_u32(&mut buf)?,
-                }),
-                t => return Err(WireError::BadTag("pending_upgrade", t)),
-            };
-            let required_min_version = wire::take_u32(&mut buf)?;
             let state_schema = wire::take_array::<32>(&mut buf)?;
             let n = wire::take_u64(&mut buf)?;
             // each entry costs at least its id length prefix + root + kind, so
@@ -767,9 +807,6 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 participants,
                 residents,
                 floor_cert,
-                current_version,
-                pending_upgrade,
-                required_min_version,
                 state_schema,
                 entries,
             })
@@ -888,28 +925,96 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 t => return Err(WireError::BadTag("blob presence", t)),
             },
         },
+        9 => SyncResponse::BlobInfo {
+            len: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_u64(&mut buf)?),
+                t => return Err(WireError::BadTag("blob info presence", t)),
+            },
+        },
+        10 => SyncResponse::BlobRange {
+            bytes: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
+                t => return Err(WireError::BadTag("blob range presence", t)),
+            },
+        },
         other => return Err(WireError::BadTag("SyncResponse", other)),
     };
     wire::expect_empty(buf)?;
     Ok(resp)
 }
 
-/// the rpc envelope pairing responses to in-flight requests over a shared
-/// duplex transport (a p2p channel). `id` is requester-local.
-pub fn encode_rpc(id: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + body.len());
+/// the ed25519 signing namespace for the statesync standing proof (ADR §5.1).
+/// a client signs this namespace over the network's genesis namespace bytes
+/// ONCE at construction; every request carries the result as its proof.
+pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
+
+/// the AUTHENTICATED rpc envelope (ADR §5.1 fail-closed, flag day — the
+/// unauthenticated `encode_rpc` is gone): `requester(32) ‖ proof(64) ‖
+/// id(8 LE) ‖ body`. the codec only FRAMES bytes; the caller produces the
+/// proof ([`sign_sync_proof`]) and the server verifies it ([`verify_sync_proof`])
+/// against committed standing. `id` is requester-local (correlates replies).
+/// server replies reuse the same frame with the auth fields zero-filled — the
+/// client gates replies by transport peer and root-verifies payloads, so a
+/// reply's requester/proof are never inspected.
+pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + 64 + 8 + body.len());
+    out.extend_from_slice(requester);
+    out.extend_from_slice(proof);
     out.extend_from_slice(&id.to_le_bytes());
     out.extend_from_slice(body);
     out
 }
 
-pub fn decode_rpc(bytes: &[u8]) -> Result<(u64, &[u8]), WireError> {
-    if bytes.len() < 8 {
-        return Err(WireError::Truncated);
-    }
-    let (head, rest) = bytes.split_at(8);
-    let id = u64::from_le_bytes(head.try_into().expect("split_at(8) yields 8 bytes"));
-    Ok((id, rest))
+/// decode the authenticated envelope into borrowed `(requester, proof, id, body)`.
+/// errors `Truncated` on any buffer shorter than the 32+64+8 fixed header.
+// the 4-tuple mirrors the fixed wire layout; a named type would just indirect it.
+#[allow(clippy::type_complexity)]
+pub fn decode_rpc_authed(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
+    let (requester, rest) = bytes.split_first_chunk::<32>().ok_or(WireError::Truncated)?;
+    let (proof, rest) = rest.split_first_chunk::<64>().ok_or(WireError::Truncated)?;
+    let (id_bytes, body) = rest.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
+    Ok((requester, proof, u64::from_le_bytes(*id_bytes), body))
+}
+
+/// sign the standing proof: the caller's real key signs [`SYNC_AUTH_NAMESPACE`]
+/// over the genesis `namespace` bytes. returns `(requester_pubkey, proof)` to
+/// attach to every request. sound as a STATIC per-session proof because the
+/// mesh transport is authenticated+encrypted (the proof is not wire-capturable)
+/// and a pre-admission joiner can only sign for its own non-standing key.
+pub fn sign_sync_proof(
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    namespace: &[u8],
+) -> ([u8; 32], [u8; 64]) {
+    use commonware_codec::Encode as _;
+    use commonware_cryptography::Signer as _;
+    let requester: [u8; 32] = signer
+        .public_key()
+        .as_ref()
+        .try_into()
+        .expect("ed25519 public key is 32 bytes");
+    let sig = signer.sign(SYNC_AUTH_NAMESPACE, namespace);
+    let proof: [u8; 64] = sig
+        .encode()
+        .as_ref()
+        .try_into()
+        .expect("ed25519 signature is 64 bytes");
+    (requester, proof)
+}
+
+/// verify a standing proof: `requester` must have signed [`SYNC_AUTH_NAMESPACE`]
+/// over `namespace`. a malformed key/signature verifies as `false` (fail-closed).
+/// standing (requester ∈ members ∪ residents) is a SEPARATE check by the server.
+pub fn verify_sync_proof(requester: &[u8; 32], proof: &[u8; 64], namespace: &[u8]) -> bool {
+    use commonware_cryptography::{Verifier as _, ed25519};
+    let Ok(pk) = ed25519::PublicKey::decode(requester.as_slice()) else {
+        return false;
+    };
+    let Ok(sig) = ed25519::Signature::decode(proof.as_slice()) else {
+        return false;
+    };
+    pk.verify(SYNC_AUTH_NAMESPACE, namespace, &sig)
 }
 
 // ============================================================================
@@ -965,11 +1070,6 @@ pub struct BoundaryCoords {
     pub participants: Vec<Vec<u8>>,
     pub residents: Vec<Vec<u8>>,
     pub floor_cert: Option<Vec<u8>>,
-    /// the agreed protocol version active at the served boundary. the caller
-    /// stamps it from live upgrade-module state, like `epoch`/`view_base`.
-    pub current_version: u32,
-    /// the single upgrade armed but not yet activated at the served boundary.
-    pub pending_upgrade: Option<UpgradeCoords>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1178,11 +1278,6 @@ impl SyncServer {
             .captures
             .get(&id)
             .ok_or_else(|| format!("no capture at boundary {} (refetch manifest)", id.height))?;
-        let required_min_version = sdk::required_min_version(
-            capture.coords.current_version,
-            capture.coords.pending_upgrade.as_ref(),
-            id.height,
-        );
         Ok(SyncResponse::Manifest(Manifest {
             height: id.height,
             app_hash: capture.app_hash,
@@ -1191,9 +1286,6 @@ impl SyncServer {
             participants: capture.coords.participants.clone(),
             residents: capture.coords.residents.clone(),
             floor_cert: capture.coords.floor_cert.clone(),
-            current_version: capture.coords.current_version,
-            pending_upgrade: capture.coords.pending_upgrade.clone(),
-            required_min_version,
             state_schema: capture.state_schema,
             entries: capture
                 .modules
@@ -1230,7 +1322,9 @@ impl SyncServer {
             // the HOST layer answers blob fetches from its node-local store
             // BEFORE requests reach this server; one arriving here means the
             // host did not intercept — answer honestly instead of wedging.
-            SyncRequest::Blob { .. } => {
+            // (the lane was briefly retired with the prompt plane; the wasm
+            // code-distribution plane is its new, live consumer.)
+            SyncRequest::Blob { .. } | SyncRequest::BlobInfo { .. } | SyncRequest::BlobRange { .. } => {
                 return Err("blob requests are answered by the host layer".into());
             }
             SyncRequest::Frames {
@@ -1893,7 +1987,7 @@ where
 }
 
 fn hex_root(root: &StateRoot) -> String {
-    root.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    sdk::hash::hex_lower(root.as_bytes())
 }
 
 #[cfg(test)]
@@ -1974,14 +2068,6 @@ mod tests {
                 // non-empty: exercises the additive resident wire tail.
                 residents: vec![vec![5u8; 32]],
                 floor_cert: Some(vec![0xCC; 96]),
-                // a pending upgrade set: exercise the Some arm of the tail.
-                current_version: 3,
-                pending_upgrade: Some(UpgradeCoords {
-                    name: "v4".into(),
-                    activation_height: 100,
-                    to_version: 4,
-                }),
-                required_min_version: 3,
                 state_schema: [0xAB; 32],
                 entries: vec![
                     ManifestEntry {
@@ -2004,7 +2090,6 @@ mod tests {
             }),
             // a fresh-epoch boundary: no finalization past the base yet, so
             // no floor certificate — the joiner spawns on the genesis floor.
-            // version tail at defaults (no upgrade scheduled).
             SyncResponse::Manifest(Manifest {
                 height: 12,
                 app_hash: StateRoot([8u8; ROOT_LEN]),
@@ -2013,9 +2098,6 @@ mod tests {
                 participants: vec![vec![3u8; 32]],
                 residents: vec![],
                 floor_cert: None,
-                current_version: 0,
-                pending_upgrade: None,
-                required_min_version: 0,
                 state_schema: [0xAB; 32],
                 entries: vec![],
             }),
@@ -2084,11 +2166,57 @@ mod tests {
 
     #[test]
     fn rpc_envelope_round_trips() {
-        let framed = encode_rpc(99, b"body");
-        let (id, body) = decode_rpc(&framed).unwrap();
+        let requester = [7u8; 32];
+        let proof = [9u8; 64];
+        let framed = encode_rpc_authed(&requester, &proof, 99, b"body");
+        let (r, p, id, body) = decode_rpc_authed(&framed).unwrap();
+        assert_eq!(r, &requester);
+        assert_eq!(p, &proof);
         assert_eq!(id, 99);
         assert_eq!(body, b"body");
-        assert!(decode_rpc(&framed[..7]).is_err(), "short envelope rejects");
+        // anything shorter than the 32+64+8 fixed header is Truncated.
+        assert!(
+            decode_rpc_authed(&framed[..32 + 64 + 7]).is_err(),
+            "short envelope rejects"
+        );
+        assert!(decode_rpc_authed(&[]).is_err(), "empty rejects");
+    }
+
+    #[test]
+    fn sync_proof_signs_and_verifies_only_for_the_signing_key() {
+        use commonware_cryptography::{Signer as _, ed25519};
+        let signer = ed25519::PrivateKey::from_seed(42);
+        let namespace = b"net#deadbeef@feedface";
+        let (requester, proof) = sign_sync_proof(&signer, namespace);
+        assert_eq!(requester.as_slice(), signer.public_key().as_ref());
+        assert!(
+            verify_sync_proof(&requester, &proof, namespace),
+            "the real key's proof verifies"
+        );
+        // a different namespace (wrong network) fails.
+        assert!(
+            !verify_sync_proof(&requester, &proof, b"other-net"),
+            "a proof for another network is refused"
+        );
+        // a substituted requester key fails (the proof is bound to the signer).
+        let thief: [u8; 32] = ed25519::PrivateKey::from_seed(43)
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        assert!(
+            !verify_sync_proof(&thief, &proof, namespace),
+            "a substituted key fails the proof"
+        );
+        // a real standing key with a forged/empty signature is refused (you
+        // cannot mint a proof for a key without its private half). (an all-zero
+        // key is a valid small-order point whose zero signature verifies — a
+        // crypto edge that is harmless here: no node holds the zero key, so the
+        // standing gate refuses it regardless.)
+        assert!(
+            !verify_sync_proof(&requester, &[0u8; 64], namespace),
+            "a forged signature for a real key is refused"
+        );
     }
 
     #[test]
@@ -2103,9 +2231,8 @@ mod tests {
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
 
-        // same header, zero participants + no floor cert + default version
-        // tail (current_version, pending tag None, required_min), then a
-        // forged ENTRY count.
+        // same header, zero participants + no floor cert, then a forged
+        // ENTRY count.
         let mut bytes = vec![0u8];
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&[0u8; ROOT_LEN]);
@@ -2113,18 +2240,15 @@ mod tests {
         bytes.extend_from_slice(&3u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.push(0); // floor_cert: None
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // current_version
-        bytes.push(0); // pending_upgrade: None
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // required_min_version
         bytes.extend_from_slice(&[0xAB; 32]); // state_schema
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
     }
 
     #[test]
-    fn decode_response_rejects_truncated_version_tail() {
-        // a manifest frame whose version tail is cut mid-field must fail
-        // cleanly (no panic), not silently default.
+    fn decode_response_rejects_truncated_manifest_tail() {
+        // a manifest frame cut mid-field must fail cleanly (no panic), not
+        // silently default.
         let resp = SyncResponse::Manifest(Manifest {
             height: 7,
             app_hash: StateRoot([9u8; ROOT_LEN]),
@@ -2133,16 +2257,12 @@ mod tests {
             participants: vec![],
             residents: vec![],
             floor_cert: None,
-            current_version: 3,
-            pending_upgrade: None,
-            required_min_version: 3,
             state_schema: [0xAB; 32],
             entries: vec![],
         });
         let bytes = encode_response(&resp);
-        // drop the trailing residents-count and entries-count u64s + the
-        // required_min u32 + part of the pending tag, landing inside the
-        // version tail.
+        // drop the trailing residents-count and entries-count u64s + part of
+        // the state schema, landing inside the manifest tail.
         for cut in 1..=21 {
             let torn = &bytes[..bytes.len() - cut];
             assert!(
@@ -2150,28 +2270,5 @@ mod tests {
                 "truncation at -{cut} must reject"
             );
         }
-    }
-
-    #[test]
-    fn manifest_preflight_gates_on_required_min() {
-        let m = Manifest {
-            height: 7,
-            app_hash: StateRoot([0u8; ROOT_LEN]),
-            epoch: 0,
-            view_base: 0,
-            participants: vec![],
-            residents: vec![],
-            floor_cert: None,
-            current_version: 3,
-            pending_upgrade: None,
-            required_min_version: 3,
-            state_schema: [0xAB; 32],
-            entries: vec![],
-        };
-        assert!(m.preflight(3).is_ok());
-        assert!(m.preflight(4).is_ok());
-        let err = m.preflight(2).expect_err("under-versioned joiner");
-        assert_eq!(err.required_min, 3);
-        assert_eq!(err.max_supported, 2);
     }
 }

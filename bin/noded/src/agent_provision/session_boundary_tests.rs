@@ -18,8 +18,9 @@
 //! envelope and builds the `WorkspaceSpec` itself, exactly as production does —
 //! lets the REAL [`NodedProvisioner`] open the session off that spec, and routes
 //! the resulting op into the REAL `runs` module as the node holding the lease.
-//! then it asserts what only an end-to-end run can: the session BOUND, to the run
-//! the pending map is actually keyed by, and the agent's process was told THAT id.
+//! then it asserts what only an end-to-end run can: the session BOUND to the run
+//! the pending map is actually keyed by, and the agent got a scoped endpoint for
+//! THAT id without receiving the private signer.
 //!
 //! the duckfs checkout and the workspace commit are not the subject: their actor
 //! traffic is answered by the same stand-in the plane tests use. the `runs` ops
@@ -31,23 +32,21 @@ use std::time::Duration;
 
 use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::Signer as _;
 use commonware_runtime::{Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
 use dispatch_oracle::{DeliverFn, DispatchPool, SpawnFn};
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
-use jobs::Jobs;
 use saga::SagaModule;
-use sdk::{Effect, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use tagging::TaggingModule;
 use tasks::Tasks;
 
 use super::plane_tests::{committed_block, files_reply};
 use super::*;
 use crate::NodeCommand;
+use statesync::qmdb::QmdbStore;
 
 /// the agent under test, and the node that will claim its run's lease. the node
 /// key IS the pool's identity — the same bytes `runs` checks the bind's origin
@@ -109,7 +108,6 @@ format = "text"
 
 fn at(height: u64, origin: Origin) -> BlockContext {
     BlockContext {
-        protocol_version: 0,
         height,
         consensus_time: height,
         origin,
@@ -123,9 +121,11 @@ fn alice() -> Origin {
 /// the genesis set the collaboration loop runs on — chat + the tagging plane +
 /// the dispatch plane + the registry + runs.
 async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
-    let chat = Chat::init(context.child("chat"), "chat")
-        .await
-        .with_tagging("tagging");
+    let chat = Chat::new(
+        "chat",
+        Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+    )
+    .with_tagging("tagging");
     Host::genesis(vec![
         Box::new(chat),
         Box::new(TaggingModule::new("tagging")),
@@ -144,18 +144,17 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             "dispatch",
             "agent",
             Some("tasks".into()),
-            Some("jobs".into()),
+            Some("tasks".into()),
         )),
         Box::new(Tasks::new("tasks")),
-        Box::new(Jobs::new("jobs")),
     ])
     .expect("genesis")
 }
 
 /// channel → agent → watch → the human's mention. the post block stages the
 /// pending entry, the dispatch, and its saga trigger, and emits the announcement
-/// effect the pool claims.
-async fn mention_run(host: &mut Host) -> Effect {
+/// event the pool claims.
+async fn mention_run(host: &mut Host) -> Event {
     let ops: Vec<Msg> = vec![
         Msg {
             target: "chat".into(),
@@ -213,9 +212,14 @@ async fn mention_run(host: &mut Host) -> Effect {
                 .expect("setup block"),
         );
     }
-    let mut effects = last.expect("the post block").effects;
-    assert_eq!(effects.len(), 1, "the post announces exactly one run");
-    effects.remove(0)
+    let mut requests: Vec<Event> = last
+        .expect("the post block")
+        .events
+        .into_iter()
+        .filter(|e| saga::decode_worker_request(&e.payload).is_ok())
+        .collect();
+    assert_eq!(requests.len(), 1, "the post announces exactly one run");
+    requests.remove(0)
 }
 
 /// serve ONE actor command the live run made.
@@ -287,7 +291,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         // run's terminal result down the deliver lane; the node submits both. we
         // never read the lane — the run's result is another test's subject.
         let (deliver_tx, _deliver_rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let spawn: SpawnFn = Box::new(|fut| {
+        let spawn: SpawnFn = Arc::new(|_, fut| {
             tokio::spawn(fut);
         });
         let deliver: DeliverFn = Arc::new(move |msg| {
@@ -305,11 +309,11 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             // no announced capacity: this bed is about the session boundary, and
             // a bare node's ledger fits the demandless jobs it dispatches.
             Default::default(),
-        )
-        .with_provisioner(Arc::new(
-            NodedProvisioner::new(handle, &runs_root)
-                .with_node_url(Some("http://127.0.0.1:8844".into())),
-        ));
+            Arc::new(
+                NodedProvisioner::new(handle, &runs_root)
+                    .with_node_url(Some("http://127.0.0.1:8844".into())),
+            ),
+        );
 
         // the announcement is an OFFER: the pool claims it with Accept, and the
         // saga re-emits the request naming the winner. the lease this creates is
@@ -318,11 +322,14 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             WorkOutcome::Handled(Some(op)) => op,
             other => panic!("the pool must CLAIM a servable announcement, got {other:?}"),
         };
-        let assigned = host
+        let assigned: Vec<Event> = host
             .submit_at(at(5, Origin::External(WORKER_NODE.to_vec())), accept)
             .await
             .expect("accept block")
-            .effects;
+            .events
+            .into_iter()
+            .filter(|e| saga::decode_worker_request(&e.payload).is_ok())
+            .collect();
         assert_eq!(
             assigned.len(),
             1,
@@ -375,7 +382,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             "the bound key is the one the provisioner minted"
         );
 
-        // and the AGENT was told the same id: the MCP server stamps this var onto
+        // The agent was told the same id: the MCP server stamps this var onto
         // every RunsMsg::AgentAction, so a host-local id here would make every
         // mid-run write name a run that does not exist. the bind is the LAST
         // actor call a provision makes, so the model call is still landing — wait
@@ -396,18 +403,19 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             Some(run_id.as_str()),
             "the run id in the agent's environment is the consensus one"
         );
-        let key_hex = ctx
-            .env
-            .get("DUCKTAPE_RUN_SESSION_KEY")
-            .expect("the agent holds the session's private half");
-        let seed = duckfs_core::from_hex_32(key_hex).expect("lowercase hex");
-        let public = commonware_cryptography::ed25519::PrivateKey::decode(seed.as_slice())
-            .expect("32 bytes decode")
-            .public_key();
+        assert!(
+            !ctx.env.contains_key("DUCKTAPE_RUN_SESSION_KEY"),
+            "the child never receives the private session key"
+        );
+        assert!(
+            ctx.env
+                .get("DUCKTAPE_RUN_ACTION_URL")
+                .is_some_and(|url| url.ends_with("/v1/run-action")),
+            "the child receives only the narrow action endpoint"
+        );
         assert_eq!(
-            public.as_ref().to_vec(),
-            sessions[0].session_key,
-            "the key the agent signs with is the key consensus bound — one credential"
+            ctx.env.get("DUCKTAPE_RUN_ACTION_TOKEN").map(String::len),
+            Some(64)
         );
     });
 }

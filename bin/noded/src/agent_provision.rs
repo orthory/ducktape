@@ -20,7 +20,7 @@
 //!
 //! whichever lane materializes it, every run is handed the same TOOL PLANE
 //! ([`run_env`] + [`tool_path_entries`]): the bin dir of the running binary on
-//! `PATH` (where `ducktape-mcp` ships), the node's http base as `DUCKTAPE_NODE`,
+//! `PATH` (where `ducktape mcp` ships), the node's http base as `DUCKTAPE_NODE`,
 //! and its agent id as `DUCKTAPE_RUN_AGENT`. that is enough for the MCP server
 //! — which the runner CLI spawns OUTSIDE the agent's sandbox — to find the node
 //! and know who it acts for; the GRANT itself is never in the env (see
@@ -129,10 +129,8 @@ fn run_slug(run_id: &str) -> String {
     // reuse duckfs's content-address hash (no new dep): a domain-separated
     // sha-256 over the FULL run_id → a stable 24-hex tail keyed on the entire
     // id, attempt included.
-    let digest = duckfs_core::objects::object_id(
-        duckfs_core::objects::Kind::Chunk,
-        run_id.as_bytes(),
-    );
+    let digest =
+        duckfs_core::objects::object_id(duckfs_core::objects::Kind::Chunk, run_id.as_bytes());
     let hash: String = duckfs_core::to_hex(&digest).chars().take(24).collect();
     let prefix: String = run_id
         .chars()
@@ -187,10 +185,10 @@ pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
 }
 
 /// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
-/// binary. `ducktape-mcp` ships beside `noded`/`node`, and the runner CLI
+/// binary. `ducktape mcp` ships beside `noded`/`node`, and the runner CLI
 /// (codex/claude) spawns the MCP server by BARE command name from OUTSIDE the
 /// agent's sandbox — so putting this one dir on the child's PATH is the whole
-/// of how `ducktape-mcp` resolves.
+/// of how `ducktape mcp` resolves.
 ///
 /// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
 /// degrades to NO entry rather than failing the run: the agent still runs,
@@ -207,9 +205,9 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// is, where its W6 skill trees are, which node its tools dial, and which agent
 /// it is acting for.
 ///
-/// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape-fs` reads — one
+/// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape fs` reads — one
 /// name for "the node this process talks to", so every Ducktape tool a run
-/// spawns (the `ducktape-mcp` server the runner CLI starts, outside the agent's
+/// spawns (the `ducktape mcp` server the runner CLI starts, outside the agent's
 /// sandbox, included) finds the node without a second convention. a node with
 /// no http surface has nothing to name, so the var is simply absent.
 ///
@@ -219,11 +217,9 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// second, unversioned copy that drifts from the record it came from the moment
 /// the registry moves. the committed record is the one truth.
 ///
-/// `DUCKTAPE_RUN_SESSION_KEY` + `DUCKTAPE_RUN_ID` are the WRITE half of the tool
-/// plane, and they appear together or not at all: the key signs the op, the run
-/// id says which session it belongs to, and neither is any use alone. absent =
-/// no session opened ([`session::open`]) = the read-only plane, which is the
-/// pre-session behaviour and never an error.
+/// `DUCKTAPE_RUN_ACTION_URL` + `DUCKTAPE_RUN_ACTION_TOKEN` + `DUCKTAPE_RUN_ID`
+/// are the write half of the tool plane. The endpoint signs only the two Runs
+/// messages scoped to this live run; the private key never enters child env.
 ///
 /// `DUCKTAPE_RUN_ID` is the session's own [`session::RunSession::run_id`] — the
 /// CONSENSUS run id, the only id space `runs` resolves. it is deliberately NOT
@@ -232,13 +228,6 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// host-local id here would make every mid-run write name a run that does not
 /// exist — which is exactly how the write plane came to be dead-on-arrival.
 ///
-/// the key is the agent's PRIVATE half, in a process the agent can read — a
-/// BEARER CREDENTIAL, not a least-privilege token. it can sign any `Msg` to any
-/// module, and consensus only re-checks the grant on the `AgentAction` lane; a
-/// leaked key posts to open channels as a plain user, run or no run. what
-/// contains it is the run's SANDBOX (no network), not its authority — see
-/// [`session`]. the NODE key, which signs validator votes and every op the human
-/// makes, must never be here at all.
 fn run_env(
     dir: &Path,
     ro_dir: Option<&Path>,
@@ -260,9 +249,10 @@ fn run_env(
         env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
     }
     if let Some(session) = session {
+        env.insert(session::ENV_ACTION_URL.into(), session.action_url.clone());
         env.insert(
-            "DUCKTAPE_RUN_SESSION_KEY".into(),
-            session.private_hex.clone(),
+            session::ENV_ACTION_TOKEN.into(),
+            session.action_token.clone(),
         );
         env.insert("DUCKTAPE_RUN_ID".into(), session.run_id.clone());
     }
@@ -413,11 +403,7 @@ impl NodedProvisioner {
     /// the repo base is read off the handle's forge repo (the same base the
     /// forge module materializes into). host `git` is probed ONCE here —
     /// a probe failure makes the lane permanently unavailable, loudly.
-    pub fn with_forge(
-        self,
-        push_base: Option<String>,
-        committer_name: impl Into<String>,
-    ) -> Self {
+    pub fn with_forge(self, push_base: Option<String>, committer_name: impl Into<String>) -> Self {
         self.with_forge_probed(push_base, committer_name, forge::probe_host_git)
     }
 
@@ -432,7 +418,11 @@ impl NodedProvisioner {
         self.forge =
             forge::ForgeLane::configure(&self.handle, push_base, committer_name.into(), probe);
         if let Err(reason) = &self.forge {
-            eprintln!("[oracle] forge workspace provisioning unavailable on this node: {reason}");
+            tracing::warn!(
+                target: "ducktape::saga",
+                error = %reason,
+                "forge workspace provisioning unavailable on this node"
+            );
         }
         self
     }
@@ -537,9 +527,13 @@ mod tests {
         // pure [a-z0-9], bounded, never empty, no traversal metacharacter survives.
         for id in ["s1:0", "../../etc/passwd", "", "A/B.C-D", &"z".repeat(200)] {
             let s = run_slug(id);
-            assert!(!s.is_empty() && s.len() <= 48, "slug {s:?} bounded+non-empty");
             assert!(
-                s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                !s.is_empty() && s.len() <= 48,
+                "slug {s:?} bounded+non-empty"
+            );
+            assert!(
+                s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
                 "slug {s:?} is [a-z0-9] — no path-traversal metacharacter"
             );
         }

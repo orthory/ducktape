@@ -33,11 +33,11 @@ command -v curl    >/dev/null || die "curl is required"
 # ── 1. node binary ─────────────────────────────────────────────
 NODE_BIN="${DUCKTAPE_NODE_BIN:-}"
 if [ -z "$NODE_BIN" ]; then
-  log "building ducktape-node (cargo build -p node-bin)…"
+  log "building ducktape (cargo build -p node-bin)…"
   blog="$(mktemp)"
   cargo build -p node-bin >"$blog" 2>&1 || die "node-bin build failed — see $blog"
   NODE_BIN="$(cargo metadata --no-deps --format-version 1 \
-    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape-node"
+    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape"
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 
@@ -51,21 +51,19 @@ read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostn
 WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});console.log(s.port);s.close()')"
 # Gateway serving needs the app's workspace_create posture:
 #   --gateway            binds the isolated browser plane that serves the routes
-#   --wireguard-effect   the userspace (TUN-less) overlay — no /dev/net/tun, no
-#     socket             privilege; the default "tun" effect can't start without them
 #   --wireguard-listen   a CONCRETE UDP port (0.0.0.0 = endpoint-less/roaming,
 #     0.0.0.0:$WGP       like the app), so the overlay comes up instead of being
 #                        skipped on port 0
 #   --primary-coordinator a self-contained local demo does NOT phone home to the
 #     none               public rendezvous coordinator; keeps network.toml (which
 #                        the app reboots from) fully local.
-CHAIN="$("$NODE_BIN" init --name "$ID" --dir "$WSDIR" \
+CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
   --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
-  --wireguard-effect socket --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
+  --wireguard-listen "0.0.0.0:$WGP" 2>/dev/null | tail -1)"
 [ -n "$CHAIN" ] || die "init produced no chain-id"
-PUB="$("$NODE_BIN" keygen --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
+PUB="$("$NODE_BIN" node key --out "$WSDIR/identity.key" 2>/dev/null | tail -1)"
 
 # ── 3. register in ~/.ducktape/registry.json (merge; make it active) ──
 bun - "$REG" "$ID" "$CHAIN" "$PUB" "$P1" "$P2" "$P3" <<'JS'
@@ -89,7 +87,7 @@ log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
 # ── 4. start the node, wait for its http surface ───────────────
 log "starting node (http 127.0.0.1:$P2)…"
-"$NODE_BIN" --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
+"$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
 NODE_PID=$!
 trap 'kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null' EXIT
 URL="http://127.0.0.1:$P2"
@@ -155,14 +153,21 @@ submit inbox '{"deliver":{"member":"demo","kind":"welcome","body":"Your demo net
 # automations — a rule that files a task whenever someone says "deploy"
 submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel_id":null,"mention":null,"text_contains":"deploy"},"action":{"create_task":{"task_id_prefix":"deploy","title_template":"Follow up on a deploy mention"}}}}'
 
-# gateway — publish two web-app routes. The helper binds an Identity account to
-# this node, stages the static site into DuckFS, and signs + submits both routes:
+# gateway — publish three web-app routes. The helper binds an Identity account to
+# this node, stages the static site into DuckFS, and signs + submits the routes:
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
-bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" \
-  || die "gateway route publish failed"
+#   • board — the network-visible kanban reference app
+GATEWAY_ROUTES=3
+bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID"
+gateway_status=$?
+case "$gateway_status" in
+  0) ;;
+  78) GATEWAY_ROUTES=0 ;;
+  *) die "gateway route publish failed" ;;
+esac
 
-log "seeded $N ops + 2 gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
+log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
 
 # ── 6. stop the node (state is durable on disk) ────────────────
 kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null; trap - EXIT
@@ -172,6 +177,16 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
+EOF
+
+if [ "$GATEWAY_ROUTES" -eq 0 ]; then
+cat <<EOF
+Gateway web apps were not published: the embedded gateway component still
+expects Identity's retired node-list wire. Regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway);
+the seed deliberately does not submit a backwards-compatible payload.
+EOF
+else
+cat <<EOF
 Gateway web apps published on this node (open in the app's browser):
   • site.$ID.duck — a bouncing-DVD web app, served static from DuckFS by
                     consensus. Works now — nothing else to run.
@@ -184,6 +199,9 @@ Gateway web apps published on this node (open in the app's browser):
 
                     Re-run it after every \`make demo-seed\` (a re-seed wipes the
                     workspace and re-mints the loopback binding).
+EOF
+fi
 
+cat <<EOF
 Done with the demo? \`make demo-clear\` removes the workspace entirely.
 EOF

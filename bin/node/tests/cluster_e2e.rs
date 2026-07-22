@@ -1,4 +1,4 @@
-//! real-socket cluster e2e: REAL `ducktape-node` OS processes over localhost
+//! real-socket cluster e2e: REAL `ducktape` OS processes over localhost
 //! TCP, driven end to end through the json-lines rpc with TYPED payloads from
 //! the modules' crate-root wire types (the drift that silently rotted the old bash demo
 //! — a module rename plus a payload reshape — now fails to compile instead).
@@ -354,6 +354,34 @@ fn cluster_lifecycle() {
             && exposition.contains("module=\"directory\""),
         "the dispatch counter carries the submitted module label:\n{exposition}"
     );
+    for sample in [
+        r#"ducktape_node_phase{role="validator",phase="validating"} 1"#,
+        "ducktape_consensus_validators ",
+        "ducktape_consensus_quorum ",
+        "ducktape_consensus_reachable_validators ",
+        "ducktape_consensus_pending_ops ",
+        "ducktape_last_finalized_timestamp_seconds ",
+        r#"ducktape_ops_outcome_total{outcome="applied"}"#,
+        r#"ducktape_index_height{module="directory"}"#,
+    ] {
+        assert!(
+            exposition.contains(sample),
+            "stable operational sample {sample:?} missing:\n{exposition}"
+        );
+    }
+    let metric_value = |name: &str| {
+        exposition
+            .lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("missing numeric {name}:\n{exposition}"))
+    };
+    assert!(
+        metric_value("ducktape_consensus_reachable_validators")
+            >= metric_value("ducktape_consensus_quorum"),
+        "a finalizing validator reports quorum reachability:\n{exposition}"
+    );
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.
@@ -395,9 +423,67 @@ fn cluster_lifecycle() {
         http_hash,
         "the app surface and the rpc disagree on node 2's app-hash"
     );
+    assert_eq!(http_status["operations"]["role"], "validator");
+    assert_eq!(http_status["operations"]["phase"], "validating");
+    assert!(
+        http_status["operations"]["consensus"]["validators"]
+            .as_u64()
+            .is_some_and(|validators| validators >= 3),
+        "status carries the current consensus set: {http_status}"
+    );
+    assert!(
+        http_status["operations"]["consensus"]["reachableValidators"]
+            .as_u64()
+            .zip(http_status["operations"]["consensus"]["quorum"].as_u64())
+            .is_some_and(|(reachable, quorum)| reachable >= quorum),
+        "status reports quorum reachability: {http_status}"
+    );
+    assert!(
+        http_status["operations"]["storage"]["indexes"]
+            .as_array()
+            .is_some_and(|indexes| indexes.iter().any(|index| index["module"] == "directory")),
+        "status carries bounded index watermarks: {http_status}"
+    );
     let boundary = status0["app_hash"]
         .as_str()
         .expect("status carries app_hash");
+
+    // 9b. the direct-peer surface: a meshed, finalizing validator holds its
+    // co-members open on the tracker, so `/v1/peers` must list them —
+    // connected, stamped `validator` off the valset, keyed by full mesh-key
+    // hex. (quorum reachability was already asserted above, so at least
+    // quorum-1 co-members are connected here; flake margin keeps this at
+    // "some connected validator peer" rather than an exact count.)
+    let (code, peer_sample) = cluster.http(0, "GET", "/v1/peers", None);
+    assert_eq!(code, 200, "peer sample failed: {peer_sample}");
+    assert!(
+        peer_sample["sampledAtMs"].as_u64().is_some_and(|ms| ms > 0),
+        "peer sample carries its timestamp: {peer_sample}"
+    );
+    let listed = peer_sample["peers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("peer sample carries a peers array: {peer_sample}"));
+    assert!(
+        listed.iter().all(|peer| peer["peer"]
+            .as_str()
+            .is_some_and(|key| key.len() == 64)),
+        "every peer keys on full mesh-key hex: {peer_sample}"
+    );
+    assert!(
+        listed.iter().any(|peer| peer["connected"] == true
+            && peer["role"] == "validator"
+            && peer["connectedSinceMs"].as_u64().is_some()),
+        "a connected co-validator is listed with valset standing: {peer_sample}"
+    );
+    // the local rpc (`ducktape node peers`) answers with the SAME view.
+    let rpc_peers = cluster.rpc(0, serde_json::json!({ "cmd": "peers" }));
+    assert_eq!(rpc_peers["ok"], true, "rpc peers failed: {rpc_peers}");
+    assert!(
+        rpc_peers["peers"]["peers"]
+            .as_array()
+            .is_some_and(|peers| !peers.is_empty()),
+        "rpc peers carries the same non-empty sample: {rpc_peers}"
+    );
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
     // channel from node 0 and must compose the identical app-hash. node 3's
@@ -451,10 +537,8 @@ fn quorum_tolerates_one_fault() {
 /// the staged reachability plane must converge a mesh on a FRESH boot: both
 /// nodes fire their boot `Retarget` (and the initial `EndpointRecord` send it
 /// triggers) before the p2p actors have any live connection, so the plane's
-/// liveness may not depend on that first datagram surviving. fake effect —
-/// the protocol (records -> adverts -> verified mesh -> handshakes -> apply)
-/// is identical to the real path right up to the interface call, and two
-/// same-host nodes with the real effect would fight over one dt-* name.
+/// liveness may not depend on that first datagram surviving. each node runs
+/// the real userspace backend on its own distinct UDP port.
 #[test]
 fn reachability_plane_converges_mesh_on_boot() {
     let _serial = serial();
@@ -465,6 +549,6 @@ fn reachability_plane_converges_mesh_on_boot() {
     cluster.spawn(1);
     for i in 0..2 {
         cluster.wait_marker(i, "mesh verified", Duration::from_secs(60));
-        cluster.wait_marker(i, "tunnel config staged on", Duration::from_secs(60));
+        cluster.wait_marker(i, "tunnels applied (config accepted", Duration::from_secs(60));
     }
 }

@@ -1,0 +1,35 @@
+[package]
+name = "gateway"
+edition.workspace = true
+version.workspace = true
+
+# Identity-authorized, consensus-replicated `.duck` routes to DuckFS or one
+# node-local loopback HTTP upstream. This crate owns no sockets, ports,
+# browser, proxy process, or filesystem I/O.
+[features]
+# the wasm-guest port (src/guest.rs): the dispatch shell over
+# guest-adapter. non-default and wasm-only — enabled solely by the
+# guest-builder's synthesized cdylib workspace, never by the native gate.
+guest = ["dep:guest-adapter"]
+
+[dependencies]
+# wasm-only, behind `guest`: the port harness. a standalone-workspace path
+# crate, pulled only when the guest build compiles this crate for wasm32.
+guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
+sdk = { workspace = true }
+identity = { workspace = true }
+valset = { workspace = true }
+# the `.duck` human-name → AccountId handle plane, absorbed as gateway's
+# internal facet: gateway owns the whole name → AccountId → route pipeline as
+# ONE consensus module. `duckdns` is now a LIBRARY gateway wraps — its
+# `Registry`, shared value types, and handle-admission grammar — not a
+# consensus module of its own.
+duckdns = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+commonware-cryptography = { workspace = true }
+futures = "0.3"

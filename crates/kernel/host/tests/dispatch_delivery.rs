@@ -19,7 +19,7 @@ use dispatch::{
     encode_query as dispatch_encode_query,
 };
 use futures::executor::block_on;
-use host::{BASELINE_VERSION, BlockContext, Host};
+use host::{BlockContext, Host};
 use saga::SagaModule;
 use saga::{SagaMsg, encode_msg as saga_encode_msg};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
@@ -55,6 +55,7 @@ impl Module for Caller {
                     recipe_id: "summarize".into(),
                     payload: b"the entire input".to_vec(),
                     demands: Default::default(),
+                    admission: dispatch::AdmissionPolicy::Queue,
                 }),
             });
         }
@@ -67,7 +68,6 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
         height,
         consensus_time: height,
         origin,
-        protocol_version: BASELINE_VERSION,
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }

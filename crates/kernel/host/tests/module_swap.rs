@@ -17,7 +17,7 @@
 //!     left to arm — still reconciles its genesis code to the committed ACTIVE
 //!     hash instead of forking on stale code.
 //!
-//! Fixtures are GENERATED artifacts (see `crates/examples/hello-wasm{,-v2}`),
+//! Fixtures are GENERATED artifacts (see `crates/guests/hello-wasm{,-v2}`),
 //! committed so the proof is self-contained.
 
 use std::collections::BTreeMap;
@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BASELINE_VERSION, BlockContext, CodeSource, Host, MODREG_MODULE_ID};
-use modreg::{ModregMsg, ModregQuery, ModregReply, Modreg};
+use host::{BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID};
+use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -34,7 +34,7 @@ const HELLO_V1: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 const HELLO_V2: &[u8] = include_bytes!("fixtures/hello-v2.component.wasm");
 
 /// the swap boundary used throughout: far enough past genesis to clear
-/// `modreg::MIN_SWAP_LEAD` from the scheduling block.
+/// `lifecycle::MIN_SWAP_LEAD` from the scheduling block.
 const H: u64 = 10;
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -51,17 +51,25 @@ impl MapSource {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl CodeSource for MapSource {
-    fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         self.0.get(code_hash).cloned()
     }
 }
 
-/// a host with the code registry + the wasm `hello` module (running v1),
-/// with v1 registered as hello's genesis-active code.
+/// the one validator key the readiness gate counts in these proofs.
+const MEMBER: [u8; 32] = [7; 32];
+
+/// a host with the code registry, a real valset (one member — the readiness
+/// denominator), and the wasm `hello` module (running v1), with v1 registered
+/// as hello's genesis-active code.
 fn host_with_wasm() -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Modreg::new(MODREG_MODULE_ID)));
+    host.register(Box::new(Lifecycle::new(LIFECYCLE_MODULE_ID, "valset")));
+    let mut valset = valset::Valset::new("valset");
+    valset.insert(MEMBER.to_vec());
+    host.register(Box::new(valset));
     host.register(Box::new(
         WasmModule::from_bytes("hello", HELLO_V1).expect("load v1"),
     ));
@@ -69,7 +77,7 @@ fn host_with_wasm() -> Host {
         &mut host,
         0,
         Origin::System,
-        modreg_msg(&ModregMsg::Register {
+        lifecycle_msg(&LifecycleMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: sha(HELLO_V1),
         }),
@@ -82,24 +90,32 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
         height,
         consensus_time: height,
         origin,
-        protocol_version: BASELINE_VERSION,
     };
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }
 
-fn modreg_msg(m: &ModregMsg) -> Msg {
+fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
     Msg {
-        target: MODREG_MODULE_ID.into(),
-        payload: modreg::encode_msg(m),
+        target: LIFECYCLE_MODULE_ID.into(),
+        payload: lifecycle::encode_msg(m),
     }
 }
 
 fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
-    modreg_msg(&ModregMsg::Schedule {
+    lifecycle_msg(&LifecycleMsg::ScheduleSwap {
         name: "hello-v2".into(),
         module_id: "hello".into(),
         activation_height,
         code_hash,
+    })
+}
+
+/// the member's byte-receipt signal: what `code_announce` self-submits once
+/// the component is verified-resident. latches the swap `ready` (R = n = 1).
+fn signal_ready_msg() -> Msg {
+    lifecycle_msg(&LifecycleMsg::SwapReady {
+        name: "hello-v2".into(),
+        module_id: "hello".into(),
     })
 }
 
@@ -116,10 +132,10 @@ fn count(host: &Host) -> u64 {
 }
 
 fn active_hash(host: &Host) -> (Vec<u8>, bool) {
-    let req = modreg::encode_query(&ModregQuery::Status);
-    let bytes = block_on(host.query(MODREG_MODULE_ID, &req)).expect("status");
-    match modreg::decode_reply(&bytes).expect("decode") {
-        ModregReply::Status { modules } => {
+    let req = lifecycle::encode_query(&LifecycleQuery::ModuleStatus);
+    let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
+    match lifecycle::decode_reply(&bytes).expect("decode") {
+        LifecycleReply::ModuleStatus { modules } => {
             let m = modules.iter().find(|m| m.module_id == "hello").expect("hello entry");
             (m.active_code_hash.clone(), m.pending.is_some())
         }
@@ -144,6 +160,9 @@ fn run_swap_scenario() -> (Host, StateRoot) {
 
     // governance-shaped schedule: swap hello -> v2 at H.
     submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    // the (sole) member verified the bytes and signals — the swap latches
+    // ready; from here activation is the height floor alone.
+    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
 
     // below H nothing arms: realization is a no-op on the running code.
     realize(&mut host, H - 1, &src).expect("below H is Ok");
@@ -206,8 +225,11 @@ fn deterministic_across_nodes() {
 fn fails_closed_on_missing_or_tampered_bytes() {
     let mut host = host_with_wasm();
     submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
 
-    // missing bytes: the source only has v1.
+    // missing bytes: the source only has v1 (this node SIGNALED honestly in
+    // consensus but its local store lost the bytes — the boundary still
+    // refuses rather than forking).
     let missing = MapSource::with(&[HELLO_V1]);
     let err = realize(&mut host, H, &missing).expect_err("absent bytes fail closed");
     assert!(matches!(err, Error::Module(m) if m.contains("absent")));
@@ -237,8 +259,8 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     // joiner: modreg installed from the source's committed snapshot (the
     // verify-then-adopt state-sync path), wasm module freshly wired from
     // GENESIS (v1) code.
-    let modreg_root = source.module_root(MODREG_MODULE_ID).expect("modreg root");
-    let mut joined_modreg = Modreg::new(MODREG_MODULE_ID);
+    let modreg_root = source.module_root(LIFECYCLE_MODULE_ID).expect("modreg root");
+    let mut joined_modreg = Lifecycle::new(LIFECYCLE_MODULE_ID, "valset");
     // reach the committed snapshot through the module's own state-sync surface,
     // exactly as a joiner would receive it.
     let handle = {
@@ -250,7 +272,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
             .expect("finalized snapshot");
         snap.modules
             .into_iter()
-            .find(|m| m.id == MODREG_MODULE_ID)
+            .find(|m| m.id == LIFECYCLE_MODULE_ID)
             .expect("modreg snapshot")
             .state_sync
     };
@@ -273,6 +295,24 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     realize(&mut joiner, H + 2, &src).expect("joiner reconciles");
     submit(&mut joiner, H + 2, Origin::External(vec![7; 32]), inc_msg());
     assert_eq!(count(&joiner), 100, "the joiner runs v2 (+100), not stale v1");
+}
+
+/// the receipt gate at the host seam: a scheduled swap whose readiness never
+/// covered the member set does NOT arm past its height — realization is a
+/// clean no-op (never a fail-closed error, never a swap) and the drain
+/// injects no Advance, however far the height runs.
+#[test]
+fn unready_swap_never_arms_past_its_height() {
+    let mut host = host_with_wasm();
+    submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    // no SignalReady: the bytes never provably reached the member set.
+    let src = MapSource::with(&[HELLO_V1, HELLO_V2]);
+    realize(&mut host, H + 100, &src).expect("unready is a no-op, not an error");
+    submit(&mut host, H + 100, Origin::External(vec![7; 32]), inc_msg());
+    assert_eq!(count(&host), 1, "still v1: receipt-gated swaps wait for R=n");
+    let (active, pending) = active_hash(&host);
+    assert_eq!(active, sha(HELLO_V1), "committed active hash untouched");
+    assert!(pending, "the pending swap keeps waiting for its receipts");
 }
 
 /// INERT without the registry: a host with only the wasm module realizes nothing

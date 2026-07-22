@@ -31,6 +31,7 @@ async fn help_prints_usage_without_binding() {
     let stdout = String::from_utf8(output.stdout).expect("help is utf8");
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--listen <addr>"));
+    assert!(stdout.contains("--relay-listen <addr|none>"));
     assert!(stdout.contains("--workers <1|4>"));
     assert!(stdout.contains("--metrics-interval <secs>"));
     assert!(stdout.contains("--genesis-set <network.toml>"));
@@ -46,6 +47,8 @@ async fn cli_rejects_missing_and_unknown_flags() {
     for args in [
         vec!["--listen"],
         vec!["--listen", "--allow-anonymous"],
+        vec!["--relay-listen"],
+        vec!["--relay-listen", "not-an-addr"],
         vec!["--workers"],
         vec!["--workers", "0"],
         vec!["--workers", "2"],
@@ -67,9 +70,13 @@ async fn cli_rejects_missing_and_unknown_flags() {
 #[tokio::test]
 async fn deployed_coordinator_binary_answers_a_bind_request() {
     // Boot the ACTUAL binary the recipe installs, with the OS choosing the port.
+    // `--relay-listen none` keeps the test hermetic: the default is 0.0.0.0:443,
+    // which a privileged CI runner could genuinely bind and expose.
     let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
         .arg("--listen")
         .arg("127.0.0.1:0")
+        .arg("--relay-listen")
+        .arg("none")
         .arg("--workers")
         .arg("4")
         .stderr(Stdio::piped())
@@ -121,5 +128,73 @@ async fn deployed_coordinator_binary_answers_a_bind_request() {
     );
 
     // Tidy up (kill_on_drop also covers a panic path).
+    let _ = child.start_kill();
+}
+
+#[tokio::test]
+async fn deployed_relay_lane_announces_and_serves_the_tcp_frame_protocol() {
+    // Boot the real binary with the relay lane on an OS-chosen loopback port
+    // and read the bound address back from its own announce line — the same
+    // no-fixed-port, no-sleep synchronization as the UDP test above.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--relay-listen")
+        .arg("127.0.0.1:0")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the compiled coordinator binary");
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut lines = BufReader::new(stderr).lines();
+    let relay_addr: SocketAddr = timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            if let Some(rest) = line.strip_prefix("coordinator relay listening on tcp/") {
+                return rest.trim().parse().expect("parse bound relay addr");
+            }
+        }
+        panic!("coordinator exited before announcing its relay address");
+    })
+    .await
+    .expect("coordinator must announce its relay address promptly");
+
+    // Drive the real TCP frame protocol under the deployed default policy
+    // (public + proof-of-possession): a validly signed intro naming a target
+    // nobody registered is refused with the stable token — proving auth
+    // verification, advert resolution, and the error path all run end-to-end
+    // in the shipped binary.
+    let signer = ed25519::PrivateKey::from_seed(8);
+    let caller = {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(signer.public_key().as_ref());
+        NodeKey(k)
+    };
+    let intro = nat_traversal::sign_relay_intro(
+        &signer,
+        caller,
+        NodeKey([0xEE; 32]),
+        b"\xffsealed-intro".to_vec(),
+        nat_traversal::now_secs(),
+        None,
+    );
+    let mut conn = nat_traversal::RelayConn::connect(relay_addr, Duration::from_secs(5))
+        .await
+        .expect("connect to the deployed relay lane");
+    conn.send(&nat_traversal::RelayFrame::Intro(intro))
+        .await
+        .expect("send intro");
+    let frame = conn
+        .recv(Duration::from_secs(5))
+        .await
+        .expect("the deployed relay must answer");
+    assert_eq!(
+        frame,
+        nat_traversal::RelayFrame::Error {
+            reason: nat_traversal::REASON_TARGET_UNREGISTERED.to_vec()
+        }
+    );
+
     let _ = child.start_kill();
 }

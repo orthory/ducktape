@@ -6,11 +6,10 @@ use commonware_utils::ordered::Set;
 use host::Host;
 use recovery::{Manifest, Recovery};
 use sdk::StateRoot;
-use statesync::{SyncServer, fetch_frames};
+use statesync::{SyncError, SyncServer, fetch_frames};
 
 use crate::constants::CUTOVER_DELAY;
-use crate::host_reads::read_upgrade_version_fields;
-use crate::util::{diag_log, hex};
+use crate::util::{fatal, hex};
 
 pub(crate) fn assert_floor_binds_view(
     view_base: u64,
@@ -101,8 +100,7 @@ pub(crate) async fn reopen_recovery(
             r
         }
         Err(e) => {
-            eprintln!("[node {label}] FATAL: cannot reopen the recovery store: {e}");
-            std::process::exit(1);
+            fatal!(label, "cannot reopen the recovery store: {e}");
         }
     }
 }
@@ -114,6 +112,18 @@ pub(crate) type ServedSeal = (
     StateRoot,
     Vec<(sdk::ModuleId, StateRoot)>,
 );
+
+/// a failed backfill, split by whether retrying the same range can ever
+/// succeed. `permanent` means the SOURCE no longer holds the frames — the
+/// range fell below its retention floor while this follower was suspended
+/// (a slept laptop's signature shape) — so waiting for the next certificate
+/// re-plans the same impossible range forever; the only way forward is a
+/// fresh boundary sync, the same jump a rebooted node takes when its reboot
+/// gap is pruned.
+pub(crate) struct BackfillUnavailable {
+    pub(crate) permanent: bool,
+    pub(crate) detail: String,
+}
 
 /// fold the committed views in `(after_view, up_to_view]` that never reached
 /// this replica as certificates — lost gossip, or ancestors committed by
@@ -133,18 +143,24 @@ pub(crate) async fn replica_backfill<C>(
     watermark: &mut Option<u64>,
     seal_checks: &mut std::collections::HashMap<u64, ServedSeal>,
     label: &str,
-) -> Result<(), String>
+) -> Result<(), BackfillUnavailable>
 where
     C: statesync::SyncClient,
 {
     let (after_view, up_to_view) = views;
     let frames = fetch_frames(client, view_base + after_view, view_base + up_to_view)
         .await
-        .map_err(|e| format!("{e}"))?;
-    println!(
-        "[node {label}] replica: backfilling {} committed frame(s) in views ({after_view}, \
-         {up_to_view}]",
-        frames.len()
+        .map_err(|e| BackfillUnavailable {
+            permanent: matches!(e, SyncError::RangePruned { .. }),
+            detail: e.to_string(),
+        })?;
+    tracing::debug!(
+        target: "ducktape::statesync",
+        node = %label,
+        frames = frames.len(),
+        after_view,
+        up_to_view,
+        "replica backfill"
     );
     for f in frames {
         let view = f.height.saturating_sub(view_base);
@@ -229,18 +245,15 @@ where
         .as_ref()
         .map(|floor| floor.height.to_string())
         .unwrap_or_else(|| "none".to_string());
-    diag_log(format!(
-        "DIAG {diag_tag} checkpoint_height={} checkpoint_hash={} \
-         floor_height={} floor_present={}",
-        boundary.height,
-        hex(&host.app_hash()),
-        floor_height,
-        floor.is_some()
-    ));
-    // stamp the real committed version fields so the captured checkpoint
-    // carries the same `required_min_version` a live checkpoint would; the
-    // next boot then preflights against them like any restart.
-    let (cv, pu) = read_upgrade_version_fields(host).await;
+    tracing::debug!(
+        target: "ducktape::statesync",
+        tag = %diag_tag,
+        checkpoint_height = boundary.height,
+        checkpoint_hash = %hex(&host.app_hash()),
+        floor_height = %floor_height,
+        floor_present = floor.is_some(),
+        "checkpoint captured"
+    );
     let ckpt = match Manifest::capture(
         host,
         Some(boundary.height),
@@ -249,26 +262,21 @@ where
         boundary.participants.clone(),
         boundary.residents.clone(),
         None,
-        cv,
-        pu,
         pos,
         1,
     ) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("[node {label}] FATAL: {diag_tag} capture: {e}");
-            std::process::exit(1);
+            fatal!(label, "{diag_tag} capture: {e}");
         }
     };
     if let Err(e) = recovery.write_manifest(&ckpt).await {
-        eprintln!("[node {label}] FATAL: {diag_tag} write: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} write: {e}");
     }
     if let Some(fc) = floor
         && let Err(e) = recovery.write_floor_cert(fc).await
     {
-        eprintln!("[node {label}] FATAL: {diag_tag} floor-cert write: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} floor-cert write: {e}");
     }
     // this checkpoint IS the journal's new genesis: everything below its
     // oplog position must never roll into a boot at this base — a prior
@@ -278,12 +286,32 @@ where
     // AHEAD of its source's serving window). the engine floor at `boundary`
     // suppresses replay at or below it, so no pruned frame is needed again.
     if let Err(e) = recovery.prune_oplog(pos).await {
-        eprintln!("[node {label}] FATAL: {diag_tag} journal prune: {e}");
-        std::process::exit(1);
+        fatal!(label, "{diag_tag} journal prune: {e}");
     }
     // the checkpoint's oplog position — the caller's prune anchor when the
     // NEXT (periodic) checkpoint supersedes this one.
     pos
+}
+
+/// how long after the last served state-sync request the source keeps
+/// deferring oplog pruning (sliding — every request renews it). generous vs
+/// the 32-block checkpoint cadence so one slow module fetch cannot lose the
+/// race; bounded so a dead syncer cannot wedge retention forever. this is the
+/// anti-treadmill: without it a busy chain prunes a slow syncer's boundary out
+/// from under it on every attempt, and a rebootstrapping replica can NEVER
+/// converge (observed: boundary 297→318→340→… forever).
+pub(crate) const SYNC_LEASE_SECS: u64 = 60;
+
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub(crate) fn sync_lease_active(lease: &std::sync::atomic::AtomicU64) -> bool {
+    let last_served = lease.load(std::sync::atomic::Ordering::Relaxed);
+    unix_now_secs().saturating_sub(last_served) < SYNC_LEASE_SECS
 }
 
 pub(crate) fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
@@ -357,6 +385,15 @@ pub(crate) enum SyncStateRequest {
     /// the Manifest path.
     TipCoords {
         reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
+    },
+    /// the fail-closed standing check (ADR §5.1): is `requester` in committed
+    /// standing (validators ∪ residents)? answered from the loop's own
+    /// committed host reads, FRESH per request — a just-committed Redeem grant
+    /// is seen immediately (a cached snapshot would starve a fresh resident
+    /// between its Redeem block and the later transport cutover).
+    Standing {
+        requester: [u8; 32],
+        reply: tokio::sync::oneshot::Sender<bool>,
     },
 }
 
@@ -457,10 +494,29 @@ pub(crate) async fn drive_sync_request(
                 Ok(Err(recovery::Error::RangePruned {
                     after_height,
                     retained_start,
-                })) => statesync::SyncResponse::RangePruned {
-                    requested_after: after_height,
-                    retained_from: retained_start,
-                },
+                })) => {
+                    // THE known wedge, and neither side logged it. `checkpoint_blocks`
+                    // defaults to 32 and prune trails one checkpoint, so at a 1s block
+                    // the retention window is 32-64 SECONDS — a slow bridge or a laptop
+                    // wake is outrun, and no node anywhere recorded what the floor was
+                    // or who got refused. this is the line that answers "was my follower
+                    // too slow, or was the source pruning too aggressively" — the exact
+                    // question that ate the 07-14 live-join session.
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        requested_after = after_height,
+                        retained_from = retained_start,
+                        gap_blocks = retained_start.saturating_sub(after_height),
+                        reason = "pruned_below_retention_floor",
+                        "frame range REFUSED — the requester is below this node's retention \
+                         floor and can never catch up from here (it must full-sync; raise \
+                         `checkpoint_blocks` if this recurs)"
+                    );
+                    statesync::SyncResponse::RangePruned {
+                        requested_after: after_height,
+                        retained_from: retained_start,
+                    }
+                }
                 Ok(Err(e)) => statesync::SyncResponse::Error(format!("recovery frame range: {e}")),
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }

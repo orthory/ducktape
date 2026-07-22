@@ -1,27 +1,51 @@
 # super-app workspace — a consensus platform of isolated modules. each module
 # publishes its wire surface (types-only payload/query/reply shapes + codecs)
 # at its crate root; cross-module product interaction goes through those wire
-# types and host-mediated queries, never another module's internals. layout:
+# types and host-mediated queries, never another module's internals.
+# three layers: module / kernel / networking — the tree groups by function,
+# not mechanism ("system" always means system *modules*). layout:
 #   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
-#                      host (submit/execute loop, app-hash composition, the
-#                      host::worker seam), node (ordered replication), consensus
-#                      (BFT orderer), statesync, recovery, indexer
-#   crates/system/   — system modules and their host-side counterparts:
-#                      consensus modules (kv, valset, governance, identity,
-#                      upgrade, saga, capability, dispatch, tagging, duckdns,
-#                      gateway) and off-consensus infra (blobstore,
-#                      dispatch-oracle, capability-host, wireguard,
-#                      nat-traversal, reachability, data-plane, overlay-net)
-#   crates/apps/     — product feature modules (forge, chat, pages, agent,
-#                      runs, tasks, vaults, automations, inbox, files, jobs)
+#                      sdk-testkit (dev-only test doubles for the sdk boundary
+#                      traits), host (submit/execute loop, app-hash composition,
+#                      the host::worker seam), node (ordered replication),
+#                      consensus (BFT orderer), statesync, recovery, indexer,
+#                      wasm-host (runs a ducktape:module component as a native
+#                      sdk::Module), module-guest (that world's WIT definition)
+#   crates/networking/ — the netstack: host-side transport infra ONLY
+#                      (wireguard, nat-traversal, reachability, data-plane,
+#                      overlay-net) — owns no consensus module
+#   crates/modules/system/ — system modules: consensus infrastructure (kv,
+#                      valset, governance, identity, lifecycle, saga,
+#                      capability, dispatch, tagging, gateway + its
+#                      absorbed duckdns naming library) and their host-side
+#                      counterparts (blobstore, dispatch-oracle, capability-host)
+#   crates/modules/apps/   — application modules, the product features (forge,
+#                      chat, pages, agent, runs, tasks, vaults, automations,
+#                      inbox, files, jobs)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
+#   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
+#                      ducktape:module world binding every port shares), the
+#                      wasm32 dep stubs, and the kernel-fixture test guests
+#                      (hello, hello-v2, sibling, object). every module
+#                      carries its OWN port (src/guest.rs behind the `guest`
+#                      feature) and bin/guest-builder synthesizes the
+#                      packaging — no per-module crate lives here
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
-#                      canary), greeter (the types-only composition example),
-#                      evm (experimental; genesis-registered in the daemons)
-#   bin/             — demo (in-process walkthrough), node (validator),
-#                      noded (the app-facing daemon), simnode (deterministic
-#                      /v1 twin), coordinator (STUN rendezvous), fs (duckfs CLI)
+#                      canary), greeter (the types-only composition example)
+#   crates/testing/  — dev-only shared test support (nettest: raw-http client,
+#                      port allocation, poll). [dev-dependencies] of the bin
+#                      integration suites ONLY; no shipping crate depends on it
+#   crates/labs/     — quarantined experimental consensus modules (evm,
+#                      multisig): in-tree and tested but registered by NO
+#                      genesis set. EXCLUDED from the workspace as its own
+#                      standalone crate so its heavy deps (revm, alloy) never
+#                      tax the shipping build; gated via `make labs-gate`
+#   bin/             — demo (in-process walkthrough), node (the `ducktape`
+#                      CLI: validator + fs verbs + mcp server), noded (the
+#                      app-facing daemon), simnode (deterministic /v1 twin),
+#                      coordinator (STUN rendezvous), guest-builder (module →
+#                      wasm component packaging tool)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -29,64 +53,76 @@
 resolver = "2"
 members = [
     # kernel — the platform (contract + dispatch + transport + BFT ordering)
-    "crates/kernel/sdk", "crates/kernel/host",
+    "crates/kernel/sdk", "crates/kernel/sdk-testkit", "crates/kernel/host",
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/wasm-host",
-    # system — consensus infrastructure modules
-    "crates/system/kv", 
-    "crates/system/valset", 
-    
-    "crates/system/governance",
-    "crates/system/identity",
-    "crates/system/upgrade", 
-    "crates/system/wireguard",
-    "crates/system/nat-traversal",
-    "crates/system/reachability",
-    "crates/system/data-plane",
-    "crates/system/overlay-net",
-    "crates/system/saga",
-    "crates/system/capability",
-    "crates/system/capability-host",
-    "crates/system/blobstore",
-    "crates/system/dispatch",
-    "crates/system/dispatch-oracle",
-    "crates/system/tagging",
-    "crates/system/modreg",
-    "crates/system/duckdns",
-    "crates/system/gateway",
+    # networking — the netstack (host-side infra + the modules that govern it)
+    "crates/networking/wireguard",
+    "crates/networking/nat-traversal",
+    "crates/networking/reachability",
+    "crates/networking/data-plane",
+    "crates/networking/overlay-net",
+    # modules/system — system modules and their host-side counterparts
+    "crates/modules/system/kv",
+    "crates/modules/system/valset",
+    "crates/modules/system/governance",
+    "crates/modules/system/identity",
+    "crates/modules/system/lifecycle",
+    "crates/modules/system/saga",
+    "crates/modules/system/capability",
+    "crates/modules/system/capability-host",
+    "crates/modules/system/blobstore",
+    "crates/modules/system/dispatch",
+    "crates/modules/system/dispatch-oracle",
+    "crates/modules/system/tagging",
+    "crates/modules/system/airlock",
+    "crates/modules/system/duckdns",
+    "crates/modules/system/gateway",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
+    "crates/rpc-client",
     # apps — product feature modules
-    "crates/apps/forge",
-    "crates/apps/pages",
-    "crates/apps/chat",
-    "crates/apps/agent",
-    "crates/apps/runs", 
-    "crates/apps/tasks", 
-    "crates/apps/vaults", 
-    "crates/apps/automations", 
-    "crates/apps/inbox", 
-    "crates/apps/files",
-    "crates/apps/jobs",
+    "crates/modules/apps/forge",
+    "crates/modules/apps/pages",
+    "crates/modules/apps/chat",
+    "crates/modules/apps/agent",
+    "crates/modules/apps/runs",
+    "crates/modules/apps/tasks",
+    "crates/modules/apps/vaults",
+    "crates/modules/apps/automations",
+    "crates/modules/apps/inbox",
+    "crates/modules/apps/files",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
-    # labs — consensus modules deliberately absent from every genesis set
-    "crates/labs",
+    # testing — dev-only shared harness helpers (raw-http client, ports,
+    # poll). NOT a Module Rule surface; no shipping crate depends on it.
+    "crates/testing/nettest",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
-    "bin/fs",
-    "bin/mcp",
-    # app — the desktop shell of the react client (web twin ships from app/)
-    "app/src-tauri",
+    "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
+    "bin/guest-builder",
+    # native desktop client — intentionally only Chat + Pages
+    "app",
 ]
+# labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
+# its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
+# the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
+exclude = ["crates/labs", "crates/guests/guest-adapter"]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
+# the ducktape CLI's argument grammar (derive). already in the graph
+# transitively, so this costs no new compilation unit.
+clap = { version = "4.6", features = ["derive"] }
+# the logging facade. events land in `noded::LogRing` (streamed to the app's
+# Logs tab over the ws `logs` topic) AND on stderr (tee'd to daemon.log) —
+# both gated by ONE reloadable filter, see bin/noded/src/log.rs.
+tracing = "0.1"
 arrayvec = "0.7"
 crossbeam-channel = "0.5"
 lru = "0.18"
@@ -95,8 +131,9 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-revm = { version = "41", default-features = false, features = ["std"] }
-alloy-primitives = { version = "1.6", default-features = false, features = ["std"] }
+# revm + alloy-primitives are NOT here on purpose: they are quarantined as
+# direct pinned deps in crates/labs/Cargo.toml (the standalone labs crate), so
+# the shipping workspace never builds the EVM dep tree. See labs-gate.
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
@@ -104,7 +141,7 @@ tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 rand = "0.8"
 # Opus codec (voice) — pure Rust, no C toolchain. No FEC-decode / PLC in the
 # decoder (empty input errors), so the voice engine renders lost frames as
-# silence; see crates/apps/chat/src/voice.
+# silence; see crates/modules/apps/chat/src/voice.
 opus-rs = "0.1"
 
 # commonware — one ecosystem, version-aligned (see auto-memory reference_qmdb_commonware).
@@ -169,54 +206,56 @@ wasmtime = "=46.0.1"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
+# dev-only shared test doubles for the sdk boundary traits (TestCtx +
+# in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
+# the Module Rule (modules link only sdk + wire surfaces) is untouched.
+sdk-testkit = { path = "crates/kernel/sdk-testkit" }
 host = { path = "crates/kernel/host" }
 node = { path = "crates/kernel/node" }
 consensus = { path = "crates/kernel/consensus" }
 statesync = { path = "crates/kernel/statesync" }
 recovery = { path = "crates/kernel/recovery" }
 indexer = { path = "crates/kernel/indexer" }
-capability-host = { path = "crates/system/capability-host" }
+capability-host = { path = "crates/modules/system/capability-host" }
 wasm-host = { path = "crates/kernel/wasm-host" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates
-kv = { path = "crates/system/kv" }
-valset = { path = "crates/system/valset" }
-governance = { path = "crates/system/governance" }
-identity = { path = "crates/system/identity" }
-upgrade = { path = "crates/system/upgrade" }
-saga = { path = "crates/system/saga" }
-capability = { path = "crates/system/capability" }
-blobstore = { path = "crates/system/blobstore" }
-dispatch = { path = "crates/system/dispatch" }
-dispatch-oracle = { path = "crates/system/dispatch-oracle" }
-tagging = { path = "crates/system/tagging" }
-modreg = { path = "crates/system/modreg" }
-duckdns = { path = "crates/system/duckdns" }
-gateway = { path = "crates/system/gateway" }
-forge = { path = "crates/apps/forge" }
-pages = { path = "crates/apps/pages" }
-chat = { path = "crates/apps/chat" }
-agent = { path = "crates/apps/agent" }
-runs = { path = "crates/apps/runs" }
-tasks = { path = "crates/apps/tasks" }
-vaults = { path = "crates/apps/vaults" }
-labs = { path = "crates/labs" }
-automations = { path = "crates/apps/automations" }
-inbox = { path = "crates/apps/inbox" }
-files = { path = "crates/apps/files" }
+kv = { path = "crates/modules/system/kv" }
+valset = { path = "crates/modules/system/valset" }
+governance = { path = "crates/modules/system/governance" }
+identity = { path = "crates/modules/system/identity" }
+lifecycle = { path = "crates/modules/system/lifecycle" }
+saga = { path = "crates/modules/system/saga" }
+capability = { path = "crates/modules/system/capability" }
+blobstore = { path = "crates/modules/system/blobstore" }
+dispatch = { path = "crates/modules/system/dispatch" }
+dispatch-oracle = { path = "crates/modules/system/dispatch-oracle" }
+tagging = { path = "crates/modules/system/tagging" }
+duckdns = { path = "crates/modules/system/duckdns" }
+gateway = { path = "crates/modules/system/gateway" }
+forge = { path = "crates/modules/apps/forge" }
+pages = { path = "crates/modules/apps/pages" }
+chat = { path = "crates/modules/apps/chat" }
+agent = { path = "crates/modules/apps/agent" }
+runs = { path = "crates/modules/apps/runs" }
+tasks = { path = "crates/modules/apps/tasks" }
+vaults = { path = "crates/modules/apps/vaults" }
+automations = { path = "crates/modules/apps/automations" }
+inbox = { path = "crates/modules/apps/inbox" }
+files = { path = "crates/modules/apps/files" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
-jobs = { path = "crates/apps/jobs" }
+ducktape-rpc = { path = "crates/rpc-client" }
 directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
-wireguard = { path = "crates/system/wireguard" }
-nat-traversal = { path = "crates/system/nat-traversal" }
-reachability = { path = "crates/system/reachability" }
-data-plane = { path = "crates/system/data-plane" }
-overlay-net = { path = "crates/system/overlay-net" }
+wireguard = { path = "crates/networking/wireguard" }
+nat-traversal = { path = "crates/networking/nat-traversal" }
+reachability = { path = "crates/networking/reachability" }
+data-plane = { path = "crates/networking/data-plane" }
+overlay-net = { path = "crates/networking/overlay-net" }
 
 # overlay-net's wrapper context implements commonware-runtime's `Clock` and
 # rng bounds, whose supertraits live in these crates — pinned to the exact
@@ -225,8 +264,8 @@ overlay-net = { path = "crates/system/overlay-net" }
 governor = "0.10.2"
 rand_core = "0.6.4"
 
-# The desktop shell runs on the standalone tauri-runtime-cef crate
-# (github.com/byeongsu-hong/tauri-runtime-cef) against PUBLISHED tauri
-# crates — no tauri fork, no [patch.crates-io]. The dep lives in
-# app/src-tauri/Cargo.toml; the shell aliases the runtime generics itself
-# (app/src-tauri/src/rt.rs) since registry tauri only defaults them to wry.
+[patch.crates-io]
+# `block` 0.1.6 is still required transitively by Metal and AVFoundation, but
+# its uninhabited extern-static type is future-incompatible with Rust. Keep the
+# API/ABI identical and patch only that declaration locally.
+block = { path = "patches/block" }

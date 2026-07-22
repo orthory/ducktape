@@ -8,40 +8,10 @@
 
 use directory::Directory;
 use directory::{DirMsg, encode_msg};
-use sdk::{Ctx, Error, Event, Module, Msg, StateRoot};
+use sdk::{Error, Module, Msg, StateRoot};
 use sha2::{Digest, Sha256};
 
-// a minimal Ctx — directory's execute never touches ctx, but the trait needs one.
-struct TestCtx {
-    env: sdk::Env,
-}
-impl TestCtx {
-    fn new() -> Self {
-        Self {
-            env: sdk::Env { protocol_version: 0,
-                height: 0,
-                consensus_time: 0,
-                origin: sdk::Origin::System,
-                me: "directory".into(),
-            },
-        }
-    }
-}
-#[async_trait::async_trait(?Send)]
-impl Ctx for TestCtx {
-    fn env(&self) -> &sdk::Env {
-        &self.env
-    }
-    fn module_root(&self, _t: &str) -> Option<StateRoot> {
-        None
-    }
-    async fn query(&self, _t: &str, _r: &[u8]) -> Result<Vec<u8>, Error> {
-        Err(Error::QueryUnsupported)
-    }
-    fn emit_msg(&mut self, _m: Msg) {}
-    fn emit_event(&mut self, _e: Event) {}
-    fn request_effect(&mut self, _e: sdk::Effect) {}
-}
+use sdk_testkit::TestCtx;
 
 fn set(key: &str, value: &str) -> Msg {
     Msg {
@@ -60,7 +30,7 @@ fn run<F: std::future::Future>(f: F) -> F::Output {
 /// a source with real content driven through the execute path and committed.
 fn committed_source() -> Directory {
     let mut src = Directory::new("directory");
-    let mut ctx = TestCtx::new();
+    let mut ctx = TestCtx::at_height(0);
     for (k, v) in [("b", "2"), ("a", "1"), ("a", "3"), ("c", "4")] {
         run(src.execute(&mut ctx, &set(k, v))).unwrap();
     }

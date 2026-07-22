@@ -24,7 +24,22 @@ commonware-codec = { workspace = true }
 bytes = "1"
 rand_core = "0.6.4"
 
+[features]
+# the mesh-carrier sim arm: `SimMesh` over commonware `simulated::Network`,
+# promoting the wiring the consensus tests already use. dev-only in practice —
+# `bin/node` wires the discovery real arm and never enables this.
+sim = []
+
+# the in-process multi-validator harness needs the sim carrier; gated so the
+# default `cargo test -p consensus` (no --features sim) SKIPS it instead of
+# failing to compile — run `cargo test -p consensus --features sim` for it.
+[[test]]
+name = "in_process_cluster"
+required-features = ["sim"]
+
 [dev-dependencies]
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 # the N-validator convergence harness: real simplex Engines over one simulated
 # commonware network, each wrapping a host::Host with a qmdb kv module.
 host = { workspace = true }

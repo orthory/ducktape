@@ -35,8 +35,8 @@ use statesync::dataplane::{DataPlaneSyncClient, read_frame, statesync_flow, writ
 use statesync::p2p::P2pSyncClient;
 use statesync::{
     BoundaryId, FinalizedFrame, FrameDisposition, Manifest, ManifestEntry, PayloadKind, SyncClient,
-    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc, encode_response,
-    encode_rpc,
+    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc_authed,
+    encode_response, encode_rpc_authed,
 };
 
 // ============================================================================
@@ -51,7 +51,8 @@ fn boundary() -> BoundaryId {
 }
 
 /// every [`SyncRequest`] variant as it exists today (`Manifest`, `Chunk`,
-/// `Module`, `Frames`, `IndexModules`, `IndexChunk`, `TipCoords`, `Blob`),
+/// `Module`, `Frames`, `IndexModules`, `IndexChunk`, `TipCoords`, `Blob`,
+/// `BlobInfo`, `BlobRange`),
 /// each with field values that would expose a codec bug (non-zero offsets,
 /// a non-trivial body, a non-empty digest), plus one deliberate
 /// PROTOCOL-error probe (an inverted `Frames` range) that both bindings
@@ -100,6 +101,18 @@ fn full_suite() -> Vec<(&'static str, SyncRequest)> {
         ("TipCoords", SyncRequest::TipCoords),
         ("Blob", SyncRequest::Blob { digest: [7u8; 32] }),
         (
+            "BlobInfo",
+            SyncRequest::BlobInfo { digest: [8u8; 32] },
+        ),
+        (
+            "BlobRange",
+            SyncRequest::BlobRange {
+                digest: [9u8; 32],
+                offset: 4096,
+                len: 512,
+            },
+        ),
+        (
             "FramesInvertedRange (protocol-error probe)",
             SyncRequest::Frames {
                 after_height: 99,
@@ -125,9 +138,6 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             participants: vec![vec![1u8; 32]],
             residents: vec![vec![2u8; 32]],
             floor_cert: Some(vec![0xAB; 8]),
-            current_version: 1,
-            pending_upgrade: None,
-            required_min_version: 1,
             state_schema: [0xAB; 32],
             entries: vec![ManifestEntry {
                 module_id: "kv".into(),
@@ -177,6 +187,10 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
         }),
         SyncRequest::Blob { digest } => SyncResponse::Blob {
             bytes: Some(digest.to_vec()),
+        },
+        SyncRequest::BlobInfo { .. } => SyncResponse::BlobInfo { len: Some(4608) },
+        SyncRequest::BlobRange { offset, len, .. } => SyncResponse::BlobRange {
+            bytes: Some(vec![(*offset % 251) as u8; *len as usize]),
         },
     }
 }
@@ -355,7 +369,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
                     return;
                 };
                 let bytes: Vec<u8> = msg.into();
-                let Ok((id, body)) = decode_rpc(&bytes) else {
+                let Ok((_requester, _proof, id, body)) = decode_rpc_authed(&bytes) else {
                     continue;
                 };
                 let Ok(req) = decode_request(body) else {
@@ -364,7 +378,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
                 let resp = encode_response(&canned_response(&req));
                 let _ = server_tx.send(
                     Recipients::One(peer),
-                    IoBuf::from(encode_rpc(id, &resp)),
+                    IoBuf::from(encode_rpc_authed(&[0u8; 32], &[0u8; 64], id, &resp)),
                     false,
                 );
             }
@@ -373,7 +387,16 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
             // genuinely unanswered — exactly the transport-error probe below.
         });
 
-        let client = P2pSyncClient::new(context.child("client"), joiner_tx, joiner_rx, server);
+        // parity is a wire round-trip proof; the serve loop above does not
+        // verify standing, so a zero proof suffices here.
+        let client = P2pSyncClient::new(
+            context.child("client"),
+            joiner_tx,
+            joiner_rx,
+            server,
+            [0u8; 32],
+            [0u8; 64],
+        );
         let mut results = Vec::with_capacity(suite.len());
         for (name, req) in suite {
             results.push((name, client.request(req).await));

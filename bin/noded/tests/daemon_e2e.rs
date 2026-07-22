@@ -10,7 +10,7 @@
 //! has drifted from that promise.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -97,31 +97,7 @@ impl Daemon {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> std::io::Result<(u16, serde_json::Value)> {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port))?;
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-        let body_bytes = body
-            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-            .unwrap_or_default();
-        let req = format!(
-            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body_bytes.len()
-        );
-        stream.write_all(req.as_bytes())?;
-        stream.write_all(&body_bytes)?;
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
-        let text = String::from_utf8_lossy(&raw);
-        let status: u16 = text
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let payload = text
-            .split("\r\n\r\n")
-            .nth(1)
-            .map(parse_http_body)
-            .unwrap_or(serde_json::Value::Null);
-        Ok((status, payload))
+        nettest::try_http_json(self.port, method, path, body)
     }
 
     fn request(
@@ -179,33 +155,7 @@ impl Daemon {
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
     fn request_bytes(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("daemon reachable");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("read timeout");
-        let head = format!(
-            "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(head.as_bytes()).expect("write head");
-        // best-effort body write: the daemon may legally answer 413 and stop
-        // reading mid-body, which can surface here as a broken pipe.
-        let _ = stream.write_all(body);
-        let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).expect("read response");
-        // split head/body at the byte level — chunk bytes must round-trip
-        // untouched, so no utf-8 decoding of the body.
-        let split = raw
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .expect("http header terminator");
-        let status_line = String::from_utf8_lossy(&raw[..split]);
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        (status, raw[split + 4..].to_vec())
+        nettest::http_bytes(self.port, method, path, "application/octet-stream", body)
     }
 
     /// open /v1/ws with a minimal rfc6455 client handshake and return the
@@ -321,19 +271,7 @@ impl Daemon {
     }
 }
 
-fn parse_http_body(body: &str) -> serde_json::Value {
-    // axum replies with content-length (no chunking) for these routes; the
-    // split above already isolated the body.
-    serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null)
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind port probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
-}
+use nettest::free_port;
 
 fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Value {
     serde_json::json!({
@@ -386,6 +324,10 @@ fn call_ws_without_a_hub_refuses_with_a_reason() {
     assert_eq!(status, 503, "no call hub → refused at upgrade: {raw}");
     assert!(raw.contains("no mesh call hub"), "refusal says WHY: {raw}");
 
+    let (status, raw) = daemon.ws_upgrade_refusal("/v1/presence/ws?page=page-1");
+    assert_eq!(status, 503, "no realtime hub → presence refused: {raw}");
+    assert!(raw.contains("no mesh realtime hub"), "refusal says WHY: {raw}");
+
     let (status, _raw) = daemon.ws_upgrade_refusal("/v1/voice/ws?channel=general");
     assert_eq!(status, 404, "the old voice route is unrouted, not refused");
 }
@@ -422,7 +364,6 @@ fn full_surface_blocks_authorship_and_ws() {
             "forge",
             "files",
             "identity",
-            "duckdns",
             "gateway"
         ]
     );
@@ -527,6 +468,63 @@ fn full_surface_blocks_authorship_and_ws() {
     let (code, err) = daemon.submit("no-such-module", serde_json::json!({"Nope": {}}), None);
     assert_eq!(code, 400, "unknown target must reject: {err}");
     daemon.status(); // still alive, still answering.
+}
+
+/// read frames until block `height`'s module event and require a heartbeat
+/// carrying that height to have arrived FIRST — the per-block tip push, not
+/// the interval beat (which the loop tolerates at other heights).
+fn assert_tip_precedes_event(ws: &mut BufReader<TcpStream>, height: u64) {
+    let mut tip_seen = false;
+    loop {
+        let frame = Daemon::ws_read_json(ws);
+        if frame["type"] == "heartbeat" && frame["height"] == height {
+            tip_seen = true;
+            continue;
+        }
+        if frame["type"] == "event" {
+            assert_eq!(frame["op"]["height"], height, "event for block {height}");
+            assert!(
+                tip_seen,
+                "no tip heartbeat at height {height} arrived before its event"
+            );
+            return;
+        }
+    }
+}
+
+/// the tip rides the block wake itself: every committed block pushes a
+/// heartbeat frame with the new height BEFORE that block's module events, so
+/// a console's height ticks per block instead of waiting out the 3s timer
+/// beat. asserting the ordering on TWO consecutive blocks makes a
+/// coincidental timer beat unable to false-pass the test — two timer beats
+/// are 3s apart and cannot both land inside one test's submit window.
+#[test]
+fn block_commits_push_tip_heartbeats_before_their_events() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    let mut ws = daemon.ws_connect();
+    let heartbeat = Daemon::ws_read_type(&mut ws, "heartbeat");
+    assert_eq!(heartbeat["height"], 0);
+
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["module:chat"]}"#);
+    let _subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+    assert_eq!(block["height"], 1);
+    assert_tip_precedes_event(&mut ws, 1);
+
+    let (code, block) = daemon.submit("chat", post_message("general", "m1", "tick"), None);
+    assert_eq!(code, 200, "post failed: {block}");
+    assert_eq!(block["height"], 2);
+    assert_tip_precedes_event(&mut ws, 2);
 }
 
 #[test]
@@ -658,7 +656,7 @@ fn state_persists_across_restart() {
 
         // graceful retirement THROUGH the wire — the port is the daemon's
         // identity; a client that spawned it has no pid to signal.
-        let (code, _) = daemon.request("POST", "/v1/shutdown", None);
+        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
         assert_eq!(code, 200);
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
@@ -669,7 +667,7 @@ fn state_persists_across_restart() {
                     break;
                 }
                 None => {
-                    assert!(Instant::now() < deadline, "daemon ignored /v1/shutdown");
+                    assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
                     std::thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -805,12 +803,12 @@ fn per_module_index_serves_ops_and_views() {
 
         pre_restart_height = daemon.status()["height"].as_u64().expect("height");
 
-        let (code, _) = daemon.request("POST", "/v1/shutdown", None);
+        let (code, _) = daemon.request("POST", "/v1/admin/shutdown", None);
         assert_eq!(code, 200);
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut daemon = daemon;
         while daemon.child.try_wait().expect("poll daemon").is_none() {
-            assert!(Instant::now() < deadline, "daemon ignored /v1/shutdown");
+            assert!(Instant::now() < deadline, "daemon ignored /v1/admin/shutdown");
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -1247,6 +1245,49 @@ fn metrics_endpoint_exposes_ducktape_and_runtime_series() {
     );
 }
 
+#[test]
+fn metrics_stream_topic_pushes_the_scrape_over_ws() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+
+    // commit one block so the ducktape series carry observed values.
+    let (code, block) = daemon.submit(
+        "chat",
+        serde_json::json!({
+            "create_channel": { "channel_id": "general", "name": "General", "post_policy": "open" }
+        }),
+        None,
+    );
+    assert_eq!(code, 200, "create channel failed: {block}");
+
+    let mut ws = daemon.ws_connect();
+    Daemon::ws_send_text(&mut ws, r#"{"op":"subscribe","topics":["metrics"]}"#);
+    let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
+    assert_eq!(subscribed["topics"]["metrics"], "0", "fresh snapshot cursor");
+
+    // the subscribe replay pushes the first sample immediately — no wait for
+    // the next heartbeat tick — carrying the SAME exposition GET /metrics
+    // serves, stamped with the server-side sample instant as its cursor.
+    let tail = Daemon::ws_read_type(&mut ws, "tail");
+    assert_eq!(tail["topic"], "metrics");
+    let text = tail["item"]["text"].as_str().expect("scrape text");
+    assert!(
+        text.contains("ducktape_blocks_total"),
+        "stream sample carries the block series: {text}"
+    );
+    assert!(text.trim_end().ends_with("# EOF"), "whole scrape body rides");
+    let time_ms = tail["item"]["timeMs"].as_u64().expect("sample instant");
+    assert_eq!(tail["cursor"], time_ms.to_string());
+
+    // the next sample arrives on the heartbeat tick without any block moving.
+    let tail2 = Daemon::ws_read_type(&mut ws, "tail");
+    assert_eq!(tail2["topic"], "metrics");
+    assert!(
+        tail2["item"]["timeMs"].as_u64().expect("second instant") >= time_ms,
+        "tick samples advance monotonically"
+    );
+}
+
 // ============================================================================
 // off-loop oracle execution: REAL script-backed providers through the full
 // capability-host path, proving the daemon's command loop no longer awaits
@@ -1370,17 +1411,7 @@ fn pending_run_count(daemon: &Daemon) -> usize {
         .unwrap_or(0)
 }
 
-/// poll `probe` until it returns Some, panicking past `budget`.
-fn poll_until<T>(what: &str, budget: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + budget;
-    loop {
-        if let Some(v) = probe() {
-            return v;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(150));
-    }
-}
+use nettest::poll_until;
 
 /// THE HEADLINE FIX, asserted directly: submit a run whose provider sleeps,
 /// then Status and Query answer BEFORE the run completes. on the pre-fix
@@ -1839,6 +1870,140 @@ fn git_clone_over_http_round_trips_full_history() {
         log_oids(&dst),
         pushed_oids,
         "the cloned history oids must match the pushed repo exactly"
+    );
+}
+
+/// Regression for stateless upload-pack negotiation: once a checkout has
+/// common objects with Forge, stock git sends one or more flush-ended `have`
+/// rounds before `done`. The server must answer those rounds with NAK only;
+/// PACK bytes are legal only in the final response.
+#[test]
+fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
+    if !have_git() {
+        eprintln!(
+            "skipping git_fetch_and_pull_into_nonempty_checkout_complete_negotiation: no `git` on PATH"
+        );
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/negotiated", daemon.port);
+
+    let source = tempfile::TempDir::new().expect("source repo");
+    let src = source.path();
+    git_ok(src, &["init"]);
+    // More than git's initial have window guarantees at least one have batch
+    // ends in a flush before the client reaches `done`.
+    for number in 1..=20 {
+        let content = format!("base {number}\n");
+        let message = format!("base commit {number}");
+        commit_file(src, "history.txt", &content, &message);
+    }
+    git_ok(src, &["remote", "add", "ducktape", &url]);
+    git_ok(src, &["push", "ducktape", "main"]);
+    let first_head = rev_parse_head(src);
+
+    let checkout_root = tempfile::TempDir::new().expect("checkout root");
+    let checkout = checkout_root.path().join("checkout");
+    git_ok(
+        checkout_root.path(),
+        &["clone", &url, checkout.to_str().expect("utf-8 checkout path")],
+    );
+
+    // A fetch from a non-empty repo has a common first commit. This exercises
+    // the intermediate have/NAK round and leaves the worktree at its prior head.
+    commit_file(src, "history.txt", "fetched\n", "fetched commit");
+    git_ok(src, &["push", "ducktape", "main"]);
+    let fetch = git_capture(&checkout, &["fetch", "origin"]);
+    eprintln!("=== negotiated git fetch ===\n{}", render(&fetch));
+    assert!(
+        fetch.status.success(),
+        "fetch into a non-empty checkout failed:\n{}",
+        render(&fetch)
+    );
+    assert_eq!(
+        rev_parse_head(&checkout),
+        first_head,
+        "fetch must not move the checked-out branch"
+    );
+
+    // Advance once more so pull performs its own negotiated fetch, then verify
+    // both the ref update and checkout bytes through stock git.
+    commit_file(src, "history.txt", "pulled\n", "pulled commit");
+    git_ok(src, &["push", "ducktape", "main"]);
+    let pull = git_capture(&checkout, &["pull", "--ff-only"]);
+    eprintln!("=== negotiated git pull ===\n{}", render(&pull));
+    assert!(
+        pull.status.success(),
+        "pull into a non-empty checkout failed:\n{}",
+        render(&pull)
+    );
+    assert_eq!(rev_parse_head(&checkout), rev_parse_head(src));
+    assert_eq!(
+        std::fs::read(checkout.join("history.txt")).expect("read pulled file"),
+        b"pulled\n"
+    );
+}
+
+/// The desktop remote-forge mirror fetches with LIBGIT2, not stock git: a
+/// fresh bare mirror pulls the full closure after a NAK, and a re-sync after
+/// the origin advances completes against the ACKed incremental pack — the
+/// exact client the app's `forge_sync_remote` runs, so this pins that interop.
+#[test]
+fn libgit2_mirror_fetch_completes_incremental_sync() {
+    if !have_git() {
+        eprintln!("skipping libgit2_mirror_fetch_completes_incremental_sync: no `git` on PATH");
+        return;
+    }
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    let daemon = Daemon::spawn(storage.path());
+    let url = format!("http://127.0.0.1:{}/forge/mirrored", daemon.port);
+
+    let source = tempfile::TempDir::new().expect("source repo");
+    let src = source.path();
+    git_ok(src, &["init"]);
+    commit_file(src, "history.txt", "one\n", "first commit");
+    git_ok(src, &["remote", "add", "ducktape", &url]);
+    git_ok(src, &["push", "ducktape", "main"]);
+    let first_head = rev_parse_head(src);
+
+    let mirror_dir = tempfile::TempDir::new().expect("mirror dir");
+    let mirror = git2::Repository::init_bare(mirror_dir.path()).expect("init mirror");
+    let refspec = ["+refs/heads/*:refs/heads/*"];
+    let fetch = |mirror: &git2::Repository| {
+        let mut remote = mirror.remote_anonymous(&url).expect("anonymous remote");
+        remote
+            .fetch(&refspec, None::<&mut git2::FetchOptions<'_>>, None)
+            .expect("libgit2 fetch");
+    };
+
+    fetch(&mirror);
+    let first_oid = git2::Oid::from_str(&first_head).expect("head oid");
+    assert!(mirror.find_commit(first_oid).is_ok(), "fresh sync lands the head");
+
+    // origin advances; the re-sync's haves earn an ACK + delta pack, and the
+    // mirror must still complete the new head's closure from it.
+    commit_file(src, "history.txt", "two\n", "second commit");
+    git_ok(src, &["push", "ducktape", "main"]);
+    let second_head = rev_parse_head(src);
+    fetch(&mirror);
+    let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
+    let landed = mirror.find_commit(second_oid).expect("incremental sync lands the head");
+    assert_eq!(
+        landed
+            .tree()
+            .expect("tree")
+            .get_name("history.txt")
+            .map(|entry| entry.id()),
+        git2::Repository::open(src)
+            .expect("open source")
+            .find_commit(second_oid)
+            .expect("source head")
+            .tree()
+            .expect("source tree")
+            .get_name("history.txt")
+            .map(|entry| entry.id()),
+        "the delta pack must complete the changed blob"
     );
 }
 

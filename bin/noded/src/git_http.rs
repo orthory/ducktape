@@ -28,10 +28,13 @@ use crate::{DEFAULT_ORIGIN, NodeCommand, NodeHandle, actor_gone, error_response}
 //
 // FETCH reads forge's git substrate DIRECTLY — the one route that opens the
 // on-disk repo (`<forge_repo>/<name>`, threaded onto the handle) instead of
-// talking to the actor. it builds a packfile of the wanted oids' full closure
-// and streams it back on side-band-64k. the MVP ignores `have`s and always
-// serves a full closure — always correct, just larger than an incremental
-// fetch; `git pull` works, it just refetches.
+// talking to the actor. once the client sends `done`, the haves it advertised
+// bound the pack: every have this repo knows hides its closure from the walk,
+// so an up-to-date-ish client (the remote-view mirror re-syncing per head
+// movement) downloads only what moved, ACKed with the common base. a client
+// with no usable common base still gets the FULL self-contained closure after
+// a NAK. intermediate flush-ended rounds answer plain NAK, so stock git keeps
+// batching haves until it sends `done`.
 // ============================================================================
 
 /// the capabilities forge's receive-pack advertises. deliberately NO
@@ -44,7 +47,7 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 /// muxes the packfile onto band 1 of the reply — git clients request it by
 /// default; `multi_ack_detailed` is the modern negotiation, `thin-pack`/
 /// `ofs-delta` are standard pack encodings. no fetch-side extras (shallow /
-/// filter): the MVP serves a full closure.
+/// filter): the answer is either the full closure or a have-bounded delta.
 const GIT_UPLOAD_PACK_CAPS: &str =
     "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
 /// the body cap for a git packfile POST — push (whole-repo pack) and fetch
@@ -102,6 +105,95 @@ fn parse_pkt_lines(buf: &[u8]) -> Result<(Vec<Vec<u8>>, &[u8]), String> {
         lines.push(rest[4..len].to_vec());
         rest = &rest[len..];
     }
+}
+
+/// the parts of a v0 upload-pack request this server needs. haves bound the
+/// pack: every have the repo knows hides its closure from the walk, so a
+/// remote client refreshing its mirror downloads only what moved — the
+/// remote-view lane syncs per head movement, and a full-closure answer there
+/// would re-ship the whole repo every time.
+struct UploadPackRequest {
+    wants: Vec<String>,
+    haves: Vec<String>,
+    side_band: bool,
+    done: bool,
+}
+
+/// parse the complete v0 upload-pack request, including the negotiation tail.
+/// A stateless smart-HTTP client may end a round with a flush instead of `done`;
+/// that round must receive only NAK so it can send another batch of haves.
+fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
+    let (lines, mut rest) = parse_pkt_lines(body)?;
+    let mut wants = Vec::new();
+    let mut side_band = false;
+    let mut first_want = true;
+    for line in &lines {
+        let text = std::str::from_utf8(line)
+            .map_err(|_| "non-utf8 want line".to_string())?
+            .trim_end();
+        let Some(want) = text.strip_prefix("want ") else {
+            return Err("unexpected line in want section".into());
+        };
+        let mut toks = want.split(' ');
+        let oid = toks
+            .next()
+            .filter(|oid| !oid.is_empty())
+            .ok_or_else(|| "want line carried no oid".to_string())?;
+        if git2::Oid::from_str(oid).is_err() {
+            return Err("want line carried an invalid oid".into());
+        }
+        wants.push(oid.to_string());
+        if first_want {
+            side_band = toks.any(|cap| cap == "side-band-64k");
+            first_want = false;
+        }
+    }
+    if wants.is_empty() {
+        return Err("request carried no want lines".into());
+    }
+
+    let mut haves = Vec::new();
+    let mut done = false;
+    while !rest.is_empty() {
+        if done {
+            return Err("upload-pack negotiation continued after done".into());
+        }
+        if rest.len() < 4 {
+            return Err("truncated negotiation pkt-line length header".into());
+        }
+        let hdr = std::str::from_utf8(&rest[..4])
+            .map_err(|_| "non-ascii negotiation pkt-line length".to_string())?;
+        let len = usize::from_str_radix(hdr, 16)
+            .map_err(|_| "invalid negotiation pkt-line length hex".to_string())?;
+        if len == 0 {
+            rest = &rest[4..];
+            continue;
+        }
+        if len < 4 || len > rest.len() {
+            return Err("negotiation pkt-line length out of range".into());
+        }
+        let text = std::str::from_utf8(&rest[4..len])
+            .map_err(|_| "non-utf8 negotiation line".to_string())?
+            .trim_end();
+        if text == "done" {
+            done = true;
+        } else if let Some(oid) = text.strip_prefix("have ") {
+            if git2::Oid::from_str(oid).is_err() {
+                return Err("have line carried an invalid oid".into());
+            }
+            haves.push(oid.to_string());
+        } else {
+            return Err("unexpected upload-pack negotiation line".into());
+        }
+        rest = &rest[len..];
+    }
+
+    Ok(UploadPackRequest {
+        wants,
+        haves,
+        side_band,
+        done,
+    })
 }
 
 /// decode an even-length hex string to raw bytes; `None` on an odd length or any
@@ -477,12 +569,12 @@ pub(crate) async fn git_receive_pack(
 }
 
 /// POST /forge/{repo}/git-upload-pack — serve a fetch/clone. parse the pkt-line
-/// negotiation (`want <oid>` lines, capabilities on the FIRST; `have`/`done`
-/// lines are read but IGNORED — the MVP serves a full closure), open
-/// `<forge_repo>/{repo}` READ-ONLY, build a packfile of the wanted oids' closure,
-/// and reply `NAK` then the pack muxed on side-band-64k band 1. incremental
-/// (`have`-aware) fetch is future work: a full pack is always correct, just
-/// larger, and `git pull` still works (it refetches).
+/// negotiation (`want <oid>` lines, capabilities on the FIRST; flush-ended
+/// `have` rounds receive plain NAK so the client keeps batching), open
+/// `<forge_repo>/{repo}` READ-ONLY, and after `done` answer with the pack on
+/// side-band-64k band 1: a have-bounded delta behind `ACK <common>` when the
+/// repo knows any of the client's haves, or the full closure behind NAK when
+/// it knows none (see [`build_upload_pack`]).
 pub(crate) async fn git_upload_pack(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
@@ -508,12 +600,8 @@ pub(crate) async fn git_upload_pack(
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
 
-    // the request opens with the `want` list (caps on the first want), then a
-    // flush-pkt, then have/done lines. parse_pkt_lines returns exactly the want
-    // section; the have/done tail after the flush is deliberately ignored (the
-    // full-closure MVP negotiates no common base).
-    let (lines, _rest) = match parse_pkt_lines(&body) {
-        Ok(parsed) => parsed,
+    let request = match parse_upload_pack_request(&body) {
+        Ok(request) => request,
         Err(msg) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -522,52 +610,52 @@ pub(crate) async fn git_upload_pack(
         }
     };
 
-    let mut wants: Vec<String> = Vec::new();
-    let mut side_band = false;
-    let mut first_want = true;
-    for line in &lines {
-        let text = std::str::from_utf8(line).map(str::trim_end).unwrap_or("");
-        let Some(rest) = text.strip_prefix("want ") else {
-            continue;
-        };
-        // `want <oid>[ <cap> <cap> …]` — the oid then space-separated caps on the
-        // first want line only.
-        let mut toks = rest.split(' ');
-        let Some(oid) = toks.next().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        wants.push(oid.to_string());
-        if first_want {
-            side_band = toks.any(|c| c == "side-band-64k");
-            first_want = false;
-        }
-    }
-    if wants.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "git-upload-pack request carried no want lines",
-        );
+    // A flush-ended have batch is an intermediate negotiation round. Returning
+    // only NAK (and no side-band/PACK bytes) lets stock git send its next batch.
+    if !request.done {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/x-git-upload-pack-result"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            pkt_line(b"NAK\n"),
+        )
+            .into_response();
     }
 
     // the pack build is blocking git2 IO over a non-Send `Repository`; run it off
     // the async worker, moving only Send data (the dir + hex oids) across.
     let repo_dir = forge_repo.join(&repo);
-    let pack = match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants)).await
-    {
-        Ok(Ok(pack)) => pack,
-        Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
-        Err(_) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "git pack builder task panicked",
-            );
-        }
-    };
+    let UploadPackRequest {
+        wants,
+        haves,
+        side_band,
+        ..
+    } = request;
+    let (pack, common) =
+        match tokio::task::spawn_blocking(move || build_upload_pack(&repo_dir, &wants, &haves))
+            .await
+        {
+            Ok(Ok(built)) => built,
+            Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+            Err(_) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "git pack builder task panicked",
+                );
+            }
+        };
 
     let mut out = Vec::new();
-    // no common base was negotiated (haves ignored), so a single NAK precedes the
-    // pack — sent as a PLAIN pkt-line, BEFORE any side-band framing begins.
-    out.extend_from_slice(&pkt_line(b"NAK\n"));
+    // the terminal negotiation line, valid in every v0 multi_ack mode: a bare
+    // `ACK <oid>` names the common base the pack builds on (the delta answer),
+    // NAK means no usable have was found (the pack is then the full closure).
+    // either way a PLAIN pkt-line, BEFORE any side-band framing begins.
+    match &common {
+        Some(oid) => out.extend_from_slice(&pkt_line(format!("ACK {oid}\n").as_bytes())),
+        None => out.extend_from_slice(&pkt_line(b"NAK\n")),
+    }
     if side_band {
         // band 1 = pack data, chunked to the side-band-64k ceiling.
         for chunk in pack.chunks(GIT_SIDE_BAND_CHUNK) {
@@ -594,17 +682,161 @@ pub(crate) async fn git_upload_pack(
         .into_response()
 }
 
-/// build a self-contained packfile of the FULL object closure of `want_hexes`
-/// from the repo at `repo_dir`, opened READ-ONLY. the packing itself is
-/// forge's `pack_closure_many` — ONE implementation for the module's snapshot
-/// pack and this fetch lane, single-threaded so the bytes are a pure function
-/// of the closure. any git2 failure — a missing repo dir, an oid absent from
-/// the odb, a pack-write error — is returned as a message the handler surfaces.
-fn build_upload_pack(repo_dir: &std::path::Path, want_hexes: &[String]) -> Result<Vec<u8>, String> {
+/// build the packfile answering `want_hexes`, bounded by the client's haves:
+/// every have this repo knows as a commit hides its closure from the walk
+/// (forge's `pack_delta`), so a mirror refresh downloads only what moved. a
+/// client with NO usable common base still gets the FULL self-contained
+/// closure (forge's `pack_closure_many` — ONE packing implementation for the
+/// module's snapshot pack and this fetch lane). returns the pack plus the
+/// first usable common base, which the handler ACKs. any git2 failure — a
+/// missing repo dir, an oid absent from the odb, a pack-write error — is
+/// returned as a message the handler surfaces.
+fn build_upload_pack(
+    repo_dir: &std::path::Path,
+    want_hexes: &[String],
+    have_hexes: &[String],
+) -> Result<(Vec<u8>, Option<String>), String> {
     let repo = git2::Repository::open(repo_dir).map_err(|e| format!("open forge repo: {e}"))?;
     let mut oids = Vec::with_capacity(want_hexes.len());
     for hex in want_hexes {
         oids.push(git2::Oid::from_str(hex).map_err(|e| format!("bad want oid {hex}: {e}"))?);
     }
-    forge::pack_closure_many(&repo, &oids).map_err(|e| format!("build pack: {e}"))
+    // only haves this repo KNOWS as commits can bound the walk — a have from
+    // history this node never saw simply doesn't help (and never errors).
+    let mut common = Vec::new();
+    for hex in have_hexes {
+        let Ok(oid) = git2::Oid::from_str(hex) else {
+            continue; // parser already validated; belt and braces
+        };
+        if repo.find_commit(oid).is_ok() {
+            common.push(oid);
+        }
+    }
+    if common.is_empty() {
+        return forge::pack_closure_many(&repo, &oids)
+            .map(|pack| (pack, None))
+            .map_err(|e| format!("build pack: {e}"));
+    }
+    let ack = common[0].to_string();
+    forge::pack_delta(&repo, &oids, &common)
+        .map(|pack| (pack, Some(ack)))
+        .map_err(|e| format!("build delta pack: {e}"))
+}
+
+#[cfg(test)]
+mod upload_pack_tests {
+    use super::*;
+
+    const WANT: &str = "1111111111111111111111111111111111111111";
+    const HAVE: &str = "2222222222222222222222222222222222222222";
+
+    fn request_tail(tail: &[u8]) -> Vec<u8> {
+        let mut body =
+            pkt_line(format!("want {WANT} multi_ack_detailed side-band-64k\n").as_bytes());
+        body.extend_from_slice(GIT_FLUSH_PKT);
+        body.extend_from_slice(tail);
+        body
+    }
+
+    #[test]
+    fn flush_ended_have_round_is_not_done() {
+        let mut tail = pkt_line(format!("have {HAVE}\n").as_bytes());
+        tail.extend_from_slice(GIT_FLUSH_PKT);
+
+        let parsed = parse_upload_pack_request(&request_tail(&tail)).expect("valid request");
+
+        assert_eq!(parsed.wants, vec![WANT.to_string()]);
+        assert_eq!(parsed.haves, vec![HAVE.to_string()]);
+        assert!(parsed.side_band);
+        assert!(!parsed.done, "a have flush must not authorize pack bytes");
+    }
+
+    #[test]
+    fn explicit_done_completes_negotiation() {
+        let mut tail = pkt_line(format!("have {HAVE}\n").as_bytes());
+        tail.extend_from_slice(&pkt_line(b"done\n"));
+
+        let parsed = parse_upload_pack_request(&request_tail(&tail)).expect("valid request");
+
+        assert!(parsed.done);
+        assert!(parsed.side_band);
+        assert_eq!(parsed.haves, vec![HAVE.to_string()]);
+    }
+
+    /// two commits at the origin; a client that has the first must get a pack
+    /// that (a) is smaller than the full closure and (b) still completes the
+    /// second commit when installed next to the objects it already holds.
+    #[test]
+    fn haves_bound_the_pack_to_what_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+
+        let blob_a = origin.blob(b"one").unwrap();
+        let mut tb = origin.treebuilder(None).unwrap();
+        tb.insert("a.txt", blob_a, 0o100644).unwrap();
+        let tree1 = origin.find_tree(tb.write().unwrap()).unwrap();
+        let first = origin
+            .commit(Some("refs/heads/dev"), &sig, &sig, "one", &tree1, &[])
+            .unwrap();
+
+        let blob_b = origin.blob(b"two").unwrap();
+        let mut tb = origin.treebuilder(Some(&tree1)).unwrap();
+        tb.insert("b.txt", blob_b, 0o100644).unwrap();
+        let tree2 = origin.find_tree(tb.write().unwrap()).unwrap();
+        let first_commit = origin.find_commit(first).unwrap();
+        let second = origin
+            .commit(
+                Some("refs/heads/dev"),
+                &sig,
+                &sig,
+                "two",
+                &tree2,
+                &[&first_commit],
+            )
+            .unwrap();
+
+        let want = vec![second.to_string()];
+        let (full, ack) = build_upload_pack(dir.path(), &want, &[]).unwrap();
+        assert_eq!(ack, None, "no haves -> full closure after NAK");
+        let (delta, ack) = build_upload_pack(dir.path(), &want, &[first.to_string()]).unwrap();
+        assert_eq!(ack, Some(first.to_string()), "the common base is ACKed");
+        assert!(
+            delta.len() < full.len(),
+            "delta pack ({}) must be smaller than the closure ({})",
+            delta.len(),
+            full.len()
+        );
+
+        // an unknown have cannot bound the walk — the answer stays full.
+        let (fallback, ack) = build_upload_pack(dir.path(), &want, &[HAVE.to_string()]).unwrap();
+        assert_eq!(ack, None);
+        assert_eq!(fallback.len(), full.len());
+
+        // install first's closure, then the delta, into a fresh repo: the
+        // second commit and BOTH blobs must be readable — the delta carried
+        // everything the client didn't already hold.
+        let clone_dir = tempfile::tempdir().unwrap();
+        let clone = git2::Repository::init_bare(clone_dir.path()).unwrap();
+        let (base_pack, _) = build_upload_pack(dir.path(), &[first.to_string()], &[]).unwrap();
+        for pack in [&base_pack, &delta] {
+            let odb = clone.odb().unwrap();
+            let mut pw = odb.packwriter().unwrap();
+            std::io::Write::write_all(&mut pw, pack).unwrap();
+            pw.commit().unwrap();
+        }
+        let landed = clone.find_commit(second).unwrap();
+        assert_eq!(landed.tree().unwrap().len(), 2);
+        assert!(clone.find_blob(blob_a).is_ok());
+        assert!(clone.find_blob(blob_b).is_ok());
+    }
+
+    #[test]
+    fn malformed_negotiation_tail_is_rejected() {
+        let err = parse_upload_pack_request(&request_tail(b"0009wat!\n"))
+            .err()
+            .expect("unknown negotiation line must fail");
+
+        assert!(err.contains("unexpected upload-pack negotiation line"));
+    }
 }

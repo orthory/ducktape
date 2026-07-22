@@ -8,7 +8,10 @@ use commonware_cryptography::Signer as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use http_body_util::BodyExt as _;
-use noded::{BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle, NodeStatus};
+use noded::{
+    AdminConfig, AdminExposure, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeStatus,
+};
 use tower::ServiceExt as _;
 
 /// a scripted actor: answers every command the same way, like a module host
@@ -50,14 +53,14 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 // the frameless arm above uses.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
-                        Ok((sdk::Origin::External(key), msg)) => {
+                        Ok((sdk::Origin::External(key), msg, _cont)) => {
                             assert_eq!(msg.target, "chat");
                             Ok(BlockSummary {
                                 height: 11,
                                 app_hash: noded::hex_bytes(&key),
                             })
                         }
-                        Ok((origin, _)) => Err(format!("a frame cannot carry {origin:?}")),
+                        Ok((origin, ..)) => Err(format!("a frame cannot carry {origin:?}")),
                         Err(err) => Err(err.to_string()),
                     };
                     let _ = reply.send(result);
@@ -82,7 +85,21 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             category: ModuleCategory::of("chat"),
                         }],
                         public_key: "ab".repeat(32),
+                        operations: noded::OperationalStatus {
+                            role: noded::NodeRole::Validator,
+                            phase: noded::NodePhase::Validating,
+                            phase_since: 1_720_000_000,
+                            ..Default::default()
+                        },
                     });
+                }
+                NodeCommand::Peers { reply } => {
+                    // answered as the real lanes answer it: a sample parsed
+                    // from an exposition — here one connected peer.
+                    let _ = reply.send(noded::peers::peers_from_exposition(
+                        "network_tracker_directory_connected{peer=\"ab\"} 1000\n",
+                        2000,
+                    ));
                 }
                 NodeCommand::Metrics { reply } => {
                     let _ = reply.send(
@@ -189,7 +206,7 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let frame = node::encode_frame(&signer, 1, &chat_op());
+    let frame = node::encode_frame(&signer, 1, &chat_op(), None);
     let response = noded::router(handle)
         .oneshot(post_frame(frame))
         .await
@@ -218,7 +235,7 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
-    let mut frame = node::encode_frame(&signer, 1, &chat_op());
+    let mut frame = node::encode_frame(&signer, 1, &chat_op(), None);
     // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
     // payload), so the frame no longer verifies — and the actor never sees it.
     let last = frame.len() - 65;
@@ -248,7 +265,7 @@ async fn a_frame_cannot_claim_another_keys_origin() {
     // signed preimage, so B's key cannot be swapped in without breaking it.
     let a = commonware_cryptography::ed25519::PrivateKey::from_seed(1);
     let b = commonware_cryptography::ed25519::PrivateKey::from_seed(2);
-    let mut frame = node::encode_frame(&a, 1, &chat_op());
+    let mut frame = node::encode_frame(&a, 1, &chat_op(), None);
     let b_key = b.public_key();
     // the origin is the first length-prefixed field: 8 bytes of length, then the
     // 32 key bytes.
@@ -374,6 +391,32 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
     // the catalog category rides on the wire as a lowercase string.
     assert_eq!(body["modules"][0]["category"], "workspace");
+    assert_eq!(body["operations"]["role"], "validator");
+    assert_eq!(body["operations"]["phase"], "validating");
+    assert_eq!(body["operations"]["phaseSince"], 1_720_000_000u64);
+}
+
+#[tokio::test]
+async fn peers_reports_the_direct_peer_sample() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/peers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["sampledAtMs"], 2000);
+    assert_eq!(body["peers"][0]["peer"], "ab");
+    assert_eq!(body["peers"][0]["connected"], true);
+    assert_eq!(body["peers"][0]["connectedSinceMs"], 1000);
 }
 
 #[tokio::test]
@@ -416,8 +459,15 @@ async fn shutdown_acknowledges_then_signals() {
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
+    // shutdown moved to the owner-gated admin namespace (ADR A2). the default
+    // handle is loopback-trust with no on-chain owner; the loopback check is
+    // FAIL-CLOSED on a missing ConnectInfo, so the test stamps a loopback peer
+    // exactly as the connect-info make-service would.
     let response = noded::router(handle)
-        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .oneshot(with_peer(
+            post("/v1/admin/shutdown", serde_json::json!({})),
+            "127.0.0.1:40000",
+        ))
         .await
         .unwrap();
 
@@ -432,6 +482,222 @@ async fn shutdown_acknowledges_then_signals() {
     )
     .await
     .expect("shutdown signal fired");
+}
+
+/// stamp a peer address onto a request the way `into_make_service_with_connect_info`
+/// would, so the admin guard's loopback check has something to read.
+fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        addr.parse::<std::net::SocketAddr>().expect("test peer addr"),
+    ));
+    req
+}
+
+/// shutdown left the unauthenticated public surface entirely (ADR A2). the old
+/// path is a 404 — flag-day, no alias.
+#[tokio::test]
+async fn the_old_public_shutdown_route_is_gone() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(post("/v1/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "shutdown must not answer on the public surface anymore"
+    );
+}
+
+/// `DUCKTAPE_ADMIN=off` leaves the control surface simply ABSENT — the admin
+/// routes are never registered, so they 404 (not a gated-but-present 403).
+#[tokio::test]
+async fn a_disabled_admin_namespace_is_absent() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let handle = handle.with_admin(AdminConfig {
+        exposure: AdminExposure::Disabled,
+        node_key: None,
+        ..Default::default()
+    });
+    let response = noded::router(handle)
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "a disabled admin namespace is absent, not forbidden"
+    );
+}
+
+/// under the default `Loopback` exposure a non-loopback peer is refused before
+/// any owner check — the exposure gate is the outer wall.
+#[tokio::test]
+async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let request = with_peer(
+        post("/v1/admin/shutdown", serde_json::json!({})),
+        "203.0.113.7:5555",
+    );
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "loopback-only admin refuses a remote peer"
+    );
+}
+
+/// an actor that answers exactly one thing: `identity` `OfNode` → the account
+/// that owns `node_key`, whose sole member is `owner_key`. everything else is a
+/// module error (the admin owner path only ever asks this one question).
+fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, node_key: Vec<u8>, owner_key: Vec<u8>) {
+    tokio::spawn(async move {
+        while let Some(cmd) = cmds.next().await {
+            if let NodeCommand::Query { target, reply, .. } = cmd {
+                assert_eq!(target, "identity");
+                let view = identity::AccountView {
+                    account_id: owner_key.clone(),
+                    display_name: None,
+                    avatar: None,
+                    bio: None,
+                    nonce: 0,
+                    member_keys: vec![identity::MemberKeyView {
+                        pubkey: owner_key.clone(),
+                        kind: identity::KeyKind::Ed25519,
+                        label: None,
+                        added_at: 0,
+                    }],
+                    nodes: vec![identity::NodeView {
+                        node_key: node_key.clone(),
+                        label: None,
+                    }],
+                    updated_at: 0,
+                };
+                let bytes = identity::encode_reply(&identity::IdentityReply::Account(Some(view)));
+                let _ = reply.send(Ok(bytes));
+            }
+        }
+    });
+}
+
+fn admin_signed_post(
+    uri: &str,
+    signer: &commonware_cryptography::ed25519::PrivateKey,
+    claimed_key_hex: &str,
+    node_key: &[u8],
+    ts: u64,
+) -> Request<Body> {
+    let sig = noded::admin::sign_admin(signer, "POST", uri, node_key, ts);
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(noded::admin::ADMIN_KEY_HEADER, claimed_key_hex)
+        .header(noded::admin::ADMIN_TS_HEADER, ts.to_string())
+        .header(
+            noded::admin::ADMIN_SIG_HEADER,
+            duckfs_core::to_hex(sig.as_ref()),
+        )
+        .body(Body::from("{}"))
+        .unwrap()
+}
+
+/// the full `Public` owner path over the actor lane: unsigned is refused, a
+/// non-owner signature is refused, the committed owner's signature passes.
+#[tokio::test]
+async fn public_admin_enforces_the_committed_owner_pop() {
+    use commonware_cryptography::Signer as _;
+    let owner = commonware_cryptography::ed25519::PrivateKey::from_seed(77);
+    let owner_key = owner.public_key().as_ref().to_vec();
+    let node_key = vec![0xabu8; 32];
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let owner_key_hex = duckfs_core::to_hex(&owner_key);
+
+    let mk_handle = || {
+        let (handle, cmd_rx, _e) = NodeHandle::channel();
+        spawn_owner_actor(cmd_rx, node_key.clone(), owner_key.clone());
+        handle.with_admin(AdminConfig {
+            exposure: AdminExposure::Public,
+            node_key: Some(node_key.clone()),
+            ..Default::default()
+        })
+    };
+
+    // unsigned ⇒ 401.
+    let bare = noded::router(mk_handle())
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED, "public admin needs a signature");
+
+    // signed by a non-owner (valid PoP, wrong account) ⇒ 403.
+    let attacker = commonware_cryptography::ed25519::PrivateKey::from_seed(99);
+    let attacker_hex = duckfs_core::to_hex(attacker.public_key().as_ref());
+    let forged = noded::router(mk_handle())
+        .oneshot(admin_signed_post(
+            "/v1/admin/shutdown",
+            &attacker,
+            &attacker_hex,
+            &node_key,
+            ts,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN, "a non-owner signer is refused");
+
+    // the owner's signature bound to a DIFFERENT node ⇒ 401 (cross-node replay).
+    let replayed = noded::router(mk_handle())
+        .oneshot(admin_signed_post(
+            "/v1/admin/shutdown",
+            &owner,
+            &owner_key_hex,
+            &[0xcd; 32],
+            ts,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.status(),
+        StatusCode::UNAUTHORIZED,
+        "a signature minted for another node is refused here"
+    );
+
+    // the committed owner's signature for THIS node ⇒ 200.
+    let ok = noded::router(mk_handle())
+        .oneshot(admin_signed_post(
+            "/v1/admin/shutdown",
+            &owner,
+            &owner_key_hex,
+            &node_key,
+            ts,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "the node owner may drive control");
+}
+
+/// the loopback gate FAILS CLOSED: a request with no ConnectInfo at all (an
+/// embedder that forgot the connect-info make-service) is refused, never
+/// granted local trust.
+#[tokio::test]
+async fn a_peer_without_connect_info_is_refused() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an unknown peer must not inherit loopback trust"
+    );
 }
 
 #[tokio::test]
@@ -478,25 +744,27 @@ fn gateway_route() -> gateway::RouteRecord {
     }
 }
 
-/// Answer the duck:// browser proxy's queries: DuckDNS resolves the handle to
-/// the route's account, gateway returns the signed route. `queries` is the
-/// total count (one proxy request = one duckdns + two gateway queries).
+/// Answer the duck:// browser proxy's queries against the MERGED gateway
+/// module: a handle `Resolve` returns the route's account, a `Get` returns the
+/// signed route — both now target the one "gateway" module, dispatched by
+/// query variant. `queries` is the total count.
 fn spawn_duck_actor(mut cmds: mpsc::Receiver<NodeCommand>, queries: usize) {
     tokio::spawn(async move {
         for _ in 0..queries {
-            let NodeCommand::Query { target, reply, .. } = cmds.next().await.unwrap() else {
+            let NodeCommand::Query { target, req, reply } = cmds.next().await.unwrap() else {
                 panic!("gateway only issues queries");
             };
-            let bytes = match target.as_str() {
-                "duckdns" => duckdns::encode_reply(&duckdns::DuckDnsReply::Resolved(Some(
-                    duckdns::ResolvedAccount {
+            assert_eq!(target, "gateway");
+            let bytes = match gateway::decode_query(&req).unwrap() {
+                gateway::GatewayQuery::Resolve { .. } => gateway::encode_reply(
+                    &gateway::GatewayReply::Resolved(Some(gateway::ResolvedAccount {
                         account_id: vec![1],
-                    },
-                ))),
-                "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(
-                    gateway_route(),
-                )))),
-                other => panic!("unexpected query target {other}"),
+                    })),
+                ),
+                gateway::GatewayQuery::Get { .. } => gateway::encode_reply(
+                    &gateway::GatewayReply::Route(Box::new(Some(gateway_route()))),
+                ),
+                other => panic!("unexpected query {other:?}"),
             };
             let _ = reply.send(Ok(bytes));
         }
@@ -548,11 +816,16 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
                     value: "application/json".into(),
                 }],
             },
-            body: br#"{"ok":true}"#.to_vec(),
+            body: {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#))).unwrap();
+                drop(tx);
+                rx
+            },
         }));
     });
     let request_body = br#"{"name":"duck"}"#;
-    let mut request = post(
+    let request = post(
         "/v1/gateway/proxy",
         serde_json::json!({
             "head": {
@@ -567,9 +840,6 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
             "bodyB64": base64::engine::general_purpose::STANDARD.encode(request_body),
         }),
     );
-    request
-        .headers_mut()
-        .insert(header::ORIGIN, "tauri://localhost".parse().unwrap());
     let response = noded::router(handle.with_gateway(lane))
         .oneshot(request)
         .await
@@ -639,7 +909,12 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
                     value: "application/json".into(),
                 }],
             },
-            body: br#"{"ok":true}"#.to_vec(),
+            body: {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#))).unwrap();
+                drop(tx);
+                rx
+            },
         }));
     });
     let authority = "app.demo.duck";
@@ -730,6 +1005,19 @@ async fn call_ws_route_is_wired() {
 
     // 426 = axum's ConnectionNotUpgradable: the route matched and websocket
     // extraction ran — anything but 404 proves the route exists.
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+}
+
+#[tokio::test]
+async fn pages_presence_ws_route_is_wired() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(ws_upgrade("/v1/presence/ws?page=page-1"))
+        .await
+        .unwrap();
+
     assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
 }
 
@@ -884,6 +1172,49 @@ async fn files_module_rejection_is_a_verbatim_400_envelope() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = body_json(response).await;
     assert_eq!(body["error"], "files: conflict: /x changed since base");
+}
+
+#[tokio::test]
+async fn upload_pack_have_round_returns_only_plain_nak() {
+    fn pkt(payload: &[u8]) -> Vec<u8> {
+        let mut line = format!("{:04x}", payload.len() + 4).into_bytes();
+        line.extend_from_slice(payload);
+        line
+    }
+
+    let oid = "11".repeat(20);
+    let mut request_body = pkt(
+        format!("want {oid} multi_ack_detailed side-band-64k\n").as_bytes(),
+    );
+    request_body.extend_from_slice(b"0000");
+    request_body.extend_from_slice(&pkt(format!("have {oid}\n").as_bytes()));
+    request_body.extend_from_slice(b"0000");
+
+    let forge_root = tempfile::tempdir().expect("forge root");
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let response = noded::router(handle.with_forge_repo(forge_root.path()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/forge/repo/git-upload-pack")
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/x-git-upload-pack-request",
+                )
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/x-git-upload-pack-result"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"0008NAK\n");
+    assert!(!body.windows(4).any(|window| window == b"PACK"));
 }
 
 // ---- duckfs workspace RPC: 503 when unconfigured, slug validation -----------

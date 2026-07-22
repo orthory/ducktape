@@ -9,17 +9,25 @@ pub(crate) struct Surfaces {
     pub(crate) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
-    pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
-    pub(crate) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    pub(crate) agent_provisioner: dispatch_oracle::SharedProvisioner,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
 }
 
 pub(crate) struct BindConfig<'a> {
     pub(crate) sync_only: bool,
+    /// a not-yet-admitted joiner: it binds and serves http reads-only while
+    /// parked, but must NOT host the interactive terminal plane (no standing).
+    pub(crate) joiner: bool,
     pub(crate) label: &'a str,
     pub(crate) storage: &'a std::path::Path,
+    /// the config dir where `gateway-routes.json` lives (= `storage` in the dev
+    /// shape). An embedded airlock gateway registers its loopback port here so
+    /// the gateway proxy can find it.
+    pub(crate) workspace: &'a std::path::Path,
     pub(crate) rpc_listen: Option<String>,
     pub(crate) http_listen: Option<String>,
     pub(crate) gateway_listen: Option<String>,
@@ -28,19 +36,33 @@ pub(crate) struct BindConfig<'a> {
     /// this node's signer identity — the COMMITTER on every forge run commit
     /// (D2: author is the agent, committer is the node).
     pub(crate) forge_committer: String,
+    /// this node's consensus public key — the `BindNode` subject the owner-gated
+    /// admin namespace resolves ownership against (ADR A5).
+    pub(crate) node_key: Vec<u8>,
+    /// how the owner-gated admin namespace is exposed (ADR A2/A4).
+    pub(crate) admin_exposure: noded::AdminExposure,
+    /// how provider runs are spawned (`node.toml sandbox`): Direct, or a
+    /// Podman/Tart image. The interactive terminal plane requires Podman/Tart,
+    /// so a Direct node hosts no terminal plane.
+    pub(crate) sandbox: capability_host::SandboxBackend,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
     let BindConfig {
         sync_only,
+        joiner,
         label,
         storage,
+        workspace,
         rpc_listen,
         http_listen,
         gateway_listen,
         gateway_enabled,
         log_ring,
         forge_committer,
+        node_key,
+        admin_exposure,
+        sandbox,
     } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
     // so a bind failure is a clean startup error, not an async surprise. a
@@ -67,10 +89,58 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             let listener = std::net::TcpListener::bind(address)?;
             listener.set_nonblocking(true)?;
             let actual = listener.local_addr()?;
-            println!("[node {label}] gateway browser listening on http://{actual}");
+            tracing::info!(
+                target: "ducktape::gateway",
+                node = %label,
+                listen = %actual,
+                "gateway browser listening"
+            );
             Some((listener, actual))
         }
         _ => None,
+    };
+    // An embedded airlock gateway (credential-provider node, DUCKTAPE_AIRLOCK_SERVE):
+    // run it in-process on loopback and register its port as the `airlock` gateway
+    // route, so a compute node can reach it over the overlay (airlock.<handle>.duck).
+    // Bound here (out of the runtime) like the browser gateway; served on the
+    // app-surface thread below. Only when the gateway plane is up to serve it; route
+    // PUBLICATION stays a one-time signed operator step.
+    let airlock_bits = match crate::airlock_serve::AirlockServe::from_env() {
+        None => None,
+        Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
+        Some(Ok(serve)) if !sync_only && gateway_enabled => {
+            let listener = std::net::TcpListener::bind((
+                std::net::Ipv4Addr::LOCALHOST,
+                serve.port.unwrap_or(0),
+            ))?;
+            listener.set_nonblocking(true)?;
+            let port = listener.local_addr()?.port();
+            // Build — and thus ATTEST — BEFORE registering the route or claiming
+            // to listen: a node that cannot attest must fail boot loudly here,
+            // never register a route to a gateway that will not come up.
+            let (router, vendor) = airlock::server::build_seeded(serve.cfg, serve.credential)
+                .map_err(|error| format!("airlock gateway: {error}"))?;
+            crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
+                .map_err(|error| format!("register airlock gateway route: {error}"))?;
+            tracing::info!(
+                target: "ducktape::gateway",
+                node = %label,
+                listen = %format_args!("127.0.0.1:{port}"),
+                route = "airlock",
+                attest = %vendor,
+                "airlock gateway listening"
+            );
+            Some((listener, router))
+        }
+        Some(Ok(_)) => {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                node = %label,
+                reason = "gateway_plane_off",
+                "DUCKTAPE_AIRLOCK_SERVE set but airlock is not served"
+            );
+            None
+        }
     };
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
     // the derived per-module index (noded's exact store, <storage>/index),
@@ -81,14 +151,20 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
-    let index = noded::open_index_store(storage, &MODULE_IDS)?;
+    let index = noded::open_index_store(storage, MODULE_IDS)?;
     stream_hub.prime(index.resume_height()?, String::new());
-    // the voice hub's session lane: /v1/call/ws handlers ask for huddle
-    // audio sessions here. created up front because the app-surface thread
-    // starts before the mesh exists; only the validator path below spawns the
-    // hub that drains it — on every other path the receiver just drops and
-    // the route answers with a refusal.
-    let (voice_lane, voice_requests) = tokio::sync::mpsc::channel::<noded::CallSessionRequest>(8);
+    // the realtime hub's session lane: /v1/call/ws and /v1/presence/ws ask for
+    // sessions here. created up front because the app-surface thread starts
+    // before the mesh exists; validator and resident paths drain it, while a
+    // sync-only or overlay-less path drops it so the routes refuse promptly.
+    let (voice_lane, voice_requests) =
+        tokio::sync::mpsc::channel::<noded::RealtimeSessionRequest>(8);
+    // the module-code stage lane: POST /v1/admin/module-code/stage fans an
+    // artifact out through the node's code plane. same shape as the realtime
+    // lane — created up front, drained only where the validator spawns the
+    // plane; elsewhere the receiver drops and the route answers 503.
+    let (code_stage_lane, code_stage_requests) =
+        tokio::sync::mpsc::channel::<noded::CodeStageRequest>(4);
     // point the http handle at this node's forge repo base (the same
     // `storage/forge-repo` the host materializes into) so the git upload-pack
     // (clone/fetch) route can open a repo READ-ONLY and serve its objects.
@@ -99,9 +175,19 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_forge_repo(storage.join("forge-repo"))
         .with_index_store(index.clone())
         .with_call(voice_lane)
+        .with_code_stage(code_stage_lane)
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
-        .with_duckfs_workspaces(storage.join("duckfs-workspaces"));
+        .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
+        // the owner-gated control namespace (ADR A2/A5): this node's own key is
+        // the `BindNode` subject ownership resolves against; the exposure is the
+        // operator's choice (default loopback). shutdown + module-code staging
+        // live here, off the unauthenticated public surface.
+        .with_admin(noded::AdminConfig {
+            exposure: admin_exposure,
+            node_key: Some(node_key.clone()),
+            ..Default::default()
+        });
     let http_handle = if gateway_enabled {
         http_handle.with_gateway(gateway_lane)
     } else {
@@ -123,7 +209,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // unconditionally, so the runs composer emits v3 (the de-versioned
     // activation — no flag day, pre-production re-genesis). a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: Option<dispatch_oracle::SharedProvisioner> = Some(std::sync::Arc::new(
+    let agent_provisioner: dispatch_oracle::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(storage)
@@ -145,24 +231,57 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // the agent tool plane: the SAME surface, bare (no /forge), handed to
         // every run as DUCKTAPE_NODE alongside the running binary's dir on
         // PATH — that is how the MCP server the runner CLI spawns (outside the
-        // agent's sandbox) finds `ducktape-mcp` and the node it acts against.
+        // agent's sandbox) finds `ducktape mcp` and the node it acts against.
         // no surface (a sync-only joiner) ⇒ nothing to dial ⇒ the var is unset.
         .with_node_url(noded::agent_provision::node_http_base(
             http_listen.as_deref().filter(|_| !sync_only),
         )),
-    ));
+    );
+    // the node-local, off-chain interactive terminal-session plane (lives on the
+    // http handle like the stream hub — never consensus). Wired only where the
+    // app surface is actually served for a real member: not sync-only, not a
+    // parked joiner, and only when an http address was configured. Sourced from
+    // the node's OWN config — the resolved `node.toml sandbox` backend and this
+    // node's signer identity (`node_key`) — so `discover_interactive` refuses
+    // the Direct backend (no terminal plane) and Podman container reaping scopes
+    // to the SAME execution id as the node's real agent runs (validator/run.rs
+    // discovers its provider set under the same identity). Mirrors bin/noded's
+    // wiring; a Podman node's create returns a session (or a clear spawn error),
+    // a Direct node's a "requires a configured podman sandbox image" 503 — never
+    // the "terminal sessions are not enabled" 503 that meant the plane was
+    // missing entirely (this bug).
+    let http_handle = if !sync_only && !joiner && http_listen.is_some() {
+        let interactive = noded::term::discover_interactive(
+            &node_key,
+            capability_host::AgentDirs::under(storage),
+            sandbox,
+        );
+        tracing::info!(
+            target: "ducktape::term",
+            enabled = interactive.is_some(),
+            "terminal_plane_ready"
+        );
+        http_handle.with_terminals(noded::TerminalSessions::new(
+            interactive,
+            capability_host::execution_node_id(&node_key),
+            storage.join("term-sessions"),
+            stream_hub.terminals(),
+            stream_hub.term_commands(),
+        ))
+    } else {
+        http_handle
+    };
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     match http_listen.as_deref() {
         Some(addr) if !sync_only => {
             let listener = std::net::TcpListener::bind(addr)?;
             listener.set_nonblocking(true)?;
-            println!(
-                "[node {label}] app surface listening on http://{}",
-                listener
-                    .local_addr()
-                    .map(|a| a.to_string())
-                    .unwrap_or_default()
+            tracing::info!(
+                target: "ducktape::http",
+                node = %label,
+                listen = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                "app surface listening"
             );
             let thread_label = label.to_string();
             let gateway_listener = gateway_listener.map(|(listener, _)| listener);
@@ -182,19 +301,50 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                                     if let Err(error) =
                                         noded::serve_browser_gateway(listener, gateway_handle).await
                                     {
-                                        eprintln!("gateway browser server error: {error}");
+                                        tracing::error!(
+                                            target: "ducktape::gateway",
+                                            error = %error,
+                                            "gateway browser server stopped"
+                                        );
+                                    }
+                                });
+                            }
+                            if let Some((airlock_listener, airlock_router)) = airlock_bits {
+                                let airlock_listener =
+                                    tokio::net::TcpListener::from_std(airlock_listener)
+                                        .expect("adopt airlock gateway listener");
+                                tokio::spawn(async move {
+                                    if let Err(error) = airlock::server::serve_router(
+                                        airlock_listener,
+                                        airlock_router,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            target: "ducktape::gateway",
+                                            error = %error,
+                                            "airlock gateway server stopped"
+                                        );
                                     }
                                 });
                             }
                             let listener = tokio::net::TcpListener::from_std(listener)
                                 .expect("adopt app-surface listener");
                             if let Err(e) = noded::serve(listener, http_handle).await {
-                                eprintln!("app surface server error: {e}");
+                                tracing::error!(
+                                    target: "ducktape::http",
+                                    error = %e,
+                                    "app surface server stopped"
+                                );
                             }
                         });
-                    // a client asked the surface to shut down (POST /v1/shutdown) —
+                    // a client asked the surface to shut down (POST /v1/admin/shutdown) —
                     // mirror the rpc shutdown: exit the whole process gracefully.
-                    println!("[node {thread_label}] shutdown requested via app surface — exiting");
+                    tracing::info!(
+                        target: "ducktape::node",
+                        node = %thread_label,
+                        "shutdown requested via app surface; exiting"
+                    );
                     std::process::exit(0);
                 })?;
         }
@@ -209,6 +359,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         stream_hub,
         index,
         voice_requests,
+        code_stage_requests,
         blobs,
         agent_provisioner,
         gateway_requests: gateway_enabled.then_some(gateway_requests),

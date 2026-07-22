@@ -5,8 +5,8 @@
 //!
 //! This is the lane the sim-integ slice (`dataplane_sync.rs`) deliberately
 //! could not exercise: there the served side was plain async and only the
-//! snapshot lane ran, sidestepping the fact that `Kv::sync_from` is
-//! commonware-runtime-based. Here the joiner drives `Kv::sync_from` —
+//! snapshot lane ran, sidestepping the fact that `QmdbStore::sync_from` is
+//! commonware-runtime-based. Here the joiner drives `QmdbStore::sync_from` —
 //! commonware's qmdb sync engine on a `commonware_runtime::tokio::Context` —
 //! and every proof-carrying op batch it fetches crosses a real `TcpStream`
 //! opened through `DataPlaneSyncClient::request`. It lands on the source's
@@ -32,7 +32,7 @@ use host::{FinalizedBlock, Host};
 use kv::{Kv, KvMsg, encode as kv_encode};
 use sdk::{Module as _, Msg};
 use statesync::dataplane::{DataPlaneSyncClient, read_frame, statesync_flow, write_frame};
-use statesync::qmdb::RemoteQmdbResolver;
+use statesync::qmdb::{QmdbStore, RemoteQmdbResolver};
 use statesync::{PayloadKind, SyncServer, fetch_manifest};
 
 use commonware_runtime::{Runner as _, Supervisor as _};
@@ -144,7 +144,11 @@ fn joiner_rebuilds_kv_through_the_real_overlay_arm() {
         );
 
         // ---- SOURCE: real committed kv content through the host op path -----
-        let kv = Kv::init(context.child("source_kv"), "kv").await;
+        // built the way a host does: concrete store first, injected as a box.
+        let kv = Kv::new(
+            "kv",
+            Box::new(QmdbStore::init(context.child("source_kv"), "kv").await),
+        );
         let mut host = Host::genesis(vec![Box::new(kv)]).expect("genesis");
         let set = |k: &[u8], v: &[u8]| Msg {
             target: "kv".into(),
@@ -210,9 +214,10 @@ fn joiner_rebuilds_kv_through_the_real_overlay_arm() {
             // every op batch crosses a real TcpStream, opened by the sync
             // engine through DataPlaneSyncClient, merkle-verified against the
             // pinned root. landing on src_kv_root IS the coexistence proof.
-            let rebuilt = Kv::sync_from(joiner_ctx, "kv-rebuilt", target, resolver)
+            let store = QmdbStore::sync_from(joiner_ctx, "kv-rebuilt", target, resolver)
                 .await
                 .expect("sync_from over the real overlay arm");
+            let rebuilt = Kv::new("kv-rebuilt", Box::new(store));
             assert_eq!(
                 rebuilt.root(),
                 src_kv_root,

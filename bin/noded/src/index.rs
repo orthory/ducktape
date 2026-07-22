@@ -37,7 +37,7 @@ pub fn open_index_store<S: AsRef<str>>(
                     .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
                     .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
                     .with_indexer(Box::new(pages::index::PagesIndex::new("pages")))
-                    .with_indexer(Box::new(saga::index::UsageIndex::new("saga")))
+                    .with_indexer(Box::new(saga::index::UsageIndex::new("saga"))),
             )
         })
         .map_err(|err| {
@@ -370,7 +370,10 @@ pub struct BlocksParams {
 /// history survives a restart. heartbeat nops never get a row, so an empty
 /// reply means no real ops have finalized, not an idle chain. a handle with
 /// no index store configured serves the same "no blocks yet" shape.
-pub(crate) async fn blocks(State(handle): State<NodeHandle>, Query(params): Query<BlocksParams>) -> Response {
+pub(crate) async fn blocks(
+    State(handle): State<NodeHandle>,
+    Query(params): Query<BlocksParams>,
+) -> Response {
     let Some(store) = handle.index.as_ref() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };

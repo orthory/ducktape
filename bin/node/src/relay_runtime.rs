@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use commonware_cryptography::ed25519;
 use commonware_p2p::{Recipients, Sender as P2pSender};
@@ -50,7 +50,7 @@ struct ResidentFanout {
 }
 
 pub(crate) struct ResidentRelay {
-    blobs: blobstore::BlobHandle,
+    blobs: std::sync::Arc<dyn blobstore::Blobs>,
     seq_file: PathBuf,
     seq: u64,
     round: usize,
@@ -59,7 +59,7 @@ pub(crate) struct ResidentRelay {
 }
 
 impl ResidentRelay {
-    pub(crate) fn new(seq_file: PathBuf, blobs: blobstore::BlobHandle) -> Self {
+    pub(crate) fn new(seq_file: PathBuf, blobs: std::sync::Arc<dyn blobstore::Blobs>) -> Self {
         let seq = std::fs::read_to_string(&seq_file)
             .ok()
             .and_then(|s| s.trim().parse().ok())
@@ -295,7 +295,7 @@ impl ResidentRelay {
         self.seq += 1;
         std::fs::write(&self.seq_file, self.seq.to_string())
             .map_err(|e| format!("cannot persist the submit seq: {e}"))?;
-        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload });
+        let frame = node::encode_frame(signer, self.seq, &Msg { target, payload }, None);
         let frame_id = node::frame_id(&frame);
         Ok((frame_id, frame, custodian))
     }
@@ -339,14 +339,14 @@ struct LocalFanout {
     frame: Vec<u8>,
     digest: [u8; 32],
     awaiting: Vec<ed25519::PublicKey>,
-    deadline: Instant,
+    deadline: SystemTime,
 }
 
 struct IncomingBlob {
     peer: ed25519::PublicKey,
     digest: [u8; 32],
     assembly: relay::BlobAssembly,
-    deadline: Instant,
+    deadline: SystemTime,
 }
 
 pub(crate) enum ValidatorAction {
@@ -359,18 +359,18 @@ pub(crate) enum ValidatorAction {
         frame_id: node::FrameId,
         frame: Vec<u8>,
         reply: HttpReply,
-        deadline: Instant,
+        deadline: SystemTime,
     },
 }
 
 pub(crate) struct ValidatorRelay {
-    blobs: blobstore::BlobHandle,
+    blobs: std::sync::Arc<dyn blobstore::Blobs>,
     local_fanouts: HashMap<node::FrameId, LocalFanout>,
     incoming: HashMap<node::FrameId, IncomingBlob>,
 }
 
 impl ValidatorRelay {
-    pub(crate) fn new(blobs: blobstore::BlobHandle) -> Self {
+    pub(crate) fn new(blobs: std::sync::Arc<dyn blobstore::Blobs>) -> Self {
         Self {
             blobs,
             local_fanouts: HashMap::new(),
@@ -383,6 +383,7 @@ impl ValidatorRelay {
     /// pending until every peer acknowledges the pack.
     pub(crate) fn prepare_local<S>(
         &mut self,
+        now: SystemTime,
         frame: Vec<u8>,
         reply: HttpReply,
         peers: Vec<ed25519::PublicKey>,
@@ -392,7 +393,7 @@ impl ValidatorRelay {
         S: P2pSender<PublicKey = ed25519::PublicKey>,
     {
         let frame_id = node::frame_id(&frame);
-        let deadline = Instant::now() + SUBMIT_HOLD;
+        let deadline = now + SUBMIT_HOLD;
         let Some(digest) = relay::required_blob_digest(&frame) else {
             return Ok(Some(ValidatorAction::SubmitLocal {
                 frame_id,
@@ -431,12 +432,15 @@ impl ValidatorRelay {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_message<S>(
         &mut self,
+        now: SystemTime,
         peer: ed25519::PublicKey,
         msg: relay::RelayMsg,
         members: &[Vec<u8>],
         residents: &[Vec<u8>],
+        clients: &[Vec<u8>],
         relay_tx: &mut S,
     ) -> Option<ValidatorAction>
     where
@@ -477,7 +481,7 @@ impl ValidatorRelay {
                                 peer,
                                 digest,
                                 assembly,
-                                deadline: Instant::now() + SUBMIT_HOLD,
+                                deadline: now + SUBMIT_HOLD,
                             },
                         );
                     }
@@ -552,7 +556,7 @@ impl ValidatorRelay {
                 })
             }
             relay::RelayMsg::Submit { frame } => {
-                let frame_id = match relay::verify_relay_submit(&frame, residents) {
+                let frame_id = match relay::verify_relay_submit(&frame, residents, clients) {
                     Ok(id) => id,
                     Err(detail) => {
                         send_reply(
@@ -587,7 +591,7 @@ impl ValidatorRelay {
         }
     }
 
-    pub(crate) fn expire<S>(&mut self, now: Instant, relay_tx: &mut S)
+    pub(crate) fn expire<S>(&mut self, now: SystemTime, relay_tx: &mut S)
     where
         S: P2pSender<PublicKey = ed25519::PublicKey>,
     {
@@ -755,7 +759,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("relay-submit-seq");
         std::fs::write(&path, "41").unwrap();
-        let relay = ResidentRelay::new(path.clone(), blobstore::BlobHandle::default());
+        let relay =
+            ResidentRelay::new(path.clone(), std::sync::Arc::new(blobstore::BlobHandle::default()));
         assert_eq!(relay.seq, 41);
         assert_eq!(std::fs::read_to_string(path).unwrap(), "41");
     }

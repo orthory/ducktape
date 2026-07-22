@@ -1,10 +1,12 @@
 //! phase 6a of the joiner/replica role: everything that must register with
 //! the mesh BEFORE `network.start()` — the per-epoch engine-channel bank
 //! (cert/payload/black-holed lanes), the statesync channel pair, the
-//! reachability plane's STANDBY wiring (+ the tunnel-first join race), and
-//! the relay/lobby lanes, ending with the lobby-reply printer task and the
-//! `network.start()` call itself. `park` (phase 6b–6d) picks up everything
-//! this phase produced via [`ReplicaChannels`].
+//! reachability plane's STANDBY wiring (+ the tunnel-first join race, which
+//! since join ADR §4 carries the GATE itself: the raced sealed intro is the
+//! gate request and the acked `Admitted` is the authoritative admission),
+//! and the relay lane, ending with the `network.start()` call itself. `park`
+//! (phase 6b–6d) picks up everything this phase produced via
+//! [`ReplicaChannels`].
 
 use commonware_cryptography::ed25519;
 use commonware_p2p::authenticated::discovery::{self, Network};
@@ -19,6 +21,7 @@ use crate::constants::*;
 use crate::first_contact_join;
 use crate::lobby;
 use crate::reachability_plane::wire_reachability_plane;
+use crate::util::fatal;
 
 use super::OverlayCtx;
 
@@ -40,7 +43,12 @@ pub(super) struct ReplicaChannels {
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
-    pub(super) lobby_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
+    /// the joiner's admission signal (join ADR §4): set by the first-contact
+    /// task the moment a member's doorbell answers the gate with the
+    /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
+    /// retired `CHANNEL_LOBBY` gate FSM.
+    pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -56,7 +64,6 @@ pub(super) async fn wire(
     label: String,
     namespace: Vec<u8>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
@@ -64,23 +71,26 @@ pub(super) async fn wire(
     // the AMBIENT coordinator override (node.toml `primary_coordinator`);
     // `None` = the compiled-in default, exactly as before the key existed.
     primary_coordinator: Option<String>,
+    // the TCP relay override (node.toml `coordinator_relay`); `None` = derive
+    // the relay from the ambient coordinator set (host at TCP/443).
+    coordinator_relay: Option<String>,
     // the WireGuard bind/advertise split (node.toml `wireguard_advertised`).
     wireguard_advertised: Option<Ingress>,
     coord_cap: &Option<nat_traversal::CoordCap>,
     invite_token: &Option<config::InviteToken>,
     invite_wireguard: &Option<config::StoredInviteWireGuard>,
     invite_fronts: Vec<config::Front>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    // where an admission's delivered coord cap is persisted and the consumed
+    // invite token deleted (the workspace dir — same one `park` gates reads
+    // from).
     workspace: std::path::PathBuf,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
-        eprintln!(
-            "[node {label}] FATAL: recovery journal exists but the checkpoint is \
+        fatal!(label, "recovery journal exists but the checkpoint is \
              missing — wipe the app state and re-join (KEEP any consensus journal \
-             partitions: they are what prevents this key from double-voting)"
-        );
-        std::process::exit(1);
+             partitions: they are what prevents this key from double-voting)");
     }
     // the parked mesh identity: genesis set at the base index (no
     // consensus coordinates yet). engine lanes are NOT black-holed
@@ -157,6 +167,10 @@ pub(super) async fn wire(
     // promotion reboot via the persisted mesh, start connected
     // instead of assembling. Without `wireguard_listen` the channel
     // just stays legal — black-hole.
+    // the joiner's TCP relay fallback endpoints (join ADR item 2), derived
+    // from the SAME ambient coordinator set before it moves into the plane
+    // below. empty = fallback off.
+    let mut relay_endpoints: Vec<String> = Vec::new();
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
         let (reach_tx, mut reach_rx) =
             network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
@@ -172,13 +186,17 @@ pub(super) async fn wire(
                         Ok(Some(ingress)) => vec![ingress],
                         Ok(None) => Vec::new(),
                         Err(e) => {
-                            eprintln!(
-                                "[node {label}] invite: ambient coordinator unusable ({e}) — \
-                                 coordinated first-contact paths disabled"
+                            tracing::warn!(
+                                target: "ducktape::join",
+                                node = %label,
+                                error = %e,
+                                reason = "ambient_coordinator_unusable",
+                                "coordinated first-contact paths disabled"
                             );
                             Vec::new()
                         }
                     };
+                relay_endpoints = coordinator_relays(coordinator_relay.as_deref(), &coordinators);
                 Some(wire_reachability_plane(
                     &context,
                     &label,
@@ -187,7 +205,6 @@ pub(super) async fn wire(
                     &wireguard_key_file,
                     &mesh_state_file,
                     wg_addr,
-                    wireguard_effect,
                     overlay_slot.clone(),
                     advertised_reach,
                     wireguard_advertised,
@@ -196,6 +213,9 @@ pub(super) async fn wire(
                     // redeemable invites.
                     None,
                     coord_cap.clone(),
+                    // JOINER side: no gate hook — this node ANSWERS no gates,
+                    // it rings them (the first-contact race below).
+                    None,
                     reach_tx,
                     reach_rx,
                 ))
@@ -209,26 +229,22 @@ pub(super) async fn wire(
             }
         }
     };
-    // the TUNNEL-FIRST join window: an invite that carried a WireGuard
-    // bootstrap makes the tunnel the join's carrier — before any p2p,
-    // (a) this node's interface gains the INVITER as a peer (endpoint
-    // straight from the blob), and (b) an intro announcer delivers
-    // this node's identity + WireGuard key to the inviter's intro
-    // listener until acked, at which point the inviter's side of the
-    // tunnel exists too. the mesh dialer below then reaches the
-    // inviter's overlay ULA (the join-minted Direct hint) the moment
-    // the tunnel routes, and everything else — lobby announce,
-    // redemption, statesync — rides it.
-    // the TUNNEL-FIRST join window races the invite's UNIFIED path
-    // set: the inviter PLUS every offered front, in one candidate list.
-    // The first candidate to install this joiner's token-signed intro
-    // wins and the rest are cancelled; the mesh dialer below then
-    // reaches that member's overlay ULA (the join-minted Direct hints)
-    // the moment the tunnel routes, and everything else — lobby
-    // announce, redemption, statesync — rides it. If every offered path
-    // is exhausted the race is HONEST-terminal (a distinct exit, never
-    // a silent success). The mechanics live in `first_contact_join`;
-    // this is just the glue.
+    // the TUNNEL-FIRST join window, which since join ADR §4 IS the join GATE:
+    // an invite that carried a WireGuard bootstrap makes the tunnel the
+    // join's carrier — before any p2p, (a) this node's interface gains the
+    // INVITER as a peer (endpoint straight from the blob), and (b) an intro
+    // announcer delivers this node's sealed identity + WireGuard key + token
+    // to the member's intro doorbell, which installs the tunnel AND forwards
+    // the gate into consensus. the race spans the invite's UNIFIED path set
+    // (the inviter PLUS every offered front, one candidate list); the first
+    // candidate whose doorbell settles the gate wins and the rest are
+    // cancelled. `Admitted` ⇒ standing is COMMITTED — persist the delivered
+    // coord cap, delete the consumed token, and wake the park loop (the
+    // `admitted` flag). a terminal `Rejected` ⇒ exit loudly (R2). If every
+    // offered path is exhausted the race is HONEST-terminal (a distinct
+    // exit, never a silent success). The mechanics live in
+    // `first_contact_join`; this is just the glue.
+    let admitted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let (Some(reach), Some(token)) = (&reach_cmd, &invite_token) {
         let inviter = invite_wireguard.as_ref().and_then(|wg| {
             match (wg.issuer_key(), wg.public_key_bytes()) {
@@ -245,27 +261,28 @@ pub(super) async fn wire(
                     intro: wg.intro.clone(),
                 }),
                 _ => {
-                    eprintln!(
-                        "[node {label}] invite: inviter wireguard bootstrap is malformed \
-                         — racing the offered fronts alone"
+                    tracing::warn!(
+                        target: "ducktape::join",
+                        node = %label,
+                        reason = "inviter_wireguard_malformed",
+                        "racing the offered fronts alone"
                     );
                     None
                 }
             }
         });
-        let raw = first_contact_join::build_candidates(inviter, &invite_fronts);
-        if raw.is_empty() {
+        let candidates = first_contact_join::build_candidates(inviter, &invite_fronts);
+        if candidates.is_empty() {
             // the invite offered no wireguard/front bootstrap — the join
             // rides the descriptor's reach hints, exactly as before.
         } else {
-            let candidates = first_contact_join::plan_race(
-                raw,
-                matches!(wireguard_effect, config::WireGuardEffectKind::Tun),
-            );
             match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
                 Ok((keypair, _)) => {
                     // this joiner's own token-signed intro, built once
-                    // and reused across every candidate in the race.
+                    // and reused across every candidate in the race. the
+                    // keypair rides along too: post-verify acks (and the
+                    // coord cap inside an `Admitted`) come back SEALED to it.
+                    let keypair = std::sync::Arc::new(keypair);
                     let intro = lobby::encode_intro(&lobby::intro_request(
                         &signer,
                         &namespace,
@@ -275,124 +292,171 @@ pub(super) async fn wire(
                     let token_nonce = token.nonce.to_vec();
                     let reach = reach.clone();
                     let race_label = label.clone();
+                    let race_admitted = admitted.clone();
+                    let cap_dir = workspace.clone();
+                    // the TCP relay fallback (item 2): the same signer + cap
+                    // every rendezvous request presents, over the relay list
+                    // derived above. `None` (no coordinators, or disabled)
+                    // keeps the race UDP-only, exactly as before the item.
+                    let race_relay = if relay_endpoints.is_empty() {
+                        None
+                    } else {
+                        Some(first_contact_join::RelayFallback {
+                            relays: relay_endpoints,
+                            signer: signer.clone(),
+                            cap: coord_cap.clone(),
+                        })
+                    };
+                    // an exhausted race is honest-terminal ONLY for a fresh
+                    // join (no checkpoint): a bad invite must exit loudly,
+                    // never spin silently. a RESTART with standing (the
+                    // checkpoint exists) is a different animal — its paths
+                    // are known-good and merely dark (machine woke before
+                    // its network, coordinator briefly down), so dying at
+                    // 90s turns every offline boot into a dead node the
+                    // operator must resurrect by hand. it re-races forever,
+                    // loudly, instead.
+                    let restart_with_standing = manifest.is_some();
                     context.child("first_contact").spawn(move |_ctx| async move {
-                        let outcome = first_contact_join::drive_first_contact(
-                            reach,
-                            candidates,
-                            intro,
-                            token_nonce,
-                            race_label.clone(),
-                            std::time::Duration::from_secs(90),
-                        )
-                        .await;
-                        match outcome {
-                            first_contact_join::FirstContactOutcome::Installed {
-                                key,
-                                via,
-                            } => println!(
-                                "[node {race_label}] invite: first contact via {via} to \
-                                 {} — join rides the overlay",
-                                hex_bytes(&key.as_ref()[..4])
-                            ),
-                            first_contact_join::FirstContactOutcome::Terminal {
-                                tried,
-                                reason,
-                            } => {
-                                eprintln!(
-                                    "[node {race_label}] FATAL: first contact failed \
-                                     across all {tried} offered path(s) — {reason}. ask \
-                                     the inviter for a fresh invite once the mesh is \
-                                     reachable."
-                                );
-                                std::process::exit(3);
+                        let mut round = 0u32;
+                        loop {
+                            round += 1;
+                            let outcome = first_contact_join::drive_first_contact(
+                                reach.clone(),
+                                candidates.clone(),
+                                intro.clone(),
+                                token_nonce.clone(),
+                                keypair.clone(),
+                                race_label.clone(),
+                                std::time::Duration::from_secs(90),
+                                race_relay.clone(),
+                            )
+                            .await;
+                            match outcome {
+                                first_contact_join::FirstContactOutcome::Admitted {
+                                    key,
+                                    via,
+                                    height,
+                                    cap,
+                                } => {
+                                    tracing::info!(
+                                        target: "ducktape::join",
+                                        node = %race_label,
+                                        height,
+                                        %via,
+                                        peer = %hex_bytes(&key.as_ref()[..4]),
+                                        "ADMITTED at height {height} via {via}; standing is \
+                                         committed"
+                                    );
+                                    if let Some(cap_bytes) = cap {
+                                        match config::unpack_coord_cap(&cap_bytes) {
+                                            Ok(cap) => match config::save_coord_cap(
+                                                &cap_dir, &cap,
+                                            ) {
+                                                Ok(()) => tracing::info!(
+                                                    target: "ducktape::join",
+                                                    node = %race_label,
+                                                    peer = %hex_bytes(&key.as_ref()[..4]),
+                                                    issuer = %hex_bytes(&cap.issuer.as_ref()[..4]),
+                                                    expires = cap.not_after,
+                                                    "coordinator cap delivered and saved"
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    target: "ducktape::join",
+                                                    node = %race_label,
+                                                    error = %e,
+                                                    reason = "coord_cap_save_failed",
+                                                    "delivered coordinator cap not saved"
+                                                ),
+                                            },
+                                            Err(e) => tracing::warn!(
+                                                target: "ducktape::join",
+                                                node = %race_label,
+                                                peer = %hex_bytes(&key.as_ref()[..4]),
+                                                error = %e,
+                                                reason = "coord_cap_malformed",
+                                                "member sent a malformed coordinator cap"
+                                            ),
+                                        }
+                                    }
+                                    // a CONSUMED credential must not survive to
+                                    // confuse a later boot (ADR §6): the invite
+                                    // did its one job.
+                                    config::delete_invite_token(&cap_dir);
+                                    race_admitted.store(
+                                        true,
+                                        std::sync::atomic::Ordering::Release,
+                                    );
+                                    return;
+                                }
+                                first_contact_join::FirstContactOutcome::Rejected {
+                                    code,
+                                    detail,
+                                } => {
+                                    // R2: a terminal refusal means this invite can
+                                    // NEVER redeem — stop loudly instead of
+                                    // spinning candidates toward the same answer.
+                                    fatal!(race_label, "join gate refused \
+                                         ({code:?}): {detail} — this invite cannot be \
+                                         redeemed. ask the inviter for a fresh invite and \
+                                         re-join with the new blob.");
+                                }
+                                first_contact_join::FirstContactOutcome::Terminal {
+                                    tried,
+                                    reason,
+                                } => {
+                                    if !restart_with_standing {
+                                        // NOT `fatal!`: this path exits 3, not 1 — a
+                                        // join that ran out of paths is distinct from a
+                                        // node that broke, and callers read the code.
+                                        tracing::error!(
+                                            target: "ducktape::join",
+                                            node = %race_label,
+                                            tried,
+                                            reason = "first_contact_terminal",
+                                            detail = %reason,
+                                            "FATAL: first contact failed across all offered \
+                                             path(s) — ask the inviter for a fresh invite once \
+                                             the mesh is reachable"
+                                        );
+                                        std::process::exit(3);
+                                    }
+                                    let should_log = round == 1 || round.is_multiple_of(10);
+                                    if should_log {
+                                        tracing::warn!(
+                                            target: "ducktape::join",
+                                            node = %race_label,
+                                            attempts = round,
+                                            tried,
+                                            reason = "first_contact_retry",
+                                            detail = %reason,
+                                            "first contact failed across all offered paths; \
+                                             retrying in 30s"
+                                        );
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_secs(30))
+                                        .await;
+                                }
                             }
                         }
                     });
                 }
-                Err(e) => eprintln!(
-                    "[node {label}] invite: wireguard key unreadable ({e}) — first \
-                     contact not started; falling back to the descriptor's reach hints"
+                Err(e) => tracing::warn!(
+                    target: "ducktape::join",
+                    node = %label,
+                    error = %e,
+                    reason = "wireguard_key_unreadable",
+                    "first contact not started; falling back to descriptor reach hints"
                 ),
             }
         }
     }
-    // media rides the overlay (Service::Voice/Service::Video), never the
-    // mesh; a parked joiner serves no huddle media, so drop the session
-    // lane to make /v1/call/ws refuse instead of hang (this branch always
-    // ends in the promotion reboot, never main.rs's validator path).
-    drop(voice_requests);
     // the submit-relay lane: once resident standing lands, writes leave
     // here — this node signs its own frames and a validator takes
     // custody. replies (the frame's consensus fate) come back on the
     // same lane. `relay_rx` is bridged into the serve window below (a
     // torn-down select must never drop its `recv()` mid-flight).
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
-    // the lobby lane: where this parked node announces its key. member
-    // replies are drained by a printer task — purely informational.
-    let (lobby_tx, mut lobby_rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
-    {
-        let label = label.clone();
-        // the parked joiner persists a coord.cap delivered over a
-        // JoinReply into its workspace, so a later boot presents it to
-        // the private coordinator (loaded via `load_coord_cap`).
-        let cap_dir = workspace.clone();
-        context.child("lobby_replies").spawn(move |_ctx| async move {
-            while let Ok((peer, msg)) = lobby_rx.recv().await {
-                let bytes: Vec<u8> = msg.into();
-                if let Ok(lobby::LobbyMsg::JoinReply {
-                    recorded,
-                    detail,
-                    cap,
-                    fatal,
-                }) = lobby::decode_msg(&bytes)
-                {
-                    println!(
-                        "[node {label}] member {}: {}{detail}",
-                        hex_bytes(&peer.as_ref()[..4]),
-                        if recorded { "" } else { "join request refused — " },
-                    );
-                    if fatal {
-                        // this invite can NEVER redeem (e.g. its
-                        // single-use token is already spent by
-                        // another key) — retrying is a silent
-                        // forever-spin. stop loudly: the FATAL
-                        // marker is the app/operator contract.
-                        eprintln!(
-                            "[node {label}] FATAL: {detail} — this invite cannot \
-                             be redeemed (an invite admits exactly one person). \
-                             ask the inviter for a fresh invite and re-join with \
-                             the new blob."
-                        );
-                        std::process::exit(1);
-                    }
-                    // a delivered cap (private coordination): unpack
-                    // the opaque bytes and persist beside identity.
-                    if let Some(cap_bytes) = cap {
-                        match config::unpack_coord_cap(&cap_bytes) {
-                            Ok(cap) => match config::save_coord_cap(&cap_dir, &cap) {
-                                Ok(()) => println!(
-                                    "[node {label}] coordinator cap delivered by \
-                                     member {} — saved (issuer {}, expires {})",
-                                    hex_bytes(&peer.as_ref()[..4]),
-                                    hex_bytes(&cap.issuer.as_ref()[..4]),
-                                    cap.not_after,
-                                ),
-                                Err(e) => eprintln!(
-                                    "[node {label}] coordinator cap delivered but \
-                                     could not be saved: {e}"
-                                ),
-                            },
-                            Err(e) => eprintln!(
-                                "[node {label}] member {} sent a malformed \
-                                 coordinator cap: {e}",
-                                hex_bytes(&peer.as_ref()[..4]),
-                            ),
-                        }
-                    }
-                }
-            }
-        });
-    }
     network.start();
 
     ReplicaChannels {
@@ -405,6 +469,81 @@ pub(super) async fn wire(
         reach_cmd,
         relay_tx,
         relay_rx,
-        lobby_tx,
+        admitted,
+        voice_requests,
+    }
+}
+
+/// TCP/443: the relay lane's deployed port — the one port every network
+/// forwards, which is the whole reason the lane exists (join ADR item 2).
+const RELAY_FALLBACK_PORT: u16 = 443;
+
+/// the relay endpoint derived from one coordinator ingress: SAME host,
+/// TCP/443. `SocketAddr`'s Display brackets an IPv6 ip, so the derived string
+/// stays `to_socket_addrs`-parseable.
+fn relay_endpoint_of(ingress: &Ingress) -> String {
+    match ingress {
+        Ingress::Socket(addr) => {
+            std::net::SocketAddr::new(addr.ip(), RELAY_FALLBACK_PORT).to_string()
+        }
+        Ingress::Dns { host, .. } => format!("{host}:{RELAY_FALLBACK_PORT}"),
+    }
+}
+
+/// the joiner's TCP relay list (item 2): an explicit `coordinator_relay`
+/// REPLACES the derived list outright; its disable sentinels mirror
+/// `primary_coordinator`'s exactly (`"none"`/`"off"`/`"direct"`, and
+/// blank = absent); absent derives one relay per ambient coordinator at
+/// [`RELAY_FALLBACK_PORT`].
+fn coordinator_relays(override_raw: Option<&str>, coordinators: &[Ingress]) -> Vec<String> {
+    match override_raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("none" | "off" | "direct") => Vec::new(),
+        Some(explicit) => vec![explicit.to_string()],
+        None => coordinators.iter().map(relay_endpoint_of).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dns_ingress(host_port: &str) -> Ingress {
+        config::coordinator_ingress(Some(host_port))
+            .expect("dialable")
+            .expect("not disabled")
+    }
+
+    #[test]
+    fn relay_endpoints_derive_coordinator_hosts_at_443_bracketing_v6() {
+        let coords = [
+            Ingress::Socket("203.0.113.9:3478".parse().unwrap()),
+            // the bracket case: a bare v6 ip + ":443" would not re-parse.
+            Ingress::Socket("[2001:db8::7]:3478".parse().unwrap()),
+            dns_ingress("p2p.example.com:3478"),
+        ];
+        assert_eq!(
+            coordinator_relays(None, &coords),
+            vec![
+                "203.0.113.9:443".to_string(),
+                "[2001:db8::7]:443".to_string(),
+                "p2p.example.com:443".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_override_replaces_the_derived_list_and_sentinels_disable() {
+        let derived = [Ingress::Socket("203.0.113.9:3478".parse().unwrap())];
+        // an explicit relay REPLACES derivation (host AND port verbatim).
+        assert_eq!(
+            coordinator_relays(Some("relay.example.com:8443"), &derived),
+            vec!["relay.example.com:8443".to_string()]
+        );
+        // the primary_coordinator sentinel set disables the lane outright.
+        for sentinel in ["none", "off", "direct"] {
+            assert!(coordinator_relays(Some(sentinel), &derived).is_empty());
+        }
+        // blank mirrors absent: derive, exactly like primary_coordinator.
+        assert_eq!(coordinator_relays(Some("  "), &derived).len(), 1);
     }
 }

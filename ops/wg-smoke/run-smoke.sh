@@ -1,37 +1,31 @@
 #!/bin/bash
-# MIXED-MODE mesh-over-tunnel container smoke, including the COLD-RESTART
-# leg — the overlay-net ADR's phase-3 standing gate
+# mesh-over-tunnel container smoke, including the COLD-RESTART leg — the
+# overlay-net ADR's standing gate
 # (docs/adr/2026-07-07-userspace-overlay-net.mdx).
 #
 # Two real-WireGuard ducktape nodes (dev-seed shape) on a rootless-podman
-# network, both with `advertised = "overlay"` — ONE PER BACKEND:
-#
-#   node0 — `wireguard_effect = "tun"` (BoringTun over a TUN device, kernel
-#           TCP/IP): CAP_NET_ADMIN + /dev/net/tun, today's server posture.
-#   node1 — `wireguard_effect = "socket"` (the TUN-less userspace backend):
-#           NO /dev/net/tun — private networking with no interface, no
-#           routes, no host mutation. (It keeps CAP_NET_ADMIN solely so the
-#           harness can cut its own underlay with iptables; the backend
-#           itself uses none of it, which the no-dt-interface evidence leg
-#           asserts.)
+# network, both with `advertised = "overlay"`, both on the userspace socket
+# backend (the node's only backend): NO /dev/net/tun — private networking
+# with no interface, no routes, no host mutation. (Both keep CAP_NET_ADMIN
+# solely so the harness can cut their underlay with iptables; the backend
+# itself uses none of it, which the no-dt-interface evidence leg asserts.)
 #
 # Assertions:
-#   1. tunnels apply on both nodes (a dt-* interface on node0; the
-#      in-process backend on node1 — and NO dt-* interface there),
-#   2. consensus finalizes (heights advance) across the mixed pair,
+#   1. tunnels apply on both nodes (the in-process backend — and NO dt-*
+#      interface anywhere),
+#   2. consensus finalizes (heights advance) across the pair,
 #   3. cut the underlay TCP path (iptables, both directions, -p tcp only —
 #      WG UDP untouched) and heights must KEEP advancing: mesh traffic
-#      re-dials the peers' overlay ULAs and rides the tunnel. node0→node1
-#      terminates in node1's VIRTUAL stack (the mesh listener's lazy leg);
-#      node1→node0 is a virtual dial into node0's kernel-routed TUN.
+#      re-dials the peers' overlay ULAs and rides the tunnel, terminating
+#      in each peer's VIRTUAL stack (the mesh listener's lazy leg).
 #   4. THE COLD-RESTART PROOF: stop BOTH containers, restart them with the
 #      underlay TCP blocked FROM BOOT (fresh netns dropped the phase-3
 #      rules; a marker file re-applies them before the node starts). With
 #      zero live TCP paths and tunnels gone, only the persisted mesh can
-#      bring the network back: both nodes must restore tunnels from disk —
-#      node1's into the userspace backend — node0 must dial node1's
-#      persisted control ULA, live assembly must re-apply, and heights must
-#      advance past their pre-restart values.
+#      bring the network back: both nodes must restore tunnels from disk
+#      into the userspace backend, node0 must dial node1's persisted
+#      control ULA, live assembly must re-apply, and heights must advance
+#      past their pre-restart values.
 set -uo pipefail
 
 NET=dtwg-smoke
@@ -40,7 +34,7 @@ IP0=172.30.0.10
 IP1=172.30.0.11
 SCRATCH="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SCRATCH/smoke.log"
-BIN="${BIN:-$(cd "$SCRATCH/../.." && pwd)/target/debug/ducktape-node}"
+BIN="${BIN:-$(cd "$SCRATCH/../.." && pwd)/target/debug/ducktape}"
 # arch + openresolv + iptables — the same base the interop smoke bakes (a
 # host-built binary needs the host's glibc; the debian rust image's is too
 # old). baked here if absent.
@@ -81,7 +75,6 @@ peer_seeds = [0, 1]
 listen = "[::]:41000"
 advertised = "overlay"
 wireguard_listen = "$IP0:51820"
-wireguard_effect = "tun"
 rpc_listen = "127.0.0.1:41100"
 storage_dir = "/data/storage"
 TOML
@@ -94,7 +87,6 @@ bootstrapper_addr = "$IP0:41000"
 listen = "[::]:41000"
 advertised = "overlay"
 wireguard_listen = "$IP1:51820"
-wireguard_effect = "socket"
 rpc_listen = "127.0.0.1:41100"
 storage_dir = "/data/storage"
 TOML
@@ -109,18 +101,17 @@ ENTRY='
     iptables -A OUTPUT -d "$PEER" -p tcp -j REJECT &&
     iptables -A INPUT -s "$PEER" -p tcp -j REJECT;
   fi &&
-  mkdir -p /run/wireguard &&
-  exec ducktape-node --config /data/node.toml'
+  exec ducktape node run --config /data/node.toml'
 
-# node0: the TUN backend — privileged, device-backed.
+# CAP_NET_ADMIN on both is the HARNESS's (for the iptables cut) — the
+# backend needs nothing, and neither container gets a TUN device.
 podman run -d --name dtwg-node0 --network $NET --ip "$IP0" \
-  --cap-add NET_ADMIN --device /dev/net/tun \
-  -v "$BIN":/usr/local/bin/ducktape-node:ro -v "$SCRATCH/node0":/data \
+  --cap-add NET_ADMIN \
+  -v "$BIN":/usr/local/bin/ducktape:ro -v "$SCRATCH/node0":/data \
   $IMG bash -c "$ENTRY" >/dev/null || fail "start node0"
-# node1: the userspace socket backend — NO tun device to be had.
 podman run -d --name dtwg-node1 --network $NET --ip "$IP1" \
   --cap-add NET_ADMIN \
-  -v "$BIN":/usr/local/bin/ducktape-node:ro -v "$SCRATCH/node1":/data \
+  -v "$BIN":/usr/local/bin/ducktape:ro -v "$SCRATCH/node1":/data \
   $IMG bash -c "$ENTRY" >/dev/null || fail "start node1"
 
 wait_marker() { # container marker timeout
@@ -134,9 +125,9 @@ wait_marker() { # container marker timeout
 }
 
 note "waiting for tunnels on both nodes (1 peer each — a 0-peer apply is a FAILED epoch)"
-wait_marker dtwg-node0 "tunnels applied on dt-.*(1 peer" 480
-wait_marker dtwg-node1 "tunnels applied on dt-.*(1 peer(s); userspace socket backend" 480
-note "tunnels applied with peers (node0 tun, node1 socket)"
+wait_marker dtwg-node0 "tunnels applied (config accepted.*peers=1" 480
+wait_marker dtwg-node1 "tunnels applied (config accepted.*peers=1" 480
+note "tunnels applied with peers (socket backend both sides)"
 
 height() { # container
   podman exec "$1" bash -c \
@@ -154,7 +145,7 @@ wait_height_past() { # container floor timeout
   return 1
 }
 
-note "baseline liveness (heights advance pre-cut, across the mixed pair)"
+note "baseline liveness (heights advance pre-cut)"
 H0=$(wait_height_past dtwg-node0 2 120) || fail "node0 height stuck pre-cut"
 H1=$(wait_height_past dtwg-node1 2 120) || fail "node1 height stuck pre-cut"
 note "pre-cut heights: node0=$H0 node1=$H1"
@@ -170,15 +161,14 @@ podman exec dtwg-node1 bash -c \
 note "waiting for mesh to re-dial over the tunnel and consensus to resume"
 HA=$(wait_height_past dtwg-node0 $(( H0 + 3 )) 180) || fail "node0 did not advance after the underlay cut"
 HB=$(wait_height_past dtwg-node1 $(( H1 + 3 )) 180) || fail "node1 did not advance after the underlay cut"
-note "post-cut heights: node0=$HA node1=$HB — consensus rides the mixed-mode tunnel"
+note "post-cut heights: node0=$HA node1=$HB — consensus rides the tunnel"
 
-note "evidence: node0 carries the overlay on a real interface"
-podman exec dtwg-node0 ss -6 -t state established | tee -a "$LOG"
-podman exec dtwg-node0 ip -6 addr show | grep -A1 "dt-" | tee -a "$LOG"
-note "evidence: node1 carries it with NO interface at all (userspace backend)"
+note "evidence: neither node touches the host network stack"
+podman exec dtwg-node0 sh -c 'test ! -e /dev/net/tun' || fail "node0 has a TUN device"
+podman exec dtwg-node0 sh -c '! ip link show | grep -q "dt-"' || fail "node0 grew a dt- interface"
 podman exec dtwg-node1 sh -c 'test ! -e /dev/net/tun' || fail "node1 has a TUN device"
 podman exec dtwg-node1 sh -c '! ip link show | grep -q "dt-"' || fail "node1 grew a dt- interface"
-echo "PHASE 1-3 PASS: mesh traffic flows tun<->socket over WireGuard after the underlay cut"
+echo "PHASE 1-3 PASS: mesh traffic flows socket<->socket over WireGuard after the underlay cut"
 
 # ---- phase 4: whole-network cold restart with the underlay blocked from boot ----
 
@@ -193,9 +183,9 @@ note "persisted mesh state present on both nodes"
 
 podman start dtwg-node0 dtwg-node1 >/dev/null || fail "restart"
 
-wait_marker dtwg-node0 "persisted mesh (epoch .*) restored on dt-" 240
-wait_marker dtwg-node1 "persisted mesh (epoch .*) restored on dt-" 240
-note "both nodes restored tunnels from disk with zero TCP paths (node1 into the socket backend)"
+wait_marker dtwg-node0 "persisted mesh restored" 240
+wait_marker dtwg-node1 "persisted mesh restored" 240
+note "both nodes restored tunnels from disk with zero TCP paths"
 
 # node1 has a configured hint for node0 (config wins — no seed); node0 has
 # no hint for node1, so its dial path to node1 IS the persisted ULA seed.
@@ -214,17 +204,16 @@ wait_marker_count() { # container marker count timeout
   fail "$1: fewer than $3 of: $2"
 }
 note "waiting for live assembly to replace the restored mesh"
-wait_marker_count dtwg-node0 "tunnels applied on dt-" 2 300
-wait_marker_count dtwg-node1 "tunnels applied on dt-" 2 300
+wait_marker_count dtwg-node0 "tunnels applied (config accepted" 2 300
+wait_marker_count dtwg-node1 "tunnels applied (config accepted" 2 300
 
 note "post-restart liveness (heights must pass their pre-restart values)"
 HC=$(wait_height_past dtwg-node0 "$HA" 300) || fail "node0 height stuck after cold restart"
 HD=$(wait_height_past dtwg-node1 "$HB" 300) || fail "node1 height stuck after cold restart"
 note "post-restart heights: node0=$HC node1=$HD (pre-restart: $HA/$HB)"
 
-note "evidence: the underlay really is blocked and the mesh rides the overlay"
+note "evidence: the underlay really is blocked"
 podman exec dtwg-node0 iptables -L OUTPUT -n | tee -a "$LOG"
-podman exec dtwg-node0 ss -6 -t state established | tee -a "$LOG"
 
 cleanup
-echo "SMOKE PASS: mixed-mode (tun<->socket) cold restart healed from the persisted mesh with no TCP ingress"
+echo "SMOKE PASS: socket<->socket cold restart healed from the persisted mesh with no TCP ingress"

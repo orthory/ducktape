@@ -13,24 +13,10 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn};
+use dispatch_oracle::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::{NodeCommand, ORACLE_ORIGIN};
-
-
-fn run_output_sink(registry: noded::RunOutputRegistry) -> capability_host::OutputSink {
-    Arc::new(move |ctx, line| {
-        let Some(run_key) = ctx.run_key.as_deref() else {
-            return;
-        };
-        let stream = match line.stream {
-            capability_host::OutputStream::Stdout => noded::RunStream::Stdout,
-            capability_host::OutputStream::Stderr => noded::RunStream::Stderr,
-        };
-        registry.append(run_key, stream, line.line);
-    })
-}
 
 /// the daemon's worker set: the dispatch pool (or, in debug builds under
 /// `DUCKTAPE_NODED_ECHO_ORACLE`, the inline echo stand-in).
@@ -65,22 +51,35 @@ where
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
     let providers = capability_host::discover(
+        ORACLE_ORIGIN,
         agent_dirs,
-        Some(run_output_sink(run_output)),
+        Some(run_output.output_sink()),
         // the embedded daemon stays Direct this phase: it exposes no operator
         // sandbox knobs, so `DispatchPool::new` below keeps the bare (empty
         // capacity) ledger — the sandbox/capacity plane is bin/node only.
         capability_host::SandboxBackend::Direct,
+        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+        false,
     )
     // BYO: run whatever executor CLIs the capability specs describe and
     // this host has installed — no credential handling here (see
     // docs/records/specs/capability-spec.md). a broken operator spec is a boot error.
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
 
-    // one supervised node for the pool; each run spawns as its own child.
+    // Queue waiters share the ordinary runtime. Only resource-admitted runs
+    // get a supervised dedicated owner because their fail-closed Drop may
+    // synchronously reap an exact process tree/container.
     let exec_ctx = context.child("oracle_pool");
-    let spawn: SpawnFn = Box::new(move |fut| {
-        exec_ctx.child("oracle_run").spawn(move |_ctx| fut);
+    let spawn: SpawnFn = Arc::new(move |kind, fut| {
+        let run = exec_ctx.child("oracle_run");
+        match kind {
+            SpawnKind::Queued => {
+                run.spawn(move |_ctx| fut);
+            }
+            SpawnKind::TeardownOwner => {
+                run.dedicated().spawn(move |_ctx| fut);
+            }
+        }
     });
 
     let deliver: DeliverFn = Arc::new(move |msg| {
@@ -99,15 +98,28 @@ where
             if cmds.send(cmd).await.is_err() {
                 // the actor is gone (shutdown): the in-flight result dies
                 // with the process, exactly like a crash mid-run.
-                eprintln!("[noded] command lane closed; dropping an oracle result");
+                tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "command_lane_closed",
+                    "oracle result dropped"
+                );
                 return;
             }
             match done.await {
                 Ok(Ok(_block)) => {}
                 // a rejected result is a deterministic verdict (e.g. the
                 // saga already settled the attempt) — log, never retry.
-                Ok(Err(e)) => eprintln!("[noded] oracle result rejected: {e}"),
-                Err(_) => eprintln!("[noded] oracle result reply dropped"),
+                Ok(Err(e)) => tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "oracle_result_rejected",
+                    error = %e,
+                    "oracle result dropped"
+                ),
+                Err(_) => tracing::warn!(
+                    target: "ducktape::saga",
+                    reason = "oracle_result_reply_dropped",
+                    "oracle result dropped"
+                ),
             }
         })
     });
@@ -137,7 +149,7 @@ where
         // the agent tool plane: every run's child gets this daemon's http base
         // as DUCKTAPE_NODE and the running binary's dir on PATH, so the MCP
         // server the runner CLI spawns (outside the agent's sandbox) finds both
-        // `ducktape-mcp` and the node it acts against.
+        // `ducktape mcp` and the node it acts against.
         .with_node_url(node_http_base),
     );
 
@@ -150,8 +162,8 @@ where
             ORACLE_ORIGIN.to_vec(),
             spawn,
             deliver,
-        )
-        .with_provisioner(provisioner),
+            provisioner,
+        ),
     )]
 }
 
@@ -166,9 +178,9 @@ struct EchoWorker;
 impl host::worker::Worker for EchoWorker {
     async fn run(
         &self,
-        effect: &sdk::Effect,
+        event: &sdk::Event,
     ) -> Result<host::worker::WorkOutcome, host::worker::Error> {
-        let request = match saga::decode_worker_request(&effect.0) {
+        let request = match saga::decode_worker_request(&event.payload) {
             Ok(request) => request,
             Err(_) => return Ok(host::worker::WorkOutcome::NotMine),
         };

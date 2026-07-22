@@ -28,14 +28,23 @@ pub(crate) async fn run(
     >,
     mut oracle: discovery::Oracle<ed25519::PublicKey>,
     quota: Quota,
+    signer: &ed25519::PrivateKey,
     mesh_participants: Set<ed25519::PublicKey>,
     sync_sources: Vec<ed25519::PublicKey>,
+    metrics: noded::NodeMetrics,
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
     identity_chain_id: String,
     blobs: noded::blobs::BlobHandle,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
+    metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Syncing);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "sync_only",
+        phase = "syncing",
+        node = label
+    );
     // no consensus coordinates yet: track the genesis mesh at the
     // base index. validators ignore this index if they have rotated
     // past keeping it; connection authorization is the UNION of every
@@ -71,14 +80,6 @@ pub(crate) async fn run(
             .child("blackhole_submit_relay")
             .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
     }
-    // the lobby lane: a sync-only resident never announces or answers,
-    // but an unregistered channel is a protocol violation — black-hole.
-    {
-        let (_tx, mut rx) = network.register(CHANNEL_LOBBY, quota, MAX_BACKLOG);
-        context.child("blackhole_lobby").spawn(move |_ctx| async move {
-            while rx.recv().await.is_ok() {}
-        });
-    }
     // the reachability lane: a sync-only resident runs no WireGuard
     // plane, but the channel must exist — black-hole.
     {
@@ -95,53 +96,79 @@ pub(crate) async fn run(
     network.start();
 
     if sync_sources.is_empty() {
-        eprintln!(
-            "[node {label}] no statesync source: no validator other than this node \
-             is available to serve (only validators answer the statesync channel)"
+        let error = "no validator state-sync source is configured";
+        metrics.record_sync_failure(error);
+        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+        tracing::error!(
+            target: "ducktape::statesync",
+            event = "node_sync_failed",
+            role = "sync_only",
+            node = %label,
+            error,
+            "SYNC FAILED: no validator state-sync source is available"
         );
         std::process::exit(1);
     }
     // rotate across every validator that can serve — the payloads
     // verify against consensus roots, so source choice is pure
-    // availability.
+    // availability. carry this node's real-key standing proof (ADR §5.1):
+    // a sync-only node WITH committed standing (a resident observing) is
+    // served; a standing-less observer is now refused, by design.
+    let (sync_requester, sync_proof) = statesync::sign_sync_proof(signer, &namespace);
     let client = P2pSyncClient::with_sources(
         context.child("sync_client"),
         sync_tx,
         sync_rx,
         sync_sources.clone(),
         None,
+        sync_requester,
+        sync_proof,
     );
 
     // the mesh takes a moment to connect, and the server only serves
     // once it has a finalized boundary — retry until the manifest lands.
+    let mut manifest_attempts = 0u64;
     let manifest = loop {
         match fetch_manifest(&client).await {
             Ok(m) => break m,
             Err(e) => {
-                println!("[node {label}] manifest not ready ({e}); retrying");
+                manifest_attempts += 1;
+                metrics.record_sync_retry(e.to_string());
+                let should_log = manifest_attempts == 1 || manifest_attempts.is_multiple_of(20);
+                if should_log {
+                    tracing::warn!(
+                        target: "ducktape::statesync",
+                        node = %label,
+                        attempts = manifest_attempts,
+                        error = %e,
+                        "manifest not ready; retrying"
+                    );
+                }
                 context.sleep(Duration::from_millis(500)).await;
             }
         }
     };
-    println!(
-        "[node {label}] manifest height={} app_hash={}",
-        manifest.height,
-        hex(&manifest.app_hash)
+    metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
+    tracing::info!(
+        target: "ducktape::statesync",
+        node = %label,
+        height = manifest.height,
+        app_hash = %hex(&manifest.app_hash),
+        "manifest ready"
     );
 
-    // BOOT PREFLIGHT (design §5 / plan Task 7.3): refuse an under-versioned
-    // binary against the SERVED boundary before installing/composing, so a
-    // too-old joiner fails with a clear "install the newer binary" message
-    // rather than an opaque post-compose app-hash mismatch. the served
-    // `required_min_version` is an unauthenticated hint (untrusted-server
-    // model): a lying value can at worst refuse-to-boot this joiner, never
-    // fork. inert on a baseline manifest.
-    if let Err(e) = manifest.preflight(MAX_PROTOCOL_VERSION) {
-        eprintln!("[node {label}] SYNC REFUSED: {e}");
-        std::process::exit(1);
-    }
     if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
-        eprintln!("[node {label}] SYNC REFUSED: {e}");
+        metrics.record_sync_failure(e.to_string());
+        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+        tracing::error!(
+            target: "ducktape::statesync",
+            event = "node_sync_refused",
+            role = "sync_only",
+            node = %label,
+            stage = "schema_preflight",
+            error = %e,
+            "SYNC REFUSED: {e}"
+        );
         std::process::exit(1);
     }
 
@@ -168,10 +195,33 @@ pub(crate) async fn run(
     .await
     {
         Ok(host) => {
-            println!("[node {label}] synced app_hash={}", hex(&host.app_hash()));
+            metrics.begin_sync(Some(client.current_source().to_string()), manifest.height);
+            metrics.record_sync_progress(manifest.height);
+            metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Serving);
+            tracing::info!(
+                target: "ducktape::statesync",
+                event = "node_phase_transition",
+                role = "sync_only",
+                phase = "serving",
+                node = %label,
+                height = manifest.height
+            );
+            tracing::info!(
+                target: "ducktape::statesync",
+                "node={label} synced app_hash={}", hex(&host.app_hash())
+            );
         }
         Err(e) => {
-            eprintln!("[node {label}] SYNC FAILED: {e}");
+            metrics.record_sync_failure(e.to_string());
+            metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
+            tracing::error!(
+                target: "ducktape::statesync",
+                event = "node_sync_failed",
+                role = "sync_only",
+                node = %label,
+                error = %e,
+                "SYNC FAILED: {e}"
+            );
             std::process::exit(1);
         }
     }

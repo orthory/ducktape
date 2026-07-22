@@ -9,7 +9,7 @@
 //! orderer is the drop-in behind the same [`Orderer`] trait.
 
 use host::{BlockContext, Host, MemberOutcome};
-use sdk::{Effect, Msg, StateRoot};
+use sdk::{Event, Msg, StateRoot};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -84,15 +84,16 @@ use commonware_cryptography::{
     Signer as _, Verifier as _,
     ed25519::{PrivateKey, PublicKey, Signature},
 };
-use sdk::Origin;
+use sdk::{Continuation, Origin};
 
 /// the signing domain for op frames. domain-separated so an op signature can
 /// never double as a consensus vote, an endpoint advertisement, or any other
-/// signed artifact in the system. v2 = the binary frame codec: the preimage
-/// gained a payload length prefix, and the bump keeps a v1-era signature from
-/// ever verifying under the new parse (an old payload's first 8 bytes would
-/// otherwise be reinterpretable as the length prefix of a different op).
-const FRAME_NS: &[u8] = b"ducktape:op-frame:v2";
+/// signed artifact in the system. the ONE codec: length-prefixed fields plus a
+/// trailing continuation section (`cont_flag(u8)`, then `[len target][target]
+/// [len payload][payload]` when the flag is `1`). BOTH arms are inside the
+/// signed preimage: the signature binds the continuation to its parent op, so
+/// nobody can graft one onto (or strip one off) someone else's transaction.
+const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 
 /// the content address of an encoded frame — sha256 over the exact bytes the
 /// orderer carries. computed identically at submit and at drain, so a caller
@@ -148,24 +149,6 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 /// compile-time assert there pins the relationship.
 pub const MAX_FRAME_BYTES: usize = (1 << 20) + (16 << 10);
 
-/// the signed preimage AND the frame's wire prefix: length-prefixed fields so
-/// no two (seq, target, payload) triples can collide across a moving
-/// boundary. a frame is exactly these bytes with the signature appended, so
-/// [`decode_frame`] verifies against the received prefix without rebuilding
-/// anything.
-fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
-    let target = msg.target.as_bytes();
-    let mut out = Vec::with_capacity(8 * 4 + origin.len() + target.len() + msg.payload.len());
-    out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
-    out.extend_from_slice(origin);
-    out.extend_from_slice(&seq.to_le_bytes());
-    out.extend_from_slice(&(target.len() as u64).to_le_bytes());
-    out.extend_from_slice(target);
-    out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
-    out.extend_from_slice(&msg.payload);
-    out
-}
-
 /// read a little-endian u64 off the front of `buf`.
 fn take_u64(buf: &mut &[u8]) -> Option<u64> {
     let (head, rest) = buf.split_at_checked(8)?;
@@ -183,50 +166,117 @@ fn take_slice<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(head)
 }
 
-/// split raw frame bytes into borrowed fields + the preimage length (the
-/// signature is the trailing rest). shared by [`decode_frame`] (which
-/// verifies) and [`frame_origin_seq`] (which deliberately does not).
-#[allow(clippy::type_complexity)]
-fn split_frame(bytes: &[u8]) -> Option<(&[u8], u64, &str, &[u8], &[u8], usize)> {
-    let mut buf = bytes;
-    let origin = take_slice(&mut buf)?;
-    let seq = take_u64(&mut buf)?;
-    let target = std::str::from_utf8(take_slice(&mut buf)?).ok()?;
-    let payload = take_slice(&mut buf)?;
-    let preimage_len = bytes.len() - buf.len();
-    Some((origin, seq, target, payload, buf, preimage_len))
+/// read one byte off the front of `buf`.
+fn take_byte(buf: &mut &[u8]) -> Option<u8> {
+    let (head, rest) = buf.split_at_checked(1)?;
+    *buf = rest;
+    Some(head[0])
 }
 
-/// frame and SIGN a locally-originated msg for the ordered lane. the signer's
-/// public key becomes the frame's origin; the frame bytes are the signed
-/// preimage with the signature appended.
-pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
+/// the signed preimage AND the frame's wire prefix: length-prefixed fields so
+/// no two (seq, target, payload) triples can collide across a moving
+/// boundary, plus the trailing continuation section. depth 1 is BY SHAPE —
+/// the continuation section has no continuation slot of its own, so a nested
+/// continuation is unrepresentable rather than merely validated. a frame is
+/// exactly these bytes with the signature appended, so [`decode_frame`]
+/// verifies against the received prefix without rebuilding anything.
+fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg, cont: Option<&Continuation>) -> Vec<u8> {
+    let target = msg.target.as_bytes();
+    let mut out = Vec::with_capacity(8 * 4 + 1 + origin.len() + target.len() + msg.payload.len());
+    out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
+    out.extend_from_slice(origin);
+    out.extend_from_slice(&seq.to_le_bytes());
+    out.extend_from_slice(&(target.len() as u64).to_le_bytes());
+    out.extend_from_slice(target);
+    out.extend_from_slice(&(msg.payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(&msg.payload);
+    match cont {
+        None => out.push(0),
+        Some(c) => {
+            out.push(1);
+            let target = c.target.as_bytes();
+            out.extend_from_slice(&(target.len() as u64).to_le_bytes());
+            out.extend_from_slice(target);
+            out.extend_from_slice(&(c.payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&c.payload);
+        }
+    }
+    out
+}
+
+/// frame and SIGN a locally-originated msg for the ordered lane, with an
+/// optional envelope continuation. the signer's public key becomes the
+/// frame's origin; the frame bytes are the signed preimage with the signature
+/// appended.
+pub fn encode_frame(
+    signer: &PrivateKey,
+    seq: u64,
+    msg: &Msg,
+    cont: Option<&Continuation>,
+) -> Vec<u8> {
     let origin = signer.public_key();
-    let mut frame = frame_preimage(origin.as_ref(), seq, msg);
+    let mut frame = frame_preimage(origin.as_ref(), seq, msg, cont);
     let sig = signer.sign(FRAME_NS, &frame);
     frame.extend_from_slice(sig.as_ref());
     frame
 }
 
-/// decode a delivered frame back to a `(Origin, Msg)` the host can submit —
-/// VERIFYING the signature first. a frame that does not parse, whose origin
-/// is not a valid ed25519 key, or whose signature does not bind (origin, seq,
-/// target, payload) errors, and the ordered drain treats that as a
-/// deterministic no-op: every honest validator rejects the identical forged
-/// frame identically. the verified `origin` becomes the block's root
-/// `Origin::External(pubkey)` — authorship a module can trust; the `seq` is
-/// ordering/replay metadata, not surfaced.
-pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
-    let (origin, _seq, target, payload, sig, preimage_len) = split_frame(bytes)
-        .ok_or_else(|| Error::Host(sdk::Error::Module("frame does not parse".into())))?;
+/// decode a delivered frame back to `(Origin, Msg, Option<Continuation>)`,
+/// VERIFYING the signature first. rejects deterministically on: a parse
+/// failure, a `cont_flag` outside `{0, 1}` (exactly one valid encoding per
+/// frame), an origin that is not a valid ed25519 key, a signature that does
+/// not bind the WHOLE preimage (continuation included), or a continuation
+/// payload over [`sdk::MAX_CONTINUATION_BYTES`]. the ordered drain treats any
+/// rejection as a deterministic no-op: every honest validator rejects the
+/// identical forged frame identically. the verified `origin` becomes the
+/// block's root `Origin::External(pubkey)` — authorship a module can trust;
+/// the `seq` is ordering/replay metadata, not surfaced.
+pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg, Option<Continuation>), Error> {
+    let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
+    let mut buf = bytes;
+    let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
+    // seq is ordering/replay metadata, consumed but not surfaced.
+    let Some(_seq) = take_u64(&mut buf) else {
+        return Err(parse_err());
+    };
+    let target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
+        .map_err(|_| parse_err())?;
+    let payload = take_slice(&mut buf).ok_or_else(parse_err)?;
+    let cont = match take_byte(&mut buf).ok_or_else(parse_err)? {
+        0 => None,
+        1 => {
+            let cont_target = std::str::from_utf8(take_slice(&mut buf).ok_or_else(parse_err)?)
+                .map_err(|_| parse_err())?;
+            let cont_payload = take_slice(&mut buf).ok_or_else(parse_err)?;
+            Some(Continuation {
+                target: cont_target.to_string(),
+                payload: cont_payload.to_vec(),
+            })
+        }
+        flag => {
+            return Err(Error::Host(sdk::Error::Module(format!(
+                "frame cont_flag {flag} is not 0|1"
+            ))));
+        }
+    };
+    let preimage_len = bytes.len() - buf.len();
     let pubkey = PublicKey::decode(origin)
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
-    let sig = Signature::decode(sig)
+    let sig = Signature::decode(buf)
         .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
     if !pubkey.verify(FRAME_NS, &bytes[..preimage_len], &sig) {
         return Err(Error::Host(sdk::Error::Module(
-            "frame signature does not bind this op to its origin".into(),
+            "frame signature does not bind this op (and continuation) to its origin".into(),
         )));
+    }
+    if let Some(c) = &cont
+        && c.payload.len() > sdk::MAX_CONTINUATION_BYTES
+    {
+        return Err(Error::Host(sdk::Error::Module(format!(
+            "continuation payload exceeds cap ({} > {})",
+            c.payload.len(),
+            sdk::MAX_CONTINUATION_BYTES
+        ))));
     }
     Ok((
         Origin::External(origin.to_vec()),
@@ -234,6 +284,7 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
             target: target.to_string(),
             payload: payload.to_vec(),
         },
+        cont,
     ))
 }
 
@@ -242,8 +293,27 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
 /// frames to advance its local sequence past everything it may have framed).
 /// `None` for bytes that are not a frame.
 pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let (origin, seq, ..) = split_frame(bytes)?;
+    let mut buf = bytes;
+    let origin = take_slice(&mut buf)?;
+    let seq = take_u64(&mut buf)?;
     Some((origin.to_vec(), seq))
+}
+
+/// decode ONE batch member into the [`host::BlockOp`] the block applies — the
+/// envelope carrying its continuation (if any) onto the op.
+///
+/// stamps `frame` with the member's content id HERE — the relay slot's
+/// `parent_frame` is consensus input a module may commit to state, so live
+/// drain, recovery replay, and suffix catch-up must all derive it from the ONE
+/// definition rather than each stamping (or forgetting) it at the call site.
+pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
+    let (origin, msg, continuation) = decode_frame(bytes)?;
+    Ok(host::BlockOp {
+        origin,
+        msg,
+        continuation,
+        frame: frame_id(bytes),
+    })
 }
 
 // ============================================================================
@@ -526,12 +596,113 @@ impl Orderer for ArrivalOrderer {
     }
 }
 
+/// the SIM orderer, behind the SAME [`Orderer`] trait: submissions PARK in
+/// FIFO arrival order and deliver only when an external [`StepHandle`] releases
+/// them — the scripted-scenario engine behind simnode's `/sim/step` (release
+/// one) and auto mode (release all). unlike [`RoundOrderer`] it does NOT
+/// byte-sort: a sim scenario's value is its EXACT authored order, which a
+/// content sort would scramble. like the other orderers it stamps a monotone
+/// view per delivered frame. the release budget is shared with the handle by an
+/// `Arc`, so simnode's serve thread can release while its actor thread owns the
+/// orderer.
+pub struct StepOrderer {
+    /// parked frames in FIFO (submit) order; the front releases first.
+    pending: std::collections::VecDeque<Vec<u8>>,
+    /// the next agreed view to stamp, monotone across releases.
+    next_view: u64,
+    /// the release budget the paired [`StepHandle`] commands.
+    budget: std::sync::Arc<StepBudget>,
+}
+
+/// the release budget a [`StepHandle`] commands and a [`StepOrderer`] spends,
+/// shared by `Arc`. `permits` counts frames cleared to deliver — `release(n)`
+/// adds n, each `poll_delivered` spends up to that many (a counting budget, so
+/// a release BEFORE a frame parks still delivers it on arrival). `all` latches
+/// AUTO mode: every parked frame, and every future submit, delivers.
+#[derive(Default)]
+struct StepBudget {
+    permits: std::sync::atomic::AtomicU64,
+    all: std::sync::atomic::AtomicBool,
+}
+
+impl StepOrderer {
+    /// a fresh sim orderer and the handle that releases its parked frames.
+    #[allow(clippy::new_without_default)] // the handle must be returned too.
+    pub fn new() -> (Self, StepHandle) {
+        let budget = std::sync::Arc::new(StepBudget::default());
+        let orderer = Self {
+            pending: std::collections::VecDeque::new(),
+            next_view: 0,
+            budget: budget.clone(),
+        };
+        (orderer, StepHandle { budget })
+    }
+}
+
+impl Orderer for StepOrderer {
+    async fn submit(&mut self, frame: Vec<u8>) -> Result<(), Error> {
+        self.pending.push_back(frame);
+        Ok(())
+    }
+
+    fn poll_delivered(&mut self) -> Vec<(u64, Vec<u8>)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // auto mode delivers everything parked; otherwise spend up to `permits`
+        // parked frames, FIFO from the front. a poll never spends more permits
+        // than it delivers, so an over-release simply carries forward.
+        let release_all = self.budget.all.load(Relaxed);
+        let n = if release_all {
+            self.pending.len()
+        } else {
+            let n = (self.budget.permits.load(Relaxed) as usize).min(self.pending.len());
+            self.budget.permits.fetch_sub(n as u64, Relaxed);
+            n
+        };
+        (0..n)
+            .map(|_| {
+                let frame = self.pending.pop_front().expect("n <= pending.len()");
+                let view = self.next_view;
+                self.next_view += 1;
+                (view, frame)
+            })
+            .collect()
+    }
+}
+
+/// the external release trigger for a [`StepOrderer`] (see its doc). `Clone`
+/// (it is an `Arc` over the shared budget) and `Send + Sync` — simnode's serve
+/// thread holds one while its actor thread owns the orderer.
+#[derive(Clone)]
+pub struct StepHandle {
+    budget: std::sync::Arc<StepBudget>,
+}
+
+impl StepHandle {
+    /// clear `n` more parked frames to deliver on the next drain — the
+    /// `/sim/step` trigger (release one). permits ACCUMULATE: releasing before a
+    /// frame parks still delivers it when it arrives.
+    pub fn release(&self, n: u64) {
+        self.budget
+            .permits
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// latch AUTO mode: every parked frame, and every future submit, delivers on
+    /// the next drain without a further `release`. a latch — auto mode is not
+    /// toggled back off mid-run.
+    pub fn release_all(&self) {
+        self.budget
+            .all
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// how a drained frame landed. every finalized frame gets exactly one of
 /// these, and each is a deterministic function of the agreed order plus the
 /// agreed ceiling — so dispositions are identical on every honest validator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Disposition {
-    /// applied via `host.submit_at`; its effects are in the effect queue.
+    /// applied via `host.submit_at`; its events are in the event queue.
     Applied,
     /// a deterministic no-op: the frame failed to decode or a module rejected
     /// the op (host-lent rolled the block back).
@@ -585,6 +756,12 @@ pub struct DrainedFrame {
 /// is `write!("Module({m})")`, no escaping), and it correctly leaves any other
 /// kind (e.g. `UnknownModule(..)`) untouched. node-local observability only:
 /// this string is never journaled, sealed, or hashed.
+/// hex for a log line — a state root as a raw byte array is unreadable, and
+/// hand-rolling this beats pulling a hex dependency into the kernel for one line.
+fn hex_root(root: &StateRoot) -> String {
+    root.0.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn member_reason(reason: String) -> String {
     match reason
         .strip_prefix("Module(")
@@ -616,6 +793,44 @@ pub struct DrainedOp {
     /// (the apply-latency histogram), so it can never enter consensus. differs
     /// per node.
     pub latency_us: u64,
+    /// the envelope continuation this frame carried and its released outcome
+    /// (envelope frames only). the continuation ALWAYS fires — a rejected parent
+    /// still releases it with the `Err` relay — so this is present iff the
+    /// FRAME carried one, independent of the parent's own disposition.
+    pub continuation: Option<DrainedContinuation>,
+}
+
+/// the released continuation of one drained envelope frame: the
+/// `continue` body plus how the derived unit landed. its dispatches are part
+/// of the block's op stream exactly like a member's (the index consumer
+/// appends them right after the parent's — the [`host::BatchOutcome`] event
+/// order), and `Discarded` is unrepresentable here: a continuation only ever
+/// exists for a frame that resolved below the cutover ceiling.
+#[derive(Clone, Debug)]
+pub struct DrainedContinuation {
+    /// the continuation's target module.
+    pub target: sdk::ModuleId,
+    /// the continuation's opaque payload bytes.
+    pub payload: Vec<u8>,
+    /// how the derived unit landed: applied, or rejected in isolation (its
+    /// stage rolled back; the parent's committed stage survives).
+    pub disposition: Disposition,
+    /// the continuation unit's own dispatch trace — empty when rejected.
+    pub dispatches: Vec<host::DispatchRecord>,
+    /// node-local, NON-CONSENSUS: the rejection reason, unwrapped like a
+    /// member's ([`DrainedFrame::reason`]). `None` when applied.
+    pub reason: Option<String>,
+}
+
+/// one decoded member's identity and envelope, carried parallel to the block's
+/// ops (in member order) so the drained records can be built after the block
+/// settles — internal to [`OrderedNode::drain_delivered`].
+struct MemberMeta {
+    id: FrameId,
+    origin: Origin,
+    target: sdk::ModuleId,
+    payload: Vec<u8>,
+    continuation: Option<Continuation>,
 }
 
 /// the durable outcome of one drained frame — everything a recovery journal
@@ -707,6 +922,34 @@ impl BlockSink for NullSink {
     }
 }
 
+/// how a block's `consensus_time` (the `Env` clock every module reads) is
+/// derived from its app height, stamped into every block's [`BlockContext`] by
+/// [`OrderedNode::drain_delivered`]. the default is byte-identical to the
+/// pre-policy hardcode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConsensusTimePolicy {
+    /// the validator lane: `consensus_time = height`. the real clock rides in
+    /// the frames' agreed order, not a wall read — the height IS the logical
+    /// clock. DEFAULT, so every existing construction site keeps today's bytes.
+    #[default]
+    HeightIsTime,
+    /// the sim lane's logical clock: `consensus_time = base_ms + height *
+    /// block_ms` — a deterministic millisecond clock advancing one `block_ms`
+    /// per block from `base_ms`, so sim receipts carry stable wall-clock-shaped
+    /// times with no real clock read.
+    Epoch { base_ms: u64, block_ms: u64 },
+}
+
+impl ConsensusTimePolicy {
+    /// stamp the `consensus_time` for a block at app `height`.
+    pub fn stamp(&self, height: u64) -> u64 {
+        match self {
+            Self::HeightIsTime => height,
+            Self::Epoch { base_ms, block_ms } => base_ms + height * block_ms,
+        }
+    }
+}
+
 /// a replicated host on the ORDERED lane. owns its [`Host`] and an [`Orderer`].
 /// unlike [`Node`], `submit` does NOT apply to the local host — it only proposes
 /// into the agreed order; application happens exclusively in [`OrderedNode::
@@ -717,11 +960,12 @@ impl BlockSink for NullSink {
 pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     host: Host,
     orderer: O,
-    /// effects surfaced by every block APPLIED via `drain_delivered` and not yet
-    /// taken. the host itself ignores its effect sink; on the ordered lane this is
-    /// where the reactor's worker driver reads finalized `WorkerRequest`s from
-    /// (via `take_effects`). accumulates in agreed-delivery order.
-    effects: Vec<Effect>,
+    /// events surfaced by every block APPLIED via `drain_delivered` and not yet
+    /// taken. on the ordered lane this is where the reactor's worker driver
+    /// reads finalized worker requests from (via `take_events`; try-decode
+    /// routing skips the purely observability events). accumulates in
+    /// agreed-delivery order.
+    events: Vec<Event>,
     /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
     /// (`view_base + engine view`) plus the app-hash after that drain settled.
     /// this is what a state-sync service serves from
@@ -743,7 +987,7 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// observes and compares cutover views against). reset on epoch respawn.
     last_engine_view: Option<u64>,
     /// per-frame outcomes recorded by `drain_delivered` and not yet taken via
-    /// [`OrderedNode::take_drained`]. like `effects`, long-lived callers take
+    /// [`OrderedNode::take_drained`]. like `events`, long-lived callers take
     /// these every drain tick; the queue accumulates until taken.
     drained: Vec<DrainedFrame>,
     /// per-BLOCK once-per-block System-injection dispatch traces (upgrade
@@ -812,6 +1056,22 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// boundary instead of silently running stale code. `Arc` so the node and
     /// its recovery sink can share the one source.
     code_source: std::sync::Arc<dyn host::CodeSource>,
+    /// how each block's `consensus_time` is derived from its height (see
+    /// [`ConsensusTimePolicy`]). defaults to `HeightIsTime` — the validator
+    /// lane's pre-policy behavior, byte-for-byte.
+    time_policy: ConsensusTimePolicy,
+    /// SIM ONLY: ops parked by [`OrderedNode::submit_decoded`], keyed by the
+    /// placeholder frame id that rides the batch pipeline in their place. the
+    /// drain takes the decoded op from here instead of verifying the placeholder
+    /// bytes — so an UNSIGNED sim lane applies without the wire codec gaining an
+    /// unsigned variant.
+    #[cfg(feature = "sim")]
+    decoded: std::collections::HashMap<FrameId, host::BlockOp>,
+    /// SIM ONLY: a monotone counter minting a UNIQUE placeholder per
+    /// [`OrderedNode::submit_decoded`], so two byte-identical unsigned ops are
+    /// still distinct ordered units and distinct `decoded` entries.
+    #[cfg(feature = "sim")]
+    decoded_seq: u64,
 }
 
 impl<O: Orderer> OrderedNode<O> {
@@ -827,7 +1087,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         Self {
             host,
             orderer,
-            effects: Vec::new(),
+            events: Vec::new(),
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized: None,
@@ -842,6 +1102,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            time_policy: ConsensusTimePolicy::HeightIsTime,
+            #[cfg(feature = "sim")]
+            decoded: std::collections::HashMap::new(),
+            #[cfg(feature = "sim")]
+            decoded_seq: 0,
         }
     }
 
@@ -860,7 +1125,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         Self {
             host,
             orderer,
-            effects: Vec::new(),
+            events: Vec::new(),
             drained: Vec::new(),
             system_dispatches: Vec::new(),
             finalized,
@@ -875,6 +1140,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            time_policy: ConsensusTimePolicy::HeightIsTime,
+            #[cfg(feature = "sim")]
+            decoded: std::collections::HashMap::new(),
+            #[cfg(feature = "sim")]
+            decoded_seq: 0,
         }
     }
 
@@ -883,6 +1153,54 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// default is [`host::NoCodeSource`] — see the field doc.
     pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
         self.code_source = src;
+    }
+
+    /// choose how each block's `consensus_time` is derived from its height (see
+    /// [`ConsensusTimePolicy`]). the default `HeightIsTime` is the validator
+    /// lane; the sim backend sets `Epoch{..}` for its logical millisecond clock.
+    pub fn set_consensus_time_policy(&mut self, policy: ConsensusTimePolicy) {
+        self.time_policy = policy;
+    }
+
+    /// SIM ONLY — the pre-decoded ingress: enqueue an ALREADY-DECODED op to ride
+    /// the same batch -> orderer -> drain pipeline as a signed client frame,
+    /// WITHOUT the signature a wire frame carries. the unsigned sim lanes
+    /// (`/sim/peer-block`, the `hex:` origin escape) carry origins that are not
+    /// ed25519 keys and could never verify, so they cannot ride
+    /// [`OrderedNode::submit_frame`]. NO wire variant: the op is stored decoded
+    /// in a side table keyed by a UNIQUE placeholder frame's id; the orderer
+    /// still orders only opaque bytes and [`decode_member`] is untouched (the
+    /// codec stays a machine contract). returns the placeholder [`FrameId`] so
+    /// the caller correlates the drained outcome exactly as with `submit_frame`.
+    #[cfg(feature = "sim")]
+    pub fn submit_decoded(&mut self, op: host::BlockOp) -> FrameId {
+        // a UNIQUE placeholder per call: two byte-identical unsigned ops must
+        // still be DISTINCT ordered units (a tie-free order key) and distinct
+        // side-table entries, so key on a monotone counter, not the op content.
+        self.decoded_seq += 1;
+        let mut placeholder = b"sim-decoded:".to_vec();
+        placeholder.extend_from_slice(&self.decoded_seq.to_le_bytes());
+        let id = frame_id(&placeholder);
+        // stamp the op's own frame id to the placeholder id, so a drained record
+        // (keyed by the placeholder's id) and the op agree. the placeholder then
+        // joins `pending_batch` exactly like a signed frame — flush packs it, the
+        // orderer FIFO-orders it, and the drain resolves it via `decoded`.
+        self.decoded.insert(id, host::BlockOp { frame: id, ..op });
+        self.pending_batch.push((id, placeholder));
+        id
+    }
+
+    /// resolve a batch member to its op: a SIM pre-decoded op parked via
+    /// [`OrderedNode::submit_decoded`] (taken from the side table by its
+    /// placeholder id, WITHOUT the signature check a wire frame carries), else
+    /// the verifying wire decode. non-sim builds compile to exactly
+    /// [`decode_member`], so the validator lane is untouched.
+    fn take_decoded(&mut self, member: &[u8]) -> Result<host::BlockOp, Error> {
+        #[cfg(feature = "sim")]
+        if let Some(op) = self.decoded.remove(&frame_id(member)) {
+            return Ok(op);
+        }
+        decode_member(member)
     }
 
     /// arm the observation barrier on `module` (see the field doc): every
@@ -934,7 +1252,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // first sealed block.
         self.finalized_view = None;
         self.view_ceiling = None;
-        // effects of pre-cutover blocks remain takeable. deferred frames
+        // events of pre-cutover blocks remain takeable. deferred frames
         // carry OLD-epoch views — stamping them under the new base would
         // corrupt heights, and a caller only cuts over after draining under
         // the ceiling, so any leftover here was past the ceiling (a discard);
@@ -991,7 +1309,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         seq: u64,
         msg: Msg,
     ) -> Result<FrameId, Error> {
-        let frame = encode_frame(signer, seq, &msg);
+        let frame = encode_frame(signer, seq, &msg, None);
         self.submit_frame(frame).await
     }
 
@@ -1015,7 +1333,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 frame.len()
             ))));
         }
-        decode_frame(&frame)?;
+        decode_member(&frame)?;
         let id = frame_id(&frame);
         // ENQUEUE, don't propose: the frame joins `pending_batch` (FIFO) and
         // enters custody. it is not pinned or proposed until [`flush_batch`]
@@ -1023,7 +1341,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         // orderer proposal happen, once per batch. custody begins HERE so a
         // cutover before the flush still carries the accepted-but-unflushed op
         // (the accept contract holds without a flush having run).
-        let (_, seq) = frame_origin_seq(&frame).expect("decode_frame verified the envelope");
+        let (_, seq) = frame_origin_seq(&frame).expect("decode_member verified the envelope");
         self.pending_batch.push((id, frame.clone()));
         self.outstanding.insert(id, (seq, frame));
         Ok(id)
@@ -1239,28 +1557,30 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // Rejected after the block settles (it shares the block app-hash).
             // the rest carry their identity parallel to `ops`, in member (=
             // applied, = enqueue/FIFO) order, for building the drained records.
-            let mut ops: Vec<(Origin, Msg)> = Vec::new();
-            let mut op_meta: Vec<(FrameId, Origin, sdk::ModuleId, Vec<u8>)> = Vec::new();
-            let mut decode_fail: Vec<FrameId> = Vec::new();
+            let mut ops: Vec<host::BlockOp> = Vec::new();
+            let mut op_meta: Vec<MemberMeta> = Vec::new();
+            let mut decode_fail: Vec<(FrameId, String)> = Vec::new();
             for member in &members {
                 let mid = frame_id(member);
-                match decode_frame(member) {
-                    Ok((origin, msg)) => {
-                        op_meta.push((
-                            mid,
-                            origin.clone(),
-                            msg.target.clone(),
-                            msg.payload.clone(),
-                        ));
-                        ops.push((origin, msg));
+                match self.take_decoded(member) {
+                    Ok(op) => {
+                        op_meta.push(MemberMeta {
+                            id: mid,
+                            origin: op.origin.clone(),
+                            target: op.msg.target.clone(),
+                            payload: op.msg.payload.clone(),
+                            continuation: op.continuation.clone(),
+                        });
+                        ops.push(op);
                     }
-                    Err(_) => decode_fail.push(mid),
+                    // keep the codec's verbatim reason — a submitter's held
+                    // reply surfaces it. node-local observability only.
+                    Err(Error::Host(sdk::Error::Module(reason))) => {
+                        decode_fail.push((mid, reason));
+                    }
+                    Err(e) => decode_fail.push((mid, e.to_string())),
                 }
             }
-            // stamp the block's dispatch version as the PURE derivation
-            // effective_version(height) — never the raw stored current_version —
-            // so dispatch and hashing agree on the version for block `height`.
-            let protocol_version = self.host.effective_version(height).await;
             // the observation barrier compares the watched root across the WHOLE
             // batch — only an applied member can move it (rejected members roll
             // back, discards never run).
@@ -1274,12 +1594,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             let started = std::time::Instant::now();
             let result = self
                 .host
-                .submit_block(
+                .submit_block_ops(
                     BlockContext {
                         height,
-                        consensus_time: height,
+                        consensus_time: self.time_policy.stamp(height),
                         origin: Origin::System,
-                        protocol_version,
                     },
                     ops,
                 )
@@ -1315,7 +1634,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             };
             // N DrainedFrames per batch, all sharing the ONE post-batch app-hash.
             let batch_hash = outcome.app_hash;
-            self.effects.extend(outcome.effects);
+            self.events.extend(outcome.events);
             // the block-level seal disposition is DRAIN-based, not app-hash-based:
             // a block is Applied iff it ran real work — any member applied, or a
             // once-per-block System injection dispatched. this is identical live,
@@ -1333,16 +1652,33 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     .push((height, outcome.system_dispatches));
             }
             let mut any_applied = false;
+            let (mut applied_count, mut rejected_count) = (0usize, 0usize);
+            // the released continuation outcomes, re-keyed by parent INPUT
+            // index (the host reports them in release = input order, at most
+            // one per envelope).
+            let mut cont_outcomes: Vec<Option<MemberOutcome>> =
+                op_meta.iter().map(|_| None).collect();
+            for (parent, cont_outcome) in outcome.continuations {
+                cont_outcomes[parent] = Some(cont_outcome);
+            }
             // one record per applying member, in member (input/FIFO) order; the
             // host guarantees `members` is 1:1 with `ops` in input order. custody
             // ends for each resolved member.
-            for ((mid, op_origin, op_target, op_payload), member_outcome) in
-                op_meta.into_iter().zip(outcome.members)
+            for (i, (meta, member_outcome)) in
+                op_meta.into_iter().zip(outcome.members).enumerate()
             {
+                let MemberMeta {
+                    id: mid,
+                    origin: op_origin,
+                    target: op_target,
+                    payload: op_payload,
+                    continuation: op_cont,
+                } = meta;
                 self.outstanding.remove(&mid);
                 let (disposition, dispatches, reason) = match member_outcome {
                     MemberOutcome::Applied { dispatches } => {
                         any_applied = true;
+                        applied_count += 1;
                         (Disposition::Applied, dispatches, None)
                     }
                     // the host stringifies the reject error with its WRAPPED
@@ -1350,9 +1686,39 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     // held reply keeps matching the module's own prefix (duckfs-
                     // client keys on "files: conflict:"). node-local only.
                     MemberOutcome::Rejected { reason } => {
+                        rejected_count += 1;
                         (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
                     }
                 };
+                // the envelope's continuation ALWAYS fired (an applied parent
+                // relays Ok, a rejected one Err) — its outcome is a block fact
+                // like a member's, and an APPLIED continuation is real work:
+                // it moves state, so it must reach the seal disposition or a
+                // continuation-only block would seal Rejected with a moved
+                // app-hash and recovery could never reproduce it.
+                let continuation = op_cont.map(|cont| {
+                    let released = cont_outcomes[i]
+                        .take()
+                        .expect("host releases exactly one outcome per envelope continuation");
+                    let (disposition, dispatches, reason) = match released {
+                        MemberOutcome::Applied { dispatches } => {
+                            any_applied = true;
+                            applied_count += 1;
+                            (Disposition::Applied, dispatches, None)
+                        }
+                        MemberOutcome::Rejected { reason } => {
+                            rejected_count += 1;
+                            (Disposition::Rejected, Vec::new(), Some(member_reason(reason)))
+                        }
+                    };
+                    DrainedContinuation {
+                        target: cont.target,
+                        payload: cont.payload,
+                        disposition,
+                        dispatches,
+                        reason,
+                    }
+                });
                 self.drained.push(DrainedFrame {
                     id: mid,
                     height,
@@ -1364,6 +1730,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         payload: op_payload,
                         dispatches,
                         latency_us,
+                        continuation,
                     }),
                     reason,
                 });
@@ -1371,7 +1738,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // members that failed to decode: recorded AFTER the outcome so they
             // share the block app-hash. custody ends — a decode-fail can never
             // apply, so it must not be carried at a cutover.
-            for mid in decode_fail {
+            for (mid, decode_reason) in decode_fail {
                 self.outstanding.remove(&mid);
                 self.drained.push(DrainedFrame {
                     id: mid,
@@ -1379,7 +1746,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     disposition: Disposition::Rejected,
                     app_hash: batch_hash,
                     op: None,
-                    reason: Some("frame decode/signature check failed".to_string()),
+                    reason: Some(decode_reason),
                 });
             }
             let block_disp = if any_applied || has_system {
@@ -1388,6 +1755,26 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 Disposition::Rejected
             };
             self.seal(height, block_disp).await?;
+            // the block spine. NOTHING in this repo ever said "height H produced
+            // app-hash X" — and fork triage, upgrade verification, and "is my node
+            // keeping up" all start exactly there.
+            //
+            // gated on `any_applied`: an idle chain heartbeats a nop block every
+            // second, and at `info` that would fill the 4096-line ring with nothing
+            // in ~68 minutes, evicting the evidence around whatever you were hunting.
+            if any_applied || has_system {
+                tracing::info!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    app_hash = %hex_root(&batch_hash),
+                    applied = applied_count,
+                    rejected = rejected_count,
+                    "block committed"
+                );
+            } else {
+                tracing::debug!(target: "ducktape::consensus", height, view, "idle block");
+            }
             last_sealed_view = Some(view);
             // OBSERVATION BARRIER (once per batch): end the drain right after a
             // batch that moved the watched root, so a once-per-drain observer
@@ -1452,17 +1839,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.host.app_hash()
     }
 
-    /// take the effects accumulated by applied blocks since the last call. the
-    /// host-owned reactor drains these, runs the assigned worker on each
-    /// `WorkerRequest`, and submits the resulting `OracleResult` op back through
-    /// the ordered lane (the oracle-as-op over consensus).
-    pub fn take_effects(&mut self) -> Vec<Effect> {
-        std::mem::take(&mut self.effects)
+    /// take the events accumulated by applied blocks since the last call. the
+    /// host-owned reactor drains these, offers each to its workers (try-decode
+    /// routing — a `WorkerRequest` is claimed, anything else falls through as
+    /// observability), and submits each resulting `OracleResult` op back
+    /// through the ordered lane (the oracle-as-op over consensus).
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
     }
 
     /// take the per-frame outcomes recorded by [`OrderedNode::drain_delivered`]
     /// since the last call, in agreed order. the drop-in counterpart of
-    /// [`OrderedNode::take_effects`] for callers holding replies open on their
+    /// [`OrderedNode::take_events`] for callers holding replies open on their
     /// own submitted [`FrameId`]s.
     pub fn take_drained(&mut self) -> Vec<DrainedFrame> {
         std::mem::take(&mut self.drained)

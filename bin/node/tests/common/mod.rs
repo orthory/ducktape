@@ -1,5 +1,5 @@
 //! process-level harness for the real-socket node e2e: spawns REAL
-//! `ducktape-node` binaries (via `CARGO_BIN_EXE_ducktape-node`) with generated
+//! `ducktape` binaries (via `CARGO_BIN_EXE_ducktape`) with generated
 //! toml configs, captures their stdout to files, polls for the node's
 //! greppable markers, and speaks the json-lines rpc — the rust replacement for
 //! what `demo-2node.sh` used to orchestrate in bash.
@@ -22,7 +22,7 @@
 //!   assertions go through rpc queries instead.
 
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,15 +79,9 @@ pub struct Cluster {
     /// points bootstrap at a forwarder in front of node 0.
     pub bootstrap_addr_override: Option<String>,
     /// When true every config gets `wireguard_listen` on the node's distinct
-    /// UDP port. The default fake effect exercises orchestration only;
-    /// `wireguard_socket` upgrades it to the real, unprivileged userspace
-    /// encrypted transport. The OS-interface effect is intentionally absent
-    /// because same-host nodes would contend for one interface name.
+    /// UDP port — the reachability plane runs the real, unprivileged
+    /// userspace transport (the node's only backend).
     pub wireguard: bool,
-    /// Use the TUN-less in-process WireGuard stack instead of the fake effect.
-    /// Unlike the OS-interface backend this is safe for multiple same-host
-    /// nodes and exercises encrypted overlay sockets end to end.
-    pub wireguard_socket: bool,
     /// extra `node.toml` lines appended verbatim to EVERY node's generated
     /// config (`spawn` regenerates the file, so a hand-edit after the fact
     /// would not survive a respawn). set before the first spawn; empty by
@@ -121,6 +115,21 @@ pub struct NetworkShapeCluster {
 }
 
 impl NetworkShapeCluster {
+    /// freeze (`SIGSTOP`) or thaw (`SIGCONT`) a running node — the closest a
+    /// test gets to a laptop sleeping mid-run: the process vanishes from the
+    /// scheduler while its kernel keeps its sockets ESTABLISHED, exactly the
+    /// silent half-open shape a slept machine leaves its peers holding.
+    pub fn signal(&self, idx: usize, signal: &str) {
+        let node = self.nodes[idx].as_ref().expect("node not running");
+        let pid = node.child.id();
+        let status = Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(pid.to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{signal} {pid} failed");
+    }
+
     pub fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("network-shape tempdir");
         let ports = alloc_ports(6);
@@ -139,7 +148,11 @@ impl NetworkShapeCluster {
     }
 
     pub fn init_founder(&self, name: &str) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        // the join protocol refuses to mint an invite from a member with no reachability
+        // plane, and this harness is deliberately coordinator-free — so every
+        // founder carries a distinct-port WireGuard listen.
+        let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
             .args([
                 "init",
                 "--name",
@@ -163,6 +176,7 @@ impl NetworkShapeCluster {
                 "--rpc",
                 &format!("127.0.0.1:{}", self.rpc_ports[0]),
             ])
+            .args(["--wireguard-listen", &wg_listen])
             .output()
             .expect("run init");
         assert!(
@@ -173,9 +187,30 @@ impl NetworkShapeCluster {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    /// mint (or reuse) the friend workspace's identity via the `node key` verb
+    /// and return its pubkey hex — the JOIN CODE the invite locks to.
+    /// `join_friend` reuses this pre-generated identity.
+    pub fn keygen_friend(&self, _idx: usize) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .args(["key", "--dir"])
+            .arg(&self.friend_dir)
+            .output()
+            .expect("run node key");
+        assert!(
+            out.status.success(),
+            "keygen failed:\n{}",
+            command_output(&out)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// mint a bearer invite (the join protocol: single-use, sealed to whoever redeems it
+    /// at first contact). Still pre-generates the friend identity so
+    /// `join_friend` reuses one stable key across the ceremony.
     pub fn invite(&self) -> String {
+        self.keygen_friend(1);
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
             .args(["invite", "--config"])
             .arg(cfg)
             .output()
@@ -202,25 +237,28 @@ impl NetworkShapeCluster {
     }
 
     /// the founder's verified join-request queue, parsed from the
-    /// `join-requests` verb's JSON stdout.
+    /// `join requests` verb's JSON stdout.
     pub fn join_requests(&self) -> serde_json::Value {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args(["join-requests", "--config"])
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .args(["join", "requests", "--config"])
             .arg(cfg)
             .output()
-            .expect("run join-requests");
+            .expect("run node join requests");
         assert!(
             out.status.success(),
-            "join-requests failed:\n{}",
+            "join requests failed:\n{}",
             command_output(&out)
         );
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
-            .expect("join-requests prints json")
+            .expect("join requests prints json")
     }
 
-    pub fn join_friend(&self, invite: &str) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+    /// run the `join` verb against the friend workspace WITHOUT asserting
+    /// success — the caller inspects the outcome (a targeted invite refuses a
+    /// mismatched local identity at the CLI, before any node spawns).
+    pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
             .args([
                 "join",
                 invite,
@@ -234,9 +272,19 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.http_ports[1]),
                 "--rpc",
                 &format!("127.0.0.1:{}", self.rpc_ports[1]),
+                "--wireguard-listen",
+                &format!("127.0.0.1:{}", alloc_ports(1)[0]),
+                // hermetic: without this the joined node registers with the
+                // LIVE public coordinator from inside the test.
+                "--primary-coordinator",
+                "none",
             ])
             .output()
-            .expect("run join");
+            .expect("run join")
+    }
+
+    pub fn join_friend(&self, invite: &str) -> String {
+        let out = self.try_join_friend(invite);
         assert!(
             out.status.success(),
             "join failed:\n{}",
@@ -263,7 +311,8 @@ impl NetworkShapeCluster {
         let log = self.dir.path().join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
@@ -283,35 +332,67 @@ impl NetworkShapeCluster {
         self.nodes[idx] = None;
     }
 
+    /// node `idx`'s captured stdout+stderr — for a failing test to preserve
+    /// evidence before the cluster tempdir (and the logs in it) is dropped.
+    pub fn log_path(&self, idx: usize) -> PathBuf {
+        self.nodes[idx].as_ref().expect("node not running").log.clone()
+    }
+
     /// one json-lines rpc against node `idx` — the NetworkShapeCluster
     /// mirror of [`Cluster::rpc`] (same wire, same ports array).
     pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
         let port = self.rpc_ports[idx];
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let stream = loop {
-            match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(s) => break s,
-                Err(e) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "rpc connect to node idx {idx} (port {port}) failed: {e}"
-                    );
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        };
-        let mut stream = stream;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("rpc read timeout");
         let mut line = serde_json::to_string(&req).expect("rpc request serializes");
         line.push('\n');
-        stream.write_all(line.as_bytes()).expect("rpc write");
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .expect("rpc read");
-        serde_json::from_str(reply.trim()).expect("rpc reply is json")
+        let retryable = req["cmd"] == "query";
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            // the listener is up before the pump — connecting retries for
+            // every cmd (nothing has been sent yet, so retrying is safe).
+            let connect_deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        assert!(
+                            Instant::now() < connect_deadline,
+                            "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                            self.all_log_tails(40)
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            };
+            let mut stream = stream;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(if retryable { 15 } else { 60 })))
+                .expect("rpc read timeout");
+            stream.write_all(line.as_bytes()).expect("rpc write");
+            let mut reply = String::new();
+            match BufReader::new(stream).read_line(&mut reply) {
+                Ok(n) if n > 0 => {
+                    return serde_json::from_str(reply.trim()).expect("rpc reply is json");
+                }
+                res => {
+                    // a query is idempotent: reconnect and resend across the
+                    // windows where the listener answers connects but the node
+                    // cannot reply yet (a promotion reboot, an epoch-cutover
+                    // engine restart). a submit is NEVER resent — a duplicate
+                    // could double-apply — it gets one long read window above.
+                    let why = match res {
+                        Ok(_) => "connection closed before a reply line".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    if !retryable || Instant::now() >= deadline {
+                        panic!(
+                            "rpc to node idx {idx} (port {port}) failed: {why}; request: {req};\n{}",
+                            self.all_log_tails(60)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
     }
 
     pub fn query(&self, idx: usize, target: &str, req: &[u8]) -> Option<Vec<u8>> {
@@ -357,22 +438,28 @@ impl NetworkShapeCluster {
         reply["status"].clone()
     }
 
-    /// drive a membership ceremony verb (`promote`, `invite-accept`,
-    /// `resident-remove`) against node 0's running rpc, from node 0's config.
+    /// drive a membership ceremony verb (`member promote`, `resident accept`,
+    /// `resident remove`) against node 0's running rpc, from node 0's config.
+    /// `verb` is the space-separated two-token spelling; it is split into argv.
     pub fn run_membership_verb(&self, verb: &str, pubkey_hex: &str) -> (bool, String) {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
-            .args([verb, pubkey_hex, "--config"])
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("node");
+        for token in verb.split(' ') {
+            cmd.arg(token);
+        }
+        let out = cmd
+            .args([pubkey_hex, "--config"])
             .arg(cfg)
             .output()
             .unwrap_or_else(|e| panic!("run {verb}: {e}"));
         (out.status.success(), command_output(&out))
     }
 
-    /// drive the DIRECT admission ceremony (`promote` — the pre-staged
-    /// `invite-accept` semantics) from node 0's config.
+    /// drive the DIRECT admission ceremony (`member promote` — the pre-staged
+    /// `resident accept` semantics) from node 0's config.
     pub fn run_promote(&self, pubkey_hex: &str) -> (bool, String) {
-        self.run_membership_verb("promote", pubkey_hex)
+        self.run_membership_verb("member promote", pubkey_hex)
     }
 
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
@@ -392,6 +479,52 @@ impl NetworkShapeCluster {
                 );
             }
             std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// wait until node `idx` has COMMITTED STANDING as a member. the join protocol has
+    /// two legitimate admission paths and which one lands first is a race:
+    /// direct first contact prints "standing is committed" (replica/wiring),
+    /// the announce-redeem park path prints "resident: standing granted".
+    /// Waiting on either is the semantic event the resident tests gate on.
+    pub fn wait_admitted(&mut self, idx: usize, timeout: Duration) {
+        let markers = ["standing is committed", "resident: standing granted"];
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
+            if markers.iter().any(|m| find_marker(&text, m).is_some()) {
+                return;
+            }
+            let exited = node.child.try_wait().expect("poll node").is_some();
+            if exited || Instant::now() >= deadline {
+                let verb = if exited { "exited" } else { "timed out" };
+                panic!(
+                    "network-shape node idx {idx} {verb} without printing any of \
+                     {markers:?};\n{}",
+                    self.all_log_tails(60),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
+    /// wait for node `idx` to exit ON ITS OWN (e.g. the fail-loud FATAL path)
+    /// and reap it — the [`Cluster::wait_exit`] mirror.
+    pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let node = self.nodes[idx].as_mut().expect("node is running");
+            if node.child.try_wait().expect("poll node").is_some() {
+                self.nodes[idx] = None;
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "network-shape node idx {idx} did not exit within {timeout:?};\n{}",
+                self.all_log_tails(40)
+            );
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -433,7 +566,6 @@ impl Cluster {
             advertised: peer_ids.iter().map(|_| None).collect(),
             bootstrap_addr_override: None,
             wireguard: false,
-            wireguard_socket: false,
             extra_toml: Vec::new(),
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
@@ -485,11 +617,6 @@ impl Cluster {
                 "wireguard_listen = \"127.0.0.1:{}\"\n",
                 self.p2p_ports[idx]
             ));
-            cfg.push_str(if self.wireguard_socket {
-                "wireguard_effect = \"socket\"\n"
-            } else {
-                "wireguard_effect = \"fake\"\n"
-            });
         }
         for line in &self.extra_toml {
             cfg.push_str(line);
@@ -507,14 +634,15 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&cfg)
             .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(err))
             .spawn()
-            .expect("spawn ducktape-node");
+            .expect("spawn ducktape");
         self.nodes[idx] = Some(NodeProc { id, child, log });
     }
 
@@ -606,7 +734,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&path)
             .stdout(Stdio::from(out))
@@ -626,13 +755,13 @@ impl Cluster {
         self.peer_ids.len() - 1
     }
 
-    /// run a ducktape-node VERB (invite-accept, admit, ...) to completion and
+    /// run a ducktape VERB (resident accept, admit, ...) to completion and
     /// return (success, combined output).
     pub fn run_verb(&self, args: &[&str]) -> (bool, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
             .args(args)
             .output()
-            .expect("run ducktape-node verb");
+            .expect("run ducktape verb");
         (
             out.status.success(),
             format!(
@@ -676,7 +805,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}-sync.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape-node"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+            .arg("run")
             .arg("--config")
             .arg(&cfg)
             .arg("--sync-only")
@@ -740,32 +870,57 @@ impl Cluster {
     /// process start).
     pub fn rpc(&self, idx: usize, req: serde_json::Value) -> serde_json::Value {
         let port = self.rpc_ports[idx];
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let stream = loop {
-            match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(s) => break s,
-                Err(e) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
-                        self.all_log_tails(40)
-                    );
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        };
-        let mut stream = stream;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(15)))
-            .expect("rpc read timeout");
         let mut line = serde_json::to_string(&req).expect("rpc request serializes");
         line.push('\n');
-        stream.write_all(line.as_bytes()).expect("rpc write");
-        let mut reply = String::new();
-        BufReader::new(stream)
-            .read_line(&mut reply)
-            .expect("rpc read");
-        serde_json::from_str(reply.trim()).expect("rpc reply is json")
+        let retryable = req["cmd"] == "query";
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            // the listener is up before the pump — connecting retries for
+            // every cmd (nothing has been sent yet, so retrying is safe).
+            let connect_deadline = Instant::now() + Duration::from_secs(30);
+            let stream = loop {
+                match TcpStream::connect(("127.0.0.1", port)) {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        assert!(
+                            Instant::now() < connect_deadline,
+                            "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                            self.all_log_tails(40)
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+            };
+            let mut stream = stream;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(if retryable { 15 } else { 60 })))
+                .expect("rpc read timeout");
+            stream.write_all(line.as_bytes()).expect("rpc write");
+            let mut reply = String::new();
+            match BufReader::new(stream).read_line(&mut reply) {
+                Ok(n) if n > 0 => {
+                    return serde_json::from_str(reply.trim()).expect("rpc reply is json");
+                }
+                res => {
+                    // a query is idempotent: reconnect and resend across the
+                    // windows where the listener answers connects but the node
+                    // cannot reply yet (a promotion reboot, an epoch-cutover
+                    // engine restart). a submit is NEVER resent — a duplicate
+                    // could double-apply — it gets one long read window above.
+                    let why = match res {
+                        Ok(_) => "connection closed before a reply line".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    if !retryable || Instant::now() >= deadline {
+                        panic!(
+                            "rpc to node idx {idx} (port {port}) failed: {why}; request: {req};\n{}",
+                            self.all_log_tails(60)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            }
+        }
     }
 
     /// submit an op via node `idx`'s rpc and assert the lane accepted it
@@ -888,90 +1043,20 @@ pub fn http_request(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> (u16, serde_json::Value) {
-    use std::io::Read as _;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("app-surface read timeout");
-    let body_bytes = body
-        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-        .unwrap_or_default();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body_bytes.len()
-    );
-    stream.write_all(req.as_bytes()).expect("app-surface write");
-    stream
-        .write_all(&body_bytes)
-        .expect("app-surface write body");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("app-surface read");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let payload = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .and_then(|b| serde_json::from_str(b.trim()).ok())
-        .unwrap_or(serde_json::Value::Null);
-    (status, payload)
+    nettest::http_json(port, method, path, body)
 }
 
 /// GET a raw TEXT body from an app-surface port — the non-json twin of
 /// [`http_request`], for bodies like the Prometheus `/metrics` exposition.
 pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
-    use std::io::Read as _;
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("app-surface connect");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .expect("app-surface read timeout");
-    let req =
-        format!("GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).expect("app-surface write");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("app-surface read");
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let body = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_string();
-    (status, body)
+    nettest::http_text(port, "GET", path)
 }
 
-/// poll `probe` every 300ms until it returns `Some`, or panic with `what`
-/// after `timeout`. the standard shape for "submitted, now wait for it to
-/// finalize and become readable".
-pub fn poll_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(v) = probe() {
-            return v;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(300));
-    }
-}
+pub use nettest::poll_until;
 
-/// allocate `n` distinct free localhost ports by holding all the listeners at
-/// once (sequential bind-drop could hand the same port back twice).
-fn alloc_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe"))
-        .collect();
-    listeners
-        .iter()
-        .map(|l| l.local_addr().expect("probe addr").port())
-        .collect()
-}
+// `n` distinct free localhost ports, collision-safe (holds every listener at
+// once — sequential bind-drop could hand the same port back twice).
+use nettest::alloc_ports;
 
 fn find_marker(text: &str, marker: &str) -> Option<String> {
     text.lines().find_map(|line| {

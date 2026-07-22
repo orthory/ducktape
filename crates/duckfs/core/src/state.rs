@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use sha2::{Digest as _, Sha256};
 
 use crate::codec::{Reader, push_string, push_u32};
-use crate::objects::ObjectId;
+use crate::objects::{Kind, ObjectId};
 use crate::wire::{HISTORY_WINDOW, MAX_PINS, MAX_STAGING_ENTRIES, MAX_WATCHES};
 
 /// a named pin: the snapshot it protects from gc and the owner allowed to remove
@@ -224,5 +224,91 @@ pub fn root_bytes(r: &Refs) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// the wasm-guest's per-block object index (`Fs::commit_block`'s
+/// `Pending::object_ids` twin), canonically encoded so it round-trips through
+/// the guest's staged-only `__block_objects` state lane. layout (all
+/// little-endian; ids raw 32 B; digest-ascending, the `BTreeMap` order):
+///
+/// ```text
+/// u32 count ‖ count × (id[32] ‖ kind-tag u8 ‖ len u64)
+/// ```
+///
+/// this NEVER enters the module root or the wire — the native module keeps this
+/// index in-memory across a block, so it is per-node bookkeeping the guest
+/// re-derives deterministically every dispatch. it exists only because an
+/// adapter guest is rebuilt per dispatch and must reconstruct the block-local
+/// index a later same-block op's availability/dedup reads (see
+/// `files::guest`). kept canonical (encode iterates the sorted map) so replay is
+/// deterministic across nodes.
+pub fn encode_block_objects(index: &BTreeMap<ObjectId, (Kind, u64)>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + index.len() * (32 + 1 + 8));
+    push_u32(&mut out, index.len() as u32);
+    for (id, (kind, len)) in index {
+        out.extend_from_slice(id);
+        out.push(kind.tag());
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    out
+}
+
+/// decode a `__block_objects` image [`encode_block_objects`] produced. strict
+/// like every duckfs frame (bounds-checked reads, whole-input `finish`, an
+/// unknown kind tag rejects); inserting into a `BTreeMap` re-canonicalizes
+/// order, so a decode is idempotent under re-encode. not a trust boundary (the
+/// guest reads back its own staged write), but strict-decoded for crate
+/// consistency and to fail loud on a torn value.
+pub fn decode_block_objects(bytes: &[u8]) -> Result<BTreeMap<ObjectId, (Kind, u64)>, String> {
+    let mut r = Reader::new("block objects", bytes);
+    let count = r.u32()?;
+    let mut index = BTreeMap::new();
+    for _ in 0..count {
+        let id = r.bytes32()?;
+        let kind = Kind::from_u8(r.u8()?)
+            .ok_or_else(|| "files: block objects unknown kind tag".to_string())?;
+        let len = r.u64()?;
+        index.insert(id, (kind, len));
+    }
+    r.finish()?;
+    Ok(index)
+}
+
 // the cursor codec (push helpers + the strict [`Reader`]) is shared with
 // `objects.rs` via `crate::codec` — one grammar, two frames, zero drift.
+
+// pure core — builds under `--no-default-features` too.
+#[cfg(test)]
+mod block_objects_tests {
+    use super::{decode_block_objects, encode_block_objects};
+    use crate::objects::{Kind, object_id};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn block_objects_round_trip_empty_and_multi_entry() {
+        // empty index: a lone count of 0, decodes back to the empty map.
+        let empty = BTreeMap::new();
+        assert_eq!(decode_block_objects(&encode_block_objects(&empty)).unwrap(), empty);
+
+        // multi-entry across kinds; decode re-canonicalizes into the same map.
+        let mut index = BTreeMap::new();
+        index.insert(object_id(Kind::Chunk, b"a"), (Kind::Chunk, 1u64));
+        index.insert(object_id(Kind::File, b"bb"), (Kind::File, 2u64));
+        index.insert(object_id(Kind::Snapshot, b"ccc"), (Kind::Snapshot, 3u64));
+        let bytes = encode_block_objects(&index);
+        assert_eq!(decode_block_objects(&bytes).unwrap(), index);
+    }
+
+    #[test]
+    fn block_objects_decode_rejects_unknown_kind_and_trailing_bytes() {
+        let mut index = BTreeMap::new();
+        index.insert(object_id(Kind::Chunk, b"x"), (Kind::Chunk, 1u64));
+        let mut bytes = encode_block_objects(&index);
+        // corrupt the kind tag byte (right after the 32-byte id, after the u32 count).
+        bytes[4 + 32] = 0xEE;
+        assert!(decode_block_objects(&bytes).unwrap_err().contains("unknown kind tag"));
+
+        // trailing bytes reject at finish.
+        let mut trailing = encode_block_objects(&index);
+        trailing.push(0);
+        assert!(decode_block_objects(&trailing).unwrap_err().contains("trailing bytes"));
+    }
+}

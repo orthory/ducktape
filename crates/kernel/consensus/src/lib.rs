@@ -65,8 +65,7 @@ use commonware_resolver::{Consumer as ResolverConsumer, Delivery, Resolver as _}
 
 mod valset_orchestrator;
 pub use valset_orchestrator::{
-    BoundaryUpgrade, EpochMembership, ObservationOutcome, PendingUpgrade, RespawnPlan,
-    ScheduledCutover, UpgradeVerdict, ValsetOrchestrator,
+    EpochMembership, ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchestrator,
 };
 
 /// the concrete digest the consensus lane orders over: a sha256 of the frame
@@ -115,6 +114,147 @@ pub fn digest_of(bytes: &[u8]) -> Digest {
     let mut hasher = Sha256::default();
     hasher.update(bytes);
     hasher.finalize()
+}
+
+// ============================================================================
+// the mesh carrier — the swappable p2p transport bundle a live engine consumes.
+// ============================================================================
+
+/// the p2p transport bundle a single live simplex engine consumes: the FIVE
+/// channel pairs [`SimplexOrderer::spawn_with_carrier`] wires into `engine.start`
+/// and the resolver (vote / certificate / resolver / payload / fetch), plus the
+/// `provider`/`blocker` the payload-fetch backstop keys on. This is the *named
+/// bundle* of what `bin/node`'s boot path produces per epoch — the discovery
+/// network registrations and the oracle — abstracted so a test can substitute an
+/// in-process `simulated::Network` for the real encrypted-TCP mesh WITHOUT
+/// touching one byte of ordering or wire framing.
+///
+/// - Real arm: `bin/node`'s discovery registrations — a pre-registered channel
+///   bank slot + the `authenticated::discovery` oracle (implemented at the
+///   bin/node boundary, where the per-epoch slot is consumed).
+/// - Sim arm: [`SimMesh`] over commonware `simulated::Network`, behind feature
+///   `sim` — promotion of the wiring `consensus/tests` already use, not
+///   invention.
+///
+/// The five channels are homogeneous (one [`Sender`](commonware_p2p::Sender) /
+/// [`Receiver`](commonware_p2p::Receiver) type across both arms), so the bundle
+/// is one `Sender`/`Receiver` associated pair rather than five identical ones.
+/// Each accessor is `&mut self` and hands its pair out BY VALUE (moved into the
+/// engine): a carrier yields each of its five channels exactly once.
+pub trait MeshCarrier {
+    /// the outbound half every channel shares. The payload relay clones it and
+    /// spawns it across tasks, hence `Clone + Send + Sync + 'static`.
+    type Sender: commonware_p2p::Sender<PublicKey = commonware_cryptography::ed25519::PublicKey>
+        + Clone
+        + Send
+        + Sync
+        + 'static;
+    /// the inbound half every channel shares. The eager payload drain and the
+    /// resolver fetch engine move it into spawned tasks, hence `Send + 'static`.
+    type Receiver: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>
+        + Send
+        + 'static;
+    /// the resolver's fetch-candidate provider (the oracle's peer manager).
+    type Provider: commonware_p2p::Provider<PublicKey = commonware_cryptography::ed25519::PublicKey>;
+    /// the peer blocker (the oracle's control) — cloned into relay + fetch.
+    type Blocker: commonware_p2p::Blocker<PublicKey = commonware_cryptography::ed25519::PublicKey>;
+
+    /// vote channel — `engine.start`'s first positional argument.
+    fn vote(&mut self) -> (Self::Sender, Self::Receiver);
+    /// certificate channel — `engine.start`'s second positional argument.
+    fn certificate(&mut self) -> (Self::Sender, Self::Receiver);
+    /// resolver channel — `engine.start`'s third positional argument.
+    fn resolver(&mut self) -> (Self::Sender, Self::Receiver);
+    /// eager payload-gossip channel the [`ConsensusRelay`] broadcasts on.
+    fn payload(&mut self) -> (Self::Sender, Self::Receiver);
+    /// lazy catch-up fetch channel the `commonware_resolver` engine runs on.
+    fn fetch(&mut self) -> (Self::Sender, Self::Receiver);
+    /// the resolver's fetch-candidate provider.
+    fn provider(&self) -> Self::Provider;
+    /// the peer blocker.
+    fn blocker(&self) -> Self::Blocker;
+}
+
+#[cfg(feature = "sim")]
+pub use sim_carrier::SimMesh;
+
+/// the mesh-carrier SIM arm — an in-process [`MeshCarrier`] over commonware
+/// `simulated::Network`, promoting the wiring the consensus tests already use.
+#[cfg(feature = "sim")]
+mod sim_carrier {
+    use super::MeshCarrier;
+    use commonware_cryptography::ed25519;
+    use commonware_p2p::simulated::{Control, Manager, Oracle, Receiver, Sender};
+    use commonware_runtime::{Clock, Quota};
+
+    type Pk = ed25519::PublicKey;
+    type Pair<E> = (Sender<Pk, E>, Receiver<Pk>);
+
+    /// a single validator's in-process transport, registered on one shared
+    /// `simulated::Network`. Holds its five channel pairs (handed out once each)
+    /// plus the oracle + identity from which `provider`/`blocker` derive — the
+    /// exact values `payload_fetch_late_join.rs` passes to the loose-channel
+    /// spawn, now bundled behind the carrier seam.
+    pub struct SimMesh<E: Clock> {
+        vote: Option<Pair<E>>,
+        certificate: Option<Pair<E>>,
+        resolver: Option<Pair<E>>,
+        payload: Option<Pair<E>>,
+        fetch: Option<Pair<E>>,
+        oracle: Oracle<Pk, E>,
+        me: Pk,
+    }
+
+    impl<E: Clock> SimMesh<E> {
+        /// register this validator's five engine channels (0..=4) from the shared
+        /// oracle — the sim analog of `bin/node`'s pre-registered channel bank.
+        pub async fn register(oracle: &Oracle<Pk, E>, me: Pk, quota: Quota) -> Self {
+            let control = oracle.control(me.clone());
+            let vote = control.register(0, quota).await.expect("register vote");
+            let certificate = control.register(1, quota).await.expect("register certificate");
+            let resolver = control.register(2, quota).await.expect("register resolver");
+            let payload = control.register(3, quota).await.expect("register payload");
+            let fetch = control.register(4, quota).await.expect("register fetch");
+            Self {
+                vote: Some(vote),
+                certificate: Some(certificate),
+                resolver: Some(resolver),
+                payload: Some(payload),
+                fetch: Some(fetch),
+                oracle: oracle.clone(),
+                me,
+            }
+        }
+    }
+
+    impl<E: Clock> MeshCarrier for SimMesh<E> {
+        type Sender = Sender<Pk, E>;
+        type Receiver = Receiver<Pk>;
+        type Provider = Manager<Pk, E>;
+        type Blocker = Control<Pk, E>;
+
+        fn vote(&mut self) -> Pair<E> {
+            self.vote.take().expect("vote channel taken once")
+        }
+        fn certificate(&mut self) -> Pair<E> {
+            self.certificate.take().expect("certificate channel taken once")
+        }
+        fn resolver(&mut self) -> Pair<E> {
+            self.resolver.take().expect("resolver channel taken once")
+        }
+        fn payload(&mut self) -> Pair<E> {
+            self.payload.take().expect("payload channel taken once")
+        }
+        fn fetch(&mut self) -> Pair<E> {
+            self.fetch.take().expect("fetch channel taken once")
+        }
+        fn provider(&self) -> Manager<Pk, E> {
+            self.oracle.manager()
+        }
+        fn blocker(&self) -> Control<Pk, E> {
+            self.oracle.control(self.me.clone())
+        }
+    }
 }
 
 // ============================================================================
@@ -1542,6 +1682,69 @@ impl SimplexOrderer {
             vote,
             certificate,
             resolver,
+        )
+    }
+
+    /// stand up the production resolver-backed engine over a [`MeshCarrier`] — the
+    /// swap-ready entry point that unpacks the carrier's five channel pairs +
+    /// provider/blocker and delegates to [`SimplexOrderer::spawn_with_resolver`]
+    /// UNCHANGED. `bin/node` passes its discovery real arm; the in-process cluster
+    /// test passes [`SimMesh`] over `simulated::Network`. This is a pure named
+    /// bundle over the loose-channel spawn — same wiring, same ordering, same
+    /// frame bytes — so the transport is the only thing a mock swaps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_carrier<E, S, C>(
+        context: E,
+        scheme: S,
+        mut carrier: C,
+        me: commonware_cryptography::ed25519::PublicKey,
+        partition: String,
+        epoch: commonware_consensus::types::Epoch,
+        genesis: Digest,
+        floor: Option<Finalization<S, Digest>>,
+        store: ContentStore,
+        starve: bool,
+    ) -> Self
+    where
+        E: commonware_runtime::Spawner
+            + commonware_runtime::Clock
+            + commonware_runtime::Storage
+            + commonware_runtime::Metrics
+            + commonware_runtime::BufferPooler
+            + rand_core::CryptoRngCore
+            + Send
+            + Sync
+            + 'static,
+        S: commonware_consensus::simplex::scheme::Scheme<
+                Digest,
+                PublicKey = commonware_cryptography::ed25519::PublicKey,
+            >,
+        C: MeshCarrier,
+    {
+        let vote = carrier.vote();
+        let certificate = carrier.certificate();
+        let resolver = carrier.resolver();
+        let payload = carrier.payload();
+        let fetch = carrier.fetch();
+        let blocker = carrier.blocker();
+        let provider = carrier.provider();
+        Self::spawn_with_resolver(
+            context,
+            scheme,
+            blocker,
+            provider,
+            me,
+            partition,
+            epoch,
+            genesis,
+            floor,
+            store,
+            vote,
+            certificate,
+            resolver,
+            payload,
+            fetch,
+            starve,
         )
     }
 }

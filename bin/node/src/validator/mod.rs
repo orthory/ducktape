@@ -4,6 +4,7 @@
 
 pub(crate) mod announce;
 mod boot;
+pub(crate) mod code_announce;
 mod engine;
 mod run;
 mod wiring;
@@ -35,7 +36,6 @@ pub(crate) async fn run_validator(
     validators: Vec<ed25519::PublicKey>,
     coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     wireguard_listen: Option<std::net::SocketAddr>,
-    wireguard_effect: crate::config::WireGuardEffectKind,
     wireguard_key_file: std::path::PathBuf,
     primary_coordinator: Option<String>,
     wireguard_advertised: Option<Ingress>,
@@ -56,26 +56,35 @@ pub(crate) async fn run_validator(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
-    voice_requests: tokio::sync::mpsc::Receiver<noded::CallSessionRequest>,
+    voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    agent_provisioner: dispatch_oracle::SharedProvisioner,
     agent_dirs: capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
+    sync_monitor: statesync::monitor::ServeMonitor,
     gateway_workspace: std::path::PathBuf,
     mut recovery: Recovery<commonware_runtime::tokio::Context>,
     manifest: Option<Manifest>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
 ) {
+    metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "validator",
+        phase = "recovering",
+        node = %label
+    );
     // (host, recovered-state, next local submit seq, last checkpoint
     // ONE index fold for the whole boot (journal replay + post-reboot
     // catch-up + post-sync refreshes): its stop flag must persist across
     // phases — a later phase folding past a gap an earlier phase detected
     // would advance watermarks over the hole and hide it from the final
     // heal below.
-    let mut boot_fold = IndexFold::new(&index, blobs.clone());
+    let mut boot_fold = IndexFold::new(&index, std::sync::Arc::new(blobs.clone()));
     let (host, resumed, next_seq, prev_ckpt, recovery_manifest_for_resume) = boot::restore(
         &context,
         &index,
@@ -101,12 +110,13 @@ pub(crate) async fn run_validator(
         channel_bank,
         sync_tx,
         sync_rx,
-        lobby_tx,
-        lobby_rx,
         relay_tx,
         relay_rx,
         media_peers,
         reach_cmd,
+        gate_fwd_rx,
+        gate_fwd_keepalive,
+        gate_outcomes,
     } = wiring::wire(
         &context,
         network,
@@ -121,7 +131,6 @@ pub(crate) async fn run_validator(
         label.clone(),
         coordinated,
         wireguard_listen,
-        wireguard_effect,
         wireguard_key_file,
         chain_id,
         mesh_state_file,
@@ -138,7 +147,7 @@ pub(crate) async fn run_validator(
     let (
         sync_tx,
         sync_rx,
-        recovery,
+        mut recovery,
         host,
         resumed,
         next_seq,
@@ -179,8 +188,9 @@ pub(crate) async fn run_validator(
         channel_bank,
         gateway_book,
         blob_peers,
+        blob_client,
         sync_state_rx,
-        lobby_ingress,
+        sync_lease,
         relay_ingress,
     } = wiring::finish(
         &context,
@@ -194,10 +204,11 @@ pub(crate) async fn run_validator(
         label.clone(),
         peers.clone(),
         namespace.clone(),
-        wireguard_effect,
+        wireguard_listen.is_some(),
         overlay_slot.clone(),
         bulk_pacer.clone(),
         planes.clone(),
+        sync_monitor,
         gateway_requests,
         gateway_commands,
         gateway_workspace,
@@ -209,7 +220,6 @@ pub(crate) async fn run_validator(
         channel_bank,
         sync_tx,
         sync_rx,
-        lobby_rx,
         relay_rx,
     )
     .await;
@@ -222,12 +232,36 @@ pub(crate) async fn run_validator(
             .expect("ed25519 keys are 32 bytes");
         crate::agent_plane::spawn(
             label.clone(),
-            crate::overlay_book::socket_factory(wireguard_effect, &overlay_slot),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
+            std::sync::Arc::clone(peers),
+            me,
+            bulk_pacer.clone(),
+            planes.clone(),
+            stream_hub.run_output(),
+        );
+        // the terminal-session plane: forwards a session's output ring and
+        // ordered command log to peers, so a member on another node streams it.
+        crate::term_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
+            std::sync::Arc::clone(peers),
+            me,
+            bulk_pacer.clone(),
+            planes.clone(),
+            stream_hub.terminals(),
+            stream_hub.term_commands(),
+        );
+        // the module-code plane: serves push/pull transfers and drains the
+        // admin RPC's stage fan-outs. same overlay book as the agent plane.
+        crate::code_plane::spawn(
+            label.clone(),
+            crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
             std::sync::Arc::clone(peers),
             me,
             bulk_pacer,
             planes.clone(),
-            stream_hub.run_output(),
+            blobs.clone(),
+            code_stage_requests,
         );
     }
 
@@ -240,6 +274,17 @@ pub(crate) async fn run_validator(
         bank_base,
         channel_bank,
     );
+    // with the serve lane wired, realize code-registry swaps through the
+    // FETCHING source for the rest of this validator's life: a committed
+    // component the local store lacks is pulled from peers (ranged, verified)
+    // before a boundary can fail closed on it.
+    recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
+        blobs.clone(),
+        blob_client.clone(),
+        crate::constants::MAX_MODULE_CODE_BYTES,
+        crate::constants::BLOB_FETCH_ATTEMPTS,
+    )));
+
     let engine::EngineState {
         node,
         orchestrator,
@@ -259,6 +304,14 @@ pub(crate) async fn run_validator(
         dev_demo,
     )
     .await;
+    metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Validating);
+    tracing::info!(
+        event = "node_phase_transition",
+        role = "validator",
+        phase = "validating",
+        node = %label,
+        epoch = orchestrator.epoch()
+    );
     run::run(run::ValidatorLoopState {
         context: &context,
         node,
@@ -270,21 +323,23 @@ pub(crate) async fn run_validator(
         gateway_book,
         media_peers,
         blob_peers,
+        blob_client,
         reach_cmd,
-        lobby_tx,
         relay_tx,
         sync_state_rx,
-        lobby_ingress,
+        gate_fwd_rx,
+        gate_fwd_keepalive,
+        gate_outcomes,
         relay_ingress,
         next_seq,
         prev_ckpt,
         signer,
         label,
-        namespace,
         peers,
         validators,
         dev_demo,
         checkpoint_blocks,
+        sync_lease,
         announce_capabilities,
         sandbox,
         sandbox_capacity,
@@ -318,3 +373,66 @@ type EpochChannels = (
     MeshChannel,
 );
 type ChannelBank = Vec<Option<EpochChannels>>;
+
+/// the mesh-carrier REAL arm: one epoch's pre-registered discovery channels
+/// (a [`ChannelBank`] slot) + the [`discovery::Oracle`] the resolver keys on.
+/// This is the `authenticated::discovery` network's per-spawn transport bundle —
+/// the discovery `Network` (`MeshHead`) registers the channels into the bank
+/// before start, and this bundles one slot with the oracle at the point
+/// [`engine`](self::engine) consumes it, feeding
+/// [`consensus::SimplexOrderer::spawn_with_carrier`] the identical values the
+/// loose-channel spawn took before the seam.
+pub(super) struct DiscoveryMesh {
+    vote: Option<MeshChannel>,
+    certificate: Option<MeshChannel>,
+    resolver: Option<MeshChannel>,
+    payload: Option<MeshChannel>,
+    fetch: Option<MeshChannel>,
+    oracle: discovery::Oracle<ed25519::PublicKey>,
+}
+
+impl DiscoveryMesh {
+    pub(super) fn new(
+        slot: EpochChannels,
+        oracle: discovery::Oracle<ed25519::PublicKey>,
+    ) -> Self {
+        let (vote, certificate, resolver, payload, fetch) = slot;
+        Self {
+            vote: Some(vote),
+            certificate: Some(certificate),
+            resolver: Some(resolver),
+            payload: Some(payload),
+            fetch: Some(fetch),
+            oracle,
+        }
+    }
+}
+
+impl consensus::MeshCarrier for DiscoveryMesh {
+    type Sender = MeshSender;
+    type Receiver = MeshReceiver;
+    type Provider = discovery::Oracle<ed25519::PublicKey>;
+    type Blocker = discovery::Oracle<ed25519::PublicKey>;
+
+    fn vote(&mut self) -> MeshChannel {
+        self.vote.take().expect("vote channel taken once")
+    }
+    fn certificate(&mut self) -> MeshChannel {
+        self.certificate.take().expect("certificate channel taken once")
+    }
+    fn resolver(&mut self) -> MeshChannel {
+        self.resolver.take().expect("resolver channel taken once")
+    }
+    fn payload(&mut self) -> MeshChannel {
+        self.payload.take().expect("payload channel taken once")
+    }
+    fn fetch(&mut self) -> MeshChannel {
+        self.fetch.take().expect("fetch channel taken once")
+    }
+    fn provider(&self) -> discovery::Oracle<ed25519::PublicKey> {
+        self.oracle.clone()
+    }
+    fn blocker(&self) -> discovery::Oracle<ed25519::PublicKey> {
+        self.oracle.clone()
+    }
+}

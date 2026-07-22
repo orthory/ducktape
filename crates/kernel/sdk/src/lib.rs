@@ -15,16 +15,25 @@
 //! this crate also carries the deterministic *system api*: the [`Ctx`] a module
 //! touches during state-machine application (own-state r/w lives in `self`;
 //! read-only cross-module [`Ctx::query`]/[`Ctx::module_root`]; the deterministic
-//! [`Env`]; and intent emission via [`Ctx::emit_msg`]/[`Ctx::emit_event`]/
-//! [`Ctx::request_effect`]). the effectful node surface (real network/IO) is a
-//! separate layer and out of scope here.
+//! [`Env`]; and intent emission via [`Ctx::emit_msg`]/[`Ctx::emit_event`] — an
+//! event is ALSO the lane a host-side worker claims off-consensus work from).
+//! the effectful node surface (real network/IO) is a separate layer and out of
+//! scope here.
 //!
 //! keep this crate types + traits with no domain deps (async-trait is the one
 //! greenlit exception): everything here is a shared surface for every module.
 //! [`codec`] carries the shared zero-dep snapshot-codec primitives on the same
-//! everyone-needs-it grounds.
+//! everyone-needs-it grounds, and [`genesis_config`] the tiny codec-based
+//! GENESIS-CONFIG encoding the host and wasm guests share (per-network
+//! parameters installed into a wasm tenant's consensus store at genesis).
 
 pub mod codec;
+pub mod genesis_config;
+pub mod hash;
+pub mod staged_store;
+pub mod wire;
+
+pub use staged_store::StagedStore;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module
@@ -98,81 +107,6 @@ impl StateSyncHandle {
 pub type ModuleId = String;
 
 // ============================================================================
-// protocol-version preflight — a serializable mirror of the upgrade module's
-// pending coordinates plus the pure boot check. these types live here so the
-// recovery and state-sync manifest crates can carry a version HINT without
-// depending on the upgrade module: the authoritative version stays derivable
-// from the replayed/committed upgrade-module state and is confirmed by the
-// final app-hash compose, so a lying manifest can at worst mis-preflight a
-// node, never induce a fork.
-// ============================================================================
-
-/// the coordinates of a scheduled upgrade, mirrored for the manifests. shape
-/// matches `upgrade::ScheduledUpgrade` but carries no module dependency.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UpgradeCoords {
-    pub name: String,
-    pub activation_height: u64,
-    pub to_version: u32,
-}
-
-/// a boot-preflight refusal: the local build is too old to safely apply the
-/// blocks at or after a boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnsupportedVersion {
-    /// the highest protocol version any block at/after the boundary needs.
-    pub required_min: u32,
-    /// the highest protocol version the local build can apply
-    /// (`MAX_PROTOCOL_VERSION`).
-    pub max_supported: u32,
-}
-
-impl core::fmt::Display for UnsupportedVersion {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "this boundary needs protocol v{}; binary supports up to v{} — install the newer node binary",
-            self.required_min, self.max_supported
-        )
-    }
-}
-
-impl std::error::Error for UnsupportedVersion {}
-
-/// pure boot preflight: fail loud when the local build's `max_supported`
-/// protocol version cannot serve a boundary requiring `required_min`. the
-/// authority stays the app-hash; this only turns an opaque post-replay
-/// app-hash mismatch into an early "height needs binary vX" refusal.
-pub fn check_required_version(
-    required_min: u32,
-    max_supported: u32,
-) -> Result<(), UnsupportedVersion> {
-    if max_supported < required_min {
-        Err(UnsupportedVersion {
-            required_min,
-            max_supported,
-        })
-    } else {
-        Ok(())
-    }
-}
-
-/// the highest protocol version any block at or after a boundary needs:
-/// `to_version` once the served height has reached a pending upgrade's
-/// activation, else the boundary's `current_version`. shared so the recovery
-/// capture and the state-sync server derive the same fence.
-pub fn required_min_version(
-    current_version: u32,
-    pending: Option<&UpgradeCoords>,
-    height: u64,
-) -> u32 {
-    match pending {
-        Some(u) if height >= u.activation_height => u.to_version,
-        _ => current_version,
-    }
-}
-
-// ============================================================================
 // the deterministic system api — envelopes, env, error, ctx, module seam.
 // ============================================================================
 
@@ -180,25 +114,78 @@ pub fn required_min_version(
 /// re-dispatched by the host as a FOLLOW-UP op after the current `execute`
 /// returns — never a reentrant mutating call. payload bytes are typed later via
 /// per-module crate-root wire types; the host treats them opaquely.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Msg {
     pub target: ModuleId,
     pub payload: Vec<u8>,
 }
 
-/// an observability record a module emits via [`Ctx::emit_event`]. it LEAVES the
-/// state machine (handed to the effectful node layer) and never re-enters as a
-/// follow-up.
+/// hard cap on one envelope continuation's payload — a continuation is
+/// control-plane reentry, not a data lane (bulk bytes ride the parent op or
+/// the blob lanes), and deferred continuations commit this payload into
+/// registry state, so the cap bounds consensus state too. matches saga's
+/// `MAX_REPLY_PAYLOAD_BYTES` class.
+pub const MAX_CONTINUATION_BYTES: usize = 64 * 1024;
+
+/// hard cap on an op's declared output ([`Ctx::set_output`]) — the bytes a
+/// continuation's relay carries on the `Ok` arm. matches saga's
+/// `MAX_RESULT_BYTES` class; an oversized output is a deterministic rejection
+/// of the op, never a truncation.
+pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// hard cap on the relay's `Err` string — a parent rejection reason that
+/// rides into a consensus op via the continuation lane. matches saga's
+/// `MAX_ERROR_BYTES`; over-cap reasons are truncated on a char boundary
+/// (identically on every node).
+pub const MAX_RELAY_ERROR_BYTES: usize = 16 * 1024;
+
+/// one envelope continuation: the op dispatched after the enclosing
+/// transaction's semantic completion. DEPTH IS EXACTLY 1 BY SHAPE — this body
+/// deliberately has no continuation slot of its own, so nesting is
+/// unrepresentable rather than merely validated; module payloads are opaque
+/// and continuations exist only at the envelope layer, so a payload cannot
+/// smuggle one either. wire-facing surfaces name the field `continue`
+/// (a Rust keyword, hence `continuation` here).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Continuation {
+    pub target: ModuleId,
+    pub payload: Vec<u8>,
+}
+
+/// the relay slot a released continuation's dispatch carries — how the parent
+/// op's identity and outcome reach the continuation target WITHOUT splicing
+/// bytes into the opaque continuation payload. present iff the current
+/// dispatch IS a released continuation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relay {
+    /// the AUTHENTICATED composer of the envelope: the parent frame's verified
+    /// signature origin, carried by the host — never module-supplied bytes.
+    /// the identity a target module MUST authorize against (see
+    /// [`Ctx::author_origin`]); `Origin`-typed for forward-compat with future
+    /// module-authored envelopes.
+    pub author: Origin,
+    /// the parent op's target module — the sending LANE of the continuation
+    /// (`Origin::Module(parent_target)`), deliberately distinct from `author`.
+    pub parent_target: ModuleId,
+    /// the parent envelope's content id (frame id), for correlation.
+    pub parent_frame: [u8; 32],
+    /// the parent's outcome. `Ok`: the parent's declared output (empty unless
+    /// it called [`Ctx::set_output`]). `Err`: the parent's deterministic
+    /// rejection string, or a deferred resolution's error.
+    pub outcome: Result<Vec<u8>, String>,
+}
+
+/// a record a module emits via [`Ctx::emit_event`]. it LEAVES the state machine
+/// (handed to the effectful node layer) and never re-enters as a follow-up. one
+/// lane, two consumer classes: observability readers, and the host-owned worker
+/// seam, which try-decodes each event and claims the ones that request
+/// off-consensus work (a worker's result returns as an ORDINARY submitted op —
+/// the oracle-as-op pattern).
 #[derive(Clone, Debug)]
 pub struct Event {
     pub source: ModuleId,
     pub payload: Vec<u8>,
 }
-
-/// a request for an effectful, non-deterministic side effect (data channel,
-/// tunnel, transport upgrade). STUB this slice: the host only collects it.
-#[derive(Clone, Debug)]
-pub struct Effect(pub Vec<u8>);
 
 /// who triggered the current dispatch. varies across follow-ups: the root op is
 /// `External`/`System`; an emitted follow-up is `Module(emitter_id)`.
@@ -246,6 +233,53 @@ pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// the field separator inside composite module keys (dispatch keys and saga
+/// ids, tagging scope keys): the ASCII unit separator. rejected inside a
+/// caller-chosen id by [`validate_id`] so a crafted id can never forge another
+/// composite key.
+pub const KEY_SEP: char = '\x1f';
+
+/// validate a caller-chosen id: non-empty, within `max_bytes`, and free of the
+/// reserved [`KEY_SEP`] — the shared guard for keys that compose with
+/// [`KEY_SEP`]. shared by dispatch and tagging. NOT agent's `validate_agent_id`,
+/// which is a deliberately separate DNS-label admission rule (an agent id must
+/// round-trip as `<id>@agents.duck`), kept distinct so neither rule can
+/// silently move the other.
+pub fn validate_id(field: &str, value: &str, max_bytes: usize) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::Module(format!("{field} must be non-empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(Error::Module(format!(
+            "{field} is {} bytes; the cap is {max_bytes}",
+            value.len()
+        )));
+    }
+    if value.contains(KEY_SEP) {
+        return Err(Error::Module(format!(
+            "{field} must not contain the reserved separator"
+        )));
+    }
+    Ok(())
+}
+
+/// the "re-derive root, compare, all-or-nothing" guard every in-memory module's
+/// `install` shares: a decoded snapshot is adopted ONLY when its recomputed
+/// root equals the expected (consensus-committed) root. `actual` is the root
+/// the module rehashed from the decoded candidate; a mismatch is a byzantine
+/// peer serving bytes that do not hash to the committed state, refused so the
+/// caller mutates nothing. this is a state-sync integrity check, never a
+/// consensus input — the verdict (accept/reject) is what matters, and it is
+/// identical to the per-module guards this replaces.
+pub fn verify_snapshot_root(actual: StateRoot, expected: StateRoot) -> Result<(), Error> {
+    if actual != expected {
+        return Err(Error::Module(format!(
+            "snapshot root mismatch: recomputed {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// the deterministic environment handed to `execute`. block-constant fields
 /// (`height`, `consensus_time`) are identical across every dispatch in one
 /// `submit`; `origin` and `me` vary per dispatch. NOT wall clock, NOT per-node.
@@ -259,13 +293,6 @@ pub struct Env {
     pub origin: Origin,
     /// the module being dispatched.
     pub me: ModuleId,
-    /// the effective protocol version for this block — a verbatim copy of
-    /// `BlockContext.protocol_version`, stamped by the host drain and identical
-    /// across the root op and every FIFO follow-up in one `submit`. this is the
-    /// ONLY version signal a module may branch on inside `execute`/`query`; it is
-    /// a read-only dispatch input and is NEVER folded into any `root()` preimage
-    /// or op/wire encoding. defaults to the baseline version (`0`).
-    pub protocol_version: u32,
 }
 
 /// a resolver-backed module's committed sync target at one boundary.
@@ -344,11 +371,68 @@ pub trait Ctx {
     /// executed reentrantly.
     fn emit_msg(&mut self, msg: Msg);
 
-    /// emit an observability event — leaves the state machine.
+    /// emit an event — leaves the state machine (observability, and the lane
+    /// the host-side worker seam claims off-consensus work from).
     fn emit_event(&mut self, ev: Event);
 
-    /// request an effectful side effect — STUB this slice (collected only).
-    fn request_effect(&mut self, eff: Effect);
+    /// the relay slot: `Some` iff the current dispatch is a released envelope
+    /// continuation. default `None` — read-only query ctxs and hosts without
+    /// the continuation lane never carry one.
+    fn relay(&self) -> Option<&Relay> {
+        None
+    }
+
+    /// declare this op's output — the bytes a continuation's relay carries on
+    /// its `Ok` arm. staged with the op (rolled back on rejection); capped at
+    /// [`MAX_OUTPUT_BYTES`], and exceeding the cap is a deterministic
+    /// rejection of the op. last write wins within one dispatch. the default
+    /// discards: a ctx without the continuation lane has no relay to feed,
+    /// and "no output" is the specified default (`Ok(vec![])`).
+    fn set_output(&mut self, _bytes: Vec<u8>) {}
+
+    /// the identity to AUTHORIZE against: the relay's author for a
+    /// continuation dispatch, the dispatch origin otherwise — one call,
+    /// correct in both, so no module keys authz on the module-origin LANE of
+    /// a continuation by accident (that would make `continue` privilege
+    /// escalation: any external key could reach module-origin-gated arms by
+    /// bouncing off an innocent parent op).
+    fn author_origin(&self) -> &Origin {
+        match self.relay() {
+            Some(r) => &r.author,
+            None => &self.env().origin,
+        }
+    }
+}
+
+/// the deterministic merkle-KV storage surface a disk-backed module touches —
+/// the HOST constructs the concrete store (qmdb today) and INJECTS this handle,
+/// so the module is pure logic over it and never names a storage crate. keys
+/// are the module's own 32-byte digests (the module owns its logical→digest
+/// hashing and its staged overlay); the handle owns durability, the merkle
+/// commitment, and the byte-level sync serve surface.
+#[async_trait::async_trait(?Send)]
+pub trait MerkleStore {
+    /// read one hashed key from COMMITTED state.
+    async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
+
+    /// apply + durably commit ONE batch of hashed-key writes (`None` = delete)
+    /// at a block boundary. after this returns, [`MerkleStore::root`] reflects
+    /// the batch.
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), Error>;
+
+    /// the merkle root over committed state — the module's `root()` verbatim.
+    fn root(&self) -> StateRoot;
+
+    /// the committed resolver sync target (root + op-log bounds) behind
+    /// [`StateSyncHandle::ResolverBacked`].
+    async fn sync_target(&self) -> Result<ResolverSyncTarget, Error>;
+
+    /// serve one byte-level state-sync request against committed state (the
+    /// qmdb sync wire; request/response bytes are handle-defined).
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error>;
 }
 
 /// the host-facing surface of a feature module: identity, authenticated root, the
@@ -378,16 +462,32 @@ pub trait Module {
     /// the global app-hash after a block applies.
     fn root(&self) -> StateRoot;
 
+    /// self-contained committed-state snapshot bytes, for the in-memory
+    /// (map-backed) module cohort whose whole state fits one installable blob.
+    /// override this — returning `Some(self.snapshot())` — instead of
+    /// `state_sync_handle`; the default `state_sync_handle` wraps these bytes in
+    /// [`StateSyncHandle::SnapshotBytes`] for you, so a module declares WHAT it
+    /// can serve without also knowing the handle enum. `None` (the default) means
+    /// no byte snapshot; a resolver-backed (qmdb) module overrides
+    /// `state_sync_handle` directly instead.
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// describe the committed-state sync surface for this module.
     ///
     /// This is called by snapshot orchestration after the host has reached a
-    /// block boundary. The default is explicit non-coverage; modules that expose
-    /// installable snapshot bytes or a resolver-backed sync path should override
-    /// it so a live node can advertise exactly what it can serve.
+    /// block boundary. The default reports [`StateSyncHandle::SnapshotBytes`]
+    /// when [`Module::snapshot_bytes`] is `Some` (the in-memory cohort), else
+    /// explicit non-coverage; a resolver-backed module overrides this directly
+    /// so a live node can advertise exactly what it can serve.
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::Unsupported {
-            reason: "module did not declare a state-sync handle".into(),
-        })
+        match self.snapshot_bytes() {
+            Some(bytes) => Ok(StateSyncHandle::SnapshotBytes(bytes)),
+            None => Ok(StateSyncHandle::Unsupported {
+                reason: "module did not declare a state-sync handle".into(),
+            }),
+        }
     }
 
     /// serve one byte-level state-sync request against COMMITTED state.
@@ -478,18 +578,6 @@ pub trait Module {
         None
     }
 
-    /// ACTIVATION HOOK. the host drives this across the whole registry at the
-    /// finalized activation boundary (from the orchestrator's agreed
-    /// `RespawnPlan::boundary_version`) so a `root()`-changing dual-path module
-    /// selects its NEW branch deterministically at `H` (design §4). `version` is
-    /// the effective boundary protocol version — an agreed, non-hashed DISPATCH
-    /// input: a module caches it as a branch selector but MUST NEVER fold it into
-    /// any `root()`/`snapshot()` preimage or op encoding. the default is a no-op:
-    /// version-invariant modules ignore it; only dual-path modules (forge)
-    /// override it. driven ONLY by the agreed boundary version, so every honest
-    /// node sets the identical value — never a wall-clock/IO/RNG input.
-    fn set_active_version(&mut self, _version: u32) {}
-
     /// this module's currently-running CODE identity: the 32-byte content hash
     /// (sha256) of the component bytes it will execute, or `None` for a native
     /// module whose code IS the node binary (nothing to hot-swap). the host
@@ -519,20 +607,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn check_required_version_boundary() {
-        // max == required passes (the boundary needs exactly what we support).
-        assert!(check_required_version(3, 3).is_ok());
-        // max > required passes.
-        assert!(check_required_version(3, 4).is_ok());
-        // max < required fails loud.
-        let err = check_required_version(4, 3).expect_err("under-versioned build");
-        assert_eq!(err.required_min, 4);
-        assert_eq!(err.max_supported, 3);
-        assert!(err.to_string().contains("v4"));
-        assert!(err.to_string().contains("v3"));
-    }
-
-    #[test]
     fn origin_actor_string_convention() {
         assert_eq!(Origin::Module("chat".into()).actor_string(), "chat");
         assert_eq!(
@@ -551,19 +625,67 @@ mod tests {
     }
 
     #[test]
-    fn required_min_version_fencepost() {
-        let pending = UpgradeCoords {
-            name: "v2".into(),
-            activation_height: 100,
-            to_version: 2,
-        };
-        // no pending upgrade: always the current version.
-        assert_eq!(required_min_version(1, None, 100), 1);
-        // below activation: current version.
-        assert_eq!(required_min_version(1, Some(&pending), 99), 1);
-        // exactly at activation: to_version.
-        assert_eq!(required_min_version(1, Some(&pending), 100), 2);
-        // past activation: to_version.
-        assert_eq!(required_min_version(1, Some(&pending), 250), 2);
+    fn validate_id_guard() {
+        assert!(validate_id("id", "ok", 128).is_ok());
+        assert!(
+            validate_id("id", "", 128)
+                .unwrap_err()
+                .to_string()
+                .contains("must be non-empty")
+        );
+        assert!(
+            validate_id("id", "toolong", 3)
+                .unwrap_err()
+                .to_string()
+                .contains("the cap is 3")
+        );
+        let with_sep = format!("a{KEY_SEP}b");
+        assert!(
+            validate_id("id", &with_sep, 128)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved separator")
+        );
     }
+
+    #[test]
+    fn verify_snapshot_root_guard() {
+        let a = StateRoot([1u8; ROOT_LEN]);
+        let b = StateRoot([2u8; ROOT_LEN]);
+        assert!(verify_snapshot_root(a, a).is_ok());
+        let err = verify_snapshot_root(a, b).unwrap_err().to_string();
+        assert!(err.contains("snapshot root mismatch"), "{err}");
+    }
+
+    /// the default `state_sync_handle` reflects `snapshot_bytes`: `Some` ->
+    /// `SnapshotBytes`, `None` -> `Unsupported` — the in-memory cohort overrides
+    /// only `snapshot_bytes` and the wrapping is shared.
+    #[test]
+    fn snapshot_bytes_drives_default_handle() {
+        struct Snap(Option<Vec<u8>>);
+        #[async_trait::async_trait(?Send)]
+        impl Module for Snap {
+            fn id(&self) -> ModuleId {
+                "snap".into()
+            }
+            fn root(&self) -> StateRoot {
+                StateRoot::ZERO
+            }
+            fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+                self.0.clone()
+            }
+            async fn execute(&mut self, _: &mut dyn Ctx, _: &Msg) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            Snap(Some(vec![1, 2, 3])).state_sync_handle().unwrap(),
+            StateSyncHandle::SnapshotBytes(vec![1, 2, 3])
+        );
+        assert!(matches!(
+            Snap(None).state_sync_handle().unwrap(),
+            StateSyncHandle::Unsupported { .. }
+        ));
+    }
+
 }

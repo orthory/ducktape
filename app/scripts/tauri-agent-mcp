@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Repo-local MCP entrypoint for the released tauri-agent package.
-set -euo pipefail
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$repo_root/app"
-exec bunx --bun --no-install tauri-agent-mcp "$@"

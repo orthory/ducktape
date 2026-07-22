@@ -13,19 +13,43 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use recovery::Manifest;
 
-use super::announce::{CapabilityAnnouncer, ReadinessSignaller};
-use crate::constants::{DRAIN_TICK, MAX_PROTOCOL_VERSION};
-use crate::host_reads::read_upgrade_version_fields;
-use crate::host_state::run_output_sink;
+use super::announce::CapabilityAnnouncer;
+use crate::constants::DRAIN_TICK;
+use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{oracle_pool, relay_runtime, voice_plane};
+use crate::{lobby, oracle_pool, relay_runtime, voice_plane};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
+
+/// a join gate held open awaiting its `Redeem` frame's consensus fate (ADR
+/// §3.2). the member submitted the redemption and holds the joiner's outcome
+/// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
+/// the settle-then-answer seam, mirroring `pending_relays`. no mesh `peer`
+/// rides here any more (join ADR §4): the answer goes back over the tunnel
+/// doorbell, read from the shared map on the joiner's next retransmit.
+struct GatePending {
+    /// the joiner key: clears the `gating` in-flight index and keys the
+    /// outcome write on resolution.
+    joiner: Vec<u8>,
+    /// the packed coord cap to deliver on `Admitted` (private coordination).
+    cap: Option<Vec<u8>>,
+    /// answer `Busy` (non-terminal) once past this instant (§3.2 timeout).
+    deadline: std::time::SystemTime,
+}
+
+/// write a resolved gate outcome where the intro doorbell reads it — the
+/// shared map the joiner's next retransmit is answered from (join ADR §4).
+fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroReply) {
+    outcomes
+        .lock()
+        .expect("gate outcomes lock")
+        .insert(joiner, reply);
+}
 
 /// The long-lived state owned by the validator event loop.
 ///
@@ -42,21 +66,32 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    pub(super) lobby_tx: super::MeshSender,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
-    pub(super) lobby_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
+    /// the join GATE's forward lane from the intro doorbell (join ADR §4):
+    /// verified gate requests the reachability plane rang through.
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    /// a never-sending clone of the forward lane's sender, held so the select
+    /// arm stays PENDING (instead of None-spinning) when no reachability
+    /// plane was wired to ring the doorbell.
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    /// where the drain writes each settled gate outcome; the doorbell reads
+    /// it on the joiner's next retransmit.
+    pub(super) gate_outcomes: GateOutcomes,
     pub(super) relay_ingress: futures::channel::mpsc::Receiver<(ed25519::PublicKey, Vec<u8>)>,
     pub(super) next_seq: u64,
     pub(super) prev_ckpt: (Option<u64>, u64),
     pub(super) signer: ed25519::PrivateKey,
     pub(super) label: String,
-    pub(super) namespace: Vec<u8>,
     pub(super) peers: Vec<ed25519::PublicKey>,
     pub(super) validators: Vec<ed25519::PublicKey>,
     pub(super) dev_demo: bool,
     pub(super) checkpoint_blocks: u64,
+    /// sync retention lease (unix secs of the last served state-sync request)
+    /// — the drain defers oplog pruning while it is fresh.
+    pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) announce_capabilities: bool,
     pub(super) sandbox: capability_host::SandboxBackend,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
@@ -65,7 +100,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
-    pub(super) agent_provisioner: Option<dispatch_oracle::SharedProvisioner>,
+    pub(super) agent_provisioner: dispatch_oracle::SharedProvisioner,
     pub(super) agent_dirs: capability_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status_public_key: String,
@@ -83,18 +118,20 @@ struct ValidatorRuntime<'a> {
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
+    blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    lobby_tx: super::MeshSender,
     relay_tx: super::MeshSender,
+    gate_outcomes: GateOutcomes,
+    _gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
     next_seq: u64,
     prev_ckpt: (Option<u64>, u64),
     signer: ed25519::PrivateKey,
     label: String,
-    namespace: Vec<u8>,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     dev_demo: bool,
     checkpoint_blocks: u64,
+    sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     announce_capabilities: bool,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
@@ -109,26 +146,34 @@ struct ValidatorRuntime<'a> {
         node::FrameId,
         (
             futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::Instant,
+            std::time::SystemTime,
         ),
     >,
     pending_relays:
-        std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::Instant)>,
+        std::collections::HashMap<node::FrameId, (ed25519::PublicKey, std::time::SystemTime)>,
+    /// join gates held open awaiting their `Redeem` frame's consensus fate,
+    /// keyed by frame id (the settle-then-answer seam, resolved in `on_drain`).
+    pending_gates: std::collections::HashMap<node::FrameId, GatePending>,
+    /// the in-flight-gate index (joiner key → its frame id): one gate per
+    /// joiner, so a duplicate Request re-arms rather than double-submits.
+    gating: std::collections::HashMap<Vec<u8>, node::FrameId>,
     validator_relay: relay_runtime::ValidatorRelay,
     last_published: Option<u64>,
     join_requests: std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
     blocks_since_checkpoint: u64,
     last_reach_view: Option<u64>,
-    last_flush: std::time::Instant,
+    last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
-    last_crank: std::time::Instant,
-    last_nudge: std::time::Instant,
+    last_crank: std::time::SystemTime,
+    last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
-    signaller: ReadinessSignaller,
+    code_signaller: super::code_announce::CodeReadinessSignaller,
+    /// completed pending-swap code fetches, reaped at each readiness pump so
+    /// a failed fetch retries next tick (the sender rides in each task).
+    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
+    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
     announcer: CapabilityAnnouncer,
-    upgrade_armed_latch: Option<(String, u32)>,
-    upgrade_pending_seen: Option<String>,
     next_drain: std::time::SystemTime,
 }
 
@@ -144,21 +189,23 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         gateway_book,
         media_peers,
         blob_peers,
+        blob_client,
         reach_cmd,
-        lobby_tx,
         relay_tx,
         mut sync_state_rx,
-        mut lobby_ingress,
+        mut gate_fwd_rx,
+        gate_fwd_keepalive,
+        gate_outcomes,
         mut relay_ingress,
         next_seq,
         prev_ckpt,
         signer,
         label,
-        namespace,
         peers,
         validators,
         dev_demo,
         checkpoint_blocks,
+        sync_lease,
         announce_capabilities,
         sandbox,
         sandbox_capacity,
@@ -177,12 +224,15 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // into this bounded queue; the pump answers between drains.
     let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
     if let Some(listener) = rpc_listener {
-        println!(
-            "[node {label}] rpc listening on {}",
-            listener
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_default()
+        let listen = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            %listen,
+            "rpc listening on {listen}"
         );
         spawn_rpc_listener(listener, rpc_tx);
     } else {
@@ -213,7 +263,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         node::FrameId,
         (
             futures::channel::oneshot::Sender<Result<noded::BlockSummary, String>>,
-            std::time::Instant,
+            std::time::SystemTime,
         ),
     > = std::collections::HashMap::new();
     // relayed submits held for a wire answer, keyed like pending_submits by
@@ -222,9 +272,15 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // the Reply goes.
     let pending_relays: std::collections::HashMap<
         node::FrameId,
-        (ed25519::PublicKey, std::time::Instant),
+        (ed25519::PublicKey, std::time::SystemTime),
     > = std::collections::HashMap::new();
-    let validator_relay = relay_runtime::ValidatorRelay::new(blobs.clone());
+    // join gates held open awaiting their Redeem frame's consensus fate, and
+    // the joiner→frame in-flight index that dedups a re-Request while settling.
+    let pending_gates: std::collections::HashMap<node::FrameId, GatePending> =
+        std::collections::HashMap::new();
+    let gating: std::collections::HashMap<Vec<u8>, node::FrameId> =
+        std::collections::HashMap::new();
+    let validator_relay = relay_runtime::ValidatorRelay::new(std::sync::Arc::new(blobs.clone()));
     let last_published: Option<u64> = None;
     // verified-but-unapproved join requests, keyed by joiner key. NODE-
     // LOCAL and in-memory by design: this is a doorbell, not state — the
@@ -240,7 +296,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let last_reach_view: Option<u64> = None;
     // the per-block-time flush cadence: packs the window's enqueued frames
     // (real ops and/or an idle nop) into one batch block. see the flush loop.
-    let last_flush = std::time::Instant::now();
+    let last_flush = context.current();
     // a cutover Retarget the plane's command queue could not take yet
     // (NON-BLOCKING sends: the plane is not consensus, so the loop never
     // waits on it). retried every drain beat until it lands; a newer
@@ -254,9 +310,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // visibly live.
     let heartbeat_disabled = std::env::var_os("DUCKTAPE_DISABLE_HEARTBEAT").is_some();
     // throttle for the saga crank pump below.
-    let last_crank = std::time::Instant::now();
+    let last_crank = context.current();
     // throttle for the dispatch delivery-nudge pump below.
-    let last_nudge = std::time::Instant::now();
+    let last_nudge = context.current();
     // the host-owned worker set (reactor seam): effects of finalized
     // blocks are offered here, and claimed follow-ups re-enter the ordered
     // lane as their own blocks.
@@ -269,11 +325,14 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
     let providers = capability_host::discover(
+        signer.public_key().as_ref(),
         agent_dirs.clone(),
-        Some(run_output_sink(stream_hub.run_output())),
+        Some(stream_hub.run_output().output_sink()),
         // the operator's `node.toml sandbox` choice: Direct (default) or a
         // Podman container that enforces this node's announced capacity.
         sandbox,
+        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+        false,
     )
     .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
     let my_capabilities = providers.capabilities();
@@ -284,7 +343,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // `oracle_results` (an ingress arm below) and re-enter the ordered
     // lane as ordinary signed submits, so a minutes-long run never
     // stalls the drain/rpc/heartbeat arms of this loop.
-    let (oracle_worker, mut oracle_results) = oracle_pool::build(
+    let (oracle_worker, _oracle_control, mut oracle_results) = oracle_pool::build(
         context,
         providers,
         signer.public_key().as_ref().to_vec(),
@@ -294,12 +353,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         sandbox_capacity.clone(),
     );
     let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
-    // the readiness self-signaller: polls COMMITTED upgrade state between drains
-    // and emits ONE truthful validator-origin `SignalReady` per pending upgrade
-    // this binary can execute. survives restart/late-join (state-driven, not a
-    // one-shot effect). inert before the module is registered.
-    let signaller =
-        ReadinessSignaller::new(MAX_PROTOCOL_VERSION, signer.public_key().as_ref().to_vec());
+    // the CODE readiness self-signaller for pending code swaps — verifies (or
+    // fetches) the committed component bytes and emits one truthful
+    // `SignalReady` per swap.
+    let code_signaller =
+        super::code_announce::CodeReadinessSignaller::new(signer.public_key().as_ref().to_vec());
+    let (fetch_done_tx, fetch_done_rx) = tokio::sync::mpsc::unbounded_channel();
     // the capability self-announcer: publishes this node's discovered
     // provider set into the capability registry once (state-driven,
     // idempotent). inert when this host installed no executor CLIs.
@@ -308,16 +367,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         my_capabilities,
         sandbox_capacity,
     );
-    // one-shot upgrade transition markers keyed off COMMITTED upgrade state,
-    // modeled on the `converged` latch: `upgrade armed …` fires when readiness
-    // first reaches R==n (every current boundary member signaled) for the
-    // pending upgrade — the pre-boundary observable the e2e keys on; `upgrade
-    // cleared …` fires when a previously-observed pending clears (the boundary
-    // `Advance` reconciliation at H, on ARM or ABORT). the boundary crossing
-    // itself prints the `upgrade activated …` / `upgrade aborted …` verdict.
-    let upgrade_armed_latch: Option<(String, u32)> = None;
-    let upgrade_pending_seen: Option<String> = None;
-
     // graceful checkpoint on process signals (SIGTERM/SIGINT): the desktop
     // shell SIGTERMs the daemon on quit, so it must take the SAME safe path
     // as an rpc `Shutdown` — a best-effort final manifest + journal barrier
@@ -332,9 +381,13 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!(
-                "[node {label}] WARN: SIGTERM handler install failed ({e}); \
-                     graceful-quit checkpoint disabled (a hard kill still recovers)"
+            tracing::warn!(
+                target: "ducktape::node",
+                node = %label,
+                signal = "SIGTERM",
+                error = %e,
+                reason = "signal_handler_install_failed",
+                "graceful-quit checkpoint disabled"
             );
             None
         }
@@ -343,9 +396,13 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     {
         Ok(s) => Some(s),
         Err(e) => {
-            eprintln!(
-                "[node {label}] WARN: SIGINT handler install failed ({e}); \
-                     graceful-quit checkpoint disabled (a hard kill still recovers)"
+            tracing::warn!(
+                target: "ducktape::node",
+                node = %label,
+                signal = "SIGINT",
+                error = %e,
+                reason = "signal_handler_install_failed",
+                "graceful-quit checkpoint disabled"
             );
             None
         }
@@ -362,18 +419,20 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         gateway_book,
         media_peers,
         blob_peers,
+        blob_client,
         reach_cmd,
-        lobby_tx,
         relay_tx,
+        gate_outcomes,
+        _gate_fwd_keepalive: gate_fwd_keepalive,
         next_seq,
         prev_ckpt,
         signer,
         label,
-        namespace,
         peers,
         validators,
         dev_demo,
         checkpoint_blocks,
+        sync_lease,
         announce_capabilities,
         stream_hub,
         index,
@@ -386,6 +445,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         converged,
         pending_submits,
         pending_relays,
+        pending_gates,
+        gating,
         validator_relay,
         last_published,
         join_requests,
@@ -397,10 +458,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_crank,
         last_nudge,
         workers,
-        signaller,
+        code_signaller,
+        fetch_done_tx,
+        fetch_done_rx,
         announcer,
-        upgrade_armed_latch,
-        upgrade_pending_seen,
         next_drain: context.current() + DRAIN_TICK,
     };
 
@@ -443,9 +504,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                     runtime.on_oracle_result(msg).await;
                 }
             }
-            announce = lobby_ingress.next() => {
-                if let Some((peer, bytes)) = announce {
-                    runtime.on_lobby(peer, bytes).await;
+            fwd = gate_fwd_rx.recv().fuse() => {
+                // the intro doorbell rang the GATE through the tunnel (§4).
+                // `None` cannot spin here: `gate_fwd_keepalive` holds the
+                // channel open even when no plane was wired.
+                if let Some(fwd) = fwd {
+                    runtime.on_gate_forward(fwd).await;
                 }
             }
             relayed = relay_ingress.next() => {
@@ -469,9 +533,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
 
 impl ValidatorRuntime<'_> {
     async fn on_signal(&mut self) -> ! {
-        println!(
-            "[node {}] SIGTERM/SIGINT — graceful checkpoint then exit",
-            self.label
+        tracing::info!(
+            target: "ducktape::node",
+            node = %self.label,
+            "SIGTERM/SIGINT — graceful checkpoint then exit"
         );
         self.graceful_checkpoint().await;
         std::process::exit(0);
@@ -489,7 +554,6 @@ async fn graceful_checkpoint(
 ) {
     if let Some(f) = node.finalized() {
         let pos = node.sink_mut().oplog_pos().await;
-        let (cv, pu) = read_upgrade_version_fields(node.host()).await;
         if let Ok(manifest) = Manifest::capture(
             node.host(),
             Some(f.height),
@@ -500,8 +564,6 @@ async fn graceful_checkpoint(
             orchestrator
                 .pending_cutover()
                 .map(|cutover| cutover.cutover_view()),
-            cv,
-            pu,
             pos,
             next_seq,
         ) {

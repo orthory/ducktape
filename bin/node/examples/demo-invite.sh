@@ -2,14 +2,14 @@
 # the network-shape onboarding ceremony over real sockets — no seeds, no
 # hand-written configs:
 #
-#   founder: ducktape-node init --name demo          -> chain-id + identity
-#            ducktape-node invite                    -> one-line paste blob
-#   friend:  ducktape-node join <blob>               -> workspace + identity
+#   founder: ducktape node init --name demo          -> chain-id + identity
+#            ducktape node invite                    -> one-line paste blob
+#   friend:  ducktape node join <blob>               -> workspace + identity
 #            (sends the printed pubkey back)
-#   founder: ducktape-node admit <pubkey>            -> pre-genesis membership
-#            ducktape-node invite                    -> REFRESHED blob
-#   friend:  ducktape-node join <refreshed blob>     -> now a member
-#   both:    ducktape-node --config .../node.toml    -> one network
+#   founder: ducktape node admit <pubkey>            -> pre-genesis membership
+#            ducktape node invite                    -> REFRESHED blob
+#   friend:  ducktape node join <refreshed blob>     -> now a member
+#   both:    ducktape node run --config .../node.toml    -> one network
 #
 # the assertion: both identities boot the SAME genesis app-hash (identical
 # descriptor -> identical genesis), an op submitted on the founder's node is
@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 command -v bun >/dev/null || { echo "bun is required" >&2; exit 1; }
 command -v nc  >/dev/null || { echo "nc is required" >&2; exit 1; }
 
-BIN=ducktape-node
+BIN=ducktape
 echo "building $BIN..."
 cargo build -p node-bin --bin "$BIN" >/dev/null 2>&1
 BIN_PATH="$(cargo metadata --no-deps --format-version 1 | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/$BIN"
@@ -32,33 +32,33 @@ cleanup() { pkill -P $$ 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "founder: init..."
-chain_id=$("$BIN_PATH" init --name demo --dir "$A" \
+chain_id=$("$BIN_PATH" node init --name demo --dir "$A" \
   --listen 127.0.0.1:53200 --advertised 127.0.0.1:53200 \
   --rpc 127.0.0.1:53300 2>/dev/null)
 echo "  chain-id: $chain_id"
-invite=$("$BIN_PATH" invite --config "$A/node.toml" 2>/dev/null)
+invite=$("$BIN_PATH" node invite --config "$A/node.toml" 2>/dev/null)
 
 echo "friend: join (first pass — identity only)..."
-friend_key=$("$BIN_PATH" join "$invite" --dir "$B" \
+friend_key=$("$BIN_PATH" node join "$invite" --dir "$B" \
   --listen 127.0.0.1:53201 --advertised 127.0.0.1:53201 \
   --rpc 127.0.0.1:53301 2>/dev/null)
 echo "  friend identity: $friend_key"
 
 echo "founder: admit + refreshed invite..."
-"$BIN_PATH" admit "$friend_key" --config "$A/node.toml" 2>/dev/null
-invite2=$("$BIN_PATH" invite --config "$A/node.toml" 2>/dev/null)
+"$BIN_PATH" node admit "$friend_key" --config "$A/node.toml" 2>/dev/null
+invite2=$("$BIN_PATH" node invite --config "$A/node.toml" 2>/dev/null)
 
 echo "friend: join (refreshed — now a member)..."
-"$BIN_PATH" join "$invite2" --dir "$B" \
+"$BIN_PATH" node join "$invite2" --dir "$B" \
   --listen 127.0.0.1:53201 --advertised 127.0.0.1:53201 \
   --rpc 127.0.0.1:53301 >/dev/null 2>&1
 
 loga=$(mktemp)
 logb=$(mktemp)
 echo "launching both members..."
-"$BIN_PATH" --config "$A/node.toml" >"$loga" 2>&1 &
+"$BIN_PATH" node run --config "$A/node.toml" >"$loga" 2>&1 &
 pa=$!
-"$BIN_PATH" --config "$B/node.toml" >"$logb" 2>&1 &
+"$BIN_PATH" node run --config "$B/node.toml" >"$logb" 2>&1 &
 pb=$!
 
 rpc() { # rpc <port> <json>

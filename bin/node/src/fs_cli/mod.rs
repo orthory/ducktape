@@ -1,0 +1,184 @@
+//! `ducktape fs` — the duckfs working-copy CLI.
+//!
+//! a clap-derive verb tree (the workspace adopted clap 4.6; the old "no clap"
+//! prohibition is dead) over the `duckfs-client` engine and its `HttpNode`
+//! transport. it ships the read verbs and the working-copy loop
+//! (checkout/status/commit/pin). the FUSE `mount` verb was removed in the
+//! 2026-07-13 storage-plane revision (see the duckfs spec's Mount surface
+//! section; the implementation lives in git history at e7b4e1d1 if genuine
+//! mount demand ever returns).
+//!
+//! exit codes are part of the contract: 0 success, 1 an operational failure (and
+//! a dirty `status`), 2 a usage error (clap owns these, at the top-level parse)
+//! and a commit conflict.
+
+mod args;
+mod read_cmds;
+mod work_cmds;
+
+use self::args::NodeAddr;
+
+/// the `ducktape fs` verb tree. usage errors (a missing positional, a bad
+/// numeric flag, an unknown verb) are clap's job at the top-level parse — it
+/// exits 2, matching the contract — so the handlers below carry `CliError` only
+/// for operational failures (exit 1) and the commit conflict (exit 2).
+#[derive(Debug, clap::Subcommand)]
+pub(crate) enum FsCmd {
+    /// list a directory
+    Ls(LsArgs),
+    /// stream a file to stdout
+    Cat(CatArgs),
+    /// print an entry's facts
+    Stat(StatArgs),
+    /// the commit window, newest-first
+    History(HistoryArgs),
+    /// changed leaves between two snapshots
+    Diff(DiffArgs),
+    /// materialize a subtree + .duckfs index
+    Checkout(CheckoutArgs),
+    /// show A/M/D (exit 1 when dirty)
+    Status(StatusArgs),
+    /// commit the working copy (exit 2 on conflict)
+    Commit(CommitArgs),
+    /// pin a snapshot so gc keeps it
+    Pin(PinArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct LsArgs {
+    /// the directory path to list
+    pub path: String,
+    /// read at this snapshot instead of the head
+    #[arg(long, value_name = "SNAPSHOT")]
+    pub snapshot: Option<String>,
+    /// per-request page size
+    #[arg(long, value_name = "N")]
+    pub limit: Option<u64>,
+    /// emit one JSON array line instead of tab-separated rows
+    #[arg(long)]
+    pub json: bool,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct CatArgs {
+    /// the file path to stream
+    pub path: String,
+    /// read at this snapshot instead of the head
+    #[arg(long, value_name = "SNAPSHOT")]
+    pub snapshot: Option<String>,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct StatArgs {
+    /// the entry path to describe
+    pub path: String,
+    /// read at this snapshot instead of the head
+    #[arg(long, value_name = "SNAPSHOT")]
+    pub snapshot: Option<String>,
+    /// emit one JSON object line instead of key/value rows
+    #[arg(long)]
+    pub json: bool,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct HistoryArgs {
+    /// how many commits to return
+    #[arg(long, value_name = "N")]
+    pub limit: Option<u64>,
+    /// emit one JSON array line instead of tab-separated rows
+    #[arg(long)]
+    pub json: bool,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DiffArgs {
+    /// the base snapshot
+    pub from: String,
+    /// the target snapshot
+    pub to: String,
+    /// restrict the diff to leaves under this path prefix
+    #[arg(long, value_name = "PREFIX")]
+    pub prefix: Option<String>,
+    /// emit one JSON array line instead of tab-separated rows
+    #[arg(long)]
+    pub json: bool,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct CheckoutArgs {
+    /// the subtree prefix to materialize
+    pub prefix: String,
+    /// the directory to materialize into
+    pub dir: String,
+    /// check out this snapshot instead of the head
+    #[arg(long, value_name = "SNAPSHOT")]
+    pub snapshot: Option<String>,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct StatusArgs {
+    /// the checkout directory (default: the current directory)
+    pub dir: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct CommitArgs {
+    /// the checkout directory (default: the current directory)
+    pub dir: Option<String>,
+    /// the commit message
+    #[arg(long, value_name = "MESSAGE")]
+    pub message: String,
+    /// fail on a conflict instead of auto-rebasing onto the current head
+    #[arg(long)]
+    pub no_rebase: bool,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct PinArgs {
+    /// the snapshot to pin
+    pub snapshot: String,
+    /// the pin name gc keeps reachable
+    pub name: String,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+}
+
+/// dispatch a parsed verb and map its `CliError` to the process exit code. an
+/// EMPTY error message prints nothing — a dirty `status` and a commit conflict
+/// each wrote their own output and only carry the exit code here.
+pub(crate) fn run(cmd: FsCmd) -> u8 {
+    let outcome = match cmd {
+        FsCmd::Ls(a) => read_cmds::ls(a),
+        FsCmd::Cat(a) => read_cmds::cat(a),
+        FsCmd::Stat(a) => read_cmds::stat(a),
+        FsCmd::History(a) => read_cmds::history(a),
+        FsCmd::Diff(a) => read_cmds::diff(a),
+        FsCmd::Checkout(a) => work_cmds::checkout(a),
+        FsCmd::Status(a) => work_cmds::status(a),
+        FsCmd::Commit(a) => work_cmds::commit(a),
+        FsCmd::Pin(a) => work_cmds::pin(a),
+    };
+    match outcome {
+        Ok(()) => 0,
+        Err(e) => {
+            if !e.message.is_empty() {
+                eprintln!("ducktape fs: {}", e.message);
+            }
+            e.code
+        }
+    }
+}

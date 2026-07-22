@@ -1,0 +1,115 @@
+---
+import { Icon } from "astro-icon/components";
+import { Button } from "./ui/button";
+import { LinkButton } from "./ui/link-button";
+import { ThemeToggle } from "./ui/theme-toggle";
+import { SearchTrigger } from "./ui/search";
+import { config } from "virtual:nimbus/config";
+
+interface Props {
+  /** Astro collection id for the current page, forwarded from DocsLayout. */
+  collection?: string;
+  /** Astro entry id for the current page, forwarded from DocsLayout. */
+  entryId?: string;
+  /**
+   * Whether the page has a sidebar to open. When `false`, the mobile
+   * menu button is hidden — pages that opted out via `sidebar: false`
+   * shouldn't show a button that opens an empty dialog. Default `true`.
+   */
+  showSidebar?: boolean;
+}
+
+// `entryId` is part of Props as a forward-compat hook (the version-switcher
+// recipe reads it) but the base Header doesn't use it — leave it off the
+// destructure to avoid an unused-var warning.
+const { showSidebar = true } = Astro.props;
+
+// Normalize trailing slash so isActive matches sidebar hrefs.
+const currentSlug = Astro.url.pathname.replace(/\/$/, "") || "/";
+const tracks = [
+  { label: "Human · English", shortLabel: "Human EN", href: "/en/human" },
+  { label: "Human · 한국어", shortLabel: "Human KO", href: "/ko/human" },
+  { label: "Agent · English", shortLabel: "Agent EN", href: "/en/agent" },
+  { label: "Agent · 한국어", shortLabel: "Agent KO", href: "/ko/agent" },
+].map((track) => ({ ...track, isActive: currentSlug.startsWith(track.href) }));
+const hasActiveTrack = tracks.some((track) => track.isActive);
+---
+
+<header class="sticky top-0 z-30 border-b border-border bg-card/80 backdrop-blur-lg">
+  <div class="mx-auto flex h-14 items-center justify-between px-2 sm:px-4 lg:px-6">
+    <div class="flex min-w-0 items-center gap-1 sm:gap-3">
+      {showSidebar && (
+        <Button
+          variant="ghost"
+          shape="square"
+          size="sm"
+          icon="ph:list"
+          aria-label="Open navigation"
+          data-menu-btn
+          class="size-11 text-muted-foreground lg:hidden"
+        />
+      )}
+
+      <a href="/" aria-label={config.title} class="group flex min-h-11 min-w-11 shrink-0 items-center justify-center sm:justify-start">
+        <span class="flex items-center gap-2 text-sm font-semibold text-foreground transition-colors group-hover:text-primary">
+          <img src="/favicon.svg" alt="" class="h-6 w-6 shrink-0" />
+          <span class="hidden sm:inline">{config.title}</span>
+        </span>
+      </a>
+
+      <nav aria-label="Documentation tracks" class="ml-4 hidden h-11 items-center gap-1 border-l border-border pl-4 lg:flex">
+          {tracks.map((track) => (
+            <a
+              href={track.href}
+              aria-current={track.isActive ? "page" : undefined}
+              class:list={[
+                "inline-flex min-h-11 items-center rounded-md px-2 text-[0.8125rem] font-medium no-underline transition-colors",
+                track.isActive
+                  ? "text-foreground bg-accent"
+                  : "text-muted-foreground hover:text-foreground hover:bg-accent/60",
+              ]}
+            >
+              {track.label}
+            </a>
+          ))}
+      </nav>
+
+      <label class="lg:hidden">
+        <span class="sr-only">Documentation track</span>
+        <select data-track-picker class="h-11 w-24 rounded-md border border-border bg-card px-2 text-xs text-foreground">
+          {!hasActiveTrack && <option value="" selected disabled>Choose track</option>}
+          {tracks.map((track) => (
+            <option value={track.href} selected={track.isActive}>{track.shortLabel}</option>
+          ))}
+        </select>
+      </label>
+    </div>
+
+    <div class="flex shrink-0 items-center gap-1 sm:gap-2">
+      {config.search !== false && <SearchTrigger />}
+      {config.github && (
+        <LinkButton
+          href={config.github}
+          variant="minimal"
+          shape="square"
+          size="sm"
+          aria-label="GitHub"
+          target="_blank"
+          rel="noopener"
+          class="hidden size-11 text-muted-foreground lg:inline-flex"
+        >
+          <Icon name="ph:github-logo" class="w-4 h-4" />
+        </LinkButton>
+      )}
+      <ThemeToggle />
+    </div>
+  </div>
+</header>
+
+<script>
+  document.querySelector<HTMLSelectElement>("[data-track-picker]")
+    ?.addEventListener("change", (event) => {
+      const picker = event.currentTarget as HTMLSelectElement;
+      window.location.assign(picker.value);
+    });
+</script>

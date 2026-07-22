@@ -2,7 +2,7 @@
 //! LIBRARY (over each node's real http surface) across a two-validator cluster.
 //!
 //! not the in-process mock (`duckfs-client`'s own tests) and not a single daemon
-//! (`noded`'s daemon_e2e): two real `ducktape-node` processes over real sockets,
+//! (`noded`'s daemon_e2e): two real `ducktape` processes over real sockets,
 //! so a checkout on node 1 provably reads bytes that crossed CONSENSUS from a
 //! commit on node 0. exercises the full engine surface — empty checkout, a
 //! multi-chunk (over 1 MiB) staged file, an empty dir, a symlink, edit-and-

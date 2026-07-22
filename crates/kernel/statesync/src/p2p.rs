@@ -34,8 +34,8 @@ use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
 
 use crate::{
-    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc, encode_request,
-    encode_rpc,
+    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc_authed,
+    encode_request, encode_rpc_authed,
 };
 
 /// the reaper's sweep interval. a request survives at most two sweeps, so the
@@ -93,6 +93,11 @@ pub struct P2pSyncClient<S: Sender> {
     sender: S,
     sources: Arc<Sources<S::PublicKey>>,
     shared: Arc<Shared>,
+    /// the caller's real-key standing proof (ADR §5.1), signed ONCE via
+    /// [`crate::sign_sync_proof`] and attached to every request. the server
+    /// verifies it against committed standing and fail-closes on a mismatch.
+    requester: [u8; 32],
+    proof: [u8; 64],
 }
 
 impl<S: Sender> Clone for P2pSyncClient<S> {
@@ -101,6 +106,8 @@ impl<S: Sender> Clone for P2pSyncClient<S> {
             sender: self.sender.clone(),
             sources: Arc::clone(&self.sources),
             shared: Arc::clone(&self.shared),
+            requester: self.requester,
+            proof: self.proof,
         }
     }
 }
@@ -110,13 +117,21 @@ where
     S: Sender,
 {
     /// bind a client to one `server` — [`P2pSyncClient::with_sources`] with a
-    /// single candidate.
-    pub fn new<E, R>(context: E, sender: S, receiver: R, server: S::PublicKey) -> Self
+    /// single candidate. `requester`/`proof` are the caller's standing proof
+    /// ([`crate::sign_sync_proof`]).
+    pub fn new<E, R>(
+        context: E,
+        sender: S,
+        receiver: R,
+        server: S::PublicKey,
+        requester: [u8; 32],
+        proof: [u8; 64],
+    ) -> Self
     where
         E: Spawner + Clock + Send + 'static,
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
-        Self::with_sources(context, sender, receiver, vec![server], None)
+        Self::with_sources(context, sender, receiver, vec![server], None, requester, proof)
     }
 
     /// bind a client to a non-empty ordered candidate set over a registered
@@ -131,6 +146,8 @@ where
         mut receiver: R,
         candidates: Vec<S::PublicKey>,
         unmatched: Option<UnmatchedFrameHook>,
+        requester: [u8; 32],
+        proof: [u8; 64],
     ) -> Self
     where
         E: Spawner + Clock + Send + 'static,
@@ -174,7 +191,10 @@ where
                     continue;
                 }
                 let bytes: Vec<u8> = msg.into();
-                let Ok((id, body)) = decode_rpc(&bytes) else {
+                // replies ride the same authed frame; the auth fields are
+                // server zero-fill (the transport-peer check above is the
+                // reply's authenticity), so only id + body matter here.
+                let Ok((_requester, _proof, id, body)) = decode_rpc_authed(&bytes) else {
                     continue;
                 };
                 let waiter = task_shared
@@ -200,7 +220,29 @@ where
             sender,
             sources,
             shared,
+            requester,
+            proof,
         }
+    }
+}
+
+impl<S> P2pSyncClient<S>
+where
+    S: Sender,
+{
+    /// The candidate selected for the next request. Operational surfaces use
+    /// this after a successful request so source rotation stays visible.
+    pub fn current_source(&self) -> S::PublicKey {
+        self.sources.current().1
+    }
+
+    /// advance the serving cursor one candidate. the transport rotates on
+    /// FAILURE by itself ([`Sources::advance_past`], wave-deduped); this is
+    /// for callers whose retry policy also rotates on an HONEST answer — a
+    /// blob fetch's "don't have it" is a valid response the failure path
+    /// never sees.
+    pub fn advance_source(&self) {
+        self.sources.cursor.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -215,6 +257,8 @@ where
         let mut sender = self.sender.clone();
         let sources = Arc::clone(&self.sources);
         let shared = Arc::clone(&self.shared);
+        let requester = self.requester;
+        let proof = self.proof;
         async move {
             let (at, server) = sources.current();
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
@@ -229,7 +273,7 @@ where
                     },
                 );
             }
-            let frame = encode_rpc(id, &encode_request(&req));
+            let frame = encode_rpc_authed(&requester, &proof, id, &encode_request(&req));
             let attempted = sender.send(Recipients::One(server), IoBuf::from(frame), false);
             if attempted.is_empty() {
                 // the source is offline/unreachable right now — fail fast

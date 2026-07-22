@@ -73,57 +73,6 @@ impl ScheduledCutover {
     }
 }
 
-/// the boundary snapshot of the upgrade module's committed state, read at the
-/// SAME finalized view (and thus discard-ceiling-frozen state) the orchestrator
-/// reads the boundary valset from. carries the agreed `current_version` and the
-/// single pending upgrade (if any) with its FROZEN readiness set.
-///
-/// this is a NON-hashed DISPATCH input — like `cutover_view`/`epoch_base` it is a
-/// coordinate the respawn reads, never a value folded into any module root. the
-/// authoritative version state lives in the upgrade module's app-hashed root; this
-/// is the boundary READ of it (design §"One boundary carries both concerns").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BoundaryUpgrade<Member> {
-    pub current_version: u32,
-    pub pending: Option<PendingUpgrade<Member>>,
-}
-
-impl<Member> BoundaryUpgrade<Member> {
-    /// a boundary with no pending upgrade at `current_version` — what every
-    /// membership-only respawn (and any node without the upgrade module) passes.
-    pub fn baseline(current_version: u32) -> Self {
-        Self {
-            current_version,
-            pending: None,
-        }
-    }
-}
-
-/// the frozen coordinates of the single pending upgrade at the boundary, with the
-/// readiness set projected into the orchestrator's `Member` key type.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingUpgrade<Member> {
-    pub name: String,
-    pub activation_height: u64,
-    pub to_version: u32,
-    /// the members who have signaled readiness for THIS upgrade, at the boundary.
-    pub ready: BTreeSet<Member>,
-}
-
-/// the deterministic arm/abort verdict evaluated EXACTLY ONCE at the finalized
-/// boundary. a NON-hashed dispatch/observability signal — the app-hashed effect
-/// (the `current_version` flip + pending clear) is carried by the in-block
-/// System-origin `Advance` the host injects at the same height, not by this enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpgradeVerdict {
-    /// no pending upgrade reached its activation height at this boundary.
-    None,
-    /// the pending upgrade ARMED: `H` reached and EVERY boundary member signaled.
-    Armed { name: String, to_version: u32 },
-    /// the pending upgrade reached `H` but readiness was unmet — clean ABORT.
-    Abort { name: String },
-}
-
 /// the respawn parameters a live adapter hands to the next consensus engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RespawnPlan<Member> {
@@ -132,15 +81,6 @@ pub struct RespawnPlan<Member> {
     cutover_view: u64,
     cutover_app_height: u64,
     valset: EpochMembership<Member>,
-    /// the effective protocol version at this boundary, read from frozen upgrade
-    /// state at the SAME finalized view as `valset` (design §"One boundary carries
-    /// both concerns"). NON-hashed — the driver stamps it into each dual-path
-    /// module's `active_version` (branch selector), never into a root preimage.
-    boundary_version: u32,
-    /// the once-at-`H` arm/abort verdict against the frozen readiness + boundary
-    /// valset. NON-hashed. the app-hashed reconciliation rides the host's in-block
-    /// System `Advance` at the same height.
-    upgrade_verdict: UpgradeVerdict,
 }
 
 impl<Member> RespawnPlan<Member> {
@@ -162,17 +102,6 @@ impl<Member> RespawnPlan<Member> {
 
     pub fn valset(&self) -> &EpochMembership<Member> {
         &self.valset
-    }
-
-    /// the effective protocol version to stamp into each dual-path module's
-    /// `active_version` at this boundary (design §4). NON-hashed.
-    pub fn boundary_version(&self) -> u32 {
-        self.boundary_version
-    }
-
-    /// the deterministic arm/abort verdict evaluated once at this boundary.
-    pub fn upgrade_verdict(&self) -> &UpgradeVerdict {
-        &self.upgrade_verdict
     }
 }
 
@@ -333,111 +262,17 @@ where
         ObservationOutcome::Scheduled(cutover)
     }
 
-    /// observe a pending upgrade whose activation lands at `activation_app_height`.
-    ///
-    /// arms the SINGLE shared cutover slot at `cutover_view = activation_app_height
-    /// - epoch_base` (`checked_sub`, fail-stop on corrupt coords) ONLY when the slot
-    /// is empty and the boundary is strictly in the future; when a membership
-    /// cutover already holds the slot this returns `Pending` — the version flip then
-    /// rides that same boundary via [`respawn_if_due`](Self::respawn_if_due)'s
-    /// boundary read, never a competing arm (design §"One boundary carries both
-    /// concerns"; orchestrator holds only one pending cutover). idempotent once
-    /// armed: a second call returns `Pending`.
-    pub fn observe_upgrade(
-        &mut self,
-        finalized_view: u64,
-        activation_app_height: u64,
-    ) -> ObservationOutcome {
-        if let Some(cutover) = self.pending {
-            // an armed boundary never moves; the version flip is applied by the
-            // boundary read when this cutover crosses.
-            return ObservationOutcome::Pending(cutover);
-        }
-
-        let cutover_view = activation_app_height
-            .checked_sub(self.epoch_base)
-            .expect("activation height precedes epoch base — corrupt upgrade coords, fail-stop");
-        // the boundary must be strictly future. the module's schedule-time
-        // MIN_UPGRADE_LEAD (>= cutover_delay) guarantees this; guard deterministically
-        // rather than arm a past/current boundary that could never gate views.
-        if cutover_view <= finalized_view {
-            return ObservationOutcome::Unchanged;
-        }
-
-        let cutover = ScheduledCutover {
-            observed_view: finalized_view,
-            cutover_view,
-            next_epoch: self
-                .epoch
-                .checked_add(1)
-                .expect("epoch overflow: corrupt upgrade coords — fail-stop"),
-        };
-        self.pending = Some(cutover);
-        ObservationOutcome::Scheduled(cutover)
-    }
-
-    /// the deterministic arm/abort predicate, evaluated EXACTLY ONCE at the
-    /// finalized boundary against the frozen boundary valset + the pending
-    /// upgrade's frozen readiness set. returns `(boundary_version, verdict)`.
-    ///
-    /// PURE — no clock/IO/RNG — so every honest node computes the identical value.
-    /// this STRUCTURALLY MIRRORS `upgrade::effective_version` (risk R4):
-    /// armed iff the pending upgrade reached its activation height, the boundary
-    /// valset is non-empty, and every boundary member is present in `ready`. the
-    /// upgrade module's own `Advance` handler and `effective_version` helper route
-    /// through the shared `upgrade::effective_version` predicate; this generic mirror can
-    /// never disagree with them on the same frozen inputs (the orchestrator is
-    /// generic over `Member`, so it cannot call the `Vec<u8>`-typed shared fn
-    /// directly — the mirror is the single deterministic contract, guarded by the
-    /// coincident-boundary tests below).
-    fn arm_verdict(
-        boundary_app_height: u64,
-        up: &BoundaryUpgrade<Member>,
-        boundary_valset: &BTreeSet<Member>,
-    ) -> (u32, UpgradeVerdict) {
-        match &up.pending {
-            Some(p) if boundary_app_height >= p.activation_height => {
-                let armed = !boundary_valset.is_empty()
-                    && boundary_valset.iter().all(|m| p.ready.contains(m));
-                if armed {
-                    (
-                        p.to_version,
-                        UpgradeVerdict::Armed {
-                            name: p.name.clone(),
-                            to_version: p.to_version,
-                        },
-                    )
-                } else {
-                    (
-                        up.current_version,
-                        UpgradeVerdict::Abort {
-                            name: p.name.clone(),
-                        },
-                    )
-                }
-            }
-            // no pending, or the boundary is below its activation height: the
-            // version does not flip early (`effective_version` is pure below `H`).
-            _ => (up.current_version, UpgradeVerdict::None),
-        }
-    }
-
     /// cross the armed boundary once `finalized_view` reaches it.
     /// `boundary_members` and `boundary_residents` are the valset projections
     /// read from app state NOW — the discard ceiling froze state at the
     /// boundary, so every honest node reads the identical sets.
-    /// `boundary_upgrade` is the upgrade module's state read from that SAME
-    /// frozen boundary, so ONE respawn applies membership changes (both
-    /// tiers) AND a pending-upgrade-at-`H` at a single finalized view.
     /// commits the cutover: the new epoch's participant + resident sets,
-    /// base, coordinates, the boundary version, and the once-evaluated
-    /// arm/abort verdict.
+    /// base, and coordinates.
     pub fn respawn_if_due(
         &mut self,
         finalized_view: u64,
         boundary_members: impl IntoIterator<Item = Member>,
         boundary_residents: impl IntoIterator<Item = Member>,
-        boundary_upgrade: BoundaryUpgrade<Member>,
     ) -> Option<RespawnPlan<Member>> {
         let cutover = self.pending.as_ref()?;
         if finalized_view < cutover.cutover_view {
@@ -447,11 +282,6 @@ where
         let cutover = self.pending.take().expect("checked pending");
         let cutover_app_height = self.app_height(cutover.cutover_view);
         let valset = EpochMembership::from_sets(boundary_members, boundary_residents);
-        // read the boundary version at the SAME frozen boundary set + app height:
-        // evaluate the arm/abort verdict EXACTLY ONCE here (no timers, no
-        // node-local readiness view). ONE respawn carries both concerns.
-        let (boundary_version, upgrade_verdict) =
-            Self::arm_verdict(cutover_app_height, &boundary_upgrade, valset.consensus_members());
         self.epoch = cutover.next_epoch;
         self.epoch_base = cutover_app_height;
         self.current = valset.consensus_members().clone();
@@ -467,8 +297,6 @@ where
             cutover_view: cutover.cutover_view,
             cutover_app_height,
             valset,
-            boundary_version,
-            upgrade_verdict,
         })
     }
 }

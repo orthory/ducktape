@@ -1,4 +1,5 @@
 use host::Host;
+use noded::projection::project_root_op;
 use sdk::StateRoot;
 
 use crate::constants::{MODULE_IDS, NOP_TARGET};
@@ -7,39 +8,10 @@ use crate::util::hex;
 // ---------------------------------------------------------------------------
 // the derived-index boot fold. consensus never depends on it: fold errors
 // poison the store and log, heal errors log — recovery and the drain proceed
-// identically with or without the index.
+// identically with or without the index. the live drain's row construction
+// (`project_root_op`) now lives in `noded::projection`; the fold below re-runs
+// the SAME seam over journal-replayed frames so both writers stay byte-identical.
 // ---------------------------------------------------------------------------
-
-/// build one explorer row ([`noded::BlockRecord`] json) from a block's
-/// decoded parts — THE row construction seam, shared by the live drain and
-/// the boot fold so both writers produce byte-identical rows. staging the
-/// payload IS computing `op_hash` (put_chunk keys the blob by sha256), and
-/// on the fold path the re-staging is load-bearing: the blob store is
-/// in-memory, so the live drain's staging dies with the process and this is
-/// what makes `GET /v1/files/blob/{op_hash}` answer again after a restart.
-pub(crate) fn explorer_root_op(
-    blobs: &blobstore::BlobHandle,
-    origin: &sdk::Origin,
-    target: &str,
-    payload: &[u8],
-    dispatches: &[host::DispatchRecord],
-    disposition: noded::BlockDisposition,
-) -> noded::RootOp {
-    noded::RootOp {
-        proposer: match origin {
-            sdk::Origin::External(key) => noded::hex_bytes(key),
-            // frames only carry verified External authorship; label the
-            // impossible rest.
-            sdk::Origin::Module(id) => format!("module:{id}"),
-            sdk::Origin::System => "system".into(),
-        },
-        disposition,
-        target: target.to_string(),
-        operations: dispatches.iter().map(noded::DispatchInfo::from).collect(),
-        payload: noded::payload_preview(payload),
-        op_hash: noded::hex_bytes(&blobs.put_chunk(payload.to_vec())),
-    }
-}
 
 /// rebuild the explorer row for a replayed sealed frame — the boot fold's
 /// equivalent of the drain's row construction, fed from the journal instead
@@ -48,14 +20,15 @@ pub(crate) fn explorer_root_op(
 /// heartbeat nop is the deliberately-empty block the explorer hides, and a
 /// discarded frame is never journaled (the arm keeps this total anyway).
 pub(crate) fn sealed_frame_block_row(
-    blobs: &blobstore::BlobHandle,
+    blobs: &dyn blobstore::Blobs,
     block: &recovery::FoldedBlock<'_>,
 ) -> Option<Vec<u8>> {
-    // the sealed frame is a BATCH: decode its members and show each as a block
-    // op. per-member dispositions/traces are not carried in the fold (recovery
-    // folds the block-level disposition + aggregate trace), so a replayed op
-    // shows the block disposition and an empty trace — the LIVE drain carries
-    // the full per-op detail.
+    // the sealed frame is a BATCH: decode its members (exactly
+    // like the live drain) and show each as a block op. per-member
+    // dispositions/traces are not carried in the fold (recovery folds the
+    // block-level disposition + aggregate trace), so a replayed op shows the
+    // block disposition and an empty trace — the LIVE drain carries the full
+    // per-op detail.
     let members = node::decode_batch(block.frame).ok()?;
     let disposition = match block.disposition {
         node::Disposition::Applied => noded::BlockDisposition::Applied,
@@ -64,20 +37,32 @@ pub(crate) fn sealed_frame_block_row(
     };
     let mut ops = Vec::new();
     for member in &members {
-        let Ok((origin, msg)) = node::decode_frame(member) else {
+        let Ok(op) = node::decode_member(member) else {
             continue;
         };
-        if msg.target == NOP_TARGET {
+        if op.msg.target == NOP_TARGET {
             continue;
         }
-        ops.push(explorer_root_op(
+        ops.push(project_root_op(
             blobs,
-            &origin,
-            &msg.target,
-            &msg.payload,
+            &op.origin,
+            &op.msg.target,
+            &op.msg.payload,
             &[],
             disposition,
         ));
+        // an envelope's released continuation is its own op row, right after
+        // its parent — the live drain's row order (`noded::projection`).
+        if let Some(cont) = op.continuation {
+            ops.push(project_root_op(
+                blobs,
+                &sdk::Origin::Module(op.msg.target),
+                &cont.target,
+                &cont.payload,
+                &[],
+                disposition,
+            ));
+        }
     }
     if ops.is_empty() {
         // a pure nop/idle block — the explorer hides it (same rule as live).
@@ -120,12 +105,15 @@ pub(crate) fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
 /// `GET /v1/blocks` loses those heights for good.
 pub(crate) struct IndexFold<'a> {
     index: &'a indexer::IndexStore,
-    blobs: blobstore::BlobHandle,
+    blobs: std::sync::Arc<dyn blobstore::Blobs>,
     stopped: bool,
 }
 
 impl<'a> IndexFold<'a> {
-    pub(crate) fn new(index: &'a indexer::IndexStore, blobs: blobstore::BlobHandle) -> Self {
+    pub(crate) fn new(
+        index: &'a indexer::IndexStore,
+        blobs: std::sync::Arc<dyn blobstore::Blobs>,
+    ) -> Self {
         Self {
             index,
             blobs,
@@ -155,12 +143,18 @@ impl recovery::ReplaySink for IndexFold<'_> {
         }
         let height = block.height;
         let ops = indexer::BlockOps {
-            record: sealed_frame_block_row(&self.blobs, block),
+            record: sealed_frame_block_row(&*self.blobs, block),
             // the validator's consensus time IS the height (see BlockContext).
             ..noded::index_block_ops(height, height, block.dispatches)
         };
         if let Err(err) = self.index.apply_block(&ops) {
-            eprintln!("[node] module index fold failed at height {height}: {err}");
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                height,
+                error = %err,
+                "module index fold stopped"
+            );
             self.stopped = true;
         }
     }
@@ -189,15 +183,23 @@ pub(crate) async fn heal_index(index: &indexer::IndexStore, host: &Host, boundar
     match noded::rebuild_stale_modules(index, host, meta).await {
         Ok(rebuilt) => {
             for (module, rows) in rebuilt {
-                println!(
-                    "[node {label}] index for {module} re-derived from state at height \
-                     {boundary} ({rows} rows)"
+                tracing::info!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    module,
+                    height = boundary,
+                    rows,
+                    "index for {module} re-derived from state at height {boundary} ({rows} rows)"
                 );
             }
         }
-        Err(err) => eprintln!(
-            "[node {label}] index heal at height {boundary} failed: {err} — wipe \
-             <storage>/index to rebuild"
+        Err(err) => tracing::error!(
+            target: "ducktape::modules",
+            event = "node_index_poisoned",
+            node = %label,
+            height = boundary,
+            error = %err,
+            "index heal failed; wipe <storage>/index to rebuild"
         ),
     }
 }
@@ -222,7 +224,14 @@ pub(crate) fn ship_index_blobs(
             Ok(files) => {
                 blobs.insert(db, statesync::encode_index_archive(&files));
             }
-            Err(err) => eprintln!("[node {label}] shipped index skips {db}: {err}"),
+            Err(err) => tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                database = %db,
+                error = %err,
+                reason = "index_checkpoint_failed",
+                "shipped index database skipped"
+            ),
         }
     }
     blobs
@@ -249,7 +258,7 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
     let staged: Result<usize, String> = async {
         // a retry of the promotion loop may have staged a partial set
         // already; start clean so attempts never interleave.
-        indexer::discard_staged(&index_base).map_err(|e| e.to_string())?;
+        indexer::discard_staged(&indexer::DiskFs, &index_base).map_err(|e| e.to_string())?;
         let entries = statesync::fetch_index_modules(client, boundary)
             .await
             .map_err(|e| e.to_string())?;
@@ -258,35 +267,57 @@ pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
             // a db this binary does not know (version skew) would sit
             // unopened on disk forever — skip it, its module heals instead.
             if !known.contains(db.as_str()) {
-                println!("[node {label}] shipped index skips unknown db {db:?}");
+                tracing::warn!(
+                    target: "ducktape::statesync",
+                    node = %label,
+                    database = %db,
+                    reason = "unknown_index_database",
+                    "shipped index database skipped"
+                );
                 continue;
             }
             let blob = statesync::fetch_index_db(client, boundary, db)
                 .await
                 .map_err(|e| format!("{db}: {e}"))?;
             let files = statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
-            indexer::stage_shipped_db(&index_base, db, &files).map_err(|e| e.to_string())?;
+            indexer::stage_shipped_db(&indexer::DiskFs, &index_base, db, &files)
+                .map_err(|e| e.to_string())?;
             staged += 1;
         }
         if staged > 0 {
-            indexer::commit_staged(&index_base).map_err(|e| e.to_string())?;
+            indexer::commit_staged(&indexer::DiskFs, &index_base).map_err(|e| e.to_string())?;
         }
         Ok(staged)
     }
     .await;
     match staged {
-        Ok(0) => println!("[node {label}] source ships no index — views heal from verified state"),
-        Ok(n) => println!(
-            "[node {label}] shipped index staged ({n} databases) — adopted at the promoted \
-             reboot; contents are trusted from the source, not verified (spec §7 lane 2)"
+        Ok(0) => tracing::info!(
+            target: "ducktape::statesync",
+            node = %label,
+            "source ships no index; views heal from verified state"
+        ),
+        Ok(n) => tracing::info!(
+            target: "ducktape::statesync",
+            node = %label,
+            databases = n,
+            "shipped index staged; it will be adopted at the promoted reboot"
         ),
         Err(e) => {
-            eprintln!(
-                "[node {label}] shipped index fetch failed: {e} — views heal from verified \
-                 state instead"
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                error = %e,
+                reason = "shipped_index_fetch_failed",
+                "views will heal from verified state instead"
             );
-            if let Err(e) = indexer::discard_staged(&index_base) {
-                eprintln!("[node {label}] shipped index staging cleanup failed: {e}");
+            if let Err(e) = indexer::discard_staged(&indexer::DiskFs, &index_base) {
+                tracing::warn!(
+                    target: "ducktape::statesync",
+                    node = %label,
+                    error = %e,
+                    reason = "shipped_index_cleanup_failed",
+                    "shipped index staging cleanup failed"
+                );
             }
         }
     }

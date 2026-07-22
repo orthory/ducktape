@@ -62,10 +62,11 @@ pub struct NetworkDescriptor {
     /// first reachable entry that is not themselves.
     #[serde(default)]
     pub bootstrap: Vec<String>,
-    /// typed reach hints (v3), canonical strings like `direct:<hex>@host:port`.
+    /// typed reach hints, canonical strings like `direct:<hex>@host:port`.
     /// advisory and EXCLUDED from the genesis fingerprint, exactly like
-    /// `bootstrap`. empty for v2/legacy descriptors — then [`NetworkDescriptor::reach_hints`]
-    /// synthesises all-`Direct` hints from `bootstrap`.
+    /// `bootstrap`. empty for bootstrap-only descriptors — then
+    /// [`NetworkDescriptor::reach_hints`] synthesises all-`Direct` hints from
+    /// `bootstrap`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
     /// Coordination privacy for the reachability plane. `None` => `Private`
@@ -202,12 +203,12 @@ impl NetworkDescriptor {
         self.bootstrap.sort();
     }
 
-    /// the reach hints, typed. if the descriptor carries explicit v3 `reach`
+    /// the reach hints, typed. if the descriptor carries explicit `reach`
     /// entries they parse to those; otherwise every `bootstrap` entry is a
-    /// `Direct` hint (so a v2/legacy descriptor yields all-`Direct` hints with
-    /// no data duplicated and no double-dial).
+    /// `Direct` hint (so a bootstrap-only descriptor yields all-`Direct`
+    /// hints with no data duplicated and no double-dial).
     pub fn reach_hints(&self) -> Result<Vec<ReachHint>, String> {
-        // the UNION of typed `reach` and legacy `bootstrap`: explicit typed
+        // the UNION of typed `reach` and untyped `bootstrap`: explicit typed
         // hints win over bootstrap-synthesised Direct hints for the same
         // member, but typed entries are a route set, not a per-key map. A
         // node may need both a rendezvous route and a tunnel-overlay route for
@@ -508,26 +509,6 @@ pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
     unpack_coord_cap(&bytes).ok()
 }
 
-// ============================================================================
-// the lobby identity — a keypair every holder of this network's descriptor can
-// DERIVE (seeded from the genesis namespace, which is public to members and
-// invitees alike). it authenticates NOTHING: it exists so a not-yet-admitted
-// joiner can complete the discovery handshake and be heard on the lobby
-// channel at all — authorization is the invite token it then presents. every
-// member folds this key into its tracked mesh, so the set stays identical
-// across nodes (discovery kills peers whose set at a shared index differs).
-// ============================================================================
-
-pub fn lobby_identity(binding: &[u8]) -> ed25519::PrivateKey {
-    use commonware_cryptography::{Hasher as _, Sha256};
-    let mut hasher = Sha256::default();
-    hasher.update(b"ducktape-lobby-v1:");
-    hasher.update(binding);
-    let digest = hasher.finalize();
-    // every 32-byte string is a valid ed25519 seed (the scheme clamps).
-    ed25519::PrivateKey::decode(digest.as_ref()).expect("32 digest bytes decode")
-}
-
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
 /// workspace dir only ever holds one chain-id. a refreshed invite for the
 /// SAME chain-id (the documented re-join after a pre-genesis admit) may
@@ -739,6 +720,14 @@ pub fn workspaces_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".ducktape").join("workspaces"))
 }
 
+/// the registry directory a chain-id's workspace materializes into:
+/// `<workspaces_root>/<chain-id>`. path separators in the id (a `--name` is
+/// arbitrary text) are made inert — the registry resolves by descriptor
+/// content, so the directory name is display-only.
+pub fn default_workspace_dir(chain_id: &str) -> Result<PathBuf, String> {
+    Ok(workspaces_root()?.join(chain_id.replace(std::path::MAIN_SEPARATOR, "-")))
+}
+
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
 /// registry for descriptors whose chain-id matches `needle` — exact first,
 /// else a unique prefix (so `ducktape` finds `ducktape#a1b2c3d4`). ambiguity
@@ -786,6 +775,76 @@ fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String
     }
 }
 
+/// resolve a `--network <chain id>` needle through the registry to the
+/// workspace directory (the node.toml's parent — what the `gateway` family
+/// addresses) and, when the workspace exposes one, the node's HTTP base URL
+/// (what the `fs`/`user` families dial). the base rewrites a wildcard bind to
+/// loopback so a local CLI actually reaches it; it is `None` when the node.toml
+/// carries no `http_listen` (no node-API surface to dial) — the callers that
+/// need a URL turn that into a loud error, the ones that need only the
+/// directory ignore it. ONE shared resolver so no family re-walks the registry.
+pub fn resolve_network(needle: &str) -> Result<(PathBuf, Option<String>), String> {
+    resolve_network_in(&workspaces_root()?, needle)
+}
+
+fn resolve_network_in(root: &Path, needle: &str) -> Result<(PathBuf, Option<String>), String> {
+    let node_toml = find_workspace_config_in(root, needle)?;
+    let dir = node_toml
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let (raw, _) = node_toml::load_node_toml(&node_toml)?;
+    Ok((dir, Some(http_base_of(&raw.http_listen))))
+}
+
+/// `http://<host:port>` for a node.toml `http_listen`, rewriting a wildcard
+/// bind to the SAME family's loopback: a wildcard means "every interface", and
+/// a co-located CLI reaches the node over loopback. `0.0.0.0` → `127.0.0.1`,
+/// but `[::]` → `[::1]`, NOT 127.0.0.1 — a bindv6only `[::]` listener refuses
+/// v4 loopback dials (mirrors `agent_provision::node_http_base`).
+fn http_base_of(http_listen: &str) -> String {
+    let Some((host, port)) = http_listen.rsplit_once(':') else {
+        return format!("http://{http_listen}");
+    };
+    let loopback = match host {
+        "0.0.0.0" => Some("127.0.0.1"),
+        "[::]" => Some("[::1]"),
+        _ => None,
+    };
+    let host = loopback.unwrap_or(host);
+    format!("http://{host}:{port}")
+}
+
+/// enumerate the workspace registry: `(chain_id, node.toml path)` per
+/// registered network, sorted by chain_id. an ABSENT registry root is an empty
+/// list, not an error — nothing has been registered yet. one unreadable
+/// descriptor is skipped, never fatal (same tolerance as `find_workspace_config`).
+pub fn list_workspaces() -> Result<Vec<(String, PathBuf)>, String> {
+    list_workspaces_in(&workspaces_root()?)
+}
+
+fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read workspace registry {root:?}: {e}")),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let descriptor_path = dir.join("network.toml");
+        if !descriptor_path.is_file() {
+            continue;
+        }
+        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
+            continue;
+        };
+        out.push((d.chain_id, dir.join("node.toml")));
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +874,37 @@ mod tests {
         assert!(load_coord_cap(dir.path()).is_none());
         save_coord_cap(dir.path(), &cap).unwrap();
         assert_eq!(load_coord_cap(dir.path()).unwrap(), cap);
+    }
+
+    #[test]
+    fn list_workspaces_enumerates_sorted_and_tolerates_junk() {
+        let root = tempfile::tempdir().unwrap();
+        // absent subdir contents => empty, and an absent root is empty too.
+        assert!(
+            list_workspaces_in(&root.path().join("nope"))
+                .unwrap()
+                .is_empty()
+        );
+        for id in ["zebra#00000002", "alpha#00000001"] {
+            let dir = root.path().join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            NetworkDescriptor {
+                chain_id: id.into(),
+                scheme: SCHEME_ED25519.into(),
+                validators: vec![],
+                bootstrap: vec![],
+                reach: vec![],
+                coordination: None,
+            }
+            .save(&dir.join("network.toml"))
+            .unwrap();
+        }
+        // a bare dir with no network.toml is skipped, not counted.
+        std::fs::create_dir_all(root.path().join("not-a-workspace")).unwrap();
+        let got = list_workspaces_in(root.path()).unwrap();
+        let ids: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(ids, ["alpha#00000001", "zebra#00000002"]);
+        assert!(got[0].1.ends_with("alpha#00000001/node.toml"));
     }
 
     #[test]
@@ -899,7 +989,8 @@ mod tests {
     /// joiner unpacks it (`unpack_coord_cap`) and presents it on an
     /// authenticated request — and the coordinator's private `verify_request`
     /// admits the joiner off that delivered cap. Proves the cap the member
-    /// hands over its `JoinReply` actually authorizes the holder.
+    /// hands over its sealed `IntroReply::Admitted` ack actually authorizes the
+    /// holder.
     #[test]
     fn delivered_cap_admits_the_joiner_under_private_policy() {
         use commonware_cryptography::Signer as _;
@@ -992,6 +1083,63 @@ mod tests {
         assert!(find_workspace_config_in(&root, "nope").is_err());
         let err = find_workspace_config_in(&root, "").expect_err("ambiguous");
         assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    fn write_workspace(root: &Path, ws: &str, chain: &str, listen: &str, http: &str) -> PathBuf {
+        let dir = root.join(ws);
+        std::fs::create_dir_all(&dir).expect("mk workspace");
+        NetworkDescriptor {
+            chain_id: chain.into(),
+            scheme: SCHEME_ED25519.into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        // the network shape is COMPLETE by construction — write every key.
+        let node_toml = format!(
+            "network = \"network.toml\"\nkey_file = \"identity.key\"\n\
+             listen = \"{listen}\"\nadvertised = \"127.0.0.1:9000\"\n\
+             storage_dir = 'storage'\nhttp_listen = \"{http}\"\n\
+             gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
+             wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
+             wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n\
+             sync_index = false\nannounce_capabilities = false\n\
+             sandbox = \"direct\"\nsandbox_image = \"docker.io/library/node:22-slim\"\n\
+             sandbox_cores = 0\nsandbox_mem_gb = 0\n"
+        );
+        std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
+        dir
+    }
+
+    #[test]
+    fn resolve_network_reads_http_base_and_reports_a_missing_listen() {
+        let root = tmp("resolve-net");
+        // a workspace with a wildcard http listen resolves to a loopback base.
+        let a = write_workspace(&root, "a", "ducktape#a1b2c3d4", "0.0.0.0:9000", "0.0.0.0:8844");
+        let (dir, http) = resolve_network_in(&root, "ducktape").expect("prefix resolves");
+        assert_eq!(dir, a);
+        assert_eq!(http.as_deref(), Some("http://127.0.0.1:8844"));
+
+        // every network-shape workspace carries an http listen (the key is
+        // required), so the base always resolves.
+        let b = write_workspace(&root, "b", "kitchen#99887766", "127.0.0.1:9001", "127.0.0.1:9002");
+        let (bdir, bhttp) = resolve_network_in(&root, "kitchen").expect("prefix resolves");
+        assert_eq!(bdir, b);
+        assert_eq!(bhttp.as_deref(), Some("http://127.0.0.1:9002"));
+    }
+
+    #[test]
+    fn http_base_substitutes_wildcard_hosts_only() {
+        assert_eq!(http_base_of("0.0.0.0:8844"), "http://127.0.0.1:8844");
+        // a bindv6only `[::]` refuses v4 loopback dials → v6 loopback, not 127.0.0.1
+        assert_eq!(http_base_of("[::]:8844"), "http://[::1]:8844");
+        assert_eq!(http_base_of("127.0.0.1:8844"), "http://127.0.0.1:8844");
+        assert_eq!(http_base_of("[::1]:8844"), "http://[::1]:8844");
+        assert_eq!(http_base_of("192.168.1.5:80"), "http://192.168.1.5:80");
     }
 
     #[test]

@@ -51,13 +51,17 @@ fn network_shape_joiner_parks_until_promote() {
     );
 
     // opt the friend into the shipped-index warm start (indexable spec §7
-    // lane 2) the way an operator would: a hand-edited node-local policy
-    // line. the whole lane then rides this admission for real — the founder
-    // cuts and serves its index checkpoints over the mesh, the friend
-    // fetches and stages them, and the promoted reboot adopts the set.
+    // lane 2) the way an operator would: EDIT the generated line's value
+    // (the file is complete — every key already present, appends would be
+    // duplicate-key parse errors). the whole lane then rides this admission
+    // for real — the founder cuts and serves its index checkpoints over the
+    // mesh, the friend fetches and stages them, and the promoted reboot
+    // adopts the set.
     let cfg = cluster.config_file(1);
     let toml = std::fs::read_to_string(&cfg).expect("read friend node.toml");
-    std::fs::write(&cfg, format!("{toml}sync_index = true\n")).expect("write friend node.toml");
+    assert!(toml.contains("sync_index = false"), "generated file carries the key");
+    std::fs::write(&cfg, toml.replace("sync_index = false", "sync_index = true"))
+        .expect("write friend node.toml");
 
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
@@ -107,8 +111,8 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
     let friend_key = cluster.join_friend_manual(&invite);
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{out}");
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
 
     let (ok, out) = cluster.run_promote(&friend_key);
@@ -418,21 +422,16 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
 ///   4. a restarted resident parks straight back into resident mode (the
 ///      pre-sync writes no checkpoint manifest — a reboot is clean) and serves
 ///      again;
-///   5. `resident-remove` REVOKES standing through the same ceremony: committed
+///   5. `resident remove` REVOKES standing through the same ceremony: committed
 ///      residents empty, the node falls back to a parked joiner, and a second
 ///      run is an honest no-op;
-///   6. `invite-accept` re-grants, and the resident resumes the follow (a
+///   6. `resident accept` re-grants, and the resident resumes the follow (a
 ///      post-re-grant write becomes readable through its surface);
 ///   7. `promote` then seats a WARM validator through the normal path.
 ///
-/// resident ops are no longer version-gated, so admission works at v0; this
-/// leg still runs the v3 upgrade ceremony first (schedule → auto-signal →
-/// activate) as incidental upgrade-path coverage, not as a precondition for
-/// the resident grant below.
 #[test]
 fn staged_admission_resident_presyncs_then_promotes_warm() {
     use directory::{DirMsg, DirQuery, DirReply};
-    use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
     use valset::{ValsetQuery, ValsetReply};
 
     let _serial = serial();
@@ -443,20 +442,6 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
-    // ---- protocol v3: schedule → auto-signal (solo R==n) → activate --------
-    let proposal_status = |cluster: &NetworkShapeCluster, id: &str| -> Option<ProposalStatus> {
-        let reply = cluster.query(
-            0,
-            "governance",
-            &governance::encode_query(&GovQuery::Proposal {
-                proposal_id: id.into(),
-            }),
-        )?;
-        match governance::decode_reply(&reply).ok()? {
-            GovReply::Proposal(Some(view)) => Some(view.status),
-            _ => None,
-        }
-    };
     let poll = |what: &str, mut pred: Box<dyn FnMut() -> bool + '_>| {
         let deadline = std::time::Instant::now() + CONVERGE;
         while !pred() {
@@ -467,84 +452,6 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             std::thread::sleep(Duration::from_millis(300));
         }
     };
-    // self-correcting lead against the (slow, nop-gated) block rate: retry
-    // with a doubled lead if the min-lead gate aborted the execute.
-    let mut lead = 30u64;
-    let mut activation = 0u64;
-    for attempt in 0..4u32 {
-        let base = cluster.status(0)["height"].as_u64().unwrap_or(0);
-        activation = base + lead;
-        let pid = format!("resident-tier-a{attempt}");
-        cluster.submit(
-            0,
-            "governance",
-            &governance::encode_msg(&GovMsg::Propose {
-                proposal_id: pid.clone(),
-                action: GovAction::ScheduleUpgrade {
-                    name: "resident-tier".into(),
-                    activation_height: activation,
-                    to_version: 3,
-                },
-                voting_period: 600_000,
-            }),
-        );
-        poll("the v3 proposal to open", Box::new(|| {
-            proposal_status(&cluster, &pid).is_some()
-        }));
-        cluster.submit(
-            0,
-            "governance",
-            &governance::encode_msg(&GovMsg::Vote {
-                proposal_id: pid.clone(),
-                approve: true,
-            }),
-        );
-        // a passing tally never auto-executes — the deciding voter drives the
-        // explicit Execute (same-origin submits finalize in seq order, so the
-        // ballot lands first).
-        cluster.submit(
-            0,
-            "governance",
-            &governance::encode_msg(&GovMsg::Execute {
-                proposal_id: pid.clone(),
-            }),
-        );
-        poll("the solo ballot to pass", Box::new(|| {
-            proposal_status(&cluster, &pid)
-                .is_some_and(|s| s != ProposalStatus::Open)
-        }));
-        // did the schedule take? (a min-lead abort leaves no pending slot.)
-        let took = {
-            let deadline = std::time::Instant::now() + Duration::from_secs(20);
-            loop {
-                let pending = cluster
-                    .query(
-                        0,
-                        "upgrade",
-                        &upgrade::encode_query(&upgrade::UpgradeQuery::Status),
-                    )
-                    .and_then(|raw| upgrade::decode_reply(&raw).ok())
-                    .map(|upgrade::UpgradeReply::Status(st)| st.pending.is_some())
-                    .unwrap_or(false);
-                if pending {
-                    break true;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(300));
-            }
-        };
-        if took {
-            break;
-        }
-        lead *= 2;
-        assert!(attempt < 3, "could not schedule the v3 upgrade (lead {lead})");
-    }
-    cluster.wait_marker(0, "signaled ready name=resident-tier", CONVERGE);
-    cluster.wait_marker(0, "upgrade armed name=resident-tier to_version=3", CONVERGE);
-    cluster.wait_marker(0, "upgrade activated name=resident-tier version=3", CONVERGE);
-    let _ = activation;
 
     // ---- invite → park → resident grant ------------------------------------
     let invite = cluster.invite();
@@ -552,11 +459,11 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
 
-    let (ok, text) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "invite-accept failed:\n{text}");
+    let (ok, text) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "resident accept failed:\n{text}");
     assert!(
         text.contains("granted resident standing"),
-        "unexpected invite-accept output:\n{text}"
+        "unexpected resident accept output:\n{text}"
     );
 
     // the grant's boundary admits the resident to the mesh; the parked node
@@ -609,17 +516,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     }));
     //     …the http app surface answers its status route from the same host…
     {
-        use std::io::{Read as _, Write as _};
-        let mut conn =
-            std::net::TcpStream::connect(("127.0.0.1", cluster.http_ports[1]))
-                .expect("connect the resident's app surface");
-        conn.set_read_timeout(Some(Duration::from_secs(15))).expect("http timeout");
-        conn.write_all(b"GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .expect("http write");
-        let mut raw = String::new();
-        conn.read_to_string(&mut raw).expect("http read");
-        assert!(raw.starts_with("HTTP/1.1 200"), "resident /v1/status must answer 200:\n{raw}");
-        assert!(raw.contains("\"height\""), "resident /v1/status carries a height:\n{raw}");
+        let (status, body) = nettest::http_text(cluster.http_ports[1], "GET", "/v1/status");
+        assert_eq!(status, 200, "resident /v1/status must answer 200:\n{body}");
+        assert!(body.contains("\"height\""), "resident /v1/status carries a height:\n{body}");
     }
     //     …a write LANDS through the submit relay: the resident signs with its
     //     own key, ships the frame to the validator, and the rpc reply holds
@@ -745,15 +644,15 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             == serde_json::json!(true)
     }));
 
-    // (5) resident-remove: the ceremony verb revokes standing. committed
+    // (5) resident remove: the ceremony verb revokes standing. committed
     //     state clears, and the resident — whose respawned log is fresh, so
     //     the parked marker is unambiguously post-revoke — falls back to a
     //     parked joiner at the boundary whose manifest drops it.
-    let (ok, out) = cluster.run_membership_verb("resident-remove", &friend_key);
-    assert!(ok, "resident-remove failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident remove", &friend_key);
+    assert!(ok, "resident remove failed:\n{out}");
     assert!(
         out.contains("revoked resident standing"),
-        "unexpected resident-remove output:\n{out}"
+        "unexpected resident remove output:\n{out}"
     );
     poll("the revoke to clear resident standing", Box::new(|| {
         cluster
@@ -763,19 +662,19 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     }));
     cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
     //     a second run is an honest no-op — the inverted guard, end to end.
-    let (ok, out) = cluster.run_membership_verb("resident-remove", &friend_key);
-    assert!(ok, "resident-remove (no standing) failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident remove", &friend_key);
+    assert!(ok, "resident remove (no standing) failed:\n{out}");
     assert!(
         out.contains("holds no resident standing"),
-        "unexpected no-op resident-remove output:\n{out}"
+        "unexpected no-op resident remove output:\n{out}"
     );
 
-    // (6) re-grant: invite-accept restores standing and the resident resumes
+    // (6) re-grant: resident accept restores standing and the resident resumes
     //     the follow — a write finalized AFTER the re-grant becomes readable
     //     through the resident's own surface (stale serves can't fake this:
     //     the revoked node never synced a boundary carrying this key).
-    let (ok, out) = cluster.run_membership_verb("invite-accept", &friend_key);
-    assert!(ok, "re-grant invite-accept failed:\n{out}");
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "re-grant resident accept failed:\n{out}");
     assert!(
         out.contains("granted resident standing"),
         "unexpected re-grant output:\n{out}"

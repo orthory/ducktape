@@ -124,6 +124,7 @@ pub(super) async fn provision(
         source: spec.source.clone(),
         env,
         context_doc,
+        _session: session,
     }))
 }
 
@@ -140,6 +141,8 @@ struct NodedWorkspace {
     /// the run's assembled soul — its `always` skills inlined, the rest indexed.
     /// `None` when the agent curated no skills. capability-host delivers it.
     context_doc: Option<String>,
+    /// Owns the scoped signer endpoint for exactly as long as the workspace.
+    _session: Option<super::session::RunSession>,
 }
 
 impl NodedWorkspace {
@@ -177,18 +180,22 @@ impl ProvisionedWorkspace for NodedWorkspace {
         self.context_doc.clone()
     }
 
-    async fn commit(&self, message: &str) -> Result<WorkspaceReceipt, String> {
+    async fn commit(
+        &self,
+        audit_message: &str,
+        _proposal: Option<&str>,
+    ) -> Result<WorkspaceReceipt, String> {
         let api = ActorNodeApi::new(self.handle.clone());
         let dir = self.dir.clone();
-        let message = message.to_string();
+        let message = audit_message.to_string();
         let result = tokio::task::spawn_blocking(move || {
             // Provider HOME/auth/temp/build state is reserved runtime debris,
             // never an agent output facet. Remove it before duckfs scans.
             let _ = std::fs::remove_dir_all(dir.join(capability_host::RUN_RUNTIME_DIR));
             commit(&api, &dir, &message)
         })
-            .await
-            .map_err(|_| "workspace commit task panicked".to_string())?;
+        .await
+        .map_err(|_| "workspace commit task panicked".to_string())?;
         let spec = self.receipt_spec();
         match result {
             Ok(summary) => Ok(WorkspaceReceipt::committed(

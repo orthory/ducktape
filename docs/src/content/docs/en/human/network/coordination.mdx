@@ -1,0 +1,195 @@
+---
+title: "Coordination"
+audience: human
+---
+
+import { InvitationFlow } from '../../../../../components/diagram/InvitationFlow.client'
+
+<InvitationFlow client:visible />
+
+Two validators that both sit behind NAT cannot dial each other directly — neither
+exposes an inbound port. A **coordinator** is the small helper that lets them
+find each other and punch a direct path anyway. It provides two services on one
+UDP socket: **reflexive-address discovery** (STUN — it tells a NAT'd node the
+public `ip:port` the world sees it as) and **rendezvous** (it brokers a
+simultaneous-open so two hidden nodes hole-punch a direct WireGuard tunnel). Once
+the tunnel is up the coordinator is out of the picture entirely; no data path
+ever traverses it.
+
+This page explains the one operational choice a network makes about its
+coordinator — **public or private coordination** — and how to run one either way.
+
+Related: [Network and Membership](/en/human/network/network-and-membership)
+places coordination beside valset state, [Quick Start](/en/human/start/quick-start)
+shows the onboarding path, [Design Records](/en/human/reference/design-records)
+points to maintained protocol records, and [agent Validator Operations](/en/agent/network/validator-operations)
+is the edit checklist.
+
+## The coordinator is untrusted by design
+
+The coordinator is deliberately powerless. It never joins consensus, never
+decrypts, never serves state, and is never on a data path. Both planes it sits
+beside authenticate themselves *without* it: the control mesh authenticates every
+peer by its `ed25519` key end-to-end, and the data tunnel is validator↔validator
+WireGuard keyed between the two validators' own keys. So a fully compromised
+coordinator can, at most, learn coarse topology and reflexive addresses and delay
+*new* connection setup. It cannot impersonate a validator, forge a mapping, or
+touch an established tunnel.
+
+That is why a coordinator holds **no secret and no state**: it can be run as
+throwaway infrastructure and replaced at will. Adding authorization does not
+change this — the only thing a private coordinator is configured with is a list
+of **public** keys.
+
+## Public vs private coordination
+
+Authorization on a coordinator is not a trust boundary for the network (key
+substitution is already impossible). It is **admission control**: it decides
+*who may use the rendezvous service*, bounding abuse and keeping topology
+metadata inside the membership. Each network picks one of two modes.
+
+**Public coordination.** Anyone may use the coordinator, but every request must
+be signed by the key it acts on — a **proof-of-possession**. This costs nothing
+to manage (a node signs with the identity key it already has) and lets a network
+point at shared or community coordinators without issuing any credentials. Proof-
+of-possession still prevents one user from poisoning another's mapping or
+registering a key it does not hold.
+
+**Private coordination.** Only nodes the network vouched for may register, look
+up, or use STUN. Genesis validators are authorized automatically; other members
+(joiners) carry a signed **capability** they receive during onboarding. Rendezvous
+metadata — who is trying to reach whom — stays within the membership. Run (or
+pin) your own coordinator for this mode.
+
+A network records its choice as `coordination = "public"` or
+`coordination = "private"` in its `network.toml` (the default is `"private"`).
+The mode travels in the invite as well, so a joiner knows which credentials to
+present without seeing the full descriptor.
+
+## How authorization works
+
+Every request a node sends to the coordinator carries a compact **authenticator**
+— the wire equivalent of an `Authorization:` header, but a field on the UDP
+datagram rather than an HTTP header, and self-validating rather than an opaque
+token the server looks up:
+
+- a **timestamp**, so a captured request cannot be replayed outside a short
+  window (about 30 seconds — coordinator hosts and nodes should keep a
+  loosely-synced clock, e.g. NTP);
+- a **proof-of-possession** signature, made with the caller's own identity key;
+- in private mode, an optional **capability** — a short blob a genesis validator
+  signed that says "this key is authorized until *expiry*".
+
+The coordinator verifies all of this with math against public keys it already
+holds — never a secret. A request that fails any check is **silently dropped**
+(no reply, no error), so the coordinator never becomes an oracle for "is this key
+a member?" and offers no amplification surface.
+
+One subtlety worth knowing: a request authenticates the **caller**, not the key
+it names. A member may *look up* any peer (it signs the lookup with its own key),
+but it may only *register or re-advertise its own* key — so no member can point
+another node's rendezvous mapping at a wrong address.
+
+## Running a coordinator
+
+The binary is `bin/coordinator`. It parses one required flag, `--listen`, plus
+the mode selector. It binds exactly one UDP socket, keeps no disk and no config
+file, and prints `coordinator listening on <addr>` on start.
+
+**Public (the default).** No mode flag needed; the coordinator accepts any
+proof-of-possession-signed request:
+
+```sh
+coordinator --listen 0.0.0.0:3478
+```
+
+**Private (pinned to one network).** Point `--genesis-set` at that network's
+`network.toml`. The coordinator reads only the **public** genesis validator keys
+out of it — there is still no secret on the box — and admits a request only when
+the caller is one of those keys or presents a capability one of them signed:
+
+```sh
+coordinator --listen 203.0.113.10:3478 --genesis-set /etc/ducktape/network.toml
+```
+
+**Legacy fully-open (development only).** `--allow-anonymous` disables
+proof-of-possession and accepts unauthenticated requests, matching the pre-auth
+behavior. Use it only for local testing:
+
+```sh
+coordinator --listen 127.0.0.1:3478 --allow-anonymous
+```
+
+A malformed or value-less `--genesis-set` is a **hard error**, never a silent
+fall-through to a weaker policy — a private coordinator that cannot load its pin
+refuses to start rather than quietly serving everyone.
+
+**Multi-homed hosts.** Everything the coordinator answers is derived from the
+observed source of each datagram, so a wildcard `--listen 0.0.0.0:3478` is fine
+on a single-IP box. On a host with more than one routable IP, bind the concrete
+public IP that peers dial: a reply that egresses from a different source address
+is (correctly) discarded by the client, and the coordinator looks healthy while
+every client times out.
+
+Run **more than one** coordinator. A network's invite carries a list of reach
+hints, and a node walks them, so a single coordinator outage never wedges entry.
+And an already-punched direct tunnel survives a coordinator restart entirely —
+only *new* rendezvous depends on a live coordinator. (Deployment recipes — a
+hardened systemd unit and a distroless container — live in the repository's
+`docs/deploy/coordinator.md`.)
+
+**Upgrade coordinators and nodes together.** An authorization-aware node always
+sends the authenticated request format, and a network's invites carry the newer
+format that echoes the coordination mode. So a coordinator running an older,
+pre-authorization build silently drops every request, and a node running an older
+build rejects a newer invite. Because the coordinator is disposable, the intended
+rollout is to replace it and upgrade the network's nodes together — not to run a
+mixed fleet.
+
+## What a node needs to use a coordinator
+
+A node needs three things, and each already has a home — no new configuration
+file is introduced:
+
+- **Path** — *where* the coordinator is. Carried by the `Coordinated` reach hint
+  in the descriptor/invite (`coordinated:<key>@<host:port>#<coord_key>`). Several
+  hints give multi-coordinator failover.
+- **Scheme** — *how* to authenticate: the network's `coordination` mode, which
+  the node learns from its `network.toml` (echoed in the invite). The node does
+  not choose the scheme; it obeys the network's recorded policy.
+- **Credential** — *what* to present: its **identity key**, which signs the
+  proof-of-possession in both modes, and — in private mode — a **`coord.cap`**
+  file holding its capability. Genesis validators need no `coord.cap` (the pinned
+  set covers them).
+
+## How joiners get a capability
+
+A capability binds a specific node's key, so it cannot be minted before that node
+exists — which means it does not ride the invite. Instead a joiner receives one
+**automatically during onboarding**. When a parked joiner announces itself over
+the lobby, any member that is a **genesis validator** verifies the joiner's key,
+mints a capability for it (a plain signature — no consensus, no governance), and
+returns it on the same lobby reply. The joiner saves it as `coord.cap` beside its
+descriptor, and from then on its rendezvous requests are admitted by a private
+coordinator — often before governance has even finished admitting it.
+
+**A v1 limitation to know.** A capability is only accepted if a **genesis**
+validator signed it. If a joiner is invited by a non-genesis member and no
+genesis validator is online to answer its announce, it receives no capability and
+a private coordinator will not admit it; the join then relies on a `Fronted` or
+`Direct` reach hint for the join window. Networks whose founders (genesis
+validators) run the onboarding are unaffected. Capabilities are long-lived;
+rotation is future work.
+
+## When rendezvous is refused
+
+A private-mode node that is neither a genesis validator nor holding a valid
+`coord.cap` **fails closed**: the coordinator drops its requests, the node gets no
+rendezvous, and it rides its statically-advertised endpoint instead (surfaced as
+a reachability failure for the operator). This is deliberate — it is an explicit,
+visible state, not a silent downgrade to open access. The usual causes are a
+missing `coord.cap` on a non-genesis member, a network whose mode says `private`
+while the coordinator is actually running open (or vice versa), or a clock skew
+beyond the freshness window. Check, in order: the node's `coordination` mode
+matches the coordinator's, a `coord.cap` is present for a non-genesis member, and
+the clocks are synced.

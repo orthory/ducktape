@@ -49,6 +49,7 @@ use kv::Kv;
 use kv::{KvMsg, encode};
 use node::{OrderedNode, encode_frame};
 use sdk::Msg;
+use statesync::qmdb::QmdbStore;
 
 const N: usize = 5;
 const LABELS: [&str; N] = ["v0", "v1", "v2", "v3", "v4"];
@@ -57,7 +58,7 @@ const LABELS: [&str; N] = ["v0", "v1", "v2", "v3", "v4"];
 const BYZ: usize = N - 1;
 
 async fn genesis_host(ctx: deterministic::Context) -> Host {
-    let kv = Kv::init(ctx, "kv").await;
+    let kv = Kv::new("kv", Box::new(QmdbStore::init(ctx, "kv").await));
     Host::genesis(vec![Box::new(kv), Box::new(Directory::new("directory"))]).expect("genesis")
 }
 
@@ -112,7 +113,7 @@ fn sentinel_garbage() -> Vec<u8> {
 ///   stores it under `digest_of(frame)`, which is never finalized (never proposed),
 ///   so it is never delivered — isolating the defense from mere frame-validity.
 fn unproposed_valid_frame() -> Vec<u8> {
-    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"))
+    encode_frame(&op_signer(200), 0, &kv_set(b"zzz", b"999"), None)
 }
 
 /// the N=5 relay convergence scenario. `flood`: when true, validator `BYZ` spawns

@@ -65,7 +65,7 @@ fn a_multi_member_batch_seals_as_one_block_and_replays_byte_identically() {
 
         let pos = node.sink_mut().oplog_pos().await;
         let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
                 .expect("capture");
         assert_eq!(manifest.app_hash, genesis_hash);
         node.sink_mut()
@@ -161,6 +161,97 @@ fn a_multi_member_batch_seals_as_one_block_and_replays_byte_identically() {
     });
 }
 
+// ---- continuation-envelope replay parity ------------------------------------
+
+/// FORK-CRITICAL for the drain wiring: a journaled batch carrying a
+/// continuation envelope replays WITH its continuation. a replay that wrapped
+/// bare `(origin, msg)` pairs would drop the continuation's write and the
+/// recovered app-hash would diverge from the sealed tip (exactly what
+/// `recover()`'s verification fail-stops on).
+#[test]
+fn an_envelope_batch_replays_with_its_continuation() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        // ---- live run: genesis checkpoint, then ONE batch mixing a plain
+        // member with an envelope (parent sets a, continuation sets b). ----
+        let recovery = Recovery::open(context.child("v3r1"))
+            .await
+            .expect("open recovery");
+        let mut node = OrderedNode::with_sink(fresh_host(), RoundOrderer::new(), recovery);
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest =
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+                .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        let signer = sk(1);
+        node.submit(&signer, 0, set("k1", "v1")).await.expect("plain member");
+        let envelope = node::encode_frame(
+            &signer,
+            1,
+            &set("a", "1"),
+            Some(&sdk::Continuation {
+                target: "directory".into(),
+                payload: encode_msg(&DirMsg::Set {
+                    key: "b".into(),
+                    value: "2".into(),
+                }),
+            }),
+        );
+        node.submit_frame(envelope).await.expect("envelope admits");
+        assert_eq!(node.flush_batch().await.expect("flush"), 1, "one mixed batch");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1, "one block");
+
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.app_hash();
+        let released = node
+            .take_drained()
+            .into_iter()
+            .find_map(|d| d.op.and_then(|op| op.continuation))
+            .expect("the envelope member surfaced its continuation");
+        assert_eq!(released.disposition, node::Disposition::Applied);
+        assert_eq!(get(node.host(), "a").await.as_deref(), Some("1"));
+        assert_eq!(get(node.host(), "b").await.as_deref(), Some("2"));
+        assert_eq!(get(node.host(), "k1").await.as_deref(), Some("v1"));
+
+        node.sink_mut().sync().await.expect("shutdown sync");
+        drop(node);
+
+        // ---- boot: fresh host, replay the journal suffix. the continuation's
+        // write must reproduce or the app-hash check fail-stops. ----
+        let mut recovery = Recovery::open(context.child("v3r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery
+            .manifest()
+            .expect("manifest decodes")
+            .expect("manifest present");
+        let mut host = fresh_host();
+        assert_eq!(get(&host, "a").await, None);
+        assert_eq!(get(&host, "b").await, None);
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("recover");
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.app_hash, tip_hash,
+            "the v3 batch (parent + released continuation) replays byte-identically"
+        );
+        assert_eq!(get(&host, "a").await.as_deref(), Some("1"));
+        assert_eq!(
+            get(&host, "b").await.as_deref(),
+            Some("2"),
+            "the continuation's write reproduced from the journal"
+        );
+        assert_eq!(get(&host, "k1").await.as_deref(), Some("v1"));
+    });
+}
+
 /// an UNSEALED trailing multi-member batch (crash after `pre_apply`, before the
 /// seal) rolls forward on boot and lands at the SAME roots a sealed run of the
 /// identical batch produces — parity for the roll-forward path, not just the
@@ -174,9 +265,9 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
         // seed the sealed reference and the torn roll-forward, so any parity gap
         // is the recovery path, not the input.
         let batch = node::encode_batch(&[
-            node::encode_frame(&signer, 1, &set("m0", "w0")),
-            node::encode_frame(&signer, 2, &set("m1", "w1")),
-            node::encode_frame(&signer, 3, &set("m2", "w2")),
+            node::encode_frame(&signer, 1, &set("m0", "w0"), None),
+            node::encode_frame(&signer, 2, &set("m1", "w1"), None),
+            node::encode_frame(&signer, 3, &set("m2", "w2"), None),
         ]);
 
         // ---- reference: the roots a NORMAL genesis -> seed(block 0) -> batch
@@ -188,15 +279,14 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
         // version, so this reproduces the drain's app-hash exactly. ----
         let reference_hash = {
             let mut host = fresh_host();
-            let (o, m) =
-                node::decode_frame(&node::encode_frame(&signer, 0, &set("seed", "s")))
+            let (o, m, _c) =
+                node::decode_frame(&node::encode_frame(&signer, 0, &set("seed", "s"), None))
                     .expect("decode seed");
             host.submit_block(
                 BlockContext {
                     height: 0,
                     consensus_time: 0,
                     origin: Origin::System,
-                    protocol_version: 0,
                 },
                 vec![(o, m)],
             )
@@ -205,14 +295,16 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
             let ops: Vec<(Origin, Msg)> = node::decode_batch(&batch)
                 .expect("decode batch")
                 .iter()
-                .map(|f| node::decode_frame(f).expect("decode member"))
+                .map(|f| {
+                    let (o, m, _c) = node::decode_frame(f).expect("decode member");
+                    (o, m)
+                })
                 .collect();
             host.submit_block(
                 BlockContext {
                     height: 1,
                     consensus_time: 1,
                     origin: Origin::System,
-                    protocol_version: 0,
                 },
                 ops,
             )
@@ -230,7 +322,7 @@ fn an_unsealed_multi_member_batch_rolls_forward_to_the_sealed_roots() {
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
         let pos = node.sink_mut().oplog_pos().await;
         let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, 0, None, pos, 1)
+            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
                 .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)

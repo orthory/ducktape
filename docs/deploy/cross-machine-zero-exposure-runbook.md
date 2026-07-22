@@ -46,7 +46,7 @@ gotcha, the 2-validator-quorum teardown caveat).
 
 - The coordinator deployed and answering (per [`coordinator.md`](coordinator.md);
   verify with the Task-2 subprocess proof or `ss -lunp 'sport = :3478'`).
-- Validator A and Validator B each have a built `ducktape-node`.
+- Validator A and Validator B each have a built `ducktape`.
 - A founder able to mint v3 invites.
 - For the tunnel steps: real WireGuard userspace/kernel on A and B.
 
@@ -76,6 +76,6 @@ gotcha, the 2-validator-quorum teardown caveat).
 
 **What still needs real infra proof:** an end-to-end tunnel across two distinct,
 punchable NATs. The logic is proven at the library level by the CI simulated-NAT
-suite (`crates/system/nat-traversal/tests/simnat_ci.rs`, Slice 3), but the real
+suite (`crates/networking/nat-traversal/tests/simnat_ci.rs`, Slice 3), but the real
 cross-machine run still needs two NATs that admit a direct punched path plus a
 VPS coordinator.

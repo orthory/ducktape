@@ -40,7 +40,7 @@ fn full_chunk_putblob() -> Msg {
 
 #[test]
 fn full_chunk_putblob_frame_fits_the_cap() {
-    let frame = encode_frame(&sk(1), 0, &full_chunk_putblob());
+    let frame = encode_frame(&sk(1), 0, &full_chunk_putblob(), None);
     assert!(
         frame.len() <= MAX_FRAME_BYTES,
         "a full-CHUNK_SIZE putblob frame must fit MAX_FRAME_BYTES: \

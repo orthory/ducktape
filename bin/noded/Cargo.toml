@@ -7,15 +7,29 @@ version.workspace = true
 # actor thread (the host is deliberately non-Send) and exposes it to clients
 # over http + websocket — POST /v1/submit (one msg = one block), POST /v1/query
 # (read committed state), GET /v1/status (version + app-hash + module roots),
-# POST /v1/shutdown (graceful exit), GET /v1/ws (a block-finalized event
+# POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a block-finalized event
 # stream). every ducktape app build is a client of this process: the web build
-# dials it directly; the tauri build spawns it as a DETACHED subprocess (an
-# orphan that outlives the window) and talks to it the same way.
+# dials it directly; the native Iced build spawns or adopts its managed
+# workspace process and talks to it over the same HTTP/WebSocket contract.
 [[bin]]
 name = "ducktape-noded"
 path = "src/main.rs"
 
+[features]
+# the in-process daemon testkit (`noded::testkit`): a real Host + router on
+# loopback threads, for e2e harnesses. dev-only — consumers enable it as a
+# dev-dependency feature, so it never compiles into the shipping node.
+testkit = ["dep:nettest"]
+
 [dependencies]
+# the shared raw-http/port/poll test client — only pulled by the `testkit`
+# feature (the in-proc daemon's readiness probe), never in a normal build.
+nettest = { path = "../../crates/testing/nettest", optional = true }
+# streamed gateway response bodies (GatewayBody chunks + Body::from_stream relay).
+bytes = "1"
+tokio-stream = "0.1"
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
@@ -25,7 +39,6 @@ duckdns = { workspace = true }
 gateway = { workspace = true }
 inbox = { workspace = true }
 automations = { workspace = true }
-jobs = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 dispatch = { workspace = true }
@@ -88,9 +101,14 @@ flate2 = "1"
 # ssh/https transport forge doesn't use either.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+# the log subscriber every bin installs (src/log.rs): ONE reloadable filter over
+# stderr + the ws-streamed LogRing. `reload` backs POST /v1/log-filter.
+tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
+nettest = { path = "../../crates/testing/nettest" }
 tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

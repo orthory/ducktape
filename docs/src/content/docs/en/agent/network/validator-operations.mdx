@@ -1,0 +1,39 @@
+---
+title: "Validator Operations"
+---
+
+import { ConsensusFlow } from '../../../../../components/diagram/ConsensusFlow.client'
+
+<ConsensusFlow client:visible />
+
+Ducktape has separate seams for propagation, ordered consensus delivery, and
+validator membership. Do not collapse those concepts in docs or code.
+
+Related: [Network and Membership](/en/human/network/network-and-membership) is
+the reader-facing twin, [Consensus and Node](/en/human/architecture/consensus-and-node)
+explains ordered delivery, and [Implementation Status](/en/human/reference/implementation-status)
+tracks the built proof surface.
+
+## Propagation
+
+`crates/kernel/node` includes the loopback transport seam used for deterministic
+local convergence tests. It is not the load-bearing path for QMDB root order.
+
+## Ordered Path
+
+`OrderedNode<O>` applies finalized operations from an `Orderer`. The commonware
+Simplex orderer lives under `crates/kernel/consensus`, and `bin/node` wires it
+into a real-socket validator process.
+
+The ordered path is required because QMDB roots depend on write order.
+
+## Membership
+
+`crates/system/valset` stores validator membership as module state. Dynamic
+valset orchestration is live: `bin/node` observes finalized membership,
+schedules the `ValsetOrchestrator` cutover, retargets mesh, state-sync, and
+reachability, and respawns the ordered node for the new epoch.
+
+When editing membership behavior, look for tests around respawn, joiner
+incorporation, and finalized epoch boundaries. The remaining operational gaps
+are demotion-to-resident/sync-server behavior and pre-recovery storage migration.

@@ -1,0 +1,42 @@
+---
+title: "Gotchas"
+---
+
+These are the recurring failure modes agents should check first.
+
+Related: [State Sync Contract](/en/agent/architecture/state-sync-contract)
+covers sync-specific hazards, [Determinism Contract](/en/agent/architecture/determinism-contract)
+covers execution hazards, [Repository Map](/en/agent/reference/repository-map)
+locates source surfaces, and [human Gotchas](/en/human/reference/gotchas) is the
+reader-facing twin.
+
+## QMDB Order
+
+QMDB roots commit to the operation log. Reordering writes can change the root
+even when the final logical map is identical.
+
+## Fixed-Width Keys
+
+Commonware streaming resolvers require fixed-width keys. Hash logical keys at the
+storage seam for QMDB modules.
+
+## Partition IDs
+
+Child contexts do not automatically namespace storage partitions in one
+deterministic runner. Rebuild tests and modules need distinct partition ids.
+
+## Forge Closure
+
+Indexing a pack is not proof that all reachable git objects exist. Verify object
+closure before moving refs.
+
+## Runtime Mixing
+
+Keep real transport and authenticated discovery tests on Tokio. Keep consensus
+logic in deterministic simulation unless the test intentionally covers runtime
+integration.
+
+## Seed Coverage
+
+`deterministic::Runner::default()` uses seed 42. Sweep seeds for
+scheduler-sensitive changes.
