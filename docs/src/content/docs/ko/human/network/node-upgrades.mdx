@@ -1,0 +1,192 @@
+---
+title: "Node Upgrades"
+audience: human
+---
+
+Ducktape node의 일부 변경은 서버를 한 대씩 순차적으로 rollout하는 것만으로는
+반영할 수 없다. 어떤 module이 state root를 계산하는 방식, operation이 encode되는
+방식, 혹은 module set 자체에 대한 변경은 **consensus-breaking**이다. 한 validator가
+new logic을 돌리는 순간 다른 validator는 여전히 old logic을 돌리고 있고, 두
+validator는 다음 block에 대해 서로 다른 app-hash를 계산하므로 network가 fork하거나
+halt한다. 이 페이지는 그런 변경을 **live** network에 **network downtime 없이**
+반영할 수 있게 하는 policy를 설명한다.
+
+## 평범한 rolling restart가 fork하는 이유
+
+모든 validator는 각 block에 대해 단일 global app-hash에 합의한다. 이 app-hash는
+`(module_id, module_root)` pair를 sorting해 hash한 값이다. consensus는
+supermajority가 *동일한* app-hash에 sign할 때만 block을 finalize한다. 그 합의가 이
+system의 존재 이유이며, 조금도 관대하지 않다. 두 validator가 state를 단 한 byte라도
+다르게 유도하면 app-hash가 어긋나고, 둘은 더 이상 함께 quorum을 형성할 수 없다.
+
+따라서 어떤 module이 hash하는 대상을 바꾸는 변경은 점진적으로 도입될 수 없다. 한
+validator를 new logic으로 restart하는 순간 나머지와 곧바로 어긋난다. forge의
+multi-repo 변경 — forge가 state root를 구성하는 방식을 개편한 변경 — 을 live
+Ducktape-2 network에 흔한 node-한-대씩-restart 방식으로 rollout할 수 없었던 이유가
+바로 이것이다.
+
+## 유일하게 동작하는 형태: height-gated activation
+
+network downtime 없이 consensus logic을 바꾸는 유일한 방법은, 변경을 사전에 합의된
+block height까지 **비활성** 상태로 두고 모든 validator를 한꺼번에 넘기는 것이다.
+이것을 안전하게 만드는 두 가지 아이디어가 결합한다.
+
+**Dual-path binary.** new binary는 old logic과 new logic을 *둘 다* 담는다. activation
+height `H` 아래에서는 old binary와 byte 단위로 동일하게 동작한다. 같은 accept/reject
+결정, 같은 snapshot, 같은 root를 낸다. 오직 변경된 그 module 하나만 `H`에서 new
+logic으로 전환하는 branch를 가진다. new binary가 `H` 아래에서는 old binary와 구별되지
+않기 때문에, operator는 downtime 없이 node를 한 대씩 install할 수 있다. 각 node는
+network 전체가 준비될 때까지 계속 old-logic block을 생산한다. 그리고 변경이 network의
+identity가 아니라 app layer에 있기 때문에, old binary와 new binary는 rollout 내내 동일한
+peer-to-peer handshake로 통신한다 — mesh는 결코 partition되지 않는다.
+
+**합의된 activation height.** protocol version 자체가 consensus state이며, app-hash에
+포함되는 작은 전용 system module에 기록된다. 따라서 모든 validator — 그리고 이후
+sync하거나 join하는 모든 node — 는 매 height에서 정확히 어떤 logic이 active인지에
+합의한다. block `H`가 도래하면 준비된 모든 validator가 단일 finalized boundary에서
+함께 new logic으로 전환한다. 이는 Ethereum과 Tendermint가 쓰는 app-version hard-fork
+model과 동일하며, Ducktape의 기존 epoch teardown-and-respawn boundary 위에 mapping된
+것이다.
+
+## Upgrade의 lifecycle
+
+upgrade는 다섯 단계를 거친다. 각 단계는 의도적이다. 암묵적이거나 자동적인 version
+bump는 존재하지 않는다.
+
+**1. Propose.** governance가 `ScheduleUpgrade` action으로 upgrade를 schedule하며,
+변경 내용, target version, activation height `H`를 명시한다. 이는 기존의 member-gated
+majority-vote governance path — validator를 추가하고 제거하는 것과 같은 mechanism —
+를 재사용한다. scheduling은 upgrade를 *authorize*할 뿐, 그 자체로 변경을 live로
+만들지는 않는다. version은 monotonic이므로 upgrade는 앞으로만 나아갈 수 있고, `H`는
+어떤 node도 소급 activation을 요구받지 않도록 충분히 미래에 놓여야 한다.
+
+**2. Pre-ship.** operator는 dual-path binary를 build해 node마다 rollout한다. 그
+binary는 `H` 아래에서 동작상 동일하므로, 이 rollout은 평범한 no-downtime restart다.
+핵심 규칙은, dual-path binary가 단지 `H` 이전이 아니라 schedule이 효력을 발휘하기
+*이전에* 모든 node에 올라가 있어야 한다는 것이다.
+
+**3. Signal ready.** validator가 new binary로 실행되기 시작하면 `SignalReady` signal을
+emit한다. 결정적으로, node는 자기 binary가 실제로 target version을 담고 있을 때만
+signal한다. "ready"는 실행 중인 code에 대한 정직한 machine 진술이지 operator가 손으로
+입력하는 주장이 아니다. upgrade module은 현재 validator들의 이 signal을 tally한다.
+
+**4. Activate at `H`.** block `H`에 도달하면 모든 node가 합의된 state에 대해 하나의
+deterministic한 질문을 평가한다. readiness quorum이 충족되었는가? 그렇다면 준비된 모든
+validator가 finalized cutover boundary에서 함께 new logic으로 전환하고, state migration이
+있다면 이미 합의된 state의 deterministic function으로 실행된다. 아니라면 upgrade는
+깔끔하게 abort한다(아래 참고). 이 결정은 committed되어 app-hash에 포함된 state만 읽으며
+wall clock이나 local view는 결코 읽지 않으므로, 모든 node에서 동일하다.
+
+**5. Verify.** `H` 이후 operator는 network가 new version으로 block을 생산하고 있고 어떤
+validator도 halt하지 않았음을 확인한다. active version은 recovery manifest와 state-sync
+manifest에 실려 이동하므로, `H` 이후 restart하거나 join하는 node는 어떤 logic을 돌려야
+하는지 알고, 요구되는 height를 서비스하기에 너무 낡은 binary로는 boot을 거부한다. 나중에
+혼란스러운 mismatch를 겪는 대신 명확한 early error를 내는 것이다.
+
+## Readiness quorum
+
+activation은 단지 height가 도래했다고 발동하지 않는다. 충분한 수의 validator가 자신이
+실제로 new logic을 돌리고 있음을 signal했을 때만 발동한다. 여기서 "충분한"은 모든 node가
+committed state에서 읽는 deterministic한 threshold이며, policy는 이를 의도적으로 높게
+설정한다.
+
+**Policy는 이것이다: 현재 boundary validator 전원이 ready를 signal해야 한다.** arming
+threshold는 validator set 전체 — `R = n` — 이므로, `n`명 전원이 signal했을 때만 flip이
+발동한다. signal하지 않은 node가 하나라도 있으면 — 정직하게 offline인 node든, signal을
+조용히 withholding하는 Byzantine validator든 — threshold가 충족되지 않는다. 그런 경우
+flip은 그냥 발동하지 않는다. upgrade는 모든 node에서 동일한 finalized boundary에 깔끔하고
+deterministic하게 abort하고, network는 이전과 정확히 똑같이 old logic을 계속 돌리며,
+operator는 더 나중의 height로 다시 schedule한다. 이것이 straggler-aborts-the-upgrade
+자세이며, no-downtime 보장을 *무조건적*으로 만드는 것이다 — live하지만 upgrade되지 않은
+network는 발동했으나 진행할 수 없는 upgrade보다 언제나 안전하다.
+
+**아슬아슬한 supermajority는 필수 하한선이지 policy가 아니다.** arming은 BFT
+supermajority 아래에서는 결코 허용되지 않는다 — 그것은 엄격한 수학적 최소값 `R = 2f+1`
+이고, mechanism은 그 아래로 내려가지 않는다. 하지만 정확히 그 최소값에서 arming하는 것은
+구체적인 이유로 default에서 의도적으로 배제된다. `2f+1`명만 signal하고 upgrade가 그들
+위에서 arm한다고 하자. fault budget 안의 adversary — 최대 `f`명의 validator — 는 ready를
+signal한 뒤 조용히 old logic을 계속 돌릴 수 있다. signal 직후의 crash도 같은 효과를 낸다.
+어느 쪽이든 실제로 new logic을 돌리는 정직한 node가 `f+1`명밖에 남지 않을 수 있는데,
+`f+1`은 첫 new-version block을 finalize하기에 부족하다. 그러면 chain은 **`H`에서 halt**
+한다. upgrade는 발동했으나, 그것이 남긴 network는 new app-hash에 대해 supermajority를
+모으지 못하고 진행을 멈춘다. 전원을 요구하는 것이 바로 이를 피하는 방법이다. `n`명
+전원이 signal하면, 최악의 경우 `f`명이 이탈하더라도 여전히 `2f+1`명의 정직한 node가 new
+logic을 돌리고 있어 — boundary를 넘어 chain을 finalize하고 이어가기에 딱 충분하다.
+
+**알려진 offline 낙오자를 용인하는 것은 문서화된 downgrade이지 결코 default가 아니다.**
+operator는 offline임이 알려진 소수의 validator를 지나쳐 진행하기 위해 threshold를
+`R = n - s`로 낮출 수 있다. 이는 권장되지 않는다. 무조건적 보장을 조건부 보장과 맞바꾸는
+것이며, signal한 모든 validator가 정말로 new binary를 돌리고 있음을 operator가
+*out of band*로 확인했을 때에만 정당화된다. 사용될 때에는 언제나 그 더 약한 보장을
+schedule 시점에 정확히 그것 — 무조건적 보장이 아니라 조건부 보장 — 으로 기록해야 한다.
+
+**전원 threshold가 무엇을 사는지 정확히 하라.** 이것은 틀리게 말하기 쉬우니 조심스럽게
+진술한다. 모든 validator에게 signal을 요구하는 것은 **liveness margin** — 충분한 수의
+정직한 node가 함께 전환해 new version의 첫 block을 finalize하는 것 — 을 사는 것이며, 그
+이상은 아니다. 그것은 safety를 더하지 **않고** fork를 막지도 **않는다**. 어떤
+threshold에서도 fork는 불가능하다. block은 supermajority가 *동일한* new app-hash에
+sign할 때만 finalize되기 때문이다. ready를 signal한 뒤 다른 logic을 돌리는 validator는
+그저 다른 hash를 낼 뿐, 표에서 밀려나 아무것도 finalize하지 못한다. fork를 막는 것은
+바로 그 app-hash quorum certificate다 — `R = n`에서도, `R = 2f+1`에서도, 그 사이
+어디에서도. `R = n`이 막는 것은 *halt*다. upgrade는 발동했으나 chain을 앞으로 이어갈
+정직한 node가 너무 적게 남는 liveness 실패 말이다.
+
+## Guarantees
+
+이 mechanism은 하나의 policy이며, 네 가지를 약속한다.
+
+**Network downtime 없음.** binary rollout은 `H` 아래에서 동작이 동일하므로 평범한
+rolling restart이고, 준비된 모든 node는 `H`에서 함께 전환한다. network는 upgrade 자체를
+위해 block 생산을 멈추는 일이 결코 없다.
+
+**절대 fork하지 않고 — 대신 소리 내어 실패한다.** new logic 없이 `H`에 도달한 node는
+추측하지 않는다. node를 안전하게 recover할 수 없을 때 Ducktape가 이미 취하는 fail-loud
+자세 그대로 **halt**한다. halt한 node는 vote를 거부하므로, 경쟁하는 old-logic quorum
+형성을 돕는 것조차 할 수 없다. 이는 그 낙오자 한 대의 downtime일 뿐 결코 fork가 아니다.
+network는 준비된 supermajority 위에서 진행하고, 낙오자는 new binary를 install해 `H`까지
+replay하는 것만으로 recover한다.
+
+**Quorum이 미달이면 abort한다.** `H`까지 readiness가 충족되지 않으면 pending upgrade는
+activation되지 않는다. 그것은 모든 node에서 하나의 finalized boundary에 deterministic하게
+비워지고, network는 old logic을 계속 돌리며, operator는 더 나중의 height로 다시
+schedule한다. 절반만 적용된 채 남는 것은 없다.
+
+**앞으로만 roll하고 결코 뒤로 가지 않는다.** version은 monotonic이며 `H`와 그 이상의
+committed state는 immutable하다. 그것을 되감으면 hash된 history를 다시 쓰게 되고 이미 `H`를
+지나 sync한 node에 대해 fork하게 된다. 따라서 activation 이후 발견된 bug는 downgrade가
+아니라, 교정된 logic으로 더 높은 version을 향한 *새로운* upgrade를 schedule해 고친다.
+rollback fallback이 없으므로, 모든 new-logic branch와 모든 migration은 일반 실행과 같은
+determinism 규칙을 지켜야 한다. wall clock 없음, IO 없음, randomness 없음. 이는 upgrade가
+schedule되기 전에 검증된다.
+
+## 사례 연구: forge multi-repo
+
+forge multi-repo 변경은 이 policy가 존재하는 이유인 교과서적 사례다. 이 변경은 forge가
+state root를 구성하는 방식을 — 단일 committed head에서 per-repo head들에 대한 canonical
+sorted hash로 — 바꿨는데, 이는 순진한 rolling restart라면 fork했을 바로 그런 종류의
+consensus-breaking 변경이다.
+
+이 mechanism과 함께라면 이런 변경은 깔끔하게 rollout된다. `H` 아래에서는 old single-head
+root를 계산하고 `H`부터는 new multi-repo root를 계산하는 dual-path forge를 pre-ship하고,
+governance를 통해 upgrade를 schedule하고, 각 node가 ready를 signal하며 binary를 node마다
+rollout하고, `H`에서 준비된 모든 node가 teardown-respawn boundary를 넘어 함께 전환한다.
+disk 상의 어떤 것도 움직이지 않는다 — 오직 in-memory head encoding만 바뀐다.
+
+실제로는 Ducktape이 forge의 root 변경을 flag day로 출하했다. 유지해야 할 production
+network가 없었으므로 in-tree dual-path forge demonstrator는 retire되었고 new layout이
+유일한 layout이 되었다. 이 예시는 live network가 생긴 뒤 root를 바꾸는 module upgrade가
+취하게 될 형태로서 남는다.
+
+## 이 policy가 다루지 않는 것
+
+upgrade module 자체를 그것이 존재하기 이전의 network에 — 예를 들어 지금 상태의
+Ducktape-2에 — 도입하는 것은 no-downtime upgrade가 아니라 일회성의 coordinated genesis
+변경이다. zero-downtime 보장은 mechanism이 어디에나 존재하게 된 이후의 두 번째 이후
+upgrade에 적용된다. module의 **set**을 바꾸는 것 — 기존 모듈의 logic을 바꾸는 것이
+아니라 module id를 추가하거나 제거하는 것 — 역시 base zero-downtime 보장 밖이다. 모듈의
+존재 자체가 app-hash의 일부이므로, 그 모듈을 추가한 새 binary는 activation height 이전,
+rollout *도중에* 기존 binary와 diverge한다. 이 class는 이 policy가 아직 정의하지 않은
+추가적인 height-gated mechanism이 필요하며, 지금으로서는 미루거나 coordinated genesis
+변경으로 처리한다. operator가 binary를 어떻게 fetch하고 verify하고 stage하는지는
+consensus mechanism이 아니라 upgrade runbook이 다루는 운영상의 관심사다. 그리고
+downgrade와 state rewind는 결코 지원되지 않는다. 유일한 방향은 앞으로다.

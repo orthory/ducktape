@@ -207,8 +207,8 @@ Mirror the Phase-2 restart/joiner harness (`bin/node/tests/common/mod.rs` `Clust
 ### Task 13: docs + hygiene
 
 **Files:**
-- Modify: `docs/pages/en/human/modules/product-modules.mdx` + `ko` mirror — the duckfs section gains the client story: `ducktape-fs` verbs, `.duckfs` index, conflict semantics (auto-rebase disjoint only), workspace RPC; note `mount` is Phase 4.
-- Modify: `docs/pages/en/agent/reference/repository-map.mdx` + `ko` — `crates/system/duckfs-client`, `bin/fs`.
+- Modify: `docs/src/content/docs/en/human/modules/product-modules.mdx` + `ko` mirror — the duckfs section gains the client story: `ducktape-fs` verbs, `.duckfs` index, conflict semantics (auto-rebase disjoint only), workspace RPC; note `mount` is Phase 4.
+- Modify: `docs/src/content/docs/en/agent/reference/repository-map.mdx` + `ko` — `crates/system/duckfs-client`, `bin/fs`.
 - Sweep: every new file under the ~600-line cap; error prefixes consistent (`"files: "` on module-side, plain on client-side); no stray `println!` debugging.
 
 - [ ] Steps: docs → hygiene → commit `docs(duckfs): phase-3 client stack — cli, index, workspaces`.

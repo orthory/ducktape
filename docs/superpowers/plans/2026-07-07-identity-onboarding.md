@@ -147,7 +147,7 @@ pub fn rewrite_user_key(path: &Path, line: &str) -> Result<(), String>      // t
 ### Task 7: Docs
 
 **Files:**
-- Modify: `docs/pages/en/human/start/*` (find the getting-started/onboarding page; add the identity-creation step + recovery-phrase guidance), `docs/pages/ko/...` mirror; `docs/pages/en/human/modules/product-modules.mdx` identity section (one paragraph: custody model — mnemonic recovers identity, password is local-only, node keys deliberately stay plaintext/disposable for liveness + full-disk-encryption pointer) + ko mirror; spec as-built amendments if any landed during implementation.
+- Modify: `docs/src/content/docs/en/human/start/*` (find the getting-started/onboarding page; add the identity-creation step + recovery-phrase guidance), `docs/src/content/docs/ko/...` mirror; `docs/src/content/docs/en/human/modules/product-modules.mdx` identity section (one paragraph: custody model — mnemonic recovers identity, password is local-only, node keys deliberately stay plaintext/disposable for liveness + full-disk-encryption pointer) + ko mirror; spec as-built amendments if any landed during implementation.
 - [ ] **Step 1:** write; `cd docs && bun run build 2>&1 | tail -3` no new errors.
 - [ ] **Step 2:** commit `docs(identity): onboarding + custody model documentation`
 

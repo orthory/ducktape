@@ -1,0 +1,220 @@
+---
+title: "Node Upgrades"
+---
+
+Shipping a consensus-breaking change — any change to a module `root()`, an
+op/wire encoding, or the module set — onto a live network with zero network
+downtime is only safe as a height-gated activation of a pre-shipped dual-path
+binary. This page is the operational contract for driving that upgrade and the
+invariants an agent MUST preserve while doing it. Scope: this procedure covers
+changes that keep every module id stable (`root()`/op-encoding changes). Adding or
+removing a module id is a harder class that is OUT of the base no-downtime
+guarantee — see Failure And Abort Handling — and MUST NOT be driven as a plain
+height-gated upgrade.
+
+Mechanism is implemented in the current node: `crates/system/upgrade` is in the
+genesis module set, governance emits `ScheduleUpgrade`/`CancelUpgrade`
+follow-ups, validators self-signal readiness, and `bin/node upgrade-status`
+queries live state. The authoritative design is
+this page plus `skills/upgrade/SKILL.md`. Do not present this procedure as
+available on a network whose binaries predate the `upgrade` module.
+
+Related: [human node upgrades](/en/human/network/node-upgrades) explains the
+policy for operators, [State Sync Contract](/en/agent/architecture/state-sync-contract)
+and [State Sync](/en/human/architecture/state-sync) cover replay/join safety,
+and [Open Work](/en/agent/roadmap/open-work) tracks the remaining edges.
+
+## Invariants You MUST Preserve
+
+- **App-hash is the only authority.** The active protocol version is agreed state
+  in the `upgrade` module, folded into `state::global_root`
+  (`crates/kernel/host/src/lib.rs:341-344`). Never treat an operator assertion, a
+  CLI flag, or a manifest hint as the source of truth for which logic a height
+  runs.
+- **Never change the network namespace during a rolling upgrade.** commonware's
+  p2p handshake does no version negotiation — its only compatibility gate is the
+  shared `namespace` (`chain_id@genesis_fingerprint`,
+  `bin/node/src/config.rs:202-233`). A `root()`/op-encoding upgrade leaves
+  `(chain_id, scheme, genesis validators)` untouched, so the namespace stays stable
+  and old/new binaries keep handshaking through the roll. Bumping the namespace or
+  genesis fingerprint mid-rollout severs the mesh — a stop-the-world operation,
+  never no-downtime.
+- **Activation is execute-time, never respawn-time or control-flow.** The version
+  bump, the pending-clear, and every state migration MUST be deterministic
+  in-block `execute()` transitions keyed on `Env.height`. Recovery re-executes
+  frames via `apply_block → host.submit_at` and never invokes a module migration
+  from a `Cutover` record (`crates/kernel/recovery/src/lib.rs:840-852,996-1017`).
+  Any activation effect placed only in the respawn path or binary control flow is
+  invisible to replay and either mass-halts restarting nodes or forks a live node
+  against a replayed one.
+- **Version is a pure derivation.** `effective_version(height)` is computed from
+  committed `upgrade`-module state, not a mutable boolean flipped once at `H`. Do
+  not add a stored flip.
+- **`protocol_version` is a read-only dispatch input.** It rides `BlockContext`
+  and `Env` (`crates/kernel/host/src/lib.rs:46-53`;
+  `crates/kernel/sdk/src/lib.rs:140-149`) and is consumed only inside the changed
+  module's explicit dual-path branch. NEVER hash it into any module root preimage
+  or op encoding, or unchanged modules' roots drift.
+- **Below `H`, the dual-path binary is byte-identical to the old one.** Gate the
+  WHOLE changed surface — `execute`, `query`, `snapshot`, `install`, `root`, and
+  op/wire semantics — so every accept/reject decision, snapshot serialization,
+  and root matches the old binary for every op at every height below `H`.
+  Otherwise the two binaries build divergent state and fork before activation.
+- **Authorization is not activation.** A simple-majority governance vote may only
+  SCHEDULE. Activation additionally requires the readiness quorum, whose arming
+  policy is `R = n` (every boundary validator) over a `2f+1` safety floor you
+  never arm below. Never fold the two thresholds into one check.
+- **Version is monotonic; recovery is roll-forward only.** Reject
+  `to_version <= current_version`. Never rewind committed state at/above `H` — it
+  rewrites hashed history and forks against anyone synced past `H`. Fix a bad
+  upgrade with a new `ScheduleUpgrade` to `to_version + 1`.
+- **Halt, never fork.** A node reaching `H` without the new logic MUST fail loud
+  (the pre-recovery boot posture) rather than execute `H` under stale rules. That
+  is downtime for one node, never a competing old-hash quorum.
+
+## Ordered Procedure
+
+Drive these steps in order. Do not skip the readiness confirmation before `H`.
+
+1. **Confirm the prerequisite.** Verify the `upgrade` module is genesis-embedded
+   and live on the target network. If binaries predate it, this is NOT a
+   no-downtime path — it is a one-time coordinated genesis bump and is out of
+   scope here.
+2. **Pre-ship the dual-path binary.** Roll the new binary out node-by-node. It
+   carries BOTH old and new logic and its `MAX_PROTOCOL_VERSION >= to_version`.
+   Confirm it runs OLD logic below `H` (behavior byte-identical). Every validator
+   admitted after scheduling MUST be provisioned new-binary-first; a node whose
+   first executed height is `>= H` MUST run the new binary.
+3. **Schedule via governance.** Author a member-gated proposal carrying
+   `GovAction::ScheduleUpgrade { name, activation_height: H, to_version }`
+   (`crates/system/governance/src/interface.rs:19-26`). Choose `H` strictly
+   in every node's future — past `MIN_UPGRADE_LEAD`, at least the orchestrator
+   `cutover_delay` window
+   (`crates/kernel/consensus/src/valset_orchestrator.rs:225-232`). On tally-pass
+   the upgrade-module follow-up records `pending`. Confirm exactly one pending
+   upgrade exists and that its `name`/`H`/`to_version` are the intended values.
+4. **Collect readiness.** Each validator running the new binary emits
+   `UpgradeReady { name, to_version }` (validator-origin, machine-generated from
+   the running binary's `MAX_PROTOCOL_VERSION`, idempotent per member pubkey).
+   Confirm each accepted signal matches the pending upgrade identity; stale
+   signals for another `name`/`to_version` do not count.
+5. **Confirm the arming quorum BEFORE `H`.** Measure readiness against the
+   **boundary valset as-of `H`** — the `EpochMembership` the respawn reads from
+   frozen state
+   (`crates/kernel/consensus/src/valset_orchestrator.rs:237-256`), NOT the
+   proposal-time set. **The arming policy is `R = n`: proceed only when EVERY
+   boundary validator has signaled ready.** This is the unconditional no-downtime
+   posture. Treat any non-signaler as straggler-aborts-the-upgrade: whether it is
+   offline-honest or withholding-Byzantine, the flip does not fire, so let the
+   clean deterministic abort run — the network keeps executing OLD logic — and
+   reschedule at a later `H`. `R >= 2f+1` is the mathematical SAFETY FLOOR, never
+   the policy: below `2f+1` you MUST NOT arm, but do NOT arm at exactly `2f+1`
+   either. At `2f+1` a within-budget adversary (`f` validators signal, then run
+   old logic) or a crash-after-signal can leave only `f+1` honest nodes on new
+   logic; the new-app-hash block then cannot gather its `2f+1` certificate and the
+   chain HALTS at `H` — a liveness failure. That is why you arm at `R = n`: it buys
+   the LIVENESS margin that finalizes the first new-version block, NOT additional
+   safety. No-fork holds at ANY value of `R` because the app-hash `2f+1` quorum
+   certificate out-votes any node that signals then diverges — never claim `R = n`
+   prevents forks; it prevents the halt-at-`H` liveness failure. The only
+   sanctioned step below `n` is a DISCOURAGED, explicitly documented downgrade
+   `R = n - s` for `s` known-offline stragglers: permit it ONLY with out-of-band
+   attestation that every signaler genuinely runs the new binary, and record it at
+   schedule time as a CONDITIONAL (not unconditional) guarantee. It is never the
+   default. If readiness is not on track for `R = n`, do NOT let `H` pass on hope —
+   `CancelUpgrade` and reschedule.
+6. **Watch activation at `H`.** Arming is a deterministic self-transition
+   evaluated exactly once at the frozen teardown-respawn boundary against the
+   frozen readiness set and boundary valset. Armed → at the finalized cutover view
+   every ready node sets the stamped `BlockContext.protocol_version` and each
+   changed module's `active_version` to `effective_version(H) = to_version`
+   (reconciling the lifecycle module's stored `current_version` in the same
+   transition); the migration runs as a deterministic in-block transition. One
+   respawn carries both a coincident membership change and the version flip.
+7. **Verify app-hash continuity across `H`.** Confirm block `H` finalized with a
+   `2f+1` quorum certificate and that the ready supermajority agrees on the new
+   app-hash — the live `AppHashMismatch` guard
+   (`crates/kernel/host/src/lib.rs:375-379`) and the recovery compose check
+   (`crates/kernel/recovery/src/lib.rs:971-975`) reject any divergent node. Then
+   drive a restart and a fresh state-sync join across `H` and confirm both
+   reconstruct the identical app-hash for `H` and every height after it.
+
+## Failure And Abort Handling
+
+- **Quorum not met by `H` (clean abort).** Evaluated once, deterministically, at
+  the boundary. Not armed ⇒ the module emits a clear-pending follow-up ⇒ every
+  node discards `pending` and readiness at one finalized view and continues on
+  OLD logic. No timers, no local view, no operator step in the clear itself.
+  Reschedule with a later `H`.
+- **Straggler halt at `H`.** A node with `MAX_PROTOCOL_VERSION < to_version`
+  halts fail-loud rather than executing `H` under stale rules. Its state through
+  `H-1` is valid and under the app-hash, so recovery needs NO wipe: install the
+  dual-path binary, restart, let recovery replay through `H` under the new
+  branch, rejoin.
+- **Pre-`upgrade`-module binary in the set.** It diverges earlier — at the block
+  where a `ScheduleUpgrade` follow-up first mutates the in-hash `lifecycle` module,
+  not at `H`. This is why the rollout gate is "upgrade-module-aware dual-path
+  binary on every node BEFORE `ScheduleUpgrade` commits."
+- **Mis-scheduled but validly-armed upgrade.** `CancelUpgrade { name }`
+  (governance-gated, valid only while `current_height < H`) stops it before the
+  boundary and clears the readiness set.
+- **Bug discovered after activation.** Roll forward only: a new `ScheduleUpgrade`
+  to `to_version + 1` at a new `H'` with corrected logic and, if needed, a
+  corrective deterministic migration. Never rewind. Because there is no rollback
+  fallback past `H`, every new-logic branch and every migration MUST obey the
+  execute purity contract (no wall-clock, IO, or RNG), proven by a pre-schedule
+  determinism / replay-equivalence test.
+- **Module-set-changing upgrade (OUT of the base guarantee — harder class).**
+  Adding or removing a module id is NOT a plain height-gated upgrade. The naive
+  "register/remove at the `H` teardown-respawn" recipe forks and halts: below `H`
+  a binary that includes the new module composes a different `global_root` than an
+  old binary (`global_root` folds the registry,
+  `crates/kernel/host/src/lib.rs:272-301`), so the two diverge DURING rollout,
+  before `H`; and the recovery `Cutover` handler never mutates the registry
+  (`crates/kernel/recovery/src/lib.rs:840-852`), so a respawn-time registry change
+  is invisible to replay and every node that restarts or state-syncs across `H`
+  halts network-wide. A module-set change requires registry composition to itself
+  be a height-gated pure function of `effective_version(height)`, reproduced
+  identically in the live, recovery-replay, and state-sync-install paths — a
+  separate design. Until it exists, do NOT drive a module-set change through this
+  runbook; defer it or use a coordinated genesis bump.
+
+## Verification Checklist
+
+Before scheduling:
+
+- The dual-path binary runs OLD logic below `H` byte-for-byte (roots, snapshot
+  bytes, and accept/reject decisions match the old binary for every op).
+- `protocol_version` appears in NO root preimage or op encoding; unchanged
+  modules' roots are identical below and above `H`.
+- A determinism / replay-equivalence test covers every new-logic branch and every
+  migration (no wall-clock, IO, or RNG).
+- `to_version > current_version` and `H > current_height + MIN_UPGRADE_LEAD`.
+
+Before `H`:
+
+- Exactly one pending upgrade; its `name`/`H`/`to_version` match intent.
+- Readiness measured against the boundary valset, not the proposal-time set.
+- `R = n` (arming policy): every boundary validator signaled ready. `R >= 2f+1`
+  is the safety floor you never arm below, but arming at exactly `2f+1` is
+  rejected (it can halt at `H`). Any `R = n - s` is a discouraged downgrade,
+  allowed only with out-of-band attestation and a documented conditional
+  guarantee.
+- Every accepted `UpgradeReady` matches the pending identity.
+
+After `H`:
+
+- Block `H` finalized under a `2f+1` certificate; the ready supermajority agrees
+  on the new app-hash; no honest node reports `AppHashMismatch`.
+- A restart across `H` replays to the identical app-hash.
+- A fresh state-sync join whose served range crosses `H` preflights its binary
+  against `required_min_version` and rebuilds the identical app-hash for `H` and
+  every later height.
+
+Docs-only edits to this page verify with:
+
+```sh
+cd docs
+bun run docs:check
+git diff --check origin/dev...HEAD
+```

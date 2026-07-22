@@ -9,7 +9,8 @@
 .codex/worktrees/
 node_modules
 docs/dist/
-docs/pages.gen.ts
+docs/.astro/
+docs/.nimbus/
 app/dist/
 ops/wg-smoke/*.log
 ops/wg-smoke/node*/

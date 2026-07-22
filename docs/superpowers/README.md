@@ -6,7 +6,7 @@ that have not clearly been folded into maintained docs/code/tests, or review
 findings that still explain current behavior.
 
 Prune a file only after reviewing its content and identifying the current owner
-of any durable facts. Valid owners are Vocs pages, ADRs, maintained runbooks,
+of any durable facts. Valid owners are Nimbus pages, ADRs, maintained runbooks,
 checked-in tests, code comments, or git history for explicitly obsolete work.
 
 ## Reviewed Prune Set

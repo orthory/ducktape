@@ -35,7 +35,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` / `airlock-broker` / `airlock-cli` (credential gateway) |
-| `docs/` | Vocs documentation site (human/agent tracks, English/Korean) |
+| `docs/` | Nimbus documentation site (human/agent tracks, English/Korean) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
@@ -209,7 +209,7 @@ Then exercise the hardware/TCC paths that cannot be validated off-Mac:
 
 ## Documentation
 
-The docs are a separate Vocs project under `docs/` (package manager: Bun), so
+The docs are a separate Nimbus project under `docs/` (package manager: Bun), so
 Rust verification and docs verification stay decoupled:
 
 ```sh
@@ -220,7 +220,7 @@ bun run dev          # local preview
 ```
 
 Pages are split by reader (human vs. coding agent) and language (English,
-Korean) under `docs/pages`.
+Korean) under `docs/src/content/docs`.
 
 ## Status
 
@@ -232,5 +232,5 @@ sync for QMDB-backed, forge, and snapshot-style modules.
 Still open — mostly live orchestration: network-backed module sync from a
 running node, dynamic valset wiring around epoch cutover, snapshot-at-height
 serving, and product depth for chat, agent, and tasks. See
-[implementation status](docs/pages/en/human/reference/implementation-status.mdx)
-and [what is left](docs/pages/en/human/roadmap/what-is-left.mdx).
+[implementation status](docs/src/content/docs/en/human/reference/implementation-status.mdx)
+and [what is left](docs/src/content/docs/en/human/roadmap/what-is-left.mdx).

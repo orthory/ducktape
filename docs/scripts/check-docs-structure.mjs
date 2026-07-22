@@ -3,6 +3,7 @@ import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
+const contentRoot = join(root, 'src/content/docs')
 const humanPages = [
   'index.mdx',
   'start/quick-start.mdx',
@@ -13,6 +14,7 @@ const humanPages = [
   'architecture/state-sync.mdx',
   'network/network-and-membership.mdx',
   'network/node-upgrades.mdx',
+  'network/coordination.mdx',
   'modules/product-modules.mdx',
   'roadmap/what-is-left.mdx',
   'reference/repository-map.mdx',
@@ -36,10 +38,22 @@ const agentPages = [
 const required = [
   'package.json',
   'bun.lock',
-  'vocs.config.ts',
-  'pages/index.mdx',
-  ...humanPages.flatMap((page) => [`pages/en/human/${page}`, `pages/ko/human/${page}`]),
-  ...agentPages.flatMap((page) => [`pages/en/agent/${page}`, `pages/ko/agent/${page}`]),
+  'astro.config.ts',
+  'tsconfig.json',
+  'src/components.ts',
+  'src/content.config.ts',
+  'src/layouts/BaseLayout.astro',
+  'src/layouts/DocsLayout.astro',
+  'src/layouts/LandingLayout.astro',
+  'src/pages/index.mdx',
+  ...humanPages.flatMap((page) => [
+    `src/content/docs/en/human/${page}`,
+    `src/content/docs/ko/human/${page}`,
+  ]),
+  ...agentPages.flatMap((page) => [
+    `src/content/docs/en/agent/${page}`,
+    `src/content/docs/ko/agent/${page}`,
+  ]),
 ]
 
 const failures = []
@@ -47,12 +61,18 @@ const failures = []
 if (existsSync(join(root, 'docs'))) {
   failures.push('nested docs/docs directory must not exist')
 }
+if (existsSync(join(root, 'pages'))) {
+  failures.push('Vocs-era docs/pages must not exist')
+}
+if (existsSync(join(root, 'vocs.config.ts'))) {
+  failures.push('Vocs config must not exist')
+}
 
-// Keep the docs root as the Vocs project entry only. Maintained non-page records
-// belong under docs/records, accepted decisions under docs/adr, and operator
-// runbooks under docs/deploy — never loose at the root.
+// dogfood.md is the maintained agent-loop guide created at this location by
+// its design of record; all other maintained non-page records stay grouped.
+const allowedRootMarkdown = new Set(['README.md', 'dogfood.md'])
 for (const entry of readdirSync(root)) {
-  if (entry.endsWith('.md') && entry !== 'README.md') {
+  if (entry.endsWith('.md') && !allowedRootMarkdown.has(entry)) {
     failures.push(`root-level ${entry} must live under docs/records, docs/adr, or docs/deploy`)
   }
 }
@@ -69,27 +89,36 @@ const packageJson = readFileSync(join(root, 'package.json'), 'utf8')
 if (!/"packageManager":\s*"bun@/.test(packageJson)) {
   failures.push('package.json must declare bun as packageManager')
 }
+if (!packageJson.includes('"@cloudflare/nimbus-docs"')) {
+  failures.push('package.json must depend on @cloudflare/nimbus-docs')
+}
+if (!packageJson.includes('"@fontsource-variable/noto-sans-kr"')) {
+  failures.push('package.json must bundle a Korean-capable font')
+}
+if (!packageJson.includes('"build": "astro build"')) {
+  failures.push('package.json must build with Astro')
+}
+if (/\bvocs\b/i.test(packageJson)) {
+  failures.push('package.json must not reference Vocs')
+}
 if (/\bpnpm\b/.test(packageJson)) {
   failures.push('package.json must not reference pnpm')
 }
 
-const config = readFileSync(join(root, 'vocs.config.ts'), 'utf8')
-if (!/srcDir:\s*['"]\.['"]/.test(config)) {
-  failures.push('vocs.config.ts must keep srcDir set to "."')
-}
-for (const route of ['/en/human', '/ko/human', '/en/agent', '/ko/agent']) {
-  if (!config.includes(`'${route}'`)) {
-    failures.push(`vocs.config.ts must include ${route}`)
+const config = readFileSync(join(root, 'astro.config.ts'), 'utf8')
+for (const route of ['en/human', 'ko/human', 'en/agent', 'ko/agent']) {
+  if (!config.includes(`segment: "/${route}"`)) {
+    failures.push(`astro.config.ts must include the ${route} navigation track`)
   }
 }
-for (const label of ['For Human', 'For Agent', 'English', 'Korean']) {
-  if (!config.includes(`text: '${label}'`)) {
-    failures.push(`vocs.config.ts must include top nav label ${label}`)
+for (const label of ['Human · English', 'Human · 한국어', 'Agent · English', 'Agent · 한국어']) {
+  if (!config.includes(`label: "${label}"`)) {
+    failures.push(`astro.config.ts must include navigation label ${label}`)
   }
 }
-for (const label of ['Human EN', 'Human KO', 'Agent EN', 'Agent KO']) {
-  if (config.includes(`text: '${label}'`)) {
-    failures.push(`vocs.config.ts must not keep retired top nav label ${label}`)
+for (const integration of ['react()', 'nimbus(nimbusConfig']) {
+  if (!config.includes(integration)) {
+    failures.push(`astro.config.ts must include ${integration}`)
   }
 }
 
@@ -98,7 +127,6 @@ if (/\bpnpm\b/.test(readme)) {
   failures.push('README.md must use bun commands')
 }
 
-const pagesDir = join(root, 'pages')
 const pages = []
 function walk(dir) {
   for (const entry of readdirSync(dir)) {
@@ -107,20 +135,39 @@ function walk(dir) {
     else if (path.endsWith('.mdx')) pages.push(path)
   }
 }
-walk(pagesDir)
+walk(contentRoot)
 
 for (const page of pages) {
   const text = readFileSync(page, 'utf8')
   const rel = relative(root, page)
+  const frontmatter = text.match(/^---\n([\s\S]*?)\n---/)
+  if (!frontmatter || !/^title:\s*\S/m.test(frontmatter[1])) {
+    failures.push(`${rel} has no title frontmatter`)
+  }
+  if (rel.includes('/human/') && !/^audience:\s*human\s*$/m.test(frontmatter?.[1] ?? '')) {
+    failures.push(`${rel} must declare the human audience`)
+  }
   if (/\b(TODO|TBD|PLACEHOLDER)\b/i.test(text)) {
     failures.push(`${rel} contains placeholder language`)
   }
   if (/\bpnpm\b/.test(text)) {
     failures.push(`${rel} must use bun commands`)
   }
-  if (!/(^#\s+)|(<h1[\s/>])|(<Hero[\s>])/m.test(text)) {
-    failures.push(`${rel} has no h1`)
+  if (/\b(showAskAi|layout:\s*docs)\b/.test(text)) {
+    failures.push(`${rel} contains Vocs frontmatter`)
   }
+  if (/<(?:ArchitectureStack|AsyncEngine|ConsensusFlow|InvitationFlow|ModuleLifecycle|ModuleMap|NetworkTopology|StateSyncFlow|WorkspaceMap)\s*\/>/.test(text)) {
+    failures.push(`${rel} has an unhydrated React diagram`)
+  }
+}
+
+const landing = readFileSync(join(root, 'src/pages/index.mdx'), 'utf8')
+if (!/^title:\s*Ducktape\s*$/m.test(landing) || !/^layout:\s*\.\.\/layouts\/LandingLayout\.astro\s*$/m.test(landing)) {
+  failures.push('src/pages/index.mdx must use the Ducktape Nimbus landing layout')
+}
+
+if (pages.length !== 54) {
+  failures.push(`expected 54 routed content pages, found ${pages.length}`)
 }
 
 if (failures.length) {
@@ -129,4 +176,4 @@ if (failures.length) {
   process.exit(1)
 }
 
-console.log(`docs structure ok (${pages.length} pages across 4 reader/language tracks)`)
+console.log('docs structure ok (54 pages across 4 reader/language tracks + landing)')

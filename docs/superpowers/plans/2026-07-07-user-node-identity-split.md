@@ -655,12 +655,12 @@ git commit -m "test(identity): two nodes bind to one user across a live cluster"
 
 **Files:**
 - Modify: `docs/superpowers/specs/2026-07-07-user-node-identity-split-design.md` — as-built amendment note at top: chain id + nonce reach the app from the workspace registry (`workspace.chainId`, Tauri) and the `Get` query; `/v1/status` was NOT extended (registry already carries `chainId`); user-key ops ride `ducktape-node` CLI verbs, not an in-shell crypto dep.
-- Modify: `docs/pages/en/human/modules/product-modules.mdx` — an `identity` section (what it stores, bind/unbind/setname semantics, the nonce, chain scoping); mirror a matching section into `docs/pages/ko/human/modules/product-modules.mdx` (follow the file's existing ko voice).
-- Modify: `docs/pages/en/human/network/network-and-membership.mdx` — one paragraph: membership stays per-node; the identity module maps nodes to users above it. Mirror to `docs/pages/ko/...` counterpart.
+- Modify: `docs/src/content/docs/en/human/modules/product-modules.mdx` — an `identity` section (what it stores, bind/unbind/setname semantics, the nonce, chain scoping); mirror a matching section into `docs/src/content/docs/ko/human/modules/product-modules.mdx` (follow the file's existing ko voice).
+- Modify: `docs/src/content/docs/en/human/network/network-and-membership.mdx` — one paragraph: membership stays per-node; the identity module maps nodes to users above it. Mirror to `docs/src/content/docs/ko/...` counterpart.
 - Modify: `bin/node/src/config.rs:75` doc comment — "(and for now the user's)" is no longer true; reword to point at the identity module for user identity.
 
 - [ ] **Step 1: Write all four doc edits.**
-- [ ] **Step 2: Build docs if a build exists** — `ls docs/package.json` and if present `cd docs && bun run build 2>&1 | tail -3` (vocs); otherwise skip.
+- [ ] **Step 2: Build docs if a build exists** — `ls docs/package.json` and if present `cd docs && bun run build 2>&1 | tail -3` (Nimbus); otherwise skip.
 - [ ] **Step 3: Commit**
 
 ```bash

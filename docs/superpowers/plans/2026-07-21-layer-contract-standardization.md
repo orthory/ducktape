@@ -295,7 +295,7 @@ already carries the rationale — link it.
   RefsStore, Clock discipline, IndexDisk, MeshCarrier), one row each:
   contract, real arm, sim arm, consumers. Note rows PR1–PR7 introduce as
   "(this campaign, PR #N)" since none are merged yet.
-- [ ] **Step 2:** `cd docs && bun run docs:check` only if docs/pages touched;
+- [ ] **Step 2:** `cd docs && bun run docs:check` only if docs/src/content/docs touched;
   README-only change needs no gate. Open PR; review; leave OPEN.
 
 ---

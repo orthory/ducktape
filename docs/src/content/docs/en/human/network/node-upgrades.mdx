@@ -1,0 +1,213 @@
+---
+title: "Node Upgrades"
+audience: human
+---
+
+Some changes to a Ducktape node cannot simply be rolled out one server at a
+time. A change to how any module computes its state root, to how operations are
+encoded, or to the set of modules itself is **consensus-breaking**: the moment
+one validator runs the new logic while another runs the old, the two compute
+different app-hashes for the next block and the network forks or halts. This
+page explains the policy that lets Ducktape ship such a change to a **live**
+network with **zero network downtime**.
+
+Related: [agent Node Upgrades](/en/agent/network/node-upgrades) is the operator
+runbook, [State Sync](/en/human/architecture/state-sync) covers joining across
+activation, [Implementation Status](/en/human/reference/implementation-status)
+marks the built upgrade surface, and [What Is Left](/en/human/roadmap/what-is-left)
+tracks remaining gaps.
+
+## Why an ordinary rolling restart forks
+
+Every validator agrees on a single global app-hash for each block: a sorted hash
+over `(module_id, module_root)` pairs. Consensus only finalizes a block when a
+supermajority signs the *same* app-hash. That agreement is the whole point of the
+system, and it is unforgiving: if two validators derive even one byte of state
+differently, they disagree on the app-hash and can no longer form a quorum
+together.
+
+So a change that alters what any module hashes cannot be introduced gradually.
+Restart one validator with new logic and it immediately disagrees with the rest.
+This is exactly why the forge multi-repo change — which reworked how forge
+composes its state root — could not be rolled onto the live Ducktape-2 network by
+the usual restart-one-node-at-a-time method.
+
+## The one shape that works: height-gated activation
+
+The only way to change consensus logic with no network downtime is to make the
+change **inactive until a pre-agreed block height** and flip every validator over
+at once. Two ideas combine to make that safe.
+
+**A dual-path binary.** The new binary carries *both* the old and the new logic.
+Below the activation height `H` it behaves byte-for-byte like the old binary —
+same accept/reject decisions, same snapshots, same roots. Only the one changed
+module has a branch that switches to new logic, and only at `H`. Because the new
+binary is indistinguishable from the old one below `H`, operators can install it
+node-by-node with no downtime at all: each node keeps producing old-logic blocks
+until the whole network is ready. And because the change lives in the app layer
+rather than in the network's identity, the old and new binaries still speak the
+same peer-to-peer handshake throughout the rollout — the mesh never partitions.
+
+**An agreed activation height.** The protocol version is itself consensus state,
+recorded in a small dedicated system module that is folded into the app-hash.
+Every validator — and every node that syncs or joins later — therefore agrees on
+exactly which logic is active at every height. When block `H` arrives, all ready
+validators flip to the new logic together, at a single finalized boundary. This
+is the same app-version hard-fork model used by Ethereum and Tendermint, mapped
+onto Ducktape's existing epoch teardown-and-respawn boundary.
+
+## The lifecycle of an upgrade
+
+An upgrade moves through five stages. Each stage is deliberate; there is no
+implicit or automatic version bump.
+
+**1. Propose.** Governance schedules the upgrade with a `ScheduleUpgrade` action
+naming the change, the target version, and the activation height `H`. This reuses
+the existing member-gated, majority-vote governance path — the same mechanism
+that adds and removes validators. Scheduling only *authorizes* the upgrade; it
+does not by itself make the change go live. The version is monotonic, so an
+upgrade may only move forward, and `H` must sit safely in the future so no node
+is asked to activate retroactively.
+
+**2. Pre-ship.** Operators build and roll out the dual-path binary node by node.
+Because that binary is behaviorally identical below `H`, this rollout is an
+ordinary no-downtime restart. The critical rule: the dual-path binary must be on
+every node *before* the schedule takes effect, not merely before `H`.
+
+**3. Signal ready.** Once a validator is running the new binary, it emits a
+`UpgradeReady` signal. Crucially, a node only signals when its own binary actually
+carries the target version — "ready" is a truthful machine statement about the
+running code, not a claim an operator types by hand. The lifecycle module tallies
+these signals from current validators.
+
+**4. Activate at `H`.** When block `H` is reached, every node evaluates one
+deterministic question against agreed state: has the readiness quorum been met?
+If yes, all ready validators flip to the new logic together at the finalized
+cutover boundary, and any state migration runs as a deterministic function of the
+already-agreed state. If no, the upgrade cleanly aborts (see below). This
+decision is identical on every node because it reads only committed, in-app-hash
+state — never a wall clock or a local view.
+
+**5. Verify.** After `H`, operators confirm the network is producing blocks under
+the new version and that no validator has halted. The active version travels in
+recovery and state-sync manifests, so a node that restarts or joins after `H`
+knows which logic to run and refuses to boot with a binary too old to serve the
+required height — a clear early error rather than a confusing mismatch later.
+
+## The readiness quorum
+
+Activation does not fire just because the height arrived; it fires only when
+enough validators have signaled that they are genuinely running the new logic.
+"Enough" is a deterministic threshold every node reads from committed state, and
+the policy sets it deliberately high.
+
+**The policy is: every current boundary validator must signal ready.** The
+arming threshold is the full validator set — `R = n` — so the flip fires only
+when all `n` of them have signaled. Any node that has not signaled, whether it is
+an honestly offline node or a Byzantine validator quietly withholding its signal,
+keeps the threshold from being met. When that happens the flip simply does not
+fire: the upgrade cleanly and deterministically aborts on every node at the same
+finalized boundary, the network keeps running the old logic exactly as before,
+and the operator reschedules with a later height. This is the
+straggler-aborts-the-upgrade posture, and it is what makes the no-downtime
+guarantee *unconditional* — a live-but-unupgraded network is always safer than an
+upgrade that fired but cannot make progress.
+
+**A bare supermajority is the mandatory floor, not the policy.** Arming is never
+permitted below a BFT supermajority — that is a hard mathematical minimum,
+`R = 2f+1`, and the mechanism will not go below it. But arming at exactly that
+minimum is deliberately rejected as the default, for a concrete reason. Suppose
+only `2f+1` validators signal and the upgrade arms on them. An adversary inside
+the fault budget — up to `f` validators — can signal ready and then quietly keep
+running the old logic; a crash right after signaling has the same effect. Either
+way you can be left with as few as `f+1` honest nodes actually running the new
+logic, and `f+1` is not enough to finalize the first new-version block. The chain
+then **halts at `H`**: the upgrade fired, but the network it left behind cannot
+gather a supermajority on the new app-hash and stops making progress. Requiring
+the full set is what avoids this. If all `n` signal, then even after the
+worst-case `f` defections there are still `2f+1` honest nodes running the new
+logic — exactly enough to finalize and carry the chain across the boundary.
+
+**Tolerating known-offline stragglers is a documented downgrade, never the
+default.** An operator may lower the threshold to `R = n - s` to proceed past a
+handful of validators known to be offline. This is discouraged: it trades the
+unconditional guarantee for a conditional one, and it is only defensible when the
+operator has confirmed *out of band* that every validator that did signal is
+truly running the new binary. Whenever it is used, that weaker guarantee must be
+recorded at schedule time as exactly that — a conditional guarantee, not the
+unconditional one the default policy provides.
+
+**Be precise about what the full-set threshold buys.** It is easy to state this
+wrong, so state it carefully: requiring every validator to signal buys
+**liveness margin** — enough honest nodes flip together to finalize the first
+block under the new version — and nothing more. It does **not** add safety and it
+does **not** prevent forks. No fork is possible at any threshold, because a block
+only finalizes when a supermajority signs the *same* new app-hash: a validator
+that signals ready and then runs different logic just produces a different hash,
+is out-voted, and finalizes nothing. That app-hash quorum certificate is what
+prevents forks — at `R = n`, at `R = 2f+1`, or anywhere in between. What `R = n`
+prevents is the *halt*: the liveness failure where the upgrade fires but too few
+honest nodes are left to carry the chain forward.
+
+## Guarantees
+
+This mechanism is a policy, and it makes four promises.
+
+**No network downtime.** The binary rollout is an ordinary rolling restart
+because behavior is identical below `H`, and all ready nodes flip together at
+`H`. The network never stops producing blocks for the upgrade itself.
+
+**Never fork — fail loud instead.** A node that reaches `H` without the new logic
+does not guess. It **halts**, exactly like the fail-loud posture Ducktape already
+takes when a node cannot safely recover. A halted node refuses to vote, so it
+cannot even help form a competing old-logic quorum. That is downtime for that one
+straggler, never a fork; the network proceeds on the ready supermajority, and the
+straggler recovers simply by installing the new binary and replaying through `H`.
+
+**Abort if the quorum is missed.** If readiness is not met by `H`, the pending
+upgrade does not activate. It is deterministically cleared on every node at one
+finalized boundary, the network keeps running the old logic, and the operator
+reschedules with a later height. Nothing is left half-applied.
+
+**Roll forward, never back.** Versions are monotonic and committed state at and
+above `H` is immutable — rewinding it would rewrite hashed history and fork
+against any node that already synced past `H`. So a bug found after activation is
+fixed by scheduling a *new* upgrade to a higher version with corrected logic, not
+by downgrading. Because there is no rollback fallback, every new-logic branch and
+every migration must obey the same determinism rules as normal execution: no wall
+clock, no IO, no randomness. This is verified before the upgrade is scheduled.
+
+## Worked example: forge multi-repo
+
+The forge multi-repo change is the textbook case this policy exists to handle. It
+altered how forge composes its state root — from a single committed head to a
+canonical sorted hash over per-repo heads — which is precisely the kind of
+consensus-breaking change that a naive rolling restart would fork on.
+
+With this mechanism such a change ships cleanly: pre-ship a dual-path forge that
+computes the old single-head root below `H` and the new multi-repo root at and
+after `H`; schedule the upgrade through governance; roll the binary out node by
+node with each node signaling ready; and at `H` every ready node flips together
+over the teardown-respawn boundary. Nothing on disk moves — only the in-memory
+head encoding changes.
+
+In practice Ducktape shipped forge's root change as a flag day: with no
+production network to keep live, the in-tree dual-path forge demonstrator was
+retired and the new layout became the only one. The example stands as the shape
+any root-changing module upgrade takes once a live network exists.
+
+## What this policy does not cover
+
+Introducing the lifecycle module itself onto a network that predates it — such as
+Ducktape-2 as it stands — is a one-time coordinated genesis change, not a
+no-downtime upgrade; the zero-downtime guarantee applies to the second and later
+upgrades, once the mechanism is present everywhere. Changing the **set** of
+modules — adding or removing a module id, rather than changing an existing
+module's logic — is likewise outside the base zero-downtime guarantee: a module's
+presence is itself part of the app-hash, so a new binary that adds it would
+diverge from the old one *during* the rollout, before the activation height. That
+class needs an additional height-gated mechanism this policy does not yet define,
+and is for now either deferred or done as a coordinated genesis change. How
+operators fetch, verify, and stage binaries is an operational concern handled by
+the upgrade runbook, not by the consensus mechanism. And downgrades and state rewinds are never supported:
+the only direction is forward.

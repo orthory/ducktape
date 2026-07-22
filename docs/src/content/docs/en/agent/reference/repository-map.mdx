@@ -1,0 +1,94 @@
+---
+title: "Repository Map"
+---
+
+import { WorkspaceMap } from '../../../../../components/diagram/WorkspaceMap.client'
+
+Use this map to find the authoritative surface before editing.
+
+<WorkspaceMap client:visible />
+
+Related: [human repository map](/en/human/reference/repository-map) is the
+reader-facing twin, [Product Modules](/en/human/modules/product-modules) expands
+the app crates, and [Implementation Status](/en/human/reference/implementation-status)
+lists what is checked in and tested.
+
+## Kernel
+
+- `crates/kernel/sdk`: module contract, deterministic system API, and the
+  shared snapshot codec (`sdk::codec`).
+- `crates/kernel/host`: registry, dispatch, follow-up drain, commit/abort,
+  global app-hash composition, and the worker seam (`host::worker`).
+- `crates/kernel/node`: loopback and ordered node seams.
+- `crates/kernel/consensus`: Simplex orderer, content store, relay, inbox,
+  resolver fetch, scheme boundaries.
+- `crates/kernel/statesync`: state-sync wire protocol and p2p binding.
+- `crates/kernel/recovery`: op journal, checkpoints, boot-time replay.
+- `crates/kernel/indexer`: derived node-local read index; never in the app-hash.
+- `crates/system/capability-host`: machine-local executor providers.
+
+## System
+
+- `crates/system/kv`: QMDB byte-key module.
+- `crates/system/valset`: validator membership state.
+- `crates/system/saga`: deterministic continuation state.
+- `crates/system/governance`: validator-set governance over valset.
+- `crates/system/identity`: canonical accounts, member keys, display names, and
+  node bindings.
+- `crates/system/duckdns`: optional `<handle>.duck` → AccountId naming, with
+  no node or service directory.
+- `crates/system/wireguard`: WireGuard tunnel-upgrade protocol;
+  `wireguard::effect` is the apply layer.
+- `crates/system/nat-traversal`, `reachability`, `data-plane`, `overlay-net`:
+  hole punch, WireGuard mesh orchestrator, off-consensus byte transport,
+  overlay seam.
+- `crates/system/upgrade`, `capability`, `dispatch`, and `tagging`: protocol
+  upgrade state, capability registry, capability-routed dispatch, and engagement
+  routing.
+- `crates/system/blobstore`, `gateway`, `dispatch-oracle`: node-local blob
+  store, `.duck` gateway route state, host-side dispatch worker.
+- `crates/duckfs/client`: OS-side duckfs checkout/commit engine — chunk hashing,
+  the versioned `.duckfs` index, worktree scan/status, change planning, and the
+  sync `NodeApi` transport (HTTP). Never on the consensus path.
+- wire surfaces: each module's typed payload and query shapes live at its crate root (`src/interface.rs`).
+
+## Apps
+
+- `crates/apps/pages`: QMDB page tree, blocks, and comments.
+- `crates/apps/forge`: git-backed project state.
+- `crates/apps/chat`: storage-owning chat module with hook fan-out.
+- `crates/apps/agent`: agent registry, watches, run records.
+- `crates/apps/tasks`: small canonical task state.
+- `crates/apps/vaults`: replicated opaque secret ciphertext.
+- `crates/apps/runs`: agent run composition, dispatch, response, and watch state.
+- `crates/apps/inbox`: per-member notification queues.
+- `crates/apps/automations`: operator rules over the chat hook seam.
+- `crates/apps/files`: the duckfs module adapter; it owns the consensus
+  filesystem surface and absorbed the old memory/workspace role as ordinary
+  duckfs snapshots, paths, and `duck://files/...` evidence.
+- `crates/apps/jobs`: consensus-native work board.
+
+## Examples and Binaries
+
+- `crates/examples/directory`: state-based directory module, registered in
+  `bin/node` as the production canary.
+- `crates/examples/greeter`: demo module emitting follow-up writes.
+- `crates/examples/evm`: experimental QMDB-backed EVM module, in the
+  `noded`/`simnode` genesis.
+- `bin/node`: the p2p validator/mesh node (also serves the noded app surface).
+- `bin/noded`: the single embedded-host daemon behind the http/ws app surface.
+- `bin/simnode`: deterministic scenario node — noded's `/v1` wire over a
+  test-scripted block producer.
+- `bin/coordinator`: public or private rendezvous/STUN helper.
+- `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI (read verbs plus the
+  checkout/status/commit/pin loop over `crates/duckfs/client`). The
+  `mount` verb (FUSE, `src/fuse/`) is gated behind the `fuse` cargo feature —
+  read-only over `NodeApi` at a pinned snapshot, `--rw` over a backing checkout —
+  so a default build pulls in no libfuse/`fuser`.
+
+## Docs
+
+- `docs/src/content/docs/en/human`: English human-facing docs.
+- `docs/src/content/docs/ko/human`: Korean human-facing docs.
+- `docs/src/content/docs/en/agent`: English agent-facing docs.
+- `docs/src/content/docs/ko/agent`: Korean agent-facing docs.

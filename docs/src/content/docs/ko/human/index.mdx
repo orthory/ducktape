@@ -1,0 +1,39 @@
+---
+title: "Ducktape"
+audience: human
+---
+
+import { ModuleMap } from '../../../../components/diagram/ModuleMap.client'
+
+Ducktape는 합의 기반 업무용 슈퍼앱이다. 하나의 BFT 복제 상태 머신이 pages,
+forge, chat, agent workflow 같은 격리된 제품 모듈을 호스팅한다.
+각 모듈은 자기 인증 상태 저장소를 소유하고, 호스트에는 32바이트 root만
+노출한다. 호스트는 그 module root들을 전역 app-hash로 합성한다.
+
+<ModuleMap client:visible />
+
+핵심 규칙은 단순하다. 모듈은 서로의 구현 crate에 링크하지 않는다. 모듈은
+`sdk`와 필요한 타입 전용 interface crate에만 의존한다. 모듈 간 read는
+호스트 라우팅 query를 통하고, 모듈 간 write는 메시지로 emit된 뒤 호스트가
+follow-up op로 drain한다.
+
+## 현재 상태
+
+- module contract, host registry, global app-hash, ordered node path,
+  commonware Simplex orderer, saga/worker async seam, 그리고 여러 root-backed
+  제품 모듈이 repo에 존재한다.
+- demo는 platform module과 product module을 함께 등록하고, 하나의 합성
+  app-hash 아래에서 root가 움직이는 것을 보여준다.
+- QMDB-backed module, forge, snapshot-style module의 state sync가 존재한다.
+  node e2e suite는 joiner가 live state-sync wire로 모든 module을 재구축해
+  source app-hash에 도달함을 증명한다.
+- dynamic valset wiring, live admission, restart recovery, video huddle,
+  no-downtime upgrade module은 구현되어 있다. 남은 일은 주로 product depth,
+  demotion behavior, replay nonce, WireGuard runtime wiring이다.
+
+## 다음에 읽을 문서
+
+- [Quick Start](/ko/human/start/quick-start): 현재 플랫폼을 증명하는 명령.
+- [Platform Invariants](/ko/human/architecture/platform-invariants): 결정성을
+  지키는 규칙.
+- [What Is Left](/ko/human/roadmap/what-is-left): 구현 frontier.

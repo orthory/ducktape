@@ -256,7 +256,7 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
    QMDB target을 frozen manifest root와 post-hoc 대조하던 부분이었다. 현재 state sync
    wire는 `BoundaryId { height, app_hash }`, leased captures, pinned resolver targets,
    floor-bound manifests, post-sync revalidation, post-reboot frame catch-up을 사용한다.
-   maintained summary는 Vocs의 State Sync와 Implementation Status page에 있다.
+   maintained summary는 Nimbus의 State Sync와 Implementation Status page에 있다.
 2. **테스트 커버리지 갭** — pre-genesis `admit` verb를 end-to-end로 구동하는 Rust e2e가 **없다.**
    `invite_e2e.rs`/`live_admission_e2e.rs`는 둘 다 post-genesis `invite-accept`(governance) 경로만 검증.
    pre-genesis는 `demo-invite.sh`(shell)와 `config.rs` 단위테스트로만 커버.
