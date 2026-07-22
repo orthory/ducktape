@@ -46,7 +46,6 @@
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-use std::path::PathBuf;
 
 use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
@@ -57,6 +56,7 @@ mod boot;
 mod code_plane;
 mod term_plane;
 mod cli;
+mod cli_args;
 mod cli_flags;
 mod config;
 mod constants;
@@ -161,18 +161,6 @@ fn hold_macos_activity() {
     std::mem::forget(token);
 }
 
-const TOP_USAGE: &str = "\
-usage: ducktape <command> ...
-
-  node     run a workspace node, plus operator verbs (run, init, invite, join, ...)
-  user     user-identity keys and signing
-  gateway  local loopback bindings for signed gateway routes
-  fs       the duckfs working-copy CLI
-  mcp      the stdio MCP server an agent runner spawns
-
-  help | --help | -h        this usage
-  version | --version | -V  binary + protocol version";
-
 /// `ducktape version` — the binary name, its crate version, and the highest
 /// protocol version this binary can execute.
 fn version_line() -> String {
@@ -182,122 +170,88 @@ fn version_line() -> String {
     )
 }
 
+// clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
+// `FATAL:` wrapper in `main` stays for runtime death.
+#[derive(clap::Parser)]
+#[command(
+    name = "ducktape",
+    about = "one workspace-network node and its operator tools",
+    // clap prints "<name> <version>", so the version string must NOT repeat
+    // the binary name the way `version_line()` (the `version` verb) does.
+    version = &*format!("{} (protocol v{MAX_PROTOCOL_VERSION})", env!("CARGO_PKG_VERSION")).leak(),
+    arg_required_else_help = true
+)]
+pub(crate) struct Cli {
+    #[command(subcommand)]
+    family: Family,
+}
+
+/// the command families. `user`/`gateway`/`fs` keep their own hand-rolled
+/// grammars (including `--help`) — clap passes their argv through untouched;
+/// migrating them onto typed args is follow-up work, not a blocker here.
+// parsed once on the stack and immediately consumed — variant size is noise.
+#[allow(clippy::large_enum_variant)]
+#[derive(clap::Subcommand)]
+enum Family {
+    /// run a workspace node, plus operator verbs (init, invite, join, ...)
+    #[command(subcommand)]
+    Node(cli_args::NodeCmd),
+    /// user-identity keys and signing (own verbs: `ducktape user help`)
+    #[command(disable_help_flag = true)]
+    User {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// local loopback bindings for signed gateway routes (`ducktape gateway help`)
+    #[command(disable_help_flag = true)]
+    Gateway {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// the duckfs working-copy CLI (`ducktape fs help`)
+    #[command(disable_help_flag = true)]
+    Fs {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// the stdio MCP server an agent runner spawns
+    Mcp,
+    /// print version (same as --version)
+    #[command(hide = true)]
+    Version,
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let Some((family, rest)) = argv.split_first() else {
-        // bare `ducktape` — print top usage and exit non-zero (an incomplete
-        // invocation), cleanly (no `FATAL:` prefix, which is for runtime death).
-        eprintln!("{TOP_USAGE}");
-        std::process::exit(1);
-    };
-    match family.as_str() {
-        // top-level help + version print to stdout and exit 0 (an explicit,
-        // successful request), bypassing the `FATAL:` error wrapper.
-        "help" | "--help" | "-h" => {
-            println!("{TOP_USAGE}");
-            Ok(())
-        }
-        "version" | "--version" | "-V" => {
-            println!("{}", version_line());
-            Ok(())
-        }
-        // each family owns its verbs and its own usage. `fs` owns a 0/1/2
-        // exit-code contract, so it exits directly (after flushing the stream
-        // `cat` wrote to); `mcp` is the stdio server the agent runner spawns
-        // and holds until its stdin closes.
-        "fs" => {
-            let code = fs_cli::run(rest);
+    let cli = <Cli as clap::Parser>::parse();
+    match cli.family {
+        // `fs` owns a 0/1/2 exit-code contract, so it exits directly (after
+        // flushing the stream `cat` wrote to); `mcp` is the stdio server the
+        // agent runner spawns and holds until its stdin closes.
+        Family::Fs { args } => {
+            let code = fs_cli::run(&args);
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
             std::process::exit(code.into());
         }
-        "mcp" => {
+        Family::Mcp => {
             mcp::serve();
             Ok(())
         }
-        "user" => userkey_cli::run(rest),
-        "gateway" => gateway_routes::run(rest),
-        "node" => run_node_family(rest),
-        other => {
-            eprintln!("unknown command {other:?}\n\n{TOP_USAGE}");
-            std::process::exit(1);
+        Family::User { args } => userkey_cli::run(&args),
+        Family::Gateway { args } => gateway_routes::run(&args),
+        Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
+        Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
+        Family::Version => {
+            println!("{}", version_line());
+            Ok(())
         }
     }
 }
 
-/// route one token of the `ducktape node` family: the family help, the `run`
-/// node-boot path, an operator verb (via [`cli::dispatch`]), or an error that
-/// points a stray run-path flag at `node run`.
-fn run_node_family(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let Some((verb, rest)) = args.split_first() else {
-        // bare `ducktape node` — list the verbs instead of the old
-        // `missing --config`.
-        eprintln!("{}", cli::node_usage());
-        std::process::exit(1);
-    };
-    let is_family_help = matches!(verb.as_str(), "help" | "--help" | "-h");
-    if is_family_help {
-        println!("{}", cli::node_usage());
-        return Ok(());
-    }
-    if verb == "run" {
-        return run_node_verb(rest);
-    }
-    let Some(result) = cli::dispatch(verb, rest) else {
-        let is_stray_run_flag =
-            matches!(verb.as_str(), "--config" | "-n" | "--network" | "--sync-only");
-        if is_stray_run_flag {
-            eprintln!(
-                "`ducktape node {verb} ...` is no longer the run path — use \
-                 `ducktape node run {verb} ...`\n\n{}",
-                cli::node_usage()
-            );
-        } else {
-            eprintln!("unknown node verb {verb:?}\n\n{}", cli::node_usage());
-        }
-        std::process::exit(1);
-    };
-    result
-}
-
-/// `ducktape node run (--config <path> | -n/--network <chain id>) [--sync-only]`
-/// — the canonical node-boot path. hand-parses its own flags (bool `--sync-only`
-/// is why this is not `parse_flags`).
-fn run_node_verb(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if cli::help_requested(args) {
-        println!("{}", cli::verb_usage_line(&["run"]));
-        return Ok(());
-    }
-    let mut cfg_path: Option<PathBuf> = None;
-    let mut network: Option<String> = None;
-    let mut sync_only = false;
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--config" => cfg_path = it.next().map(PathBuf::from),
-            "-n" | "--network" => network = it.next().cloned(),
-            "--sync-only" => sync_only = true,
-            other => {
-                return Err(format!(
-                    "unexpected arg {other:?}\n{}",
-                    cli::verb_usage_line(&["run"])
-                )
-                .into());
-            }
-        }
-    }
-    // `--network` addresses a workspace by its chain id through the registry;
-    // `--config` stays the explicit path. exactly one selects the node.
-    let cfg_path = match (network, cfg_path) {
-        (Some(needle), None) => config::find_workspace_config(&needle)?,
-        (None, Some(path)) => path,
-        (Some(_), Some(_)) => {
-            return Err("pass either --network <chain id> or --config <path>, not both".into());
-        }
-        (None, None) => {
-            return Err("missing --config <path> (or -n/--network <chain id>)".into());
-        }
-    };
+/// `ducktape node run` — the canonical node-boot path.
+fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = args.selector.config_path()?;
+    let sync_only = args.sync_only;
 
     let log_ring = noded::LogRing::default();
     // ONE filter over stderr + the ring (the ws `logs` topic) + the node's own

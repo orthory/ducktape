@@ -8,303 +8,68 @@ use std::path::PathBuf;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 
-use crate::{MAX_PROTOCOL_VERSION, cli_flags::parse_flags, config};
+use crate::cli_args::{
+    AdmitArgs, InitArgs, InviteArgs, JoinCmd, JoinQuery, KeyArgs, MemberCmd, OpCmd, PubkeyArgs,
+    ResidentCmd, SelectorArgs, StatusArgs, UpgradeCmd,
+};
+use crate::{MAX_PROTOCOL_VERSION, config};
 use config::{hex_bytes, unhex};
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
-/// One entry in the `ducktape node` verb table — the single source of truth
-/// the family listing, per-verb `--help`, and the shell completions all render
-/// from. `path` is the token sequence (`["resident", "accept"]`, `["run"]`),
-/// `usage` the full one-line invocation, `summary` the family-listing blurb,
-/// and `flags` the long flag names (no `--`) the completion drift-guard checks.
-pub(super) struct Verb {
-    pub path: &'static [&'static str],
-    pub usage: &'static str,
-    pub summary: &'static str,
-    // consumed only by the completion drift-guard test — dead in a plain build.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub flags: &'static [&'static str],
-}
-
-/// The `ducktape node` grammar. Two-token verbs (`resident accept`,
-/// `member promote`, `join requests`, `upgrade status`) are dispatched
-/// token-by-token below; `run` is the canonical node-boot path (handled in
-/// `main.rs`, listed here for help + completion coverage).
-pub(super) const NODE_VERBS: &[Verb] = &[
-    Verb {
-        path: &["run"],
-        usage: "node run (--config <path> | -n/--network <chain-id>) [--sync-only]",
-        summary: "run this workspace's node",
-        flags: &["config", "network", "sync-only"],
-    },
-    Verb {
-        path: &["key"],
-        usage: "node key [--out <path>] [--dir <dir>]",
-        summary: "generate or reuse a node identity (prints pubkey)",
-        flags: &["out", "dir"],
-    },
-    Verb {
-        path: &["init"],
-        usage: "node init --name <network name> [--dir <dir>] [--listen a] [--advertised a] \
-                [--http a] [--rpc a] [--gateway a] [--primary-coordinator host:port|none] \
-                [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a] \
-                [--wireguard-effect socket|tun|fake]",
-        summary: "found a new network (default dir: ~/.ducktape/workspaces/<chain-id>)",
-        flags: &[
-            "name",
-            "dir",
-            "listen",
-            "advertised",
-            "http",
-            "rpc",
-            "gateway",
-            "primary-coordinator",
-            "wireguard-listen",
-            "wireguard-advertised",
-            "invite-listen",
-            "wireguard-effect",
-        ],
-    },
-    Verb {
-        path: &["invite"],
-        usage: "node invite [--role resident|client] [--ttl-days N] \
-                [--config <path> | -n <chain-id>]",
-        summary: "mint a single-use bearer invite blob",
-        flags: &["role", "ttl-days", "config", "network"],
-    },
-    Verb {
-        path: &["admit"],
-        usage: "node admit <hex pubkey> [--config <path> | -n <chain-id>]",
-        summary: "pre-genesis: add a key to the validator set",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["join"],
-        usage: "node join <invite blob> [--dir <dir>] [--listen a] [--advertised a] [--http a] \
-                [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port] \
-                [--invite-listen a] [--wireguard-effect socket|tun|fake] \
-                [--primary-coordinator host:port|none]",
-        summary: "materialize a workspace from an invite blob",
-        flags: &[
-            "dir",
-            "listen",
-            "advertised",
-            "http",
-            "rpc",
-            "wireguard-listen",
-            "wireguard-advertised",
-            "invite-listen",
-            "wireguard-effect",
-            "primary-coordinator",
-        ],
-    },
-    Verb {
-        path: &["list"],
-        usage: "node list",
-        summary: "list registered workspaces (chain-id + config path)",
-        flags: &[],
-    },
-    Verb {
-        path: &["resident", "accept"],
-        usage: "node resident accept <hex pubkey> [--config <path> | -n <chain-id>]",
-        summary: "grant resident standing to a joiner",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["resident", "remove"],
-        usage: "node resident remove <hex pubkey> [--config <path> | -n <chain-id>]",
-        summary: "revoke resident standing",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["member", "promote"],
-        usage: "node member promote <hex pubkey> [--config <path> | -n <chain-id>]",
-        summary: "seat a key in the consensus quorum",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["member", "remove"],
-        usage: "node member remove <hex pubkey> [--config <path> | -n <chain-id>]",
-        summary: "remove a validator from the set",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["member", "leave"],
-        usage: "node member leave [--config <path> | -n <chain-id>]",
-        summary: "this node drives its own removal",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["member", "status"],
-        usage: "node member status [--config <path> | -n <chain-id>] [--json]",
-        summary: "print in-set + validator count for this node",
-        flags: &["config", "network", "json"],
-    },
-    Verb {
-        path: &["join", "requests"],
-        usage: "node join requests [--config <path> | -n <chain-id>]",
-        summary: "list parked joiners (JSON)",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["join", "state"],
-        usage: "node join state [--config <path> | -n <chain-id>]",
-        summary: "this node's onboarding phase (JSON)",
-        flags: &["config", "network"],
-    },
-    Verb {
-        path: &["upgrade", "status"],
-        usage: "node upgrade status [--config <path> | -n <chain-id>] [--json]",
-        summary: "pending upgrade + readiness verdict",
-        flags: &["config", "network", "json"],
-    },
-];
-
-/// the family usage block: header + one padded `verb  summary` line per entry.
-pub(super) fn node_usage() -> String {
-    let width = NODE_VERBS
-        .iter()
-        .map(|v| v.path.join(" ").len())
-        .max()
-        .unwrap_or(0);
-    let mut out = String::from(
-        "ducktape node — run a workspace node, plus operator verbs\n\n\
-         usage: ducktape node <verb> [args...]\n\n",
-    );
-    for verb in NODE_VERBS {
-        let name = verb.path.join(" ");
-        out.push_str(&format!("  {name:<width$}  {}\n", verb.summary));
-    }
-    out.push_str("\nrun `ducktape node <verb> --help` for a verb's full usage.");
-    out
-}
-
-/// the `usage:` line for one verb path, from the table.
-pub(super) fn verb_usage_line(path: &[&str]) -> String {
-    match NODE_VERBS.iter().find(|v| v.path == path) {
-        Some(verb) => format!("usage: ducktape {}", verb.usage),
-        None => format!("usage: ducktape node {}", path.join(" ")),
+/// route one operator verb to its handler — ONE visible dispatch, nothing in
+/// the arms but delegation. (`run` never reaches here; `main.rs` owns the
+/// node-boot path.) the grammar itself lives in `cli_args.rs`.
+pub(super) fn run(op: OpCmd) -> CommandResult {
+    match op {
+        OpCmd::Key(args) => cmd_keygen(args),
+        OpCmd::Init(args) => cmd_init(args),
+        OpCmd::Invite(args) => cmd_invite(args),
+        OpCmd::Admit(args) => cmd_admit(args),
+        OpCmd::Join(cmd) => dispatch_join(cmd),
+        OpCmd::List => cmd_list(),
+        OpCmd::Resident(cmd) => dispatch_resident(cmd),
+        OpCmd::Member(cmd) => dispatch_member(cmd),
+        OpCmd::Upgrade(cmd) => dispatch_upgrade(cmd),
     }
 }
 
-/// the two-token verbs under a subfamily (`resident`, `member`, ...), listed.
-fn subfamily_listing(family: &str) -> String {
-    NODE_VERBS
-        .iter()
-        .filter(|v| v.path.len() == 2 && v.path[0] == family)
-        .map(|v| format!("  {}  {}", v.path.join(" "), v.summary))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn subfamily_usage(family: &str) -> String {
-    format!(
-        "`ducktape node {family}` needs a subcommand:\n{}",
-        subfamily_listing(family)
-    )
-}
-
-fn unknown_subverb(family: &str, sub: &str) -> String {
-    format!(
-        "unknown `{family}` subcommand {sub:?}:\n{}",
-        subfamily_listing(family)
-    )
-}
-
-/// `--help`/`-h` anywhere in a verb's own args prints that verb's usage line.
-pub(super) fn help_requested(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--help" || a == "-h")
-}
-
-/// intercept `--help` before the handler runs; else delegate.
-fn with_help(
-    path: &[&str],
-    args: &[String],
-    handler: fn(&[String]) -> CommandResult,
-) -> CommandResult {
-    if help_requested(args) {
-        println!("{}", verb_usage_line(path));
-        return Ok(());
-    }
-    handler(args)
-}
-
-/// Run an operator command of the `ducktape node` family, or return `None`
-/// when the first token is not a node verb (the caller reports the error,
-/// pointing at `node run` for a stray run-path flag). `run` itself is NOT
-/// routed here — `main.rs` owns the node-boot path.
-pub(super) fn dispatch(command: &str, args: &[String]) -> Option<CommandResult> {
-    let result = match command {
-        "key" => with_help(&["key"], args, cmd_keygen),
-        "init" => with_help(&["init"], args, cmd_init),
-        "invite" => with_help(&["invite"], args, cmd_invite),
-        "admit" => with_help(&["admit"], args, cmd_admit),
-        "list" => with_help(&["list"], args, cmd_list),
-        "resident" => dispatch_resident(args),
-        "member" => dispatch_member(args),
-        "join" => dispatch_join(args),
-        "upgrade" => dispatch_upgrade(args),
-        _ => return None,
-    };
-    Some(result)
-}
-
-fn dispatch_resident(args: &[String]) -> CommandResult {
-    let Some((sub, rest)) = args.split_first() else {
-        return Err(subfamily_usage("resident").into());
-    };
-    match sub.as_str() {
-        "accept" => with_help(&["resident", "accept"], rest, cmd_invite_accept),
-        "remove" => with_help(&["resident", "remove"], rest, cmd_resident_remove),
-        other => Err(unknown_subverb("resident", other).into()),
+fn dispatch_resident(cmd: ResidentCmd) -> CommandResult {
+    match cmd {
+        ResidentCmd::Accept(args) => cmd_invite_accept(args),
+        ResidentCmd::Remove(args) => cmd_resident_remove(args),
     }
 }
 
-fn dispatch_member(args: &[String]) -> CommandResult {
-    let Some((sub, rest)) = args.split_first() else {
-        return Err(subfamily_usage("member").into());
-    };
-    match sub.as_str() {
-        "promote" => with_help(&["member", "promote"], rest, cmd_promote),
-        "remove" => with_help(&["member", "remove"], rest, cmd_member_remove),
-        "leave" => with_help(&["member", "leave"], rest, cmd_member_leave),
-        "status" => with_help(&["member", "status"], rest, cmd_member_status),
-        other => Err(unknown_subverb("member", other).into()),
+fn dispatch_member(cmd: MemberCmd) -> CommandResult {
+    match cmd {
+        MemberCmd::Promote(args) => cmd_promote(args),
+        MemberCmd::Remove(args) => cmd_member_remove(args),
+        MemberCmd::Leave(args) => cmd_member_leave(args),
+        MemberCmd::Status(args) => cmd_member_status(args),
     }
 }
 
-fn dispatch_upgrade(args: &[String]) -> CommandResult {
-    let Some((sub, rest)) = args.split_first() else {
-        return Err(subfamily_usage("upgrade").into());
-    };
-    match sub.as_str() {
-        "status" => with_help(&["upgrade", "status"], rest, cmd_upgrade_status),
-        other => Err(unknown_subverb("upgrade", other).into()),
+fn dispatch_upgrade(cmd: UpgradeCmd) -> CommandResult {
+    match cmd {
+        UpgradeCmd::Status(args) => cmd_upgrade_status(args),
     }
 }
 
 /// `join` is BOTH a leaf verb (`join <blob>`) and a subfamily prefix
-/// (`join requests`, `join state`). a first token of `requests`/`state`
-/// selects the subverb; anything else is the invite-blob positional.
-fn dispatch_join(args: &[String]) -> CommandResult {
-    let Some((sub, rest)) = args.split_first() else {
-        return with_help(&["join"], args, cmd_join);
-    };
-    match sub.as_str() {
-        "requests" => with_help(&["join", "requests"], rest, cmd_join_requests),
-        "state" => with_help(&["join", "state"], rest, cmd_join_state),
-        _ => with_help(&["join"], args, cmd_join),
+/// (`join requests`, `join state`) — a subcommand token wins.
+fn dispatch_join(cmd: JoinCmd) -> CommandResult {
+    match cmd.query {
+        Some(JoinQuery::Requests(args)) => cmd_join_requests(args),
+        Some(JoinQuery::State(args)) => cmd_join_state(args),
+        None => cmd_join(cmd),
     }
 }
 
 /// `list` — enumerate the workspace registry, one `chain-id<TAB>config-path`
 /// line per registered network on stdout. an empty registry prints a friendly
 /// notice on stderr and exits 0 (nothing registered is not an error).
-fn cmd_list(args: &[String]) -> CommandResult {
-    if !args.is_empty() {
-        return Err(format!("node list takes no arguments (got {args:?})").into());
-    }
+fn cmd_list() -> CommandResult {
     let workspaces = config::list_workspaces()?;
     if workspaces.is_empty() {
         eprintln!(
@@ -323,44 +88,18 @@ fn cmd_list(args: &[String]) -> CommandResult {
 // onboarding verbs — key / init / invite / admit / join.
 // ============================================================================
 
-/// the config a verb operates on: `-n`/`--network <chain id>` resolves through
-/// the workspace registry (`~/.ducktape/workspaces`), `--config <path>` is the
-/// explicit escape hatch, and the default is ./node.toml — the pre-registry
-/// behavior, unchanged.
-fn config_path(flags: &std::collections::BTreeMap<String, String>) -> Result<PathBuf, String> {
-    if let Some(needle) = flags.get("network") {
-        return config::find_workspace_config(needle);
-    }
-    Ok(PathBuf::from(
-        flags
-            .get("config")
-            .map(String::as_str)
-            .unwrap_or("node.toml"),
-    ))
-}
-
-/// `key [--out <path>] [--dir <dir>]` — generate (or reuse) a persisted
-/// ed25519 identity. pubkey on stdout (scriptable); provenance on stderr.
-/// `--dir <dir>` mints (or reuses) `<dir>/identity.key`, creating the dir: this
-/// is the JOIN CODE an invitee hands the inviter so the invite can be locked to
-/// this key before the workspace joins anything.
-fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("unexpected args: {pos:?}").into());
-    }
-    let out = match flags.get("dir") {
+/// `key` — generate (or reuse) a persisted ed25519 identity. pubkey on stdout
+/// (scriptable); provenance on stderr. `--dir <dir>` mints (or reuses)
+/// `<dir>/identity.key`, creating the dir: this is the JOIN CODE an invitee
+/// hands the inviter so the invite can be locked to this key before the
+/// workspace joins anything.
+fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let out = match args.dir {
         Some(dir) => {
-            let dir = PathBuf::from(dir);
             std::fs::create_dir_all(&dir)?;
             dir.join("identity.key")
         }
-        None => PathBuf::from(
-            flags
-                .get("out")
-                .map(String::as_str)
-                .unwrap_or("identity.key"),
-        ),
+        None => args.out.unwrap_or_else(|| PathBuf::from("identity.key")),
     };
     let (key, generated) = config::load_or_generate_identity(&out)?;
     println!("{}", hex_bytes(key.public_key().as_ref()));
@@ -380,23 +119,17 @@ fn cmd_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// set with this identity. without `--dir` the workspace lands in the
 /// registry (`~/.ducktape/workspaces/<chain-id>/`), where `-n <chain-id>`
 /// finds it.
-fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("unexpected args: {pos:?}").into());
-    }
-    let name = flags
-        .get("name")
-        .ok_or("init needs --name <human-readable network name>")?;
+fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let name = &args.name;
+    let explicit_dir = args.dir.is_some();
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
     // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
     // founded. the default dir is NAMED by the chain id, and the chain id is
     // minted from the identity pubkey, so the key is born in memory and only
     // persisted once the dir exists.
-    let (dir, key, generated, chain_id) = match flags.get("dir") {
-        Some(d) => {
-            let dir = PathBuf::from(d);
+    let (dir, key, generated, chain_id) = match args.dir {
+        Some(dir) => {
             std::fs::create_dir_all(&dir)?;
             let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
             let chain_id = config::mint_chain_id(name, &key.public_key());
@@ -424,9 +157,9 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let primary_coordinator = config::primary_coordinator_or_default(
-        flags.get("primary-coordinator").map(String::as_str),
-    )?;
+    let net = &args.plumbing;
+    let primary_coordinator =
+        config::primary_coordinator_or_default(net.primary_coordinator.as_deref())?;
     // node.toml carries the SAME raw flag value (not the defaulted/
     // normalized `primary_coordinator` above) — an absent flag leaves the
     // key absent too, so the runtime re-derives the identical compiled
@@ -435,22 +168,22 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // silently disagree (see `docs`: coordinator is ambient, node-local).
     let mut plumbing = config::merged_plumbing(
         &dir,
-        flags.get("listen").map(String::as_str),
-        flags.get("advertised").map(String::as_str),
-        flags.get("http").map(String::as_str),
-        flags.get("gateway").map(String::as_str),
-        flags.get("rpc").map(String::as_str),
-        flags.get("wireguard-effect").map(String::as_str),
-        flags.get("wireguard-listen").map(String::as_str),
-        flags.get("invite-listen").map(String::as_str),
-        flags.get("primary-coordinator").map(String::as_str),
-        flags.get("wireguard-advertised").map(String::as_str),
+        net.listen.as_deref(),
+        net.advertised.as_deref(),
+        net.http.as_deref(),
+        net.gateway.as_deref(),
+        net.rpc.as_deref(),
+        net.wireguard_effect.as_deref(),
+        net.wireguard_listen.as_deref(),
+        net.invite_listen.as_deref(),
+        net.primary_coordinator.as_deref(),
+        net.wireguard_advertised.as_deref(),
     )?;
     if primary_coordinator.is_some() {
         if plumbing.wireguard_listen.is_none() {
             plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
         }
-        if !flags.contains_key("listen") {
+        if net.listen.is_none() {
             let port: u16 = plumbing
                 .listen
                 .parse::<std::net::SocketAddr>()
@@ -490,7 +223,7 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("network {chain_id} initialized in {}", dir.display());
     // a registry-default workspace is addressable by chain id; an explicit
     // --dir may live outside the registry, so its hints stay path-based.
-    let selector = match flags.contains_key("dir") {
+    let selector = match explicit_dir {
         true => format!("--config {}/node.toml", dir.display()),
         false => format!("-n '{chain_id}'"),
     };
@@ -514,24 +247,16 @@ fn cmd_init(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `user-redeem-invite`, never `join`); WITHOUT `--target` that is a BEARER
 /// invite — single-use, 1-day default TTL, first valid redeemer wins. the
 /// resident role always requires a target.
-fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("unexpected args: {pos:?}").into());
-    }
+fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // every invite is BEARER (기명 dropped in Join Protocol v2): `--role`
     // (default resident) selects the standing plane, and there is no `--target`
     // — whoever redeems the single-use token first wins. A resident invite is
     // the admission credential itself, kept off the wire by the sealed
     // first-contact intro; a client invite redeems over `user-redeem-invite`.
-    let role = match flags.get("role").map(String::as_str) {
-        None | Some("resident") => config::InviteRole::Resident,
-        Some("client") => config::InviteRole::Client,
-        Some(other) => return Err(format!("--role must be resident or client, got {other:?}").into()),
-    };
+    let role = config::InviteRole::from(args.role);
     // reject a stale `--target` loudly rather than silently ignoring it: the
     // habit meant something in v1 and must not appear to still work.
-    if flags.contains_key("target") {
+    if args.target.is_some() {
         return Err(
             "--target was removed: every invite is now bearer (무기명) — single-use, and \
              (for a resident invite) sealed to the receiving member at first contact. \
@@ -539,8 +264,8 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    let ttl_days: u64 = match flags.get("ttl-days") {
-        Some(v) => v.parse().map_err(|e| format!("--ttl-days {v:?}: {e}"))?,
+    let ttl_days: u64 = match args.ttl_days {
+        Some(v) => v,
         // a client invite defaults to a tight window; a resident invite keeps
         // the operator-friendly onboarding default (a LOST blob is the residual
         // risk — single-use + sealing cover interception).
@@ -550,7 +275,7 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
-    let cfg_path = config_path(&flags)?;
+    let cfg_path = args.selector.config_path()?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -741,13 +466,10 @@ fn cmd_invite(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `admit <hex pubkey> [--config node.toml]` — pre-genesis membership: add an
 /// identity to the descriptor's validator set. once the network has state,
 /// membership changes go through governance (AddValidator), not genesis edits.
-fn cmd_admit(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    let [pubkey_hex] = pos.as_slice() else {
-        return Err("admit needs exactly one <hex pubkey>".into());
-    };
+fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
-    let cfg_path = config_path(&flags)?;
+    let cfg_path = args.selector.config_path()?;
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let network_rel = raw
         .network
@@ -910,12 +632,8 @@ fn proposal_progress(proposal: &governance::ProposalView, members: &[Vec<u8>]) -
 /// is a separate, deliberate act: `resident accept <joiner>` (or the app's
 /// approve button) casts this account's governance ballot; the proposal's
 /// frozen rule decides admission.
-fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("unexpected args: {pos:?}").into());
-    }
-    let cfg_path = config_path(&flags)?;
+fn cmd_join_requests(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
         .rpc_listen
@@ -940,12 +658,8 @@ fn cmd_join_requests(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// desktop app reads this instead of parsing daemon.log, which loses the
 /// admission markers across a restart and mis-reads a re-syncing resident as
 /// unjoined. prints the `join_state` projection as JSON.
-fn cmd_join_state(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("unexpected args: {pos:?}").into());
-    }
-    let cfg_path = config_path(&flags)?;
+fn cmd_join_state(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
         .rpc_listen
@@ -1008,11 +722,10 @@ fn upgrade_status_json(status: &lifecycle::UpgradeStatus, max_supported: u32) ->
 /// (module-absent → `{"available":false,"max_supported":N}`). degrades
 /// gracefully on a net
 /// WITHOUT the module (pre-retrofit): the query errors and we report baseline.
-fn cmd_upgrade_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_upgrade_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
-    let (_, flags) = parse_flags(args)?;
-    let want_json = flags.contains_key("json");
-    let cfg_path = config_path(&flags)?;
+    let want_json = args.json;
+    let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let addr = resolved
         .rpc_listen
@@ -1256,16 +969,13 @@ fn drive_membership_ceremony(
 /// admits the key to the mesh, at which point its parked node PRE-SYNCS
 /// state on a stride cadence. promotion into the quorum is the separate,
 /// deliberate `member promote` verb — run it once the resident is warm.
-fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
-    let (pos, flags) = parse_flags(args)?;
-    let [pubkey_hex] = pos.as_slice() else {
-        return Err("resident accept needs exactly one <hex pubkey>".into());
-    };
+    let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = config_path(&flags)?;
+    let cfg_path = args.selector.config_path()?;
     // Full config resolution derives the same node identity the daemon signs
     // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
@@ -1314,16 +1024,13 @@ fn cmd_invite_accept(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// pre-synced resident then catches up a small delta and reboots as a
 /// validator, so the quorum only ever gains a warm member. also serves DIRECT
 /// (un-staged) admission — exactly the pre-resident `resident accept` semantics.
-fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
-    let (pos, flags) = parse_flags(args)?;
-    let [pubkey_hex] = pos.as_slice() else {
-        return Err("promote needs exactly one <hex pubkey>".into());
-    };
+    let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = config_path(&flags)?;
+    let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen
@@ -1365,16 +1072,13 @@ fn cmd_promote(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// parked joiner, and `resident accept` re-grants. a seated validator is
 /// `member remove`'s job — standing never overlaps (Grant refuses validators,
 /// Join clears standing).
-fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     use governance::GovAction;
 
-    let (pos, flags) = parse_flags(args)?;
-    let [pubkey_hex] = pos.as_slice() else {
-        return Err("resident remove needs exactly one <hex pubkey>".into());
-    };
+    let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = config_path(&flags)?;
+    let cfg_path = args.selector.config_path()?;
     // Full config resolution derives the same node identity the daemon signs
     // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
@@ -1426,16 +1130,13 @@ fn cmd_resident_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>
 /// command (propose if absent, cast a yes ballot, execute once decidable); the
 /// run that lands the deciding ballot executes. the passing proposal's valset
 /// Leave schedules the epoch cutover that drops the key from the tracked set.
-fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     use governance::{GovAction, GovMsg, ProposalStatus, encode_msg};
 
-    let (pos, flags) = parse_flags(args)?;
-    let [pubkey_hex] = pos.as_slice() else {
-        return Err("member remove needs exactly one <hex pubkey>".into());
-    };
+    let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
     let key_bytes = key.as_ref().to_vec();
-    let cfg_path = config_path(&flags)?;
+    let cfg_path = args.selector.config_path()?;
     // Full config resolution derives the same node identity the daemon signs
     // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
@@ -1546,26 +1247,19 @@ fn cmd_member_remove(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// required power. this casts only its account ballot (or the legacy node
 /// ballot), and member remove prints the remaining threshold plus the command
 /// other voters run (`member remove <this key>`).
-fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("member leave takes no positional args (got {pos:?})").into());
-    }
-    let cfg_path = config_path(&flags)?;
+fn cmd_member_leave(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = args.selector.config_path()?;
     // resolve the running node's identity — the key it signs ballots with, and
     // the one this verb submits for removal.
     let resolved = config::resolve(&cfg_path)?;
     let me_hex = hex_bytes(resolved.signer.public_key().as_ref());
     eprintln!("leaving the network: opening a self-removal for {me_hex}");
     // delegate to member remove targeting SELF — same propose+vote+execute
-    // path, same strict-majority honesty. rebuild the arg vector so the flags
-    // (notably --config) reach the delegate unchanged.
-    let mut forwarded = vec![me_hex];
-    for (name, value) in &flags {
-        forwarded.push(format!("--{name}"));
-        forwarded.push(value.clone());
-    }
-    cmd_member_remove(&forwarded)
+    // path, same strict-majority honesty, same selector.
+    cmd_member_remove(PubkeyArgs {
+        pubkey: me_hex,
+        selector: args.selector,
+    })
 }
 
 // ---- member status: is THIS node still in the validator set? --------------
@@ -1587,12 +1281,8 @@ fn cmd_member_leave(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// `in-set=true` and `validators>=2`; a lone validator (`validators=1`) or an
 /// already-removed key (`in-set=false`) is safe to forget. requires the node to
 /// be up (it serves this over the same local rpc as `member remove`).
-fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    if !pos.is_empty() {
-        return Err(format!("member status takes no positional args (got {pos:?})").into());
-    }
-    let cfg_path = config_path(&flags)?;
+fn cmd_member_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let rpc_addr = resolved
         .rpc_listen
@@ -1602,7 +1292,7 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     let members = read_members(&rpc_addr)?;
     let in_set = members.contains(&me_bytes);
     let validators = members.len();
-    if flags.contains_key("json") {
+    if args.json {
         println!(
             "{}",
             serde_json::json!({ "in_set": in_set, "validators": validators })
@@ -1623,11 +1313,11 @@ fn cmd_member_status(args: &[String]) -> Result<(), Box<dyn std::error::Error>> 
 /// `--primary-coordinator` is node-local plumbing ONLY — it never touches
 /// the invite or the joined descriptor (the coordinator is always ambient,
 /// per docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md).
-fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (pos, flags) = parse_flags(args)?;
-    let [blob] = pos.as_slice() else {
-        return Err("join needs exactly one <invite blob>".into());
-    };
+fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
+    let blob = args
+        .blob
+        .as_deref()
+        .ok_or("join needs an invite blob (or a `requests`/`state` subcommand)")?;
     let invite = config::decode_invite(blob)?;
     // a CLIENT invite grants submit access, not a node — a node redeeming it
     // would gate-fail terminally at the lobby (V8); fail at paste time with
@@ -1640,12 +1330,13 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
     let mut descriptor = invite.descriptor.clone();
+    let explicit_dir = args.dir.is_some();
     // same default as `init`: without `--dir` the workspace materializes in
     // the registry under its chain id (known here from the invite), so the
     // joined node is `-n <chain-id>`-addressable. a re-join for the same
     // chain lands in the same dir and reuses its identity, as before.
-    let dir = match flags.get("dir") {
-        Some(d) => PathBuf::from(d),
+    let dir = match args.dir {
+        Some(dir) => dir,
         None => config::default_workspace_dir(&descriptor.chain_id)?,
     };
     std::fs::create_dir_all(&dir)?;
@@ -1663,18 +1354,19 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // the join without leaving a half-migrated dir. the file is ALWAYS
     // rewritten in the network shape — a join must take effect even in a dir
     // holding the app's dev-shape solo config.
+    let net = &args.plumbing;
     let mut plumbing = config::merged_plumbing(
         &dir,
-        flags.get("listen").map(String::as_str),
-        flags.get("advertised").map(String::as_str),
-        flags.get("http").map(String::as_str),
-        flags.get("gateway").map(String::as_str),
-        flags.get("rpc").map(String::as_str),
-        flags.get("wireguard-effect").map(String::as_str),
-        flags.get("wireguard-listen").map(String::as_str),
-        flags.get("invite-listen").map(String::as_str),
-        flags.get("primary-coordinator").map(String::as_str),
-        flags.get("wireguard-advertised").map(String::as_str),
+        net.listen.as_deref(),
+        net.advertised.as_deref(),
+        net.http.as_deref(),
+        net.gateway.as_deref(),
+        net.rpc.as_deref(),
+        net.wireguard_effect.as_deref(),
+        net.wireguard_listen.as_deref(),
+        net.invite_listen.as_deref(),
+        net.primary_coordinator.as_deref(),
+        net.wireguard_advertised.as_deref(),
     )?;
     if config::invite_requires_reachability_defaults(&invite) {
         // a WireGuard or Coordinated invite makes the reachability plane the
@@ -1686,7 +1378,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         if plumbing.wireguard_listen.is_none() {
             plumbing.wireguard_listen = Some("0.0.0.0:51820".into());
         }
-        if !flags.contains_key("listen") {
+        if net.listen.is_none() {
             let port: u16 = plumbing
                 .listen
                 .parse::<std::net::SocketAddr>()
@@ -1757,7 +1449,7 @@ fn cmd_join(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         descriptor.chain_id,
         dir.display()
     );
-    let selector = match flags.contains_key("dir") {
+    let selector = match explicit_dir {
         true => format!("--config {}/node.toml", dir.display()),
         false => format!("-n '{}'", descriptor.chain_id),
     };
@@ -1868,8 +1560,6 @@ mod json_output_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     fn completions() -> (String, String) {
         let bash = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -1884,8 +1574,9 @@ mod tests {
         (bash, zsh)
     }
 
-    /// the drift guard: every verb token and flag in NODE_VERBS must appear in
-    /// BOTH completion files (and every family name too). Renaming a verb or
+    /// the drift guard: every node verb token and every non-hidden long flag
+    /// in the CLAP TREE (the grammar itself, not a parallel table) must appear
+    /// in BOTH completion files, and every family name too. renaming a verb or
     /// adding a flag without updating the hand-written completions fails here.
     #[test]
     fn completion_files_cover_the_verb_table() {
@@ -1894,29 +1585,41 @@ mod tests {
             assert!(bash.contains(family), "ducktape.bash missing family {family:?}");
             assert!(zsh.contains(family), "ducktape.zsh missing family {family:?}");
         }
-        for verb in NODE_VERBS {
-            for token in verb.path {
-                assert!(bash.contains(*token), "ducktape.bash missing token {token:?}");
-                assert!(zsh.contains(*token), "ducktape.zsh missing token {token:?}");
-            }
-            for flag in verb.flags {
-                let long = format!("--{flag}");
-                assert!(bash.contains(&long), "ducktape.bash missing flag {long}");
-                assert!(zsh.contains(&long), "ducktape.zsh missing flag {long}");
+        fn walk(cmd: &clap::Command, bash: &str, zsh: &str) {
+            for sub in cmd.get_subcommands() {
+                if sub.is_hide_set() {
+                    continue;
+                }
+                let token = sub.get_name();
+                if token == "help" {
+                    continue;
+                }
+                assert!(bash.contains(token), "ducktape.bash missing token {token:?}");
+                assert!(zsh.contains(token), "ducktape.zsh missing token {token:?}");
+                for arg in sub.get_arguments() {
+                    if arg.is_hide_set() {
+                        continue;
+                    }
+                    let Some(long) = arg.get_long() else { continue };
+                    if long == "help" {
+                        continue;
+                    }
+                    let flag = format!("--{long}");
+                    assert!(bash.contains(&flag), "ducktape.bash missing flag {flag}");
+                    assert!(zsh.contains(&flag), "ducktape.zsh missing flag {flag}");
+                }
+                walk(sub, bash, zsh);
             }
         }
+        let cmd = <crate::Cli as clap::CommandFactory>::command();
+        let node = cmd.find_subcommand("node").expect("node family exists");
+        walk(node, &bash, &zsh);
     }
 
-    /// every two-token verb resolves to a table entry (so `--help` and the
-    /// family listing never fall through to the generic path).
+    /// the grammar's own consistency check (conflicting ids, broken flatten,
+    /// missing subcommand settings all panic here instead of at first use).
     #[test]
-    fn every_verb_path_has_a_usage_line() {
-        for verb in NODE_VERBS {
-            assert!(
-                verb_usage_line(verb.path).starts_with("usage: ducktape "),
-                "no usage line for {:?}",
-                verb.path
-            );
-        }
+    fn the_clap_tree_is_internally_consistent() {
+        <crate::Cli as clap::CommandFactory>::command().debug_assert();
     }
 }
