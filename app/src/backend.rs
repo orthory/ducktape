@@ -69,6 +69,7 @@ pub struct PagesData {
 pub struct WorkspaceData {
     pub rpc: String,
     pub status: String,
+    pub height: i64,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
     pub active_channel: String,
@@ -76,6 +77,12 @@ pub struct WorkspaceData {
     pub blocks: Vec<PageBlock>,
     pub active_page: String,
     pub active_page_title: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockTip {
+    pub height: i64,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -184,20 +191,34 @@ impl Rpc {
 pub async fn connect(rpc: String) -> Result<WorkspaceData, AppError> {
     async {
         let rpc = Rpc::new(&rpc)?;
-        let status = rpc.status().await?;
-        let chat = load_chat_data(&rpc, None).await?;
-        let pages = load_pages_data(&rpc, None).await?;
-        Ok(WorkspaceData {
-            rpc: rpc.origin,
-            status: format!("Connected · block {}", status.height),
-            channels: chat.channels,
-            messages: chat.messages,
-            active_channel: chat.active_channel,
-            pages: pages.pages,
-            blocks: pages.blocks,
-            active_page: pages.active_page,
-            active_page_title: pages.active_page_title,
-        })
+        load_workspace(&rpc, None, None).await
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn block_tip(rpc: String) -> Result<BlockTip, AppError> {
+    async {
+        let rpc = Rpc::new(&rpc)?;
+        tip_from_status(rpc.status().await?)
+    }
+    .await
+    .map_err(app_error)
+}
+
+pub async fn refresh(
+    rpc: String,
+    channel_id: String,
+    page_id: String,
+) -> Result<WorkspaceData, AppError> {
+    async {
+        let rpc = Rpc::new(&rpc)?;
+        load_workspace(
+            &rpc,
+            (!channel_id.is_empty()).then_some(channel_id.as_str()),
+            (!page_id.is_empty()).then_some(page_id.as_str()),
+        )
+        .await
     }
     .await
     .map_err(app_error)
@@ -381,6 +402,36 @@ pub async fn add_paragraph(
     }
     .await
     .map_err(app_error)
+}
+
+async fn load_workspace(
+    rpc: &Rpc,
+    channel_id: Option<&str>,
+    page_id: Option<&str>,
+) -> Result<WorkspaceData, String> {
+    let tip = tip_from_status(rpc.status().await?)?;
+    let chat = load_chat_data(rpc, channel_id).await?;
+    let pages = load_pages_data(rpc, page_id).await?;
+    Ok(WorkspaceData {
+        rpc: rpc.origin.clone(),
+        status: tip.status,
+        height: tip.height,
+        channels: chat.channels,
+        messages: chat.messages,
+        active_channel: chat.active_channel,
+        pages: pages.pages,
+        blocks: pages.blocks,
+        active_page: pages.active_page,
+        active_page_title: pages.active_page_title,
+    })
+}
+
+fn tip_from_status(status: NodeStatus) -> Result<BlockTip, String> {
+    let height = i64::try_from(status.height).map_err(|_| "node height exceeds i64")?;
+    Ok(BlockTip {
+        height,
+        status: format!("Connected · block {height}"),
+    })
 }
 
 async fn load_chat_data(rpc: &Rpc, requested: Option<&str>) -> Result<ChatData, String> {
@@ -901,6 +952,30 @@ mod tests {
         let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
         assert_eq!(pages.active_page_title, "Welcome");
         assert_eq!(pages.blocks[0].text, "A signed page block");
+
+        let origin = rpc.origin.clone();
+        let workspace = connect(origin.clone()).await.unwrap();
+        submit_test(
+            &rpc,
+            &signer,
+            5,
+            "chat",
+            chat::encode_msg(&ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: "hello-2".into(),
+                blocks: vec![chat::Block::paragraph("arrived on the next block")],
+                thread: None,
+                as_agent: None,
+            }),
+        )
+        .await;
+        let tip = block_tip(origin.clone()).await.unwrap();
+        assert!(tip.height > workspace.height);
+        let refreshed = refresh(origin, "general".into(), "welcome".into())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.messages[1].body, "arrived on the next block");
+        assert_eq!(refreshed.active_page, "welcome");
         sim.shutdown();
     }
 

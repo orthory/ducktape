@@ -8631,7 +8631,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ae14a2c259fc4b82b0893bba4075ea2bbbde061a#ae14a2c259fc4b82b0893bba4075ea2bbbde061a"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=1a97a8e52c61a66122653a0442da3b007ffbc746#1a97a8e52c61a66122653a0442da3b007ffbc746"
 dependencies = [
  "ui-lang-core",
 ]
@@ -8639,12 +8639,12 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ae14a2c259fc4b82b0893bba4075ea2bbbde061a#ae14a2c259fc4b82b0893bba4075ea2bbbde061a"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=1a97a8e52c61a66122653a0442da3b007ffbc746#1a97a8e52c61a66122653a0442da3b007ffbc746"
 
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=ae14a2c259fc4b82b0893bba4075ea2bbbde061a#ae14a2c259fc4b82b0893bba4075ea2bbbde061a"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=1a97a8e52c61a66122653a0442da3b007ffbc746#1a97a8e52c61a66122653a0442da3b007ffbc746"
 dependencies = [
  "accesskit",
  "accesskit_unix",
