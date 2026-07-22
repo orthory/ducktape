@@ -1,15 +1,17 @@
-//! `tasks-wasm` — the wasm port of the `tasks` module, built the ADAPTER way:
-//! the NATIVE `tasks` crate is compiled to wasm32 unmodified and adapted to
-//! the `ducktape:module` world through `guest-adapter`, so the module's logic
-//! is single-sourced (a behavior change in the native crate IS the wasm change).
+//! the wasm port of this module, built the ADAPTER way: the native crate is
+//! compiled to wasm32 unmodified and adapted to the `ducktape:module` world
+//! through `guest-adapter`, so the module's logic is single-sourced (a behavior
+//! change in the native crate IS the wasm change). the packaging cdylib around
+//! this port is synthesized by `guest-builder` — this module is the whole of
+//! the guest's hand-written surface.
 //!
-//! the guest takes `tasks` with `default-features = false`: the `native`
+//! the guest takes the crate with `default-features = false`: the `native`
 //! feature carries only the node-local derived index (whose `indexer` dep is
 //! unix-only IO), never consensus state — so the ported state machine is the
 //! FULL consensus surface.
 //!
 //! the whole-state dispatch model and its equivalence argument are spelled out
-//! in `agent-wasm` (a whole-state tenant) and `guest-adapter`; tasks is
+//! in `agent`'s guest port (a whole-state tenant) and `guest-adapter`; tasks is
 //! the same shape: a pure `SnapshotBytes` module whose canonical snapshot is
 //! persisted as ONE host-KV value per dispatch. that host-KV encoding is a
 //! STATE-SCHEMA BREAK versus the native root (revision 3 — the tasks+jobs merge
@@ -17,7 +19,7 @@
 //! snapshot is now the task board and job board concatenated; beta networks
 //! re-genesis, no back-compat shim).
 
-use tasks::Tasks;
+use crate::Tasks;
 
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).

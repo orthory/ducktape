@@ -219,7 +219,7 @@ pub fn dispatch<S: ObjectStore>(
 }
 
 // ============================================================================
-// FilesGuest — the wasm entry surface Task 4's `files-wasm` wrapper forwards to
+// FilesGuest — the wasm entry surface the component export forwards to
 // ============================================================================
 
 #[cfg(feature = "guest")]
@@ -287,6 +287,23 @@ mod entry {
             Err(host::Error::Unsupported)
         }
     }
+
+    /// the `ducktape:module` component export: a two-line forward to
+    /// [`FilesGuest`]. the packaging cdylib around this crate is synthesized by
+    /// `guest-builder` — this export is the whole of the guest's entry wiring.
+    struct Component;
+
+    impl guest_adapter::Guest for Component {
+        fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
+            FilesGuest::execute(payload)
+        }
+
+        fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
+            FilesGuest::query(req)
+        }
+    }
+
+    guest_adapter::export_module!(Component);
 }
 
 #[cfg(feature = "guest")]

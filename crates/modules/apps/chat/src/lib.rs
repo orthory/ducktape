@@ -25,9 +25,15 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
+
+// the wasm-guest port: the dispatch shell that adapts this module to the
+// ducktape:module world. compiled only by the guest-builder's synthesized
+// wasm32 cdylib workspace (feature `guest`), never by the native build.
+#[cfg(feature = "guest")]
+mod guest;
 // everything below is OFF-consensus and native-only: none of it touches qmdb
 // or the app-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
-// cannot cross into the `chat-wasm` guest — so the consensus state machine
+// cannot cross into the wasm guest — so the consensus state machine
 // above compiles for wasm32 without them.
 //
 // the derived-tier materialized view; registered only by serving binaries.

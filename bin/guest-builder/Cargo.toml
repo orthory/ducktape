@@ -1,0 +1,12 @@
+[package]
+name = "guest-builder"
+edition.workspace = true
+version.workspace = true
+
+# the wasm packaging tool: synthesizes the ephemeral cdylib workspace for a
+# module crate (feature `guest`) and builds its componentized artifact, so no
+# per-module packaging crate is checked in and a module directory — in-tree or
+# out-of-tree — is the complete distributable unit. see `make wasm-modules`.
+
+[dependencies]
+serde_json = { workspace = true }

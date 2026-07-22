@@ -93,12 +93,24 @@ test: wasm-modules-check
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
 ## guards mutual consistency, not reproducibility.
 #
-# The uniform guests each build a canonical `component.wasm` that is copied into
-# the host test fixtures. The four odd ones out are kept explicit below.
-WASM_GUESTS := directory inbox tasks tagging dispatch capability identity \
-  gateway governance pages chat saga agent automations runs files
+# Migrated modules carry their own guest port (src/guest.rs behind the `guest`
+# feature); guest-builder synthesizes the packaging workspace and writes the
+# canonical component.wasm into the module directory itself.
+BUILDER_MODULES := apps/tasks apps/chat apps/files
+
+# The unmigrated uniform guests each build a canonical `component.wasm` in
+# their standalone crates/guests workspace, copied into the host test
+# fixtures. The four odd ones out are kept explicit below.
+WASM_GUESTS := directory inbox tagging dispatch capability identity \
+  gateway governance pages saga agent automations runs
 
 wasm-modules:
+	@for m in $(BUILDER_MODULES); do \
+	  id=$$(basename $$m) && \
+	  $(CARGO) run -q -p guest-builder -- crates/modules/$$m && \
+	  cp crates/modules/$$m/component.wasm \
+	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
 	@for g in $(WASM_GUESTS); do \
 	  ( cd crates/guests/$$g-wasm && $(CARGO) build --target wasm32-unknown-unknown --release ) && \
 	  wasm-tools component new \
@@ -140,6 +152,11 @@ wasm-modules-check:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	@for m in $(BUILDER_MODULES); do \
+	  id=$$(basename $$m) && \
+	  cmp crates/modules/$$m/component.wasm \
+	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
 	@for g in $(WASM_GUESTS); do \
 	  cmp crates/guests/$$g-wasm/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$g.component.wasm || exit 1; \

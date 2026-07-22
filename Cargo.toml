@@ -24,10 +24,15 @@
 #                      inbox, files, jobs)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
-#   crates/guests/   — the wasm ports: one standalone guest workspace per
-#                      module (X-wasm compiles the native crate to a
-#                      component the node embeds) + guest-adapter (the
-#                      ducktape:module world binding they all share)
+#   crates/guests/   — shared wasm-port infra: guest-adapter (the
+#                      ducktape:module world binding every port shares), the
+#                      wasm32 dep stubs, and the kernel-fixture test guests
+#                      (hello, hello-v2, sibling, object). product modules
+#                      carry their OWN port (src/guest.rs behind the `guest`
+#                      feature) and bin/guest-builder synthesizes the
+#                      packaging — migrated modules have no crate here;
+#                      unmigrated ones still keep a standalone X-wasm
+#                      workspace pending the sweep
 #   crates/examples/ — reference modules: directory (also bin/node's liveness
 #                      canary), greeter (the types-only composition example)
 #   crates/testing/  — dev-only shared test support (nettest: raw-http client,
@@ -41,7 +46,8 @@
 #   bin/             — demo (in-process walkthrough), node (the `ducktape`
 #                      CLI: validator + fs verbs + mcp server), noded (the
 #                      app-facing daemon), simnode (deterministic /v1 twin),
-#                      coordinator (STUN rendezvous)
+#                      coordinator (STUN rendezvous), guest-builder (module →
+#                      wasm component packaging tool)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -97,6 +103,7 @@ members = [
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",
+    "bin/guest-builder",
 ]
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —

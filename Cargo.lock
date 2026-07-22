@@ -916,6 +916,7 @@ dependencies = [
  "async-trait",
  "commonware-runtime",
  "data-plane",
+ "guest-adapter",
  "host",
  "indexer",
  "opus-rs",
@@ -2927,6 +2928,13 @@ dependencies = [
  "duckfs-core",
  "sdk",
  "wit-bindgen",
+]
+
+[[package]]
+name = "guest-builder"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -6143,6 +6151,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "guest-adapter",
  "host",
  "indexer",
  "sdk",
