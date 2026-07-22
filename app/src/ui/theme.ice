@@ -1,4 +1,4 @@
-font ui family="Inter" weight=normal stretch=normal style=normal default=true
+font ui family=sans weight=normal stretch=normal style=normal default=true
 font mono family=mono weight=normal stretch=normal style=normal
 
 theme

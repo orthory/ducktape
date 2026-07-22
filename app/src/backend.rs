@@ -36,6 +36,7 @@ pub struct ChatChannel {
 pub struct ChatReaction {
     pub emoji: String,
     pub count: i64,
+    pub reacted_by_me: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -76,19 +77,35 @@ pub struct ChatData {
     pub active_thread_seq: i64,
     pub thread_target_seq: i64,
     pub thread_messages: Vec<ChatMessage>,
+    pub thread_next_reply_offset: i64,
+    pub thread_has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ThreadData {
+struct ThreadData {
     pub root_seq: i64,
+    pub target_seq: i64,
     pub messages: Vec<ChatMessage>,
+    pub next_reply_offset: i64,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ThreadLoadData {
     pub generation: i64,
     pub root_seq: i64,
+    pub target_seq: i64,
     pub messages: Vec<ChatMessage>,
+    pub next_reply_offset: i64,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ThreadPageData {
+    pub generation: i64,
+    pub messages: Vec<ChatMessage>,
+    pub next_reply_offset: i64,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -236,6 +253,30 @@ pub fn rollback_messages(mut messages: Vec<ChatMessage>, keep_pending: bool) -> 
     }
     messages.retain(|message| !message.pending);
     messages
+}
+
+pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .chain(next)
+        .map(|message| (message.seq, message))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+pub fn finish_thread_reply(mut messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
+    messages.retain(|message| !message.pending && message.seq != reply.seq);
+    messages.push(reply);
+    messages
+}
+
+pub fn thread_offset_after_reply(offset: i64, has_more: bool) -> i64 {
+    if offset < 0 || has_more {
+        offset
+    } else {
+        offset.saturating_add(1)
+    }
 }
 
 pub fn optimistic_block(mut blocks: Vec<PageBlock>, kind: String, text: String) -> Vec<PageBlock> {
@@ -530,9 +571,11 @@ pub async fn load_chat_hit(
         if reply.head.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
+        let current_user = local_user_key().await;
         chat.active_thread_seq = root.seq;
         chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![root, chat_message(reply)];
+        chat.thread_messages = vec![root, chat_message(reply, current_user.as_deref())];
+        chat.thread_next_reply_offset = -1;
         Ok(chat)
     }
     .await
@@ -786,24 +829,88 @@ pub async fn load_thread(
     rpc: String,
     channel_id: String,
     root_seq: i64,
+    target_seq: i64,
+    through_reply_offset: i64,
+    committed_reply: bool,
     generation: i64,
 ) -> Result<ThreadLoadData, HydrationError> {
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
+        let target_seq = u64::try_from(target_seq).unwrap_or(0);
+        let is_sparse_target = !committed_reply && through_reply_offset < 0 && target_seq > 0;
+        let requested_reply_offset = u64::try_from(through_reply_offset)
+            .unwrap_or(0)
+            .min(chat::MAX_THREAD_REPLIES as u64);
+        let through_reply_offset = if committed_reply {
+            chat::MAX_THREAD_REPLIES as u64
+        } else {
+            requested_reply_offset
+        };
         let rpc = rpc_client(&rpc)?;
-        load_thread_data(&rpc, &channel_id, root_seq).await
+        if is_sparse_target {
+            return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
+        }
+        let mut thread =
+            load_thread_data(&rpc, &channel_id, root_seq, through_reply_offset).await?;
+        let target_is_loaded = target_seq > 0
+            && thread
+                .messages
+                .iter()
+                .any(|message| message.seq == number_i64(target_seq));
+        if target_is_loaded {
+            thread.target_seq = number_i64(target_seq);
+        }
+        Ok(thread)
     }
     .await;
     result
         .map(|thread| ThreadLoadData {
             generation,
             root_seq: thread.root_seq,
+            target_seq: thread.target_seq,
             messages: thread.messages,
+            next_reply_offset: thread.next_reply_offset,
+            has_more: thread.has_more,
         })
         .map_err(|message| HydrationError {
             generation,
             message,
         })
+}
+
+pub async fn load_thread_page(
+    rpc: String,
+    channel_id: String,
+    root_seq: i64,
+    from: i64,
+    generation: i64,
+) -> Result<ThreadPageData, HydrationError> {
+    let result = async {
+        let root_seq = positive_sequence(root_seq)?;
+        let from = u64::try_from(from).map_err(|_| "invalid thread offset".to_string())?;
+        let rpc = rpc_client(&rpc)?;
+        let thread = query_thread_page(&rpc, &channel_id, root_seq, from).await?;
+        let reply_count = thread.replies.len() as u64;
+        let current_user = local_user_key().await;
+        let next_reply_offset = from.saturating_add(reply_count);
+        let page_is_full = reply_count == chat::MAX_QUERY_LIMIT;
+        let thread_cap_reached = next_reply_offset >= chat::MAX_THREAD_REPLIES as u64;
+        Ok(ThreadPageData {
+            generation,
+            messages: thread
+                .replies
+                .into_iter()
+                .map(|message| chat_message(message, current_user.as_deref()))
+                .collect(),
+            next_reply_offset: number_i64(next_reply_offset),
+            has_more: page_is_full && !thread_cap_reached,
+        })
+    }
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
 }
 
 pub async fn send_reply(
@@ -812,17 +919,18 @@ pub async fn send_reply(
     channel_id: String,
     root_seq: i64,
     body: String,
-) -> Result<ThreadData, AppError> {
+) -> Result<ChatMessage, AppError> {
     async {
         let root_seq = positive_sequence(root_seq)?;
         let body = bounded_text(body, "reply", 16 * 1024)?;
         let rpc = rpc_client(&rpc)?;
+        let message_id = fresh_id("message");
         signed_write(
             &rpc,
             "chat",
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
-                message_id: fresh_id("message"),
+                message_id: message_id.clone(),
                 blocks: vec![chat::Block::paragraph(body)],
                 thread: Some(root_seq),
                 as_agent: None,
@@ -830,9 +938,11 @@ pub async fn send_reply(
             password,
         )
         .await?;
-        load_thread_data(&rpc, &channel_id, root_seq)
+        let reply = load_reply_by_id(&rpc, &message_id, &channel_id, root_seq)
             .await
-            .map_err(committed_error)
+            .map_err(committed_error)?;
+        let current_user = local_user_key().await;
+        Ok(chat_message(reply, current_user.as_deref()))
     }
     .await
 }
@@ -911,6 +1021,35 @@ pub async fn add_reaction(
             &rpc,
             "chat",
             chat::encode_msg(&ChatMsg::AddReaction {
+                channel_id: channel_id.clone(),
+                seq,
+                emoji,
+            }),
+            password,
+        )
+        .await?;
+        load_chat_data(&rpc, Some(&channel_id))
+            .await
+            .map_err(committed_error)
+    }
+    .await
+}
+
+pub async fn remove_reaction(
+    rpc: String,
+    password: String,
+    channel_id: String,
+    seq: i64,
+    emoji: String,
+) -> Result<ChatData, AppError> {
+    async {
+        let seq = positive_sequence(seq)?;
+        let emoji = bounded_text(emoji, "reaction", chat::MAX_EMOJI_BYTES)?;
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "chat",
+            chat::encode_msg(&ChatMsg::RemoveReaction {
                 channel_id: channel_id.clone(),
                 seq,
                 emoji,
@@ -1410,6 +1549,8 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         active_thread_seq: 0,
         thread_target_seq: 0,
         thread_messages: Vec::new(),
+        thread_next_reply_offset: 0,
+        thread_has_more: false,
     })
 }
 
@@ -1475,7 +1616,11 @@ async fn load_messages(
     roots.sort_by_key(|message| message.seq);
     let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
     roots.drain(..excess);
-    Ok(roots.into_iter().map(chat_message).collect())
+    let current_user = local_user_key().await;
+    Ok(roots
+        .into_iter()
+        .map(|message| chat_message(message, current_user.as_deref()))
+        .collect())
 }
 
 async fn load_messages_around(
@@ -1497,10 +1642,11 @@ async fn load_messages_around(
         ChatReply::Messages(messages) => messages,
         _ => return Err("node returned an invalid message window".into()),
     };
+    let current_user = local_user_key().await;
     Ok(messages
         .into_iter()
         .filter(|message| message.head.thread.is_none())
-        .map(chat_message)
+        .map(|message| chat_message(message, current_user.as_deref()))
         .collect())
 }
 
@@ -1529,43 +1675,131 @@ async fn load_message_at(
         .ok_or_else(|| "message was not found".into())
 }
 
-async fn load_thread_data(
+async fn load_reply_by_id(
+    rpc: &RpcClient,
+    message_id: &str,
+    channel_id: &str,
+    root_seq: u64,
+) -> Result<chat::MessageView, String> {
+    let reply: ChatReply = rpc
+        .query(
+            "chat",
+            &ChatQuery::Message {
+                message_id: message_id.to_string(),
+            },
+        )
+        .await?;
+    let message = match reply {
+        ChatReply::Message(Some(message)) => message,
+        _ => return Err("reply was not found".into()),
+    };
+    let is_expected_reply =
+        message.channel_id == channel_id && message.head.thread == Some(root_seq);
+    if !is_expected_reply {
+        return Err("node returned an invalid thread reply".into());
+    }
+    Ok(message)
+}
+
+async fn query_thread_page(
     rpc: &RpcClient,
     channel_id: &str,
     root_seq: u64,
-) -> Result<ThreadData, String> {
-    if channel_id.is_empty() || root_seq == 0 {
-        return Ok(ThreadData {
-            root_seq: 0,
-            messages: Vec::new(),
-        });
-    }
+    from: u64,
+) -> Result<chat::Thread, String> {
     let reply: ChatReply = rpc
         .query(
             "chat",
             &ChatQuery::Thread {
                 channel_id: channel_id.to_string(),
                 root_seq,
-                from: 0,
+                from,
                 limit: chat::MAX_QUERY_LIMIT,
             },
         )
         .await?;
-    let thread = match reply {
-        ChatReply::Thread(Some(thread)) => thread,
-        _ => return Err("thread was not found".into()),
-    };
-    let messages = std::iter::once(thread.root)
-        .chain(thread.replies)
-        .map(chat_message)
-        .collect();
+    match reply {
+        ChatReply::Thread(Some(thread)) => Ok(thread),
+        _ => Err("thread was not found".into()),
+    }
+}
+
+async fn load_sparse_thread_data(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+    target_seq: u64,
+) -> Result<ThreadData, String> {
+    let root = load_message_at(rpc, channel_id, root_seq).await?;
+    let target = load_message_at(rpc, channel_id, target_seq).await?;
+    if target.head.thread != Some(root_seq) {
+        return Err("search result does not belong to the selected thread".into());
+    }
+    let current_user = local_user_key().await;
     Ok(ThreadData {
         root_seq: number_i64(root_seq),
-        messages,
+        target_seq: number_i64(target_seq),
+        messages: vec![
+            chat_message(root, current_user.as_deref()),
+            chat_message(target, current_user.as_deref()),
+        ],
+        next_reply_offset: -1,
+        has_more: false,
     })
 }
 
-fn chat_message(message: chat::MessageView) -> ChatMessage {
+async fn load_thread_data(
+    rpc: &RpcClient,
+    channel_id: &str,
+    root_seq: u64,
+    through_reply_offset: u64,
+) -> Result<ThreadData, String> {
+    if channel_id.is_empty() || root_seq == 0 {
+        return Ok(ThreadData {
+            root_seq: 0,
+            target_seq: 0,
+            messages: Vec::new(),
+            next_reply_offset: 0,
+            has_more: false,
+        });
+    }
+
+    let mut root = None;
+    let mut replies = Vec::new();
+    let mut from = 0_u64;
+    let has_more = loop {
+        let thread = query_thread_page(rpc, channel_id, root_seq, from).await?;
+        if root.is_none() {
+            root = Some(thread.root);
+        }
+        let page_len = thread.replies.len() as u64;
+        replies.extend(thread.replies);
+        from = from.saturating_add(page_len);
+        let page_is_full = page_len == chat::MAX_QUERY_LIMIT;
+        let thread_cap_reached = from >= chat::MAX_THREAD_REPLIES as u64;
+        let has_more = page_is_full && !thread_cap_reached;
+        let first_page_is_enough = through_reply_offset == 0;
+        let requested_offset_is_loaded = from >= through_reply_offset;
+        if !has_more || first_page_is_enough || requested_offset_is_loaded {
+            break has_more;
+        }
+    };
+    let root = root.ok_or_else(|| "thread was not found".to_string())?;
+    let current_user = local_user_key().await;
+    let messages = std::iter::once(root)
+        .chain(replies)
+        .map(|message| chat_message(message, current_user.as_deref()))
+        .collect();
+    Ok(ThreadData {
+        root_seq: number_i64(root_seq),
+        target_seq: 0,
+        messages,
+        next_reply_offset: number_i64(from),
+        has_more,
+    })
+}
+
+fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> ChatMessage {
     let edited = message.head.rev > 0;
     let meta = if edited {
         format!("#{} · edited", message.seq)
@@ -1591,12 +1825,24 @@ fn chat_message(message: chat::MessageView) -> ChatMessage {
         reactions: message
             .reactions
             .into_iter()
-            .map(|reaction| ChatReaction {
-                emoji: reaction.emoji,
-                count: count_i64(reaction.reactors.len()),
+            .map(|reaction| {
+                let reacted_by_me = reacted_by_user(&reaction.reactors, current_user);
+                ChatReaction {
+                    emoji: reaction.emoji,
+                    count: count_i64(reaction.reactors.len()),
+                    reacted_by_me,
+                }
             })
             .collect(),
     }
+}
+
+fn reacted_by_user(reactors: &BTreeSet<AuthorRef>, current_user: Option<&[u8]>) -> bool {
+    current_user.is_some_and(|current_user| {
+        reactors
+            .iter()
+            .any(|reactor| matches!(reactor, AuthorRef::User(key) if key == current_user))
+    })
 }
 
 async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<PagesData, String> {
@@ -1864,6 +2110,45 @@ fn signing_input(encrypted: bool, password: &str, payload_hex: &str) -> Result<V
     input.extend_from_slice(payload_hex.as_bytes());
     input.push(b'\n');
     Ok(input)
+}
+
+async fn local_user_key() -> Option<Vec<u8>> {
+    // ponytail: cache the launch identity; restart the app after replacing user.key.
+    static KEY: tokio::sync::OnceCell<Option<Vec<u8>>> = tokio::sync::OnceCell::const_new();
+    KEY.get_or_init(read_local_user_key).await.clone()
+}
+
+async fn read_local_user_key() -> Option<Vec<u8>> {
+    let key = user_key_path().ok()?;
+    let mut command = tokio::process::Command::new(ducktape_binary());
+    command
+        .arg("user")
+        .arg("key")
+        .arg("status")
+        .arg("--key")
+        .arg(key)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(RPC_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 256 {
+        return None;
+    }
+    parse_user_key_status(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+fn parse_user_key_status(status: &str) -> Option<Vec<u8>> {
+    let mut fields = status.split_whitespace();
+    let kind = fields.next()?;
+    if !matches!(kind, "plaintext" | "encrypted") {
+        return None;
+    }
+    let key = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    public_key(key, "local user key").ok()
 }
 
 fn user_key_path() -> Result<PathBuf, String> {
@@ -2315,6 +2600,18 @@ mod tests {
         assert!(key_is_encrypted(&key).unwrap());
         std::fs::write(&key, "plaintext-key").unwrap();
         assert!(!key_is_encrypted(&key).unwrap());
+
+        let public_key = "ab".repeat(32);
+        assert_eq!(
+            parse_user_key_status(&format!("encrypted {public_key}\n")),
+            Some(vec![0xab; 32])
+        );
+        assert!(parse_user_key_status("absent\n").is_none());
+        assert!(parse_user_key_status("plaintext not-hex\n").is_none());
+        let reactors = BTreeSet::from([AuthorRef::User(vec![0xab; 32]), AuthorRef::System]);
+        assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
+        assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
+        assert!(!reacted_by_user(&reactors, None));
     }
 
     #[test]
@@ -2336,7 +2633,8 @@ mod tests {
             },
         )
         .unwrap();
-        let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+        let origin = format!("http://{}", sim.addr());
+        let rpc = RpcClient::new(&origin).unwrap();
         let signer = ed25519::PrivateKey::from_seed(7);
 
         submit_test(
@@ -2479,7 +2777,7 @@ mod tests {
         assert!(chat.messages[0].edited);
         assert_eq!(chat.messages[0].reply_count, 1);
         assert_eq!(chat.messages[0].reactions[0].emoji, "👍");
-        let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
+        let thread = load_thread_data(&rpc, "general", 1, 0).await.unwrap();
         assert_eq!(thread.messages.len(), 2);
         assert_eq!(thread.messages[1].body, "a threaded reply");
         let hit = load_chat_hit(origin.clone(), "general".into(), 1, 3)
@@ -2581,7 +2879,8 @@ mod tests {
             },
         )
         .unwrap();
-        let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+        let origin = format!("http://{}", sim.addr());
+        let rpc = RpcClient::new(&origin).unwrap();
         let signer = ed25519::PrivateKey::from_seed(8);
 
         submit_test(
@@ -2610,7 +2909,7 @@ mod tests {
             }),
         )
         .await;
-        for index in 0_u64..128 {
+        for index in 0_u64..257 {
             submit_test(
                 &rpc,
                 &signer,
@@ -2630,6 +2929,31 @@ mod tests {
         let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].body, "root stays visible");
+        let first = load_thread_data(&rpc, "general", 1, 0).await.unwrap();
+        assert_eq!(first.messages.len(), 257);
+        assert_eq!(first.next_reply_offset, 256);
+        assert!(first.has_more);
+        let last = load_thread_page(origin.clone(), "general".into(), 1, 256, 9)
+            .await
+            .unwrap();
+        assert_eq!(last.messages.len(), 1);
+        assert_eq!(last.messages[0].body, "reply 256");
+        assert_eq!(last.next_reply_offset, 257);
+        assert!(!last.has_more);
+        let sparse = load_thread(origin.clone(), "general".into(), 1, 258, -1, false, 10)
+            .await
+            .unwrap();
+        assert_eq!(sparse.target_seq, 258);
+        assert_eq!(sparse.next_reply_offset, -1);
+        assert_eq!(sparse.messages.len(), 2);
+        assert_eq!(sparse.messages[1].body, "reply 256");
+        let committed = load_thread(origin, "general".into(), 1, 258, -1, true, 11)
+            .await
+            .unwrap();
+        assert_eq!(committed.target_seq, 258);
+        assert_eq!(committed.messages.len(), 258);
+        assert_eq!(committed.messages[257].body, "reply 256");
+        assert!(!committed.has_more);
         sim.shutdown();
     }
 

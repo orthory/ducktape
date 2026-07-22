@@ -1,11 +1,11 @@
 extern crate::backend
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
-  ChatReaction(emoji:str, count:i64)
+  ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, reactions:[ChatReaction])
-  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage])
-  ThreadData(root_seq:i64, messages:[ChatMessage])
-  ThreadLoadData(generation:i64, root_seq:i64, messages:[ChatMessage])
+  ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
+  ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
+  ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
@@ -24,6 +24,9 @@ extern crate::backend
   retry_refresh(rpc:str, channel_id:str, page_id:str, generation:i64, attempt:i64) -> WorkspaceData ! HydrationError
   sync optimistic_message(messages:[ChatMessage], body:str) -> [ChatMessage]
   sync rollback_messages(messages:[ChatMessage], keep_pending:bool) -> [ChatMessage]
+  sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
+  sync finish_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
+  sync thread_offset_after_reply(offset:i64, has_more:bool) -> i64
   sync optimistic_block(blocks:[PageBlock], kind:str, text:str) -> [PageBlock]
   sync rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
@@ -48,11 +51,13 @@ extern crate::backend
   join_huddle(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
   send_message(rpc:str, password:str, channel_id:str, body:str) -> ChatData ! AppError
-  load_thread(rpc:str, channel_id:str, root_seq:i64, generation:i64) -> ThreadLoadData ! HydrationError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, body:str) -> ThreadData ! AppError
+  load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, committed_reply:bool, generation:i64) -> ThreadLoadData ! HydrationError
+  load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, body:str) -> ChatMessage ! AppError
   edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> ChatData ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> ChatData ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
+  remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
   load_page(rpc:str, page_id:str, selected_block_id:str) -> PagesData ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError

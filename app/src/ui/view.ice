@@ -177,11 +177,7 @@ view
                                   active bg=transparent text=muted r=7.0
                                   hovered bg=white/11 text=fg
                                   pressed bg=white/16
-                                button "👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) width=26.0 height=26.0 padding=4.0 -> add_reaction_submit("👍")
-                                  active bg=transparent text=muted r=7.0
-                                  hovered bg=white/11 text=fg
-                                  pressed bg=white/16
-                                button "♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) width=26.0 height=26.0 padding=4.0 -> add_reaction_submit("❤️")
+                                button "Reactions" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> manage_reactions
                                   active bg=transparent text=muted r=7.0
                                   hovered bg=white/11 text=fg
                                   pressed bg=white/16
@@ -198,6 +194,32 @@ view
                                   active bg=transparent text=muted r=7.0
                                   hovered bg=white/11 text=fg
                                   pressed bg=white/16
+                            if message_action == "reactions"
+                              col width=fill spacing=5.0
+                                row width=fill spacing=5.0 align=center
+                                  text "Reactions" width=fill size=11.0 @font-bold text-fg
+                                  button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("👍")
+                                    active bg=white/8 text=fg border=white/10 border-w=1.0 r=7.0
+                                    hovered bg=white/13
+                                    pressed bg=white/17
+                                  button "+ ♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("❤️")
+                                    active bg=white/8 text=fg border=white/10 border-w=1.0 r=7.0
+                                    hovered bg=white/13
+                                    pressed bg=white/17
+                                  button "Back" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 style=text -> cancel_message_action
+                                if !empty(message.reactions)
+                                  container width=fill height=84.0
+                                    scroll direction=vertical width=fill height=fill
+                                      col width=fill spacing=2.0
+                                        for reaction in message.reactions
+                                          row width=fill height=28.0 spacing=6.0 align=center
+                                            text reaction.emoji size=11.0 @text-fg
+                                            text reaction.count width=fill size=10.0 @text-muted
+                                            if reaction.reacted_by_me
+                                              button "Remove mine" label="Remove my reaction" description=reaction.emoji disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> remove_reaction_submit(reaction.emoji)
+                                                active bg=transparent text=muted r=7.0
+                                                hovered bg=white/11 text=fg
+                                                pressed bg=white/16
                             if message_action == "editing"
                               row width=fill spacing=5.0 align=center
                                 input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_message_submit width=fill padding=6.0 text-size=12.0 line-height=1.2
@@ -259,13 +281,18 @@ view
                   col width=fill spacing=1.0
                     for thread_message in thread_messages
                       ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq)
+                    if thread_has_more && thread_next_reply_offset >= 0
+                      button "Load more replies" disabled=(thread_loading || mutation_phase != "idle") width=fill height=28.0 padding=5.0 -> load_more_thread
+                        active bg=transparent text=muted r=8.0
+                        hovered bg=white/9 text=fg
+                        pressed bg=selection
                 container width=fill padding=5.0 bg=white/7 border=white/12 border-w=1.0 r=11.0
                   row width=fill spacing=5.0 align=center
-                    input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(mutation_phase != "idle" || active_channel_archived) submit=send_reply_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
+                    input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(thread_loading || mutation_phase != "idle" || active_channel_archived) submit=send_reply_submit width=fill padding=6.0 text-size=11.0 line-height=1.2
                       active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=8.0
                       focused bg=white/8 border=white/13 border-w=1.0
                       disabled value=muted
-                    button "Send" label="Send reply" disabled=(mutation_phase != "idle" || active_channel_archived || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
+                    button "Send" label="Send reply" disabled=(thread_loading || mutation_phase != "idle" || active_channel_archived || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
                       active bg=fg/88 text=bg border=white/5 border-w=1.0 r=9.0
                       hovered bg=fg/78
                       pressed bg=fg
@@ -327,7 +354,7 @@ view
                             col width=fill spacing=5.0
                               row width=fill spacing=4.0 align=center
                                 if selected_block_kind != "Page"
-                                  pick block_kinds some(selected_block_kind) placeholder="Block type" width=116.0 menu-height=210.0 padding=5.0 text-size=10.0 line-height=1.2 -> selected_block_kind_changed _
+                                  pick editable_block_kinds some(selected_block_kind) placeholder="Block type" width=116.0 menu-height=210.0 padding=5.0 text-size=10.0 line-height=1.2 -> selected_block_kind_changed _
                                     active text=fg placeholder=muted handle=muted bg=white/7 border=white/10 border-w=1.0 r=7.0
                                     hovered text=fg placeholder=muted handle=fg bg=white/11 border=white/14 border-w=1.0 r=7.0
                                     opened text=fg placeholder=muted handle=fg bg=white/13 border=white/16 border-w=1.0 r=7.0

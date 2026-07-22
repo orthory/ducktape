@@ -24,6 +24,7 @@ on clear_page_search
 
 on open_page_search_hit(page_id, block_id)
   return if loading || mutation_phase != "idle"
+  block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -42,6 +43,7 @@ on open_page_search_hit(page_id, block_id)
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
+  block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -52,6 +54,7 @@ on choose_page(id)
   selected_block_checked = false
   page_title_selected = false
   block_edit_draft = ""
+  block_autosave_status = "idle"
   page_delete_armed = false
   block_delete_armed = false
   error = ""
@@ -130,6 +133,9 @@ on clear_block_selection
 on block_text_changed(next)
   block_edit_draft = next
   return if loading || empty(selected_block_id) || selected_block_kind == "Divider"
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
   block_autosave_status = "saving"
   block_autosave_generation = block_autosave_generation + 1
   error = ""
@@ -139,6 +145,11 @@ on block_text_saved(next)
   return if next.generation != block_autosave_generation
   return if !next.written
   block_autosave_status = "saved"
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  live_dirty = false
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on block_text_save_failed(cause)
   return if cause.generation != block_autosave_generation

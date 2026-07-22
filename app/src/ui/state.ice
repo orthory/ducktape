@@ -33,6 +33,8 @@ state
   active_thread_seq:i64 = 0
   thread_target_seq:i64 = 0
   thread_messages:[ChatMessage] = []
+  thread_next_reply_offset:i64 = 0
+  thread_has_more = false
   thread_loading = false
   thread_generation:i64 = 0
   reply_draft = ""
@@ -54,6 +56,7 @@ state
   page_draft = ""
   pending_page = ""
   block_kinds = ["Text", "Page", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
+  editable_block_kinds = ["Text", "Heading 1", "Heading 2", "Heading 3", "Bullet", "Number", "Todo", "Toggle", "Quote", "Code", "Callout", "Divider"]
   new_block_kind = "Text"
   block_draft = ""
   pending_block = ""

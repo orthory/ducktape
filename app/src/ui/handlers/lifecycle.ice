@@ -40,6 +40,8 @@ on reconnect
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
   thread_generation = thread_generation + 1
   thread_loading = false
   reply_draft = ""

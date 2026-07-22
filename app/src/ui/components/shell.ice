@@ -9,7 +9,7 @@ component Brand()
 component EmptyState(title:str, detail:str)
   container width=fill height=fill align-x=center align-y=center
     col spacing=6.0 align=center
-      text title size=15.0 @font-bold text-fg
+      text title size=15.0 font=ui @text-fg
       text detail size=12.0 @text-muted
 
 component WorkspaceTabs(status:str, loading:bool)

@@ -179,6 +179,8 @@ mod tests {
             active_thread_seq: 0,
             thread_target_seq: 0,
             thread_messages: Vec::new(),
+            thread_next_reply_offset: 0,
+            thread_has_more: false,
         }));
         assert_eq!(app.message_draft, "second");
         assert_eq!(app.mutation_phase, "idle");
@@ -196,6 +198,9 @@ mod tests {
         assert_eq!(app.message_action, "editing");
         let _ = app.__update(__DucktapeMessage::CancelMessageAction);
         assert_eq!(app.message_action, "toolbar");
+        let _ = app.__update(__DucktapeMessage::ManageReactions);
+        assert_eq!(app.message_action, "reactions");
+        let _ = app.__update(__DucktapeMessage::CancelMessageAction);
         let _ = app.__update(__DucktapeMessage::ArmMessageDelete);
         assert_eq!(app.message_action, "delete");
     }
@@ -221,9 +226,84 @@ mod tests {
         let _ = app.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
             generation: 4,
             root_seq: 1,
+            target_seq: 0,
             messages: Vec::new(),
+            next_reply_offset: 0,
+            has_more: false,
         }));
         assert_eq!(app.active_thread_seq, 0);
+    }
+
+    #[test]
+    fn thread_pages_and_new_replies_preserve_loaded_messages() {
+        let message = |seq: i64, thread_seq: i64, body: &str| backend::ChatMessage {
+            id: format!("message-{seq}"),
+            seq,
+            author: "user".into(),
+            meta: format!("#{seq}"),
+            body: body.into(),
+            pending: false,
+            rev: 0,
+            edited: false,
+            deleted: false,
+            reply_count: 0,
+            thread_seq,
+            reactions: Vec::new(),
+        };
+        let (mut app, _) = Ducktape::__boot();
+        app.active_thread_seq = 1;
+        app.thread_generation = 7;
+        app.thread_loading = true;
+        app.thread_messages = vec![message(1, 0, "root"), message(2, 1, "first")];
+
+        let _ = app.__update(__DucktapeMessage::ThreadPageLoaded(
+            backend::ThreadPageData {
+                generation: 7,
+                messages: vec![message(3, 1, "second")],
+                next_reply_offset: 2,
+                has_more: false,
+            },
+        ));
+        assert_eq!(app.thread_messages.len(), 3);
+        assert_eq!(app.thread_messages[1].body, "first");
+        assert_eq!(app.thread_next_reply_offset, 2);
+
+        app.thread_messages = backend::optimistic_message(app.thread_messages, "third".into());
+        app.pending_reply = "third".into();
+        app.mutation_phase = "reply".into();
+        let _ = app.__update(__DucktapeMessage::ThreadMutated(message(4, 1, "third")));
+        assert_eq!(app.thread_messages.len(), 4);
+        assert_eq!(app.thread_messages[1].body, "first");
+        assert_eq!(app.thread_messages[3].body, "third");
+        assert!(!app.thread_messages.iter().any(|message| message.pending));
+        assert_eq!(app.thread_next_reply_offset, 3);
+
+        let (mut partial, _) = Ducktape::__boot();
+        partial.active_thread_seq = 1;
+        partial.thread_next_reply_offset = 256;
+        partial.thread_has_more = true;
+        partial.thread_messages =
+            backend::optimistic_message(vec![message(1, 0, "root")], "new tail".into());
+        partial.mutation_phase = "reply".into();
+        let _ = partial.__update(__DucktapeMessage::ThreadMutated(message(
+            300, 1, "new tail",
+        )));
+        assert_eq!(partial.thread_next_reply_offset, 256);
+
+        partial.thread_generation = 8;
+        partial.thread_loading = true;
+        let _ = partial.__update(__DucktapeMessage::ThreadPageLoaded(
+            backend::ThreadPageData {
+                generation: 8,
+                messages: vec![message(257, 1, "unseen"), message(300, 1, "new tail")],
+                next_reply_offset: 258,
+                has_more: false,
+            },
+        ));
+        assert_eq!(partial.thread_next_reply_offset, 258);
+        assert_eq!(partial.thread_messages.len(), 3);
+        assert_eq!(partial.thread_messages[1].body, "unseen");
+        assert_eq!(partial.thread_messages[2].body, "new tail");
     }
 
     #[test]
@@ -311,6 +391,95 @@ mod tests {
         assert_eq!(app.selected_block_kind, "Todo");
         assert_eq!(app.block_edit_draft, "Canonical text");
         assert!(app.selected_block_checked);
+    }
+
+    #[test]
+    fn page_blocks_can_be_created_but_not_converted_to_subpages() {
+        let (app, _) = Ducktape::__boot();
+        assert!(app.block_kinds.iter().any(|kind| kind == "Page"));
+        assert!(!app.editable_block_kinds.iter().any(|kind| kind == "Page"));
+    }
+
+    #[test]
+    fn page_navigation_ignores_the_previous_block_autosave_callback() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.active_page = "old-page".into();
+        app.block_autosave_generation = 4;
+
+        let _ = app.__update(__DucktapeMessage::ChoosePage("next-page".into()));
+        let navigation_generation = app.hydration_generation;
+        assert_eq!(app.block_autosave_generation, 5);
+
+        let _ = app.__update(__DucktapeMessage::BlockTextSaved(backend::AutosaveResult {
+            generation: 4,
+            written: true,
+        }));
+        assert_eq!(app.hydration_generation, navigation_generation);
+        assert_eq!(app.sync_phase, "idle");
+        assert!(app.loading);
+    }
+
+    #[test]
+    fn block_edits_invalidate_an_older_workspace_refresh() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.connected_rpc = "http://node".into();
+        app.selected_block_id = "block-1".into();
+        app.selected_block_kind = "Text".into();
+        app.block_edit_draft = "old".into();
+        app.hydration_generation = 3;
+        app.sync_phase = "refreshing".into();
+
+        let _ = app.__update(__DucktapeMessage::BlockTextChanged("new".into()));
+        assert_eq!(app.hydration_generation, 4);
+        assert_eq!(app.sync_phase, "idle");
+
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "changed".into(),
+            status: "Live".into(),
+            height: 1,
+        }));
+        assert_eq!(app.hydration_generation, 5);
+        assert_eq!(app.sync_phase, "refreshing");
+        let _ = app.__update(__DucktapeMessage::BlockTextSaved(backend::AutosaveResult {
+            generation: app.block_autosave_generation,
+            written: true,
+        }));
+        assert_eq!(app.hydration_generation, 6);
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
+            backend::WorkspaceData {
+                generation: 5,
+                rpc: "http://node".into(),
+                status: "stale".into(),
+                height: 1,
+                channels: Vec::new(),
+                messages: Vec::new(),
+                active_channel: String::new(),
+                active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                pages: Vec::new(),
+                blocks: vec![backend::PageBlock {
+                    id: "block-1".into(),
+                    parent: "page".into(),
+                    kind: "Text".into(),
+                    text: "old".into(),
+                    pending: false,
+                    checked: false,
+                    prefix: String::new(),
+                    child_count: 0,
+                    mark_count: 0,
+                }],
+                active_page: "page".into(),
+                active_page_title: "Page".into(),
+                active_page_parent: String::new(),
+            },
+        ));
+        assert_eq!(app.block_edit_draft, "new");
     }
 
     #[test]
@@ -429,6 +598,24 @@ mod tests {
         assert!(app.thread_messages.is_empty());
         assert_eq!(app.mutation_phase, "recovering");
         assert!(app.thread_loading);
+    }
+
+    #[test]
+    fn committed_thread_reply_survives_a_failed_recovery_read() {
+        let (mut app, _) = Ducktape::__boot();
+        app.thread_generation = 4;
+        app.thread_loading = true;
+        app.mutation_phase = "recovering".into();
+        app.thread_messages = backend::optimistic_message(Vec::new(), "committed reply".into());
+
+        let _ = app.__update(__DucktapeMessage::ThreadFailed(backend::HydrationError {
+            generation: 4,
+            message: "read failed after commit".into(),
+        }));
+
+        assert!(!app.thread_loading);
+        assert_eq!(app.thread_messages.len(), 1);
+        assert!(app.thread_messages[0].pending);
     }
 
     #[test]

@@ -39,6 +39,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
   thread_generation = thread_generation + 1
   thread_loading = false
   reply_draft = ""
@@ -63,6 +65,8 @@ on choose_channel(id)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
   thread_generation = thread_generation + 1
   thread_loading = false
   reply_draft = ""
@@ -177,6 +181,8 @@ on chat_updated(next)
   active_thread_seq = next.active_thread_seq
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
+  thread_next_reply_offset = next.thread_next_reply_offset
+  thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
   thread_loading = false
   loading = false
@@ -205,6 +211,8 @@ on chat_mutated(next)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
   thread_generation = thread_generation + 1
   thread_loading = false
   reply_draft = ""
@@ -226,6 +234,8 @@ on select_message(seq, body, rev)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
   reply_draft = ""
   pending_reply = ""
   selected_message_seq = seq
@@ -236,6 +246,10 @@ on select_message(seq, body, rev)
 on begin_message_edit
   return if selected_message_seq <= 0 || mutation_phase != "idle"
   message_action = "editing"
+
+on manage_reactions
+  return if selected_message_seq <= 0 || mutation_phase != "idle"
+  message_action = "reactions"
 
 on arm_message_delete
   return if selected_message_seq <= 0 || mutation_phase != "idle"
@@ -256,16 +270,20 @@ on open_thread
   thread_generation = thread_generation + 1
   thread_loading = true
   thread_target_seq = 0
+  thread_next_reply_offset = 0
+  thread_has_more = false
   reply_draft = ""
   pending_reply = ""
   error = ""
-  run load_thread(connected_rpc, active_channel, selected_message_seq, thread_generation) -> thread_loaded _ | thread_failed _
+  run load_thread(connected_rpc, active_channel, selected_message_seq, 0, 0, false, thread_generation) -> thread_loaded _ | thread_failed _
 
 on thread_loaded(next)
   return if next.generation != thread_generation || !thread_loading
   active_thread_seq = next.root_seq
-  thread_target_seq = 0
+  thread_target_seq = next.target_seq
   thread_messages = next.messages
+  thread_next_reply_offset = next.next_reply_offset
+  thread_has_more = next.has_more
   thread_loading = false
   error = ""
   return if !live_dirty
@@ -274,10 +292,30 @@ on thread_loaded(next)
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
+on load_more_thread
+  return if thread_loading || mutation_phase != "idle" || active_thread_seq <= 0 || thread_next_reply_offset < 0 || !thread_has_more
+  thread_generation = thread_generation + 1
+  thread_loading = true
+  error = ""
+  run load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_offset, thread_generation) -> thread_page_loaded _ | thread_page_failed _
+
+on thread_page_loaded(next)
+  return if next.generation != thread_generation || !thread_loading
+  thread_messages = append_thread_page(thread_messages, next.messages)
+  thread_next_reply_offset = next.next_reply_offset
+  thread_has_more = next.has_more
+  thread_loading = false
+  error = ""
+
+on thread_page_failed(cause)
+  return if cause.generation != thread_generation || !thread_loading
+  thread_loading = false
+  error = cause.message
+
 on thread_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
   thread_loading = false
-  thread_messages = rollback_messages(thread_messages, false)
+  thread_messages = rollback_messages(thread_messages, mutation_phase == "recovering")
   error = cause.message
   return if !live_dirty
   live_dirty = false
@@ -290,6 +328,8 @@ on close_thread
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
   thread_loading = false
   reply_draft = ""
   pending_reply = ""
@@ -321,8 +361,17 @@ on add_reaction_submit(emoji)
   error = ""
   run add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_mutated _ | mutation_failed _
 
+on remove_reaction_submit(emoji)
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "reaction"
+  error = ""
+  run remove_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_mutated _ | mutation_failed _
+
 on send_reply_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
+  return if loading || thread_loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -343,12 +392,12 @@ on reply_mutation_failed(cause)
   live_dirty = true
   thread_generation = thread_generation + 1
   thread_loading = true
-  run load_thread(connected_rpc, active_channel, active_thread_seq, thread_generation) -> thread_loaded _ | thread_failed _
+  run load_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, cause.committed, thread_generation) -> thread_loaded _ | thread_failed _
 
 on thread_mutated(next)
-  active_thread_seq = next.root_seq
   thread_target_seq = 0
-  thread_messages = next.messages
+  thread_messages = finish_thread_reply(thread_messages, next)
+  thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more)
   pending_reply = ""
   mutation_phase = "idle"
   live_dirty = false
