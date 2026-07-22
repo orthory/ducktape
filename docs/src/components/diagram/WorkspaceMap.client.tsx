@@ -17,7 +17,7 @@ const nodes: SemanticNode[] = [
   { id: 'bin-fs', label: 'bin/fs', sub: 'duckfs CLI + FUSE', category: 'bin' },
   // kernel
   { id: 'sdk', label: 'sdk', sub: 'module contract', category: 'kernel' },
-  { id: 'host', label: 'host', sub: 'dispatch + app-hash + worker seam', category: 'kernel' },
+  { id: 'host', label: 'host', sub: 'dispatch + root-hash + worker seam', category: 'kernel' },
   { id: 'node', label: 'node', sub: 'ordered path', category: 'kernel' },
   { id: 'consensus', label: 'consensus', sub: 'Simplex orderer', category: 'kernel' },
   { id: 'statesync', label: 'statesync + recovery', sub: 'rebuild + durability', category: 'kernel' },
@@ -62,7 +62,7 @@ export function WorkspaceMap({ height = 620 }: { height?: number }) {
   return (
     <GraphFlow
       title="Cargo workspace by layer"
-      description="Every product and system module depends only on sdk (and the types-only interface crates it addresses). The kernel wires the consensus → node → host path, and host composes the global app-hash; bins compose it into runnable processes."
+      description="Every product and system module depends only on sdk (and the types-only interface crates it addresses). The kernel wires the consensus → node → host path, and host composes the global root-hash; bins compose it into runnable processes."
       nodes={nodes}
       edges={edges}
       legend={legend}

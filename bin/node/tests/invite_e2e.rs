@@ -60,7 +60,7 @@ fn solo_founder_invites_a_friend() {
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
-    cluster.wait_marker(0, "converged app_hash=", CONVERGE);
+    cluster.wait_marker(0, "converged root_hash=", CONVERGE);
 
     // the friend starts an out-of-mesh node: it must PARK (the founder's
     // tracked set does not contain this key), not sync and not crash.
@@ -92,9 +92,9 @@ fn solo_founder_invites_a_friend() {
     // the parked node notices its admission, syncs the boundary, fabricates
     // its recovery checkpoint, and reboots into the restore path.
     cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
+    cluster.wait_marker(joiner, "recovered root_hash=", CONVERGE);
 
     // THE property: consensus is live again, and only because the friend
     // votes — a 2-validator simplex finalizes nothing without both. an op
@@ -113,11 +113,11 @@ fn solo_founder_invites_a_friend() {
     });
     assert_eq!(value, "hi back");
 
-    // no fork: identical status app-hashes once both sides quiesce.
+    // no fork: identical status root-hashes once both sides quiesce.
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
-        cluster.status(0)["app_hash"],
-        cluster.status(joiner)["app_hash"],
+        cluster.status(0)["root_hash"],
+        cluster.status(joiner)["root_hash"],
         "founder and promoted friend disagree on state"
     );
 }
@@ -133,7 +133,7 @@ fn live_quorum_admits_a_fourth_validator() {
     cluster.spawn(1);
     cluster.spawn(2);
     for i in 0..3 {
-        cluster.wait_marker(i, "converged app_hash=", CONVERGE);
+        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
     }
 
     let joiner = cluster.spawn_joiner(3);
@@ -172,9 +172,9 @@ fn live_quorum_admits_a_fourth_validator() {
     }
 
     cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
+    cluster.wait_marker(joiner, "recovered root_hash=", CONVERGE);
 
     // the promoted validator's own op finalizes and reads on an incumbent —
     // its frame bytes start out ONLY in its store, so this proves the joiner
@@ -190,8 +190,8 @@ fn live_quorum_admits_a_fourth_validator() {
     // and it holds the full replicated state (no fork after quiesce).
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
-        cluster.status(0)["app_hash"],
-        cluster.status(joiner)["app_hash"],
+        cluster.status(0)["root_hash"],
+        cluster.status(joiner)["root_hash"],
         "incumbent and promoted validator disagree on state"
     );
 }

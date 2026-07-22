@@ -1,13 +1,13 @@
 //! the batch-apply API: [`Host::submit_block`] applies a batch of ops as ONE
 //! block with per-op isolation, a SINGLE commit boundary, and ONE post-batch
-//! app-hash shared by every applied member. four properties:
+//! root-hash shared by every applied member. four properties:
 //!
 //! 1. per-op isolation: a batch `[A, <reject>, C]` applies A and C and rejects
 //!    the middle op, landing committed state byte-identical to applying A then C
-//!    in isolation, under ONE shared post-batch app-hash;
-//! 2. an all-reject batch commits nothing — app-hash unchanged from pre-batch;
-//! 3. a batch-of-one equals `submit_at` of that op (same app-hash + roots);
-//! 4. an empty batch is an empty block — app-hash unchanged when nothing pending.
+//!    in isolation, under ONE shared post-batch root-hash;
+//! 2. an all-reject batch commits nothing — root-hash unchanged from pre-batch;
+//! 3. a batch-of-one equals `submit_at` of that op (same root-hash + roots);
+//! 4. an empty batch is an empty block — root-hash unchanged when nothing pending.
 //!
 //! the `directory` module is an in-memory, content-addressed, staging module
 //! (stage on `execute`, merge on `commit_block`, discard on `abort_block`), so a
@@ -51,7 +51,7 @@ fn host() -> Host {
 
 // (1) a middle op that rejects deterministically leaves the committed state
 // identical to applying only the surviving ops, in order, in isolation — under
-// exactly one shared post-batch app-hash.
+// exactly one shared post-batch root-hash.
 #[test]
 fn submit_block_per_op_isolation() {
     block_on(async {
@@ -100,27 +100,27 @@ fn submit_block_per_op_isolation() {
             reference.module_root(DIR).unwrap(),
             "batch directory root must equal applying a then b in isolation"
         );
-        // exactly one post-batch app-hash, equal to the reference's, recompute-stable.
+        // exactly one post-batch root-hash, equal to the reference's, recompute-stable.
         assert_eq!(
-            out.app_hash, ref_out.app_hash,
-            "the one batch app-hash equals the reference app-hash"
+            out.root_hash, ref_out.root_hash,
+            "the one batch root-hash equals the reference root-hash"
         );
-        assert_eq!(batch.app_hash(), reference.app_hash());
+        assert_eq!(batch.root_hash(), reference.root_hash());
         assert_eq!(
-            out.app_hash,
-            batch.app_hash(),
-            "the returned app-hash is recompute-stable"
+            out.root_hash,
+            batch.root_hash(),
+            "the returned root-hash is recompute-stable"
         );
     });
 }
 
 // (2) an all-reject batch commits nothing — every member rejects and the
-// app-hash is byte-identical to pre-batch.
+// root-hash is byte-identical to pre-batch.
 #[test]
 fn submit_block_all_reject() {
     block_on(async {
         let mut host = host();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let out = host
             .submit_block(
@@ -138,14 +138,14 @@ fn submit_block_all_reject() {
             "every member rejected"
         );
         assert_eq!(
-            out.app_hash, app0,
-            "no member applied — app-hash unchanged from pre-batch"
+            out.root_hash, app0,
+            "no member applied — root-hash unchanged from pre-batch"
         );
-        assert_eq!(host.app_hash(), app0);
+        assert_eq!(host.root_hash(), app0);
     });
 }
 
-// (3) the batch-of-one path equals the single-op path: same app-hash and same
+// (3) the batch-of-one path equals the single-op path: same root-hash and same
 // committed roots as `submit_at` of that op.
 #[test]
 fn submit_block_single_matches_submit_at() {
@@ -165,25 +165,25 @@ fn submit_block_single_matches_submit_at() {
             .expect("single op applies");
 
         assert_eq!(
-            out.app_hash, single_out.app_hash,
-            "batch-of-one app-hash == submit_at app-hash"
+            out.root_hash, single_out.root_hash,
+            "batch-of-one root-hash == submit_at root-hash"
         );
         assert_eq!(
             batch.module_root(DIR).unwrap(),
             single.module_root(DIR).unwrap(),
             "batch-of-one committed root == submit_at committed root"
         );
-        assert_eq!(batch.app_hash(), single.app_hash());
+        assert_eq!(batch.root_hash(), single.root_hash());
     });
 }
 
 // (4) an empty batch is an empty block: no members, and with nothing pending to
-// inject the app-hash is unchanged.
+// inject the root-hash is unchanged.
 #[test]
 fn submit_block_empty_is_empty_block() {
     block_on(async {
         let mut host = host();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let out = host
             .submit_block(BlockContext::default(), vec![])
@@ -197,9 +197,9 @@ fn submit_block_empty_is_empty_block() {
             "no upgrade/dispatch modules -> nothing injected"
         );
         assert_eq!(
-            out.app_hash, app0,
-            "no ops, no injections — app-hash unchanged (an empty block)"
+            out.root_hash, app0,
+            "no ops, no injections — root-hash unchanged (an empty block)"
         );
-        assert_eq!(host.app_hash(), app0);
+        assert_eq!(host.root_hash(), app0);
     });
 }

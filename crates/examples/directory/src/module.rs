@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 pub struct Directory {
     id: ModuleId,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     entries: BTreeMap<String, String>,
     /// writes staged during the current block: read ahead of `entries` (read-
     /// your-writes) but merged in — and reflected in `root()` — only when the

@@ -11,7 +11,7 @@
 //!
 //! ## Why chat, and why no new module
 //!
-//! A new consensus module changes the genesis app-hash — a flag day that kills
+//! A new consensus module changes the genesis root-hash — a flag day that kills
 //! every existing network. So we reuse the CHAT module, already in genesis and
 //! already an ordered, origin-signed, durable per-channel append log: a shared
 //! session's command lane IS a dedicated chat channel, a submitted command IS a

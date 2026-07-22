@@ -93,7 +93,7 @@ demo composes `demo`. `MODULE_IDS`, `BASE_MODULE_IDS`, `VALSET_MODULE_IDS`
 become derivations; `genesis_registry_matches_module_ids` derives from
 topology; NO `[&str; N]` count annotation survives.
 **Steps:** topology + derivation tests first (production set == today's 20;
-sim_base == today's 14; demo set == today's); swap the four sites; app-hash
+sim_base == today's 14; demo set == today's); swap the four sites; root-hash
 of a default simnode genesis must be byte-identical before/after (assert in
 test). Gates: `-p node-bin -p simnode -p demo` clippy/test + node-bin unit
 lane. Open stacked PR.

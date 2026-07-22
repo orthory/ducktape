@@ -165,7 +165,7 @@ fn joiner_rebuilds_kv_through_the_real_overlay_arm() {
         host.submit(set(b"motd", b"final")).await.expect("op 3");
         let finalized = FinalizedBlock {
             height: 3,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
         let src_kv_root = host.module_root("kv").expect("kv registered");
         let coords = statesync::BoundaryCoords {
@@ -198,7 +198,7 @@ fn joiner_rebuilds_kv_through_the_real_overlay_arm() {
         let join = async move {
             let manifest = fetch_manifest(&client).await.expect("manifest fetch");
             assert_eq!(manifest.height, 3, "manifest reports the served height");
-            assert_eq!(manifest.app_hash, finalized.app_hash);
+            assert_eq!(manifest.root_hash, finalized.root_hash);
             let kv_entry = manifest.entry("kv").expect("kv in manifest");
             assert_eq!(kv_entry.kind, PayloadKind::Resolver);
             assert_eq!(kv_entry.root, src_kv_root);

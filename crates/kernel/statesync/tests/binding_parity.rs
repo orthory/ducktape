@@ -46,7 +46,7 @@ use statesync::{
 fn boundary() -> BoundaryId {
     BoundaryId {
         height: 42,
-        app_hash: StateRoot([9u8; 32]),
+        root_hash: StateRoot([9u8; 32]),
     }
 }
 
@@ -132,7 +132,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
     match req {
         SyncRequest::Manifest => SyncResponse::Manifest(Manifest {
             height: 42,
-            app_hash: StateRoot([9u8; 32]),
+            root_hash: StateRoot([9u8; 32]),
             epoch: 3,
             view_base: 40,
             participants: vec![vec![1u8; 32]],
@@ -166,7 +166,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 frame: vec![*after_height as u8; 3],
                 disposition: FrameDisposition::Applied,
                 roots: vec![("kv".into(), StateRoot([5u8; 32]))],
-                app_hash: StateRoot([6u8; 32]),
+                root_hash: StateRoot([6u8; 32]),
             }],
         },
         SyncRequest::IndexModules { .. } => SyncResponse::IndexModules {
@@ -178,7 +178,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
         },
         SyncRequest::TipCoords => SyncResponse::TipCoords(TipCoords {
             height: 100,
-            app_hash: StateRoot([7u8; 32]),
+            root_hash: StateRoot([7u8; 32]),
             epoch: 2,
             view_base: 90,
             participants: vec![vec![9u8; 32]],

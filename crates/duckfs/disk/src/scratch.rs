@@ -16,7 +16,7 @@
 //!   and a retry never refetches what a failed attempt already landed.
 //! - [`SyncScratch::promote`] is the ONLY road into the canonical dir, and it
 //!   is verify-then-replace: the scratch refs envelope is checksum-loaded and
-//!   re-hashed against the caller's expected (app-hash-verified) root, the
+//!   re-hashed against the caller's expected (root-hash-verified) root, the
 //!   objects are published durably into the canonical odb FIRST (link-or-copy,
 //!   touched-dir fsync — `commit_block`'s ordering contract), and only then is
 //!   the canonical refs file atomically replaced at the scratch's sync-target
@@ -97,7 +97,7 @@ impl SyncScratch {
     }
 
     /// verify-then-replace promotion into the canonical dir — call ONLY after
-    /// the join's composite app-hash gate has passed, with the files root that
+    /// the join's composite root-hash gate has passed, with the files root that
     /// gate certified. ordering mirrors `commit_block`'s durability contract:
     ///
     /// 1. checksum-load the scratch refs and re-hash against `expected_root` —

@@ -102,7 +102,7 @@ In `crates/system/governance/src/lib.rs handle_redeem`:
 `governance-wasm/component.wasm` via `include_bytes!` — without
 `make wasm-modules` the consensus change is inert and `wasm-modules-check`
 (in `make test`) pins the drift. Refreshed component bytes are committed
-with the source. App-hash flag day: pre-existing networks must re-seed
+with the source. Root-hash flag day: pre-existing networks must re-seed
 (accepted, standard).
 
 ## 3. Node: mint + guards (the lobby gate does NOT change)

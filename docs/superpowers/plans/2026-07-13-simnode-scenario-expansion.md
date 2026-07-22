@@ -80,7 +80,7 @@ should bound sweep_huddle staleness (product question).
   actions Threshold{ceil(2n/3)}; `MAX_ACTIONS_PER_SESSION=32`; KvMsg has NO
   delete op (empty Set ≠ absence).
 - **NEW ideas (batch E/F)**: (1) a batch-vs-singles conformance test
-  asserting the app-hash gap is entirely the qmdb commit-boundary merkle's —
+  asserting the root-hash gap is entirely the qmdb commit-boundary merkle's —
   catches a module accidentally authenticating block structure; (2)
   `--node-key` + `--with-valset` combo naming the seeded key in the roster →
   huddle-membership consensus scenarios; (3) gateway registry over the wire:
@@ -125,7 +125,7 @@ registry with scripted ordering (hold/step, peer-block, logical clock) — so
 cross-module integration and the reactor itself are e2e-testable *only* here.
 The host IS the reactor: `crates/kernel/host/src/lib.rs` — routes a Msg to its
 module, drains emitted follow-ups FIFO under `MAX_DISPATCHES = 1024`, aborts
-the WHOLE block on any module error (P2 atomicity), recomposes the app-hash.
+the WHOLE block on any module error (P2 atomicity), recomposes the root-hash.
 
 Priority key: (a) past-incident trap, (b) unreachable by any other lane,
 (c) security/data-loss semantics.
@@ -152,7 +152,7 @@ These pin the HOST's cross-module machinery, not any one module. All core-lane
    id-squatting note (item C3) is the concrete instance: pre-post the rule's
    composed message id, then the triggering post's ENTIRE block aborts.
    Assert: post rejected, message absent from chat, run-history absent, tasks
-   absent, app-hash unchanged.
+   absent, root-hash unchanged.
 3. **Oracle drain discipline** (partially covered by the TS echo-oracle
    tests): multiple queued oracle follow-ups drain ONE per step as their own
    blocks (`kind: "oracle"`), never coalesce, and survive interleaved peer
@@ -161,14 +161,14 @@ These pin the HOST's cross-module machinery, not any one module. All core-lane
 4. **Saga wedge cap.** Batch-6 refactor added a "saga-wedge cap"
    (`crates/system/saga`) — find the cap, compose a wedged saga over the
    wire, pin the rejection. (Nobody has ever exercised it e2e.)
-5. **Whole-registry determinism sweep.** Extend `same_script_same_app_hash`
+5. **Whole-registry determinism sweep.** Extend `same_script_same_root_hash`
    from chat+tasks to a script touching ALL 16 registered modules — the cheap
    standing insurance against nondeterminism (HashMap iteration, wall-clock
    reads) creeping into any module. Also run the same script through auto vs
    stepped (the existing two-path test only covers 3 modules).
 6. **Sim restart/resume.** "the height resumes above the index watermark" is
    sim-only code with zero tests: run a script, kill, respawn on the SAME
-   storage dir, assert height continuity + app-hash stability + module state
+   storage dir, assert height continuity + root-hash stability + module state
    survives (per-module `install`/statesync handles get exercised through the
    real boot path).
 7. **Scoped hydration map correctness (TS).** `refreshScoped` refetches only

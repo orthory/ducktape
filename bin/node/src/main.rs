@@ -36,13 +36,13 @@
 //! `--sync-only` and the process joins the mesh WITHOUT a consensus engine,
 //! pulls a manifest + every module from the bootstrapper over that channel,
 //! rebuilds them against their consensus-committed roots, prints its composed
-//! `synced app_hash=`, and exits 0 — the network-backed joiner path over real
+//! `synced root_hash=`, and exits 0 — the network-backed joiner path over real
 //! sockets. membership note: `peer_seeds` is the AUTHORIZED MESH (everyone,
 //! including sync-only joiners); `validator_seeds` (default: peer_seeds) is the
 //! CONSENSUS participant set — the split that lets a non-validator sync.
 //!
-//! each validator prints its GENESIS app-hash at startup and its CONVERGED
-//! app-hash once it has applied ALL validator ops. the demo script asserts every
+//! each validator prints its GENESIS root-hash at startup and its CONVERGED
+//! root-hash once it has applied ALL validator ops. the demo script asserts every
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 

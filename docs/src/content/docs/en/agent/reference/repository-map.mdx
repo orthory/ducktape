@@ -18,13 +18,13 @@ lists what is checked in and tested.
 - `crates/kernel/sdk`: module contract, deterministic system API, and the
   shared snapshot codec (`sdk::codec`).
 - `crates/kernel/host`: registry, dispatch, follow-up drain, commit/abort,
-  global app-hash composition, and the worker seam (`host::worker`).
+  global root-hash composition, and the worker seam (`host::worker`).
 - `crates/kernel/node`: loopback and ordered node seams.
 - `crates/kernel/consensus`: Simplex orderer, content store, relay, inbox,
   resolver fetch, scheme boundaries.
 - `crates/kernel/statesync`: state-sync wire protocol and p2p binding.
 - `crates/kernel/recovery`: op journal, checkpoints, boot-time replay.
-- `crates/kernel/indexer`: derived node-local read index; never in the app-hash.
+- `crates/kernel/indexer`: derived node-local read index; never in the root-hash.
 - `crates/system/capability-host`: machine-local executor providers.
 
 ## System

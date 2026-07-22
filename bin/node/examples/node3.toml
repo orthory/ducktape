@@ -2,7 +2,7 @@
 # (until governance admits its key and the validators cut over to epoch 1).
 # run with `--sync-only`: it pulls a manifest + every module from node 0 over
 # the statesync channel, rebuilds them against their committed roots, prints
-# `synced app_hash=`, and exits.
+# `synced root_hash=`, and exits.
 id = 3
 listen = "127.0.0.1:52203"
 namespace = "ducktape-demo"

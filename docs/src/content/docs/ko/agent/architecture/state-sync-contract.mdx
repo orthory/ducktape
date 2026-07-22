@@ -33,6 +33,6 @@ snapshot이 local root를 부분적으로 advance하면 안 된다.
 ## Proof Surface
 
 `cargo test -p demo --test network_joiner_full`은 state-sync wire protocol만으로
-module rebuild와 global app-hash composition을 증명한다. `cargo test -p node-bin
+module rebuild와 global root-hash composition을 증명한다. `cargo test -p node-bin
 --test cluster_e2e`, `cargo test -p node-bin --test invite_e2e`는 running node
 위에서도 같은 boundary를 증명한다.

@@ -211,7 +211,7 @@ mod tests {
                         frame: vec![],
                         disposition: statesync::FrameDisposition::Applied,
                         roots: vec![],
-                        app_hash: sdk::StateRoot([0u8; 32]),
+                        root_hash: sdk::StateRoot([0u8; 32]),
                     }],
                 },
                 1024,

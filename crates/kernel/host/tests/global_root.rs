@@ -1,4 +1,4 @@
-//! the app-hash composition contract (moved here with `global_root` when the
+//! the root-hash composition contract (moved here with `global_root` when the
 //! `state` crate merged into host): order-independent, id-boundary-unambiguous,
 //! sensitive to every module root.
 

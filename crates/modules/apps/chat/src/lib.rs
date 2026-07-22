@@ -32,7 +32,7 @@ pub use interface::*;
 #[cfg(feature = "guest")]
 mod guest;
 // everything below is OFF-consensus and native-only: none of it touches qmdb
-// or the app-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
+// or the root-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
 // cannot cross into the wasm guest — so the consensus state machine
 // above compiles for wasm32 without them.
 //
@@ -40,7 +40,7 @@ mod guest;
 #[cfg(feature = "native")]
 pub mod index;
 // the real-time voice media engine (Opus over the data plane's datagram
-// class). Off-consensus: it touches no qmdb and no app-hash — the chat
+// class). Off-consensus: it touches no qmdb and no root-hash — the chat
 // module's consensus state (channels, membership) is what will drive its
 // admission and channel→flow derivation. Kept as a self-contained submodule.
 #[cfg(feature = "native")]

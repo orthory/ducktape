@@ -22,7 +22,7 @@ covers rendezvous.
 - **Network state sync.** A running validator serves the state-sync wire
   protocol (manifest, chunked snapshots, live qmdb op-range serving via
   `serve_sync`); a joiner rebuilds every module over it and composes the source
-  app-hash. Snapshot serving is the finalized-boundary capture cache.
+  root-hash. Snapshot serving is the finalized-boundary capture cache.
 - **Dynamic valset orchestration.** The `ValsetOrchestrator` watches finalized
   valset state, schedules a deterministic cutover, respawns the engine over the
   new participant set, and rotates channels — all driven by governance-admitted
@@ -43,7 +43,7 @@ covers rendezvous.
 
 - ~~Restart/recovery from persisted state~~ — shipped: a write-ahead op journal
   plus periodic checkpoints of the in-memory modules recover the composed
-  app-hash on boot, and the engine respawns at its persisted epoch over its
+  root-hash on boot, and the engine respawns at its persisted epoch over its
   existing journal partition behind a persisted finalization floor (no
   double-apply, no double-vote). Remaining edge: a pre-recovery storage dir
   (state without a checkpoint) fails loudly instead of migrating.

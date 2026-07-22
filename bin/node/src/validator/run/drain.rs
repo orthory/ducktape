@@ -240,7 +240,7 @@ impl ValidatorRuntime<'_> {
                 let outcome = match d.disposition {
                     node::Disposition::Applied => relay::RelayOutcome::Applied {
                         height: d.height,
-                        app_hash: hex(&d.app_hash),
+                        root_hash: hex(&d.root_hash),
                     },
                     node::Disposition::Rejected => relay::RelayOutcome::Rejected {
                         // carry the module's VERBATIM reason (node-
@@ -300,7 +300,7 @@ impl ValidatorRuntime<'_> {
                     // the PER-BLOCK boundary this frame settled at
                     // (not the end-of-drain hash — a drain can
                     // apply several blocks).
-                    app_hash: hex(&d.app_hash),
+                    root_hash: hex(&d.root_hash),
                 }),
                 node::Disposition::Rejected => Err(d.reason.clone().unwrap_or_else(|| {
                     // the module's VERBATIM reason when the drain
@@ -395,7 +395,7 @@ impl ValidatorRuntime<'_> {
         if let Some(f) = node.finalized()
             && *last_published != Some(f.height)
         {
-            stream_hub.publish_block(f.height, hex(&f.app_hash));
+            stream_hub.publish_block(f.height, hex(&f.root_hash));
             *last_published = Some(f.height);
         }
 
@@ -805,10 +805,10 @@ impl ValidatorRuntime<'_> {
         }
         notes.finish();
         if dev_demo && !*converged && *applied >= expected {
-            let h = node.app_hash();
+            let h = node.root_hash();
             tracing::info!(
                 target: "ducktape::consensus",
-                "node={label} converged app_hash={}", hex(&h)
+                "node={label} converged root_hash={}", hex(&h)
             );
             // dump every directory key so the demo can eyeball the ops
             // (each node ends holding the op it originated AND the peer's).

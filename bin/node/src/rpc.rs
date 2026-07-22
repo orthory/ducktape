@@ -76,7 +76,7 @@ pub(crate) struct RpcReply {
 #[derive(serde::Serialize)]
 pub(crate) struct RpcStatus {
     pub(crate) height: Option<u64>,
-    pub(crate) app_hash: String,
+    pub(crate) root_hash: String,
     pub(crate) modules: std::collections::BTreeMap<String, String>,
 }
 

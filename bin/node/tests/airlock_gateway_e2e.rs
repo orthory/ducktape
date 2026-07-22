@@ -300,7 +300,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     }
     for index in 0..2 {
         cluster.wait_marker(index, "rpc listening on", READY);
-        cluster.wait_marker(index, "converged app_hash=", READY);
+        cluster.wait_marker(index, "converged root_hash=", READY);
         cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
@@ -451,7 +451,7 @@ fn airlock_single_node_self_serves_its_own_route() {
     cluster.wireguard = true;
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", READY);
-    cluster.wait_marker(0, "converged app_hash=", READY);
+    cluster.wait_marker(0, "converged root_hash=", READY);
     cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
 
     let alice = ed25519::PrivateKey::from_seed(42);
@@ -645,7 +645,7 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
     cluster.wireguard = true;
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", READY);
-    cluster.wait_marker(0, "converged app_hash=", READY);
+    cluster.wait_marker(0, "converged root_hash=", READY);
     cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
 
     let alice = ed25519::PrivateKey::from_seed(42);
@@ -873,7 +873,7 @@ fn airlock_embedded_gateway_self_serves() {
     ];
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", READY);
-    cluster.wait_marker(0, "converged app_hash=", READY);
+    cluster.wait_marker(0, "converged root_hash=", READY);
     cluster.wait_marker(0, "gateway plane: overlay stream bound", READY);
     // the node's OWN airlock gateway came up + registered its route.
     cluster.wait_marker(0, "airlock gateway listening", READY);

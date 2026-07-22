@@ -17,7 +17,7 @@
 //!   batch simultaneously and then releasing it.
 //! - the namespace is unique per cluster so a stale process from an earlier
 //!   run can never handshake its way into this mesh.
-//! - `converged app_hash=` latches after ANY `validator_seeds.len()` frames
+//! - `converged root_hash=` latches after ANY `validator_seeds.len()` frames
 //!   apply — it is a liveness marker, not proof of specific ops; state
 //!   assertions go through rpc queries instead.
 
@@ -793,7 +793,7 @@ impl Cluster {
 
     /// run the node at `idx` with `--sync-only` to completion and return
     /// (success, full log). the sync path exits on its own — 0 with a
-    /// `synced app_hash=` line on parity, 1 on any mismatch.
+    /// `synced root_hash=` line on parity, 1 on any mismatch.
     pub fn run_sync_only(&mut self, idx: usize, timeout: Duration) -> (bool, String) {
         // this port was reserved minutes ago (cluster layout) and nothing held
         // it since — by joiner time another process may own it. re-allocate
@@ -1013,7 +1013,7 @@ impl Cluster {
             .join("\n")
     }
 
-    /// the node's status projection (height, app_hash, module roots).
+    /// the node's status projection (height, root_hash, module roots).
     pub fn status(&self, idx: usize) -> serde_json::Value {
         let reply = self.rpc(idx, serde_json::json!({ "cmd": "status" }));
         assert_eq!(

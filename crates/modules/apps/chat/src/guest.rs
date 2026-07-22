@@ -1,7 +1,7 @@
 //! the wasm port of this module, built the ADAPTER way: the native crate is
 //! compiled to wasm32 unmodified (minus the `native`-feature off-consensus
 //! submodules — the derived index and the voice/video media engines, which
-//! never touch the app-hash) and adapted to the `ducktape:module` world
+//! never touch the root-hash) and adapted to the `ducktape:module` world
 //! through `guest-adapter`, so the module's logic is single-sourced (a
 //! behavior change in the native crate IS the wasm change). the packaging
 //! cdylib around this port is synthesized by `guest-builder` — this module is

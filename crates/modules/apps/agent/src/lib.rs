@@ -1,6 +1,6 @@
 //! the agent module — the platform's agent registry, and nothing more.
 //!
-//! a pure state-machine module (in the app-hash) holding one map: agent id →
+//! a pure state-machine module (in the root-hash) holding one map: agent id →
 //! record (owner, capability tag, curated skills, granted actions, status). it is
 //! 100% self-contained — no other module's interface crosses this crate
 //! (`SagaOrigin` and the capability tag shape rule are platform vocabulary,
@@ -26,7 +26,7 @@
 //!   legitimate submitters — a module may own agents.
 //!
 //! `root()` folds in every field of the map, so any transition moves the
-//! app-hash. a joiner rebuilds this module from a peer via
+//! root-hash. a joiner rebuilds this module from a peer via
 //! [`AgentModule::snapshot`] / [`AgentModule::install`]: the snapshot ships
 //! the committed map in the exact canonical encoding `root()` hashes, and
 //! install re-derives the root from the decoded temporaries before adopting
@@ -89,7 +89,7 @@ struct AgentState {
 // byte for options, u64-le integers. this is the exact preimage
 // [`Module::root`] hashes, so a snapshot and the root that must authenticate
 // it cannot drift. every entry ALWAYS carries the recipe_hash/caps/skills tail
-// (empty/default when unset) — the runtime identity is part of the app-hash.
+// (empty/default when unset) — the runtime identity is part of the root-hash.
 // length-prefixed bytes go through the shared `sdk::codec` writer.
 
 fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
@@ -136,7 +136,7 @@ fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
 ///
 /// the load mode is IN the preimage because it decides what the host inlines
 /// into the agent's assembled context document: flipping a skill from on-demand
-/// to always changes what the model is, so it must change the app-hash.
+/// to always changes what the model is, so it must change the root-hash.
 fn put_skills(out: &mut Vec<u8>, skills: &[SkillRef]) {
     out.extend_from_slice(&(skills.len() as u64).to_le_bytes());
     for s in skills {
@@ -476,7 +476,7 @@ pub struct AgentModule {
     /// in lockstep. an opaque id: this crate never decodes its interface.
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     agents: BTreeMap<String, AgentState>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
@@ -1611,7 +1611,7 @@ mod tests {
     /// re-pinned for the SOUL flag day: `prompt_hash` retired, so every agent
     /// loses its 8-byte length prefix and 32 pin bytes from the preimage (each
     /// skill entry also gains a load-mode byte, invisible here — the fixture
-    /// mounts none). the app-hash moves; that is the flag day, declared.
+    /// mounts none). the root-hash moves; that is the flag day, declared.
     #[test]
     fn committed_bytes_match_the_golden() {
         const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d3102000000000000000900000000000000636861742e706f73740c000000000000007461736b732e63726561746500030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d31000000000000000000030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
@@ -1751,7 +1751,7 @@ mod tests {
         assert_eq!(joiner.root(), root);
         assert_eq!(get_agent(&joiner, "bot").unwrap().skills, rec.skills);
 
-        // the SAME skills with one load mode flipped is a different app-hash:
+        // the SAME skills with one load mode flipped is a different root-hash:
         // an always-skill is inlined into the assembled context document and an
         // on-demand one is not, so the two agents do not think alike.
         assert_ne!(

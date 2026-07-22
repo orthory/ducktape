@@ -7,7 +7,7 @@
 //! scannable index fed block-by-block from the ops consensus applied. it is
 //! DERIVED BY CONSTRUCTION:
 //!
-//! - never part of any `root()` or the app-hash — a wiped index changes no
+//! - never part of any `root()` or the root-hash — a wiped index changes no
 //!   consensus-visible byte;
 //! - node-local — no cross-node determinism claim is made for its contents;
 //! - rebuildable — the crash story is "delete the module's index directory
@@ -430,7 +430,7 @@ impl ViewReader<'_> {
 /// [`Error::State`]); the mapper speaks its module's json request shapes
 /// through it via the types-only interface crate it already depends on. this
 /// keeps the crate domain-agnostic — no sdk, host, or module dep — and keeps
-/// the derivation rooted in state that verified against the app-hash.
+/// the derivation rooted in state that verified against the root-hash.
 #[async_trait::async_trait(?Send)]
 pub trait StateReader {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>>;

@@ -226,7 +226,7 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
         let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
             let finalized = host::FinalizedBlock {
                 height: 2,
-                app_hash: host.app_hash(),
+                root_hash: host.root_hash(),
             };
             host.capture_finalized_snapshot(finalized)
                 .expect("capture")

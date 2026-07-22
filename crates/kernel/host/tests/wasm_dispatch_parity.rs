@@ -562,7 +562,7 @@ async fn snapshot_install_inner() {
     let snap = wasm
         .capture_finalized_snapshot(FinalizedBlock {
             height: 2,
-            app_hash: wasm.app_hash(),
+            root_hash: wasm.root_hash(),
         })
         .expect("capture finalized snapshot");
     let entry = snap.module("dispatch").expect("dispatch in the snapshot");

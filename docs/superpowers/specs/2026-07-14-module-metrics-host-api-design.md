@@ -44,7 +44,7 @@ the host performs the generic Counter/Gauge/Histogram aggregation.
 ## Goals
 
 1. Let native and Wasm modules publish their own bounded operational metrics.
-2. Keep metric state outside module roots, snapshots, app hashes, recovery
+2. Keep metric state outside module roots, snapshots, root hashes, recovery
    manifests, and state sync.
 3. Preserve exactly one observation for a successful dispatch despite Wasm
    memoized replay and batch member replay.
@@ -64,7 +64,7 @@ the host performs the generic Counter/Gauge/Histogram aggregation.
 - Storing process-lifetime counters in consensus state merely to survive a
   restart.
 - Exact-once metric delivery across a process crash.
-- Making telemetry part of consensus validity or app-hash composition.
+- Making telemetry part of consensus validity or root-hash composition.
 - Adding OTLP, dashboards, alert rules, or a general observer plug-in runtime
   in the first implementation.
 - Replacing structured events, logs, or traces. Metrics answer aggregate
@@ -328,7 +328,7 @@ The batch rules mirror the existing event trace:
 `BlockOutcome` and `BatchOutcome` therefore gain an aggregate
 `metric_observations` field. `DispatchRecord` gains `emitted_metrics`, matching
 its existing emitted message/event counts. Observations are not serialized into
-the journal, block wire, state-sync frames, or app hash.
+the journal, block wire, state-sync frames, or root hash.
 
 If the process dies after state commit but before applying the metric batch,
 the metrics may miss that block. That is acceptable: telemetry must never add
@@ -493,7 +493,7 @@ The implementation is complete only with these checks:
 - rejected members and aborted blocks contribute nothing;
 - system-injection observations follow the same commit rule;
 - recovery selective commit does not leak observations from aborted modules;
-- app hashes are byte-identical with Prometheus handling on and off.
+- root hashes are byte-identical with Prometheus handling on and off.
 
 ### Node exporter
 

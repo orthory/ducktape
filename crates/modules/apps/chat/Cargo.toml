@@ -12,7 +12,7 @@ version.workspace = true
 # drags fluent31's unix-only IO), the voice/video media engines (tokio, opus,
 # the data plane), and the call-socket wire codec that only serving binaries
 # speak. `default-features = false` is therefore FULL consensus behavior,
-# minus everything that never touches the app-hash.
+# minus everything that never touches the root-hash.
 [features]
 default = ["native"]
 native = [
@@ -45,7 +45,7 @@ serde_json = { workspace = true }
 # the logical-key -> store-key hash (sha256); the store itself is injected.
 sha2 = { workspace = true }
 # voice submodule (crates/modules/apps/chat/src/voice): real-time media over the data
-# plane's datagram class. Off-consensus — no qmdb, no app-hash.
+# plane's datagram class. Off-consensus — no qmdb, no root-hash.
 data-plane = { workspace = true, optional = true }
 opus-rs = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }

@@ -29,7 +29,7 @@
 > (added with the loud-spent-invite fix, commit c277a382) pins the member refusal
 > and the joiner FATAL line via kill+wipe+rejoin on idx 1 (the harness is
 > hard-wired to 2 nodes; there is no idx 2, and network-shape founders never
-> print "converged app_hash="). Task 1 therefore became: strengthen THAT test in
+> print "converged root_hash="). Task 1 therefore became: strengthen THAT test in
 > place with the two missing assertions — `fresh invite` actionable guidance and
 > `wait_exit` (process actually died) — plus a mirrored
 > `NetworkShapeCluster::wait_exit`. The pseudocode below is superseded; kept for
@@ -66,7 +66,7 @@ fn a_spent_invite_refuses_the_second_joiner_loudly() {
     cluster.init_founder("reuse-net");
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
-    cluster.wait_marker(0, "converged app_hash=", CONVERGE);
+    cluster.wait_marker(0, "converged root_hash=", CONVERGE);
 
     // ONE invite, redeemed by friend A (auto-redemption over the lobby).
     let invite = cluster.invite();

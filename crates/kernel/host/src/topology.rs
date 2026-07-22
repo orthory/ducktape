@@ -10,10 +10,10 @@
 //! [`ModuleTopology`] value and each backend's genesis set is a NAMED SELECTION
 //! ([`PRODUCTION`], [`SIM_BASE`], [`SIM_VALSET`], [`DEMO`]) validated against it.
 //!
-//! This is a plan, NOT an app-hash. Instantiation stays per-backend on purpose:
+//! This is a plan, NOT a root-hash. Instantiation stays per-backend on purpose:
 //! node composes the selection over the wasm runtime, simnode/noded/demo compose
 //! the SAME ids over native module structs, and the wasm and native roots differ
-//! by design. One topology never means one app-hash — it means one place the
+//! by design. One topology never means one root-hash — it means one place the
 //! module SET (and the drift guard on it) lives.
 //!
 //! Home is `host` because every composer (node-bin, noded, simnode, demo)
@@ -24,7 +24,7 @@
 /// A single module in the composition universe: its id plus the metadata that
 /// used to be scattered across the composer sites.
 pub struct ModuleSpec {
-    /// The consensus-visible module id (the key in the host registry / app-hash).
+    /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
     /// The NATIVE sibling wiring the native composers (noded/simnode/demo) pass
     /// as constructor args — the concrete duplication this topology absorbs.
@@ -117,7 +117,7 @@ const MODULES: &[ModuleSpec] = &[
 ];
 
 /// node's production genesis set (20), in status-report order — every node runs
-/// exactly these, so the set is in the app-hash. A module here is consensus
+/// exactly these, so the set is in the root-hash. A module here is consensus
 /// state forever; experiments live unwired in `crates/labs` and appear in no
 /// selection.
 pub const PRODUCTION: &[&str] = &[

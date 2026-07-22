@@ -4,9 +4,9 @@
 //! `execute` emits a follow-up [`Msg`] targeting `kv` (a cross-module
 //! self-trigger). one message is submitted to `relay`; after `submit` returns we
 //! prove the follow-up was actually dispatched into `kv` (its root moved), that
-//! the app-hash moved and is recompute-stable, and that the drain terminated.
+//! the root-hash moved and is recompute-stable, and that the drain terminated.
 //! a second, independent deterministic run must yield the byte-identical
-//! app-hash.
+//! root-hash.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{DispatchRecord, Host};
@@ -28,8 +28,8 @@ impl Module for Relay {
     fn id(&self) -> ModuleId {
         RELAY_ID.to_string()
     }
-    // constant root: the ONLY thing that can move the app-hash is kv, so an
-    // app-hash delta is attributable to the follow-up landing in kv.
+    // constant root: the ONLY thing that can move the root-hash is kv, so an
+    // root-hash delta is attributable to the follow-up landing in kv.
     fn root(&self) -> StateRoot {
         StateRoot::ZERO
     }
@@ -50,7 +50,7 @@ impl Module for Relay {
 }
 
 /// build a fresh host (kv + relay) on `context`, submit one message to relay, and
-/// return the resulting app-hash. asserts the cross-module follow-up landed.
+/// return the resulting root-hash. asserts the cross-module follow-up landed.
 async fn run_block(context: deterministic::Context) -> StateRoot {
     let mut host = Host::new();
     let kv = Kv::new(KV_ID, Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await));
@@ -58,7 +58,7 @@ async fn run_block(context: deterministic::Context) -> StateRoot {
     host.register(Box::new(Relay));
 
     let kv_root_before = host.module_root(KV_ID).unwrap();
-    let app_before = host.app_hash();
+    let app_before = host.root_hash();
 
     // submit to RELAY, not kv. any kv change therefore came via the follow-up.
     let outcome = host
@@ -83,38 +83,38 @@ async fn run_block(context: deterministic::Context) -> StateRoot {
         "kv root after write is real"
     );
 
-    // (b) the app-hash moved, and recomputing it is identical (idempotent over
+    // (b) the root-hash moved, and recomputing it is identical (idempotent over
     //     the settled registry).
     assert_ne!(
-        app_before, outcome.app_hash,
-        "app-hash must move after the write"
+        app_before, outcome.root_hash,
+        "root-hash must move after the write"
     );
     assert_eq!(
-        outcome.app_hash,
-        host.app_hash(),
-        "app-hash must be recompute-stable"
+        outcome.root_hash,
+        host.root_hash(),
+        "root-hash must be recompute-stable"
     );
 
     // (c) termination: submit returned Ok rather than Err(BudgetExceeded).
-    outcome.app_hash
+    outcome.root_hash
 }
 
 #[test]
-fn relay_follow_up_reaches_kv_and_moves_app_hash() {
+fn relay_follow_up_reaches_kv_and_moves_root_hash() {
     deterministic::Runner::default().start(|context| async move {
         run_block(context).await;
     });
 }
 
 #[test]
-fn app_hash_is_deterministic_across_runs() {
+fn root_hash_is_deterministic_across_runs() {
     let a =
         deterministic::Runner::default().start(|context| async move { run_block(context).await });
     let b =
         deterministic::Runner::default().start(|context| async move { run_block(context).await });
     assert_eq!(
         a, b,
-        "same submit on a fresh fixed-seed host -> identical app-hash"
+        "same submit on a fresh fixed-seed host -> identical root-hash"
     );
 }
 
@@ -188,10 +188,10 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
 }
 
 #[test]
-fn app_hash_is_schedule_independent() {
-    // the real consensus property: the app-hash must NOT depend on task
+fn root_hash_is_schedule_independent() {
+    // the real consensus property: the root-hash must NOT depend on task
     // scheduling. each seed drives a different deterministic schedule; every node
-    // (modeled here as a seed) must agree on the same app-hash.
+    // (modeled here as a seed) must agree on the same root-hash.
     let roots: Vec<StateRoot> = (0..16u64)
         .map(|s| {
             deterministic::Runner::seeded(s)
@@ -200,6 +200,6 @@ fn app_hash_is_schedule_independent() {
         .collect();
     assert!(
         roots.windows(2).all(|w| w[0] == w[1]),
-        "app-hash must be identical across schedules: {roots:?}"
+        "root-hash must be identical across schedules: {roots:?}"
     );
 }

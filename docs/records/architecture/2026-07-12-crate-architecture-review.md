@@ -10,7 +10,7 @@ read-only at the merged tip of `dev`. Verdict summary first; evidence below.
 | kernel/ (8) | Sound | Move `capability-host` to `system/` — the tier's only normal-dep edge into system/, and its own doc calls it a module's "machine-local counterpart", not platform. **(Applied in this PR.)** |
 | system/ (18) | Sound | Nothing structural; absorbs `capability-host`. |
 | apps/ (11) | Sound | Nothing — the types-only rule holds under import-level inspection (`runs`, `automations`, `forge` verified). |
-| examples/ (3) | Needs a product call | `evm` self-describes as experimental but is genesis-registered in the real daemon (`bin/noded`) — every node pays its app-hash cost. Either feature-gate its registration or own it as product (rename/move). **Flagged for the user, not changed here** — it shipped deliberately this week. |
+| examples/ (3) | Needs a product call | `evm` self-describes as experimental but is genesis-registered in the real daemon (`bin/noded`) — every node pays its root-hash cost. Either feature-gate its registration or own it as product (rename/move). **Flagged for the user, not changed here** — it shipped deliberately this week. |
 | duckfs/ (3, untiered) | Needs docs only | The core/disk/client split is correct (the wasm gate forces it); it just needs a line in the workspace header + the types-only list. **(Applied.)** |
 | bin/ + shell | Sound | Header silence on noded/simnode/coordinator/fs was a docs gap. **(Applied.)** |
 

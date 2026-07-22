@@ -137,7 +137,7 @@ async fn joiner_syncs_a_snapshot_over_the_data_plane() {
     let host = Host::genesis(vec![Box::new(BigSnapshot::new())]).expect("genesis");
     let finalized = FinalizedBlock {
         height: 1,
-        app_hash: host.app_hash(),
+        root_hash: host.root_hash(),
     };
     // fixed coordinates: this proof exercises the module payload lanes; the
     // epoch fields only have to round-trip through the manifest.
@@ -173,8 +173,8 @@ async fn joiner_syncs_a_snapshot_over_the_data_plane() {
         let manifest = fetch_manifest(&client).await.expect("manifest fetch");
         assert_eq!(manifest.height, 1, "manifest reports the served height");
         assert_eq!(
-            manifest.app_hash, finalized.app_hash,
-            "manifest carries the served app-hash"
+            manifest.root_hash, finalized.root_hash,
+            "manifest carries the served root-hash"
         );
         let entry = manifest.entry("bigsnap").expect("bigsnap in manifest");
         assert_eq!(entry.kind, PayloadKind::Snapshot);

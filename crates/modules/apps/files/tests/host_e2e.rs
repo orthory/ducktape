@@ -4,7 +4,7 @@
 //! consensus lane does: one op per `submit_at` block, the host owning the
 //! `commit_block`/`abort_block` boundary. this is the only layer that proves the
 //! whole module behaves identically across nodes under the real kernel host —
-//! the unit/module tests drive the module in isolation; here the app-hash is
+//! the unit/module tests drive the module in isolation; here the root-hash is
 //! composed over the registry (`state::global_root`), so equality across hosts
 //! is the real cross-node gate.
 //!
@@ -45,14 +45,14 @@ fn bctx(height: u64, origin: Origin) -> BlockContext {
     }
 }
 
-/// submit one op as a block, returning the committed app-hash on success.
+/// submit one op as a block, returning the committed root-hash on success.
 fn submit(
     host: &mut Host,
     height: u64,
     origin: Origin,
     msg: Msg,
 ) -> Result<StateRoot, SubmitError> {
-    block_on(host.submit_at(bctx(height, origin), msg)).map(|o| o.app_hash)
+    block_on(host.submit_at(bctx(height, origin), msg)).map(|o| o.root_hash)
 }
 
 fn query_bytes(host: &Host, q: &FilesQuery) -> Vec<u8> {
@@ -185,7 +185,7 @@ fn chunk_hex(bytes: &[u8]) -> String {
 
 /// the end-to-end happy path over the real host: putblob a 1.5-chunk file across
 /// two blocks, commit it (chunks ref + inline + mkdir + symlink) in one block,
-/// then pin the head. the app-hash MOVES on every successful block; every query
+/// then pin the head. the root-hash MOVES on every successful block; every query
 /// round-trips through `host.query`; the multi-chunk content reads back byte-exact;
 /// the pin is visible via Refs and the author is the mapped external identity.
 #[test]
@@ -203,22 +203,22 @@ fn host_flow() {
     let size = CHUNK_SIZE + tail_len as u64;
     let want: Vec<u8> = chunk0.iter().chain(chunk1.iter()).copied().collect();
 
-    let mut prev = host.app_hash();
+    let mut prev = host.root_hash();
 
     // block 1: stage chunk0. staging is state (it lands in refs), so commit_block
-    // adopts it and the app-hash moves even without any tree change.
+    // adopts it and the root-hash moves even without any tree change.
     let h = submit(&mut host, 1, tester.clone(), putblob_op(&chunk0)).expect("putblob c0");
-    assert_ne!(h, prev, "putblob chunk0 moves the app-hash");
+    assert_ne!(h, prev, "putblob chunk0 moves the root-hash");
     assert_eq!(
         h,
-        host.app_hash(),
+        host.root_hash(),
         "outcome hash matches the live host hash"
     );
     prev = h;
 
     // block 2: stage chunk1.
     let h = submit(&mut host, 2, tester.clone(), putblob_op(&chunk1)).expect("putblob c1");
-    assert_ne!(h, prev, "putblob chunk1 moves the app-hash");
+    assert_ne!(h, prev, "putblob chunk1 moves the root-hash");
     prev = h;
 
     // block 3: one atomic commit — the staged chunks, an inline file, a dir, a link.
@@ -244,13 +244,13 @@ fn host_flow() {
         commit_op(None, "genesis commit", changes),
     )
     .expect("commit");
-    assert_ne!(h, prev, "commit moves the app-hash");
+    assert_ne!(h, prev, "commit moves the root-hash");
     prev = h;
 
     // block 4: pin the now-committed head.
     let head_hex = head(&host);
     let h = submit(&mut host, 4, tester.clone(), pin_op(&head_hex, "release")).expect("pin");
-    assert_ne!(h, prev, "pin moves the app-hash");
+    assert_ne!(h, prev, "pin moves the root-hash");
 
     // ---- queries round-trip through the host ----
     match query(
@@ -341,7 +341,7 @@ fn host_flow() {
 
 // ---- test 2: two hosts converge (the cross-node determinism gate) ------------
 
-/// apply one op to BOTH hosts and assert their app-hashes stay equal after the
+/// apply one op to BOTH hosts and assert their root-hashes stay equal after the
 /// block — a rejection must land IDENTICALLY on both, and never move either hash.
 fn step(a: &mut Host, b: &mut Host, height: u64, origin: Origin, msg: Msg, expect_reject: bool) {
     let ra = block_on(a.submit_at(bctx(height, origin.clone()), msg.clone()));
@@ -353,8 +353,8 @@ fn step(a: &mut Host, b: &mut Host, height: u64, origin: Origin, msg: Msg, expec
                 "block {height}: expected a rejection, both accepted"
             );
             assert_eq!(
-                oa.app_hash, ob.app_hash,
-                "block {height}: outcome app-hash equal"
+                oa.root_hash, ob.root_hash,
+                "block {height}: outcome root-hash equal"
             );
         }
         (Err(ea), Err(eb)) => {
@@ -368,16 +368,16 @@ fn step(a: &mut Host, b: &mut Host, height: u64, origin: Origin, msg: Msg, expec
         _ => panic!("block {height}: host divergence a={ra:?} b={rb:?}"),
     }
     assert_eq!(
-        a.app_hash(),
-        b.app_hash(),
-        "block {height}: committed app-hash equal after the block"
+        a.root_hash(),
+        b.root_hash(),
+        "block {height}: committed root-hash equal after the block"
     );
 }
 
 /// two hosts over different tempdirs fed the IDENTICAL op stream — interleaved
 /// putblobs by two owners, commits, a mid-sequence CAS-conflict rejection, a
 /// module-origin watch + unwatch, a pin, and a run of commits that exercise the
-/// bounded history window push — must agree on the app-hash after EVERY block and
+/// bounded history window push — must agree on the root-hash after EVERY block and
 /// serve byte-identical replies at the end. this is the whole crate's cross-node
 /// determinism gate.
 #[test]
@@ -386,7 +386,7 @@ fn two_hosts_converge() {
     let dir_b = tempfile::tempdir().unwrap();
     let mut a = open_host(&dir_a);
     let mut b = open_host(&dir_b);
-    assert_eq!(a.app_hash(), b.app_hash(), "fresh hosts start equal");
+    assert_eq!(a.root_hash(), b.root_hash(), "fresh hosts start equal");
 
     let owner_a = Origin::External(b"owner-a".to_vec());
     let owner_b = Origin::External(b"owner-b".to_vec());
@@ -491,7 +491,7 @@ fn two_hosts_converge() {
         );
     }
 
-    assert_eq!(a.app_hash(), b.app_hash(), "final app-hash equal");
+    assert_eq!(a.root_hash(), b.root_hash(), "final root-hash equal");
 
     // every read reply is byte-identical across the two hosts.
     let queries = [
@@ -523,15 +523,15 @@ fn two_hosts_converge() {
     }
 }
 
-// ---- test 3: rejects never move the app-hash --------------------------------
+// ---- test 3: rejects never move the root-hash --------------------------------
 
 /// submit one op that MUST be rejected, and assert (1) the host surfaces a
 /// deterministic module rejection — never a node-local fatal boundary fault — and
-/// (2) the app-hash is byte-identical before and after. the kernel contract is
+/// (2) the root-hash is byte-identical before and after. the kernel contract is
 /// that an execute error aborts the WHOLE block (host/src/lib.rs), so no staged
 /// write survives.
 fn assert_rejected(host: &mut Host, height: u64, origin: Origin, msg: Msg, label: &str) {
-    let before = host.app_hash();
+    let before = host.root_hash();
     let err = block_on(host.submit_at(bctx(height, origin), msg)).expect_err(label);
     // a rejection is the deterministic no-op every honest node computes; a Fatal
     // would mean this node's state went indeterminate, which no rejection may.
@@ -544,16 +544,16 @@ fn assert_rejected(host: &mut Host, height: u64, origin: Origin, msg: Msg, label
         "{label}: module-level rejection, got {err:?}"
     );
     assert_eq!(
-        host.app_hash(),
+        host.root_hash(),
         before,
-        "{label}: app-hash byte-identical after the rejected block"
+        "{label}: root-hash byte-identical after the rejected block"
     );
 }
 
 /// every rejection class from the verb surface, submitted through the host: each
-/// proves the module error surfaces AND the app-hash is untouched.
+/// proves the module error surfaces AND the root-hash is untouched.
 #[test]
-fn rejects_never_move_app_hash() {
+fn rejects_never_move_root_hash() {
     let dir = tempfile::tempdir().unwrap();
     let mut host = open_host(&dir);
 
@@ -638,7 +638,7 @@ fn rejects_never_move_app_hash() {
 // ---- test 4: a restarted host replays and converges -------------------------
 
 /// determinism hardening: a host that is DROPPED mid-sequence, REOPENED over its
-/// data dir, and replays the remaining blocks must land on the same app-hash as a
+/// data dir, and replays the remaining blocks must land on the same root-hash as a
 /// host that ran the whole sequence straight through.
 ///
 /// this is the host-layer equivalent of a node crash-and-recover across a block.
@@ -724,7 +724,7 @@ fn restart_mid_sequence_converges() {
     // the reopened host re-adopts block 3's durable committed state (including the
     // still-staged second chunk) — the same module root host A held at block 3.
     assert_eq!(
-        b2.app_hash(),
+        b2.root_hash(),
         a_after_3,
         "reopen re-adopts the block-3 committed state exactly"
     );
@@ -733,7 +733,7 @@ fn restart_mid_sequence_converges() {
     }
 
     assert_eq!(
-        b2.app_hash(),
+        b2.root_hash(),
         final_a,
         "a restarted host replaying 4-6 converges to the straight-through host"
     );

@@ -154,7 +154,7 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
 
         let finalized = FinalizedBlock {
             height: 3,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
         let src_kv_root = host.module_root("kv").expect("kv registered");
 
@@ -169,7 +169,7 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             // manifest: the captured boundary describes every module.
             let manifest = fetch_manifest(&client_for_join).await.expect("manifest");
             assert_eq!(manifest.height, 3);
-            assert_eq!(manifest.app_hash, finalized.app_hash);
+            assert_eq!(manifest.root_hash, finalized.root_hash);
             let kv_entry = manifest.entry("kv").expect("kv in manifest");
             assert_eq!(kv_entry.kind, PayloadKind::Resolver);
             assert_eq!(kv_entry.root, src_kv_root);
@@ -240,7 +240,7 @@ fn stale_capture_requests_are_refused_not_mis_served() {
         .expect("op");
         let finalized = FinalizedBlock {
             height: 1,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
 
         let mut server = SyncServer::new();
@@ -253,7 +253,7 @@ fn stale_capture_requests_are_refused_not_mis_served() {
                 SyncRequest::Chunk {
                     boundary: statesync::BoundaryId {
                         height: 999,
-                        app_hash: StateRoot([9u8; 32]),
+                        root_hash: StateRoot([9u8; 32]),
                     },
                     module_id: "kv".into(),
                     offset: 0,
@@ -266,10 +266,10 @@ fn stale_capture_requests_are_refused_not_mis_served() {
         );
 
         // manifest against a WRONG finalized boundary (host has advanced past
-        // it) is refused by the host's app-hash gate, not served stale.
+        // it) is refused by the host's root-hash gate, not served stale.
         let wrong = FinalizedBlock {
             height: 0,
-            app_hash: StateRoot([1u8; 32]),
+            root_hash: StateRoot([1u8; 32]),
         };
         let resp = server
             .handle(
@@ -387,7 +387,7 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
         let host = Host::genesis(vec![]).expect("genesis");
         let finalized = FinalizedBlock {
             height: 4,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
         let (tx, rx) = mpsc::channel::<RpcPair>(16);
         let client = ChannelClient { tx };

@@ -109,7 +109,7 @@ impl Notification {
     /// the `duckfs_notify` follow-up payload bytes. TYPED serialization on
     /// purpose: a `serde_json::json!` map's key order depends on the build's
     /// serde_json features (`preserve_order` keeps insertion order, default
-    /// sorts), and these bytes land in a sibling module's app-hashed state —
+    /// sorts), and these bytes land in a sibling module's root-hashed state —
     /// the native module and the wasm guest must emit byte-identical wire
     /// regardless of how each build resolved serde_json.
     pub fn payload(&self) -> Vec<u8> {
@@ -1135,7 +1135,7 @@ fn commit_apply(
     // ([`verify_chunk_len_at`]). the local odb is DELIBERATELY not a source: its
     // orphan set differs across nodes (gc timing, join/rejoin history), so
     // letting raw odb presence satisfy availability would make commit acceptance
-    // node-dependent and split the block app-hash (finding #1). `validate_chunks`
+    // node-dependent and split the block root-hash (finding #1). `validate_chunks`
     // pinned the size/COUNT shape; without the length half a wrong-length digest
     // would commit fine and only explode at read time — a committed-but-
     // unreadable file. every source answers from metadata alone (the staging
@@ -1249,7 +1249,7 @@ fn commit_apply(
 /// local odb is DELIBERATELY not a source — its orphan set is per-node (gc
 /// timing, join/rejoin history), so a chunk referenceable "because it happens to
 /// be on this node's disk" would let one validator accept a commit another
-/// rejects and split the app-hash (finding #1). a chunk must be STAGED or
+/// rejects and split the root-hash (finding #1). a chunk must be STAGED or
 /// produced in-block to be referenceable; the client re-stages anything absent.
 /// `Ok(None)` = reachable in neither uniform source, the availability reject. a
 /// digest that resolves to a NON-chunk object is a malformed reference and errors
@@ -1457,7 +1457,7 @@ fn stage_object(
 // differs across nodes (deterministic gc still leaves join-history/rejoin
 // asymmetries: a fresh-synced node holds zero orphans, a genesis node holds
 // them until the next sweep). two nodes with divergent odb must apply the SAME
-// op to the SAME root, or the block app-hash splits and the network bricks.
+// op to the SAME root, or the block root-hash splits and the network bricks.
 // these tests build under `--no-default-features` (pure core, no sdk/disk).
 #[cfg(test)]
 mod consensus_uniformity {

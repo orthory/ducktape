@@ -120,7 +120,7 @@ fn installed_snapshot_reconstructs_root_and_reads() {
 
     dst.install(&snap, src_root).unwrap();
 
-    // THE PROPERTY: identical root — the app-hash linkage a joiner needs.
+    // THE PROPERTY: identical root — the root-hash linkage a joiner needs.
     assert_eq!(dst.root(), src_root, "installed root must equal the source");
 
     // query parity.

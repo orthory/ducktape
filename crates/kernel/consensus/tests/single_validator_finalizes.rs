@@ -83,7 +83,7 @@ fn a_single_validator_finalizes_sequential_blocks() {
         let host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
         let mut node = OrderedNode::new(host, orderer);
 
-        let genesis = node.app_hash();
+        let genesis = node.root_hash();
 
         // two ops from distinct origins, flushed as two SEPARATE batches so
         // the engine finalizes two SEQUENTIAL blocks (the property under
@@ -113,9 +113,9 @@ fn a_single_validator_finalizes_sequential_blocks() {
         }
 
         assert_ne!(
-            node.app_hash(),
+            node.root_hash(),
             genesis,
-            "finalized solo blocks moved the app-hash"
+            "finalized solo blocks moved the root-hash"
         );
     });
 }

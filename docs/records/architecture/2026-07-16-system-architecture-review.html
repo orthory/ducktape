@@ -156,7 +156,7 @@
   <p class="lede">One BFT-replicated state machine hosting isolated modules;
   each <code>sdk::Module</code> exposes one 32-byte <code>sdk::StateRoot</code>, and
   <code>host::global_root</code> (<code>crates/kernel/host/src/lib.rs:55</code>) folds the
-  sorted <code>(ModuleId, StateRoot)</code> pairs into the app-hash that consensus commits.</p>
+  sorted <code>(ModuleId, StateRoot)</code> pairs into the root-hash that consensus commits.</p>
 
   <pre class="mermaid">
 flowchart TB
@@ -405,7 +405,7 @@ flowchart LR
 
   <pre class="mermaid">
 flowchart LR
-    M["sdk::Module execute<br/>stages writes, emits Event"] --> SG["saga::SagaModule records<br/>pending continuation<br/>(in app-hash)"]
+    M["sdk::Module execute<br/>stages writes, emits Event"] --> SG["saga::SagaModule records<br/>pending continuation<br/>(in root-hash)"]
     SG --> W["host::worker seam<br/>Event offered to Workers"]
     W --> P["dispatch_oracle::DispatchPool<br/>resolves capability tag to<br/>capability_host::Provider<br/>(TOML spec, sandboxed CLI)"]
     P --> O["result submitted as<br/>signed saga OracleResult op"]

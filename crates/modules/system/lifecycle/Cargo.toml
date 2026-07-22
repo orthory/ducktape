@@ -1,4 +1,4 @@
-# lifecycle — the network lifecycle module. ONE app-hashed commitment covering
+# lifecycle — the network lifecycle module. ONE root-hashed commitment covering
 # both height-gated coordination classes that used to live in the mirror-image
 # `upgrade` and `modreg` crates:
 #   * the agreed node protocol version + at most one pending, readiness-gated

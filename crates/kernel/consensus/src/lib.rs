@@ -1938,7 +1938,7 @@ impl FollowerOrderer {
     /// admit one BACKFILLED finalized frame — bytes fetched over the
     /// statesync Frames lane rather than proven by an observed certificate.
     /// THE CALLER OWNS THIS LANE'S TRUST: after the fold it must cross-check
-    /// the folded seal (disposition / app-hash) against the served one, the
+    /// the folded seal (disposition / root-hash) against the served one, the
     /// same per-frame verification the post-reboot catch-up performs — this
     /// method only stores the bytes content-addressed and logs the gate
     /// slot. the latest-finalization floor slot is deliberately NOT advanced

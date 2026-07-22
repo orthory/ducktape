@@ -417,7 +417,7 @@ mod tests {
     fn empty_external_origin_creates_no_vault() {
         block_on(async {
             let mut host = Host::genesis(vec![Box::new(Vaults::new("vaults"))]).expect("genesis");
-            let app0 = host.app_hash();
+            let app0 = host.root_hash();
 
             // Host::submit uses the default Origin::External(vec![]).
             let err = host
@@ -435,7 +435,7 @@ mod tests {
                 "got {err:?}"
             );
 
-            // no empty-owner vault landed, and the app hash is untouched.
+            // no empty-owner vault landed, and the root hash is untouched.
             let reply = host
                 .query("vaults", &encode_query(&VaultQuery::Vaults))
                 .await
@@ -444,7 +444,7 @@ mod tests {
                 panic!("vaults reply");
             };
             assert!(views.is_empty(), "no vault must exist");
-            assert_eq!(host.app_hash(), app0, "refused create leaves no trace");
+            assert_eq!(host.root_hash(), app0, "refused create leaves no trace");
         });
     }
 }

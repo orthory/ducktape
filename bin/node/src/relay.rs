@@ -40,9 +40,9 @@ pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayOutcome {
-    /// drained Applied at `height`; `app_hash` is the PER-BLOCK boundary
+    /// drained Applied at `height`; `root_hash` is the PER-BLOCK boundary
     /// hash the frame settled at (what a local app-surface hold reports).
-    Applied { height: u64, app_hash: String },
+    Applied { height: u64, root_hash: String },
     /// finalized but deterministically rejected by its module.
     Rejected { detail: String },
     /// refused at the door (bad frame / origin lacks resident standing) or
@@ -286,7 +286,7 @@ mod tests {
                 frame_id: [7; 32],
                 outcome: RelayOutcome::Applied {
                     height: 42,
-                    app_hash: "aa".into(),
+                    root_hash: "aa".into(),
                 },
             },
             RelayMsg::Reply {

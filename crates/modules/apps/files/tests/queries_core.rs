@@ -722,7 +722,7 @@ fn has_chunks_reports_only_staging_not_the_odb() {
     // its stage). has_chunks reports it ABSENT so the client RE-STAGES it: odb
     // presence is per-node (orphan sets diverge across the set), so probing it
     // would tell one client to skip a stage another node needs — the finding #1
-    // split app-hash. re-staging is consensus-safe (the bytes ride the block).
+    // split root-hash. re-staging is consensus-safe (the bytes ride the block).
     let committed_bytes = b"committed-inline-body";
     commit(
         &mut f,

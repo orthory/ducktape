@@ -302,7 +302,7 @@ mod tests {
     /// the exact pre-refactor inline formula (count, then per sorted pair
     /// `len(k)|k|len(v)|v`), hashes it the old way, and asserts the SAME root.
     /// If the shared helper ever drifts from this formula, every map-backed
-    /// module root — and the app-hash — moves, and this fails.
+    /// module root — and the root-hash — moves, and this fails.
     #[test]
     fn memstore_root_matches_the_pre_refactor_inline_formula() {
         let entries = vec![

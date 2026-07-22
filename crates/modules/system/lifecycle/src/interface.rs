@@ -1,6 +1,6 @@
 //! the lifecycle module's public wire surface — types only.
 //!
-//! lifecycle is the MODULE CODE coordination plane, folded into ONE app-hashed
+//! lifecycle is the MODULE CODE coordination plane, folded into ONE root-hashed
 //! `root()`: per hot-swappable module, the ACTIVE 32-byte code hash plus at
 //! most one pending `ScheduledSwap`; governance authorizes a
 //! register/schedule/cancel, each validator emits `SwapReady` once the target

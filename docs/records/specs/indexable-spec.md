@@ -14,7 +14,7 @@ Ducktape state lives in two tiers with opposite contracts:
 | | canonical tier | derived tier (this spec) |
 | --- | --- | --- |
 | substrate | qmdb / git — authenticated | fluent31 — ordered, scannable |
-| in the app-hash | **always** (`Module::root()`) | **never** |
+| in the root-hash | **always** (`Module::root()`) | **never** |
 | cross-node | byte-identical by consensus | node-local, no determinism claim |
 | reads | point lookups, module `query` | scans, search, partitions, views |
 | crash story | replay / state-sync to the root | **rebuild** — delete and re-fold |
@@ -163,10 +163,10 @@ The first shipped mappers and why they exist:
   (pre-replay) and again at the boot tip once every path converged.
 - A serving RESIDENT never folds — it observes state boundaries, not sealed
   frames — so its entire feed is the heal: on every followed boundary whose
-  verified app-hash moved, every module re-derives (or re-stamps) at that
+  verified root-hash moved, every module re-derives (or re-stamps) at that
   boundary, and the blocks database gains one honest boundary row
-  (`IndexStore::apply_block_record` — verified height + app-hash,
-  frame-derived fields empty). An unchanged app-hash is an idle stride and
+  (`IndexStore::apply_block_record` — verified height + root-hash,
+  frame-derived fields empty). An unchanged root-hash is an idle stride and
   writes nothing, mirroring the validator's nop gate.
 - Poisoned means poisoned: no gap-skipping, no partial patching. Reads stay
   up; the remedy is a rebuild — automatic at the next boot's heal, or an

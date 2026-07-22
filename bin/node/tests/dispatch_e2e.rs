@@ -175,12 +175,12 @@ fn boot(cluster: &mut Cluster) {
     cluster.spawn(1);
     cluster.spawn(2);
     let genesis: Vec<String> = (0..3)
-        .map(|i| cluster.wait_marker(i, "genesis app_hash=", Duration::from_secs(60)))
+        .map(|i| cluster.wait_marker(i, "genesis root_hash=", Duration::from_secs(60)))
         .collect();
     assert_eq!(genesis[0], genesis[1], "genesis fork between nodes 0 and 1");
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
-        cluster.wait_marker(i, "converged app_hash=", CONVERGE);
+        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
     }
 }
 

@@ -144,13 +144,13 @@ pub(super) async fn restore(
             tracing::info!(
                 target: "ducktape::recovery",
                 node = %label,
-                app_hash = %hex(&rec.app_hash),
+                root_hash = %hex(&rec.root_hash),
                 height = %rec.height.map(|h| h.to_string()).unwrap_or_else(|| "genesis".into()),
                 epoch = rec.epoch,
                 replayed = rec.applied,
                 already_on_disk = rec.skipped,
                 rolled_forward = rec.rolled_forward,
-                "recovered app_hash={}", hex(&rec.app_hash)
+                "recovered root_hash={}", hex(&rec.root_hash)
             );
             let prev = (manifest.height, manifest.oplog_pos);
             (host, Some(rec), next_seq, prev, Some(manifest))

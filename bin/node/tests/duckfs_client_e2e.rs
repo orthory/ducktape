@@ -36,8 +36,8 @@ fn two_validators() -> Cluster {
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.spawn(0);
     cluster.spawn(1);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
-    cluster.wait_marker(1, "genesis app_hash=", Duration::from_secs(30));
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
+    cluster.wait_marker(1, "genesis root_hash=", Duration::from_secs(30));
     cluster
 }
 

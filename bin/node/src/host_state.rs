@@ -131,7 +131,7 @@ const CAPABILITY_MODULE_ID: &str = "capability";
 /// GENESIS CONFIG: the builders below install an initial store carrying the
 /// reserved `__config` key (`sdk::genesis_config`) at construction, and the
 /// guest decodes it per dispatch. the config is consensus state — identical on
-/// every node, in the module root (hence the app-hash) from genesis, and
+/// every node, in the module root (hence the root-hash) from genesis, and
 /// carried by checkpoint snapshots like any other store key.
 const IDENTITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/identity/component.wasm");
@@ -568,7 +568,7 @@ struct ProductionModules {
 impl ProductionModules {
     /// compose the registry into a [`Host`]. registration order is NOT
     /// consensus-relevant (the host keys modules in a `BTreeMap`) — only the
-    /// module set and each module's constructed state compose the app-hash.
+    /// module set and each module's constructed state compose the root-hash.
     fn compose(self) -> Result<Host, sdk::Error> {
         let mut host = Host::genesis(vec![
             Box::new(self.pages),
@@ -600,7 +600,7 @@ impl ProductionModules {
 }
 
 /// the PRODUCTION module set — genesis state, identical on every node (a
-/// different set composes a different app-hash and the network forks at
+/// different set composes a different root-hash and the network forks at
 /// genesis). system infrastructure (valset seeded with the genesis
 /// validators, saga) plus every product module. `forge_repo` is this node's
 /// on-disk git substrate; wrapper modules run EMBEDDED substrates for now.
@@ -707,7 +707,7 @@ pub(super) async fn genesis_host(
         // compiled into the guest.
         runs: genesis_runs_wasm(),
         // the first real wasm tenant: bytes-compatible with the retired native
-        // implementation, so this cutover left the app-hash untouched.
+        // implementation, so this cutover left the root-hash untouched.
         directory: genesis_directory_wasm(),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
         // events and emits chat/tasks follow-ups. adapter-ported; the
@@ -911,7 +911,7 @@ pub(super) async fn restore_host(
 /// under an ATTEMPT-scoped runtime child (`{name}_scratch_a{n}`) — the module
 /// this adapter wraps is opened over `duckfs_disk::SyncScratch`'s attempt-scoped
 /// scratch dir, NEVER the canonical `duckfs_dir`. the canonical dir is written
-/// only by the verified promotion after `sync_all_modules`' composite app-hash
+/// only by the verified promotion after `sync_all_modules`' composite root-hash
 /// gate, so a failed join leaves it byte-untouched.
 struct FilesOdb<'a>(&'a mut Files);
 
@@ -951,7 +951,7 @@ impl statesync::ObjectFetch for FilesOdb<'_> {
 
 /// rebuild EVERY production module from a peer's statesync service at
 /// `manifest`'s boundary and compose them into a [`Host`], verified against
-/// the manifest's app-hash. the disk substrates land under their canonical
+/// the manifest's root-hash. the disk substrates land under their canonical
 /// ids in this process's storage root — this IS the node's state afterwards,
 /// not a scratch copy. `attempt` disambiguates runtime child labels across
 /// retries (a busy source moves its qmdb targets past the captured boundary;
@@ -1147,7 +1147,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     // one byte readable). the sync lands in an ATTEMPT-scoped scratch dir
     // (`duckfs_scratch_a{attempt}`, mirroring the qmdb scratch namespaces);
     // the canonical `duckfs_dir` is written only by the verified promotion
-    // after the composite app-hash gate below (#219).
+    // after the composite root-hash gate below (#219).
     let files_scratch =
         SyncScratch::prepare(duckfs_dir, attempt).map_err(|e| format!("duckfs scratch: {e}"))?;
     // possession is node-local verification machinery, OFF consensus: drive it
@@ -1171,7 +1171,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     .map_err(|e| format!("files sync: {e}"))?;
     // possession wrote the synced refs envelope + every object durably to the
     // scratch dir, so drop that native handle and compose the ROOT-CONTINUOUS
-    // wasm files tenant over the SAME scratch dir for the composite app-hash gate
+    // wasm files tenant over the SAME scratch dir for the composite root-hash gate
     // below — `FilesOdbBacking::open` recovers exactly the possession-synced refs
     // (and its `durable_commit_height` from the envelope), so `root() =
     // sha256(refs_bytes)` certifies against the manifest's files root.
@@ -1205,10 +1205,10 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;
 
-    // compose and check THE property: the rebuilt app-hash IS the manifest's.
+    // compose and check THE property: the rebuilt root-hash IS the manifest's.
     // [`ProductionModules`] keeps this registry in lockstep with
     // [`genesis_host`] by construction — a missing module composes a
-    // different app-hash and the join fails its final check.
+    // different root-hash and the join fails its final check.
     let mut host = ProductionModules {
         pages,
         chat,
@@ -1233,11 +1233,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     }
     .compose()
     .map_err(|e| format!("compose synced host: {e}"))?;
-    if host.app_hash() != manifest.app_hash {
+    if host.root_hash() != manifest.root_hash {
         return Err(format!(
             "composed {} != manifest {}",
-            hex(&host.app_hash()),
-            hex(&manifest.app_hash)
+            hex(&host.root_hash()),
+            hex(&manifest.root_hash)
         ));
     }
     // the composite gate passed — promote files' scratch into the canonical
@@ -1255,11 +1255,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         files_wasm(duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs reopen: {e}"))?,
     ));
     // re-check THE property against the canonical-backed composition.
-    if host.app_hash() != manifest.app_hash {
+    if host.root_hash() != manifest.root_hash {
         return Err(format!(
             "canonical duckfs reopen composed {} != manifest {}",
-            hex(&host.app_hash()),
-            hex(&manifest.app_hash)
+            hex(&host.root_hash()),
+            hex(&manifest.root_hash)
         ));
     }
     Ok(host)

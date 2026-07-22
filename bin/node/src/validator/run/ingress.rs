@@ -100,7 +100,7 @@ impl ValidatorRuntime<'_> {
                 RpcReply {
                     status: Some(RpcStatus {
                         height: node.finalized().map(|f| f.height),
-                        app_hash: hex(&node.app_hash()),
+                        root_hash: hex(&node.root_hash()),
                         modules,
                     }),
                     ..RpcReply::ok()
@@ -590,7 +590,7 @@ impl ValidatorRuntime<'_> {
                     .collect();
                 let _ = reply.send(noded::NodeStatus {
                     version: env!("CARGO_PKG_VERSION").into(),
-                    app_hash: hex(&self.node.app_hash()),
+                    root_hash: hex(&self.node.root_hash()),
                     height: self.node.finalized().map(|f| f.height).unwrap_or(0),
                     modules,
                     public_key: self.status_public_key.clone(),

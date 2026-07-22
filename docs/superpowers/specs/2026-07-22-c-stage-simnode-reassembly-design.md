@@ -49,7 +49,7 @@ shared code instead of a promise kept by parity tests.
    (NetworkBindings et al.), consumed by node's `ProductionModules` (wasm
    backend), simnode (native backend), and demo. Instantiation stays
    per-backend — wasm and native roots differ by design; one topology is NOT
-   one app-hash. `BASE_MODULE_IDS`/`VALSET_MODULE_IDS` hand-copies and
+   one root-hash. `BASE_MODULE_IDS`/`VALSET_MODULE_IDS` hand-copies and
    `[&str; N]` count annotations die; subsets become named selections validated
    against the topology (the #706 accident class becomes unrepresentable).
 6. **simnode reassembly on `OrderedNode<StepOrderer>`**: the Sim actor keeps
@@ -64,7 +64,7 @@ shared code instead of a promise kept by parity tests.
 
 ## Non-goals
 
-- No wire/codec change anywhere. No app-hash unification across backends.
+- No wire/codec change anywhere. No root-hash unification across backends.
 - No changes to SimplexOrderer/consensus semantics; no mesh involvement.
 - demo stays a scripted walkthrough (adopts topology, not OrderedNode).
 - noded stays on its 1-op-1-block lane (adopts projection + reactor, not the

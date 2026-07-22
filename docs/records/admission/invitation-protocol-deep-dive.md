@@ -146,7 +146,7 @@ dispatch table (`main.rs:744-754`)이 config 해석 전에 verb를 가른다. fo
 | 5 | Founder | `admit <pubkey>` | `cmd_admit` `main.rs:934` | descriptor | `network.toml`(validator 추가) | — |
 | 6 | Founder | `invite` (재실행) | | | | **refreshed blob** |
 | 7 | Joiner | `join <refreshed blob>` (같은 dir) | | refreshed blob | `network.toml` 덮어씀, identity **재사용** | "member 됨" |
-| 8 | 양쪽 | `ducktape-node --config` | `run_node` | node.toml | `storage/` = **genesis FREEZE** | app-hash |
+| 8 | 양쪽 | `ducktape-node --config` | `run_node` | node.toml | `storage/` = **genesis FREEZE** | root-hash |
 
 핵심 불변식:
 
@@ -234,7 +234,7 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
   `workspace_invite_blob`(→`invite`), `workspace_admit`(→`invite-accept`), `workspace_select`(노드 detach spawn),
   `workspace_phase`.
 - **parked joiner는 HTTP/RPC surface가 없으므로** 진행상황을 `daemon.log` tail의 마커
-  문자열(`"joiner mode: parking"`/`"parked:"`/`"admitted at epoch"`/`"synced app_hash="`/`"promoted:"`/`"FATAL"`)로
+  문자열(`"joiner mode: parking"`/`"parked:"`/`"admitted at epoch"`/`"synced root_hash="`/`"promoted:"`/`"FATAL"`)로
   `starting|parked|admitted|synced|promoted|fatal` phase에 매핑(`classify`, `workspaces.rs:571`).
   CLI 마커가 곧 UX API인 셈.
 - **advertised addr 우선순위** (`advertised_addr`, `workspaces.rs:305`): ① `DUCKTAPE_ADVERTISE_ADDR`(full
@@ -254,7 +254,7 @@ execute 시 member 수를 **재조회**(제안 이후 membership 변동 반영).
    idle nop가 finalized view를 계속 틱하게 만들면서 admission 중 **JOINING validator의
    state를 fork**시켰다. fault line은 resolver-lane 모듈(`kv`/`pages`/`chat`)의 live
    QMDB target을 frozen manifest root와 post-hoc 대조하던 부분이었다. 현재 state sync
-   wire는 `BoundaryId { height, app_hash }`, leased captures, pinned resolver targets,
+   wire는 `BoundaryId { height, root_hash }`, leased captures, pinned resolver targets,
    floor-bound manifests, post-sync revalidation, post-reboot frame catch-up을 사용한다.
    maintained summary는 Nimbus의 State Sync와 Implementation Status page에 있다.
 2. **테스트 커버리지 갭** — pre-genesis `admit` verb를 end-to-end로 구동하는 Rust e2e가 **없다.**

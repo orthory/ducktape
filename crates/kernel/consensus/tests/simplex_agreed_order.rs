@@ -7,7 +7,7 @@
 //! distributed ONE PER VALIDATOR (the faithful BFT reading — a validator that
 //! never submitted an op still converges via finalization replication). simplex
 //! BFT-orders them; every validator applies `host.submit` on finalization in the
-//! agreed (ascending-view) order and converges on a BYTE-IDENTICAL app-hash —
+//! agreed (ascending-view) order and converges on a BYTE-IDENTICAL root-hash —
 //! INCLUDING the order-dependent qmdb root.
 //!
 //! this is the [`RoundOrderer`] convergence property (see node/tests/
@@ -20,7 +20,7 @@
 //! the scenario is SCHEME-PARAMETRIC: `converge` takes a factory producing the
 //! sorted identity participant set + index-aligned per-validator schemes, so
 //! the full path (propose -> finalize -> ordered delivery -> identical
-//! app-hash, qmdb root included) is scheme-independent by construction —
+//! root-hash, qmdb root included) is scheme-independent by construction —
 //! today only V1 ed25519 is wired.
 
 use std::collections::HashMap;
@@ -190,13 +190,13 @@ where
             nodes.push(OrderedNode::new(host, orderer));
         }
 
-        // identical genesis module set -> identical genesis app-hash.
-        let genesis = nodes[0].app_hash();
+        // identical genesis module set -> identical genesis root-hash.
+        let genesis = nodes[0].root_hash();
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 genesis,
-                "identical genesis -> identical app-hash"
+                "identical genesis -> identical root-hash"
             );
         }
         let genesis_kv = nodes[0].host().module_root("kv").unwrap();
@@ -216,9 +216,9 @@ where
         // EVERY node is still at genesis — nothing was applied optimistically.
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 genesis,
-                "no optimistic echo: submit does not advance app-hash"
+                "no optimistic echo: submit does not advance root-hash"
             );
         }
 
@@ -242,20 +242,20 @@ where
             }
         }
 
-        // THE MILESTONE: byte-identical app-hash on every validator, moved off
+        // THE MILESTONE: byte-identical root-hash on every validator, moved off
         // genesis, INCLUDING the order-dependent qmdb root — under REAL BFT order.
-        let converged = nodes[0].app_hash();
+        let converged = nodes[0].root_hash();
         let converged_kv = nodes[0].host().module_root("kv").unwrap();
         assert_ne!(
             converged, genesis,
-            "the finalized ops moved the app-hash off genesis"
+            "the finalized ops moved the root-hash off genesis"
         );
         assert_ne!(converged_kv, genesis_kv, "the qmdb root moved off genesis");
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 converged,
-                "all validators converge on identical app-hash"
+                "all validators converge on identical root-hash"
             );
             assert_eq!(
                 n.host().module_root("kv").unwrap(),
