@@ -111,8 +111,9 @@ lands on the source app-hash:
 cargo test -p demo --test network_joiner_full
 ```
 
-Run everything the repo can verify locally (rust workspace including the e2e
-suites, then the app suites against a freshly built daemon):
+Run everything the repo can verify locally (the wasm-artifact drift gate, the
+rust workspace including the e2e suites, the consensus sim-feature suite, and a
+build of the noded + simnode binaries the test harnesses stage):
 
 ```sh
 make test
@@ -127,85 +128,44 @@ target/release/coordinator --help
 target/release/coordinator --listen 0.0.0.0:3478
 ```
 
-## Run The App
+## Run a node
 
-Ducktape has a native Rust desktop app under `app/src-iced` and a React web
-twin under `app/`. The iced app owns every product screen and the desktop
-lifecycle; pinned CEF is embedded only as the Browser pane. Both surfaces use
-the same node HTTP/WebSocket contracts. The desktop app also owns the workspace
-registry and starts or adopts each workspace's `ducktape` process.
+The product ships as headless surfaces — there is no bundled desktop app in
+this tree. Three binaries are runnable:
 
-Install the current platform's self-contained desktop package. Every default is
-rootless: macOS uses `~/Applications`, Linux uses `~/.ducktape` plus
-`~/.cargo/bin`, and Windows uses the current user's LocalAppData. Each package
-already carries its exact matching node sidecar. A managed
-Mac can opt into a shared location with `make install APP_DEST=/Applications`.
+- **`node-bin`** (the `ducktape` daemon) — the networked node that serves the
+  module HTTP/WebSocket surface. Release build with `make node`; run a
+  throwaway dev daemon with temporary storage:
 
-```sh
-make install
-```
+  ```sh
+  cargo run -p noded                        # http://127.0.0.1:8844, temp storage
+  # add -- --storage <dir> for persistent module state
+  ```
 
-Operators who also want the standalone node CLI in `~/.cargo/bin` can run
-`make install-node` explicitly.
+  A browser or any HTTP client dials `http://127.0.0.1:8844` by default; the
+  node exposes the same module contracts the rest of the platform speaks.
 
-Web, for development — start the daemon, then the dev server:
+- **`simnode`** — a deterministic in-process twin of the node's `/v1` surface
+  (`bin/simnode`), used by the test lanes; embed it in any crate's tests via
+  `simnode::boot`.
 
-```sh
-DUCKTAPE_ALLOWED_ORIGINS=http://localhost:1420 \
-  cargo run -p noded                      # http://127.0.0.1:8844, temp storage
-# add -- --storage <dir> for persistent module state
+- **`coordinator`** — the untrusted UDP rendezvous (see the operator path
+  above).
 
-cd app
-bun install
-bun run dev                               # http://localhost:1420
-```
-
-The web build dials `http://127.0.0.1:8844` by default; point it elsewhere
-with `VITE_DUCKTAPE_NODE_URL`.
-
-Desktop, for development — build the matching node and run the native shell:
+Install the `ducktape` operator CLI into `~/.cargo/bin`:
 
 ```sh
-make dev
+make install          # == make install-node
 ```
 
-On first launch the desktop app opens the onboarding gate: found a new network
-or join one from an invite blob. Each becomes a **workspace** under
-`~/.ducktape/workspaces/<id>/` (its own descriptor, ed25519 identity, storage,
-and `daemon.log`), tracked in `~/.ducktape/registry.json`. Selecting a workspace
-spawns/adopts its `ducktape` on the workspace's own port and dials it; a
-joiner parks until a member admits it (Settings → Admit a joiner) and then
-promotes itself, with the park→admitted→promoted phase shown live. The web build
-has no registry — it dials a single configured node (`VITE_DUCKTAPE_NODE_URL`).
-
-`make app` builds a self-contained native package under
-`target/release/bundle`: an ad-hoc signed local-test `.app` plus zip on macOS, a relocatable
-directory plus tarball on Linux, or a relocatable directory plus zip on
-Windows. Every package includes the node sidecar and the Cargo-pinned CEF
-runtime. `make web` still builds the independent static web twin to `app/dist`.
-The macOS app requires macOS 14 or newer; set `DUCKTAPE_MACOS_SIGN_IDENTITY`
-and `DUCKTAPE_MACOS_NOTARY_PROFILE` for Developer ID signing and notarization.
-
-On macOS, validate the staged native window, close-to-menu-bar behavior, and
-activation reopen before testing product flows (the invoking terminal needs
-Accessibility permission):
+Seed a local "demo" network preloaded with sample data — chat channels and
+messages, a tasks board, pages, a registered agent, an inbox note, an
+automation rule, plus gateway web-app routes — registered as a "demo"
+workspace under `~/.ducktape`:
 
 ```sh
-make macos-smoke
-make macos-cef-smoke
+make demo-seed
 ```
-
-Then exercise the hardware/TCC paths that cannot be validated off-Mac:
-
-- open Browser, navigate and resize it, and confirm CEF content stays below
-  the native chrome;
-- allow, deny, cancel, and retry microphone, camera, and screen sharing in a
-  huddle; switch each available device and stop sharing;
-- pop a huddle out and back in, close/reopen the main window, and activate a
-  native notification;
-- enable and use Touch ID after the normal account unlock; and
-- confirm the app and workspace remain under the current user's directories
-  and never request an administrator password.
 
 ## Documentation
 

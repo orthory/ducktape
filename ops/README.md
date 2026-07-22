@@ -1,91 +1,44 @@
-# Desktop operations
+# Operator scripts
 
-Ducktape's supported desktop is the native Rust application in
-`app/src-iced`. Iced owns the UI, workspace registry, node lifecycle, system
-integration, and media. The pinned CEF runtime is present only for the isolated
-Browser pane. The React application under `app/` is an independent static web
-twin and is not part of the desktop package.
+Repo-side helpers for running, seeding, and maintaining a ducktape node. There
+is no desktop app in this tree anymore — the native iced shell was removed; the
+runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
+`simnode`, and the UDP coordinator. Most scripts here back a `make` target; see
+the repository `Makefile`.
 
-## Development
-
-From the repository root:
+## Demo network
 
 ```bash
-make dev       # matching debug node + native Iced app
-make web       # independent React bundle -> app/dist
+make demo-seed   # ops/demo-seed.sh  — seed a solo "demo" workspace with sample data
+make demo-app    # ops/demo-app.sh   — serve the user-hosted app behind its gateway route
+make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 ```
 
-`make dev` stages a real `.app` on macOS, runs the flat binary with an explicit
-node sidecar on Linux, and stages the CEF bootstrap package on Windows. CEF is
-Cargo-pinned; `make cef-env` installs only the build prerequisite needed by the
-current host.
+`demo-gateway.mjs` and `demo-kanban.mjs` publish the demo's gateway web-app
+routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
-## Packages
+## Forge
 
-```bash
-make app       # self-contained package under target/release/bundle
-make install   # current-user install; no root required
-```
+- `dogfood-forge.sh` (`make dogfood-forge`) — mirror GitHub `origin/dev` into
+  the local node's Forge `dev` without moving release-only `main`; needs a
+  running node.
+- `mirror-forge-pr.sh` — deliver a merged canonical Forge PR onto GitHub `dev`
+  (`mirror-forge-pr.test.sh` is its test).
 
-Every desktop package includes the matching `ducktape` sidecar and pinned
-CEF payload. Platform staging lives in `stage-macos-iced-app.sh`,
-`stage-linux-app.sh`, and `stage-windows-app.ps1`. Do not copy only the main
-executable: its sibling sidecar and CEF resources are part of the package
-contract.
+## Node operator CLI
 
-Windows staging must run in an MSVC/Windows SDK environment with CMake, Ninja,
-and `mt.exe` on `PATH`; the script embeds the `asInvoker` manifest in the
-bootstrap PE and reads it back before packaging.
+- `agent-system` — a compact operator CLI over a running node's module surface
+  (raw query/submit, agent list/pause/resume); reads the selected node from
+  `~/.ducktape/agent-system-url`.
+- `completions/` — shell completions for the `ducktape` CLI.
 
-macOS local builds are ad-hoc signed, use an explicitly `-unsigned` release ZIP,
-and require macOS 14 or newer. A direct-distribution release requires both a
-Developer ID Application identity and a notarytool keychain profile:
+## Networking and media harnesses
 
-```bash
-DUCKTAPE_MACOS_SIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
-DUCKTAPE_MACOS_NOTARY_PROFILE=ducktape-notary make app
-```
-
-The staging script signs nested Mach-O files inside-out with the hardened
-runtime, submits the release ZIP, staples and Gatekeeper-checks the app, and
-repacks the stapled artifact. It refuses to create a Developer ID release
-without notarization. Credentials remain in the login keychain.
-
-Windows local packages are explicitly suffixed `-unsigned`. A distribution
-archive requires a code-signing certificate and RFC 3161 timestamp service;
-the staging script signs and Authenticode-verifies every app-owned PE after
-embedding the rootless manifest and before archiving:
-
-```powershell
-$env:DUCKTAPE_WINDOWS_SIGN_SHA1 = "CERTIFICATE_THUMBPRINT"
-$env:DUCKTAPE_WINDOWS_TIMESTAMP_URL = "http://timestamp.example"
-make app
-```
-
-## Native verification
-
-Run the repository gates first:
-
-```bash
-cargo test -p ducktape-iced
-cd app && bun install --frozen-lockfile
-bun run typecheck
-bun run test
-bun run build
-```
-
-On macOS, the supported real-window gates are:
-
-```bash
-make macos-smoke       # launch, close-to-menu-bar, activation reopen
-make macos-cef-smoke   # staged CEF child, navigation, bounds, teardown
-```
-
-The terminal running `macos-smoke` needs Accessibility permission. On Linux
-and Windows, launch the staged package from `target/release/bundle`, complete
-onboarding in an isolated user profile, enter a workspace, and open Browser.
-Verify that `ducktape` belongs to that workspace and that the CEF child
-exits with the app. Use the `qa` skill for the exact checklist.
+- `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
+  coordinator (see `coordinator/README.md`).
+- `wg-smoke/` — WireGuard smoke, interop, and bench harnesses.
+- `callbed/` — containerized huddle/call end-to-end harness (see
+  `callbed/README.md`).
 
 ## Worktree cleanup
 
