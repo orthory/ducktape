@@ -2,7 +2,6 @@ use super::{
     AuthorRef, BlockKind, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId, Msg, PAGE_INDEX_KEY,
     PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget, StateRoot,
     StateSyncHandle, TagEvent, TaggingMsg, TargetThreads, decode_msg, decode_query, encode_reply,
-    hash_key,
 };
 
 fn tag_author(author: &AuthorRef) -> tagging::Author {
@@ -35,24 +34,21 @@ impl Module for Pages {
 
     /// the store's REAL merkle root over all blocks, as a 32-byte state root.
     fn root(&self) -> StateRoot {
-        self.store.root()
+        self.staged.root()
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::ResolverBacked {
-            backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
-        })
+        self.staged.state_sync_handle()
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire
     /// requests from committed state. read-only.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        self.store.serve_sync(req).await
+        self.staged.serve_sync(req).await
     }
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
-        self.store.sync_target().await
+        self.staged.sync_target().await
     }
 
     /// decode a [`crate::PageMsg`] and apply it to the staged overlay. the only
@@ -191,23 +187,13 @@ impl Module for Pages {
     /// if nothing was staged. BTreeMap iteration keeps the write order
     /// deterministic across validators.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let writes = self
-            .pending
-            .iter()
-            .map(|(key, value)| (hash_key(key), value.clone()))
-            .collect();
-        self.store.commit_batch(writes).await?;
-        self.pending.clear();
-        Ok(())
+        self.staged.commit().await
     }
 
     /// discard the staged records — nothing reached the store, so `root()` is
     /// unchanged.
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
+        self.staged.abort();
         Ok(())
     }
 }

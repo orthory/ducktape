@@ -30,6 +30,10 @@
 pub mod codec;
 pub mod genesis_config;
 pub mod hash;
+pub mod staged_store;
+pub mod wire;
+
+pub use staged_store::StagedStore;
 
 /// length of an authenticated state root, in bytes. both substrates we use emit
 /// 32-byte digests — a qmdb merkle root and a sha256-mode git oid — so a module
@@ -304,6 +308,53 @@ pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// the field separator inside composite module keys (dispatch keys and saga
+/// ids, tagging scope keys): the ASCII unit separator. rejected inside a
+/// caller-chosen id by [`validate_id`] so a crafted id can never forge another
+/// composite key.
+pub const KEY_SEP: char = '\x1f';
+
+/// validate a caller-chosen id: non-empty, within `max_bytes`, and free of the
+/// reserved [`KEY_SEP`] — the shared guard for keys that compose with
+/// [`KEY_SEP`]. shared by dispatch and tagging. NOT agent's `validate_agent_id`,
+/// which is a deliberately separate DNS-label admission rule (an agent id must
+/// round-trip as `<id>@agents.duck`), kept distinct so neither rule can
+/// silently move the other.
+pub fn validate_id(field: &str, value: &str, max_bytes: usize) -> Result<(), Error> {
+    if value.is_empty() {
+        return Err(Error::Module(format!("{field} must be non-empty")));
+    }
+    if value.len() > max_bytes {
+        return Err(Error::Module(format!(
+            "{field} is {} bytes; the cap is {max_bytes}",
+            value.len()
+        )));
+    }
+    if value.contains(KEY_SEP) {
+        return Err(Error::Module(format!(
+            "{field} must not contain the reserved separator"
+        )));
+    }
+    Ok(())
+}
+
+/// the "re-derive root, compare, all-or-nothing" guard every in-memory module's
+/// `install` shares: a decoded snapshot is adopted ONLY when its recomputed
+/// root equals the expected (consensus-committed) root. `actual` is the root
+/// the module rehashed from the decoded candidate; a mismatch is a byzantine
+/// peer serving bytes that do not hash to the committed state, refused so the
+/// caller mutates nothing. this is a state-sync integrity check, never a
+/// consensus input — the verdict (accept/reject) is what matters, and it is
+/// identical to the per-module guards this replaces.
+pub fn verify_snapshot_root(actual: StateRoot, expected: StateRoot) -> Result<(), Error> {
+    if actual != expected {
+        return Err(Error::Module(format!(
+            "snapshot root mismatch: recomputed {actual:?}, expected {expected:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// the deterministic environment handed to `execute`. block-constant fields
 /// (`height`, `consensus_time`) are identical across every dispatch in one
 /// `submit`; `origin` and `me` vary per dispatch. NOT wall clock, NOT per-node.
@@ -493,16 +544,32 @@ pub trait Module {
     /// the global app-hash after a block applies.
     fn root(&self) -> StateRoot;
 
+    /// self-contained committed-state snapshot bytes, for the in-memory
+    /// (map-backed) module cohort whose whole state fits one installable blob.
+    /// override this — returning `Some(self.snapshot())` — instead of
+    /// `state_sync_handle`; the default `state_sync_handle` wraps these bytes in
+    /// [`StateSyncHandle::SnapshotBytes`] for you, so a module declares WHAT it
+    /// can serve without also knowing the handle enum. `None` (the default) means
+    /// no byte snapshot; a resolver-backed (qmdb) module overrides
+    /// `state_sync_handle` directly instead.
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// describe the committed-state sync surface for this module.
     ///
     /// This is called by snapshot orchestration after the host has reached a
-    /// block boundary. The default is explicit non-coverage; modules that expose
-    /// installable snapshot bytes or a resolver-backed sync path should override
-    /// it so a live node can advertise exactly what it can serve.
+    /// block boundary. The default reports [`StateSyncHandle::SnapshotBytes`]
+    /// when [`Module::snapshot_bytes`] is `Some` (the in-memory cohort), else
+    /// explicit non-coverage; a resolver-backed module overrides this directly
+    /// so a live node can advertise exactly what it can serve.
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::Unsupported {
-            reason: "module did not declare a state-sync handle".into(),
-        })
+        match self.snapshot_bytes() {
+            Some(bytes) => Ok(StateSyncHandle::SnapshotBytes(bytes)),
+            None => Ok(StateSyncHandle::Unsupported {
+                reason: "module did not declare a state-sync handle".into(),
+            }),
+        }
     }
 
     /// serve one byte-level state-sync request against COMMITTED state.
@@ -663,6 +730,70 @@ mod tests {
         assert!(require_non_empty("id", "x").is_ok());
         let err = require_non_empty("id", "").unwrap_err().to_string();
         assert!(err.contains("id must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn validate_id_guard() {
+        assert!(validate_id("id", "ok", 128).is_ok());
+        assert!(
+            validate_id("id", "", 128)
+                .unwrap_err()
+                .to_string()
+                .contains("must be non-empty")
+        );
+        assert!(
+            validate_id("id", "toolong", 3)
+                .unwrap_err()
+                .to_string()
+                .contains("the cap is 3")
+        );
+        let with_sep = format!("a{KEY_SEP}b");
+        assert!(
+            validate_id("id", &with_sep, 128)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved separator")
+        );
+    }
+
+    #[test]
+    fn verify_snapshot_root_guard() {
+        let a = StateRoot([1u8; ROOT_LEN]);
+        let b = StateRoot([2u8; ROOT_LEN]);
+        assert!(verify_snapshot_root(a, a).is_ok());
+        let err = verify_snapshot_root(a, b).unwrap_err().to_string();
+        assert!(err.contains("snapshot root mismatch"), "{err}");
+    }
+
+    /// the default `state_sync_handle` reflects `snapshot_bytes`: `Some` ->
+    /// `SnapshotBytes`, `None` -> `Unsupported` — the in-memory cohort overrides
+    /// only `snapshot_bytes` and the wrapping is shared.
+    #[test]
+    fn snapshot_bytes_drives_default_handle() {
+        struct Snap(Option<Vec<u8>>);
+        #[async_trait::async_trait(?Send)]
+        impl Module for Snap {
+            fn id(&self) -> ModuleId {
+                "snap".into()
+            }
+            fn root(&self) -> StateRoot {
+                StateRoot::ZERO
+            }
+            fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+                self.0.clone()
+            }
+            async fn execute(&mut self, _: &mut dyn Ctx, _: &Msg) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            Snap(Some(vec![1, 2, 3])).state_sync_handle().unwrap(),
+            StateSyncHandle::SnapshotBytes(vec![1, 2, 3])
+        );
+        assert!(matches!(
+            Snap(None).state_sync_handle().unwrap(),
+            StateSyncHandle::Unsupported { .. }
+        ));
     }
 
     #[test]

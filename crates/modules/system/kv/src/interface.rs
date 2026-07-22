@@ -1,5 +1,6 @@
-//! the kv module's public wire surface — types only, no logic, no sdk dep.
-//! a module that wants to write kv depends on THIS, never on the kv impl.
+//! the kv module's public wire surface — types plus thin `sdk::wire` codec
+//! delegates. a module that wants to write kv depends on THIS, never on the
+//! kv impl.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,11 +12,11 @@ pub enum KvMsg {
 }
 
 pub fn encode(m: &KvMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("KvMsg is always serializable")
+    sdk::wire::encode(m)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<KvMsg, String> {
-    serde_json::from_slice(bytes).map_err(|e| e.to_string())
+    sdk::wire::decode(bytes)
 }
 
 /// read requests the kv module serves via `Module::query`.
@@ -32,14 +33,14 @@ pub enum KvReply {
 }
 
 pub fn encode_query(q: &KvQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<KvQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &KvReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<KvReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

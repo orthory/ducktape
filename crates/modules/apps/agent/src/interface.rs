@@ -692,32 +692,32 @@ pub enum AgentReply {
 // ---- codecs -------------------------------------------------------------------
 
 pub fn encode_msg(m: &AgentMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<AgentMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_event(e: &AgentEvent) -> Vec<u8> {
-    serde_json::to_vec(e).expect("serializable")
+    sdk::wire::encode(e)
 }
 pub fn decode_event(b: &[u8]) -> Result<AgentEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_response(r: &AgentResponse) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_response(b: &[u8]) -> Result<AgentResponse, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_query(q: &AgentQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<AgentQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &AgentReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<AgentReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

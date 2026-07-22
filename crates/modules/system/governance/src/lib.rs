@@ -44,7 +44,7 @@ use identity::{
     encode_msg as identity_encode_msg, encode_query as identity_encode_query,
 };
 use sdk::codec::{Cursor, push_bytes};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
 use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
 use valset::{
@@ -702,9 +702,7 @@ impl Governance {
     /// any error. success drops the stage (it belonged to the replaced state).
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (proposals, redeemed, shares, share_mode) = decode_state(bytes)?;
-        if Self::root_of(&proposals, &redeemed, shares.as_ref(), share_mode) != expected {
-            return Err(Error::Module("snapshot root mismatch".into()));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&proposals, &redeemed, shares.as_ref(), share_mode), expected)?;
         self.proposals = proposals;
         self.redeemed = redeemed;
         self.shares = shares;
@@ -1338,8 +1336,8 @@ impl Module for Governance {
         )
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

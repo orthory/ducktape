@@ -4,39 +4,19 @@ use super::{
     PendingState, RUN_KEY_SEPARATOR, RunAuthority, SESSION_KEY_LEN, SagaOrigin, Sha256, StateRoot,
     TurnPolicy, delegation_id_for, dispatch_id_for,
 };
+use sdk::codec;
 use serde::de::DeserializeOwned;
 
 // ---- canonical encoding -------------------------------------------------------
 // u64-le counts, sorted keys, every field in declaration order: u64-le length
 // prefixes for byte strings, single-byte discriminants for enums, a 0/1 tag
-// byte for options, u64-le integers. this is the exact preimage
-// [`Module::root`] hashes, so a snapshot and the root that must authenticate
-// it cannot drift. no version byte — encoding changes are flag-day (design
-// principle: no backwards compatibility).
-
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
-fn put_opt_u64(out: &mut Vec<u8>, opt: Option<u64>) {
-    match opt {
-        None => out.push(0),
-        Some(v) => {
-            out.push(1);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-}
+// byte for options, u64-le integers (via the shared `sdk::codec` writers). this
+// is the exact preimage [`Module::root`] hashes, so a snapshot and the root that
+// must authenticate it cannot drift. no version byte — encoding changes are
+// flag-day (design principle: no backwards compatibility).
 
 fn put_opt_string(out: &mut Vec<u8>, opt: &Option<String>) {
-    match opt {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            put_bytes(out, value.as_bytes());
-        }
-    }
+    codec::push_opt_str(out, opt.as_deref());
 }
 
 fn put_opt_json<T: serde::Serialize>(out: &mut Vec<u8>, opt: &Option<T>) {
@@ -44,7 +24,7 @@ fn put_opt_json<T: serde::Serialize>(out: &mut Vec<u8>, opt: &Option<T>) {
         None => out.push(0),
         Some(value) => {
             out.push(1);
-            put_bytes(
+            codec::push_bytes(
                 out,
                 &serde_json::to_vec(value).expect("committed state serializes"),
             );
@@ -56,11 +36,11 @@ fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
     match origin {
         SagaOrigin::External(key) => {
             out.push(0);
-            put_bytes(out, key);
+            codec::push_bytes(out, key);
         }
         SagaOrigin::Module(module) => {
             out.push(1);
-            put_bytes(out, module.as_bytes());
+            codec::push_bytes(out, module.as_bytes());
         }
         SagaOrigin::System => out.push(2),
     }
@@ -76,13 +56,13 @@ pub(super) fn encode_committed(
 
     out.extend_from_slice(&(watches.len() as u64).to_le_bytes());
     for (channel, policy) in watches {
-        put_bytes(&mut out, channel.as_bytes());
+        codec::push_bytes(&mut out, channel.as_bytes());
         match policy {
             TurnPolicy::Mention => out.push(0),
             TurnPolicy::All => out.push(1),
             TurnPolicy::Assigned(agent_id) => {
                 out.push(2);
-                put_bytes(&mut out, agent_id.as_bytes());
+                codec::push_bytes(&mut out, agent_id.as_bytes());
             }
             TurnPolicy::RoundRobin => out.push(3),
         }
@@ -90,15 +70,15 @@ pub(super) fn encode_committed(
 
     out.extend_from_slice(&(pending.len() as u64).to_le_bytes());
     for (dispatch_id, p) in pending {
-        put_bytes(&mut out, dispatch_id.as_bytes());
-        put_bytes(&mut out, p.run_id.as_bytes());
-        put_bytes(&mut out, p.agent_id.as_bytes());
-        put_bytes(&mut out, p.workspace_agent_id.as_bytes());
+        codec::push_bytes(&mut out, dispatch_id.as_bytes());
+        codec::push_bytes(&mut out, p.run_id.as_bytes());
+        codec::push_bytes(&mut out, p.agent_id.as_bytes());
+        codec::push_bytes(&mut out, p.workspace_agent_id.as_bytes());
         put_opt_json(&mut out, &p.authority);
         put_opt_string(&mut out, &p.delegation_id);
-        put_bytes(&mut out, p.channel_id.as_bytes());
+        codec::push_bytes(&mut out, p.channel_id.as_bytes());
         out.extend_from_slice(&p.anchor_seq.to_le_bytes());
-        put_opt_u64(&mut out, p.thread_root);
+        codec::push_opt_u64(&mut out, p.thread_root);
         put_opt_string(&mut out, &p.job_id);
         out.extend_from_slice(&p.job_claim_height.to_le_bytes());
         put_origin(&mut out, &p.requester);
@@ -111,17 +91,17 @@ pub(super) fn encode_committed(
     // mint different ids.
     out.extend_from_slice(&(sessions.len() as u64).to_le_bytes());
     for (run_id, s) in sessions {
-        put_bytes(&mut out, run_id.as_bytes());
-        put_bytes(&mut out, s.agent_id.as_bytes());
-        put_bytes(&mut out, &s.session_key);
+        codec::push_bytes(&mut out, run_id.as_bytes());
+        codec::push_bytes(&mut out, s.agent_id.as_bytes());
+        codec::push_bytes(&mut out, &s.session_key);
         out.extend_from_slice(&s.opened_at.to_le_bytes());
         out.extend_from_slice(&u64::from(s.actions).to_le_bytes());
     }
 
     out.extend_from_slice(&(delegations.len() as u64).to_le_bytes());
     for (delegation_id, delegation) in delegations {
-        put_bytes(&mut out, delegation_id.as_bytes());
-        put_bytes(
+        codec::push_bytes(&mut out, delegation_id.as_bytes());
+        codec::push_bytes(
             &mut out,
             &serde_json::to_vec(delegation).expect("delegation state serializes"),
         );
@@ -148,74 +128,55 @@ pub(super) fn committed_root(
 // free), unknown discriminants/tags and trailing bytes are rejected. never
 // panics on malformed input.
 
-/// pull `n` bytes off the front of `buf`, checked before any slicing.
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-    if n > buf.len() {
-        return Err("snapshot truncated".into());
-    }
-    let (head, tail) = buf.split_at(n);
-    *buf = tail;
-    Ok(head)
+// primitives delegate to the shared `sdk::codec::Cursor` (each accessor
+// bounds-checks before it reads); the Cursor error is mapped to this module's
+// `String` decode contract. the module-specific readers thread one `Cursor`
+// through the whole decode.
+
+fn take_byte(cur: &mut codec::Cursor, what: &str) -> Result<u8, String> {
+    cur.byte(what).map_err(|e| e.to_string())
 }
 
-fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        take(buf, 8)?.try_into().expect("8 bytes"),
-    ))
+fn take_u64(cur: &mut codec::Cursor) -> Result<u64, String> {
+    cur.u64("snapshot u64").map_err(|e| e.to_string())
 }
 
-/// a length prefix, validated against the remaining input before the caller
-/// allocates anything of that size.
-fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
-    let n = take_u64(buf)?;
-    if n > buf.len() as u64 {
-        return Err("snapshot length prefix exceeds input".into());
-    }
-    Ok(n as usize)
+fn take_lp_bytes(cur: &mut codec::Cursor) -> Result<Vec<u8>, String> {
+    cur.bytes("snapshot bytes")
+        .map(<[u8]>::to_vec)
+        .map_err(|e| e.to_string())
 }
 
-fn take_lp_bytes(buf: &mut &[u8]) -> Result<Vec<u8>, String> {
-    let len = take_len(buf)?;
-    Ok(take(buf, len)?.to_vec())
+fn take_lp_string(cur: &mut codec::Cursor) -> Result<String, String> {
+    cur.string("snapshot string").map_err(|e| e.to_string())
 }
 
-fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
-    let len = take_len(buf)?;
-    Ok(std::str::from_utf8(take(buf, len)?)
-        .map_err(|_| "snapshot string is not utf-8".to_string())?
-        .to_owned())
+fn take_opt_u64(cur: &mut codec::Cursor) -> Result<Option<u64>, String> {
+    cur.opt_u64("snapshot opt u64").map_err(|e| e.to_string())
 }
 
-fn take_opt_u64(buf: &mut &[u8]) -> Result<Option<u64>, String> {
-    match take(buf, 1)?[0] {
+fn take_opt_string(cur: &mut codec::Cursor) -> Result<Option<String>, String> {
+    match take_byte(cur, "snapshot opt tag")? {
         0 => Ok(None),
-        1 => Ok(Some(take_u64(buf)?)),
+        1 => Ok(Some(take_lp_string(cur)?)),
         t => Err(format!("snapshot has unknown option tag {t}")),
     }
 }
 
-fn take_opt_string(buf: &mut &[u8]) -> Result<Option<String>, String> {
-    match take(buf, 1)?[0] {
+fn take_opt_json<T: DeserializeOwned>(cur: &mut codec::Cursor) -> Result<Option<T>, String> {
+    match take_byte(cur, "snapshot opt tag")? {
         0 => Ok(None),
-        1 => Ok(Some(take_lp_string(buf)?)),
-        t => Err(format!("snapshot has unknown option tag {t}")),
-    }
-}
-
-fn take_opt_json<T: DeserializeOwned>(buf: &mut &[u8]) -> Result<Option<T>, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(None),
-        1 => serde_json::from_slice(&take_lp_bytes(buf)?)
+        1 => serde_json::from_slice(&take_lp_bytes(cur)?)
             .map(Some)
             .map_err(|error| format!("snapshot json value failed to decode: {error}")),
         tag => Err(format!("snapshot has unknown option tag {tag}")),
     }
 }
 
-fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
-    match take(buf, 1)?[0] {
-        0 => Ok(SagaOrigin::External(take_lp_bytes(buf)?)),
-        1 => Ok(SagaOrigin::Module(take_lp_string(buf)?)),
+fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, String> {
+    match take_byte(cur, "snapshot origin discriminant")? {
+        0 => Ok(SagaOrigin::External(take_lp_bytes(cur)?)),
+        1 => Ok(SagaOrigin::Module(take_lp_string(cur)?)),
         2 => Ok(SagaOrigin::System),
         d => Err(format!("snapshot has unknown origin discriminant {d}")),
     }
@@ -223,15 +184,11 @@ fn take_origin(buf: &mut &[u8]) -> Result<SagaOrigin, String> {
 
 /// a section count, bounded by what the remaining input could possibly hold
 /// given each entry's minimum encoded size — rejected before the loop builds
-/// anything.
-fn take_count(buf: &mut &[u8], min_entry_bytes: u64, what: &str) -> Result<u64, String> {
-    let count = take_u64(buf)?;
-    if count
-        .checked_mul(min_entry_bytes)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err(format!("snapshot {what} count exceeds input"));
-    }
+/// anything (`Cursor::bound`).
+fn take_count(cur: &mut codec::Cursor, min_entry_bytes: u64, what: &str) -> Result<u64, String> {
+    let count = take_u64(cur)?;
+    cur.bound(count, min_entry_bytes, what)
+        .map_err(|e| e.to_string())?;
     Ok(count)
 }
 
@@ -388,7 +345,7 @@ type Committed = (
     BTreeMap<String, DelegationState>,
 );
 
-pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
+pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: a watch costs its id prefix and a policy
     // discriminant; a pending entry its three length prefixes, anchor, two
     // option tags, claim height, origin discriminant, and created_at; a session
@@ -398,17 +355,18 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8;
     const MIN_DELEGATION_BYTES: u64 = 8 + 8;
 
+    let mut cur = codec::Cursor::new(bytes);
     let mut watches: BTreeMap<String, TurnPolicy> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_WATCH_BYTES, "watch")?;
+    let count = take_count(&mut cur, MIN_WATCH_BYTES, "watch")?;
     for _ in 0..count {
-        let channel = take_lp_string(&mut buf)?;
+        let channel = take_lp_string(&mut cur)?;
         if contains_run_separator(&channel) {
             return Err("snapshot channel_id contains reserved unit separator".into());
         }
-        let policy = match take(&mut buf, 1)?[0] {
+        let policy = match take_byte(&mut cur, "snapshot turn policy")? {
             0 => TurnPolicy::Mention,
             1 => TurnPolicy::All,
-            2 => TurnPolicy::Assigned(take_lp_string(&mut buf)?),
+            2 => TurnPolicy::Assigned(take_lp_string(&mut cur)?),
             3 => TurnPolicy::RoundRobin,
             d => return Err(format!("snapshot has unknown turn policy {d}")),
         };
@@ -416,21 +374,21 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     }
 
     let mut pending: BTreeMap<String, PendingState> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_PENDING_BYTES, "pending")?;
+    let count = take_count(&mut cur, MIN_PENDING_BYTES, "pending")?;
     for _ in 0..count {
-        let dispatch_id = take_lp_string(&mut buf)?;
-        let run_id = take_lp_string(&mut buf)?;
-        let agent_id = take_lp_string(&mut buf)?;
-        let workspace_agent_id = take_lp_string(&mut buf)?;
-        let authority = take_opt_json::<RunAuthority>(&mut buf)?;
-        let delegation_id = take_opt_string(&mut buf)?;
-        let channel_id = take_lp_string(&mut buf)?;
-        let anchor_seq = take_u64(&mut buf)?;
-        let thread_root = take_opt_u64(&mut buf)?;
-        let job_id = take_opt_string(&mut buf)?;
-        let job_claim_height = take_u64(&mut buf)?;
-        let requester = take_origin(&mut buf)?;
-        let created_at = take_u64(&mut buf)?;
+        let dispatch_id = take_lp_string(&mut cur)?;
+        let run_id = take_lp_string(&mut cur)?;
+        let agent_id = take_lp_string(&mut cur)?;
+        let workspace_agent_id = take_lp_string(&mut cur)?;
+        let authority = take_opt_json::<RunAuthority>(&mut cur)?;
+        let delegation_id = take_opt_string(&mut cur)?;
+        let channel_id = take_lp_string(&mut cur)?;
+        let anchor_seq = take_u64(&mut cur)?;
+        let thread_root = take_opt_u64(&mut cur)?;
+        let job_id = take_opt_string(&mut cur)?;
+        let job_claim_height = take_u64(&mut cur)?;
+        let requester = take_origin(&mut cur)?;
+        let created_at = take_u64(&mut cur)?;
         let entry = PendingState {
             run_id,
             agent_id,
@@ -450,13 +408,13 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     }
 
     let mut sessions: BTreeMap<String, AgentSession> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_SESSION_BYTES, "session")?;
+    let count = take_count(&mut cur, MIN_SESSION_BYTES, "session")?;
     for _ in 0..count {
-        let run_id = take_lp_string(&mut buf)?;
-        let agent_id = take_lp_string(&mut buf)?;
-        let session_key = take_lp_bytes(&mut buf)?;
-        let opened_at = take_u64(&mut buf)?;
-        let actions = u32::try_from(take_u64(&mut buf)?)
+        let run_id = take_lp_string(&mut cur)?;
+        let agent_id = take_lp_string(&mut cur)?;
+        let session_key = take_lp_bytes(&mut cur)?;
+        let opened_at = take_u64(&mut cur)?;
+        let actions = u32::try_from(take_u64(&mut cur)?)
             .map_err(|_| "snapshot session action count exceeds u32".to_string())?;
         let session = AgentSession {
             run_id: run_id.clone(),
@@ -470,16 +428,16 @@ pub(super) fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
     }
 
     let mut delegations: BTreeMap<String, DelegationState> = BTreeMap::new();
-    let count = take_count(&mut buf, MIN_DELEGATION_BYTES, "delegation")?;
+    let count = take_count(&mut cur, MIN_DELEGATION_BYTES, "delegation")?;
     for _ in 0..count {
-        let id = take_lp_string(&mut buf)?;
-        let state: DelegationState = serde_json::from_slice(&take_lp_bytes(&mut buf)?)
+        let id = take_lp_string(&mut cur)?;
+        let state: DelegationState = serde_json::from_slice(&take_lp_bytes(&mut cur)?)
             .map_err(|error| format!("snapshot delegation failed to decode: {error}"))?;
         insert_ascending(&mut delegations, id, state)?;
     }
     validate_decoded_delegations(&pending, &delegations)?;
 
-    if !buf.is_empty() {
+    if cur.remaining() != 0 {
         return Err("snapshot has trailing bytes".into());
     }
     Ok((watches, pending, sessions, delegations))

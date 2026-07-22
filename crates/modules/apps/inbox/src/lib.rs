@@ -277,9 +277,7 @@ impl Inbox {
 
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let members = decode_snapshot(bytes)?;
-        if Self::root_of(&members) != expected {
-            return Err(Error::Module("snapshot root mismatch".into()));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&members), expected)?;
         self.members = members;
         self.pending.clear();
         self.new_pending = 0;
@@ -383,8 +381,8 @@ impl Module for Inbox {
 
     /// advertise the snapshot lane: [`Inbox::snapshot`] is the exact preimage of
     /// `root()`, and [`Inbox::install`] verifies before adopting.
-    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, Error> {
-        Ok(sdk::StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

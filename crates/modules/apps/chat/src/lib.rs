@@ -51,23 +51,16 @@ pub mod video;
 #[cfg(feature = "native")]
 pub mod call_wire;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use sdk::{
-    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StateRoot,
-    StateSyncHandle,
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use sha2::Digest as _;
 use tagging::{TagEvent, TaggingMsg};
 
 const CHANNEL_INDEX_KEY: &[u8] = b"channel-index";
-
-/// hash a logical record key to its fixed-width store key. deterministic, so
-/// every validator maps a given logical key to the same store slot.
-fn hash_key(key: &[u8]) -> [u8; 32] {
-    sha2::Sha256::digest(key).into()
-}
 
 /// single-component key: prefix + 0 + id. safe because every prefix is a fixed
 /// literal and no prefix is another prefix followed by a 0 byte.
@@ -229,11 +222,11 @@ struct Posted {
 /// storage-backed chat module.
 pub struct Chat {
     id: ModuleId,
-    /// the host-injected authenticated store: it owns durability, the merkle
-    /// commitment, and the byte-level sync serve surface.
-    store: Box<dyn MerkleStore>,
-    /// logical-key -> staged write for the current block; `None` = delete.
-    pending: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (logical-key -> staged write; `None` = delete; read-your-writes, folded
+    /// into `root()` at `commit_block`). store key is `sha256(logical_key)`,
+    /// owned by [`StagedStore`].
+    staged: StagedStore,
     /// the tagging plane every post is reported to (one `TagEvent` follow-up
     /// per post, same block). `None` = no plane on this host (tests, minimal
     /// registries). the plane owns the loop rule and the subscription check;
@@ -247,8 +240,7 @@ impl Chat {
     pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
-            store,
-            pending: BTreeMap::new(),
+            staged: StagedStore::new(store),
             tagging: None,
         }
     }
@@ -267,10 +259,7 @@ impl Chat {
     }
 
     async fn get_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        if let Some(value) = self.pending.get(key) {
-            return Ok(value.clone());
-        }
-        self.store.get(&hash_key(key)).await
+        self.staged.get(key).await
     }
 
     async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
@@ -289,9 +278,9 @@ impl Chat {
     where
         T: Serialize,
     {
-        self.pending.insert(
+        self.staged.stage(
             key,
-            Some(serde_json::to_vec(value).expect("chat value is serializable")),
+            serde_json::to_vec(value).expect("chat value is serializable"),
         );
     }
 
@@ -314,12 +303,12 @@ impl Chat {
                 bytes.len()
             )));
         }
-        self.pending.insert(key, Some(bytes));
+        self.staged.stage(key, bytes);
         Ok(())
     }
 
     fn delete(&mut self, key: Vec<u8>) {
-        self.pending.insert(key, None);
+        self.staged.delete(key);
     }
 
     async fn channel_index(&self) -> Result<BTreeSet<String>, Error> {
@@ -1192,25 +1181,22 @@ impl Module for Chat {
     /// the store's merkle root over all committed records, verbatim — the
     /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        self.store.root()
+        self.staged.root()
     }
 
     fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::ResolverBacked {
-            backend: "qmdb".into(),
-            detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
-        })
+        self.staged.state_sync_handle()
     }
 
     /// the network state-sync serve lane: answers the shared qmdb wire requests
     /// (historical proof-carrying op ranges) from committed state. read-only;
     /// the joiner's sync engine merkle-verifies every batch.
     async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        self.store.serve_sync(req).await
+        self.staged.serve_sync(req).await
     }
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
-        self.store.sync_target().await
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -1412,21 +1398,11 @@ impl Module for Chat {
     /// write order deterministic across validators, and a staged `None` ships
     /// as a delete of the hashed key.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let writes = self
-            .pending
-            .iter()
-            .map(|(key, value)| (hash_key(key), value.clone()))
-            .collect();
-        self.store.commit_batch(writes).await?;
-        self.pending.clear();
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
+        self.staged.abort();
         Ok(())
     }
 }

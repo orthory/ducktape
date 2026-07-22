@@ -207,8 +207,8 @@ pub enum IdentityReply {
 /// the signed preimage of a node-bind certificate: chain id + node key + nonce.
 pub fn bind_preimage(chain_id: &str, node_key: &[u8], nonce: u64) -> Vec<u8> {
     let mut out = Vec::new();
-    push_len(&mut out, chain_id.as_bytes());
-    push_len(&mut out, node_key);
+    sdk::codec::push_bytes(&mut out, chain_id.as_bytes());
+    sdk::codec::push_bytes(&mut out, node_key);
     out.extend_from_slice(&nonce.to_le_bytes());
     out
 }
@@ -231,9 +231,9 @@ pub fn add_member_preimage(
     nonce: u64,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    push_len(&mut out, chain_id.as_bytes());
-    push_len(&mut out, account_id);
-    push_len(&mut out, new_key);
+    sdk::codec::push_bytes(&mut out, chain_id.as_bytes());
+    sdk::codec::push_bytes(&mut out, account_id);
+    sdk::codec::push_bytes(&mut out, new_key);
     out.push(new_kind.tag());
     out.extend_from_slice(&nonce.to_le_bytes());
     out
@@ -248,16 +248,11 @@ pub fn remove_member_preimage(
     nonce: u64,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    push_len(&mut out, chain_id.as_bytes());
-    push_len(&mut out, account_id);
-    push_len(&mut out, target_key);
+    sdk::codec::push_bytes(&mut out, chain_id.as_bytes());
+    sdk::codec::push_bytes(&mut out, account_id);
+    sdk::codec::push_bytes(&mut out, target_key);
     out.extend_from_slice(&nonce.to_le_bytes());
     out
-}
-
-fn push_len(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
 }
 
 /// the exact bytes a NATIVE key (`Ed25519`/`P256`) signs to prove possession
@@ -284,22 +279,22 @@ pub fn add_member_signing_payload(
 }
 
 pub fn encode_msg(m: &IdentityMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<IdentityMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_query(q: &IdentityQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<IdentityQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &IdentityReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<IdentityReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 #[cfg(test)]

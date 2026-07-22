@@ -53,12 +53,14 @@ pub use interface::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::codec;
+use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
 
-/// the field separator inside composite scope keys. rejected inside
-/// caller-chosen ids so a crafted container can never forge another scope.
-const SEP: char = '\x1f';
+/// the field separator inside composite scope keys (the shared
+/// [`sdk::KEY_SEP`]). rejected inside caller-chosen ids by [`sdk::validate_id`]
+/// so a crafted container can never forge another scope.
+const SEP: char = sdk::KEY_SEP;
 
 /// the composite subscription key: scopes are namespaced per source module.
 fn scope_key(source: &str, container: &str) -> String {
@@ -75,22 +77,17 @@ struct Committed {
 
 // ---- canonical encoding ----------------------------------------------------------
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 /// canonical byte encoding of the committed state: u64-le counts, sorted-key
-/// order, u64-le length prefixes. this is the exact preimage `root()` hashes
-/// AND the snapshot format.
+/// order, u64-le length prefixes (via [`sdk::codec`]). this is the exact
+/// preimage `root()` hashes AND the snapshot format.
 fn encode_committed(c: &Committed) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(c.subscriptions.len() as u64).to_le_bytes());
     for (key, subscribers) in &c.subscriptions {
-        put_bytes(&mut out, key.as_bytes());
+        codec::push_bytes(&mut out, key.as_bytes());
         out.extend_from_slice(&(subscribers.len() as u64).to_le_bytes());
         for subscriber in subscribers {
-            put_bytes(&mut out, subscriber.as_bytes());
+            codec::push_bytes(&mut out, subscriber.as_bytes());
         }
     }
     out
@@ -101,70 +98,34 @@ fn committed_root(c: &Committed) -> StateRoot {
 }
 
 // ---- strict decode (untrusted snapshot bytes) -------------------------------------
+// over the shared `sdk::codec::Cursor`: every accessor bounds-checks before it
+// reads, and `bound` rejects a forged count the remaining bytes cannot hold.
 
-fn take<'a>(buf: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
-    if n > buf.len() {
-        return Err("snapshot truncated".into());
-    }
-    let (head, tail) = buf.split_at(n);
-    *buf = tail;
-    Ok(head)
-}
-
-fn take_u64(buf: &mut &[u8]) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(
-        take(buf, 8)?.try_into().expect("8 bytes"),
-    ))
-}
-
-fn take_len(buf: &mut &[u8]) -> Result<usize, String> {
-    let n = take_u64(buf)?;
-    if n > buf.len() as u64 {
-        return Err("snapshot length prefix exceeds input".into());
-    }
-    Ok(n as usize)
-}
-
-fn take_lp_string(buf: &mut &[u8]) -> Result<String, String> {
-    let len = take_len(buf)?;
-    Ok(std::str::from_utf8(take(buf, len)?)
-        .map_err(|_| "snapshot string is not utf-8".to_string())?
-        .to_owned())
-}
-
-fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
+fn decode_committed(bytes: &[u8]) -> Result<Committed, Error> {
+    let mut cur = codec::Cursor::new(bytes);
     let mut c = Committed::default();
-    let scopes = take_u64(&mut buf)?;
-    // every scope costs at least its two fixed-width counts; a count the
-    // input cannot possibly hold is rejected before the loop builds anything.
-    const MIN_SCOPE_BYTES: u64 = 8 + 8;
-    if scopes
-        .checked_mul(MIN_SCOPE_BYTES)
-        .is_none_or(|need| need > buf.len() as u64)
-    {
-        return Err("snapshot scope count exceeds input".into());
-    }
+    let scopes = cur.u64("scope count")?;
+    // every scope costs at least its two fixed-width counts (8 + 8); a count
+    // the input cannot possibly hold is rejected before the loop builds
+    // anything.
+    cur.bound(scopes, 8 + 8, "scope")?;
     for _ in 0..scopes {
-        let key = take_lp_string(&mut buf)?;
+        let key = cur.string("scope key")?;
         if let Some((last, _)) = c.subscriptions.iter().next_back()
             && last.as_str() >= key.as_str()
         {
-            return Err("snapshot keys not strictly ascending".into());
+            return Err(Error::Module("snapshot keys not strictly ascending".into()));
         }
-        let count = take_u64(&mut buf)?;
-        const MIN_SUBSCRIBER_BYTES: u64 = 8;
-        if count
-            .checked_mul(MIN_SUBSCRIBER_BYTES)
-            .is_none_or(|need| need > buf.len() as u64)
-        {
-            return Err("snapshot subscriber count exceeds input".into());
-        }
+        let count = cur.u64("subscriber count")?;
+        cur.bound(count, 8, "subscriber")?;
         let mut subscribers = BTreeSet::new();
         for _ in 0..count {
-            let subscriber = take_lp_string(&mut buf)?;
+            let subscriber = cur.string("subscriber")?;
             match subscribers.iter().next_back() {
                 Some(last) if *last >= subscriber => {
-                    return Err("snapshot subscribers not strictly ascending".into());
+                    return Err(Error::Module(
+                        "snapshot subscribers not strictly ascending".into(),
+                    ));
                 }
                 _ => {}
             }
@@ -173,13 +134,11 @@ fn decode_committed(mut buf: &[u8]) -> Result<Committed, String> {
         if subscribers.is_empty() {
             // committed state never holds an empty scope (unsubscribe of the
             // last subscriber removes the key), so a snapshot must not either.
-            return Err("snapshot has an empty subscription scope".into());
+            return Err(Error::Module("snapshot has an empty subscription scope".into()));
         }
         c.subscriptions.insert(key, subscribers);
     }
-    if !buf.is_empty() {
-        return Err("snapshot has trailing bytes".into());
-    }
+    cur.finish("snapshot")?;
     Ok(c)
 }
 
@@ -231,24 +190,6 @@ impl TaggingModule {
 
     // ---- validation helpers --------------------------------------------------------
 
-    fn validate_id(field: &str, value: &str) -> Result<(), Error> {
-        if value.is_empty() {
-            return Err(Error::Module(format!("{field} must be non-empty")));
-        }
-        if value.len() > MAX_ID_BYTES {
-            return Err(Error::Module(format!(
-                "{field} is {} bytes; the cap is {MAX_ID_BYTES}",
-                value.len()
-            )));
-        }
-        if value.contains(SEP) {
-            return Err(Error::Module(format!(
-                "{field} must not contain the reserved separator"
-            )));
-        }
-        Ok(())
-    }
-
     /// the module behind the current dispatch — every tagging op's acting
     /// party. externals and the system have no surface here.
     fn acting_module(origin: &Origin) -> Result<ModuleId, Error> {
@@ -278,8 +219,8 @@ impl TaggingModule {
         container: String,
     ) -> Result<(), Error> {
         let subscriber = Self::acting_module(&ctx.env().origin)?;
-        Self::validate_id("source", &source)?;
-        Self::validate_id("container", &container)?;
+        sdk::validate_id("source", &source, MAX_ID_BYTES)?;
+        sdk::validate_id("container", &container, MAX_ID_BYTES)?;
         // the registry is genesis-fixed, so this existence check is
         // deterministic across every validator.
         if ctx.module_root(&source).is_none() {
@@ -335,7 +276,7 @@ impl TaggingModule {
             author,
             mut tags,
         } = event;
-        if Self::validate_id("container", &container).is_err() {
+        if sdk::validate_id("container", &container, MAX_ID_BYTES).is_err() {
             self.note(ctx, "dropped tag event with a malformed container".into());
             return Ok(());
         }
@@ -352,8 +293,8 @@ impl TaggingModule {
             tags.truncate(MAX_TAGS_PER_EVENT);
         }
         let malformed = |t: &crate::EntityRef| {
-            Self::validate_id("tag module", &t.module).is_err()
-                || Self::validate_id("tag entity", &t.entity).is_err()
+            sdk::validate_id("tag module", &t.module, MAX_ID_BYTES).is_err()
+                || sdk::validate_id("tag entity", &t.entity, MAX_ID_BYTES).is_err()
         };
         if tags.iter().any(malformed) {
             self.note(ctx, "dropped malformed tags from a tag event".into());
@@ -407,12 +348,8 @@ impl TaggingModule {
     /// adopt a peer's snapshot — only after the decoded temporaries re-derive
     /// `expected` via the exact `root()` algorithm. all-or-nothing.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let committed = decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&committed) != expected {
-            return Err(Error::Module(
-                "snapshot does not match expected root".into(),
-            ));
-        }
+        let committed = decode_committed(bytes)?;
+        sdk::verify_snapshot_root(committed_root(&committed), expected)?;
         self.committed = committed;
         self.staged.clear();
         Ok(())
@@ -429,8 +366,8 @@ impl Module for TaggingModule {
         committed_root(&self.committed)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

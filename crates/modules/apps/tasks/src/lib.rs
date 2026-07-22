@@ -87,9 +87,7 @@ impl Tasks {
         let mut encoded = Vec::new();
         tasks.encode_committed(&mut encoded);
         jobs.encode_committed(&mut encoded);
-        if Self::root_of(&encoded) != expected {
-            return Err(Error::Module("snapshot root mismatch".into()));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&encoded), expected)?;
         self.tasks = tasks;
         self.jobs = jobs;
         Ok(())
@@ -110,8 +108,8 @@ impl Module for Tasks {
     /// `root()`, and [`Tasks::install`] verifies before adopting -- without this
     /// override, sync orchestration saw `Unsupported` and a joiner could not
     /// rebuild the module at all.
-    fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, Error> {
-        Ok(sdk::StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

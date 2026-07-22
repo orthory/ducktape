@@ -95,20 +95,20 @@ pub enum VaultReply {
 }
 
 pub fn encode_msg(m: &VaultMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<VaultMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_query(q: &VaultQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<VaultQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &VaultReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<VaultReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

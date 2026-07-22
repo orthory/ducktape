@@ -503,7 +503,7 @@ fn comment_caps_and_reserved_ids_reject() {
             "comment text too large",
         )
         .await;
-        assert!(p.pending.is_empty(), "a rejected comment op stages nothing");
+        assert!(p.staged.is_empty(), "a rejected comment op stages nothing");
         // a NUL-prefixed id lands in the reserved keyspace — rejected.
         apply_err_as(
             &mut p,

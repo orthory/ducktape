@@ -67,12 +67,8 @@ pub use interface::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use sdk::codec;
-use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
 use sha2::{Digest, Sha256};
-use valset::{
-    ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
-    encode_query as valset_encode_query,
-};
 
 /// most tags a single node may announce. a bound, not a schema: it exists so
 /// one announcement cannot bloat replicated state, while staying far above
@@ -147,40 +143,6 @@ impl CapabilityRegistry {
     }
 
     /// the CURRENT validator set UNION resident set, both queried live from
-    /// the valset module's staged-over-committed projection — exactly
-    /// identity's `BindNode` gate: an announce is admitted for either
-    /// standing, so a joined (not-yet-promoted) node can publish the
-    /// executors it really provides.
-    async fn members(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
-        let validators = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Validators))
-                .await?,
-        )
-        .map_err(Error::Module)?
-        {
-            ValsetReply::Validators(v) => v,
-            other => {
-                return Err(Error::Module(format!(
-                    "valset answered a Validators query with {other:?}"
-                )));
-            }
-        };
-        let residents = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Residents))
-                .await?,
-        )
-        .map_err(Error::Module)?
-        {
-            ValsetReply::Residents(o) => o,
-            other => {
-                return Err(Error::Module(format!(
-                    "valset answered a Residents query with {other:?}"
-                )));
-            }
-        };
-        Ok(validators.into_iter().chain(residents).collect())
-    }
-
     /// the committed registry with this block's staged replacements applied —
     /// read-your-writes; a staged entry with empty tags reads as absent.
     fn effective(&self) -> BTreeMap<Vec<u8>, NodeEntry> {
@@ -280,12 +242,7 @@ impl CapabilityRegistry {
     /// state being replaced, not the state being adopted.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (announced, class_claims) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&announced, &class_claims);
-        if root != expected {
-            return Err(Error::Module(format!(
-                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
-            )));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&announced, &class_claims), expected)?;
         self.announced = announced;
         self.class_claims = class_claims;
         self.pending.clear();
@@ -427,8 +384,8 @@ impl Module for CapabilityRegistry {
         Self::root_of(&self.announced, &self.class_claims)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -459,7 +416,10 @@ impl Module for CapabilityRegistry {
                     // residents populate the registry, so lookups resolve to
                     // known peers — including a joined node that has not been
                     // promoted yet.
-                    if !self.members(ctx, &valset_id).await?.contains(&node) {
+                    if !valset::members_and_residents(ctx, &valset_id)
+                        .await?
+                        .contains(&node)
+                    {
                         return Err(Error::Module(
                             "capability announcer holds no current standing (validator or resident)"
                                 .into(),
@@ -601,7 +561,7 @@ impl Module for CapabilityRegistry {
 mod tests {
     use super::*;
     use crate::{MAX_CLASS_LEN, MAX_TAG_LEN, encode_msg, encode_query};
-    use valset::encode_reply as valset_encode_reply;
+    use valset::{ValsetQuery, ValsetReply, encode_reply as valset_encode_reply};
 
     use sdk_testkit::TestCtx;
 

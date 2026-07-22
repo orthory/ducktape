@@ -231,27 +231,27 @@ pub enum WorkReply {
 // ---- envelope codecs (module-internal + index) ----------------------------
 
 pub fn encode_work_msg(m: &WorkMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 
 pub fn decode_work_msg(b: &[u8]) -> Result<WorkMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_work_query(q: &WorkQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 
 pub fn decode_work_query(b: &[u8]) -> Result<WorkQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_work_reply(r: &WorkReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 
 pub fn decode_work_reply(b: &[u8]) -> Result<WorkReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 // ---- task-board codecs (wrap/unwrap the envelope) -------------------------
@@ -326,9 +326,9 @@ pub fn decode_job_reply(b: &[u8]) -> Result<JobsReply, String> {
 
 // job events are un-enveloped follow-up payloads, not board ops.
 pub fn encode_job_event(e: &JobsEvent) -> Vec<u8> {
-    serde_json::to_vec(e).expect("serializable")
+    sdk::wire::encode(e)
 }
 
 pub fn decode_job_event(b: &[u8]) -> Result<JobsEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

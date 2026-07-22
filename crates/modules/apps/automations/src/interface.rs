@@ -123,25 +123,25 @@ pub enum AutomationsReply {
 }
 
 pub fn encode_msg(m: &AutomationsMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 
 pub fn decode_msg(b: &[u8]) -> Result<AutomationsMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_query(q: &AutomationsQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 
 pub fn decode_query(b: &[u8]) -> Result<AutomationsQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_reply(r: &AutomationsReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 
 pub fn decode_reply(b: &[u8]) -> Result<AutomationsReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

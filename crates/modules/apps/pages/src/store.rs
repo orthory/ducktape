@@ -1,14 +1,7 @@
 use super::{
     BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_DEPTH, MerkleStore, ModuleId,
-    PAGE_INDEX_KEY, PageError, Pages, to_page_err,
+    PAGE_INDEX_KEY, PageError, Pages, StagedStore, to_page_err,
 };
-use sha2::Digest as _;
-
-/// hash a `block_id` to its fixed-width store key. deterministic, so every
-/// validator maps a given block to the same store slot.
-pub(super) fn hash_key(block_id: &[u8]) -> [u8; 32] {
-    sha2::Sha256::digest(block_id).into()
-}
 
 impl Pages {
     /// wrap the host-constructed store under module identity `id`. sync — the
@@ -16,8 +9,7 @@ impl Pages {
     pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
-            store,
-            pending: BTreeMap::new(),
+            staged: StagedStore::new(store),
             tagging: None,
         }
     }
@@ -31,10 +23,7 @@ impl Pages {
     /// read raw bytes for `key` through the staged overlay: a staged write
     /// shadows committed state, and a staged DELETE reads as absence.
     pub(super) async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        if let Some(staged) = self.pending.get(key) {
-            return staged.clone();
-        }
-        self.store.get(&hash_key(key)).await.expect("get failed")
+        self.staged.get(key).await.expect("get failed")
     }
 
     /// load one block (`None` == absent), through the staged-over-committed
@@ -56,7 +45,7 @@ impl Pages {
         if bytes.len() > MAX_BLOCK_LEN {
             return Err(PageError::BlockTooLarge);
         }
-        self.pending.insert(key.as_bytes().to_vec(), Some(bytes));
+        self.staged.stage(key.as_bytes().to_vec(), bytes);
         Ok(())
     }
 
@@ -69,7 +58,7 @@ impl Pages {
     /// stage a DELETE of `block_id` — reads see absence at once; the key is
     /// dropped from the store (and the root) at `commit_block`.
     pub(super) fn delete_block(&mut self, block_id: &str) {
-        self.pending.insert(block_id.as_bytes().to_vec(), None);
+        self.staged.delete(block_id.as_bytes().to_vec());
     }
 
     /// delete a whole subtree depth-first, purging each block's comments and

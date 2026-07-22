@@ -80,12 +80,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use sdk::codec::{Cursor, push_bytes, push_opt_str};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use valset::{
-    ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
-    encode_query as valset_encode_query,
-};
 
 /// per-member metadata; the public key is the map key, so it is not repeated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,39 +209,6 @@ impl Identity {
                 "identity operations are origin-gated to external submitters, got {other:?}"
             ))),
         }
-    }
-
-    /// the CURRENT validator set UNION resident set, both queried live from the
-    /// valset module's staged-over-committed projection -- a bind is admitted
-    /// for either standing.
-    async fn members(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<BTreeSet<Vec<u8>>, Error> {
-        let validators = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Validators))
-                .await?,
-        )
-        .map_err(Error::Module)?
-        {
-            ValsetReply::Validators(v) => v,
-            other => {
-                return Err(Error::Module(format!(
-                    "valset answered a Validators query with {other:?}"
-                )));
-            }
-        };
-        let residents = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Residents))
-                .await?,
-        )
-        .map_err(Error::Module)?
-        {
-            ValsetReply::Residents(o) => o,
-            other => {
-                return Err(Error::Module(format!(
-                    "valset answered a Residents query with {other:?}"
-                )));
-            }
-        };
-        Ok(validators.into_iter().chain(residents).collect())
     }
 
     /// verify that `auth` is a current member of `record` and that its proof
@@ -446,12 +409,7 @@ impl Identity {
     /// before.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (accounts, clients) = Self::decode_snapshot(bytes)?;
-        let root = Self::root_of(&accounts, &clients);
-        if root != expected {
-            return Err(Error::Module(format!(
-                "snapshot root mismatch: decoded {root:?}, expected {expected:?}"
-            )));
-        }
+        sdk::verify_snapshot_root(Self::root_of(&accounts, &clients), expected)?;
         self.node_index = Self::node_index_of(&accounts);
         self.member_index = Self::member_index_of(&accounts);
         self.accounts = accounts;
@@ -641,8 +599,8 @@ impl Module for Identity {
         Self::root_of(&self.accounts, &self.clients)
     }
 
-    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
-        Ok(StateSyncHandle::SnapshotBytes(self.snapshot()))
+    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
+        Some(self.snapshot())
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -767,7 +725,7 @@ impl Identity {
 
         // member gate: validators UNION residents, only when configured.
         if let Some(valset_id) = self.valset_id.clone() {
-            let members = self.members(&*ctx, &valset_id).await?;
+            let members = valset::members_and_residents(&*ctx, &valset_id).await?;
             if !members.contains(&origin) {
                 return Err(Error::Module(
                     "bind origin is not a network member or resident".into(),

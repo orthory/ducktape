@@ -383,22 +383,22 @@ pub struct SagaView {
 }
 
 pub fn encode_msg(m: &SagaMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<SagaMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_worker_request(w: &WorkerRequest) -> Vec<u8> {
-    serde_json::to_vec(w).expect("serializable")
+    sdk::wire::encode(w)
 }
 pub fn decode_worker_request(b: &[u8]) -> Result<WorkerRequest, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_worker_control(c: &WorkerControl) -> Vec<u8> {
-    serde_json::to_vec(c).expect("serializable")
+    sdk::wire::encode(c)
 }
 pub fn decode_worker_control(b: &[u8]) -> Result<WorkerControl, String> {
-    let control: WorkerControl = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+    let control: WorkerControl = sdk::wire::decode(b)?;
     if control.kind != WORKER_CONTROL_KIND {
         return Err(format!("not a worker control (kind {:?})", control.kind));
     }
@@ -411,20 +411,20 @@ pub fn decode_worker_control(b: &[u8]) -> Result<WorkerControl, String> {
     Ok(control)
 }
 pub fn encode_callback(c: &SagaCallback) -> Vec<u8> {
-    serde_json::to_vec(c).expect("serializable")
+    sdk::wire::encode(c)
 }
 pub fn decode_callback(b: &[u8]) -> Result<SagaCallback, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_query(q: &SagaQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<SagaQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &SagaReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<SagaReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

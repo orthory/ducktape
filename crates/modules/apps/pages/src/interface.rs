@@ -1,4 +1,5 @@
-//! the pages module's public wire surface — types only, no logic, no sdk dep.
+//! the pages module's public wire surface — types plus thin `sdk::wire` codec
+//! delegates.
 //!
 //! a page is a TREE of [`Block`]s (notion's model, simplified): the page itself
 //! is the root block, every block carries an ordered `children` list, and every
@@ -319,10 +320,10 @@ pub struct TargetThreads {
 }
 
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 /// read requests the pages module serves via `Module::query`.
@@ -375,16 +376,16 @@ pub enum PageReply {
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 pub fn decode_query(b: &[u8]) -> Result<PageQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_reply(r: &PageReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 pub fn decode_reply(b: &[u8]) -> Result<PageReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 #[cfg(test)]

@@ -756,11 +756,7 @@ impl RunsModule {
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (watches, pending, sessions, delegations) =
             decode_committed(bytes).map_err(Error::Module)?;
-        if committed_root(&watches, &pending, &sessions, &delegations) != expected {
-            return Err(Error::Module(
-                "snapshot does not match expected root".into(),
-            ));
-        }
+        sdk::verify_snapshot_root(committed_root(&watches, &pending, &sessions, &delegations), expected)?;
         self.watches = watches;
         self.pending = pending;
         self.sessions = sessions;

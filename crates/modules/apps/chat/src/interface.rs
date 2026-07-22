@@ -371,33 +371,33 @@ pub enum ChatEvent {
 }
 
 pub fn encode_msg(m: &ChatMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 
 pub fn decode_msg(b: &[u8]) -> Result<ChatMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_query(q: &ChatQuery) -> Vec<u8> {
-    serde_json::to_vec(q).expect("serializable")
+    sdk::wire::encode(q)
 }
 
 pub fn decode_query(b: &[u8]) -> Result<ChatQuery, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_reply(r: &ChatReply) -> Vec<u8> {
-    serde_json::to_vec(r).expect("serializable")
+    sdk::wire::encode(r)
 }
 
 pub fn decode_reply(b: &[u8]) -> Result<ChatReply, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 
 pub fn encode_event(e: &ChatEvent) -> Vec<u8> {
-    serde_json::to_vec(e).expect("serializable")
+    sdk::wire::encode(e)
 }
 
 pub fn decode_event(b: &[u8]) -> Result<ChatEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }

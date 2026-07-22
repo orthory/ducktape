@@ -113,14 +113,14 @@ pub struct EngagementEvent {
 // ---- codecs ---------------------------------------------------------------------
 
 pub fn encode_msg(m: &TaggingMsg) -> Vec<u8> {
-    serde_json::to_vec(m).expect("serializable")
+    sdk::wire::encode(m)
 }
 pub fn decode_msg(b: &[u8]) -> Result<TaggingMsg, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
 pub fn encode_event(e: &EngagementEvent) -> Vec<u8> {
-    serde_json::to_vec(e).expect("serializable")
+    sdk::wire::encode(e)
 }
 pub fn decode_event(b: &[u8]) -> Result<EngagementEvent, String> {
-    serde_json::from_slice(b).map_err(|e| e.to_string())
+    sdk::wire::decode(b)
 }
