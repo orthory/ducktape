@@ -9,8 +9,8 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel, post_message};
-use identity::{IDENTITY_BIND_NS, bind_preimage};
+use harness::{Sim, create_channel, ed_bind_auth, post_message};
+use identity::bind_preimage;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
@@ -254,17 +254,6 @@ fn inbox_seqs_never_rewind_and_maintenance_is_idempotent() {
 }
 
 // ── identity → duckdns: origin-derived account authority ─
-
-/// a MemberAuth whose ed25519 `key` consents to `preimage` under the bind
-/// namespace — the identity module's own test-builder pattern.
-fn ed_bind_auth(key: &Ed, preimage: &[u8]) -> serde_json::Value {
-    let sig = key.sign(IDENTITY_BIND_NS, preimage);
-    serde_json::json!({
-        "key": key.public_key().as_ref().to_vec(),
-        "kind": "ed25519",
-        "proof": { "signature": { "sig": sig.as_ref().to_vec() } },
-    })
-}
 
 #[test]
 fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {

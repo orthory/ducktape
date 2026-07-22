@@ -34,6 +34,12 @@ p256 = { workspace = true }
 # base64url-decoding the WebAuthn challenge out of clientDataJSON.
 base64 = { workspace = true }
 
+[features]
+# test-only member-auth builders (`identity::testkit`). no extra deps — just
+# gates the module so a shipping build never compiles it. consumers enable it
+# as a dev-dependency feature.
+testkit = []
+
 [dev-dependencies]
 futures = { workspace = true }
 sdk-testkit = { workspace = true }

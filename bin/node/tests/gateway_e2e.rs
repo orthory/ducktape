@@ -27,19 +27,7 @@ const READY: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    MemberAuth {
-        key: member.public_key().as_ref().to_vec(),
-        kind: identity::KeyKind::Ed25519,
-        proof: identity::MemberProof::Signature {
-            sig: member
-                .sign(
-                    identity::IDENTITY_BIND_NS,
-                    &identity::bind_preimage(chain, node, 0),
-                )
-                .as_ref()
-                .to_vec(),
-        },
-    }
+    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
 }
 
 fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {

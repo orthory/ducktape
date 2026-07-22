@@ -44,19 +44,7 @@ fn boot(cluster: &mut Cluster) {
 /// `config::ed25519_member_auth` over the bind preimage: the user (ed25519)
 /// key's signature in the bind NS domain, wrapped as an ed25519 member.
 fn bind_auth(user: &ed25519::PrivateKey, chain_id: &str, node_pub: &[u8], nonce: u64) -> MemberAuth {
-    MemberAuth {
-        key: user.public_key().as_ref().to_vec(),
-        kind: identity::KeyKind::Ed25519,
-        proof: identity::MemberProof::Signature {
-            sig: user
-                .sign(
-                    identity::IDENTITY_BIND_NS,
-                    &identity::bind_preimage(chain_id, node_pub, nonce),
-                )
-                .as_ref()
-                .to_vec(),
-        },
-    }
+    identity::testkit::ed_bind_auth(user, &identity::bind_preimage(chain_id, node_pub, nonce))
 }
 
 /// the `MemberAuth` an unbind op carries (same shape, unbind NS domain).
@@ -66,19 +54,11 @@ fn unbind_auth(
     node_pub: &[u8],
     nonce: u64,
 ) -> MemberAuth {
-    MemberAuth {
-        key: user.public_key().as_ref().to_vec(),
-        kind: identity::KeyKind::Ed25519,
-        proof: identity::MemberProof::Signature {
-            sig: user
-                .sign(
-                    identity::IDENTITY_UNBIND_NS,
-                    &identity::unbind_preimage(chain_id, node_pub, nonce),
-                )
-                .as_ref()
-                .to_vec(),
-        },
-    }
+    identity::testkit::ed_auth(
+        user,
+        identity::IDENTITY_UNBIND_NS,
+        &identity::unbind_preimage(chain_id, node_pub, nonce),
+    )
 }
 
 /// `UserOf(node_key)` on node `idx`. `None` covers both a rejected query and

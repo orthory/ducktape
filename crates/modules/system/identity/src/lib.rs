@@ -70,6 +70,11 @@ pub use interface::*;
 mod scheme;
 pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_challenge, webauthn_rp_id_hash};
 
+// test-only member-auth builders (beside `IDENTITY_BIND_NS`). dev-only: gated so
+// a shipping build never compiles the ed25519 signing helpers into itself.
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use commonware_codec::DecodeExt as _;

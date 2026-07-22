@@ -149,6 +149,9 @@ nettest = { path = "../../crates/nettest" }
 # hand-mirrored the NodeCommand actor). dev-only feature: resolver v2 keeps it
 # out of the production `ducktape` binary build.
 noded = { path = "../noded", features = ["testkit"] }
+# the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
+# dev-only feature: resolver v2 keeps it out of the production binary build.
+identity = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
 # paused-clock unit tests (`#[tokio::test(start_paused = true)]`) — the
 # first-contact window guard proves "a mute plane cannot hang the race"
