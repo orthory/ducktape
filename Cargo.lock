@@ -3920,6 +3920,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nettest"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3999,6 +4006,7 @@ dependencies = [
  "libc",
  "lifecycle",
  "nat-traversal",
+ "nettest",
  "node",
  "noded",
  "objc2-foundation",
@@ -4063,6 +4071,7 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
+ "nettest",
  "node",
  "pages",
  "rand 0.8.6",
@@ -5813,6 +5822,7 @@ dependencies = [
  "indexer",
  "kv",
  "lifecycle",
+ "nettest",
  "node",
  "noded",
  "pages",

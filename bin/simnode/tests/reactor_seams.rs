@@ -23,8 +23,8 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel, post_message};
-use identity::{IDENTITY_BIND_NS, bind_preimage};
+use harness::{Sim, create_channel, ed_bind_auth, post_message};
+use identity::bind_preimage;
 use serde_json::{Value, json};
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
@@ -278,18 +278,6 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
 }
 
 // ── A5: whole-registry determinism sweep ────────────────
-
-/// a MemberAuth whose ed25519 `key` consents to `preimage` under the bind
-/// namespace — the identity module's own test-builder pattern (see
-/// core_scenarios.rs). deterministic: same seed, same signature.
-fn ed_bind_auth(key: &Ed, preimage: &[u8]) -> Value {
-    let sig = key.sign(IDENTITY_BIND_NS, preimage);
-    json!({
-        "key": key.public_key().as_ref().to_vec(),
-        "kind": "ed25519",
-        "proof": { "signature": { "sig": sig.as_ref().to_vec() } },
-    })
-}
 
 /// one op per registered module the sim can reach over /v1/submit, in a fixed
 /// order. `chat` cascades a `TagEvent` into `tagging`; `runs` subscribes through

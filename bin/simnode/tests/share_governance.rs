@@ -27,8 +27,8 @@ mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use harness::Sim;
-use identity::{IDENTITY_BIND_NS, bind_preimage};
+use harness::{Sim, ed_bind_auth};
+use identity::bind_preimage;
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -65,17 +65,6 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
         .join(",");
     let sim = Sim::spawn(storage, &["--auto", "--with-valset", &hexes]);
     (sim, validators)
-}
-
-/// a MemberAuth whose ed25519 `key` consents to `preimage` under the bind
-/// namespace — core_scenarios' identity ceremony.
-fn ed_bind_auth(key: &Ed, preimage: &[u8]) -> Value {
-    let sig = key.sign(IDENTITY_BIND_NS, preimage);
-    json!({
-        "key": key.public_key().as_ref().to_vec(),
-        "kind": "ed25519",
-        "proof": { "signature": { "sig": sig.as_ref().to_vec() } },
-    })
 }
 
 /// found an Identity account: `key` consents to binding `node` at nonce 0 (the

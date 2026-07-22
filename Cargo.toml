@@ -86,6 +86,9 @@ members = [
     "crates/modules/apps/files",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
+    # test support — dev-only shared harness helpers (raw-http client, ports,
+    # poll). NOT a Module Rule surface; no shipping crate depends on it.
+    "crates/nettest",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway", "bin/airlock-broker", "bin/airlock-cli",

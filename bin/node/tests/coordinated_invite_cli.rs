@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -40,17 +40,7 @@ fn keygen(dir: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// grab `n` distinct free localhost ports by holding every listener at once
-/// (sequential bind-drop can hand the same port back twice).
-fn alloc_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("bind port-0 probe"))
-        .collect();
-    listeners
-        .iter()
-        .map(|l| l.local_addr().expect("probe addr").port())
-        .collect()
-}
+use nettest::alloc_ports;
 
 /// recompute a founder's genesis namespace exactly as `config::genesis_namespace`
 /// does — sha256 over the scheme + sorted validator hexes, chain-id prefixed —

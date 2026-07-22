@@ -7,8 +7,6 @@
 //! expected — hence the file-wide dead_code allow.
 #![allow(dead_code)]
 
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -239,78 +237,24 @@ impl Sim {
     }
 }
 
-pub fn try_request(
-    port: u16,
-    method: &str,
-    path: &str,
-    body: Option<&serde_json::Value>,
-) -> std::io::Result<(u16, serde_json::Value)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let body_bytes = body
-        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
-        .unwrap_or_default();
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body_bytes.len()
-    );
-    stream.write_all(req.as_bytes())?;
-    stream.write_all(&body_bytes)?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let payload = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .map(|b| serde_json::from_str(b.trim()).unwrap_or(serde_json::Value::Null))
-        .unwrap_or(serde_json::Value::Null);
-    Ok((status, payload))
-}
+/// json request/response against the sim's /v1 + /sim wires — the shared raw
+/// http/1.1 client, `io::Result` so `await_status` can poll a not-yet-up sim.
+/// `embed.rs` drives the embedded server through this directly.
+pub use nettest::try_http_json as try_request;
+
+use nettest::free_port;
 
 /// POST arbitrary body bytes with an explicit content-type — the raw-bytes
 /// twin of [`try_request`] (which is json-only), for the octet-stream frame
-/// lane. same deliberately-raw std-TCP http/1.1 transport.
+/// lane.
 fn post_raw(
     port: u16,
     path: &str,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<(u16, serde_json::Value)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(req.as_bytes())?;
-    stream.write_all(body)?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-    let text = String::from_utf8_lossy(&raw);
-    let status: u16 = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let payload = text
-        .split("\r\n\r\n")
-        .nth(1)
-        .map(|b| serde_json::from_str(b.trim()).unwrap_or(serde_json::Value::Null))
-        .unwrap_or(serde_json::Value::Null);
-    Ok((status, payload))
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind port probe")
-        .local_addr()
-        .expect("probe addr")
-        .port()
+    let (status, raw) = nettest::try_http_bytes(port, "POST", path, content_type, body)?;
+    Ok((status, serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null)))
 }
 
 pub fn create_channel(channel: &str, name: &str) -> serde_json::Value {
@@ -332,19 +276,15 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
 }
 
 /// a `MemberAuth` JSON whose ed25519 `key` consents to `preimage` under the
-/// identity bind namespace — the shared ed25519 member-auth builder the bound and
+/// identity bind namespace — the shared member-auth builder the bound and
 /// governed scenarios reuse (identity binds, gateway routes, share adoption).
-/// promoted here once the round-3 suites duplicated it a third time; the earlier
-/// suites keep their own local copies untouched.
+/// the ed25519 signing + `MemberAuth` shape now live ONCE in `identity::testkit`;
+/// this wraps it back to the untyped JSON the sim's `/v1/submit` lane takes (the
+/// serde shape is byte-identical to the hand-rolled json).
 pub fn ed_bind_auth(
     key: &commonware_cryptography::ed25519::PrivateKey,
     preimage: &[u8],
 ) -> serde_json::Value {
-    use commonware_cryptography::Signer as _;
-    let sig = key.sign(identity::IDENTITY_BIND_NS, preimage);
-    serde_json::json!({
-        "key": key.public_key().as_ref().to_vec(),
-        "kind": "ed25519",
-        "proof": { "signature": { "sig": sig.as_ref().to_vec() } },
-    })
+    serde_json::to_value(identity::testkit::ed_bind_auth(key, preimage))
+        .expect("MemberAuth serializes")
 }

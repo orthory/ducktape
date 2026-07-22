@@ -15,7 +15,7 @@ use sdk::{Origin, StateRoot};
 use crate::blobs::BlobHandle;
 use crate::{
     BlockDisposition, BlockRecord, DispatchInfo, RootOp, block_row, hex_bytes, hex_root,
-    payload_preview,
+    index_block_ops, payload_preview,
 };
 
 /// the idle-chain heartbeat filler's target — a module that deliberately does
@@ -199,6 +199,39 @@ pub fn project_block(
         });
     }
     projections
+}
+
+/// Fold one finalized block into the derived per-module index — the shared
+/// epilogue of every block-apply lane (validator drain, embedded daemon submit,
+/// sim). Merges the lane's explorer `record` onto [`index_block_ops`] and
+/// applies it, logging the ONE STALE-index error they share on failure.
+///
+/// The derived index is a READ MODEL: a failure here degrades the app's views
+/// (every module view the app reads is served from it, and it does not
+/// self-heal), NEVER consensus — canonical state is already sealed, so the block
+/// stands regardless. Hence loud-but-non-fatal. `event` is the operational
+/// contract (#603); `target` is the filtering plane — orthogonal, carry both.
+pub fn apply_block_to_index(
+    index: &indexer::IndexStore,
+    height: u64,
+    consensus_time: u64,
+    record: Option<Vec<u8>>,
+    dispatches: &[host::DispatchRecord],
+) {
+    let ops = indexer::BlockOps {
+        record,
+        ..index_block_ops(height, consensus_time, dispatches)
+    };
+    if let Err(err) = index.apply_block(&ops) {
+        tracing::error!(
+            target: "ducktape::consensus",
+            event = "node_index_poisoned",
+            height,
+            error = %err,
+            "module index apply failed — the app's views are now STALE; wipe \
+             <storage>/index to rebuild"
+        );
+    }
 }
 
 #[cfg(test)]
