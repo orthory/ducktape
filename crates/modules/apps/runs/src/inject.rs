@@ -23,7 +23,10 @@ use pages::{Block, BlockKind, PageQuery, PageReply};
 use sdk::Ctx;
 
 use crate::forge_source::{ForgeItem, ForgeItemKind};
-use crate::{FilesQuery, FilesReply, ModuleId, RunsModule, files_decode_reply, files_encode_query};
+use crate::{
+    FilesQuery, FilesReply, ModuleId, RunsModule, SiblingReadBudget, files_decode_reply,
+    files_encode_query,
+};
 
 /// the item-context byte cap (spec verbatim: 16 KiB, truncate-with-marker —
 /// never fail on size). separate from — and earlier than — the whole-payload
@@ -82,6 +85,8 @@ pub(crate) const PAGE_CONTEXT_BYTES: usize = 64 * 1024;
 
 /// the deterministic page-section truncation marker.
 const PAGE_TRUNCATION_MARKER: &str = "\n[page context truncated at 64 KiB]";
+const PAGE_READ_TRUNCATION_MARKER: &str = "[page context truncated at bounded read limit]";
+const PAGE_READ_TRUNCATION_BLOCK_ID: &str = "\0runs-page-read-truncated";
 
 /// the confinement root for file refs (matches the console tokenizer).
 const ATTACHMENTS_ROOT: &str = "/shared/attachments/";
@@ -173,7 +178,10 @@ fn classify_duck_url(url: &str, out: &mut DuckRefs) {
         return;
     };
     let segs: Vec<&str> = rest.split('/').collect();
-    let confined = segs.len() == 2 && segs.iter().all(|s| !s.is_empty() && *s != "." && *s != "..");
+    let confined = segs.len() == 2
+        && segs
+            .iter()
+            .all(|s| !s.is_empty() && *s != "." && *s != "..");
     if confined && !out.files.iter().any(|f| f == path) {
         out.files.push(path.to_string());
     }
@@ -247,6 +255,52 @@ fn render_page(page_id: &str, blocks: Option<&[Block]>) -> String {
     out
 }
 
+fn page_render_reaches_budget(page_id: &str, blocks: &[Block]) -> bool {
+    let section_header_bytes = "Referenced pages:\n\n".len();
+    section_header_bytes.saturating_add(render_page(page_id, Some(blocks)).len())
+        >= PAGE_CONTEXT_BYTES
+}
+
+enum PageBlocksRead {
+    Complete(Option<Vec<Block>>),
+    Partial(Vec<Block>),
+}
+
+fn partial_blocks(blocks: Vec<Block>) -> PageBlocksRead {
+    if blocks.is_empty() {
+        PageBlocksRead::Complete(None)
+    } else {
+        PageBlocksRead::Partial(blocks)
+    }
+}
+
+fn append_page_read_marker(blocks: &mut Vec<Block>) {
+    let Some(root) = blocks.first() else {
+        return;
+    };
+    blocks.push(Block {
+        id: PAGE_READ_TRUNCATION_BLOCK_ID.into(),
+        parent: Some(root.id.clone()),
+        page: root.page.clone(),
+        kind: BlockKind::Callout,
+        text: PAGE_READ_TRUNCATION_MARKER.into(),
+        marks: Vec::new(),
+        checked: false,
+        children: Vec::new(),
+    });
+}
+
+fn mark_page_section_truncated(section: String) -> String {
+    if section.ends_with(PAGE_TRUNCATION_MARKER) {
+        return section;
+    }
+    crate::truncate_on_boundary(
+        &format!("{section}\n{PAGE_READ_TRUNCATION_MARKER}"),
+        PAGE_CONTEXT_BYTES,
+        PAGE_TRUNCATION_MARKER,
+    )
+}
+
 // ---- duck://files attachment injection ----------------------------------------
 
 /// the attachment-section byte budget across ALL injected attachments — also
@@ -255,6 +309,8 @@ pub(crate) const ATTACHMENT_CONTEXT_BYTES: usize = 64 * 1024;
 
 /// the deterministic attachment-section truncation marker.
 const ATTACHMENT_TRUNCATION_MARKER: &str = "\n[attachment context truncated at 64 KiB]";
+const ATTACHMENT_READ_TRUNCATION_MARKER: &str =
+    "\n[attachment context truncated at bounded read limit]";
 
 /// one referenced attachment's resolved content.
 #[derive(Debug, PartialEq, Eq)]
@@ -297,6 +353,17 @@ pub(crate) fn render_attachments_section(items: &[(String, Attachment)]) -> Stri
     )
 }
 
+fn mark_attachment_section_truncated(section: String) -> String {
+    if section.ends_with(ATTACHMENT_TRUNCATION_MARKER) {
+        return section;
+    }
+    crate::truncate_on_boundary(
+        &format!("{section}{ATTACHMENT_READ_TRUNCATION_MARKER}"),
+        ATTACHMENT_CONTEXT_BYTES,
+        ATTACHMENT_READ_TRUNCATION_MARKER,
+    )
+}
+
 impl RunsModule {
     /// the `duck://page/<id>` page section for a run (M2): parse refs from the
     /// given sources (the trigger message text, then the injected item body),
@@ -304,7 +371,13 @@ impl RunsModule {
     /// same cross-module query lane as the forge tracker reads (I1) — and
     /// render. `None` when no pages module is wired or no ref parses; an
     /// unresolvable ref renders its marker, NEVER a failure.
-    pub(crate) async fn page_context(&self, ctx: &dyn Ctx, sources: &[&str]) -> Option<String> {
+    pub(crate) async fn page_context(
+        &self,
+        ctx: &dyn Ctx,
+        sources: &[&str],
+        remaining_queries: &mut usize,
+        budget: &SiblingReadBudget,
+    ) -> Option<String> {
         let pages = self.pages.clone()?;
         let refs = parse_duck_refs(sources).pages;
         if refs.is_empty() {
@@ -312,34 +385,110 @@ impl RunsModule {
         }
         let mut resolved = Vec::new();
         for page_id in refs {
-            let blocks = self.page_blocks(ctx, &pages, &page_id).await;
-            resolved.push((page_id, blocks));
+            if *remaining_queries == 0 {
+                let section = render_pages_section(&resolved);
+                return Some(mark_page_section_truncated(section));
+            }
+            match self
+                .page_blocks_with_budget(ctx, &pages, &page_id, remaining_queries, budget)
+                .await
+            {
+                PageBlocksRead::Complete(blocks) => resolved.push((page_id, blocks)),
+                PageBlocksRead::Partial(blocks) => {
+                    resolved.push((page_id, Some(blocks)));
+                    let section = render_pages_section(&resolved);
+                    return Some(mark_page_section_truncated(section));
+                }
+            }
+            let context_is_full = render_pages_section(&resolved).len() >= PAGE_CONTEXT_BYTES;
+            if context_is_full {
+                break;
+            }
         }
         Some(render_pages_section(&resolved))
     }
 
-    /// one committed page in preorder, or `None` when it does not exist —
-    /// a query/decode error degrades to `None` too (page injection is
-    /// context garnish; it never fails a run).
+    /// One committed page in preorder, assembled from bounded Pages replies.
+    /// `None` means the first read found no page (or failed); a later failure
+    /// keeps the blocks already read because page injection is degrade-only.
+    #[cfg(test)]
     pub(crate) async fn page_blocks(
         &self,
         ctx: &dyn Ctx,
         pages: &str,
         page_id: &str,
     ) -> Option<Vec<Block>> {
-        let reply = ctx
-            .query(
-                pages,
-                &pages::encode_query(&PageQuery::GetPage {
-                    page_id: page_id.to_string(),
-                }),
-            )
+        let budget = SiblingReadBudget::default();
+        self.page_blocks_for_execute(ctx, pages, page_id, &budget)
             .await
-            .ok()?;
-        match pages::decode_reply(&reply) {
-            Ok(PageReply::Page(blocks)) => blocks,
-            _ => None,
+    }
+
+    pub(crate) async fn page_blocks_for_execute(
+        &self,
+        ctx: &dyn Ctx,
+        pages: &str,
+        page_id: &str,
+        budget: &SiblingReadBudget,
+    ) -> Option<Vec<Block>> {
+        let mut remaining_queries = crate::MAX_SIBLING_QUERY_READS;
+        match self
+            .page_blocks_with_budget(ctx, pages, page_id, &mut remaining_queries, budget)
+            .await
+        {
+            PageBlocksRead::Complete(blocks) => blocks,
+            PageBlocksRead::Partial(mut blocks) => {
+                append_page_read_marker(&mut blocks);
+                Some(blocks)
+            }
         }
+    }
+
+    async fn page_blocks_with_budget(
+        &self,
+        ctx: &dyn Ctx,
+        pages: &str,
+        page_id: &str,
+        remaining_queries: &mut usize,
+        budget: &SiblingReadBudget,
+    ) -> PageBlocksRead {
+        let mut after = None;
+        let mut blocks = Vec::new();
+        while *remaining_queries > 0 {
+            let query = pages::encode_query(&PageQuery::GetPage {
+                page_id: page_id.to_string(),
+                after: after.clone(),
+                limit: pages::MAX_PAGE_QUERY_LIMIT,
+            });
+            if !budget.reserve_query(pages, &query) {
+                return partial_blocks(blocks);
+            }
+            *remaining_queries -= 1;
+            let reply = match ctx.query(pages, &query).await {
+                Ok(reply) => reply,
+                Err(_) => return partial_blocks(blocks),
+            };
+            let page = match pages::decode_reply(&reply) {
+                Ok(PageReply::Page(Some(page))) => page,
+                _ => return partial_blocks(blocks),
+            };
+            let previous_len = blocks.len();
+            blocks.extend(page.blocks);
+            let made_progress = blocks.len() > previous_len;
+            if !made_progress {
+                return partial_blocks(blocks);
+            }
+            let cursor_repeated = page.next_after.is_some() && page.next_after == after;
+            if cursor_repeated {
+                return partial_blocks(blocks);
+            }
+            let page_is_complete = page.next_after.is_none();
+            let render_is_full = page_render_reaches_budget(page_id, &blocks);
+            if page_is_complete || render_is_full {
+                return PageBlocksRead::Complete(Some(blocks));
+            }
+            after = page.next_after;
+        }
+        partial_blocks(blocks)
     }
 
     /// the `duck://files` attachment section for a run: parse the confined file
@@ -352,6 +501,8 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         sources: &[&str],
+        remaining_queries: &mut usize,
+        budget: &SiblingReadBudget,
     ) -> Option<String> {
         let files = self.files.clone()?;
         let paths = parse_duck_refs(sources).files;
@@ -360,8 +511,25 @@ impl RunsModule {
         }
         let mut resolved = Vec::new();
         for path in paths {
-            let content = self.attachment_content(ctx, &files, &path).await;
+            let query = files_encode_query(&FilesQuery::Read {
+                path: path.clone(),
+                snapshot: None,
+                offset: 0,
+                len: ATTACHMENT_CONTEXT_BYTES as u64,
+            });
+            let read_budget_exhausted =
+                *remaining_queries == 0 || !budget.reserve_query(&files, &query);
+            if read_budget_exhausted {
+                let section = render_attachments_section(&resolved);
+                return Some(mark_attachment_section_truncated(section));
+            }
+            *remaining_queries -= 1;
+            let content = self.attachment_content(ctx, &files, &query).await;
             resolved.push((path, content));
+            let section = render_attachments_section(&resolved);
+            if section.ends_with(ATTACHMENT_TRUNCATION_MARKER) {
+                return Some(section);
+            }
         }
         Some(render_attachments_section(&resolved))
     }
@@ -370,14 +538,13 @@ impl RunsModule {
     /// failure degrades to `NotFound`; non-UTF-8 bytes (an image, a binary) are
     /// `Binary` — the agent plane cannot ingest them. bounded by the section
     /// budget so a single file can't blow the read.
-    async fn attachment_content(&self, ctx: &dyn Ctx, files: &ModuleId, path: &str) -> Attachment {
-        let query = files_encode_query(&FilesQuery::Read {
-            path: path.to_string(),
-            snapshot: None,
-            offset: 0,
-            len: ATTACHMENT_CONTEXT_BYTES as u64,
-        });
-        let Ok(reply) = ctx.query(files, &query).await else {
+    async fn attachment_content(
+        &self,
+        ctx: &dyn Ctx,
+        files: &ModuleId,
+        query: &[u8],
+    ) -> Attachment {
+        let Ok(reply) = ctx.query(files, query).await else {
             return Attachment::NotFound;
         };
         let b64 = match files_decode_reply(&reply) {
@@ -572,11 +739,11 @@ mod tests {
     #[test]
     fn malformed_or_non_duck_refs_are_skipped_never_a_failure() {
         let refs = parse_duck_refs(&[
-            "[empty](duck://page/)",            // empty id
-            "[ext](https://example.com)",       // not a duck scheme
-            "[unterminated](duck://page/x",     // no closing paren
-            "[nested](duck://page/a/b)",        // page id must be one segment
-            "plain [not a link] text",          // no url
+            "[empty](duck://page/)",        // empty id
+            "[ext](https://example.com)",   // not a duck scheme
+            "[unterminated](duck://page/x", // no closing paren
+            "[nested](duck://page/a/b)",    // page id must be one segment
+            "plain [not a link] text",      // no url
             "ok [Good](duck://page/ok) ok",
         ]);
         assert_eq!(refs.pages, vec!["ok"]);
@@ -585,12 +752,12 @@ mod tests {
     #[test]
     fn duck_file_refs_are_confined_to_the_attachments_root() {
         let refs = parse_duck_refs(&[
-            "![img](duck://files/shared/attachments/u1/cat.png)",  // ok (embed marker ignored)
-            "[doc](duck://files/shared/attachments/u2/notes.md)",  // ok
-            "[home](duck://files/home/alice/secret.txt)",          // outside root — dropped
-            "[skill](duck://files/shared/skills/a/b)",             // wrong subtree — dropped
-            "[deep](duck://files/shared/attachments/a/b/c)",       // wrong depth — dropped
-            "[dots](duck://files/shared/attachments/../secret)",   // dot-segment — dropped
+            "![img](duck://files/shared/attachments/u1/cat.png)", // ok (embed marker ignored)
+            "[doc](duck://files/shared/attachments/u2/notes.md)", // ok
+            "[home](duck://files/home/alice/secret.txt)",         // outside root — dropped
+            "[skill](duck://files/shared/skills/a/b)",            // wrong subtree — dropped
+            "[deep](duck://files/shared/attachments/a/b/c)",      // wrong depth — dropped
+            "[dots](duck://files/shared/attachments/../secret)",  // dot-segment — dropped
         ]);
         assert_eq!(
             refs.files,
@@ -636,14 +803,23 @@ mod tests {
     fn a_page_renders_headings_todos_lists_code_and_nesting_from_preorder() {
         let section = render_pages_section(&[("plan".into(), Some(preorder_page()))]);
         assert!(section.starts_with("Referenced pages:"), "{section}");
-        assert!(section.contains("[Project Plan](duck://page/plan)"), "{section}");
+        assert!(
+            section.contains("[Project Plan](duck://page/plan)"),
+            "{section}"
+        );
         assert!(section.contains("\nthe intro\n"), "{section}");
         assert!(section.contains("\n# Goals\n"), "{section}");
         assert!(section.contains("\n## Near term\n"), "{section}");
         assert!(section.contains("\n### This week\n"), "{section}");
         // todos carry the M2.3-targetable block id inline.
-        assert!(section.contains("\n- [ ] ship it [blk:b-todo]\n"), "{section}");
-        assert!(section.contains("\n- [x] design it [blk:b-done]\n"), "{section}");
+        assert!(
+            section.contains("\n- [ ] ship it [blk:b-todo]\n"),
+            "{section}"
+        );
+        assert!(
+            section.contains("\n- [x] design it [blk:b-done]\n"),
+            "{section}"
+        );
         assert!(section.contains("\n- a bullet\n"), "{section}");
         // preorder nesting: the child bullet indents one level.
         assert!(section.contains("\n  - a sub bullet\n"), "{section}");
@@ -669,18 +845,32 @@ mod tests {
     fn the_page_section_truncates_at_its_budget_with_a_marker() {
         let big = vec![
             block("root", None, BlockKind::Page, "Big"),
-            block("b1", Some("root"), BlockKind::Paragraph, &"x".repeat(128 * 1024)),
+            block(
+                "b1",
+                Some("root"),
+                BlockKind::Paragraph,
+                &"x".repeat(128 * 1024),
+            ),
         ];
         let section = render_pages_section(&[("big".into(), Some(big))]);
         assert_eq!(section.len(), PAGE_CONTEXT_BYTES);
-        assert!(section.ends_with(PAGE_TRUNCATION_MARKER), "{}", &section[section.len() - 60..]);
+        assert!(
+            section.ends_with(PAGE_TRUNCATION_MARKER),
+            "{}",
+            &section[section.len() - 60..]
+        );
     }
 
     #[test]
     fn page_truncation_respects_utf8_boundaries() {
         let big = vec![
             block("root", None, BlockKind::Page, "Big"),
-            block("b1", Some("root"), BlockKind::Paragraph, &"é".repeat(64 * 1024)),
+            block(
+                "b1",
+                Some("root"),
+                BlockKind::Paragraph,
+                &"é".repeat(64 * 1024),
+            ),
         ];
         let section = render_pages_section(&[("big".into(), Some(big))]);
         assert!(section.len() <= PAGE_CONTEXT_BYTES);
@@ -744,17 +934,26 @@ mod tests {
                 Attachment::Text("# Plan\nship it".into()),
             ),
             ("/shared/attachments/u2/cat.png".into(), Attachment::Binary),
-            ("/shared/attachments/u3/gone.txt".into(), Attachment::NotFound),
+            (
+                "/shared/attachments/u3/gone.txt".into(),
+                Attachment::NotFound,
+            ),
         ]);
         assert!(section.starts_with("Referenced attachments:"), "{section}");
         // text content is inlined under a name header (name = last segment).
-        assert!(section.contains("[attachment: notes.md]\n# Plan\nship it"), "{section}");
+        assert!(
+            section.contains("[attachment: notes.md]\n# Plan\nship it"),
+            "{section}"
+        );
         // an image is named, never inlined (the agent plane is text-only).
         assert!(
             section.contains("[attachment: cat.png — binary content, not shown]"),
             "{section}"
         );
-        assert!(section.contains("[attachment: gone.txt — not found]"), "{section}");
+        assert!(
+            section.contains("[attachment: gone.txt — not found]"),
+            "{section}"
+        );
     }
 
     #[test]
@@ -764,7 +963,11 @@ mod tests {
             Attachment::Text("x".repeat(128 * 1024)),
         )]);
         assert_eq!(big.len(), ATTACHMENT_CONTEXT_BYTES);
-        assert!(big.ends_with(ATTACHMENT_TRUNCATION_MARKER), "{}", &big[big.len() - 60..]);
+        assert!(
+            big.ends_with(ATTACHMENT_TRUNCATION_MARKER),
+            "{}",
+            &big[big.len() - 60..]
+        );
     }
 
     #[test]
@@ -786,7 +989,10 @@ mod tests {
                     "/shared/attachments/u/a.md".to_string(),
                     Attachment::Text("hi".into()),
                 ),
-                ("/shared/attachments/u/b.png".to_string(), Attachment::Binary),
+                (
+                    "/shared/attachments/u/b.png".to_string(),
+                    Attachment::Binary,
+                ),
             ]
         };
         assert_eq!(

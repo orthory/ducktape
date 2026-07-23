@@ -34,7 +34,7 @@ use crate::workspace_source::WireWorkspace;
 pub const RUN_ENVELOPE_VERSION: u64 = 1;
 /// the runner-result wrapper version — the SINGLE owner across this crate. the
 /// provisioning wrapper's [`crate::provision::assemble_runner_result`] stamps
-/// it, the v3 accept slice validates the envelope requests it, and `runs`
+/// it, the v1 accept slice validates the envelope requests it, and `runs`
 /// reads it back as `u32 == 1`. never redeclare a second const.
 pub const RUNNER_RESULT_VERSION: u64 = 1;
 
@@ -113,8 +113,8 @@ pub struct Prepared {
 }
 
 /// turn one dispatch payload into the provider's input and per-run context.
-/// every payload MUST be a v3 run envelope; anything else — flat strings, v2
-/// envelopes, unknown versions, malformed fields — is a loud `Err` that becomes
+/// every payload MUST be the current v1 run envelope; anything with a different
+/// shape, unknown version, or malformed fields is a loud `Err` that becomes
 /// the saga result (NEVER a silent fallback: the pinned workspace and the
 /// curated skills are the whole point).
 ///
@@ -210,16 +210,16 @@ fn accept_portable_envelope(
     agent_display_name: String,
     library_readable: bool,
 ) -> Result<PortablePlan, String> {
-    let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
+    let workspace = workspace.ok_or_else(|| "v1 run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
     // non-empty-prefix rule; forge requires repo/commit/branch) with loud,
     // field-naming errors — see [`crate::workspace_source`].
     let source = workspace.validate()?;
     let result_contract =
-        result_contract.ok_or_else(|| "v3 run envelope is missing result_contract".to_string())?;
+        result_contract.ok_or_else(|| "v1 run envelope is missing result_contract".to_string())?;
     if result_contract.ducktape_runner_result != RUNNER_RESULT_VERSION {
         return Err(format!(
-            "v3 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
+            "v1 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
             result_contract.ducktape_runner_result
         ));
     }
@@ -230,7 +230,7 @@ fn accept_portable_envelope(
         .iter()
         .any(|s| s.name.is_empty() || s.source_prefix.is_empty())
     {
-        return Err("v3 run envelope skill entries must carry a name and source_prefix".into());
+        return Err("v1 run envelope skill entries must carry a name and source_prefix".into());
     }
 
     // mark portable (no host-local session resume) but set NO

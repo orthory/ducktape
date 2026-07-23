@@ -1,8 +1,8 @@
 //! pages' materialized view: full-text search over the block tree.
 //!
-//! canonical pages state serves whole pages (preorder) and blocks by id; it
-//! cannot search. this mapper folds applied [`PageMsg`] ops into a token
-//! index and serves `search` as pages' endpoint on the derived tier.
+//! canonical pages state serves bounded preorder slices and blocks by id; it
+//! cannot search. this mapper folds applied [`PageMsg`] ops into a token index
+//! and serves `search` as pages' endpoint on the derived tier.
 //!
 //! block ids are globally unique (the module's addressability contract), so
 //! rows key on the id alone. the fold mirrors just enough of the tree to stay
@@ -15,9 +15,10 @@
 //! - `tok/{token}/{block_id}` — one posting per (token, block), value =
 //!   [`TokRef`]; rewritten whole on every text change.
 //!
-//! from-state rebuild: canonical `ListPages`/`GetPage` enumerate every block
-//! WITH its tree shape (`parent`/`page`/`children` are canonical), so rows,
-//! postings, and the subtree-removal membership mirror all re-derive exactly.
+//! from-state rebuild follows every canonical `ListPages`/`GetPage` cursor to
+//! enumerate each block WITH its tree shape (`parent`/`page`/`children` are
+//! canonical), so rows, postings, and the subtree-removal membership mirror
+//! all re-derive exactly.
 //! the one degradation: canonical blocks keep no per-block coordinates, so
 //! `height` and `time` collapse to the boundary — hit sets stay exact,
 //! ranking among rebuilt rows falls back to id order.
@@ -347,35 +348,67 @@ impl ModuleIndexer for PagesIndex {
         meta: &RebuildMeta,
         out: &mut Backfill<'_>,
     ) -> Result<()> {
-        let reply = state.query(&encode_query(&PageQuery::ListPages)).await?;
-        let pages = match decode_reply(&reply).map_err(Error::State)? {
-            PageReply::PageList(pages) => pages,
-            other => return Err(Error::State(format!("ListPages answered {other:?}"))),
-        };
-        for page in pages {
+        let mut pages = Vec::new();
+        let mut page_after = None;
+        loop {
             let reply = state
-                .query(&encode_query(&PageQuery::GetPage {
-                    page_id: page.id.clone(),
+                .query(&encode_query(&PageQuery::ListPages {
+                    after: page_after.clone(),
+                    limit: 0,
                 }))
                 .await?;
-            let blocks = match decode_reply(&reply).map_err(Error::State)? {
-                PageReply::Page(blocks) => blocks,
-                other => return Err(Error::State(format!("GetPage answered {other:?}"))),
+            let page = match decode_reply(&reply).map_err(Error::State)? {
+                PageReply::PageList(page) => page,
+                other => return Err(Error::State(format!("ListPages answered {other:?}"))),
             };
-            for block in blocks.unwrap_or_default() {
-                let row = PageBlockRow {
-                    block_id: block.id,
-                    page_id: block.page,
-                    parent: block.parent,
-                    kind: block.kind,
-                    text: block.text,
-                    children: block.children,
-                    height: meta.height,
-                    time: meta.time,
+            pages.extend(page.pages);
+            let Some(next) = page.next_after else {
+                break;
+            };
+            if page_after.as_ref() == Some(&next) {
+                return Err(Error::State("ListPages repeated its cursor".into()));
+            }
+            page_after = Some(next);
+        }
+        for page in pages {
+            let mut block_after = None;
+            loop {
+                let reply = state
+                    .query(&encode_query(&PageQuery::GetPage {
+                        page_id: page.id.clone(),
+                        after: block_after.clone(),
+                        limit: 0,
+                    }))
+                    .await?;
+                let block_page = match decode_reply(&reply).map_err(Error::State)? {
+                    PageReply::Page(Some(block_page)) => block_page,
+                    PageReply::Page(None) => {
+                        return Err(Error::State("indexed page disappeared".into()));
+                    }
+                    other => return Err(Error::State(format!("GetPage answered {other:?}"))),
                 };
-                for (key, value) in row_entries(&row)? {
-                    out.put(key, value)?;
+                for block in block_page.blocks {
+                    let row = PageBlockRow {
+                        block_id: block.id,
+                        page_id: block.page,
+                        parent: block.parent,
+                        kind: block.kind,
+                        text: block.text,
+                        children: block.children,
+                        height: meta.height,
+                        time: meta.time,
+                    };
+                    for (key, value) in row_entries(&row)? {
+                        out.put(key, value)?;
+                    }
                 }
+                let Some(next) = block_page.next_after else {
+                    break;
+                };
+                if block_after.as_ref() == Some(&next) {
+                    return Err(Error::State("GetPage repeated its cursor".into()));
+                }
+                block_after = Some(next);
             }
         }
         Ok(())
@@ -653,19 +686,68 @@ mod tests {
     impl indexer::StateReader for CanonicalPages {
         async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
             let reply = match crate::decode_query(req).map_err(Error::State)? {
-                PageQuery::ListPages => {
-                    PageReply::PageList(self.0.iter().map(|(meta, _)| meta.clone()).collect())
-                }
-                PageQuery::GetPage { page_id } => PageReply::Page(
-                    self.0
+                PageQuery::ListPages { after, limit } => {
+                    let mut entries = self
+                        .0
                         .iter()
-                        .find(|(meta, _)| meta.id == page_id)
-                        .map(|(_, blocks)| blocks.clone()),
-                ),
+                        .filter(|(meta, _)| after.as_ref().is_none_or(|cursor| meta.id > *cursor));
+                    let mut pages = Vec::new();
+                    for _ in 0..page_limit(limit) {
+                        let Some((meta, _)) = entries.next() else {
+                            break;
+                        };
+                        pages.push(meta.clone());
+                    }
+                    let next_after = entries
+                        .next()
+                        .and_then(|_| pages.last().map(|meta| meta.id.clone()));
+                    PageReply::PageList(crate::PageList { pages, next_after })
+                }
+                PageQuery::GetPage {
+                    page_id,
+                    after,
+                    limit,
+                } => {
+                    let page = self.0.iter().find(|(meta, _)| meta.id == page_id);
+                    let block_page = page
+                        .map(|(_, blocks)| {
+                            let start = after
+                                .as_ref()
+                                .map(|cursor| {
+                                    blocks
+                                        .iter()
+                                        .position(|block| block.id == *cursor)
+                                        .ok_or_else(|| Error::State("invalid page cursor".into()))
+                                        .map(|index| index + 1)
+                                })
+                                .transpose()?
+                                .unwrap_or(0);
+                            let end = start.saturating_add(page_limit(limit)).min(blocks.len());
+                            let page_blocks = blocks[start..end].to_vec();
+                            let next_after = (end < blocks.len())
+                                .then(|| page_blocks.last().map(|block| block.id.clone()))
+                                .flatten();
+                            Ok::<_, Error>(crate::PageBlockPage {
+                                blocks: page_blocks,
+                                next_after,
+                            })
+                        })
+                        .transpose()?;
+                    PageReply::Page(block_page)
+                }
                 other => return Err(Error::State(format!("unexpected query {other:?}"))),
             };
             Ok(crate::encode_reply(&reply))
         }
+    }
+
+    fn page_limit(limit: u16) -> usize {
+        let requested = usize::from(if limit == 0 {
+            crate::MAX_PAGE_QUERY_LIMIT
+        } else {
+            limit.min(crate::MAX_PAGE_QUERY_LIMIT)
+        });
+        requested.min(2)
     }
 
     fn canonical_block(
@@ -703,40 +785,72 @@ mod tests {
         );
 
         // one page: root p1 → b1 (toggle section) → b2 (inner), plus b3.
-        let state = CanonicalPages(vec![(
-            crate::PageMeta {
-                id: "p1".into(),
-                title: "roadmap".into(),
-                parent: None,
-            },
-            vec![
-                canonical_block("p1", None, "p1", BlockKind::Page, "roadmap", &["b1", "b3"]),
-                canonical_block(
-                    "b1",
-                    Some("p1"),
-                    "p1",
-                    BlockKind::Paragraph,
-                    "toggle section",
-                    &["b2"],
-                ),
-                canonical_block(
-                    "b2",
-                    Some("b1"),
-                    "p1",
-                    BlockKind::Paragraph,
-                    "hidden inner text",
+        let state = CanonicalPages(vec![
+            (
+                crate::PageMeta {
+                    id: "p1".into(),
+                    title: "roadmap".into(),
+                    parent: None,
+                },
+                vec![
+                    canonical_block("p1", None, "p1", BlockKind::Page, "roadmap", &["b1", "b3"]),
+                    canonical_block(
+                        "b1",
+                        Some("p1"),
+                        "p1",
+                        BlockKind::Paragraph,
+                        "toggle section",
+                        &["b2"],
+                    ),
+                    canonical_block(
+                        "b2",
+                        Some("b1"),
+                        "p1",
+                        BlockKind::Paragraph,
+                        "hidden inner text",
+                        &[],
+                    ),
+                    canonical_block(
+                        "b3",
+                        Some("p1"),
+                        "p1",
+                        BlockKind::Paragraph,
+                        "sibling survivor",
+                        &[],
+                    ),
+                ],
+            ),
+            (
+                crate::PageMeta {
+                    id: "p2".into(),
+                    title: "second page".into(),
+                    parent: None,
+                },
+                vec![canonical_block(
+                    "p2",
+                    None,
+                    "p2",
+                    BlockKind::Page,
+                    "second page",
                     &[],
-                ),
-                canonical_block(
-                    "b3",
-                    Some("p1"),
-                    "p1",
-                    BlockKind::Paragraph,
-                    "sibling survivor",
+                )],
+            ),
+            (
+                crate::PageMeta {
+                    id: "p3".into(),
+                    title: "third page".into(),
+                    parent: None,
+                },
+                vec![canonical_block(
+                    "p3",
+                    None,
+                    "p3",
+                    BlockKind::Page,
+                    "third page",
                     &[],
-                ),
-            ],
-        )]);
+                )],
+            ),
+        ]);
         store
             .rebuild_module(
                 "pages",
@@ -759,6 +873,11 @@ mod tests {
         assert_eq!(hits[0].height, 20, "coordinates collapse to the boundary");
         assert_eq!(store.applied_height("pages").unwrap(), 20);
         assert_eq!(store.backfill_height("pages").unwrap(), Some(20));
+        assert_eq!(
+            search(&store, serde_json::json!({"search": {"text": "third"}})).len(),
+            1,
+            "rebuild follows the page-list continuation"
+        );
 
         // the rebuilt membership mirror carries the fold forward: removing b1
         // above the boundary unindexes its whole subtree, sibling untouched.

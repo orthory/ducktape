@@ -1,4 +1,4 @@
-//! the portable workspace SOURCE — the tagged `workspace` block of a v3 run
+//! the portable workspace SOURCE — the tagged `workspace` block of a v1 run
 //! envelope (wire contract §1: `kind` = `duckfs` | `forge`) and the plain-data
 //! vocabulary ([`WorkspaceSource`]) the plan/spec carry it in across the
 //! reachability wall.
@@ -90,7 +90,7 @@ pub(crate) enum WireWorkspace {
     },
     Forge {
         repo: String,
-        /// required in v3: the composer always states the tracker title.
+        /// required in v1: the composer always states the tracker title.
         item_title: String,
         commit: String,
         branch: String,
@@ -100,7 +100,7 @@ pub(crate) enum WireWorkspace {
 }
 
 impl WireWorkspace {
-    /// per-variant, per-field loud validation: a v3 marker with an empty
+    /// per-variant, per-field loud validation: a v1 marker with an empty
     /// coordinate is a mixed-network signal, never silently downgraded.
     pub(crate) fn validate(self) -> Result<WorkspaceSource, String> {
         match self {
@@ -110,7 +110,7 @@ impl WireWorkspace {
             } => {
                 if source_prefix.is_empty() {
                     return Err(
-                        "v3 run envelope workspace.source_prefix must not be empty".into()
+                        "v1 run envelope workspace.source_prefix must not be empty".into()
                     );
                 }
                 Ok(WorkspaceSource::Duckfs {
@@ -129,7 +129,7 @@ impl WireWorkspace {
                 for (field, value) in [("repo", &repo), ("commit", &commit), ("branch", &branch)] {
                     if value.is_empty() {
                         return Err(format!(
-                            "v3 run envelope forge workspace.{field} must not be empty"
+                            "v1 run envelope forge workspace.{field} must not be empty"
                         ));
                     }
                 }

@@ -386,9 +386,8 @@ fn genesis_capability_wasm() -> WasmModule {
         .with_state_schema_revision(2)
 }
 
-/// saga / agent / automations at their GENESIS code (adapter-ported; saga and
-/// automations are revision 2, while agent's later role tail makes it revision
-/// 3). the sibling wiring — saga's valset/capability assignment reads, agent's
+/// saga / agent / automations at their GENESIS code (adapter-ported). the
+/// sibling wiring — saga's valset/capability assignment reads, agent's
 /// saga dead-letter + runs hook, automations' chat/tasks/inbox lanes — is
 /// genesis-constant and compiled into the guests (the exact production
 /// constructors these builders used to call natively).
@@ -401,7 +400,7 @@ fn genesis_saga_wasm() -> WasmModule {
 fn genesis_agent_wasm() -> WasmModule {
     WasmModule::from_bytes(AGENT_MODULE_ID, AGENT_WASM_COMPONENT)
         .expect("embedded agent component loads")
-        .with_state_schema_revision(3)
+        .with_state_schema_revision(1)
 }
 
 fn genesis_automations_wasm() -> WasmModule {
@@ -424,13 +423,12 @@ fn genesis_dispatch_wasm() -> WasmModule {
 }
 
 /// runs at its GENESIS code (adapter-ported — see the component const's doc).
-/// revision 3: the native canonical snapshot (itself at revision 2 since the
-/// session section landed) is persisted as one host-KV value, so the encoding
-/// breaks shape again at cutover.
+/// The native canonical snapshot and delivered-runs ring are persisted in the
+/// current v1 host-KV layout.
 fn genesis_runs_wasm() -> WasmModule {
     WasmModule::from_bytes(RUNS_MODULE_ID, RUNS_WASM_COMPONENT)
         .expect("embedded runs component loads")
-        .with_state_schema_revision(3)
+        .with_state_schema_revision(1)
 }
 
 /// pages at its GENESIS code over the host-constructed store (a fresh/reopened

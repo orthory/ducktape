@@ -201,13 +201,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     let blobs = http_handle.blob_handle();
     let gateway_commands = http_handle.command_sender();
     // the REAL portable-agent-run provisioner, built from a clone of the http
-    // handle BEFORE the serve/drop match consumes it. portable (v3) runs
+    // handle BEFORE the serve/drop match consumes it. portable v1 runs
     // materialize a per-run duckfs checkout under a root VALIDATED to be
     // outside <storage> (D7) and drive checkout/commit over this SAME
     // NodeHandle actor lane the /v1/fs/workspaces RPC already rides here.
     // LIVE for every agent run: this binary wires the files module
-    // unconditionally, so the runs composer emits v3 (the de-versioned
-    // activation — no flag day, pre-production re-genesis). a misconfigured
+    // unconditionally, so the runs composer emits v1. a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
     let agent_provisioner: dispatch_oracle::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(

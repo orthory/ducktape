@@ -79,8 +79,6 @@ struct AgentState {
     /// C4 ordered skill refs — the agent's SOUL (order is significant to the
     /// hash, and to the order `Always` bodies assemble in host-side).
     skills: Vec<SkillRef>,
-    /// owner-assigned semantic role; general is the default.
-    role: AgentRole,
 }
 
 // ---- canonical encoding -------------------------------------------------------
@@ -175,23 +173,6 @@ fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
         codec::push_bytes(&mut out, &a.recipe_hash);
         put_caps(&mut out, &a.caps);
         put_skills(&mut out, &a.skills);
-    }
-    // Sparse additive role tail. If every record is General (the common case),
-    // omit it entirely — the root stays byte-for-byte identical to an
-    // all-General registry.
-    let roles = agents
-        .iter()
-        .filter(|(_, agent)| agent.role != AgentRole::General)
-        .collect::<Vec<_>>();
-    if !roles.is_empty() {
-        out.extend_from_slice(&(roles.len() as u64).to_le_bytes());
-        for (id, agent) in roles {
-            codec::push_bytes(&mut out, id.as_bytes());
-            out.push(match agent.role {
-                AgentRole::General => 0,
-                AgentRole::ProjectLibrarian => 1,
-            });
-        }
     }
     out
 }
@@ -395,14 +376,20 @@ fn decode_committed(bytes: &[u8]) -> Result<BTreeMap<String, AgentState>, Error>
             if let Some(last) = allowed_actions.iter().next_back()
                 && last.as_str() >= action.as_str()
             {
-                return Err(Error::Module("snapshot actions not strictly ascending".into()));
+                return Err(Error::Module(
+                    "snapshot actions not strictly ascending".into(),
+                ));
             }
             allowed_actions.insert(action);
         }
         let active = match cur.byte("agent status")? {
             0 => true,
             1 => false,
-            d => return Err(Error::Module(format!("snapshot has unknown agent status {d}"))),
+            d => {
+                return Err(Error::Module(format!(
+                    "snapshot has unknown agent status {d}"
+                )));
+            }
         };
         let created_at = cur.u64("agent created_at")?;
         let updated_at = cur.u64("agent updated_at")?;
@@ -424,43 +411,10 @@ fn decode_committed(bytes: &[u8]) -> Result<BTreeMap<String, AgentState>, Error>
                 recipe_hash,
                 caps,
                 skills,
-                role: AgentRole::General,
             },
         )?;
     }
-
-    // A missing tail means every agent is General (the common case). A present
-    // tail is a canonical, strictly-ascending sparse map of non-default role
-    // assignments.
-    if cur.remaining() > 0 {
-        let role_count = take_count(&mut cur, 8 + 1, "agent role")?;
-        if role_count == 0 {
-            return Err(Error::Module("snapshot has empty agent role tail".into()));
-        }
-        let mut last: Option<String> = None;
-        for _ in 0..role_count {
-            let id = cur.string("agent role id")?;
-            if last.as_ref().is_some_and(|previous| previous >= &id) {
-                return Err(Error::Module(
-                    "snapshot role keys not strictly ascending".into(),
-                ));
-            }
-            let role = match cur.byte("agent role")? {
-                1 => AgentRole::ProjectLibrarian,
-                d => {
-                    return Err(Error::Module(format!(
-                        "snapshot has unknown or default agent role {d}"
-                    )));
-                }
-            };
-            let agent = agents
-                .get_mut(&id)
-                .ok_or_else(|| Error::Module(format!("snapshot role names unknown agent: {id}")))?;
-            agent.role = role;
-            last = Some(id);
-        }
-        cur.finish("snapshot")?;
-    }
+    cur.finish("snapshot")?;
     Ok(agents)
 }
 
@@ -543,7 +497,7 @@ impl AgentModule {
             } else {
                 AgentStatus::Paused
             },
-            role: a.role,
+            role: AgentRole::General,
             created_at: a.created_at,
             updated_at: a.updated_at,
             recipe_hash: a.recipe_hash.clone(),
@@ -746,7 +700,6 @@ impl AgentModule {
                     recipe_hash,
                     caps,
                     skills,
-                    role: AgentRole::General,
                 };
                 Self::validate_record_size(&agent_id, &state)?;
                 // the hook stages the agent's dispatch recipe in this same
@@ -870,7 +823,7 @@ impl Module for AgentModule {
     }
 
     fn state_schema_revision(&self) -> u32 {
-        2
+        1
     }
 
     /// state-based commitment: sha256 over the canonical committed encoding —
@@ -935,8 +888,7 @@ impl Module for AgentModule {
 mod tests {
     use super::*;
     use crate::{
-        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg,
-        encode_query,
+        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
     };
     use futures::executor::block_on;
     use sdk::{Env, StateSyncHandle};
@@ -1014,7 +966,6 @@ mod tests {
     fn agent_response_commit_message_is_optional_and_round_trips_exactly() {
         let clean = decode_response(br#"{"reply_blocks":[],"actions":[]}"#).unwrap();
         assert_eq!(clean.commit_message, None);
-        assert!(clean.delegations.is_empty());
 
         let message = "fix: exact subject\n\nExact body.";
         let response = AgentResponse {
@@ -1542,7 +1493,9 @@ mod tests {
         let run = || {
             let mut m = module();
             for (i, (origin, op)) in ops.iter().enumerate() {
-                let mut ctx = CaptureCtx::new().at(i as u64 + 1).with_origin(origin.clone());
+                let mut ctx = CaptureCtx::new()
+                    .at(i as u64 + 1)
+                    .with_origin(origin.clone());
                 exec(&mut m, &mut ctx, &admin(op)).unwrap();
                 commit(&mut m);
             }
@@ -1642,7 +1595,11 @@ mod tests {
         let mut joiner = module();
         joiner.install(&bytes, root).unwrap();
         assert_eq!(joiner.root(), root);
-        assert_eq!(joiner.snapshot(), bytes, "the joiner re-encodes identically");
+        assert_eq!(
+            joiner.snapshot(),
+            bytes,
+            "the joiner re-encodes identically"
+        );
     }
 
     /// register the runtime-identity fields, commit, snapshot -> install into a
@@ -1919,7 +1876,7 @@ mod tests {
     }
 
     #[test]
-    fn role_defaults_to_general_and_round_trips_through_the_sparse_tail() {
+    fn role_defaults_to_general() {
         let record: AgentRecord = serde_json::from_value(serde_json::json!({
             "agent_id": "bot",
             "owner": { "external": [9] },
@@ -1935,25 +1892,6 @@ mod tests {
         assert!(
             serde_json::to_value(&record).unwrap().get("role").is_none(),
             "the default role stays absent on the JSON wire"
-        );
-
-        let mut m = module();
-        let mut owner = CaptureCtx::new().at(3).with_origin(user(9));
-        exec(&mut m, &mut owner, &admin(&register("bot", &[]))).unwrap();
-        commit(&mut m);
-        m.agents.get_mut("bot").unwrap().role = AgentRole::ProjectLibrarian;
-        assert_eq!(
-            get_agent(&m, "bot").unwrap().role,
-            AgentRole::ProjectLibrarian
-        );
-
-        let (bytes, root) = (m.snapshot(), m.root());
-        let mut joiner = module();
-        joiner.install(&bytes, root).unwrap();
-        assert_eq!(joiner.root(), root);
-        assert_eq!(
-            get_agent(&joiner, "bot").unwrap().role,
-            AgentRole::ProjectLibrarian
         );
     }
 

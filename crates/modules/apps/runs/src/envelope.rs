@@ -53,8 +53,8 @@ pub(crate) const DEFAULT_PROMPT: &str =
 /// the strict output contract riding every composed payload — exactly the
 /// [`agent::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
-{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"delegations":[],"commit_message":"Your Git subject\n\nOptional body"}
-Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. The terminal delegations field remains only for older runners that cannot call tools mid-run; it is shaped as {"agent_id":"<registered agent>","instruction":"...","skills":["<library skill name>"]}. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
+{"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
+Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
 
 /// the committed payload shape. FIELD ORDER IS PART OF THE COMMITTED BYTES:
 /// serde_json serializes struct fields in declaration order, so this
@@ -1038,7 +1038,7 @@ mod tests {
             "the thread key follows the display name directly: {payload}"
         );
         let v = parse(&payload);
-        assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(v["ducktape_run"], 1);
         assert_eq!(
             v["workspace"]["kind"], "duckfs",
             "the workspace source is tagged"
@@ -1085,7 +1085,7 @@ mod tests {
             plain(),
         );
         let v = parse(&payload);
-        assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(v["ducktape_run"], 1);
         assert!(
             v["workspace"]["source_snapshot"].is_null(),
             "an unresolved head composes source_snapshot: null"
@@ -1132,7 +1132,7 @@ mod tests {
             payload.contains(r#"Reply as the agent.","workspace":{"kind":"duckfs""#),
             "conversation runs straight into workspace: {payload}"
         );
-        assert_eq!(parse(&payload)["ducktape_run"], 3);
+        assert_eq!(parse(&payload)["ducktape_run"], 1);
     }
 
     // ---- the forge workspace source (M1) --------------------------------------
@@ -1172,7 +1172,7 @@ mod tests {
             inputs,
         );
         let v = parse(&payload);
-        assert_eq!(v["ducktape_run"], 3);
+        assert_eq!(v["ducktape_run"], 1);
         assert_eq!(
             v["thread_key"], "forge:app:7#1",
             "thread continuity keys are unchanged — replies land in the item discussion"

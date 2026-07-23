@@ -264,7 +264,7 @@ pub struct RunContext {
     /// (scheduling already matched them). Default empty — a Direct backend
     /// ignores it entirely.
     pub limits: BTreeMap<String, u64>,
-    /// true for portable v3 runs: native CLI sessions are host-local
+    /// true for portable v1 runs: native CLI sessions are host-local
     /// optimizations and must not be resumed or captured for portable state.
     pub portable: bool,
     /// the run's assembled context document — the agent's curated skills, built
@@ -6322,7 +6322,7 @@ fi"#,
         assert_eq!(
             p.run("q", &portable).await.unwrap(),
             "cold",
-            "portable v3 runs start from duckfs state, not host-local CLI sessions"
+            "portable v1 runs start from duckfs state, not host-local CLI sessions"
         );
         assert_eq!(
             sole_session_id(&sessions, "bot").as_deref(),

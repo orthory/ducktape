@@ -622,8 +622,14 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         );
     }
     assert_eq!(
-        sim_a.query("pages", serde_json::json!("list_pages"))["page_list"],
-        sim_b.query("pages", serde_json::json!("list_pages"))["page_list"],
+        sim_a.query(
+            "pages",
+            serde_json::json!({ "list_pages": { "after": null, "limit": 0 } }),
+        )["page_list"]["pages"],
+        sim_b.query(
+            "pages",
+            serde_json::json!({ "list_pages": { "after": null, "limit": 0 } }),
+        )["page_list"]["pages"],
         "the page list converges"
     );
 

@@ -130,15 +130,42 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     .expect("genesis")
 }
 
-/// the read matrix: every query family, including the `None`/absent shapes.
+/// the read matrix: every query family, including paged continuations and the
+/// `None`/absent shapes.
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&PageQuery::ListPages),
+        encode_query(&PageQuery::ListPages {
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::ListPages {
+            after: Some("home".into()),
+            limit: 1,
+        }),
         encode_query(&PageQuery::GetPage {
             page_id: "home".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "home".into(),
+            after: Some("home".into()),
+            limit: 1,
         }),
         encode_query(&PageQuery::GetPage {
             page_id: "absent".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "empty".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "empty".into(),
+            after: Some("empty".into()),
+            limit: 1,
         }),
         encode_query(&PageQuery::GetBlock {
             block_id: "b1".into(),
@@ -257,6 +284,16 @@ fn same_ops_identical_roots_block_by_block() {
                     block_id: "b2".into(),
                     parent: Some("b3".into()),
                     after: None,
+                },
+            ),
+            // Empty nested pages terminate at their own root even though the
+            // containing document has a following sibling (`b3`).
+            (
+                alice.clone(),
+                PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b1".into()),
+                    block: nb("empty", BlockKind::Page, "Empty"),
                 },
             ),
             (
@@ -573,11 +610,12 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
 
         // ONE block, four dispatches: the insert reads the page CREATED one
         // dispatch earlier (staged, not committed), the probe host-routes a
-        // GetPage query MID-BLOCK (the wasm side answers it staged-over-store
-        // through the replay), and the comment reads the staged block. on the
-        // wasm side dispatch N+1's reads come from the OUTER staged overlay —
-        // the guest's inner pending died with dispatch N — which is exactly
-        // the native pending-persists-across-dispatches view.
+        // GetPage continuation MID-BLOCK (the wasm side answers it
+        // staged-over-store through the replay), and the comment reads the
+        // staged block. on the wasm side dispatch N+1's reads come from the
+        // OUTER staged overlay — the guest's inner pending died with dispatch
+        // N — which is exactly the native pending-persists-across-dispatches
+        // view.
         let batch = vec![
             (
                 Origin::External(alice.clone()),
@@ -600,6 +638,8 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                     target: "probe".into(),
                     payload: encode_query(&PageQuery::GetPage {
                         page_id: "home".into(),
+                        after: Some("home".into()),
+                        limit: 1,
                     }),
                 },
             ),
@@ -650,6 +690,8 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 "pages",
                 &encode_query(&PageQuery::GetPage {
                     page_id: "home".into(),
+                    after: Some("home".into()),
+                    limit: 1,
                 }),
             )
             .await

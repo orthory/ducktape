@@ -89,6 +89,12 @@ use error::{PageError, to_page_err};
 /// bounds a single parent to tens of thousands of children.
 pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 
+/// Maximum number of block edges below one page root. Nested `Page` blocks
+/// are leaves in the containing document and start their own depth budget.
+/// This keeps every valid preorder cursor page comfortably below the wasm
+/// host's store-read ceiling while leaving far more nesting than the UI uses.
+pub const MAX_PAGE_DEPTH: usize = 64;
+
 /// the reserved logical key under which the page-enumeration INDEX rides in
 /// the same store. its value is a serialized sorted map from every page block
 /// id to its containing page. the leading NUL makes it UNCOLLIDABLE with a real
@@ -96,11 +102,14 @@ pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 /// ([`PageError::ReservedId`]) before it can reach storage.
 const PAGE_INDEX_KEY: &str = "\u{0}page-index";
 
-/// how many parent hops a MoveBlock ancestry walk will follow before declaring
-/// the stored tree corrupt. committed state is acyclic by construction (every
-/// move re-checks), so a walk this deep can only mean a broken parent chain —
-/// the cap turns a would-be infinite loop into a loud deterministic error.
-const MAX_DEPTH: usize = 10_000;
+/// Local ceiling for tree walks and the record work they schedule. The wasm
+/// host permits 4096 reads per dispatch; the headroom covers records touched
+/// before and after the walk while making native and wasm reject at one point.
+const MAX_TRAVERSAL_WORK: usize = 3_500;
+
+/// Leaves room for the moved block, both page-depth walks, and parent writes
+/// below the wasm host's 4096 store-read ceiling.
+const MAX_MOVE_SUBTREE_READS: usize = 3_000;
 
 /// a block-tree pages module over a host-injected authenticated store.
 pub struct Pages {

@@ -61,15 +61,27 @@ async fn apply_expect_err(p: &mut Pages, m: &PageMsg, needle: &str) {
 }
 
 async fn get_page(p: &Pages, page_id: &str) -> Option<Vec<Block>> {
-    let reply = p
-        .query(&encode_query(&PageQuery::GetPage {
-            page_id: page_id.into(),
-        }))
-        .await
-        .unwrap();
-    match decode_reply(&reply).unwrap() {
-        PageReply::Page(v) => v,
-        _ => panic!("expected Page"),
+    let mut blocks = Vec::new();
+    let mut after = None;
+    loop {
+        let reply = p
+            .query(&encode_query(&PageQuery::GetPage {
+                page_id: page_id.into(),
+                after: after.clone(),
+                limit: 0,
+            }))
+            .await
+            .unwrap();
+        let page = match decode_reply(&reply).unwrap() {
+            PageReply::Page(page) => page?,
+            _ => panic!("expected Page"),
+        };
+        blocks.extend(page.blocks);
+        let Some(next) = page.next_after else {
+            return Some(blocks);
+        };
+        assert_ne!(after.as_ref(), Some(&next), "page cursor must advance");
+        after = Some(next);
     }
 }
 
@@ -87,10 +99,26 @@ async fn get_block(p: &Pages, block_id: &str) -> Option<Block> {
 }
 
 async fn list_pages(p: &Pages) -> Vec<PageMeta> {
-    let reply = p.query(&encode_query(&PageQuery::ListPages)).await.unwrap();
-    match decode_reply(&reply).unwrap() {
-        PageReply::PageList(l) => l,
-        _ => panic!("expected PageList"),
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let reply = p
+            .query(&encode_query(&PageQuery::ListPages {
+                after: after.clone(),
+                limit: 0,
+            }))
+            .await
+            .unwrap();
+        let page = match decode_reply(&reply).unwrap() {
+            PageReply::PageList(page) => page,
+            _ => panic!("expected PageList"),
+        };
+        pages.extend(page.pages);
+        let Some(next) = page.next_after else {
+            return pages;
+        };
+        assert_ne!(after.as_ref(), Some(&next), "page-list cursor must advance");
+        after = Some(next);
     }
 }
 

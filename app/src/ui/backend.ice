@@ -1,4 +1,5 @@
 extern crate::backend
+  task focus_next() -> unit
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
   ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
@@ -6,10 +7,11 @@ extern crate::backend
   ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
+  LiveThreadData(generation:i64, channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
-  PageBlock(id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64)
+  PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64)
   PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, selected_block_id:str, selected_block_kind:str, selected_block_text:str, selected_block_checked:bool, page_title_selected:bool)
   PageCommentThread(id:str, author:str, meta:str, resolved:bool, comment_count:i64)
   PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
@@ -32,7 +34,7 @@ extern crate::backend
   sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   sync finish_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
   sync thread_offset_after_reply(offset:i64, has_more:bool) -> i64
-  sync optimistic_block(blocks:[PageBlock], kind:str, text:str) -> [PageBlock]
+  sync optimistic_block(blocks:[PageBlock], after_id:str, kind:str, text:str) -> [PageBlock]
   sync rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
   sync append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
   sync append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
@@ -46,7 +48,19 @@ extern crate::backend
   sync message_action_after_failure(current:str, phase:str, committed:bool) -> str
   sync cancel_autosaves(rpc:str, generation:i64) -> i64
   sync refreshed_block_draft(blocks:[PageBlock], selected_id:str, current:str, autosave_status:str) -> str
+  sync remember_orphaned_block_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str, autosave_status:str) -> [str]
+  sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
+  sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
+  sync retain_drafts_for_endpoint(drafts:[str], current:str, next:str) -> [str]
+  sync refreshed_selected_block(blocks:[PageBlock], selected_id:str) -> str
+  sync retain_selected_string(value:str, selected_id:str) -> str
+  sync retain_selected_i64(value:i64, selected_id:str) -> i64
+  sync retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
+  sync retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
+  sync cancel_missing_block_autosave(rpc:str, generation:i64, blocks:[PageBlock], selected_id:str) -> i64
   sync scope_key(scope:str, id:str) -> str
+  sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
+  defer_focus(scope:str) -> str
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
   create_channel(rpc:str, password:str, name:str) -> ChatData ! AppError
@@ -60,6 +74,7 @@ extern crate::backend
   send_message(rpc:str, password:str, channel_id:str, body:str) -> ChatData ! AppError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, committed_reply:bool, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
+  refresh_live_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> LiveThreadData ! HydrationError
   send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, body:str) -> ChatMessage ! AppError
   edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> ChatData ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> ChatData ! AppError

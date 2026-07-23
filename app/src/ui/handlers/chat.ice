@@ -30,6 +30,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   loading = true
   chat_search_hits = []
   selected_message_seq = 0
+  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -42,6 +43,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
   pending_reply = ""
@@ -56,6 +58,7 @@ on choose_channel(id)
   loading = true
   chat_search_hits = []
   selected_message_seq = 0
+  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -68,6 +71,7 @@ on choose_channel(id)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
   pending_reply = ""
@@ -85,10 +89,26 @@ on create_channel_submit
   error = ""
   run create_channel(connected_rpc, password, pending_channel) -> chat_mutated _ | mutation_failed _
 
+on toggle_channel_create
+  channel_create_open = !channel_create_open
+  return if !channel_create_open
+  task widget focus #workspace-tabs/new-channel
+
 on toggle_channel_settings
   return if empty(active_channel)
   channel_settings_open = !channel_settings_open
   channel_name_draft = active_channel_name
+  return if !channel_settings_open
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  active_thread_seq = 0
+  thread_target_seq = 0
+  thread_messages = []
+  thread_next_reply_offset = 0
+  thread_has_more = false
+  thread_loading = false
+  reply_draft = ""
+  pending_reply = ""
 
 on rename_channel_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(channel_name_draft))
@@ -184,6 +204,7 @@ on chat_updated(next)
   thread_next_reply_offset = next.thread_next_reply_offset
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = false
   loading = false
   error = ""
@@ -214,10 +235,12 @@ on chat_mutated(next)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
   pending_reply = ""
   pending_channel = ""
+  channel_create_open = false
   pending_message = ""
   mutation_phase = "idle"
   error = ""
@@ -227,10 +250,82 @@ on chat_mutated(next)
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
-on select_message(seq, body, rev)
+on message_entered(seq)
+  hovered_message_seq = seq
+
+on message_exited(seq)
+  return if hovered_message_seq != seq
+  hovered_message_seq = 0
+
+on chat_pointer_moved(_, y)
+  chat_pointer_y = y
+
+on chat_resized(_, height)
+  chat_height = height
+
+on open_message_actions(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
+  message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
+  selected_message_seq = seq
+  selected_message_rev = rev
+  message_action = "more"
+  message_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/message-action-focus
+    task focus_next() -> message_action_focused
+
+on open_message_actions_accessibly(seq, body, rev)
+  return if seq <= 0 || mutation_phase != "idle"
+  message_menu_y = 0.0
+  selected_message_seq = seq
+  selected_message_rev = rev
+  message_action = "more"
+  message_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/message-action-focus
+    task focus_next() -> message_action_focused
+
+on open_message_reactions(seq, body, rev)
+  return if seq <= 0 || mutation_phase != "idle"
+  message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
+  selected_message_seq = seq
+  selected_message_rev = rev
+  message_action = "reactions"
+  message_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/message-reaction-focus
+    task focus_next() -> message_action_focused
+
+on arm_message_delete(seq, body, rev)
+  return if seq <= 0 || mutation_phase != "idle"
+  selected_message_seq = seq
+  selected_message_rev = rev
+  message_action = "delete"
+  message_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/message-delete-focus
+    task focus_next() -> message_action_focused
+
+on message_action_focused
+
+on begin_message_edit(seq, body, rev)
+  return if seq <= 0 || mutation_phase != "idle"
+  selected_message_seq = seq
+  selected_message_rev = rev
+  message_action = "editing"
+  message_edit_draft = body
+  task widget focus #workspace-tabs/message-edit
+
+on open_thread_for(seq)
+  return if seq <= 0 || mutation_phase != "idle" || empty(active_channel)
+  channel_settings_open = false
+  selected_message_seq = 0
+  selected_message_rev = 0
+  message_action = "toolbar"
+  message_edit_draft = ""
   thread_generation = thread_generation + 1
-  thread_loading = false
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = true
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -238,22 +333,8 @@ on select_message(seq, body, rev)
   thread_has_more = false
   reply_draft = ""
   pending_reply = ""
-  selected_message_seq = seq
-  selected_message_rev = rev
-  message_action = "toolbar"
-  message_edit_draft = body
-
-on begin_message_edit
-  return if selected_message_seq <= 0 || mutation_phase != "idle"
-  message_action = "editing"
-
-on manage_reactions
-  return if selected_message_seq <= 0 || mutation_phase != "idle"
-  message_action = "reactions"
-
-on arm_message_delete
-  return if selected_message_seq <= 0 || mutation_phase != "idle"
-  message_action = "delete"
+  error = ""
+  run load_thread(connected_rpc, active_channel, seq, 0, 0, false, thread_generation) -> thread_loaded _ | thread_failed _
 
 on cancel_message_action
   return if selected_message_seq <= 0 || mutation_phase != "idle"
@@ -264,18 +345,6 @@ on clear_message_selection
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
-
-on open_thread
-  return if thread_loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0
-  thread_generation = thread_generation + 1
-  thread_loading = true
-  thread_target_seq = 0
-  thread_next_reply_offset = 0
-  thread_has_more = false
-  reply_draft = ""
-  pending_reply = ""
-  error = ""
-  run load_thread(connected_rpc, active_channel, selected_message_seq, 0, 0, false, thread_generation) -> thread_loaded _ | thread_failed _
 
 on thread_loaded(next)
   return if next.generation != thread_generation || !thread_loading
@@ -295,6 +364,7 @@ on thread_loaded(next)
 on load_more_thread
   return if thread_loading || mutation_phase != "idle" || active_thread_seq <= 0 || thread_next_reply_offset < 0 || !thread_has_more
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = true
   error = ""
   run load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_offset, thread_generation) -> thread_page_loaded _ | thread_page_failed _
@@ -306,11 +376,21 @@ on thread_page_loaded(next)
   thread_has_more = next.has_more
   thread_loading = false
   error = ""
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on thread_page_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
   thread_loading = false
   error = cause.message
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on thread_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
@@ -325,6 +405,7 @@ on thread_failed(cause)
 
 on close_thread
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -336,6 +417,7 @@ on close_thread
 
 on edit_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
+  live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -345,6 +427,7 @@ on edit_message_submit
 
 on delete_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || message_action != "delete"
+  live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -354,6 +437,7 @@ on delete_message_submit
 
 on add_reaction_submit(emoji)
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -363,6 +447,7 @@ on add_reaction_submit(emoji)
 
 on remove_reaction_submit(emoji)
   return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -372,6 +457,7 @@ on remove_reaction_submit(emoji)
 
 on send_reply_submit
   return if loading || thread_loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
+  live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -391,6 +477,7 @@ on reply_mutation_failed(cause)
   error = cause.message
   live_dirty = true
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = true
   run load_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, cause.committed, thread_generation) -> thread_loaded _ | thread_failed _
 

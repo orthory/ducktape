@@ -37,47 +37,65 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
       pressed bg=white/15
 
 component MessageContents(message:ChatMessage)
-  col width=fill spacing=4.0
-    row width=fill spacing=8.0 align=center
-      text message.author width=fill size=12.0 @font-bold text-fg
-      text message.meta size=10.0 @text-muted
-    text message.body width=fill size=13.0 wrapping=word @text-fg
-    if message.reply_count > 0 || !empty(message.reactions)
-      row width=fill spacing=5.0 align=center
-        if message.reply_count > 0
-          container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/7 border=white/11 border-w=1.0 r=8.0
-            row spacing=4.0 align=center
-              text "Thread" size=10.0 @font-bold text-muted
-              text message.reply_count size=10.0 @text-muted
-        for reaction in message.reactions
-          container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/7 border=white/11 border-w=1.0 r=8.0
-            row spacing=4.0 align=center
-              text reaction.emoji size=10.0 @text-fg
-              text reaction.count size=10.0 @text-muted
+  row width=fill spacing=8.0 align=start
+    container width=32.0 height=32.0 align-x=center align-y=center bg=white/8 r=6.0
+      text "•" size=12.0 @text-muted
+    col width=fill spacing=4.0
+      row width=fill spacing=8.0 align=center
+        text message.author width=fill size=12.0 @font-bold text-fg
+        text message.meta size=10.0 @text-muted
+      text message.body width=fill size=14.0 wrapping=word @text-fg
+      if message.reply_count > 0 || !empty(message.reactions)
+        row width=fill spacing=5.0 align=center
+          if message.reply_count > 0
+            container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/7 border=white/11 border-w=1.0 r=8.0
+              row spacing=4.0 align=center
+                text "Thread" size=10.0 @font-bold text-muted
+                text message.reply_count size=10.0 @text-muted
+          for reaction in message.reactions
+            container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/7 border=white/11 border-w=1.0 r=8.0
+              row spacing=4.0 align=center
+                text reaction.emoji size=10.0 @text-fg
+                text reaction.count size=10.0 @text-muted
 
-component MessageCard(message:ChatMessage, selected:bool)
-  col width=fill
-    if message.deleted
-      container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=10.0
-        MessageContents message=message
-    if !message.deleted && selected
-      button label=message.body width=fill padding=8.0 -> select_message(message.seq, message.body, message.rev)
-        MessageContents message=message
-        active bg=linear(2.3, white/15@0.0, surface/52@1.0) text=fg border=white/16 border-w=1.0 r=10.0
-        hovered bg=white/16 text=fg
-        pressed bg=selection text=fg
-    if !message.deleted && !selected
-      button label=message.body width=fill padding=8.0 -> select_message(message.seq, message.body, message.rev)
-        MessageContents message=message
-        active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
-        hovered bg=white/6 text=fg border=white/8
-        pressed bg=selection text=fg
+component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
+  mouse enter=message_entered(message.seq) exit=message_exited(message.seq)
+    stack width=fill
+      if message.deleted
+        container width=fill padding=8.0 bg=transparent
+          MessageContents message=message
+      if !message.deleted && selected
+        container width=fill padding=8.0 bg=white/5
+          MessageContents message=message
+      if !message.deleted && !selected
+        container width=fill padding=8.0 bg=transparent
+          MessageContents message=message
+      if !message.deleted && !hovered
+        container width=fill align-x=end align-y=start padding-right=8.0
+          button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_actions_accessibly(message.seq, message.body, message.rev)
+            active bg=transparent text=muted r=6.0
+            hovered bg=white/11 text=fg
+            pressed bg=white/16
+      if !message.deleted && hovered
+        container width=fill align-x=end align-y=start padding-right=8.0
+          container padding=2.0 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+            row spacing=1.0 align=center
+              button "♡" label="Manage reactions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_reactions(message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=white/11 text=fg
+                pressed bg=white/16
+              button "↳" label="Open thread" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_for(message.seq)
+                active bg=transparent text=muted r=6.0
+                hovered bg=white/11 text=fg
+                pressed bg=white/16
+              button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_actions(message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=white/11 text=fg
+                pressed bg=white/16
 
 component ThreadMessageCard(message:ChatMessage, selected:bool)
   container width=fill padding=8.0 bg=transparent r=8.0
     col width=fill spacing=3.0
-      if selected
-        text "SEARCH MATCH" size=10.0 @font-bold text-fg
       row width=fill spacing=7.0 align=center
         text message.author width=fill size=11.0 @font-bold text-fg
         text message.meta size=10.0 @text-muted

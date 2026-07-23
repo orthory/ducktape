@@ -15,11 +15,14 @@ component EmptyState(title:str, detail:str)
 component WorkspaceTabs(status:str, loading:bool)
   state
     tab = "chat"
+    connection_open = false
   on select_tab(next)
     tab = next
-  container width=fill height=fill clip=true bg=linear(2.35, elevated/72@0.0, bg/86@0.55, surface/78@1.0) border=white/14 border-w=1.0 r=20.0 shadow=black/18 shadow-y=8.0 shadow-blur=28.0 px-snap=true
+  on toggle_connection
+    connection_open = !connection_open
+  container width=fill height=fill clip=true bg=bg px-snap=true
     row width=fill height=fill
-      container width=241.0 height=fill padding=12.0 padding-top=38.0 bg=transparent clip=true
+      container width=241.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar clip=true
         col width=fill height=fill spacing=8.0
           Brand
           space height=6.0
@@ -63,28 +66,24 @@ component WorkspaceTabs(status:str, loading:bool)
               slot chat_sidebar
             _
               slot pages_sidebar
-          slot connection
-          row width=fill spacing=7.0 padding=7.0 align=center
-            container width=7.0 height=7.0 bg=fg/55 r=3.5
-              text ""
-            if loading
-              text "Working…" width=fill size=10.0 wrapping=none @text-muted
-            if !loading
-              text status width=fill size=10.0 wrapping=none @text-muted
+          button label="Connection" width=fill height=28.0 padding=7.0 -> toggle_connection
+            row width=fill spacing=7.0 align=center
+              container width=7.0 height=7.0 bg=fg/55 r=3.5
+                text ""
+              text "Connection" size=10.0 @font-bold text-muted
+              if loading
+                text "Working…" width=fill size=10.0 wrapping=none @text-muted
+              if !loading
+                text status width=fill size=10.0 wrapping=none @text-muted
+              text "›" size=14.0 @text-muted
+            active bg=transparent text=muted r=8.0
+            hovered bg=white/7 text=fg
+            pressed bg=white/12
+          if connection_open
+            slot connection
       container width=1.0 height=fill bg=separator
         text ""
       col width=fill height=fill
-        container width=fill padding=12.0 padding-left=16.0
-          row width=fill height=38.0 spacing=12.0 align=center
-            match tab
-              "chat"
-                col spacing=0.0
-                  text "Chat" size=17.0 @font-bold text-fg
-                  text "Workspace conversations" size=10.0 @text-muted
-              _
-                col spacing=0.0
-                  text "Pages" size=17.0 @font-bold text-fg
-                  text "Shared documents" size=10.0 @text-muted
         slot notice
         col width=fill height=fill padding=12.0 padding-top=4.0
           match tab

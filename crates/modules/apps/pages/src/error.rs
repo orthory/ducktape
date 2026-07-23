@@ -1,7 +1,7 @@
 use super::Error;
 
-/// per-op failures. mapped to [`Error::Module`] so any error aborts the whole
-/// block (the sdk `abort_block` contract), rolling back the staged overlay.
+/// deterministic module failures. Operation errors abort the whole block (the
+/// sdk `abort_block` contract); query errors leave state untouched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PageError {
     /// insert/create of a block id already present ANYWHERE in the module —
@@ -13,6 +13,20 @@ pub(super) enum PageError {
     ParentNotFound,
     /// an `after` anchor that is not a child of the named parent.
     AnchorNotFound,
+    /// a page-block query cursor that is absent or outside the requested page.
+    InvalidPageCursor,
+    /// a page query exceeded its deterministic block-read budget before the
+    /// wasm host's broader per-dispatch store-read ceiling.
+    PageTraversalTooDeep,
+    /// an insert or move would put a block below [`crate::MAX_PAGE_DEPTH`].
+    PageTooDeep,
+    /// a subtree-deepening move was too large to validate inside one wasm
+    /// dispatch. Same-depth and shallower moves do not need this traversal.
+    MoveSubtreeTooLarge,
+    /// a page move's physical ancestry exceeded the local store-read budget.
+    MoveAncestryTooDeep,
+    /// a subtree removal exceeded the local traversal/work budget during preflight.
+    RemoveSubtreeTooLarge,
     /// a move whose new parent sits inside the moved block's own subtree.
     CycleMove,
     /// a move whose new parent belongs to a different page.
@@ -81,6 +95,12 @@ impl core::fmt::Display for PageError {
             PageError::BlockNotFound => "block not found",
             PageError::ParentNotFound => "parent block not found",
             PageError::AnchorNotFound => "after-anchor not found",
+            PageError::InvalidPageCursor => "invalid page cursor",
+            PageError::PageTraversalTooDeep => "page traversal too deep",
+            PageError::PageTooDeep => "page nesting is too deep",
+            PageError::MoveSubtreeTooLarge => "subtree is too large to move deeper",
+            PageError::MoveAncestryTooDeep => "page ancestry is too deep to move",
+            PageError::RemoveSubtreeTooLarge => "subtree is too large to remove",
             PageError::CycleMove => "move target is inside the moved subtree",
             PageError::CrossPageMove => "cross-page move",
             PageError::PageKindImmutable => "page blocks cannot be converted to another kind",

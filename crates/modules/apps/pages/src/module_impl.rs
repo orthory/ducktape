@@ -1,7 +1,6 @@
 use super::{
-    AuthorRef, BlockKind, Ctx, Error, Module, ModuleId, Msg, PAGE_INDEX_KEY, PageError, PageMeta,
-    PageQuery, PageReply, Pages, ResolverSyncTarget, StateRoot, StateSyncHandle, TagEvent,
-    TaggingMsg, decode_msg, decode_query, encode_reply,
+    AuthorRef, Ctx, Error, Module, ModuleId, Msg, PageQuery, PageReply, Pages, ResolverSyncTarget,
+    StateRoot, StateSyncHandle, TagEvent, TaggingMsg, decode_msg, decode_query, encode_reply,
 };
 
 fn tag_author(author: &AuthorRef) -> tagging::Author {
@@ -111,41 +110,29 @@ impl Module for Pages {
     /// reserved sentinel reads as absence (it is not a block).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            PageQuery::GetPage { page_id } => {
-                let page = if page_id == PAGE_INDEX_KEY {
+            PageQuery::GetPage {
+                page_id,
+                after,
+                limit,
+            } => {
+                let page = if page_id.starts_with('\0') {
                     None
                 } else {
-                    self.load_page(&page_id).await?
+                    self.load_page_page(&page_id, after, limit).await?
                 };
                 Ok(encode_reply(&PageReply::Page(page)))
             }
             PageQuery::GetBlock { block_id } => {
-                let block = if block_id == PAGE_INDEX_KEY {
+                let block = if block_id.starts_with('\0') {
                     None
                 } else {
                     self.load_block(&block_id).await?
                 };
                 Ok(encode_reply(&PageReply::Block(block)))
             }
-            PageQuery::ListPages => {
-                // id -> containing page straight from the reserved index entry;
-                // titles read from live Page blocks so a rename shows without
-                // touching the index.
-                let index = self.load_index().await?;
-                let mut pages = Vec::with_capacity(index.len());
-                for (id, parent) in index {
-                    let root = self
-                        .load_block(&id)
-                        .await?
-                        .filter(|b| b.kind == BlockKind::Page)
-                        .ok_or_else(|| Error::Module(PageError::Corrupt.to_string()))?;
-                    pages.push(PageMeta {
-                        id,
-                        title: root.text,
-                        parent,
-                    });
-                }
-                Ok(encode_reply(&PageReply::PageList(pages)))
+            PageQuery::ListPages { after, limit } => {
+                let page = self.list_page_page(after, limit).await?;
+                Ok(encode_reply(&PageReply::PageList(page)))
             }
             PageQuery::ThreadsForTarget {
                 target,

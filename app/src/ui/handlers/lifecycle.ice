@@ -14,6 +14,10 @@ on reconnect
   page_draft = retain_for_endpoint(page_draft, connected_rpc, rpc)
   block_draft = retain_for_endpoint(block_draft, connected_rpc, rpc)
   page_search_draft = retain_for_endpoint(page_search_draft, connected_rpc, rpc)
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  orphaned_block_drafts = retain_drafts_for_endpoint(orphaned_block_drafts, connected_rpc, rpc)
+  orphaned_comment_drafts = retain_drafts_for_endpoint(orphaned_comment_drafts, connected_rpc, rpc)
   connected_rpc = rpc
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -34,6 +38,7 @@ on reconnect
   channel_name_draft = ""
   member_key_draft = ""
   selected_message_seq = 0
+  hovered_message_seq = 0
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
@@ -43,6 +48,7 @@ on reconnect
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
   pending_reply = ""
@@ -58,9 +64,13 @@ on reconnect
   active_page_parent = ""
   pending_page = ""
   pending_block = ""
+  block_insert_after_id = ""
+  block_insert_open = !empty(block_draft)
   selected_block_id = ""
+  hovered_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_actions_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -130,32 +140,67 @@ on workspace_refreshed(next)
   active_channel_huddle_count = next.active_channel_huddle_count
   channel_members = next.channel_members
   pages = next.pages
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, next.blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, next.blocks, selected_block_id, block_comment_draft)
+  block_edit_draft = refreshed_block_draft(next.blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  block_autosave_generation = cancel_missing_block_autosave(connected_rpc, block_autosave_generation, next.blocks, selected_block_id)
+  selected_block_id = refreshed_selected_block(next.blocks, selected_block_id)
+  selected_block_kind = retain_selected_string(selected_block_kind, selected_block_id)
+  selected_block_checked = selected_block_checked && !empty(selected_block_id)
+  block_comments_open = block_comments_open && !empty(selected_block_id)
+  block_comments_target = retain_selected_string(block_comments_target, selected_block_id)
+  block_comment_threads = retain_selected_comment_threads(block_comment_threads, selected_block_id)
+  block_comment_thread_total = retain_selected_i64(block_comment_thread_total, selected_block_id)
+  block_comment_threads_next_from = retain_selected_i64(block_comment_threads_next_from, selected_block_id)
+  block_comment_threads_has_more = block_comment_threads_has_more && !empty(selected_block_id)
+  block_comment_threads_loading = block_comment_threads_loading && !empty(selected_block_id)
+  active_block_comment_thread = retain_selected_string(active_block_comment_thread, selected_block_id)
+  block_thread_comments = retain_selected_comments(block_thread_comments, selected_block_id)
+  block_thread_comments_next_from = retain_selected_i64(block_thread_comments_next_from, selected_block_id)
+  block_thread_comments_has_more = block_thread_comments_has_more && !empty(selected_block_id)
+  block_thread_comments_loading = block_thread_comments_loading && !empty(selected_block_id)
+  block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)
+  pending_block_comment = retain_selected_string(pending_block_comment, selected_block_id)
+  block_edit_draft = retain_selected_string(block_edit_draft, selected_block_id)
+  block_delete_armed = block_delete_armed && !empty(selected_block_id)
+  block_actions_open = block_actions_open && !empty(selected_block_id)
+  block_insert_after_id = refreshed_selected_block(next.blocks, block_insert_after_id)
   blocks = next.blocks
+  page_delete_armed = page_delete_armed && active_page == next.active_page
+  page_title_selected = page_title_selected && active_page == next.active_page
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
-  block_edit_draft = refreshed_block_draft(next.blocks, selected_block_id, block_edit_draft, block_autosave_status)
-  page_delete_armed = false
-  block_delete_armed = false
   error = ""
-  return if !live_dirty
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
   block_comments_generation = block_comments_generation + 1
-  run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
+  live_thread_generation = live_thread_generation + 1
+  parallel
+    run refresh_live_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, live_thread_generation) -> live_thread_refreshed _ | live_thread_refresh_failed _
+    run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
 
 on live_updated(next)
   status = next.status
   return if next.kind == "retrying"
   live_dirty = true
-  return if loading || mutation_phase != "idle" || sync_phase == "refreshing"
+  return if loading || thread_loading || mutation_phase != "idle"
   live_dirty = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "refreshing"
-  block_comments_generation = block_comments_generation + 1
-  run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+
+on live_thread_refreshed(next)
+  return if next.generation != live_thread_generation
+  return if next.channel_id != active_channel || next.root_seq != active_thread_seq
+  live_dirty = live_dirty || thread_loading || mutation_phase != "idle"
+  return if thread_loading || mutation_phase != "idle"
+  thread_target_seq = next.target_seq
+  thread_messages = next.messages
+  thread_next_reply_offset = next.next_reply_offset
+  thread_has_more = next.has_more
+
+on live_thread_refresh_failed(cause)
+  return if cause.generation != live_thread_generation
 
 on live_block_comments_refreshed(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target
@@ -169,14 +214,12 @@ on live_block_comments_refreshed(next)
   block_thread_comments = next.comments
   block_thread_comments_next_from = next.comments_next_from
   block_thread_comments_has_more = next.comments_has_more
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on live_block_comments_failed(cause)
   return if cause.generation != block_comments_generation
   block_comment_threads_loading = false
   block_thread_comments_loading = false
   error = cause.message
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on refresh_failed(cause)
   return if cause.generation != hydration_generation

@@ -1,5 +1,19 @@
 use super::*;
 
+async fn list_slice(p: &Pages, after: Option<&str>, limit: u16) -> PageList {
+    let reply = p
+        .query(&encode_query(&PageQuery::ListPages {
+            after: after.map(str::to_string),
+            limit,
+        }))
+        .await
+        .unwrap();
+    match decode_reply(&reply).unwrap() {
+        PageReply::PageList(page) => page,
+        other => panic!("expected PageList, got {other:?}"),
+    }
+}
+
 #[test]
 fn create_page_is_idempotent_and_preserves_the_title() {
     deterministic::Runner::default().start(|context| async move {
@@ -55,6 +69,102 @@ fn list_pages_enumerates_sorted_with_live_titles() {
             .map(|m| (m.id.as_str(), m.title.as_str()))
             .collect();
         assert_eq!(got, [("alpha", "A"), ("mid", "M"), ("zebra", "Z")]);
+    });
+}
+
+#[test]
+fn list_pages_uses_an_exclusive_lexical_cursor() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        for id in ["zebra", "alpha", "mid"] {
+            apply_commit(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: id.into(),
+                    title: id.into(),
+                },
+            )
+            .await;
+        }
+        let first = list_slice(&p, None, 1).await;
+        assert_eq!(first.pages[0].id, "alpha");
+        assert_eq!(first.next_after.as_deref(), Some("alpha"));
+
+        apply_commit(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "alpha".into(),
+            },
+        )
+        .await;
+        let resumed = list_slice(&p, Some("alpha"), 1).await;
+        assert_eq!(resumed.pages[0].id, "mid");
+        assert_eq!(resumed.next_after.as_deref(), Some("mid"));
+        let last = list_slice(&p, resumed.next_after.as_deref(), u16::MAX).await;
+        assert_eq!(last.pages[0].id, "zebra");
+        assert_eq!(last.next_after, None);
+    });
+}
+
+#[test]
+fn page_query_replies_stop_before_the_rpc_client_limit() {
+    deterministic::Runner::default().start(|context| async move {
+        const RPC_CLIENT_LIMIT: usize = 8 * 1024 * 1024;
+        let mut p = pages_on!(context, "pages");
+        apply_commit(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "root".into(),
+                title: "root".into(),
+            },
+        )
+        .await;
+        let title = "x".repeat(700 * 1024);
+        let mut after = None;
+        for index in 0..10 {
+            let id = format!("p{index:02}");
+            apply_commit(
+                &mut p,
+                &PageMsg::InsertBlock {
+                    parent: "root".into(),
+                    after,
+                    block: page(&id, &title),
+                },
+            )
+            .await;
+            after = Some(id);
+        }
+
+        let block_reply = p
+            .query(&encode_query(&PageQuery::GetPage {
+                page_id: "root".into(),
+                after: None,
+                limit: u16::MAX,
+            }))
+            .await
+            .unwrap();
+        assert!(block_reply.len() < RPC_CLIENT_LIMIT);
+        let PageReply::Page(Some(block_page)) = decode_reply(&block_reply).unwrap() else {
+            panic!("expected Page")
+        };
+        assert!(block_page.next_after.is_some());
+        assert!(block_page.blocks.len() < 11);
+        assert_eq!(get_page(&p, "root").await.unwrap().len(), 11);
+
+        let list_reply = p
+            .query(&encode_query(&PageQuery::ListPages {
+                after: None,
+                limit: u16::MAX,
+            }))
+            .await
+            .unwrap();
+        assert!(list_reply.len() < RPC_CLIENT_LIMIT);
+        let PageReply::PageList(page_list) = decode_reply(&list_reply).unwrap() else {
+            panic!("expected PageList")
+        };
+        assert!(page_list.next_after.is_some());
+        assert!(page_list.pages.len() < 11);
+        assert_eq!(list_pages(&p).await.len(), 11);
     });
 }
 

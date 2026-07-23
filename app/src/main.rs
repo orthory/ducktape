@@ -22,6 +22,11 @@ mod tests {
             app.__ice_component_workspacetabs["workspace-tabs"].tab,
             "pages"
         );
+
+        let _ = app.__update(__DucktapeMessage::__WorkspaceTabsHandleToggleConnection(
+            "workspace-tabs".into(),
+        ));
+        assert!(app.__ice_component_workspacetabs["workspace-tabs"].connection_open);
     }
 
     #[test]
@@ -53,7 +58,6 @@ mod tests {
             "chat_search_draft",
             "page_draft",
             "block_draft",
-            "block_comment_draft",
             "page_search_draft",
         ];
         let overwrites_editable = refresh.lines().any(|line| {
@@ -65,8 +69,46 @@ mod tests {
         assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
         assert!(!lifecycle.contains("every 1s"));
         assert!(lifecycle.contains("run refresh(connected_rpc"));
+        assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
+        assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
         assert!(lifecycle.contains("active_page_title = next.active_page_title"));
         assert!(lifecycle.contains("block_edit_draft = refreshed_block_draft("));
+        assert!(lifecycle.contains(
+            "block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)"
+        ));
+        let live_comment_callbacks = lifecycle
+            .split_once("on live_block_comments_refreshed(next)\n")
+            .unwrap()
+            .1
+            .split_once("\non refresh_failed(cause)")
+            .unwrap()
+            .0;
+        assert!(!live_comment_callbacks.contains("run refresh("));
+    }
+
+    #[test]
+    fn context_destroying_page_handlers_recover_drafts() {
+        let pages = include_str!("ui/handlers/pages.ice");
+        for name in [
+            "open_page_search_hit(page_id, block_id)",
+            "choose_page(id)",
+            "select_block(key, id, kind, text, checked, open_actions)",
+            "clear_block_selection",
+            "pages_mutated(next)",
+        ] {
+            let rest = pages.split_once(&format!("on {name}")).unwrap().1;
+            let body = rest.split_once("\non ").map_or(rest, |(body, _)| body);
+            assert!(body.contains("remember_orphaned_block_drafts("), "{name}");
+            assert!(body.contains("remember_orphaned_comment_drafts("), "{name}");
+        }
+        let close_comments = pages
+            .split_once("on close_block_comments\n")
+            .unwrap()
+            .1
+            .split_once("\non ")
+            .unwrap()
+            .0;
+        assert!(close_comments.contains("remember_orphaned_comment_drafts("));
     }
 
     #[test]
@@ -138,6 +180,79 @@ mod tests {
     }
 
     #[test]
+    fn a_new_live_event_replaces_an_inflight_workspace_refresh() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.hydration_generation = 10;
+
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "changed".into(),
+            status: "first".into(),
+            height: 1,
+        }));
+        assert_eq!(app.hydration_generation, 11);
+        assert_eq!(app.sync_phase, "refreshing");
+        assert!(!app.live_dirty);
+
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "changed".into(),
+            status: "second".into(),
+            height: 2,
+        }));
+        assert_eq!(app.hydration_generation, 12);
+        assert_eq!(app.status, "second");
+        assert!(!app.live_dirty);
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
+            backend::WorkspaceData {
+                generation: 11,
+                rpc: "http://node".into(),
+                status: "stale".into(),
+                height: 1,
+                channels: Vec::new(),
+                messages: Vec::new(),
+                active_channel: String::new(),
+                active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                pages: Vec::new(),
+                blocks: Vec::new(),
+                active_page: String::new(),
+                active_page_title: String::new(),
+                active_page_parent: String::new(),
+            },
+        ));
+        assert_eq!(app.status, "second");
+        assert_eq!(app.sync_phase, "refreshing");
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
+            backend::WorkspaceData {
+                generation: 12,
+                rpc: "http://node".into(),
+                status: "fresh".into(),
+                height: 2,
+                channels: Vec::new(),
+                messages: Vec::new(),
+                active_channel: String::new(),
+                active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                pages: Vec::new(),
+                blocks: Vec::new(),
+                active_page: String::new(),
+                active_page_title: String::new(),
+                active_page_parent: String::new(),
+            },
+        ));
+        assert_eq!(app.status, "fresh");
+        assert_eq!(app.sync_phase, "idle");
+    }
+
+    #[test]
     fn optimistic_send_never_erases_the_next_draft() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
@@ -193,23 +308,131 @@ mod tests {
         let (mut app, _) = Ducktape::__boot();
         app.mutation_phase = "idle".into();
 
-        let _ = app.__update(__DucktapeMessage::SelectMessage(7, "hello".into(), 2));
-        assert_eq!(app.message_action, "toolbar");
-        let _ = app.__update(__DucktapeMessage::BeginMessageEdit);
+        let _ = app.__update(__DucktapeMessage::MessageEntered(7));
+        assert_eq!(app.hovered_message_seq, 7);
+        app.chat_pointer_y = 450.0;
+        app.chat_height = 500.0;
+        let _ = app.__update(__DucktapeMessage::OpenMessageActions(7, "hello".into(), 2));
+        assert_eq!(app.message_menu_y, 260.0);
+        let _ = app.__update(__DucktapeMessage::MessageExited(7));
+        assert_eq!(app.hovered_message_seq, 0);
+        assert_eq!(app.selected_message_seq, 7);
+        assert_eq!(app.message_action, "more");
+        let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
         assert_eq!(app.message_action, "editing");
         let _ = app.__update(__DucktapeMessage::CancelMessageAction);
         assert_eq!(app.message_action, "toolbar");
-        let _ = app.__update(__DucktapeMessage::ManageReactions);
+        let _ = app.__update(__DucktapeMessage::OpenMessageReactions(
+            7,
+            "hello".into(),
+            2,
+        ));
         assert_eq!(app.message_action, "reactions");
         let _ = app.__update(__DucktapeMessage::CancelMessageAction);
-        let _ = app.__update(__DucktapeMessage::ArmMessageDelete);
+        let _ = app.__update(__DucktapeMessage::ArmMessageDelete(7, "hello".into(), 2));
         assert_eq!(app.message_action, "delete");
+        let _ = app.__update(__DucktapeMessage::OpenMessageActionsAccessibly(
+            7,
+            "hello".into(),
+            2,
+        ));
+        assert_eq!(app.message_action, "more");
+        assert_eq!(app.message_menu_y, 0.0);
     }
 
     #[test]
-    fn selecting_another_message_invalidates_the_pending_thread() {
+    fn message_action_toolbar_stays_compact_and_accessible() {
+        let components = include_str!("ui/components/chat.ice");
+        let toolbar = components
+            .split_once("component MessageCard")
+            .unwrap()
+            .1
+            .split_once("component ThreadMessageCard")
+            .unwrap()
+            .0;
+        assert!(toolbar.contains("mouse enter=message_entered(message.seq)"));
+        assert!(toolbar.contains("if !message.deleted && hovered"));
+        assert!(toolbar.contains("if !message.deleted && !hovered"));
+        assert!(toolbar.contains("-> open_message_actions_accessibly("));
+        assert!(!toolbar.contains("hovered || selected"));
+        assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
+        for label in ["Open thread", "Manage reactions", "More message actions"] {
+            assert!(toolbar.contains(&format!("label=\"{label}\"")));
+        }
+
+        let view = include_str!("ui/view.ice");
+        let chat = view
+            .split_once("    chat:")
+            .unwrap()
+            .1
+            .split_once("    pages:")
+            .unwrap()
+            .0;
+        assert!(
+            chat.contains(
+                "overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")"
+            )
+        );
+        assert!(chat.contains("dismiss=clear_message_selection backdrop=transparent"));
+        assert!(chat.contains("mouse move=chat_pointer_moved"));
+        assert!(chat.contains("sensor show=chat_resized resize=chat_resized"));
+        assert!(chat.contains("float x=0.0 y=message_menu_y"));
+        assert!(chat.contains(
+            "stack width=fill height=fill\n                mouse move=chat_pointer_moved"
+        ));
+        let overlay_content = chat
+            .split_once("                  content\n")
+            .unwrap()
+            .1
+            .split_once("                  layer\n")
+            .unwrap()
+            .0;
+        assert!(overlay_content.contains("space width=fill height=fill"));
+        assert!(!overlay_content.contains("message_action =="));
+        let more = view
+            .split_once("message_action == \"more\"")
+            .unwrap()
+            .1
+            .split_once("message_action == \"reactions\"")
+            .unwrap()
+            .0;
+        assert!(more.contains("button \"React\""));
+        assert!(more.contains("button \"Open thread\""));
+        assert!(more.contains("button \"Edit\""));
+        assert!(more.contains("button \"Delete\""));
+        assert!(more.contains("button \"Close\""));
+
+        let handlers = include_str!("ui/handlers/chat.ice");
+        for focus in [
+            "#workspace-tabs/message-action-focus",
+            "#workspace-tabs/message-reaction-focus",
+            "#workspace-tabs/message-delete-focus",
+        ] {
+            assert!(handlers.contains(focus));
+        }
+        for focus in [
+            "#message-action-focus",
+            "#message-reaction-focus",
+            "#message-delete-focus",
+        ] {
+            assert!(chat.contains(&format!("input \"\" {focus}")));
+        }
+        assert_eq!(handlers.matches("task focus_next()").count(), 4);
+        let activate = handlers
+            .split_once("on begin_message_edit(seq, body, rev)\n")
+            .unwrap()
+            .1
+            .split_once("\non ")
+            .unwrap()
+            .0;
+        assert!(activate.contains("task widget focus #workspace-tabs/message-edit"));
+    }
+
+    #[test]
+    fn opening_another_thread_invalidates_the_pending_thread() {
         let (mut app, _) = Ducktape::__boot();
         app.mutation_phase = "idle".into();
+        app.active_channel = "general".into();
         app.selected_message_seq = 1;
         app.thread_generation = 4;
         app.thread_loading = true;
@@ -217,9 +440,9 @@ mod tests {
         app.thread_messages = backend::optimistic_message(Vec::new(), "old thread".into());
         app.reply_draft = "old reply".into();
 
-        let _ = app.__update(__DucktapeMessage::SelectMessage(2, "next".into(), 0));
+        let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
         assert_eq!(app.thread_generation, 5);
-        assert!(!app.thread_loading);
+        assert!(app.thread_loading);
         assert_eq!(app.active_thread_seq, 0);
         assert!(app.thread_messages.is_empty());
         assert!(app.reply_draft.is_empty());
@@ -374,6 +597,7 @@ mod tests {
         let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
             pages: Vec::new(),
             blocks: vec![backend::PageBlock {
+                key: 0,
                 id: "block-1".into(),
                 parent: "page-1".into(),
                 kind: "Todo".into(),
@@ -408,15 +632,50 @@ mod tests {
     }
 
     #[test]
-    fn block_comments_stay_inside_the_selected_block_editor() {
+    fn page_title_and_block_actions_use_native_focus_and_overlay_paths() {
+        let components = include_str!("ui/components/pages.ice");
+        let handlers = include_str!("ui/handlers/pages.ice");
         let view = include_str!("ui/view.ice");
-        let selected = view
-            .split_once("if block.id == selected_block_id")
-            .unwrap()
-            .1;
-        assert!(selected.contains("open_block_comments"));
-        assert!(selected.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
-        assert!(!view.contains("button \"Save\""));
+
+        assert!(components.contains("run defer_focus(current_scope) -> focus_page_title _"));
+        assert!(components.contains("-> begin(title, scope_key(rpc, page_id))"));
+        assert!(
+            handlers.contains(
+                "task widget focus #workspace-tabs/page-title(current_scope)/title-input"
+            )
+        );
+        assert!(view.contains("mouse move=pages_pointer_moved"));
+        assert!(view.contains("overlay when=(connected && !empty(active_page)"));
+        assert!(view.contains("dismiss=close_block_actions backdrop=transparent"));
+        assert!(view.contains("float x=(block_menu_x + 10.0)"));
+        assert!(!view.contains("pin x=(block_menu_x"));
+        assert!(view.contains("BlockActionsMenu block_id=selected_block_id"));
+        assert!(view.matches("button \"Insert divider\"").count() == 2);
+
+        assert!(components.contains("text block.prefix size=14.0"));
+        assert!(components.contains(
+            "component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)"
+        ));
+        assert!(view.contains("prefix=block.prefix #block-insert-row"));
+        assert!(view.contains(
+            "container width=fill padding-left=36.0\n                    PageTitleEditor"
+        ));
+    }
+
+    #[test]
+    fn block_comments_use_a_floating_side_panel() {
+        let view = include_str!("ui/view.ice");
+        let pages = view.split_once("    pages:").unwrap().1;
+        assert!(pages.contains("block_comments_open"));
+        assert!(pages.contains("align-x=end align-y=start"));
+        assert!(pages.contains("width=300.0 height=380.0"));
+        assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
+        assert!(!pages.contains("button \"Save\""));
+        assert!(!pages.contains("Saving"));
+
+        let components = include_str!("ui/components/pages.ice");
+        assert!(components.contains("label=\"Comments\""));
+        assert!(components.contains("-> open_block_comments"));
     }
 
     #[test]
@@ -424,18 +683,22 @@ mod tests {
         let (mut app, _) = Ducktape::__boot();
         app.mutation_phase = "idle".into();
         let _ = app.__update(__DucktapeMessage::SelectBlock(
+            0,
             "block-a".into(),
             "Text".into(),
             "A".into(),
+            false,
             false,
         ));
         let _ = app.__update(__DucktapeMessage::OpenBlockComments);
         let stale_generation = app.block_comments_generation;
 
         let _ = app.__update(__DucktapeMessage::SelectBlock(
+            1,
             "block-b".into(),
             "Text".into(),
             "B".into(),
+            false,
             false,
         ));
         let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
@@ -516,6 +779,7 @@ mod tests {
         app.block_comments_open = true;
         app.block_comments_target = "block-1".into();
         app.block_comment_draft = "draft stays".into();
+        app.block_comment_threads_has_more = true;
         app.active_block_comment_thread = "deleted-thread".into();
         app.block_thread_comments = vec![backend::PageComment {
             id: "stale-comment".into(),
@@ -530,9 +794,62 @@ mod tests {
             status: "Live".into(),
             height: 8,
         }));
-        let generation = app.block_comments_generation;
+        let workspace_generation = app.hydration_generation;
+        let stale_generation = app.block_comments_generation;
         assert_eq!(app.sync_phase, "refreshing");
-        assert!(!app.block_comment_threads_loading);
+        let _ = app.__update(__DucktapeMessage::LoadMoreBlockThreads);
+        assert_ne!(app.block_comments_generation, stale_generation);
+
+        let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
+            backend::BlockCommentsRefreshData {
+                generation: stale_generation,
+                target: "block-1".into(),
+                threads: Vec::new(),
+                total: 0,
+                threads_next_from: 0,
+                threads_has_more: false,
+                thread_id: String::new(),
+                comments: Vec::new(),
+                comments_next_from: 0,
+                comments_has_more: false,
+            },
+        ));
+        assert_eq!(app.sync_phase, "refreshing");
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
+            backend::WorkspaceData {
+                generation: workspace_generation,
+                rpc: "http://node".into(),
+                status: "Live".into(),
+                height: 8,
+                channels: Vec::new(),
+                messages: Vec::new(),
+                active_channel: String::new(),
+                active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                pages: Vec::new(),
+                blocks: vec![backend::PageBlock {
+                    key: 0,
+                    id: "block-1".into(),
+                    parent: "page".into(),
+                    kind: "Text".into(),
+                    text: "block".into(),
+                    pending: false,
+                    checked: false,
+                    prefix: String::new(),
+                    child_count: 0,
+                    mark_count: 0,
+                }],
+                active_page: "page".into(),
+                active_page_title: "Page".into(),
+                active_page_parent: String::new(),
+            },
+        ));
+        assert_eq!(app.sync_phase, "idle");
+        let generation = app.block_comments_generation;
 
         let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
             backend::BlockCommentsRefreshData {
@@ -560,6 +877,38 @@ mod tests {
         assert!(app.active_block_comment_thread.is_empty());
         assert!(app.block_thread_comments.is_empty());
         assert!(!app.block_comment_threads_loading);
+    }
+
+    #[test]
+    fn a_live_event_waits_for_thread_pagination_then_refreshes() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_thread_seq = 7;
+        app.thread_generation = 4;
+        app.thread_loading = true;
+        app.hydration_generation = 9;
+
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "changed".into(),
+            status: "Live".into(),
+            height: 10,
+        }));
+        assert!(app.live_dirty);
+        assert_eq!(app.hydration_generation, 9);
+
+        let _ = app.__update(__DucktapeMessage::ThreadPageLoaded(
+            backend::ThreadPageData {
+                generation: 4,
+                messages: Vec::new(),
+                next_reply_offset: 0,
+                has_more: false,
+            },
+        ));
+        assert!(!app.live_dirty);
+        assert!(!app.thread_loading);
+        assert_eq!(app.hydration_generation, 10);
+        assert_eq!(app.sync_phase, "refreshing");
     }
 
     #[test]
@@ -665,6 +1014,7 @@ mod tests {
                 channel_members: Vec::new(),
                 pages: Vec::new(),
                 blocks: vec![backend::PageBlock {
+                    key: 0,
                     id: "block-1".into(),
                     parent: "page".into(),
                     kind: "Text".into(),
@@ -681,6 +1031,170 @@ mod tests {
             },
         ));
         assert_eq!(app.block_edit_draft, "new");
+    }
+
+    #[test]
+    fn remote_block_deletion_recovers_local_drafts_and_closes_the_editor() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.connected_rpc = "http://node".into();
+        app.hydration_generation = 4;
+        app.sync_phase = "refreshing".into();
+        app.selected_block_id = "deleted".into();
+        app.selected_block_kind = "Text".into();
+        app.block_edit_draft = "unfinished block".into();
+        app.block_autosave_status = "error".into();
+        app.block_autosave_generation = 8;
+        app.block_comments_open = true;
+        app.block_comments_target = "deleted".into();
+        app.block_comment_draft = "unfinished comment".into();
+        app.active_page = "page".into();
+        app.page_delete_armed = true;
+        app.page_title_selected = true;
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
+            backend::WorkspaceData {
+                generation: 4,
+                rpc: "http://node".into(),
+                status: "Live".into(),
+                height: 9,
+                channels: Vec::new(),
+                messages: Vec::new(),
+                active_channel: String::new(),
+                active_channel_name: String::new(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                pages: Vec::new(),
+                blocks: Vec::new(),
+                active_page: "page".into(),
+                active_page_title: "Page".into(),
+                active_page_parent: String::new(),
+            },
+        ));
+
+        assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
+        assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
+        assert!(app.selected_block_id.is_empty());
+        assert!(app.block_edit_draft.is_empty());
+        assert!(app.block_comment_draft.is_empty());
+        assert!(!app.block_comments_open);
+        assert_eq!(app.block_autosave_generation, 9);
+        assert!(app.page_delete_armed);
+        assert!(app.page_title_selected);
+
+        let _ = app.__update(__DucktapeMessage::UseOrphanedBlockDraft(
+            "unfinished block".into(),
+        ));
+        assert_eq!(app.block_draft, "unfinished block");
+        assert!(app.orphaned_block_drafts.is_empty());
+    }
+
+    #[test]
+    fn live_thread_refresh_preserves_the_reply_draft_and_rejects_stale_results() {
+        let (mut app, _) = Ducktape::__boot();
+        app.active_channel = "general".into();
+        app.active_thread_seq = 7;
+        app.thread_target_seq = 9;
+        app.live_thread_generation = 3;
+        app.reply_draft = "typing".into();
+
+        let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
+            backend::LiveThreadData {
+                generation: 3,
+                channel_id: "other".into(),
+                root_seq: 7,
+                target_seq: 0,
+                messages: Vec::new(),
+                next_reply_offset: 99,
+                has_more: true,
+            },
+        ));
+        assert_eq!(app.thread_next_reply_offset, 0);
+
+        let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
+            backend::LiveThreadData {
+                generation: 3,
+                channel_id: "general".into(),
+                root_seq: 7,
+                target_seq: 0,
+                messages: Vec::new(),
+                next_reply_offset: 5,
+                has_more: true,
+            },
+        ));
+        assert_eq!(app.reply_draft, "typing");
+        assert_eq!(app.thread_target_seq, 0);
+        assert_eq!(app.thread_next_reply_offset, 5);
+        assert!(app.thread_has_more);
+
+        let _ = app.__update(__DucktapeMessage::CloseThread);
+        let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
+            backend::LiveThreadData {
+                generation: 3,
+                channel_id: "general".into(),
+                root_seq: 7,
+                target_seq: 9,
+                messages: Vec::new(),
+                next_reply_offset: 99,
+                has_more: true,
+            },
+        ));
+        assert_eq!(app.thread_next_reply_offset, 0);
+        assert!(!app.thread_has_more);
+    }
+
+    #[test]
+    fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.rpc = "http://node".into();
+        app.connected_rpc = "http://node".into();
+        app.selected_block_id = "block".into();
+        app.block_edit_draft = "unfinished block".into();
+        app.block_autosave_status = "saving".into();
+        app.block_comment_draft = "unfinished comment".into();
+
+        let _ = app.__update(__DucktapeMessage::Reconnect);
+
+        assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
+        assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
+    }
+
+    #[test]
+    fn page_and_block_context_changes_recover_local_drafts() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.connected_rpc = "http://draft-context-test".into();
+        app.selected_block_id = "block-a".into();
+        app.selected_block_kind = "Text".into();
+        app.block_edit_draft = "failed edit".into();
+        app.block_autosave_status = "error".into();
+        app.block_comment_draft = "comment a".into();
+
+        let _ = app.__update(__DucktapeMessage::SelectBlock(
+            0,
+            "block-b".into(),
+            "Text".into(),
+            "canonical b".into(),
+            false,
+            false,
+        ));
+        assert_eq!(app.orphaned_block_drafts, ["failed edit"]);
+        assert_eq!(app.orphaned_comment_drafts, ["comment a"]);
+        assert_eq!(app.block_edit_draft, "canonical b");
+
+        app.block_comment_draft = "comment b".into();
+        let _ = app.__update(__DucktapeMessage::CloseBlockComments);
+        assert_eq!(app.orphaned_comment_drafts, ["comment a", "comment b"]);
+
+        app.block_edit_draft = "saving b".into();
+        app.block_autosave_status = "saving".into();
+        let _ = app.__update(__DucktapeMessage::ChoosePage("next".into()));
+        assert_eq!(app.orphaned_block_drafts, ["failed edit", "saving b"]);
+        assert!(app.block_edit_draft.is_empty());
+        assert!(app.selected_block_id.is_empty());
     }
 
     #[test]

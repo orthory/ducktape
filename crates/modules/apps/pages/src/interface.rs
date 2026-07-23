@@ -216,7 +216,11 @@ pub enum PageMsg {
 
 // write-time caps for comments (consensus constants) — enforced before staging.
 pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
-pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
+// One target index read + one thread read leave this many comment records
+// inside the subtree-removal work budget. An otherwise-empty target with one
+// full thread stays directly removable; larger targets can first shed the
+// thread because its last-live delete also stays below the wasm read ceiling.
+pub const MAX_COMMENTS_PER_THREAD: usize = 3_498;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
 pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
 pub const MAX_COMMENT_AGENT_ID_BYTES: usize = 512;
@@ -224,6 +228,11 @@ pub const DEFAULT_THREAD_PAGE_LIMIT: u16 = 32;
 pub const MAX_THREAD_PAGE_LIMIT: u16 = 64;
 pub const DEFAULT_COMMENT_PAGE_LIMIT: u16 = 8;
 pub const MAX_COMMENT_PAGE_LIMIT: u16 = 8;
+/// Hard count bound for both page-index and page-block query pages.
+pub const MAX_PAGE_QUERY_LIMIT: u16 = 256;
+/// Encoded item budget for a page query reply. The remaining 2 MiB covers the
+/// response envelope and a worst-case cursor below the RPC client's 8 MiB cap.
+pub const MAX_PAGE_QUERY_BYTES: usize = 6 * 1024 * 1024;
 
 // client-minted id length caps (consensus constants). the shared DERIVED
 // blocks — the per-target thread index (a `Vec<thread_id>`, up to
@@ -233,8 +242,8 @@ pub const MAX_COMMENT_PAGE_LIMIT: u16 = 8;
 // long ids until one more append trips `MAX_BLOCK_LEN` at stage time and
 // ABORTS the block (a permanent-re-abort R4 wedge). these caps keep those
 // derived blocks safely under `MAX_BLOCK_LEN` (768 KiB) at full count (JSON
-// overhead ≈ 3 B/entry): 1024 × (512+3) ≈ 515 KiB and 4096 × (128+3) ≈ 524
-// KiB, both a comfortable ~250 KiB clear.
+// overhead ≈ 3 B/entry): 1024 × (512+3) ≈ 515 KiB and 3498 × (128+3) ≈ 448
+// KiB, both comfortably below the stored-value ceiling.
 pub const MAX_THREAD_ID_BYTES: usize = 512;
 pub const MAX_COMMENT_ID_BYTES: usize = 128;
 pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
@@ -354,17 +363,23 @@ pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageQuery {
-    /// the whole page as its blocks in PREORDER (root first, each block's
-    /// subtree before its next sibling). `None` == no page at that id.
-    GetPage { page_id: String },
+    /// One bounded page of blocks in PREORDER (root first, each block's
+    /// subtree before its next sibling). `after` is the exclusive id of the
+    /// last block returned; `limit == 0` selects [`MAX_PAGE_QUERY_LIMIT`]. An
+    /// adversarially deep traversal fails before the wasm store-read ceiling.
+    GetPage {
+        page_id: String,
+        after: Option<String>,
+        limit: u16,
+    },
     /// a single block by id ALONE — no page context needed. this is the
     /// cross-module resolution surface; the returned block carries its `page`
     /// and `parent`, so a resolver learns where the block lives, not just
     /// what it says.
     GetBlock { block_id: String },
-    /// enumerate every page, served from the module's reserved index entry
-    /// (sorted by id), with titles read from the live roots.
-    ListPages,
+    /// Enumerate the sorted page index after the exclusive page-id cursor.
+    /// `limit == 0` selects [`MAX_PAGE_QUERY_LIMIT`].
+    ListPages { after: Option<String>, limit: u16 },
     /// One bounded page of threads anchored to `target`. `limit == 0` selects
     /// [`DEFAULT_THREAD_PAGE_LIMIT`]; larger values clamp to
     /// [`MAX_THREAD_PAGE_LIMIT`].
@@ -398,13 +413,27 @@ pub struct PageMeta {
     pub parent: Option<String>,
 }
 
+/// One bounded slice of the sorted page index.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PageList {
+    pub pages: Vec<PageMeta>,
+    pub next_after: Option<String>,
+}
+
+/// One bounded slice of a page's preorder block traversal.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PageBlockPage {
+    pub blocks: Vec<Block>,
+    pub next_after: Option<String>,
+}
+
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageReply {
-    Page(Option<Vec<Block>>),
+    Page(Option<PageBlockPage>),
     Block(Option<Block>),
-    PageList(Vec<PageMeta>),
+    PageList(PageList),
     ThreadPage(TargetThreadPage),
     CommentPage(Option<CommentPage>),
     Comment(Option<Comment>),
@@ -458,6 +487,23 @@ mod interface_tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn page_queries_require_the_bounded_cursor_wire() {
+        let list = PageQuery::ListPages {
+            after: Some("p1".into()),
+            limit: MAX_PAGE_QUERY_LIMIT,
+        };
+        assert_eq!(decode_query(&encode_query(&list)).unwrap(), list);
+        let page = PageQuery::GetPage {
+            page_id: "p2".into(),
+            after: Some("b7".into()),
+            limit: 4,
+        };
+        assert_eq!(decode_query(&encode_query(&page)).unwrap(), page);
+        assert!(decode_query(br#""list_pages""#).is_err());
+        assert!(decode_query(br#"{"get_page":{"page_id":"p2"}}"#).is_err());
     }
 
     #[test]

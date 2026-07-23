@@ -1,4 +1,4 @@
-use super::{Block, BlockKind, PageError, PageMsg, Pages, to_page_err};
+use super::{Block, BlockKind, MAX_PAGE_DEPTH, PageError, PageMsg, Pages, to_page_err};
 use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
 
 /// resolve an `after` sibling anchor to the insert index within `children`:
@@ -39,6 +39,10 @@ impl Pages {
                     .require_block(&parent, PageError::ParentNotFound)
                     .await?;
                 let i = idx_after(&parent_blk.children, &after)?;
+                let parent_depth = self.page_depth(&parent_blk).await?;
+                if parent_depth >= MAX_PAGE_DEPTH {
+                    return Err(PageError::PageTooDeep);
+                }
                 parent_blk.children.insert(i, block.id.clone());
                 let creates_page = block.kind == BlockKind::Page;
                 let page = if creates_page {
@@ -174,7 +178,25 @@ impl Pages {
                         if !moves_page && new_parent.page != blk.page {
                             return Err(PageError::CrossPageMove);
                         }
-                        self.ancestry_excludes(&parent_id, &block_id).await?;
+                        let new_parent_depth = if moves_page {
+                            self.ancestry_excludes(&parent_id, &block_id).await?;
+                            self.page_depth(&new_parent).await?
+                        } else {
+                            self.page_depth_excluding(&new_parent, Some(&block_id))
+                                .await?
+                        };
+                        let new_depth = new_parent_depth + 1;
+                        if new_depth > MAX_PAGE_DEPTH {
+                            return Err(PageError::PageTooDeep);
+                        }
+                        if !moves_page {
+                            let old_depth = self.page_depth(&blk).await?;
+                            let deepens_subtree = new_depth > old_depth;
+                            if deepens_subtree {
+                                self.ensure_subtree_fits(&blk, MAX_PAGE_DEPTH - new_depth)
+                                    .await?;
+                            }
+                        }
                         if old_parent_id.as_deref() == Some(parent_id.as_str()) {
                             let mut parent = new_parent;
                             let position = parent
@@ -220,6 +242,11 @@ impl Pages {
                 let blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
+                let invalid_top_level = blk.parent.is_none() && blk.kind != BlockKind::Page;
+                if invalid_top_level {
+                    return Err(PageError::Corrupt);
+                }
+                let removal = self.preflight_subtree_removal(blk.clone()).await?;
                 if let Some(parent_id) = &blk.parent {
                     let mut parent = self.require_block(parent_id, PageError::Corrupt).await?;
                     let position = parent
@@ -229,10 +256,8 @@ impl Pages {
                         .ok_or(PageError::Corrupt)?;
                     parent.children.remove(position);
                     self.store_block(&parent)?;
-                } else if blk.kind != BlockKind::Page {
-                    return Err(PageError::Corrupt);
                 }
-                self.delete_subtree(blk).await
+                self.delete_subtree(removal).await
             }
             _ => unreachable!("non-block op routed to apply_block_op"),
         }

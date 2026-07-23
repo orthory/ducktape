@@ -31,7 +31,7 @@ saga = { path = "../../system/saga", default-features = false }
 tagging = { workspace = true }
 dispatch = { workspace = true }
 tasks = { path = "../tasks", default-features = false }
-# the duckfs wire types (FilesQuery::Refs / FilesReply::Refs / RefsInfo) the v3
+# the duckfs wire types (FilesQuery::Refs / FilesReply::Refs / RefsInfo) the v1
 # composer queries for the committed head it pins as source_snapshot (W2), plus
 # `paths::canonical`. linked through the `files` MODULE's crate root (which
 # re-exports duckfs-core) rather than duckfs-core directly, per the module rule:
@@ -40,8 +40,8 @@ tasks = { path = "../tasks", default-features = false }
 # the `runs` guest graph stays pure, same as chat/tasks/pages above.
 files = { path = "../files", default-features = false }
 base64 = { workspace = true }
-# the pages wire types (PageQuery::GetPage / PageReply / Block) the injector
-# queries for `[[page:<id>]]` refs (M2). a normal prod-safe dep — pages pulls
+# the pages wire types (paged PageQuery::GetPage / PageReply / Block) the
+# injector queries for `[[page:<id>]]` refs (M2). a normal prod-safe dep — pages pulls
 # only commonware-storage (no libgit2), which chat/tasks already pull.
 # default-features = false for the wasm32 graph, same as chat/tasks above.
 pages = { path = "../pages", default-features = false }

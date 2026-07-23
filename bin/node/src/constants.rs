@@ -143,9 +143,7 @@ pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;
 /// change that alters its canonical snapshot/root encoding. The registry
 /// parity test compares these declarations with the live module trait values.
 pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
-    // 3: revision 2 was the wasm adapter port; revision 3 adds the sparse role
-    // tail inside the native snapshot persisted as one host-KV value.
-    ("agent", 3),
+    ("agent", 1),
     ("automations", 2),
     ("capability", 2),
     // 1 (UNCHANGED at the wasm cutover): chat/pages are STORE-BACKED ports —
@@ -201,10 +199,8 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     ("lifecycle", 2),
     // 1: store-backed wasm port, root-continuous — see the chat note above.
     ("pages", 1),
-    // 3: the wasm adapter port — the native canonical snapshot (itself at
-    // revision 2 since the session section landed) persisted as one host-KV
-    // value, so root()/snapshot bytes changed shape again at cutover.
-    ("runs", 3),
+    // Current adapter-backed Runs state layout.
+    ("runs", 1),
     // 2: the wasm adapter port (saga's empty-map root coincides with the
     // empty host-KV root, but every written state re-encodes — a break).
     ("saga", 2),
@@ -243,4 +239,3 @@ pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)
 }
-

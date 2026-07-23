@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chat::{AuthorRef, ChatMsg, ChatQuery, ChatReply, PostPolicy};
@@ -109,6 +109,17 @@ pub struct ThreadPageData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LiveThreadData {
+    pub generation: i64,
+    pub channel_id: String,
+    pub root_seq: i64,
+    pub target_seq: i64,
+    pub messages: Vec<ChatMessage>,
+    pub next_reply_offset: i64,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatSearchHit {
     pub channel_id: String,
     pub seq: i64,
@@ -135,6 +146,7 @@ pub struct PageItem {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageBlock {
+    pub key: i64,
     pub id: String,
     pub parent: String,
     pub kind: String,
@@ -333,18 +345,48 @@ pub fn thread_offset_after_reply(offset: i64, has_more: bool) -> i64 {
     }
 }
 
-pub fn optimistic_block(mut blocks: Vec<PageBlock>, kind: String, text: String) -> Vec<PageBlock> {
-    blocks.push(PageBlock {
-        id: "pending".into(),
-        parent: String::new(),
-        kind,
-        text,
-        pending: true,
-        checked: false,
-        prefix: String::new(),
-        child_count: 0,
-        mark_count: 0,
-    });
+pub fn optimistic_block(
+    mut blocks: Vec<PageBlock>,
+    after_id: String,
+    kind: String,
+    text: String,
+) -> Vec<PageBlock> {
+    let selected_index = blocks.iter().position(|block| block.id == after_id);
+    let (insert_at, parent, prefix) = match selected_index {
+        Some(index) => {
+            let selected = &blocks[index];
+            let selected_depth = selected.prefix.len();
+            let insert_at = blocks
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .find(|(_, block)| block.prefix.len() <= selected_depth)
+                .map_or(blocks.len(), |(index, _)| index);
+            (insert_at, selected.parent.clone(), selected.prefix.clone())
+        }
+        None => (blocks.len(), String::new(), String::new()),
+    };
+    let id = loop {
+        let id = fresh_id("pending-block");
+        if blocks.iter().all(|block| block.id != id) {
+            break id;
+        }
+    };
+    blocks.insert(
+        insert_at,
+        PageBlock {
+            key: page_block_key(&id),
+            id,
+            parent,
+            kind,
+            text,
+            pending: true,
+            checked: false,
+            prefix,
+            child_count: 0,
+            mark_count: 0,
+        },
+    );
     blocks
 }
 
@@ -460,8 +502,137 @@ pub fn refreshed_block_draft(
         .map_or(current, |block| block.text)
 }
 
+pub fn remember_orphaned_block_drafts(
+    mut drafts: Vec<String>,
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+    current: String,
+    autosave_status: String,
+) -> Vec<String> {
+    let has_local_edit = matches!(autosave_status.as_str(), "saving" | "error");
+    if has_local_edit && selected_block_missing(&blocks, &selected_id) {
+        append_recovered_draft(&mut drafts, current);
+    }
+    drafts
+}
+
+pub fn remember_orphaned_comment_drafts(
+    mut drafts: Vec<String>,
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+    current: String,
+) -> Vec<String> {
+    if selected_block_missing(&blocks, &selected_id) {
+        append_recovered_draft(&mut drafts, current);
+    }
+    drafts
+}
+
+pub fn remove_recovered_draft(mut drafts: Vec<String>, recovered: String) -> Vec<String> {
+    if let Some(index) = drafts.iter().position(|draft| draft == &recovered) {
+        drafts.remove(index);
+    }
+    drafts
+}
+
+pub fn retain_drafts_for_endpoint(
+    drafts: Vec<String>,
+    current: String,
+    next: String,
+) -> Vec<String> {
+    if current == next { drafts } else { Vec::new() }
+}
+
+pub fn refreshed_selected_block(blocks: Vec<PageBlock>, selected_id: String) -> String {
+    if selected_block_missing(&blocks, &selected_id) {
+        String::new()
+    } else {
+        selected_id
+    }
+}
+
+pub fn retain_selected_string(value: String, selected_id: String) -> String {
+    if selected_id.is_empty() {
+        String::new()
+    } else {
+        value
+    }
+}
+
+pub fn retain_selected_i64(value: i64, selected_id: String) -> i64 {
+    if selected_id.is_empty() { 0 } else { value }
+}
+
+pub fn retain_selected_comment_threads(
+    threads: Vec<PageCommentThread>,
+    selected_id: String,
+) -> Vec<PageCommentThread> {
+    if selected_id.is_empty() {
+        Vec::new()
+    } else {
+        threads
+    }
+}
+
+pub fn retain_selected_comments(
+    comments: Vec<PageComment>,
+    selected_id: String,
+) -> Vec<PageComment> {
+    if selected_id.is_empty() {
+        Vec::new()
+    } else {
+        comments
+    }
+}
+
+pub fn cancel_missing_block_autosave(
+    rpc: String,
+    generation: i64,
+    blocks: Vec<PageBlock>,
+    selected_id: String,
+) -> i64 {
+    if selected_block_missing(&blocks, &selected_id) {
+        let key = scope_key(rpc.trim().to_string(), selected_id);
+        autosaves()
+            .lock()
+            .expect("autosave lock poisoned")
+            .remove(&key);
+        return generation.saturating_add(1);
+    }
+    generation
+}
+
+fn selected_block_missing(blocks: &[PageBlock], selected_id: &str) -> bool {
+    !selected_id.is_empty() && !blocks.iter().any(|block| block.id == selected_id)
+}
+
+fn append_recovered_draft(drafts: &mut Vec<String>, draft: String) {
+    let should_append = !draft.is_empty() && !drafts.iter().any(|current| current == &draft);
+    if should_append {
+        drafts.push(draft);
+    }
+}
+
 pub fn scope_key(scope: String, id: String) -> String {
     format!("{scope}\0{id}")
+}
+
+pub async fn defer_focus(scope: String) -> String {
+    scope
+}
+
+pub fn focus_next() -> iced::Task<()> {
+    iced::widget::operation::focus_next()
+}
+
+pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
+    let below = (pointer_y - 4.0).max(0.0);
+    let below_fits = below + 190.0 <= viewport_height;
+    if below_fits {
+        below
+    } else {
+        (pointer_y - 190.0).max(0.0)
+    }
 }
 
 struct Tip {
@@ -990,6 +1161,46 @@ pub async fn load_thread_page(
     result.map_err(|message| HydrationError {
         generation,
         message,
+    })
+}
+
+pub async fn refresh_live_thread(
+    rpc: String,
+    channel_id: String,
+    root_seq: i64,
+    target_seq: i64,
+    through_reply_offset: i64,
+    generation: i64,
+) -> Result<LiveThreadData, HydrationError> {
+    if channel_id.is_empty() || root_seq <= 0 {
+        return Ok(LiveThreadData {
+            generation,
+            channel_id,
+            root_seq: 0,
+            target_seq: 0,
+            messages: Vec::new(),
+            next_reply_offset: 0,
+            has_more: false,
+        });
+    }
+    load_thread(
+        rpc,
+        channel_id.clone(),
+        root_seq,
+        target_seq,
+        through_reply_offset,
+        false,
+        generation,
+    )
+    .await
+    .map(|thread| LiveThreadData {
+        generation: thread.generation,
+        channel_id,
+        root_seq: thread.root_seq,
+        target_seq: thread.target_seq,
+        messages: thread.messages,
+        next_reply_offset: thread.next_reply_offset,
+        has_more: thread.has_more,
     })
 }
 
@@ -2188,11 +2399,7 @@ fn page_author_name(author: &pages::AuthorRef) -> String {
 }
 
 async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<PagesData, String> {
-    let reply: PageReply = rpc.query("pages", &PageQuery::ListPages).await?;
-    let wire_pages = match reply {
-        PageReply::PageList(pages) => pages,
-        _ => return Err("node returned an invalid page list".into()),
-    };
+    let wire_pages = load_page_index(rpc).await?;
     let pages = page_items(wire_pages);
     let active_page = requested
         .filter(|id| pages.iter().any(|page| page.id == *id))
@@ -2223,25 +2430,7 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
         .first()
         .map(|block| block.text.clone())
         .unwrap_or_default();
-    let parents = wire_blocks
-        .iter()
-        .map(|block| (block.id.clone(), block.parent.clone()))
-        .collect::<BTreeMap<_, _>>();
-    let blocks = wire_blocks
-        .into_iter()
-        .skip(1)
-        .map(|block| PageBlock {
-            prefix: block_prefix(&block, &active_page, &parents),
-            id: block.id,
-            parent: block.parent.unwrap_or_default(),
-            kind: block_kind_name(block.kind).into(),
-            text: block.text,
-            pending: false,
-            checked: block.checked,
-            child_count: count_i64(block.children.len()),
-            mark_count: count_i64(block.marks.len()),
-        })
-        .collect();
+    let blocks = page_blocks(wire_blocks, &active_page);
     Ok(PagesData {
         pages,
         blocks,
@@ -2254,6 +2443,45 @@ async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Pag
         selected_block_checked: false,
         page_title_selected: false,
     })
+}
+
+fn page_blocks(wire_blocks: Vec<pages::Block>, active_page: &str) -> Vec<PageBlock> {
+    let parents = wire_blocks
+        .iter()
+        .map(|block| (block.id.clone(), block.parent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    wire_blocks
+        .into_iter()
+        .skip(1)
+        .map(|block| PageBlock {
+            key: page_block_key(&block.id),
+            prefix: block_prefix(&block, active_page, &parents),
+            id: block.id,
+            parent: block.parent.unwrap_or_default(),
+            kind: block_kind_name(block.kind).into(),
+            text: block.text,
+            pending: false,
+            checked: block.checked,
+            child_count: count_i64(block.children.len()),
+            mark_count: count_i64(block.marks.len()),
+        })
+        .collect()
+}
+
+fn page_block_key(id: &str) -> i64 {
+    // ponytail: session-wide interning is collision-free; scope it per workspace
+    // only if retaining every visited block id becomes measurable.
+    static KEYS: OnceLock<Mutex<BTreeMap<String, i64>>> = OnceLock::new();
+    let mut keys = KEYS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(key) = keys.get(id) {
+        return *key;
+    }
+    let key = count_i64(keys.len());
+    keys.insert(id.to_owned(), key);
+    key
 }
 
 fn with_selected_block(mut pages: PagesData, selected_block_id: &str) -> PagesData {
@@ -2276,17 +2504,59 @@ fn with_selected_block(mut pages: PagesData, selected_block_id: &str) -> PagesDa
 }
 
 async fn load_page_blocks(rpc: &RpcClient, page_id: &str) -> Result<Vec<pages::Block>, String> {
-    let reply: PageReply = rpc
-        .query(
-            "pages",
-            &PageQuery::GetPage {
-                page_id: page_id.to_string(),
-            },
-        )
-        .await?;
-    match reply {
-        PageReply::Page(Some(blocks)) => Ok(blocks),
-        _ => Err("page was not found".into()),
+    let mut blocks = Vec::new();
+    let mut after = None;
+    loop {
+        let reply: PageReply = rpc
+            .query(
+                "pages",
+                &PageQuery::GetPage {
+                    page_id: page_id.to_string(),
+                    after: after.clone(),
+                    limit: 0,
+                },
+            )
+            .await?;
+        let page = match reply {
+            PageReply::Page(Some(page)) => page,
+            _ => return Err("page was not found".into()),
+        };
+        blocks.extend(page.blocks);
+        let Some(next) = page.next_after else {
+            return Ok(blocks);
+        };
+        if after.as_ref() == Some(&next) {
+            return Err("node repeated the page cursor".into());
+        }
+        after = Some(next);
+    }
+}
+
+async fn load_page_index(rpc: &RpcClient) -> Result<Vec<pages::PageMeta>, String> {
+    let mut pages = Vec::new();
+    let mut after = None;
+    loop {
+        let reply: PageReply = rpc
+            .query(
+                "pages",
+                &PageQuery::ListPages {
+                    after: after.clone(),
+                    limit: 0,
+                },
+            )
+            .await?;
+        let page = match reply {
+            PageReply::PageList(page) => page,
+            _ => return Err("node returned an invalid page list".into()),
+        };
+        pages.extend(page.pages);
+        let Some(next) = page.next_after else {
+            return Ok(pages);
+        };
+        if after.as_ref() == Some(&next) {
+            return Err("node repeated the page-list cursor".into());
+        }
+        after = Some(next);
     }
 }
 
@@ -3345,8 +3615,103 @@ mod tests {
     }
 
     #[test]
+    fn page_block_keys_survive_refresh_reordering() {
+        let root = pages::Block {
+            id: "page".into(),
+            parent: None,
+            page: "page".into(),
+            kind: BlockKind::Page,
+            text: "Page".into(),
+            marks: Vec::new(),
+            checked: false,
+            children: Vec::new(),
+        };
+        let block = |id: &str| pages::Block {
+            id: id.into(),
+            parent: Some("page".into()),
+            page: "page".into(),
+            kind: BlockKind::Paragraph,
+            text: id.into(),
+            marks: Vec::new(),
+            checked: false,
+            children: Vec::new(),
+        };
+        let before = page_blocks(
+            vec![root.clone(), block("editing"), block("trailing")],
+            "page",
+        );
+        let editing_key = before
+            .iter()
+            .find(|block| block.id == "editing")
+            .unwrap()
+            .key;
+        let nested = pages::Block {
+            id: "nested".into(),
+            parent: Some("inserted".into()),
+            page: "page".into(),
+            kind: BlockKind::Paragraph,
+            text: "nested".into(),
+            marks: Vec::new(),
+            checked: false,
+            children: Vec::new(),
+        };
+        let after = page_blocks(
+            vec![
+                root,
+                block("inserted"),
+                nested,
+                block("trailing"),
+                block("editing"),
+            ],
+            "page",
+        );
+
+        assert_eq!(
+            after
+                .iter()
+                .find(|block| block.id == "editing")
+                .unwrap()
+                .key,
+            editing_key
+        );
+        assert_eq!(
+            after
+                .iter()
+                .map(|block| block.key)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            after.len()
+        );
+
+        let optimistic =
+            optimistic_block(after, "inserted".into(), "Text".into(), "pending".into());
+        let pending = &optimistic[2];
+        assert!(pending.id.starts_with("pending-block-"));
+        assert_eq!(pending.key, page_block_key(&pending.id));
+        assert_eq!(pending.parent, "page");
+        assert_eq!(optimistic[1].id, "nested");
+        assert_eq!(optimistic[3].id, "trailing");
+        assert_eq!(
+            optimistic
+                .iter()
+                .map(|block| block.key)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            optimistic.len()
+        );
+    }
+
+    #[test]
+    fn block_action_menu_stays_inside_the_page_viewport() {
+        assert_eq!(block_action_menu_y(100.0, 500.0), 96.0);
+        assert_eq!(block_action_menu_y(450.0, 500.0), 260.0);
+        assert_eq!(block_action_menu_y(2.0, 500.0), 0.0);
+    }
+
+    #[test]
     fn refresh_merges_only_clean_block_drafts() {
         let blocks = vec![PageBlock {
+            key: 0,
             id: "block".into(),
             parent: "page".into(),
             kind: "Text".into(),
@@ -3370,6 +3735,26 @@ mod tests {
         assert_eq!(
             refreshed_block_draft(blocks, "block".into(), "local".into(), "saved".into()),
             "remote"
+        );
+    }
+
+    #[test]
+    fn recovered_drafts_are_deduplicated_and_endpoint_scoped() {
+        let drafts = remember_orphaned_block_drafts(
+            vec!["local".into()],
+            Vec::new(),
+            "missing".into(),
+            "local".into(),
+            "error".into(),
+        );
+        assert_eq!(drafts, ["local"]);
+        assert_eq!(
+            retain_drafts_for_endpoint(drafts.clone(), "http://node".into(), "http://node".into(),),
+            drafts
+        );
+        assert!(
+            retain_drafts_for_endpoint(drafts, "http://node".into(), "http://other".into(),)
+                .is_empty()
         );
     }
 
@@ -3411,6 +3796,26 @@ mod tests {
         assert_eq!(cancel_autosaves("http://old".into(), 4), 5);
         assert!(!autosave_is_current(old_key, old_ticket));
         assert!(finish_autosave(other_key, other_ticket));
+    }
+
+    #[test]
+    fn missing_block_cancels_only_its_own_autosave() {
+        let title_key = "http://missing-block-test\0page";
+        let block_key = "http://missing-block-test\0block";
+        let title_ticket = begin_autosave(title_key);
+        let block_ticket = begin_autosave(block_key);
+
+        assert_eq!(
+            cancel_missing_block_autosave(
+                "http://missing-block-test".into(),
+                4,
+                Vec::new(),
+                "block".into(),
+            ),
+            5
+        );
+        assert!(!autosave_is_current(block_key, block_ticket));
+        assert!(finish_autosave(title_key, title_ticket));
     }
 
     #[test]

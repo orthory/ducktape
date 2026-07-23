@@ -24,6 +24,8 @@ on clear_page_search
 
 on open_page_search_hit(page_id, block_id)
   return if loading || mutation_phase != "idle"
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -31,8 +33,10 @@ on open_page_search_hit(page_id, block_id)
   loading = true
   page_search_hits = []
   selected_block_id = ""
+  hovered_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_actions_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -51,6 +55,8 @@ on open_page_search_hit(page_id, block_id)
   page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
+  block_insert_after_id = ""
+  block_insert_open = !empty(block_draft)
   page_delete_armed = false
   block_delete_armed = false
   error = ""
@@ -58,6 +64,8 @@ on open_page_search_hit(page_id, block_id)
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -65,8 +73,10 @@ on choose_page(id)
   loading = true
   page_search_hits = []
   selected_block_id = ""
+  hovered_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_actions_open = false
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -85,6 +95,8 @@ on choose_page(id)
   page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
+  block_insert_after_id = ""
+  block_insert_open = !empty(block_draft)
   page_delete_armed = false
   block_delete_armed = false
   error = ""
@@ -100,6 +112,14 @@ on create_page_submit
   page_draft = ""
   error = ""
   run create_page(connected_rpc, password, pending_page) -> pages_mutated _ | mutation_failed _
+
+on toggle_page_create
+  page_create_open = !page_create_open
+  return if !page_create_open
+  task widget focus #workspace-tabs/new-page
+
+on focus_page_title(current_scope)
+  task widget focus #workspace-tabs/page-title(current_scope)/title-input
 
 on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)
@@ -118,6 +138,57 @@ on delete_page_submit
 on new_block_kind_changed(next)
   new_block_kind = next
 
+on block_entered(id)
+  hovered_block_id = id
+
+on block_exited(id)
+  return if hovered_block_id != id
+  hovered_block_id = ""
+
+on pages_pointer_moved(x, y)
+  pages_pointer_x = x
+  pages_pointer_y = y
+
+on pages_resized(_, height)
+  pages_height = height
+
+on open_block_insert(key, after_id)
+  return if loading || mutation_phase != "idle" || empty(active_page)
+  block_insert_after_id = after_id
+  block_insert_open = true
+  task widget focus #workspace-tabs/key(key)/block-insert-row(block_insert_after_id)/block-insert
+
+on open_root_block_insert
+  return if loading || mutation_phase != "idle" || empty(active_page)
+  block_insert_after_id = ""
+  block_insert_open = true
+  task widget focus #workspace-tabs/block-insert-row(block_insert_after_id)/block-insert
+
+on close_block_insert
+  return if mutation_phase != "idle"
+  block_insert_open = false
+  block_insert_after_id = ""
+
+on use_orphaned_block_draft(draft)
+  return if loading || mutation_phase != "idle" || !empty(block_draft)
+  block_draft = draft
+  block_insert_after_id = selected_block_id
+  block_insert_open = true
+  orphaned_block_drafts = remove_recovered_draft(orphaned_block_drafts, block_draft)
+
+on discard_orphaned_block_draft(draft)
+  orphaned_block_drafts = remove_recovered_draft(orphaned_block_drafts, draft)
+
+on use_orphaned_comment_draft(draft)
+  return if loading || mutation_phase != "idle" || !empty(block_draft)
+  block_draft = draft
+  block_insert_after_id = selected_block_id
+  block_insert_open = true
+  orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, block_draft)
+
+on discard_orphaned_comment_draft(draft)
+  orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
+
 on add_block_submit
   return if loading || mutation_phase != "idle" || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
   hydration_generation = hydration_generation + 1
@@ -126,12 +197,19 @@ on add_block_submit
   mutation_phase = "block"
   pending_block = block_draft
   block_draft = ""
-  blocks = optimistic_block(blocks, new_block_kind, pending_block)
+  blocks = optimistic_block(blocks, block_insert_after_id, new_block_kind, pending_block)
   error = ""
-  run add_block(connected_rpc, password, active_page, selected_block_id, new_block_kind, pending_block) -> pages_mutated _ | mutation_failed _
+  run add_block(connected_rpc, password, active_page, block_insert_after_id, new_block_kind, pending_block) -> pages_mutated _ | mutation_failed _
 
-on select_block(id, kind, text, checked)
+on select_block(key, id, kind, text, checked, open_actions)
   return if mutation_phase != "idle"
+  block_menu_x = pages_pointer_x
+  block_menu_y = block_action_menu_y(pages_pointer_y, pages_height)
+  block_actions_open = open_actions
+  return if id == selected_block_id
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  block_autosave_generation = block_autosave_generation + 1
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -153,8 +231,12 @@ on select_block(id, kind, text, checked)
   page_title_selected = false
   block_edit_draft = text
   block_autosave_status = "idle"
-  block_autosave_generation = block_autosave_generation + 1
   block_delete_armed = false
+  return if open_actions
+  task widget focus #workspace-tabs/key(key)/block(selected_block_id)/BlockLine/block-edit
+
+on close_block_actions
+  block_actions_open = false
 
 on selected_block_kind_changed(next)
   return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || next == selected_block_kind
@@ -167,6 +249,9 @@ on selected_block_kind_changed(next)
   run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, block_edit_draft) -> pages_mutated _ | mutation_failed _
 
 on clear_block_selection
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  block_autosave_generation = block_autosave_generation + 1
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
@@ -187,12 +272,13 @@ on clear_block_selection
   pending_block_comment = ""
   block_edit_draft = ""
   block_autosave_status = "idle"
-  block_autosave_generation = block_autosave_generation + 1
   block_delete_armed = false
+  block_actions_open = false
 
 on open_block_comments
   return if loading || mutation_phase != "idle" || empty(selected_block_id)
   block_comments_generation = block_comments_generation + 1
+  block_actions_open = false
   block_comments_open = true
   block_comments_target = selected_block_id
   block_comment_threads = []
@@ -209,6 +295,7 @@ on open_block_comments
   run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on close_block_comments
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -233,6 +320,11 @@ on block_threads_loaded(next)
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
   error = ""
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on load_more_block_threads
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || !block_comment_threads_has_more
@@ -324,7 +416,6 @@ on block_thread_created(next)
   block_thread_comments_loading = false
   pending_block_comment = ""
   mutation_phase = "idle"
-  live_dirty = false
   error = ""
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
@@ -349,14 +440,23 @@ on block_threads_recovered(next)
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
   mutation_phase = "idle"
-  live_dirty = false
   error = ""
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on block_threads_recovery_failed(cause)
   return if cause.generation != block_comments_generation || !block_comments_open
   block_comment_threads_loading = false
   mutation_phase = "idle"
   error = cause.message
+  return if !live_dirty
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on block_text_changed(next)
   block_edit_draft = next
@@ -454,13 +554,20 @@ on pages_updated(next)
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on pages_mutated(next)
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
+  block_autosave_generation = block_autosave_generation + 1
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   pending_page = ""
+  page_create_open = false
   pending_block = ""
+  block_insert_open = false
+  block_insert_after_id = ""
+  block_actions_open = false
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false

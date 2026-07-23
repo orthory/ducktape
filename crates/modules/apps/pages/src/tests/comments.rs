@@ -266,6 +266,79 @@ fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
 }
 
 #[test]
+fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
+    deterministic::Runner::default().start(|_context| async move {
+        assert_eq!(MAX_COMMENTS_PER_THREAD + 2, MAX_TRAVERSAL_WORK);
+        let mut p = Pages::new("pages", Box::new(sdk_testkit::MemStore::new()));
+        let comment_ids: Vec<_> = (0..MAX_COMMENTS_PER_THREAD)
+            .map(|index| format!("comment-{index}"))
+            .collect();
+        p.store_block(&Block {
+            id: "target".into(),
+            parent: None,
+            page: "target".into(),
+            kind: BlockKind::Page,
+            text: String::new(),
+            marks: Vec::new(),
+            checked: false,
+            children: Vec::new(),
+        })
+        .unwrap();
+        p.stage_index(&BTreeMap::from([("target".into(), None)]))
+            .unwrap();
+        p.stage(
+            "\0ct:thread",
+            serde_json::to_vec(&Thread {
+                id: "thread".into(),
+                target: "target".into(),
+                opener: AuthorRef::System,
+                created_at: 0,
+                anchor: None,
+                resolved: false,
+                resolved_by: None,
+                comment_ids: comment_ids.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        p.stage("\0ci:target", serde_json::to_vec(&vec!["thread"]).unwrap())
+            .unwrap();
+        for id in &comment_ids {
+            p.stage(
+                &format!("\0cc:{id}"),
+                serde_json::to_vec(&Comment {
+                    id: id.clone(),
+                    thread_id: "thread".into(),
+                    author: AuthorRef::System,
+                    text: String::new(),
+                    created_at: 0,
+                    edited_at: None,
+                    deleted: false,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        p.commit_block().await.unwrap();
+
+        p.apply(
+            PageMsg::RemoveBlock {
+                block_id: "target".into(),
+            },
+            &Origin::System,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(p.load_block("target").await.unwrap().is_none());
+        assert!(p.load_thread("thread").await.unwrap().is_none());
+        assert!(p.load_comment(&comment_ids[0]).await.unwrap().is_none());
+        assert!(p.load_index().await.unwrap().is_empty());
+    });
+}
+
+#[test]
 fn as_agent_refines_a_module_origin_into_an_agent_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");

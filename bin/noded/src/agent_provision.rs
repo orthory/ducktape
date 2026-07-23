@@ -1,4 +1,4 @@
-//! the REAL [`WorkspaceProvisioner`] for portable (v3) agent runs: one
+//! the REAL [`WorkspaceProvisioner`] for portable (v1) agent runs: one
 //! per-run workspace under a D7-validated root, materialized from whichever
 //! source the run's envelope pinned.
 //!
