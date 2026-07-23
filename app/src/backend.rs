@@ -486,6 +486,81 @@ pub fn message_action_after_failure(current: String, phase: String, committed: b
     }
 }
 
+pub fn refreshed_required_message_seq(
+    messages: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+    value: i64,
+) -> i64 {
+    if current_channel != next_channel {
+        return 0;
+    }
+    if messages
+        .iter()
+        .any(|message| message.seq == value && !message.deleted)
+    {
+        value
+    } else {
+        0
+    }
+}
+
+pub fn refreshed_known_message_seq(
+    messages: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+    value: i64,
+) -> i64 {
+    if current_channel != next_channel
+        || messages
+            .iter()
+            .any(|message| message.seq == value && message.deleted)
+    {
+        0
+    } else {
+        value
+    }
+}
+
+pub fn refreshed_channel_value(current_channel: String, next_channel: String, value: i64) -> i64 {
+    if current_channel == next_channel {
+        value
+    } else {
+        0
+    }
+}
+
+pub fn thread_generation_after_refresh(
+    generation: i64,
+    current_channel: String,
+    next_channel: String,
+    previous_root: i64,
+    next_root: i64,
+) -> i64 {
+    let context_unchanged = current_channel == next_channel && previous_root == next_root;
+    if context_unchanged {
+        generation
+    } else {
+        generation + 1
+    }
+}
+
+pub fn thread_loading_after_refresh(
+    loading: bool,
+    current_channel: String,
+    next_channel: String,
+    previous_root: i64,
+    next_root: i64,
+) -> bool {
+    let same_channel = current_channel == next_channel;
+    let active_root_was_invalidated = previous_root > 0 && next_root <= 0;
+    loading && same_channel && !active_root_was_invalidated
+}
+
+pub fn retain_thread_messages(messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
+    if root_seq > 0 { messages } else { Vec::new() }
+}
+
 pub fn refreshed_block_draft(
     blocks: Vec<PageBlock>,
     selected_id: String,
@@ -615,14 +690,6 @@ fn append_recovered_draft(drafts: &mut Vec<String>, draft: String) {
 
 pub fn scope_key(scope: String, id: String) -> String {
     format!("{scope}\0{id}")
-}
-
-pub async fn defer_focus(scope: String) -> String {
-    scope
-}
-
-pub fn focus_next() -> iced::Task<()> {
-    iced::widget::operation::focus_next()
 }
 
 pub fn block_action_menu_y(pointer_y: f64, viewport_height: f64) -> f64 {
@@ -1741,13 +1808,16 @@ pub async fn save_block(
                 signed_write(
                     &rpc,
                     "pages",
-                    pages::encode_msg(&PageMsg::SetKind { block_id, kind }),
+                    pages::encode_msg(&PageMsg::SetKind {
+                        block_id: block_id.clone(),
+                        kind,
+                    }),
                     password,
                 )
                 .await
                 .map_err(committed_error)?;
             }
-            return load_pages_data(&rpc, Some(&page_id))
+            return load_selected_page_data(&rpc, &page_id, &block_id)
                 .await
                 .map_err(committed_error);
         }
@@ -1755,15 +1825,18 @@ pub async fn save_block(
             signed_write(
                 &rpc,
                 "pages",
-                pages::encode_msg(&PageMsg::SetKind { block_id, kind }),
+                pages::encode_msg(&PageMsg::SetKind {
+                    block_id: block_id.clone(),
+                    kind,
+                }),
                 password,
             )
             .await?;
-            return load_pages_data(&rpc, Some(&page_id))
+            return load_selected_page_data(&rpc, &page_id, &block_id)
                 .await
                 .map_err(committed_error);
         }
-        load_pages_data(&rpc, Some(&page_id))
+        load_selected_page_data(&rpc, &page_id, &block_id)
             .await
             .map_err(app_error)
     }
@@ -1782,11 +1855,14 @@ pub async fn set_block_checked(
         signed_write(
             &rpc,
             "pages",
-            pages::encode_msg(&PageMsg::SetChecked { block_id, checked }),
+            pages::encode_msg(&PageMsg::SetChecked {
+                block_id: block_id.clone(),
+                checked,
+            }),
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id))
+        load_selected_page_data(&rpc, &page_id, &block_id)
             .await
             .map_err(committed_error)
     }
@@ -1808,14 +1884,14 @@ pub async fn move_block(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::MoveBlock {
-                block_id,
+                block_id: block_id.clone(),
                 parent,
                 after,
             }),
             password,
         )
         .await?;
-        load_pages_data(&rpc, Some(&page_id))
+        load_selected_page_data(&rpc, &page_id, &block_id)
             .await
             .map_err(committed_error)
     }
@@ -2501,6 +2577,16 @@ fn with_selected_block(mut pages: PagesData, selected_block_id: &str) -> PagesDa
     pages.selected_block_text.clone_from(&block.text);
     pages.selected_block_checked = block.checked;
     pages
+}
+
+async fn load_selected_page_data(
+    rpc: &RpcClient,
+    page_id: &str,
+    block_id: &str,
+) -> Result<PagesData, String> {
+    load_pages_data(rpc, Some(page_id))
+        .await
+        .map(|pages| with_selected_block(pages, block_id))
 }
 
 async fn load_page_blocks(rpc: &RpcClient, page_id: &str) -> Result<Vec<pages::Block>, String> {

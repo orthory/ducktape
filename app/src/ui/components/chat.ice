@@ -42,8 +42,9 @@ component MessageContents(message:ChatMessage)
       text "•" size=12.0 @text-muted
     col width=fill spacing=4.0
       row width=fill spacing=8.0 align=center
-        text message.author width=fill size=12.0 @font-bold text-fg
-        text message.meta size=10.0 @text-muted
+        text message.author size=12.0 wrapping=none @font-bold text-fg
+        text message.meta size=10.0 wrapping=none @text-muted
+        space width=fill
       text message.body width=fill size=14.0 wrapping=word @text-fg
       if message.reply_count > 0 || !empty(message.reactions)
         row width=fill spacing=5.0 align=center
@@ -78,7 +79,7 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
             pressed bg=white/16
       if !message.deleted && hovered
         container width=fill align-x=end align-y=start padding-right=8.0
-          container padding=2.0 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+          container padding=2.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
             row spacing=1.0 align=center
               button "♡" label="Manage reactions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_message_reactions(message.seq, message.body, message.rev)
                 active bg=transparent text=muted r=6.0

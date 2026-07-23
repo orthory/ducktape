@@ -9,7 +9,7 @@ component Brand()
 component EmptyState(title:str, detail:str)
   container width=fill height=fill align-x=center align-y=center
     col spacing=6.0 align=center
-      text title size=15.0 font=ui @text-fg
+      text title size=15.0 @font-bold text-fg
       text detail size=12.0 @text-muted
 
 component WorkspaceTabs(status:str, loading:bool)
@@ -20,9 +20,9 @@ component WorkspaceTabs(status:str, loading:bool)
     tab = next
   on toggle_connection
     connection_open = !connection_open
-  container width=fill height=fill clip=true bg=bg px-snap=true
+  container width=fill height=fill clip=true bg=bg border=white/4 border-w=1.0 px-snap=true
     row width=fill height=fill
-      container width=241.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar clip=true
+      container width=240.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar clip=true
         col width=fill height=fill spacing=8.0
           Brand
           space height=6.0
@@ -35,7 +35,7 @@ component WorkspaceTabs(status:str, loading:bool)
                   row width=fill spacing=9.0 align=center
                     text "#" width=18.0 size=14.0 align-x=center @font-bold text-fg
                     text "Chat" width=fill size=12.0 @font-bold text-fg
-                  active bg=linear(2.3, white/12@0.0, surface/76@1.0) text=fg border=white/18 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
+                  active bg=linear(2.3, white/8@0.0, surface/76@1.0) text=fg border=white/12 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
                   pressed bg=selection
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill spacing=9.0 align=center
@@ -57,7 +57,7 @@ component WorkspaceTabs(status:str, loading:bool)
                   row width=fill spacing=9.0 align=center
                     text "□" width=18.0 size=14.0 align-x=center @font-bold text-fg
                     text "Pages" width=fill size=12.0 @font-bold text-fg
-                  active bg=linear(2.3, white/12@0.0, surface/76@1.0) text=fg border=white/18 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
+                  active bg=linear(2.3, white/8@0.0, surface/76@1.0) text=fg border=white/12 border-w=1.0 r=10.0 shadow=black/10 shadow-y=2.0 shadow-blur=8.0
                   pressed bg=selection
           container width=fill height=1.0 bg=separator
             text ""
@@ -75,7 +75,10 @@ component WorkspaceTabs(status:str, loading:bool)
                 text "Working…" width=fill size=10.0 wrapping=none @text-muted
               if !loading
                 text status width=fill size=10.0 wrapping=none @text-muted
-              text "›" size=14.0 @text-muted
+              if connection_open
+                text "⌄" size=14.0 @text-muted
+              if !connection_open
+                text "›" size=14.0 @text-muted
             active bg=transparent text=muted r=8.0
             hovered bg=white/7 text=fg
             pressed bg=white/12
@@ -83,7 +86,7 @@ component WorkspaceTabs(status:str, loading:bool)
             slot connection
       container width=1.0 height=fill bg=separator
         text ""
-      col width=fill height=fill
+      col width=fill height=fill padding-top=28.0
         slot notice
         col width=fill height=fill padding=12.0 padding-top=4.0
           match tab

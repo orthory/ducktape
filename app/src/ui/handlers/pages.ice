@@ -2,6 +2,7 @@ on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
   page_search_generation = page_search_generation + 1
   page_searching = true
+  page_search_hits = []
   error = ""
   run search_pages(connected_rpc, "", trim(page_search_draft), page_search_generation) -> page_search_loaded _ | page_search_failed _
 
@@ -24,6 +25,8 @@ on clear_page_search
 
 on open_page_search_hit(page_id, block_id)
   return if loading || mutation_phase != "idle"
+  page_search_generation = page_search_generation + 1
+  page_searching = false
   orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
@@ -64,6 +67,8 @@ on open_page_search_hit(page_id, block_id)
 
 on choose_page(id)
   return if loading || mutation_phase != "idle"
+  page_search_generation = page_search_generation + 1
+  page_searching = false
   orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
@@ -117,9 +122,6 @@ on toggle_page_create
   page_create_open = !page_create_open
   return if !page_create_open
   task widget focus #workspace-tabs/new-page
-
-on focus_page_title(current_scope)
-  task widget focus #workspace-tabs/page-title(current_scope)/title-input
 
 on arm_page_delete
   return if loading || mutation_phase != "idle" || empty(active_page)
@@ -568,9 +570,9 @@ on pages_mutated(next)
   block_insert_open = false
   block_insert_after_id = ""
   block_actions_open = false
-  selected_block_id = ""
-  selected_block_kind = ""
-  selected_block_checked = false
+  selected_block_id = next.selected_block_id
+  selected_block_kind = next.selected_block_kind
+  selected_block_checked = next.selected_block_checked
   block_comments_generation = block_comments_generation + 1
   block_comments_open = false
   block_comments_target = ""
@@ -586,8 +588,8 @@ on pages_mutated(next)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  page_title_selected = false
-  block_edit_draft = ""
+  page_title_selected = next.page_title_selected
+  block_edit_draft = next.selected_block_text
   block_autosave_status = "idle"
   page_delete_armed = false
   block_delete_armed = false

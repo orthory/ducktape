@@ -3,11 +3,11 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
     editing = false
     draft = ""
     local_error = ""
-  on begin(current, current_scope)
+  on begin(current)
     editing = true
     draft = current
     local_error = ""
-    run defer_focus(current_scope) -> focus_page_title _
+    task widget focus #title-input
   on changed(next, next_rpc, next_password, next_page)
     draft = next
     local_error = ""
@@ -19,13 +19,13 @@ component PageTitleEditor(rpc:str, password:str, page_id:str, title:str, disable
     local_error = cause.message
   col width=fill spacing=2.0
     if !editing && !empty(title)
-      button label=title disabled=disabled width=fill padding=4.0 -> begin(title, scope_key(rpc, page_id))
+      button label=title disabled=disabled width=fill padding=4.0 -> begin(title)
         text title width=fill size=35.0 wrapping=none @font-bold text-fg
         active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
         hovered bg=white/5 text=fg border=white/7
         pressed bg=white/8 text=fg
     if !editing && empty(title)
-      button label="Untitled" disabled=disabled width=fill padding=4.0 -> begin(title, scope_key(rpc, page_id))
+      button label="Untitled" disabled=disabled width=fill padding=4.0 -> begin(title)
         text "Untitled" width=fill size=35.0 wrapping=none @font-bold text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
         hovered bg=white/5 text=fg border=white/7
@@ -166,14 +166,14 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
                 pressed bg=white/15
 
 component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:bool, editable_kinds:[str])
-  container width=172.0 padding=4.0 bg=surface border=white/15 border-w=1.0 r=9.0 shadow=black/22 shadow-y=3.0 shadow-blur=12.0
+  container width=172.0 padding=4.0 bg=popover border=white/15 border-w=1.0 r=9.0 shadow=black/22 shadow-y=3.0 shadow-blur=12.0
     col width=fill spacing=2.0
       if kind != "Page"
         pick editable_kinds some(kind) placeholder="Block type" width=fill menu-height=210.0 padding=6.0 text-size=11.0 line-height=1.2 -> selected_block_kind_changed _
           active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
           hovered text=fg placeholder=muted handle=fg bg=white/9 border=white/12 border-w=1.0 r=6.0
           opened text=fg placeholder=muted handle=fg bg=white/12 border=white/15 border-w=1.0 r=6.0
-          menu text=fg selected-text=fg selected-bg=white/18 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/16 shadow-y=3.0 shadow-blur=10.0
+          menu text=fg selected-text=fg selected-bg=white/18 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/16 shadow-y=3.0 shadow-blur=10.0
       if kind == "Page"
         button "Open page" label="Open subpage" disabled=disabled width=fill height=28.0 padding=6.0 -> choose_page(block_id)
           active bg=transparent text=muted r=6.0
@@ -228,13 +228,13 @@ component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
           text prefix size=14.0 wrapping=none font=mono
         slot
     container width=fill align-x=end align-y=start padding-right=4.0
-      container padding=2.0 bg=surface border=white/14 border-w=1.0 r=8.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
+      container padding=2.0 bg=popover border=white/14 border-w=1.0 r=8.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
         row spacing=1.0 align=center
           pick kinds some(kind) placeholder="Type" width=82.0 menu-height=210.0 padding=4.0 text-size=10.0 line-height=1.2 -> new_block_kind_changed _
             active text=fg placeholder=muted handle=muted bg=transparent border=transparent border-w=0.0 r=6.0
             hovered text=fg placeholder=muted handle=fg bg=white/9 border=white/12 border-w=1.0 r=6.0
             opened text=fg placeholder=muted handle=fg bg=white/12 border=white/15 border-w=1.0 r=6.0
-            menu text=fg selected-text=fg selected-bg=white/18 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/16 shadow-y=3.0 shadow-blur=10.0
+            menu text=fg selected-text=fg selected-bg=white/18 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/16 shadow-y=3.0 shadow-blur=10.0
           button "×" label="Cancel block insertion" disabled=disabled width=26.0 height=26.0 padding=4.0 -> close_block_insert
             active bg=transparent text=muted r=6.0
             hovered bg=white/10 text=fg

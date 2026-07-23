@@ -4,6 +4,7 @@ font mono family=mono weight=normal stretch=normal style=normal
 theme
   bg #101012ee
   surface #202023d8
+  popover #262629ff
   sidebar #18181bdc
   elevated #29292ddc
   fg #f2f2f4
@@ -14,5 +15,5 @@ theme
   border #ffffff24
   subtle #ffffff10
   selection #ffffff20
-  separator #ffffff16
+  separator #ffffff08
   shadow #00000090

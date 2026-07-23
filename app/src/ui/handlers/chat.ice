@@ -2,6 +2,7 @@ on search_chat_submit
   return if chat_searching || empty(trim(chat_search_draft))
   chat_search_generation = chat_search_generation + 1
   chat_searching = true
+  chat_search_hits = []
   error = ""
   run search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
 
@@ -24,6 +25,8 @@ on clear_chat_search
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   return if loading || mutation_phase != "idle"
+  chat_search_generation = chat_search_generation + 1
+  chat_searching = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -52,6 +55,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
+  chat_search_generation = chat_search_generation + 1
+  chat_searching = false
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
@@ -216,6 +221,35 @@ on chat_updated(next)
 
 on chat_mutated(next)
   channels = next.channels
+  failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == next.active_channel)
+  selected_message_seq = refreshed_required_message_seq(next.messages, active_channel, next.active_channel, selected_message_seq)
+  failed_message_draft = remember_failed_draft(failed_message_draft, message_action, message_edit_draft, selected_message_seq > 0 || message_action != "editing" || mutation_phase == "message-edit" || mutation_phase == "message-delete")
+  selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, true)
+  selected_message_rev = message_seq_after_failure(selected_message_rev, mutation_phase, true)
+  selected_message_rev = message_seq_after_failure(selected_message_rev, "message-edit", selected_message_seq <= 0)
+  message_action = message_action_after_failure(message_action, mutation_phase, true)
+  message_action = message_action_after_failure(message_action, "message-edit", selected_message_seq <= 0)
+  message_edit_draft = message_text_after_failure(message_edit_draft, mutation_phase, true)
+  message_edit_draft = message_text_after_failure(message_edit_draft, "message-edit", selected_message_seq <= 0)
+  hovered_message_seq = refreshed_required_message_seq(next.messages, active_channel, next.active_channel, hovered_message_seq)
+  channel_settings_open = channel_settings_open && active_channel == next.active_channel
+  channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, next.active_channel)
+  member_key_draft = retain_for_endpoint(member_key_draft, active_channel, next.active_channel)
+  thread_generation = thread_generation_after_refresh(thread_generation, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
+  thread_loading = thread_loading_after_refresh(thread_loading, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
+  active_thread_seq = refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq)
+  failed_message_draft = remember_failed_draft(failed_message_draft, "thread", reply_draft, active_thread_seq > 0)
+  thread_target_seq = refreshed_channel_value(active_channel, next.active_channel, thread_target_seq)
+  thread_next_reply_offset = refreshed_channel_value(active_channel, next.active_channel, thread_next_reply_offset)
+  thread_target_seq = message_seq_after_failure(thread_target_seq, "message-edit", active_thread_seq <= 0)
+  thread_next_reply_offset = message_seq_after_failure(thread_next_reply_offset, "message-edit", active_thread_seq <= 0)
+  thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
+  thread_has_more = thread_has_more && active_channel == next.active_channel && active_thread_seq > 0
+  reply_draft = retain_for_endpoint(reply_draft, active_channel, next.active_channel)
+  pending_reply = retain_for_endpoint(pending_reply, active_channel, next.active_channel)
+  reply_draft = message_text_after_failure(reply_draft, "message-edit", active_thread_seq <= 0)
+  pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
+  message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
   messages = next.messages
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
@@ -223,22 +257,7 @@ on chat_mutated(next)
   active_channel_members_only = next.active_channel_members_only
   active_channel_huddle_count = next.active_channel_huddle_count
   channel_members = next.channel_members
-  channel_name_draft = next.active_channel_name
-  member_key_draft = ""
-  selected_message_seq = 0
-  selected_message_rev = 0
-  message_action = "toolbar"
-  message_edit_draft = ""
-  active_thread_seq = 0
-  thread_target_seq = 0
-  thread_messages = []
-  thread_next_reply_offset = 0
-  thread_has_more = false
-  thread_generation = thread_generation + 1
   live_thread_generation = live_thread_generation + 1
-  thread_loading = false
-  reply_draft = ""
-  pending_reply = ""
   pending_channel = ""
   channel_create_open = false
   pending_message = ""
@@ -272,7 +291,7 @@ on open_message_actions(seq, body, rev)
   message_edit_draft = body
   sequential
     task widget focus #workspace-tabs/message-action-focus
-    task focus_next() -> message_action_focused
+    task widget focus-next
 
 on open_message_actions_accessibly(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
@@ -283,7 +302,7 @@ on open_message_actions_accessibly(seq, body, rev)
   message_edit_draft = body
   sequential
     task widget focus #workspace-tabs/message-action-focus
-    task focus_next() -> message_action_focused
+    task widget focus-next
 
 on open_message_reactions(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
@@ -294,7 +313,7 @@ on open_message_reactions(seq, body, rev)
   message_edit_draft = body
   sequential
     task widget focus #workspace-tabs/message-reaction-focus
-    task focus_next() -> message_action_focused
+    task widget focus-next
 
 on arm_message_delete(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
@@ -304,9 +323,7 @@ on arm_message_delete(seq, body, rev)
   message_edit_draft = body
   sequential
     task widget focus #workspace-tabs/message-delete-focus
-    task focus_next() -> message_action_focused
-
-on message_action_focused
+    task widget focus-next
 
 on begin_message_edit(seq, body, rev)
   return if seq <= 0 || mutation_phase != "idle"
@@ -326,7 +343,7 @@ on open_thread_for(seq)
   thread_generation = thread_generation + 1
   live_thread_generation = live_thread_generation + 1
   thread_loading = true
-  active_thread_seq = 0
+  active_thread_seq = seq
   thread_target_seq = 0
   thread_messages = []
   thread_next_reply_offset = 0

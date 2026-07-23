@@ -112,10 +112,6 @@ view
                   active bg=transparent border=white/10 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                   focused bg=white/7 border=fg/40
                   disabled bg=transparent value=muted
-                button "⌕" label="Search messages" disabled=(!connected || chat_searching || empty(trim(chat_search_draft))) width=28.0 height=28.0 padding=4.0 -> search_chat_submit
-                  active bg=transparent text=muted r=7.0
-                  hovered bg=white/10 text=fg
-                  pressed bg=white/15
                 if !empty(chat_search_hits)
                   button "×" label="Clear message search" width=28.0 height=28.0 padding=4.0 -> clear_chat_search
                     active bg=transparent text=muted r=7.0
@@ -155,7 +151,7 @@ view
                             input "" #message-action-focus label="Message action focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container width=190.0 padding=4.0 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container width=190.0 padding=4.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
                               col width=fill spacing=1.0
                                 button "React" label="Manage reactions" disabled=(mutation_phase != "idle" || active_channel_archived) width=fill height=28.0 padding=6.0 -> open_message_reactions(selected_message_seq, message_edit_draft, selected_message_rev)
                                   active bg=transparent text=muted r=6.0
@@ -182,7 +178,7 @@ view
                             input "" #message-reaction-focus label="Message reaction focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container padding=3.0 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container padding=3.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
                               row spacing=2.0 align=center
                                 button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("👍")
                                   active bg=transparent text=fg r=6.0
@@ -206,7 +202,7 @@ view
                                   hovered bg=white/10 text=fg
                                   pressed bg=white/15
                         if message_action == "editing"
-                          container width=520.0 padding=3.0 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                          container width=fill max-width=520.0 padding=3.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
                             row width=fill spacing=4.0 align=center
                               input "" #message-edit label="Edit message" <-> message_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_message_submit width=fill padding=6.8 text-size=12.0 line-height=1.2
                                 active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
@@ -225,7 +221,7 @@ view
                             input "" #message-delete-focus label="Message delete focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
                               active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
                               focused bg=transparent border=transparent value=transparent border-w=0.0
-                            container padding=3.0 bg=surface border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            container padding=3.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
                               row spacing=5.0 align=center
                                 text "Delete this message?" size=11.0 @text-muted
                                 button "Delete" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> delete_message_submit
@@ -472,9 +468,11 @@ view
                                 active bg=transparent text=muted r=6.0
                                 hovered bg=white/8 text=fg
                                 pressed bg=white/12
-          if connected && !empty(active_page) && block_comments_open
-            container width=fill height=fill padding=12.0 align-x=end align-y=start
-              container width=300.0 height=380.0 padding=8.0 bg=surface border=white/15 border-w=1.0 r=11.0 shadow=black/24 shadow-y=4.0 shadow-blur=16.0
+          overlay when=(connected && !empty(active_page) && block_comments_open) dismiss=close_block_comments backdrop=transparent padding=12.0 align-x=end align-y=start
+            content
+              space width=fill height=fill
+            layer
+              container width=300.0 height=380.0 padding=8.0 bg=popover border=white/15 border-w=1.0 r=11.0 shadow=black/24 shadow-y=4.0 shadow-blur=16.0
                 col width=fill height=fill spacing=6.0
                   row width=fill spacing=6.0 align=center
                     text "Comments" width=fill size=11.0 @font-bold text-fg

@@ -1,5 +1,4 @@
 extern crate::backend
-  task focus_next() -> unit
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
   ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
@@ -46,6 +45,12 @@ extern crate::backend
   sync message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64
   sync message_text_after_failure(current:str, phase:str, committed:bool) -> str
   sync message_action_after_failure(current:str, phase:str, committed:bool) -> str
+  sync refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
+  sync refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
+  sync refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
+  sync thread_generation_after_refresh(generation:i64, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> i64
+  sync thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
+  sync retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
   sync cancel_autosaves(rpc:str, generation:i64) -> i64
   sync refreshed_block_draft(blocks:[PageBlock], selected_id:str, current:str, autosave_status:str) -> str
   sync remember_orphaned_block_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str, autosave_status:str) -> [str]
@@ -60,7 +65,6 @@ extern crate::backend
   sync cancel_missing_block_autosave(rpc:str, generation:i64, blocks:[PageBlock], selected_id:str) -> i64
   sync scope_key(scope:str, id:str) -> str
   sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
-  defer_focus(scope:str) -> str
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
   create_channel(rpc:str, password:str, name:str) -> ChatData ! AppError

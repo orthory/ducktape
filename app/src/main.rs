@@ -10,6 +10,72 @@ fn main() -> iced::Result {
 mod tests {
     use super::*;
 
+    fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
+        backend::ChatMessage {
+            id: format!("message-{seq}"),
+            seq,
+            author: "user".into(),
+            meta: format!("#{seq}"),
+            body: body.into(),
+            pending: false,
+            rev: 2,
+            edited: false,
+            deleted,
+            reply_count: 0,
+            thread_seq: 0,
+            reactions: Vec::new(),
+        }
+    }
+
+    fn workspace(
+        generation: i64,
+        active_channel: &str,
+        messages: Vec<backend::ChatMessage>,
+        active_page: &str,
+        blocks: Vec<backend::PageBlock>,
+    ) -> backend::WorkspaceData {
+        backend::WorkspaceData {
+            generation,
+            rpc: "http://node".into(),
+            status: "Live".into(),
+            height: 1,
+            channels: Vec::new(),
+            messages,
+            active_channel: active_channel.into(),
+            active_channel_name: active_channel.into(),
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            active_channel_huddle_count: 0,
+            channel_members: Vec::new(),
+            pages: Vec::new(),
+            blocks,
+            active_page: active_page.into(),
+            active_page_title: active_page.into(),
+            active_page_parent: String::new(),
+        }
+    }
+
+    fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backend::ChatData {
+        backend::ChatData {
+            channels: Vec::new(),
+            messages,
+            active_channel: active_channel.into(),
+            active_channel_name: active_channel.into(),
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            active_channel_huddle_count: 0,
+            channel_members: Vec::new(),
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            selected_message_body: String::new(),
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: Vec::new(),
+            thread_next_reply_offset: 0,
+            thread_has_more: false,
+        }
+    }
+
     #[test]
     fn tab_selection_stays_in_the_component_scope() {
         let (mut app, _) = Ducktape::__boot();
@@ -50,11 +116,6 @@ mod tests {
             "rpc",
             "password",
             "channel_draft",
-            "channel_name_draft",
-            "member_key_draft",
-            "message_draft",
-            "message_edit_draft",
-            "reply_draft",
             "chat_search_draft",
             "page_draft",
             "block_draft",
@@ -66,6 +127,18 @@ mod tests {
                 .any(|name| line.trim_start().starts_with(&format!("{name} =")))
         });
         assert!(!overwrites_editable);
+        for scoped in [
+            "channel_name_draft",
+            "member_key_draft",
+            "message_draft",
+            "reply_draft",
+        ] {
+            assert!(refresh.contains(&format!(
+                "{scoped} = retain_for_endpoint({scoped}, active_channel, next.active_channel)"
+            )));
+        }
+        assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
+        assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
         assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
         assert!(!lifecycle.contains("every 1s"));
         assert!(lifecycle.contains("run refresh(connected_rpc"));
@@ -253,6 +326,357 @@ mod tests {
     }
 
     #[test]
+    fn workspace_refresh_cannot_retarget_drafts_to_fallback_contexts() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected_rpc = "http://node".into();
+        app.sync_phase = "refreshing".into();
+        app.hydration_generation = 7;
+        app.active_channel = "deleted-channel".into();
+        app.message_draft = "channel draft".into();
+        app.selected_message_seq = 7;
+        app.selected_message_rev = 2;
+        app.hovered_message_seq = 7;
+        app.message_action = "editing".into();
+        app.message_edit_draft = "message edit".into();
+        app.channel_settings_open = true;
+        app.channel_name_draft = "channel rename".into();
+        app.member_key_draft = "member".into();
+        app.active_thread_seq = 7;
+        app.thread_generation = 4;
+        app.thread_target_seq = 9;
+        app.thread_messages = vec![message(7, "old thread", false)];
+        app.thread_next_reply_offset = 4;
+        app.thread_has_more = true;
+        app.thread_loading = true;
+        app.reply_draft = "thread reply".into();
+        app.pending_reply = "pending thread reply".into();
+        app.active_page = "deleted-page".into();
+        app.block_insert_open = true;
+        app.block_insert_after_id = "deleted-block".into();
+        app.block_draft = "new block draft".into();
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
+            7,
+            "fallback-channel",
+            vec![message(7, "same sequence, other channel", false)],
+            "fallback-page",
+            Vec::new(),
+        )));
+
+        assert_eq!(app.active_channel, "fallback-channel");
+        assert_eq!(app.selected_message_seq, 0);
+        assert_eq!(app.selected_message_rev, 0);
+        assert_eq!(app.hovered_message_seq, 0);
+        assert_eq!(app.message_action, "toolbar");
+        assert!(app.message_edit_draft.is_empty());
+        assert!(!app.channel_settings_open);
+        assert!(app.channel_name_draft.is_empty());
+        assert!(app.member_key_draft.is_empty());
+        assert_eq!(app.active_thread_seq, 0);
+        assert_eq!(app.thread_generation, 5);
+        assert_eq!(app.thread_target_seq, 0);
+        assert!(app.thread_messages.is_empty());
+        assert_eq!(app.thread_next_reply_offset, 0);
+        assert!(!app.thread_has_more);
+        assert!(!app.thread_loading);
+        assert!(app.reply_draft.is_empty());
+        assert!(app.pending_reply.is_empty());
+        assert!(app.message_draft.is_empty());
+        assert_eq!(
+            app.failed_message_draft,
+            "channel draft\nmessage edit\nthread reply"
+        );
+        assert_eq!(app.active_page, "fallback-page");
+        assert!(!app.block_insert_open);
+        assert!(app.block_insert_after_id.is_empty());
+        assert_eq!(app.block_draft, "new block draft");
+
+        let _ = app.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
+            generation: 4,
+            root_seq: 7,
+            target_seq: 7,
+            messages: vec![message(7, "stale fallback collision", false)],
+            next_reply_offset: 1,
+            has_more: true,
+        }));
+        assert_eq!(app.active_thread_seq, 0);
+        assert!(app.thread_messages.is_empty());
+    }
+
+    #[test]
+    fn unrelated_chat_mutation_preserves_open_editors_and_thread_state() {
+        let (mut app, _) = Ducktape::__boot();
+        app.active_channel = "general".into();
+        app.selected_message_seq = 7;
+        app.selected_message_rev = 2;
+        app.message_action = "editing".into();
+        app.message_edit_draft = "edit in progress".into();
+        app.active_thread_seq = 9;
+        app.thread_target_seq = 10;
+        app.thread_messages = vec![message(9, "thread root", false)];
+        app.thread_next_reply_offset = 3;
+        app.thread_has_more = true;
+        app.reply_draft = "reply in progress".into();
+        app.message_draft = "next message".into();
+        app.mutation_phase = "message".into();
+        app.pending_message = "sent message".into();
+
+        let _ = app.__update(__DucktapeMessage::ChatMutated(backend::ChatData {
+            channels: Vec::new(),
+            messages: vec![
+                message(7, "message being edited", false),
+                message(9, "thread root", false),
+            ],
+            active_channel: "general".into(),
+            active_channel_name: "General".into(),
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            active_channel_huddle_count: 0,
+            channel_members: Vec::new(),
+            selected_message_seq: 0,
+            selected_message_rev: 0,
+            selected_message_body: String::new(),
+            active_thread_seq: 0,
+            thread_target_seq: 0,
+            thread_messages: Vec::new(),
+            thread_next_reply_offset: 0,
+            thread_has_more: false,
+        }));
+
+        assert_eq!(app.selected_message_seq, 7);
+        assert_eq!(app.message_action, "editing");
+        assert_eq!(app.message_edit_draft, "edit in progress");
+        assert_eq!(app.active_thread_seq, 9);
+        assert_eq!(app.thread_target_seq, 10);
+        assert_eq!(app.thread_messages.len(), 1);
+        assert_eq!(app.thread_next_reply_offset, 3);
+        assert!(app.thread_has_more);
+        assert_eq!(app.reply_draft, "reply in progress");
+        assert_eq!(app.message_draft, "next message");
+        assert_eq!(app.mutation_phase, "idle");
+    }
+
+    #[test]
+    fn tombstoned_thread_root_closes_every_thread_bound_state() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected_rpc = "http://node".into();
+        app.sync_phase = "refreshing".into();
+        app.hydration_generation = 3;
+        app.active_channel = "general".into();
+        app.active_thread_seq = 9;
+        app.thread_generation = 11;
+        app.thread_target_seq = 10;
+        app.thread_messages = vec![message(9, "thread root", false)];
+        app.thread_next_reply_offset = 4;
+        app.thread_has_more = true;
+        app.thread_loading = true;
+        app.reply_draft = "unsent reply".into();
+        app.pending_reply = "pending reply".into();
+
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
+            3,
+            "general",
+            vec![message(9, "thread root", true)],
+            "",
+            Vec::new(),
+        )));
+
+        assert_eq!(app.active_thread_seq, 0);
+        assert_eq!(app.thread_generation, 12);
+        assert_eq!(app.thread_target_seq, 0);
+        assert!(app.thread_messages.is_empty());
+        assert_eq!(app.thread_next_reply_offset, 0);
+        assert!(!app.thread_has_more);
+        assert!(!app.thread_loading);
+        assert!(app.reply_draft.is_empty());
+        assert!(app.pending_reply.is_empty());
+        assert_eq!(app.failed_message_draft, "unsent reply");
+    }
+
+    #[test]
+    fn unrelated_hydration_keeps_an_initial_thread_load_alive() {
+        let (mut refresh, _) = Ducktape::__boot();
+        refresh.connected_rpc = "http://node".into();
+        refresh.active_channel = "general".into();
+        refresh.loading = false;
+        refresh.mutation_phase = "idle".into();
+        refresh.thread_generation = 6;
+        let _ = refresh.__update(__DucktapeMessage::OpenThreadFor(7));
+        assert_eq!(refresh.active_thread_seq, 7);
+        assert_eq!(refresh.thread_generation, 7);
+        assert!(refresh.thread_loading);
+        refresh.sync_phase = "refreshing".into();
+        refresh.hydration_generation = 5;
+
+        let _ = refresh.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
+            5,
+            "general",
+            vec![message(7, "root", false)],
+            "",
+            Vec::new(),
+        )));
+        assert_eq!(refresh.active_thread_seq, 7);
+        assert_eq!(refresh.thread_generation, 7);
+        assert!(refresh.thread_loading);
+
+        refresh.sync_phase = "refreshing".into();
+        refresh.hydration_generation = 6;
+        let _ = refresh.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
+            6,
+            "general",
+            vec![message(7, "root", true)],
+            "",
+            Vec::new(),
+        )));
+        assert_eq!(refresh.active_thread_seq, 0);
+        assert_eq!(refresh.thread_generation, 8);
+        assert!(!refresh.thread_loading);
+        let _ = refresh.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
+            generation: 7,
+            root_seq: 7,
+            target_seq: 7,
+            messages: vec![message(7, "stale deleted root", false)],
+            next_reply_offset: 1,
+            has_more: true,
+        }));
+        assert_eq!(refresh.active_thread_seq, 0);
+        assert!(refresh.thread_messages.is_empty());
+
+        let (mut mutation, _) = Ducktape::__boot();
+        mutation.active_channel = "general".into();
+        mutation.loading = false;
+        mutation.mutation_phase = "idle".into();
+        mutation.thread_generation = 8;
+        let _ = mutation.__update(__DucktapeMessage::OpenThreadFor(7));
+        mutation.mutation_phase = "message".into();
+        let _ = mutation.__update(__DucktapeMessage::ChatMutated(chat_data(
+            "general",
+            vec![message(7, "root", false)],
+        )));
+        assert_eq!(mutation.active_thread_seq, 7);
+        assert_eq!(mutation.thread_generation, 9);
+        assert!(mutation.thread_loading);
+
+        mutation.mutation_phase = "channel".into();
+        let _ = mutation.__update(__DucktapeMessage::ChatMutated(chat_data(
+            "fallback",
+            vec![message(7, "same sequence, other channel", false)],
+        )));
+        assert_eq!(mutation.thread_generation, 10);
+        assert!(!mutation.thread_loading);
+
+        let _ = mutation.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
+            generation: 9,
+            root_seq: 7,
+            target_seq: 7,
+            messages: vec![message(7, "stale load", false)],
+            next_reply_offset: 1,
+            has_more: true,
+        }));
+        assert_eq!(mutation.active_thread_seq, 0);
+        assert!(mutation.thread_messages.is_empty());
+    }
+
+    #[test]
+    fn pages_mutation_keeps_the_canonical_selected_block() {
+        let (mut app, _) = Ducktape::__boot();
+        app.mutation_phase = "block-kind".into();
+        app.selected_block_id = "block-1".into();
+        app.selected_block_kind = "Text".into();
+        app.block_edit_draft = "local".into();
+        app.block_actions_open = true;
+
+        let block = backend::PageBlock {
+            key: 1,
+            id: "block-1".into(),
+            parent: "page-1".into(),
+            kind: "Todo".into(),
+            text: "canonical".into(),
+            pending: false,
+            checked: true,
+            prefix: String::new(),
+            child_count: 0,
+            mark_count: 0,
+        };
+        let _ = app.__update(__DucktapeMessage::PagesMutated(backend::PagesData {
+            pages: Vec::new(),
+            blocks: vec![block],
+            active_page: "page-1".into(),
+            active_page_title: "Page".into(),
+            active_page_parent: String::new(),
+            selected_block_id: "block-1".into(),
+            selected_block_kind: "Todo".into(),
+            selected_block_text: "canonical".into(),
+            selected_block_checked: true,
+            page_title_selected: false,
+        }));
+
+        assert_eq!(app.selected_block_id, "block-1");
+        assert_eq!(app.selected_block_kind, "Todo");
+        assert_eq!(app.block_edit_draft, "canonical");
+        assert!(app.selected_block_checked);
+        assert!(!app.block_actions_open);
+        assert_eq!(app.mutation_phase, "idle");
+    }
+
+    #[test]
+    fn ready_events_and_stale_searches_do_not_rehydrate_navigation() {
+        let (mut chat, _) = Ducktape::__boot();
+        chat.loading = false;
+        chat.chat_search_generation = 4;
+        chat.chat_searching = true;
+        let _ = chat.__update(__DucktapeMessage::ChooseChannel("next".into()));
+        assert_eq!(chat.chat_search_generation, 5);
+        assert!(!chat.chat_searching);
+        let _ = chat.__update(__DucktapeMessage::ChatSearchLoaded(
+            backend::ChatSearchData {
+                generation: 4,
+                hits: vec![backend::ChatSearchHit {
+                    channel_id: "old".into(),
+                    seq: 1,
+                    root_seq: 1,
+                    author: "user".into(),
+                    text: "stale".into(),
+                    meta: "#1".into(),
+                }],
+            },
+        ));
+        assert!(chat.chat_search_hits.is_empty());
+
+        let (mut pages, _) = Ducktape::__boot();
+        pages.loading = false;
+        pages.page_search_generation = 8;
+        pages.page_searching = true;
+        let _ = pages.__update(__DucktapeMessage::ChoosePage("next".into()));
+        assert_eq!(pages.page_search_generation, 9);
+        assert!(!pages.page_searching);
+        let _ = pages.__update(__DucktapeMessage::PageSearchLoaded(
+            backend::PageSearchData {
+                generation: 8,
+                hits: vec![backend::PageSearchHit {
+                    page_id: "old".into(),
+                    block_id: "old-block".into(),
+                    kind: "Text".into(),
+                    text: "stale".into(),
+                }],
+            },
+        ));
+        assert!(pages.page_search_hits.is_empty());
+
+        let (mut live, _) = Ducktape::__boot();
+        live.loading = false;
+        live.hydration_generation = 2;
+        let _ = live.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "ready".into(),
+            status: "Live".into(),
+            height: -1,
+        }));
+        assert_eq!(live.hydration_generation, 2);
+        assert_eq!(live.sync_phase, "idle");
+        assert!(!live.live_dirty);
+    }
+
+    #[test]
     fn optimistic_send_never_erases_the_next_draft() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
@@ -356,6 +780,10 @@ mod tests {
         assert!(toolbar.contains("-> open_message_actions_accessibly("));
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
+        assert!(components.contains(
+            "text message.author size=12.0 wrapping=none @font-bold text-fg\n        text message.meta size=10.0 wrapping=none @text-muted\n        space width=fill"
+        ));
+        assert!(toolbar.contains("bg=popover"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
@@ -417,7 +845,8 @@ mod tests {
         ] {
             assert!(chat.contains(&format!("input \"\" {focus}")));
         }
-        assert_eq!(handlers.matches("task focus_next()").count(), 4);
+        assert_eq!(handlers.matches("task widget focus-next").count(), 4);
+        assert!(!include_str!("ui/backend.ice").contains("task focus_next()"));
         let activate = handlers
             .split_once("on begin_message_edit(seq, body, rev)\n")
             .unwrap()
@@ -443,7 +872,7 @@ mod tests {
         let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
         assert_eq!(app.thread_generation, 5);
         assert!(app.thread_loading);
-        assert_eq!(app.active_thread_seq, 0);
+        assert_eq!(app.active_thread_seq, 2);
         assert!(app.thread_messages.is_empty());
         assert!(app.reply_draft.is_empty());
 
@@ -455,7 +884,7 @@ mod tests {
             next_reply_offset: 0,
             has_more: false,
         }));
-        assert_eq!(app.active_thread_seq, 0);
+        assert_eq!(app.active_thread_seq, 2);
     }
 
     #[test]
@@ -637,13 +1066,10 @@ mod tests {
         let handlers = include_str!("ui/handlers/pages.ice");
         let view = include_str!("ui/view.ice");
 
-        assert!(components.contains("run defer_focus(current_scope) -> focus_page_title _"));
-        assert!(components.contains("-> begin(title, scope_key(rpc, page_id))"));
-        assert!(
-            handlers.contains(
-                "task widget focus #workspace-tabs/page-title(current_scope)/title-input"
-            )
-        );
+        assert!(components.contains("task widget focus #title-input"));
+        assert!(!components.contains("defer_focus"));
+        assert!(!handlers.contains("focus_page_title"));
+        assert!(!include_str!("ui/backend.ice").contains("defer_focus"));
         assert!(view.contains("mouse move=pages_pointer_moved"));
         assert!(view.contains("overlay when=(connected && !empty(active_page)"));
         assert!(view.contains("dismiss=close_block_actions backdrop=transparent"));
@@ -667,8 +1093,14 @@ mod tests {
         let view = include_str!("ui/view.ice");
         let pages = view.split_once("    pages:").unwrap().1;
         assert!(pages.contains("block_comments_open"));
+        assert!(
+            pages
+                .contains("overlay when=(connected && !empty(active_page) && block_comments_open)")
+        );
+        assert!(pages.contains("dismiss=close_block_comments backdrop=transparent"));
         assert!(pages.contains("align-x=end align-y=start"));
         assert!(pages.contains("width=300.0 height=380.0"));
+        assert!(pages.contains("bg=popover"));
         assert!(pages.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
         assert!(!pages.contains("button \"Save\""));
         assert!(!pages.contains("Saving"));
