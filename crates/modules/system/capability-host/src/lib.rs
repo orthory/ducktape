@@ -144,6 +144,12 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
 }
 
 mod broker;
+// The airlock credential-resolution surface: a consensus-resolved credential and
+// the per-run config the broker builds from it (self-host pins the on-chain
+// seal_pk). `CredentialKind` is capability-host's OWN mirror of the gateway
+// module's enum — the node maps between them so this crate stays independent of
+// the gateway module crate.
+pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential};
 // interactive (pty) sessions are unix-only: they use libc pty primitives, which
 // are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
 #[cfg(unix)]
@@ -1028,7 +1034,15 @@ impl CliProvider {
     /// it (any exit path of [`Self::run_output`]) tears the endpoint down. Tart
     /// binds the host side of its private NAT; the guest plan maps that gateway
     /// to `ducktape-host`. Direct/Podman remain loopback-only.
-    async fn start_broker(&self) -> Result<Option<broker::RunBroker>, String> {
+    /// `airlock` is the per-run credential source — the narrowest seam that
+    /// reaches broker construction (RunAuth is built AFTER the broker, from its
+    /// endpoint, so it cannot carry this). `Some` pins a consensus-resolved
+    /// self-host gateway and takes precedence over `DUCKTAPE_AIRLOCK_*` env;
+    /// `None` keeps the env/host-credential path unchanged.
+    async fn start_broker(
+        &self,
+        airlock: Option<broker::AirlockConfig>,
+    ) -> Result<Option<broker::RunBroker>, String> {
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
@@ -1040,22 +1054,22 @@ impl CliProvider {
         match kind {
             BrokerKind::CodexResponses => {
                 if tart {
-                    broker::RunBroker::start_for_tart().await.map(Some)
+                    broker::RunBroker::start_for_tart(airlock).await.map(Some)
                 } else if podman_private {
-                    broker::RunBroker::start_for_podman_private().await.map(Some)
+                    broker::RunBroker::start_for_podman_private(airlock).await.map(Some)
                 } else {
-                    broker::RunBroker::start().await.map(Some)
+                    broker::RunBroker::start(airlock).await.map(Some)
                 }
             }
             BrokerKind::AnthropicMessages => {
                 if tart {
-                    broker::RunBroker::start_anthropic_for_tart().await.map(Some)
+                    broker::RunBroker::start_anthropic_for_tart(airlock).await.map(Some)
                 } else if podman_private {
-                    broker::RunBroker::start_anthropic_for_podman_private()
+                    broker::RunBroker::start_anthropic_for_podman_private(airlock)
                         .await
                         .map(Some)
                 } else {
-                    broker::RunBroker::start_anthropic().await.map(Some)
+                    broker::RunBroker::start_anthropic(airlock).await.map(Some)
                 }
             }
         }
@@ -3531,7 +3545,9 @@ impl CliProvider {
         let _context = self.deliver_context(&workdir, config_home.as_deref(), ctx)?;
         let prompt_buf = self.prompt_with_context(prompt, ctx);
         let prompt = prompt_buf.as_str();
-        let broker = self.start_broker().await?;
+        // no per-run airlock resolution is wired here yet (that arrives with the
+        // consensus-record lookup); the env/host-credential path is unchanged.
+        let broker = self.start_broker(None).await?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
@@ -5059,7 +5075,7 @@ broker = "anthropic-messages"
         ] {
             let provider = CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"))
                 .with_backend(backend.clone());
-            if let Err(e) = provider.start_broker().await {
+            if let Err(e) = provider.start_broker(None).await {
                 assert!(
                     !e.contains("cannot host a credential broker"),
                     "{backend:?} reached credential loading, not a backend veto: {e:?}"
