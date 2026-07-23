@@ -306,7 +306,7 @@ view
                   hovered bg=white/10 text=fg
                   pressed bg=white/15
             container width=fill padding=8.0 bg=surface border=white/13 border-w=1.0 r=13.0 shadow=black/24 shadow-y=3.0 shadow-blur=18.0
-              flex width=fill gap=8.0 align-items=center
+              flex width=fill gap=8.0 align-items=end
                 editor #message <-> message_editor placeholder="Message #general…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word key-binding=composer_keys() -> send_message_submit
                   active bg=transparent border=transparent value=fg placeholder=muted selection=primary/40 border-w=0.0 r=9.0
                   hovered bg=white/4 border=white/8 border-w=1.0
@@ -422,7 +422,7 @@ view
                             hovered bg=white/10 text=fg
                             pressed bg=white/15
                       container width=fill padding=5.0 bg=transparent border=white/12 border-w=1.0 r=7.0
-                        row width=fill spacing=5.0 align=center
+                        row width=fill spacing=5.0 align=end
                           editor #reply <-> reply_editor placeholder="Reply…" disabled=(thread_loading || active_channel_archived) min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word key-binding=composer_keys() -> send_reply_submit
                             active bg=transparent border=transparent value=fg placeholder=muted selection=primary/40 border-w=0.0 r=9.0
                             hovered bg=white/4 border=white/8 border-w=1.0
