@@ -112,34 +112,40 @@ view
         row width=fill height=fill
           col width=fill height=fill spacing=9.0 padding=14.0
             if !empty(active_channel)
-              row width=fill height=28.0 spacing=7.0 align=center
-                container width=22.0 height=22.0 align-x=center align-y=center bg=white/10 border=white/16 border-w=1.0 r=7.0
-                  text "#" size=13.0 font=medium @text-fg
-                text active_channel_name width=fill size=13.0 font=medium @text-fg
-                if active_channel_archived
-                  text "Archived" size=11.0 @text-muted
-                if active_channel_members_only
-                  text "Members" size=11.0 @text-muted
-                if active_channel_huddle_count > 0
-                  text active_channel_huddle_count size=11.0 @text-muted
-                input "" #chat-search label="Search messages" <-> chat_search_draft hint="Search messages" disabled=(!connected || chat_searching) submit=search_chat_submit width=180.0 padding=6.2 text-size=13.0 line-height=1.2
-                  active bg=transparent border=white/10 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                  hovered bg=white/4 border=white/14
-                  focused bg=white/7 border=fg/40
-                  disabled bg=transparent value=muted
-                if !empty(chat_search_hits)
-                  button label="Clear message search" width=28.0 height=28.0 padding=0.0 -> clear_chat_search
+              col width=fill spacing=12.0
+                row width=fill height=32.0 spacing=9.0 align=center
+                  text "#" size=18.0 wrapping=none font=display @text-primary
+                  text active_channel_name size=16.0 wrapping=none font=display @text-fg
+                  if active_channel_archived
+                    container padding=2.0 padding-left=7.0 padding-right=7.0 bg=white/6 border=white/13 border-w=1.0 r=6.0
+                      text "Archived" size=11.0 wrapping=none font=medium @text-muted
+                  if active_channel_members_only
+                    container padding=2.0 padding-left=7.0 padding-right=7.0 bg=primary/14 border=primary/26 border-w=1.0 r=6.0
+                      text "Members only" size=11.0 wrapping=none font=medium @text-primary
+                  if active_channel_huddle_count > 0
+                    container padding=2.0 padding-left=7.0 padding-right=7.0 bg=success/16 border=success/26 border-w=1.0 r=6.0
+                      text active_channel_huddle_count size=11.0 wrapping=none font=medium @text-success
+                  space width=fill
+                  input "" #chat-search label="Search messages" <-> chat_search_draft hint="Search messages" disabled=(!connected || chat_searching) submit=search_chat_submit width=190.0 padding=6.2 text-size=13.0 line-height=1.2
+                    active bg=white/4 border=white/11 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                    hovered bg=white/6 border=white/15
+                    focused bg=white/8 border=primary/55
+                    disabled bg=transparent value=muted
+                  if !empty(chat_search_hits)
+                    button label="Clear message search" width=28.0 height=28.0 padding=0.0 -> clear_chat_search
+                      container width=fill height=fill align-x=center align-y=center
+                        text "×" size=14.0
+                      active bg=transparent text=muted r=8.0
+                      hovered bg=white/10 text=fg
+                      pressed bg=white/15
+                  button label="Channel details" width=28.0 height=28.0 padding=0.0 -> toggle_channel_settings
                     container width=fill height=fill align-x=center align-y=center
-                      text "×" size=14.0
-                    active bg=transparent text=muted r=7.0
+                      text "•••" size=13.0
+                    active bg=transparent text=muted r=8.0
                     hovered bg=white/10 text=fg
                     pressed bg=white/15
-                button label="Channel details" width=28.0 height=28.0 padding=0.0 -> toggle_channel_settings
-                  container width=fill height=fill align-x=center align-y=center
-                    text "•••" size=13.0
-                  active bg=transparent text=muted r=7.0
-                  hovered bg=white/10 text=fg
-                  pressed bg=white/15
+                container width=fill height=1.0 bg=separator
+                  text ""
             if !empty(chat_search_hits)
               container width=fill height=148.0 padding=6.0 bg=elevated border=white/10 border-w=1.0 r=10.0
                 scroll direction=vertical width=fill height=fill
@@ -157,8 +163,11 @@ view
                     scroll direction=vertical width=fill height=fill
                       col width=fill spacing=1.0
                         for message in messages
-                          stack #message(message.id) width=fill
-                            MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
+                          col width=fill spacing=0.0
+                            if message.show_author
+                              space height=10.0
+                            stack #message(message.id) width=fill
+                              MessageCard message=message selected=(message.seq == selected_message_seq) hovered=(message.seq == hovered_message_seq) disabled=loading
                 overlay when=(selected_message_seq > 0 && message_action != "toolbar") dismiss=clear_message_selection backdrop=transparent padding=8.0 align-x=end align-y=start
                   content
                     space width=fill height=fill
@@ -283,17 +292,17 @@ view
                   active bg=transparent text=muted r=7.0
                   hovered bg=white/10 text=fg
                   pressed bg=white/15
-            container width=fill padding=6.0 bg=surface border=white/16 border-w=1.0 r=14.0 shadow=black/10 shadow-y=2.0 shadow-blur=12.0
-              flex width=fill gap=6.0 align-items=center
-                input "" #message label="Message" <-> message_draft hint="Write a message…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) submit=send_message_submit width=fill padding=6.6 text-size=14.0 line-height=1.2
-                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=9.0
+            container width=fill padding=8.0 bg=surface border=white/13 border-w=1.0 r=13.0 shadow=black/24 shadow-y=3.0 shadow-blur=18.0
+              flex width=fill gap=8.0 align-items=center
+                input "" #message label="Message" <-> message_draft hint="Message #general…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) submit=send_message_submit width=fill padding=6.6 text-size=14.0 line-height=1.2
+                  active bg=transparent border=transparent value=fg placeholder=muted selection=primary/40 border-w=0.0 r=9.0
                   hovered bg=white/4 border=white/8 border-w=1.0
-                  focused bg=white/7 border=white/14 border-w=1.0
+                  focused bg=white/6 border=primary/45 border-w=1.0
                   disabled value=muted
-                button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(message_draft))) width=62.0 height=30.0 padding=7.0 -> send_message_submit
-                  active bg=fg/90 text=bg border=white/5 border-w=1.0 r=10.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
-                  hovered bg=fg/80 text=bg
-                  pressed bg=fg text=bg
+                button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(message_draft))) width=66.0 height=30.0 padding=7.0 -> send_message_submit
+                  active bg=primary text=fg border=primaryhi/50 border-w=1.0 r=10.0 shadow=black/26 shadow-y=2.0 shadow-blur=9.0
+                  hovered bg=primaryhi text=fg
+                  pressed bg=primary text=fg
                   disabled bg=white/8 text=muted
           if channel_settings_open && !empty(active_channel)
             container width=1.0 height=fill bg=white/8

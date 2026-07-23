@@ -1,10 +1,10 @@
 component Brand()
-  row width=fill spacing=9.0 align=center
-    container width=28.0 height=28.0 align-x=center align-y=center bg=white/7 border=white/13 border-w=1.0 r=8.0 shadow=black/8 shadow-y=1.0 shadow-blur=5.0
-      text "D" size=13.0 font=medium @text-fg
-    col width=fill spacing=0.0
-      text "Ducktape" size=13.0 font=medium @text-fg
-      text "Workspace" size=11.0 @text-muted
+  row width=fill spacing=10.0 align=center
+    container width=30.0 height=30.0 align-x=center align-y=center bg=primary border=primaryhi/45 border-w=1.0 r=9.0 shadow=black/28 shadow-y=1.0 shadow-blur=6.0
+      text "D" size=15.0 font=display @text-fg
+    col width=fill spacing=1.0
+      text "Ducktape" size=14.0 wrapping=none font=display @text-fg
+      text "Workspace" size=11.0 wrapping=none @text-muted
 
 component EmptyState(title:str, detail:str)
   container width=fill height=fill align-x=center align-y=center
@@ -33,15 +33,15 @@ component WorkspaceTabs(status:str, loading:bool)
               col width=fill spacing=3.0
                 button label="Chat" width=fill height=34.0 padding=7.0 -> select_tab("chat")
                   row width=fill height=fill spacing=9.0 align=center
-                    text "#" width=18.0 size=14.0 align-x=center font=medium @text-fg
-                    text "Chat" width=fill size=13.0 font=medium @text-fg
-                  active bg=white/9 text=fg border=white/13 border-w=1.0 r=10.0
-                  hovered bg=white/11 text=fg border=white/16
-                  pressed bg=white/14
+                    text "#" width=18.0 size=15.0 align-x=center font=display @text-primary
+                    text "Chat" width=fill size=14.0 font=medium @text-fg
+                  active bg=primary/16 text=fg border=primary/26 border-w=1.0 r=10.0
+                  hovered bg=primary/22 text=fg border=primary/34
+                  pressed bg=primary/30 text=fg
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill height=fill spacing=9.0 align=center
                     text "▤" width=18.0 size=14.0 align-x=center @text-muted
-                    text "Pages" width=fill size=13.0 @text-muted
+                    text "Pages" width=fill size=14.0 @text-muted
                   active bg=transparent text=muted border=transparent border-w=1.0 r=10.0
                   hovered bg=white/6 text=fg border=white/8
                   pressed bg=white/10 text=fg
@@ -49,18 +49,18 @@ component WorkspaceTabs(status:str, loading:bool)
               col width=fill spacing=3.0
                 button label="Chat" width=fill height=34.0 padding=7.0 -> select_tab("chat")
                   row width=fill height=fill spacing=9.0 align=center
-                    text "#" width=18.0 size=14.0 align-x=center @text-muted
-                    text "Chat" width=fill size=13.0 @text-muted
+                    text "#" width=18.0 size=15.0 align-x=center @text-muted
+                    text "Chat" width=fill size=14.0 @text-muted
                   active bg=transparent text=muted border=transparent border-w=1.0 r=10.0
                   hovered bg=white/6 text=fg border=white/8
                   pressed bg=white/10 text=fg
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill height=fill spacing=9.0 align=center
-                    text "▤" width=18.0 size=14.0 align-x=center font=medium @text-fg
-                    text "Pages" width=fill size=13.0 font=medium @text-fg
-                  active bg=white/9 text=fg border=white/13 border-w=1.0 r=10.0
-                  hovered bg=white/11 text=fg border=white/16
-                  pressed bg=white/14
+                    text "▤" width=18.0 size=15.0 align-x=center font=display @text-primary
+                    text "Pages" width=fill size=14.0 font=medium @text-fg
+                  active bg=primary/16 text=fg border=primary/26 border-w=1.0 r=10.0
+                  hovered bg=primary/22 text=fg border=primary/34
+                  pressed bg=primary/30 text=fg
           container width=fill height=1.0 bg=white/6
             text ""
           match tab

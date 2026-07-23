@@ -29,6 +29,7 @@ extern crate::backend
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
+  container-style avatar_style(r:f64, g:f64, b:f64)
   connect(rpc:str) -> WorkspaceData ! AppError
   stream live_events(rpc:str) -> LiveUpdate
   refresh(rpc:str, channel_id:str, page_id:str, generation:i64) -> WorkspaceData ! HydrationError

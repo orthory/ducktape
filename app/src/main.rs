@@ -809,12 +809,22 @@ mod tests {
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
         assert!(components.contains(
-            "text message.author size=13.0 wrapping=none font=medium @text-fg\n          text message.meta size=11.0 wrapping=none @text-muted\n          space width=fill"
+            "text message.author size=14.0 wrapping=none font=display @text-fg\n          text message.meta size=11.0 wrapping=none @text-muted\n          space width=fill"
         ));
-        // Slack-style grouping: the avatar + author header only renders for a
-        // run's first message; continuations keep the body aligned via a gutter.
-        assert!(components.contains("if message.show_author\n      container width=30.0 height=30.0"));
-        assert!(components.contains("if !message.show_author\n      space width=30.0"));
+        // Slack-style grouping: the colored avatar + author header only renders
+        // for a run's first message; continuations keep the body aligned via a
+        // gutter that matches the avatar's width.
+        assert!(components.contains("if message.show_author\n      container width=36.0 height=36.0"));
+        assert!(components.contains("if !message.show_author\n      space width=36.0"));
+        // The per-author avatar tint rides in through a container-style extern
+        // because `bg=` only takes static colors.
+        assert!(components.contains(
+            "style=avatar_style(message.avatar_r, message.avatar_g, message.avatar_b)"
+        ));
+        // Rich bodies render structured blocks, not one flattened string.
+        assert!(components.contains("for block in message.blocks"));
+        assert!(components.contains("if block.kind == \"code\""));
+        assert!(components.contains("flex width=fill wrap"));
         assert!(toolbar.contains("bg=popover"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
@@ -1150,13 +1160,18 @@ mod tests {
         let theme = include_str!("ui/theme.ice");
         assert!(theme.contains("font ui family=\"Inter\" weight=normal"));
         for material in [
-            "bg #101012de",
-            "surface #202023d9",
-            "popover #262629de",
-            "sidebar #18181bdb",
-            "elevated #29292dde",
+            "bg #0b0b10ec",
+            "surface #17171fe8",
+            "popover #20202be8",
+            "sidebar #101016ef",
+            "elevated #262631e8",
         ] {
             assert!(theme.contains(material), "{material}");
+        }
+        // The redesign introduces an indigo accent for life (avatars, selection,
+        // primary actions) while staying a layered dark system material set.
+        for accent in ["primary #6f6cf6", "primaryhi #8a88ff"] {
+            assert!(theme.contains(accent), "{accent}");
         }
 
         let shell = include_str!("ui/components/shell.ice");

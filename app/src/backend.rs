@@ -3629,9 +3629,30 @@ const AVATAR_PALETTE: [(u8, u8, u8); 8] = [
     (0x2f, 0x7a, 0xe0), // blue
 ];
 
-/// The avatar tint for an author as linear 0..1 RGB, ready for `color.rgb`.
+/// The avatar tint for an author as linear 0..1 RGB.
 pub fn avatar_rgb(author: &AuthorRef) -> (f64, f64, f64) {
     avatar_rgb_for(&avatar_source(author))
+}
+
+/// Container style for a per-author avatar: the data-driven tint fill with a
+/// rounded-square radius and a soft drop shadow. `bg=` only takes static colors,
+/// so the dynamic tint rides in through a `container-style` extern.
+pub fn avatar_style(_theme: &iced::Theme, r: f64, g: f64, b: f64) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            r as f32, g as f32, b as f32,
+        ))),
+        border: iced::Border {
+            radius: 10.0.into(),
+            ..Default::default()
+        },
+        shadow: iced::Shadow {
+            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.30),
+            offset: iced::Vector::new(0.0, 1.0),
+            blur_radius: 4.0,
+        },
+        ..Default::default()
+    }
 }
 
 /// The avatar tint for a bare identity string (used for optimistic/local authors).
