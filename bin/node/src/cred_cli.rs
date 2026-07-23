@@ -96,7 +96,7 @@ impl ProviderArg {
     }
 
     /// the lowercase token used in `kind` files and default names.
-    fn token(self) -> &'static str {
+    pub(crate) fn token(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -616,7 +616,7 @@ fn resolve_account(base: &str, input: &str) -> Result<Vec<u8>, Box<dyn std::erro
 }
 
 /// One `/v1/query` round-trip: `{target, query}` in, the module reply JSON out.
-fn query_node(
+pub(crate) fn query_node(
     base: &str,
     target: &str,
     query: serde_json::Value,
