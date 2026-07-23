@@ -261,8 +261,9 @@ on chat_mutated(next)
   member_key_draft = retain_for_endpoint(member_key_draft, active_channel, next.active_channel)
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
+  failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, next.active_channel)
   active_thread_seq = refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq)
-  failed_message_draft = remember_failed_draft(failed_message_draft, "thread", reply_draft, active_thread_seq > 0)
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, "thread", reply_draft, active_thread_seq > 0)
   thread_target_seq = refreshed_channel_value(active_channel, next.active_channel, thread_target_seq)
   thread_next_reply_offset = refreshed_channel_value(active_channel, next.active_channel, thread_next_reply_offset)
   thread_target_seq = message_seq_after_failure(thread_target_seq, "message-edit", active_thread_seq <= 0)
@@ -374,7 +375,7 @@ on open_thread_for(seq)
   reply_draft = ""
   pending_reply = ""
   error = ""
-  run load_thread(connected_rpc, active_channel, seq, 0, 0, false, thread_generation) -> thread_loaded _ | thread_failed _
+  run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
 on cancel_message_action
   return if selected_message_seq <= 0
@@ -435,7 +436,6 @@ on thread_page_failed(cause)
 on thread_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
   thread_loading = false
-  thread_messages = rollback_messages(thread_messages, mutation_phase == "recovering")
   error = cause.message
   return if !live_dirty
   live_dirty = false
@@ -496,39 +496,38 @@ on remove_reaction_submit(emoji)
   run remove_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_mutated _ | mutation_failed _
 
 on send_reply_submit
-  return if loading || thread_loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
+  return if loading || thread_loading || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
-  mutation_phase = "reply"
   pending_reply = trim(reply_draft)
   pending_reply_id = fresh_operation_id("reply")
   reply_draft = ""
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
-  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply) -> thread_mutated _ | reply_mutation_failed _
+  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply) -> thread_reply_sent _ | thread_reply_send_failed _
 
-on reply_mutation_failed(cause)
-  mutation_phase = "recovering"
-  block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
-  reply_draft = restore_draft(reply_draft, pending_reply, cause.committed)
-  thread_messages = rollback_messages(thread_messages, cause.committed)
-  pending_reply = ""
+on thread_reply_send_failed(cause)
+  return if active_channel != cause.scope_id
+  return if !contains_pending_message(thread_messages, cause.operation_id)
+  thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, reply_draft, cause.body, cause.committed)
+  reply_draft = restore_draft(reply_draft, cause.body, cause.committed)
+  thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more, cause.committed)
   error = cause.message
-  live_dirty = true
-  thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
-  thread_loading = true
-  run load_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, cause.committed, thread_generation) -> thread_loaded _ | thread_failed _
-
-on thread_mutated(next)
-  thread_target_seq = 0
-  thread_messages = finish_thread_reply(thread_messages, next)
-  thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more)
-  pending_reply = ""
-  mutation_phase = "idle"
+  live_dirty = live_dirty || cause.committed
+  return if !live_dirty || loading || sync_phase == "refreshing"
   live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+
+on thread_reply_sent(next)
+  return if !contains_pending_message(thread_messages, next.id)
+  thread_target_seq = 0
+  thread_messages = merge_thread_reply(thread_messages, next)
+  thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more, true)
   error = ""
   hydration_generation = hydration_generation + 1
   sync_phase = "refreshing"

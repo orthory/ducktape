@@ -36,10 +36,10 @@ extern crate::backend
   sync merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   sync merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   sync rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
-  sync rollback_messages(messages:[ChatMessage], keep_pending:bool) -> [ChatMessage]
+  sync contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
-  sync finish_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
-  sync thread_offset_after_reply(offset:i64, has_more:bool) -> i64
+  sync merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
+  sync thread_offset_after_reply(offset:i64, has_more:bool, committed:bool) -> i64
   sync optimistic_block(blocks:[PageBlock], after_id:str, kind:str, text:str, id:str) -> [PageBlock]
   sync merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   sync merge_block_insert_result(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
@@ -87,10 +87,10 @@ extern crate::backend
   join_huddle(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> ChatSendResult ! OptimisticMutationError
-  load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, committed_reply:bool, generation:i64) -> ThreadLoadData ! HydrationError
+  load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
   refresh_live_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> LiveThreadData ! HydrationError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, body:str) -> ChatMessage ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> ChatMessage ! OptimisticMutationError
   edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> ChatData ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> ChatData ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError

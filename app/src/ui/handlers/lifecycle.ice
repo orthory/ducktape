@@ -10,6 +10,7 @@ on reconnect
   channel_draft = retain_for_endpoint(channel_draft, connected_rpc, rpc)
   message_draft = retain_for_endpoint(message_draft, connected_rpc, rpc)
   failed_message_draft = retain_for_endpoint(failed_message_draft, connected_rpc, rpc)
+  failed_reply_draft = retain_for_endpoint(failed_reply_draft, connected_rpc, rpc)
   chat_search_draft = retain_for_endpoint(chat_search_draft, connected_rpc, rpc)
   page_draft = retain_for_endpoint(page_draft, connected_rpc, rpc)
   block_draft = retain_for_endpoint(block_draft, connected_rpc, rpc)
@@ -144,8 +145,9 @@ on workspace_refreshed(next)
   member_key_draft = retain_for_endpoint(member_key_draft, active_channel, next.active_channel)
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
+  failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, next.active_channel)
   active_thread_seq = refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq)
-  failed_message_draft = remember_failed_draft(failed_message_draft, "thread", reply_draft, active_thread_seq > 0)
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, "thread", reply_draft, active_thread_seq > 0)
   thread_target_seq = refreshed_channel_value(active_channel, next.active_channel, thread_target_seq)
   thread_next_reply_offset = refreshed_channel_value(active_channel, next.active_channel, thread_next_reply_offset)
   thread_target_seq = message_seq_after_failure(thread_target_seq, "message-edit", active_thread_seq <= 0)
@@ -222,7 +224,7 @@ on live_thread_refreshed(next)
   live_dirty = live_dirty || thread_loading || mutation_phase != "idle"
   return if thread_loading || mutation_phase != "idle"
   thread_target_seq = next.target_seq
-  thread_messages = next.messages
+  thread_messages = merge_pending_messages(next.messages, thread_messages, active_channel, next.channel_id, "")
   thread_next_reply_offset = next.next_reply_offset
   thread_has_more = next.has_more
 
@@ -267,11 +269,8 @@ on mutation_failed(cause)
   mutation_phase = mutation_failure_phase(cause.committed)
   channel_draft = restore_draft(channel_draft, pending_channel, cause.committed)
   page_draft = restore_draft(page_draft, pending_page, cause.committed)
-  reply_draft = restore_draft(reply_draft, pending_reply, cause.committed)
-  thread_messages = rollback_messages(thread_messages, cause.committed)
   pending_channel = ""
   pending_page = ""
-  pending_reply = ""
   error = cause.message
   live_dirty = live_dirty || cause.committed
   return if !live_dirty
@@ -291,6 +290,15 @@ on restore_failed_message
 
 on dismiss_failed_message
   failed_message_draft = ""
+
+on restore_failed_reply
+  return if empty(failed_reply_draft) || !empty(reply_draft)
+  reply_draft = failed_reply_draft
+  failed_reply_draft = ""
+  task widget focus #workspace-tabs/reply
+
+on dismiss_failed_reply
+  failed_reply_draft = ""
 
 on failed(cause)
   hydration_generation = hydration_generation + 1

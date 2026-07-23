@@ -53,6 +53,7 @@ state
   pending_message = ""
   pending_message_id = ""
   failed_message_draft = ""
+  failed_reply_draft = ""
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_searching = false

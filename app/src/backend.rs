@@ -409,32 +409,29 @@ pub fn rollback_pending_message(
     messages
 }
 
-pub fn rollback_messages(mut messages: Vec<ChatMessage>, keep_pending: bool) -> Vec<ChatMessage> {
-    if keep_pending {
-        return messages;
-    }
-    messages.retain(|message| !message.pending);
+pub fn contains_pending_message(messages: Vec<ChatMessage>, pending_id: String) -> bool {
     messages
+        .iter()
+        .any(|message| message.pending && message.id == pending_id)
 }
 
 pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    messages
-        .into_iter()
-        .chain(next)
-        .map(|message| (message.seq, message))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect()
+    merge_message_send_result(next, messages, String::new(), String::new(), String::new())
 }
 
-pub fn finish_thread_reply(mut messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
-    messages.retain(|message| !message.pending && message.seq != reply.seq);
-    messages.push(reply);
-    messages
+pub fn merge_thread_reply(messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
+    let settled_id = reply.id.clone();
+    merge_message_send_result(
+        vec![reply],
+        messages,
+        String::new(),
+        String::new(),
+        settled_id,
+    )
 }
 
-pub fn thread_offset_after_reply(offset: i64, has_more: bool) -> i64 {
-    if offset < 0 || has_more {
+pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -> i64 {
+    if !committed || offset < 0 || has_more {
         offset
     } else {
         offset.saturating_add(1)
@@ -1358,21 +1355,15 @@ pub async fn load_thread(
     root_seq: i64,
     target_seq: i64,
     through_reply_offset: i64,
-    committed_reply: bool,
     generation: i64,
 ) -> Result<ThreadLoadData, HydrationError> {
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
         let target_seq = u64::try_from(target_seq).unwrap_or(0);
-        let is_sparse_target = !committed_reply && through_reply_offset < 0 && target_seq > 0;
-        let requested_reply_offset = u64::try_from(through_reply_offset)
+        let is_sparse_target = through_reply_offset < 0 && target_seq > 0;
+        let through_reply_offset = u64::try_from(through_reply_offset)
             .unwrap_or(0)
             .min(chat::MAX_THREAD_REPLIES as u64);
-        let through_reply_offset = if committed_reply {
-            chat::MAX_THREAD_REPLIES as u64
-        } else {
-            requested_reply_offset
-        };
         let rpc = rpc_client(&rpc)?;
         if is_sparse_target {
             return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
@@ -1465,7 +1456,6 @@ pub async fn refresh_live_thread(
         root_seq,
         target_seq,
         through_reply_offset,
-        false,
         generation,
     )
     .await
@@ -1485,13 +1475,17 @@ pub async fn send_reply(
     password: String,
     channel_id: String,
     root_seq: i64,
+    message_id: String,
     body: String,
-) -> Result<ChatMessage, AppError> {
-    async {
+) -> Result<ChatMessage, OptimisticMutationError> {
+    let operation_id = message_id.clone();
+    let operation_scope = channel_id.clone();
+    let operation_body = body.clone();
+    let result = async {
         let root_seq = positive_sequence(root_seq)?;
         let body = bounded_text(body, "reply", 16 * 1024)?;
         let rpc = rpc_client(&rpc)?;
-        let message_id = fresh_id("message");
+        let message_id = required_id(message_id, "message")?;
         signed_write(
             &rpc,
             "chat",
@@ -1511,7 +1505,14 @@ pub async fn send_reply(
         let current_user = local_user_key().await;
         Ok(chat_message(reply, current_user.as_deref()))
     }
-    .await
+    .await;
+    result.map_err(|cause: AppError| OptimisticMutationError {
+        message: cause.message,
+        committed: cause.committed,
+        operation_id,
+        scope_id: operation_scope,
+        body: operation_body,
+    })
 }
 
 pub async fn edit_message(
@@ -3616,6 +3617,14 @@ mod tests {
     }
 
     #[test]
+    fn thread_offsets_advance_only_for_loaded_commits() {
+        assert_eq!(thread_offset_after_reply(3, false, true), 4);
+        assert_eq!(thread_offset_after_reply(3, false, false), 3);
+        assert_eq!(thread_offset_after_reply(256, true, true), 256);
+        assert_eq!(thread_offset_after_reply(-1, false, true), -1);
+    }
+
+    #[test]
     fn concurrent_blocks_preserve_pending_position_then_accept_canonical_order() {
         let block = |id: &str, pending: bool| PageBlock {
             key: page_block_key(id),
@@ -4035,20 +4044,13 @@ mod tests {
         assert_eq!(last.messages[0].body, "reply 256");
         assert_eq!(last.next_reply_offset, 257);
         assert!(!last.has_more);
-        let sparse = load_thread(origin.clone(), "general".into(), 1, 258, -1, false, 10)
+        let sparse = load_thread(origin, "general".into(), 1, 258, -1, 10)
             .await
             .unwrap();
         assert_eq!(sparse.target_seq, 258);
         assert_eq!(sparse.next_reply_offset, -1);
         assert_eq!(sparse.messages.len(), 2);
         assert_eq!(sparse.messages[1].body, "reply 256");
-        let committed = load_thread(origin, "general".into(), 1, 258, -1, true, 11)
-            .await
-            .unwrap();
-        assert_eq!(committed.target_seq, 258);
-        assert_eq!(committed.messages.len(), 258);
-        assert_eq!(committed.messages[257].body, "reply 256");
-        assert!(!committed.has_more);
         sim.shutdown();
     }
 

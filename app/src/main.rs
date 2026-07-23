@@ -382,10 +382,8 @@ mod tests {
         assert!(app.reply_draft.is_empty());
         assert!(app.pending_reply.is_empty());
         assert!(app.message_draft.is_empty());
-        assert_eq!(
-            app.failed_message_draft,
-            "channel draft\nmessage edit\nthread reply"
-        );
+        assert_eq!(app.failed_message_draft, "channel draft\nmessage edit");
+        assert_eq!(app.failed_reply_draft, "thread reply");
         assert_eq!(app.active_page, "fallback-page");
         assert!(!app.block_insert_open);
         assert!(app.block_insert_after_id.is_empty());
@@ -490,7 +488,7 @@ mod tests {
         assert!(!app.thread_loading);
         assert!(app.reply_draft.is_empty());
         assert!(app.pending_reply.is_empty());
-        assert_eq!(app.failed_message_draft, "unsent reply");
+        assert_eq!(app.failed_reply_draft, "unsent reply");
     }
 
     #[test]
@@ -907,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn thread_pages_and_new_replies_preserve_loaded_messages() {
+    fn thread_pagination_preserves_multiple_pending_replies() {
         let message = |seq: i64, thread_seq: i64, body: &str| backend::ChatMessage {
             id: format!("message-{seq}"),
             seq,
@@ -926,7 +924,15 @@ mod tests {
         app.active_thread_seq = 1;
         app.thread_generation = 7;
         app.thread_loading = true;
-        app.thread_messages = vec![message(1, 0, "root"), message(2, 1, "first")];
+        app.thread_messages = backend::optimistic_message(
+            backend::optimistic_message(
+                vec![message(1, 0, "root"), message(2, 1, "first")],
+                "pending first".into(),
+                "pending-first".into(),
+            ),
+            "pending second".into(),
+            "pending-second".into(),
+        );
 
         let _ = app.__update(__DucktapeMessage::ThreadPageLoaded(
             backend::ThreadPageData {
@@ -936,53 +942,19 @@ mod tests {
                 has_more: false,
             },
         ));
-        assert_eq!(app.thread_messages.len(), 3);
+        assert_eq!(app.thread_messages.len(), 5);
         assert_eq!(app.thread_messages[1].body, "first");
         assert_eq!(app.thread_next_reply_offset, 2);
-
-        app.thread_messages = backend::optimistic_message(
-            app.thread_messages,
-            "third".into(),
-            "pending-third".into(),
+        assert!(
+            app.thread_messages
+                .iter()
+                .any(|message| { message.pending && message.id == "pending-first" })
         );
-        app.pending_reply = "third".into();
-        app.mutation_phase = "reply".into();
-        let _ = app.__update(__DucktapeMessage::ThreadMutated(message(4, 1, "third")));
-        assert_eq!(app.thread_messages.len(), 4);
-        assert_eq!(app.thread_messages[1].body, "first");
-        assert_eq!(app.thread_messages[3].body, "third");
-        assert!(!app.thread_messages.iter().any(|message| message.pending));
-        assert_eq!(app.thread_next_reply_offset, 3);
-
-        let (mut partial, _) = Ducktape::__boot();
-        partial.active_thread_seq = 1;
-        partial.thread_next_reply_offset = 256;
-        partial.thread_has_more = true;
-        partial.thread_messages = backend::optimistic_message(
-            vec![message(1, 0, "root")],
-            "new tail".into(),
-            "pending-tail".into(),
+        assert!(
+            app.thread_messages
+                .iter()
+                .any(|message| { message.pending && message.id == "pending-second" })
         );
-        partial.mutation_phase = "reply".into();
-        let _ = partial.__update(__DucktapeMessage::ThreadMutated(message(
-            300, 1, "new tail",
-        )));
-        assert_eq!(partial.thread_next_reply_offset, 256);
-
-        partial.thread_generation = 8;
-        partial.thread_loading = true;
-        let _ = partial.__update(__DucktapeMessage::ThreadPageLoaded(
-            backend::ThreadPageData {
-                generation: 8,
-                messages: vec![message(257, 1, "unseen"), message(300, 1, "new tail")],
-                next_reply_offset: 258,
-                has_more: false,
-            },
-        ));
-        assert_eq!(partial.thread_next_reply_offset, 258);
-        assert_eq!(partial.thread_messages.len(), 3);
-        assert_eq!(partial.thread_messages[1].body, "unseen");
-        assert_eq!(partial.thread_messages[2].body, "new tail");
     }
 
     #[test]
@@ -1632,6 +1604,11 @@ mod tests {
         app.thread_target_seq = 9;
         app.live_thread_generation = 3;
         app.reply_draft = "typing".into();
+        app.thread_messages = backend::optimistic_message(
+            backend::optimistic_message(Vec::new(), "pending first".into(), "pending-first".into()),
+            "pending second".into(),
+            "pending-second".into(),
+        );
 
         let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
             backend::LiveThreadData {
@@ -1661,6 +1638,16 @@ mod tests {
         assert_eq!(app.thread_target_seq, 0);
         assert_eq!(app.thread_next_reply_offset, 5);
         assert!(app.thread_has_more);
+        assert!(
+            app.thread_messages
+                .iter()
+                .any(|message| { message.pending && message.id == "pending-first" })
+        );
+        assert!(
+            app.thread_messages
+                .iter()
+                .any(|message| { message.pending && message.id == "pending-second" })
+        );
 
         let _ = app.__update(__DucktapeMessage::CloseThread);
         let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
@@ -1843,49 +1830,129 @@ mod tests {
     }
 
     #[test]
-    fn failed_thread_reply_rolls_back_and_restores_the_draft() {
+    fn optimistic_thread_replies_settle_independently_out_of_order() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
         app.active_channel = "general".into();
         app.active_thread_seq = 1;
-        app.reply_draft = "retry reply".into();
+        app.reply_draft = "first".into();
 
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
-        assert_eq!(app.mutation_phase, "reply");
+        let first_id = app.thread_messages[0].id.clone();
+        assert_eq!(app.mutation_phase, "idle");
         assert!(app.reply_draft.is_empty());
         assert!(app.thread_messages[0].pending);
 
-        let _ = app.__update(__DucktapeMessage::ReplyMutationFailed(backend::AppError {
-            message: "rejected".into(),
-            committed: false,
-        }));
-        assert_eq!(app.reply_draft, "retry reply");
-        assert!(app.thread_messages.is_empty());
-        assert_eq!(app.mutation_phase, "recovering");
-        assert!(app.thread_loading);
+        app.reply_draft = "second".into();
+        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let second_id = app.thread_messages[1].id.clone();
+        assert_ne!(first_id, second_id);
+        assert_eq!(app.thread_messages.len(), 2);
+        assert!(app.thread_messages.iter().all(|message| message.pending));
+
+        let mut second = message(3, "second", false);
+        second.id = second_id.clone();
+        second.thread_seq = 1;
+        let _ = app.__update(__DucktapeMessage::ThreadReplySent(second));
+        assert_eq!(app.thread_messages.len(), 2);
+        assert!(
+            app.thread_messages
+                .iter()
+                .any(|message| message.id == first_id && message.pending)
+        );
+        assert!(
+            app.thread_messages
+                .iter()
+                .any(|message| message.body == "second" && !message.pending)
+        );
+
+        let mut first = message(2, "first", false);
+        first.id = first_id.clone();
+        first.thread_seq = 1;
+        let _ = app.__update(__DucktapeMessage::ThreadReplySent(first));
+        assert_eq!(app.thread_messages.len(), 2);
+        assert!(app.thread_messages.iter().all(|message| !message.pending));
+        assert_eq!(app.thread_messages[0].body, "first");
+        assert_eq!(app.thread_messages[1].body, "second");
     }
 
     #[test]
-    fn committed_thread_reply_survives_a_failed_recovery_read() {
+    fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
         let (mut app, _) = Ducktape::__boot();
-        app.thread_generation = 4;
-        app.thread_loading = true;
-        app.mutation_phase = "recovering".into();
-        app.thread_messages = backend::optimistic_message(
-            Vec::new(),
-            "committed reply".into(),
-            "pending-committed".into(),
-        );
+        app.connected = true;
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_thread_seq = 1;
+        app.reply_draft = "first".into();
 
-        let _ = app.__update(__DucktapeMessage::ThreadFailed(backend::HydrationError {
-            generation: 4,
-            message: "read failed after commit".into(),
-        }));
+        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let first_id = app.thread_messages[0].id.clone();
+        app.reply_draft = "second".into();
+        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let second_id = app.thread_messages[1].id.clone();
+        app.reply_draft = "newer draft".into();
 
+        let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
+            backend::OptimisticMutationError {
+                message: "rejected".into(),
+                committed: false,
+                operation_id: first_id,
+                scope_id: "general".into(),
+                body: "first".into(),
+            },
+        ));
+        assert_eq!(app.reply_draft, "newer draft");
+        assert_eq!(app.failed_reply_draft, "first");
+        assert_eq!(app.thread_messages.len(), 1);
+        assert_eq!(app.thread_messages[0].id, second_id);
+        assert!(app.thread_messages[0].pending);
+        assert_eq!(app.mutation_phase, "idle");
         assert!(!app.thread_loading);
+
+        let _ = app.__update(__DucktapeMessage::RestoreFailedReply);
+        assert_eq!(app.reply_draft, "newer draft");
+        assert_eq!(app.failed_reply_draft, "first");
+        app.reply_draft.clear();
+        let _ = app.__update(__DucktapeMessage::RestoreFailedReply);
+        assert_eq!(app.reply_draft, "first");
+        assert!(app.failed_reply_draft.is_empty());
+    }
+
+    #[test]
+    fn committed_thread_reply_refreshes_without_blocking_the_composer() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.connected_rpc = "http://node".into();
+        app.active_channel = "general".into();
+        app.active_thread_seq = 1;
+        app.reply_draft = "committed".into();
+
+        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        let operation_id = app.thread_messages[0].id.clone();
+        let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
+            backend::OptimisticMutationError {
+                message: "read failed after commit".into(),
+                committed: true,
+                operation_id,
+                scope_id: "general".into(),
+                body: "committed".into(),
+            },
+        ));
         assert_eq!(app.thread_messages.len(), 1);
         assert!(app.thread_messages[0].pending);
+        assert!(app.reply_draft.is_empty());
+        assert!(app.failed_reply_draft.is_empty());
+        assert_eq!(app.mutation_phase, "idle");
+        assert!(!app.thread_loading);
+        assert_eq!(app.sync_phase, "refreshing");
+
+        app.reply_draft = "still available".into();
+        let _ = app.__update(__DucktapeMessage::SendReplySubmit);
+        assert_eq!(app.thread_messages.len(), 2);
+        assert!(app.thread_messages.iter().all(|message| message.pending));
+        assert!(app.reply_draft.is_empty());
     }
 
     #[test]

@@ -346,14 +346,25 @@ view
                         active bg=transparent text=muted r=7.0
                         hovered bg=white/9 text=fg
                         pressed bg=selection
+                if !empty(failed_reply_draft)
+                  row width=fill spacing=6.0 align=center
+                    text "Unsent reply" width=fill size=11.0 @text-muted
+                    button "Restore" disabled=(!empty(reply_draft)) height=26.0 padding=5.0 -> restore_failed_reply
+                      active bg=white/9 text=fg border=white/11 border-w=1.0 r=7.0
+                      hovered bg=white/14
+                      pressed bg=white/18
+                    button "×" label="Dismiss unsent reply" width=26.0 height=26.0 padding=4.0 -> dismiss_failed_reply
+                      active bg=transparent text=muted r=7.0
+                      hovered bg=white/10 text=fg
+                      pressed bg=white/15
                 container width=fill padding=5.0 bg=white/7 border=white/12 border-w=1.0 r=7.0
                   row width=fill spacing=5.0 align=center
-                    input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(thread_loading || mutation_phase != "idle" || active_channel_archived) submit=send_reply_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                    input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(thread_loading || active_channel_archived) submit=send_reply_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
                       active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=8.0
                       hovered bg=white/4 border=white/8 border-w=1.0
                       focused bg=white/8 border=white/13 border-w=1.0
                       disabled value=muted
-                    button "Send" label="Send reply" disabled=(thread_loading || mutation_phase != "idle" || active_channel_archived || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
+                    button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
                       active bg=fg/88 text=bg border=white/5 border-w=1.0 r=9.0
                       hovered bg=fg/78
                       pressed bg=fg
