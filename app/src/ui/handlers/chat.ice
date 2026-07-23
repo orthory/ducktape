@@ -271,6 +271,10 @@ on chat_mutated(next)
   thread_next_reply_offset = refreshed_channel_value(active_channel, next.active_channel, thread_next_reply_offset)
   thread_target_seq = message_seq_after_failure(thread_target_seq, "message-edit", active_thread_seq <= 0)
   thread_next_reply_offset = message_seq_after_failure(thread_next_reply_offset, "message-edit", active_thread_seq <= 0)
+  thread_selected_seq = message_seq_after_failure(thread_selected_seq, mutation_phase, true)
+  thread_selected_rev = message_seq_after_failure(thread_selected_rev, mutation_phase, true)
+  thread_message_action = message_action_after_failure(thread_message_action, mutation_phase, true)
+  thread_edit_draft = message_text_after_failure(thread_edit_draft, mutation_phase, true)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
   thread_has_more = thread_has_more && active_channel == next.active_channel && active_thread_seq > 0
   reply_draft = retain_for_endpoint(reply_draft, active_channel, next.active_channel)
@@ -309,6 +313,85 @@ on chat_pointer_moved(_, y)
 
 on chat_resized(_, height)
   chat_height = height
+
+on thread_message_entered(seq)
+  thread_hovered_seq = seq
+
+on thread_message_exited(seq)
+  return if thread_hovered_seq != seq
+  thread_hovered_seq = 0
+
+on thread_pointer_moved(_, y)
+  thread_pointer_y = y
+
+on thread_resized(_, height)
+  thread_height = height
+
+on open_thread_message_actions(seq, body, rev)
+  return if seq <= 0
+  thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
+  thread_selected_seq = seq
+  thread_selected_rev = rev
+  thread_message_action = "more"
+  thread_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/thread-action-focus
+    task widget focus-next
+
+on open_thread_message_reactions(seq, body, rev)
+  return if seq <= 0
+  thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
+  thread_selected_seq = seq
+  thread_selected_rev = rev
+  thread_message_action = "reactions"
+  thread_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/thread-reaction-focus
+    task widget focus-next
+
+on arm_thread_message_delete(seq, body, rev)
+  return if seq <= 0
+  thread_selected_seq = seq
+  thread_selected_rev = rev
+  thread_message_action = "delete"
+  thread_edit_draft = body
+  sequential
+    task widget focus #workspace-tabs/thread-delete-focus
+    task widget focus-next
+
+on begin_thread_message_edit(seq, body, rev)
+  return if seq <= 0
+  thread_selected_seq = seq
+  thread_selected_rev = rev
+  thread_message_action = "editing"
+  thread_edit_draft = body
+  task widget focus #workspace-tabs/thread-edit
+
+on clear_thread_message_selection
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
+
+on edit_thread_message_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || empty(trim(thread_edit_draft))
+  live_thread_generation = live_thread_generation + 1
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "message-edit"
+  error = ""
+  run edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft)) -> chat_mutated _ | mutation_failed _
+
+on delete_thread_message_submit
+  return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != "delete"
+  live_thread_generation = live_thread_generation + 1
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "message-delete"
+  error = ""
+  run delete_message(connected_rpc, password, active_channel, thread_selected_seq) -> chat_mutated _ | mutation_failed _
 
 on open_message_actions(seq, body, rev)
   return if seq <= 0
@@ -368,6 +451,11 @@ on open_thread_for(seq)
   selected_message_rev = 0
   message_action = "toolbar"
   message_edit_draft = ""
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_hovered_seq = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   thread_generation = thread_generation + 1
   live_thread_generation = live_thread_generation + 1
   thread_loading = true
@@ -474,6 +562,11 @@ on close_thread
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_loading = false
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_hovered_seq = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
   reply_draft = ""
   pending_reply = ""
 

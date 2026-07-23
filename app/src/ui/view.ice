@@ -376,53 +376,163 @@ view
             container width=1.0 height=fill bg=white/8
               text ""
             container width=300.0 height=fill padding=12.0 bg=surface
-              col width=fill height=fill spacing=8.0
-                row width=fill height=28.0 spacing=6.0 align=center
-                  if thread_target_seq <= 0
-                    text "Thread" width=fill size=13.0 font=medium @text-fg
-                  if thread_target_seq > 0
-                    text "Thread result" width=fill size=13.0 font=medium @text-fg
-                  text len(thread_messages) size=11.0 @text-muted
-                  button label="Close thread" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> close_thread
-                    container width=fill height=fill align-x=center align-y=center
-                      text "×" size=14.0
-                    active bg=transparent text=muted r=7.0
-                    hovered bg=white/11 text=fg
-                    pressed bg=selection
-                container width=fill height=1.0 bg=separator
-                  text ""
-                scroll direction=vertical width=fill height=fill
-                  col width=fill spacing=1.0
-                    for thread_message in thread_messages
-                      ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq)
-                    if thread_has_more && thread_next_reply_offset >= 0
-                      button "Load more replies" disabled=(thread_loading || mutation_phase != "idle") width=fill height=28.0 padding=5.0 -> load_more_thread
-                        active bg=transparent text=muted r=7.0
-                        hovered bg=white/9 text=fg
-                        pressed bg=selection
-                if !empty(failed_reply_draft)
-                  row width=fill spacing=6.0 align=center
-                    text "Unsent reply" width=fill size=11.0 @text-muted
-                    button "Restore" disabled=(!empty(reply_draft)) height=26.0 padding=5.0 -> restore_failed_reply
-                      active bg=white/9 text=fg border=white/11 border-w=1.0 r=7.0
-                      hovered bg=white/14
-                      pressed bg=white/18
-                    button "×" label="Dismiss unsent reply" width=26.0 height=26.0 padding=4.0 -> dismiss_failed_reply
-                      active bg=transparent text=muted r=7.0
-                      hovered bg=white/10 text=fg
-                      pressed bg=white/15
-                container width=fill padding=5.0 bg=transparent border=white/12 border-w=1.0 r=7.0
-                  row width=fill spacing=5.0 align=center
-                    input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(thread_loading || active_channel_archived) submit=send_reply_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
-                      active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=8.0
-                      hovered bg=white/4 border=white/8 border-w=1.0
-                      focused bg=white/8 border=white/13 border-w=1.0
-                      disabled value=muted
-                    button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
-                      active bg=fg/88 text=bg border=white/5 border-w=1.0 r=9.0
-                      hovered bg=fg/78
-                      pressed bg=fg
-                      disabled bg=fg/24 text=bg/12
+              stack width=fill height=fill
+                mouse move=thread_pointer_moved
+                  sensor show=thread_resized resize=thread_resized
+                    col width=fill height=fill spacing=8.0
+                      row width=fill height=28.0 spacing=6.0 align=center
+                        if thread_target_seq <= 0
+                          text "Thread" width=fill size=13.0 font=medium @text-fg
+                        if thread_target_seq > 0
+                          text "Thread result" width=fill size=13.0 font=medium @text-fg
+                        text len(thread_messages) size=11.0 @text-muted
+                        button label="Close thread" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> close_thread
+                          container width=fill height=fill align-x=center align-y=center
+                            text "×" size=14.0
+                          active bg=transparent text=muted r=7.0
+                          hovered bg=white/11 text=fg
+                          pressed bg=selection
+                      container width=fill height=1.0 bg=separator
+                        text ""
+                      scroll direction=vertical width=fill height=fill
+                        col width=fill spacing=1.0
+                          for thread_message in thread_messages
+                            ThreadMessageCard message=thread_message selected=(thread_message.seq == thread_target_seq) hovered=(thread_message.seq == thread_hovered_seq) disabled=loading
+                          if thread_has_more && thread_next_reply_offset >= 0
+                            button "Load more replies" disabled=(thread_loading || mutation_phase != "idle") width=fill height=28.0 padding=5.0 -> load_more_thread
+                              active bg=transparent text=muted r=7.0
+                              hovered bg=white/9 text=fg
+                              pressed bg=selection
+                      if !empty(failed_reply_draft)
+                        row width=fill spacing=6.0 align=center
+                          text "Unsent reply" width=fill size=11.0 @text-muted
+                          button "Restore" disabled=(!empty(reply_draft)) height=26.0 padding=5.0 -> restore_failed_reply
+                            active bg=white/9 text=fg border=white/11 border-w=1.0 r=7.0
+                            hovered bg=white/14
+                            pressed bg=white/18
+                          button "×" label="Dismiss unsent reply" width=26.0 height=26.0 padding=4.0 -> dismiss_failed_reply
+                            active bg=transparent text=muted r=7.0
+                            hovered bg=white/10 text=fg
+                            pressed bg=white/15
+                      container width=fill padding=5.0 bg=transparent border=white/12 border-w=1.0 r=7.0
+                        row width=fill spacing=5.0 align=center
+                          input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(thread_loading || active_channel_archived) submit=send_reply_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                            active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=8.0
+                            hovered bg=white/4 border=white/8 border-w=1.0
+                            focused bg=white/8 border=white/13 border-w=1.0
+                            disabled value=muted
+                          button "Send" label="Send reply" disabled=(thread_loading || active_channel_archived || empty(trim(reply_draft))) height=28.0 padding=6.0 -> send_reply_submit
+                            active bg=fg/88 text=bg border=white/5 border-w=1.0 r=9.0
+                            hovered bg=fg/78
+                            pressed bg=fg
+                            disabled bg=fg/24 text=bg/12
+                overlay when=(thread_selected_seq > 0 && thread_message_action != "toolbar") dismiss=clear_thread_message_selection backdrop=transparent padding=8.0 align-x=end align-y=start
+                  content
+                    space width=fill height=fill
+                  layer
+                    float x=0.0 y=thread_menu_y
+                      col
+                        if thread_message_action == "more"
+                          stack
+                            input "" #thread-action-focus label="Thread action focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
+                              active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
+                              focused bg=transparent border=transparent value=transparent border-w=0.0
+                            container width=190.0 padding=4.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                              col width=fill spacing=1.0
+                                button "React" label="Manage reactions" disabled=active_channel_archived width=fill height=28.0 padding=6.0 -> open_thread_message_reactions(thread_selected_seq, thread_edit_draft, thread_selected_rev)
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=white/10 text=fg
+                                  pressed bg=white/15
+                                button "Edit" width=fill height=28.0 padding=6.0 -> begin_thread_message_edit(thread_selected_seq, thread_edit_draft, thread_selected_rev)
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=white/10 text=fg
+                                  pressed bg=white/15
+                                button "Delete" width=fill height=28.0 padding=6.0 -> arm_thread_message_delete(thread_selected_seq, thread_edit_draft, thread_selected_rev)
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=white/10 text=fg
+                                  pressed bg=white/15
+                                button "Close" label="Close message actions" width=fill height=28.0 padding=6.0 -> clear_thread_message_selection
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=white/10 text=fg
+                                  pressed bg=white/15
+                        if thread_message_action == "reactions"
+                          stack
+                            input "" #thread-reaction-focus label="Thread reaction focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
+                              active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
+                              focused bg=transparent border=transparent value=transparent border-w=0.0
+                            container padding=3.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                              row spacing=2.0 align=center
+                                button "+ 👍" label="Add thumbs up reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "👍")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ ♥" label="Add heart reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "❤️")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 😄" label="Add smile reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "😄")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 🎉" label="Add celebration reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "🎉")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 👀" label="Add eyes reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "👀")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 🙌" label="Add raised hands reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_at(thread_selected_seq, "🙌")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                for thread_message in thread_messages
+                                  if thread_message.seq == thread_selected_seq
+                                    for reaction in thread_message.reactions
+                                      if reaction.reacted_by_me
+                                        button label="Remove my reaction" description=reaction.emoji disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> remove_reaction_at(thread_selected_seq, reaction.emoji)
+                                          text reaction.emoji size=11.0 @text-fg
+                                          active bg=white/7 text=fg r=6.0
+                                          hovered bg=white/12
+                                          pressed bg=white/17
+                                button "×" label="Close reactions" disabled=(mutation_phase != "idle") width=26.0 height=26.0 padding=4.0 -> clear_thread_message_selection
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=white/10 text=fg
+                                  pressed bg=white/15
+                        if thread_message_action == "editing"
+                          container width=fill max-width=520.0 padding=3.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                            row width=fill spacing=4.0 align=center
+                              input "" #thread-edit label="Edit message" <-> thread_edit_draft hint="Edit message" disabled=(mutation_phase != "idle") submit=edit_thread_message_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                                hovered bg=white/4 border=white/8
+                                focused bg=white/7 border=white/12
+                                disabled value=muted
+                              button "Save" label="Save message changes" disabled=(mutation_phase != "idle" || empty(trim(thread_edit_draft))) height=28.0 padding=6.0 -> edit_thread_message_submit
+                                active bg=white/11 text=fg border=white/13 border-w=1.0 r=7.0
+                                hovered bg=white/16
+                                pressed bg=white/20
+                              button label="Cancel message edit" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> clear_thread_message_selection
+                                container width=fill height=fill align-x=center align-y=center
+                                  text "×" size=14.0
+                                active bg=transparent text=muted r=7.0
+                                hovered bg=white/10 text=fg
+                                pressed bg=white/15
+                        if thread_message_action == "delete"
+                          stack
+                            input "" #thread-delete-focus label="Thread delete focus" <-> message_action_focus width=1.0 padding=0.0 text-size=1.0 line-height=1.0
+                              active bg=transparent border=transparent value=transparent placeholder=transparent border-w=0.0 r=0.0
+                              focused bg=transparent border=transparent value=transparent border-w=0.0
+                            container padding=3.0 bg=popover border=white/16 border-w=1.0 r=8.0 shadow=black/18 shadow-y=2.0 shadow-blur=8.0
+                              row spacing=5.0 align=center
+                                text "Delete this message?" size=11.0 @text-muted
+                                button "Delete" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> delete_thread_message_submit
+                                  active bg=white/12 text=fg r=6.0
+                                  hovered bg=white/17
+                                  pressed bg=white/22
+                                button "Cancel" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> clear_thread_message_selection
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=white/10 text=fg
+                                  pressed bg=white/15
     pages:
       mouse move=pages_pointer_moved
         stack width=fill height=fill clip=true

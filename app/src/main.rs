@@ -901,7 +901,7 @@ mod tests {
         ] {
             assert!(chat.contains(&format!("input \"\" {focus}")));
         }
-        assert_eq!(handlers.matches("task widget focus-next").count(), 4);
+        assert_eq!(handlers.matches("task widget focus-next").count(), 7);
         assert!(!include_str!("ui/backend.ice").contains("task focus_next()"));
         let activate = handlers
             .split_once("on begin_message_edit(seq, body, rev)\n")
@@ -911,6 +911,123 @@ mod tests {
             .unwrap()
             .0;
         assert!(activate.contains("task widget focus #workspace-tabs/message-edit"));
+    }
+
+    #[test]
+    fn thread_messages_mirror_the_main_action_system() {
+        let components = include_str!("ui/components/chat.ice");
+        let card = components
+            .split_once("component ThreadMessageCard")
+            .unwrap()
+            .1;
+        assert!(card.contains(
+            "mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)"
+        ));
+        assert!(card.contains(
+            "-> open_thread_message_reactions(message.seq, message.body, message.rev)"
+        ));
+        assert!(card.contains(
+            "-> open_thread_message_actions(message.seq, message.body, message.rev)"
+        ));
+        // No open-thread action from inside a thread you are already reading.
+        assert!(!card.contains("open_thread_for"));
+
+        let view = include_str!("ui/view.ice");
+        let thread = view
+            .split_once("if active_thread_seq > 0 && !channel_settings_open")
+            .unwrap()
+            .1
+            .split_once("    pages:")
+            .unwrap()
+            .0;
+        // A SECOND overlay, keyed on thread-scoped state, independent of the main one.
+        assert!(thread.contains(
+            "overlay when=(thread_selected_seq > 0 && thread_message_action != \"toolbar\")"
+        ));
+        assert!(thread.contains("dismiss=clear_thread_message_selection backdrop=transparent"));
+        assert!(thread.contains("float x=0.0 y=thread_menu_y"));
+        assert!(thread.contains("mouse move=thread_pointer_moved"));
+        assert!(thread.contains("sensor show=thread_resized resize=thread_resized"));
+        // The picker reuses the seq-targeted reaction mutations against the thread selection.
+        assert!(thread.contains("-> add_reaction_at(thread_selected_seq, \"👍\")"));
+        assert!(thread.contains("-> remove_reaction_at(thread_selected_seq, reaction.emoji)"));
+        // More-menu omits Open thread (already inside the thread).
+        let more = thread
+            .split_once("thread_message_action == \"more\"")
+            .unwrap()
+            .1
+            .split_once("thread_message_action == \"reactions\"")
+            .unwrap()
+            .0;
+        for label in ["\"React\"", "\"Edit\"", "\"Delete\"", "\"Close\""] {
+            assert!(more.contains(&format!("button {label}")), "{label}");
+        }
+        assert!(!more.contains("Open thread"));
+
+        let handlers = include_str!("ui/handlers/chat.ice");
+        for name in [
+            "on open_thread_message_actions(seq, body, rev)",
+            "on open_thread_message_reactions(seq, body, rev)",
+            "on begin_thread_message_edit(seq, body, rev)",
+            "on arm_thread_message_delete(seq, body, rev)",
+            "on clear_thread_message_selection",
+            "on edit_thread_message_submit",
+            "on delete_thread_message_submit",
+        ] {
+            assert!(handlers.contains(name), "{name}");
+        }
+        // Thread edit/delete target the thread selection, never the main one.
+        let edit = handlers
+            .split_once("on edit_thread_message_submit\n")
+            .unwrap()
+            .1
+            .split_once("\non ")
+            .unwrap()
+            .0;
+        assert!(edit.contains(
+            "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft))"
+        ));
+        let delete = handlers
+            .split_once("on delete_thread_message_submit\n")
+            .unwrap()
+            .1
+            .split_once("\non ")
+            .unwrap()
+            .0;
+        assert!(delete.contains(
+            "delete_message(connected_rpc, password, active_channel, thread_selected_seq)"
+        ));
+    }
+
+    #[test]
+    fn thread_action_state_is_independent_of_the_main_message_menu() {
+        let (mut app, _) = Ducktape::__boot();
+        app.mutation_phase = "idle".into();
+        app.active_channel = "general".into();
+        app.active_thread_seq = 1;
+
+        // Opening a thread action must not touch the main message menu.
+        app.thread_pointer_y = 400.0;
+        app.thread_height = 500.0;
+        let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(2, "reply".into(), 3));
+        assert_eq!(app.thread_selected_seq, 2);
+        assert_eq!(app.thread_message_action, "more");
+        assert_eq!(app.thread_menu_y, 210.0);
+        assert_eq!(app.selected_message_seq, 0);
+        assert_eq!(app.message_action, "toolbar");
+
+        // And a main message action must not touch the thread menu.
+        let _ = app.__update(__DucktapeMessage::OpenMessageActions(5, "root".into(), 1));
+        assert_eq!(app.selected_message_seq, 5);
+        assert_eq!(app.message_action, "more");
+        assert_eq!(app.thread_selected_seq, 2);
+        assert_eq!(app.thread_message_action, "more");
+
+        let _ = app.__update(__DucktapeMessage::ClearThreadMessageSelection);
+        assert_eq!(app.thread_selected_seq, 0);
+        assert_eq!(app.thread_message_action, "toolbar");
+        assert_eq!(app.selected_message_seq, 5);
+        assert_eq!(app.message_action, "more");
     }
 
     #[test]

@@ -191,14 +191,39 @@ component ThreadMessageBody(message:ChatMessage)
                 hovered bg=white/12 text=fg border=white/18
                 pressed bg=white/16 text=fg
 
-component ThreadMessageCard(message:ChatMessage, selected:bool)
-  stack width=fill
-    if selected
-      container width=fill padding=8.0 bg=primary/10 border=primary/22 border-w=1.0 r=9.0
-        ThreadMessageBody message=message
-    if !selected
-      container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
-        ThreadMessageBody message=message
+component ThreadMessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
+  mouse enter=thread_message_entered(message.seq) exit=thread_message_exited(message.seq)
+    stack width=fill
+      if message.deleted
+        container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
+          ThreadMessageBody message=message
+      if !message.deleted && selected
+        container width=fill padding=8.0 bg=primary/10 border=primary/22 border-w=1.0 r=9.0
+          ThreadMessageBody message=message
+      if !message.deleted && !selected && hovered
+        container width=fill padding=8.0 bg=white/4 border=white/7 border-w=1.0 r=9.0
+          ThreadMessageBody message=message
+      if !message.deleted && !selected && !hovered
+        container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=9.0
+          ThreadMessageBody message=message
+      if !message.deleted && !message.pending && !hovered
+        container width=fill align-x=end align-y=start padding-top=3.0 padding-right=9.0
+          button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_message_actions(message.seq, message.body, message.rev)
+            active bg=transparent text=muted r=7.0
+            hovered bg=white/9 text=fg
+            pressed bg=white/13 text=fg
+      if !message.deleted && !message.pending && hovered
+        container width=fill align-x=end align-y=start padding-top=3.0 padding-right=9.0
+          container padding=2.0 bg=popover border=white/14 border-w=1.0 r=9.0 shadow=black/24 shadow-y=2.0 shadow-blur=9.0
+            row spacing=1.0 align=center
+              button "♡" label="Manage reactions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_message_reactions(message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=white/10 text=fg
+                pressed bg=white/14 text=fg
+              button "…" label="More message actions" disabled=disabled width=26.0 height=26.0 padding=4.0 -> open_thread_message_actions(message.seq, message.body, message.rev)
+                active bg=transparent text=muted r=6.0
+                hovered bg=white/10 text=fg
+                pressed bg=white/14 text=fg
 
 component ChatSearchResult(hit:ChatSearchHit)
   button label=hit.text width=fill padding=8.0 -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)

@@ -43,6 +43,14 @@ state
   thread_loading = false
   thread_generation:i64 = 0
   live_thread_generation:i64 = 0
+  thread_selected_seq:i64 = 0
+  thread_selected_rev:i64 = 0
+  thread_hovered_seq:i64 = 0
+  thread_message_action = "toolbar"
+  thread_edit_draft = ""
+  thread_pointer_y = 0.0
+  thread_height = 720.0
+  thread_menu_y = 0.0
   history_loading = false
   history_generation:i64 = 0
   reply_draft = ""
