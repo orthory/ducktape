@@ -7,8 +7,7 @@
 //! conversation, and the portable workspace plan ([`PortableInputs`]) — whose
 //! skill list now states, per skill, whether it loads `always`. the host-side
 //! worker routes on the `ducktape_run` marker and assembles the final model
-//! input. every run composes the ONE portable envelope shape; there are no
-//! legacy flat-string or older envelope tolerances.
+//! input. every run composes the ONE portable envelope shape.
 //!
 //! the agent's PERSONA is no longer in here. it was a `prompt_hash` the host
 //! resolved from the blob store; it is now an `always` skill, whose body the

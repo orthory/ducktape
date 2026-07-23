@@ -225,7 +225,7 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     // (the drain's DrainedFrame.reason lane): proof the op reached execute and
     // was deterministically rejected there. governance gates in two steps —
     // "holds no validator-set standing" when the submitter has no member node
-    // bound at all (the v2-joined resident's shape), "not a current
+    // bound at all, "not a current
     // validator-set member" when it has a node outside the set — and either
     // one is the deterministic no-authority reject this test pins.
     let reason = gov["error"].as_str().unwrap_or_default();

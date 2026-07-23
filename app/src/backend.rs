@@ -82,6 +82,13 @@ pub struct ChatData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatSendResult {
+    pub data: ChatData,
+    pub operation_id: String,
+    pub channel_id: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct ThreadData {
     pub root_seq: i64,
     pub target_seq: i64,
@@ -170,6 +177,13 @@ pub struct PagesData {
     pub selected_block_text: String,
     pub selected_block_checked: bool,
     pub page_title_selected: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockInsertResult {
+    pub data: PagesData,
+    pub operation_id: String,
+    pub page_id: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -273,6 +287,15 @@ pub struct AppError {
     pub committed: bool,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct OptimisticMutationError {
+    pub message: String,
+    pub committed: bool,
+    pub operation_id: String,
+    pub scope_id: String,
+    pub body: String,
+}
+
 impl From<String> for AppError {
     fn from(message: String) -> Self {
         Self {
@@ -295,9 +318,17 @@ pub struct LiveUpdate {
     pub height: i64,
 }
 
-pub fn optimistic_message(mut messages: Vec<ChatMessage>, body: String) -> Vec<ChatMessage> {
+pub fn fresh_operation_id(prefix: String) -> String {
+    fresh_id(&prefix)
+}
+
+pub fn optimistic_message(
+    mut messages: Vec<ChatMessage>,
+    body: String,
+    message_id: String,
+) -> Vec<ChatMessage> {
     messages.push(ChatMessage {
-        id: "pending".into(),
+        id: message_id,
         seq: -1,
         author: "You".into(),
         meta: "Sending…".into(),
@@ -310,6 +341,71 @@ pub fn optimistic_message(mut messages: Vec<ChatMessage>, body: String) -> Vec<C
         thread_seq: 0,
         reactions: Vec::new(),
     });
+    messages
+}
+
+pub fn merge_pending_messages(
+    mut canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+    settled_id: String,
+) -> Vec<ChatMessage> {
+    if current_channel != next_channel {
+        return canonical;
+    }
+    let mut ids = canonical
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<BTreeSet<_>>();
+    canonical.extend(current.into_iter().filter(|message| {
+        message.pending && message.id != settled_id && ids.insert(message.id.clone())
+    }));
+    canonical
+}
+
+pub fn merge_message_send_result(
+    canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+    settled_id: String,
+) -> Vec<ChatMessage> {
+    if current_channel != next_channel {
+        return canonical;
+    }
+    let canonical_ids = canonical
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut committed = current
+        .iter()
+        .filter(|message| !message.pending && message.seq > 0)
+        .map(|message| (message.seq, message.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for message in canonical {
+        let replace = committed
+            .get(&message.seq)
+            .is_none_or(|current| message.rev >= current.rev);
+        if replace {
+            committed.insert(message.seq, message);
+        }
+    }
+    let mut merged = committed.into_values().collect::<Vec<_>>();
+    merged.extend(current.into_iter().filter(|message| {
+        message.pending && message.id != settled_id && !canonical_ids.contains(&message.id)
+    }));
+    merged
+}
+
+pub fn rollback_pending_message(
+    mut messages: Vec<ChatMessage>,
+    pending_id: String,
+    committed: bool,
+) -> Vec<ChatMessage> {
+    if !committed {
+        messages.retain(|message| !message.pending || message.id != pending_id);
+    }
     messages
 }
 
@@ -350,6 +446,7 @@ pub fn optimistic_block(
     after_id: String,
     kind: String,
     text: String,
+    id: String,
 ) -> Vec<PageBlock> {
     let selected_index = blocks.iter().position(|block| block.id == after_id);
     let (insert_at, parent, prefix) = match selected_index {
@@ -365,12 +462,6 @@ pub fn optimistic_block(
             (insert_at, selected.parent.clone(), selected.prefix.clone())
         }
         None => (blocks.len(), String::new(), String::new()),
-    };
-    let id = loop {
-        let id = fresh_id("pending-block");
-        if blocks.iter().all(|block| block.id != id) {
-            break id;
-        }
     };
     blocks.insert(
         insert_at,
@@ -388,6 +479,107 @@ pub fn optimistic_block(
         },
     );
     blocks
+}
+
+pub fn merge_pending_blocks(
+    canonical: Vec<PageBlock>,
+    current: Vec<PageBlock>,
+    current_page: String,
+    next_page: String,
+    settled_id: String,
+) -> Vec<PageBlock> {
+    if current_page != next_page {
+        return canonical;
+    }
+    let canonical_ids = canonical
+        .iter()
+        .map(|block| block.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut pending_by_anchor = BTreeMap::<String, Vec<PageBlock>>::new();
+    let mut anchor = String::new();
+    for block in current {
+        if canonical_ids.contains(&block.id) {
+            anchor = block.id;
+        } else if block.pending && block.id != settled_id {
+            pending_by_anchor
+                .entry(anchor.clone())
+                .or_default()
+                .push(block);
+        }
+    }
+    if pending_by_anchor.is_empty() {
+        return canonical;
+    }
+    let mut merged = pending_by_anchor.remove("").unwrap_or_default();
+    for block in canonical {
+        let id = block.id.clone();
+        merged.push(block);
+        merged.extend(pending_by_anchor.remove(&id).unwrap_or_default());
+    }
+    merged.extend(pending_by_anchor.into_values().flatten());
+    merged
+}
+
+pub fn merge_block_insert_result(
+    canonical: Vec<PageBlock>,
+    current: Vec<PageBlock>,
+    current_page: String,
+    next_page: String,
+    settled_id: String,
+) -> Vec<PageBlock> {
+    if current_page != next_page {
+        return canonical;
+    }
+    let canonical_ids = canonical
+        .iter()
+        .map(|block| block.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut extras_by_anchor = BTreeMap::<String, Vec<PageBlock>>::new();
+    let mut anchor = String::new();
+    for block in current {
+        if canonical_ids.contains(&block.id) {
+            anchor = block.id;
+        } else if block.id != settled_id {
+            extras_by_anchor
+                .entry(anchor.clone())
+                .or_default()
+                .push(block);
+        }
+    }
+    if extras_by_anchor.is_empty() {
+        return canonical;
+    }
+    let mut merged = extras_by_anchor.remove("").unwrap_or_default();
+    for block in canonical {
+        let id = block.id.clone();
+        merged.push(block);
+        merged.extend(extras_by_anchor.remove(&id).unwrap_or_default());
+    }
+    merged.extend(extras_by_anchor.into_values().flatten());
+    merged
+}
+
+pub fn rollback_pending_block(
+    mut blocks: Vec<PageBlock>,
+    pending_id: String,
+    committed: bool,
+) -> Vec<PageBlock> {
+    if !committed {
+        blocks.retain(|block| !block.pending || block.id != pending_id);
+    }
+    blocks
+}
+
+pub fn remember_failed_block(
+    mut drafts: Vec<String>,
+    current: String,
+    pending: String,
+    committed: bool,
+) -> Vec<String> {
+    if !committed && !current.is_empty() {
+        append_recovered_draft(&mut drafts, pending);
+    }
+    drafts
 }
 
 pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<PageBlock> {
@@ -1115,9 +1307,13 @@ pub async fn send_message(
     rpc: String,
     password: String,
     channel_id: String,
+    message_id: String,
     body: String,
-) -> Result<ChatData, AppError> {
-    async {
+) -> Result<ChatSendResult, OptimisticMutationError> {
+    let operation_id = message_id.clone();
+    let operation_scope = channel_id.clone();
+    let operation_body = body.clone();
+    let result = async {
         if channel_id.is_empty() {
             return Err("choose a channel first".to_string().into());
         }
@@ -1128,7 +1324,7 @@ pub async fn send_message(
             "chat",
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
-                message_id: fresh_id("message"),
+                message_id: required_id(message_id, "message")?,
                 blocks: vec![chat::Block::paragraph(body)],
                 thread: None,
                 as_agent: None,
@@ -1140,7 +1336,20 @@ pub async fn send_message(
             .await
             .map_err(committed_error)
     }
-    .await
+    .await;
+    result
+        .map(|data| ChatSendResult {
+            data,
+            operation_id: operation_id.clone(),
+            channel_id: operation_scope.clone(),
+        })
+        .map_err(|cause: AppError| OptimisticMutationError {
+            message: cause.message,
+            committed: cause.committed,
+            operation_id,
+            scope_id: operation_scope,
+            body: operation_body,
+        })
 }
 
 pub async fn load_thread(
@@ -1725,9 +1934,13 @@ pub async fn add_block(
     page_id: String,
     after_id: String,
     kind: String,
+    block_id: String,
     text: String,
-) -> Result<PagesData, AppError> {
-    async {
+) -> Result<BlockInsertResult, OptimisticMutationError> {
+    let operation_id = block_id.clone();
+    let operation_scope = page_id.clone();
+    let operation_body = text.clone();
+    let result = async {
         if page_id.is_empty() {
             return Err("choose a page first".to_string().into());
         }
@@ -1753,11 +1966,7 @@ pub async fn add_block(
                 parent,
                 after,
                 block: NewBlock {
-                    id: fresh_id(if kind == BlockKind::Page {
-                        "page"
-                    } else {
-                        "block"
-                    }),
+                    id: required_id(block_id, "block")?,
                     kind,
                     text,
                     marks: Vec::new(),
@@ -1770,7 +1979,20 @@ pub async fn add_block(
             .await
             .map_err(committed_error)
     }
-    .await
+    .await;
+    result
+        .map(|data| BlockInsertResult {
+            data,
+            operation_id: operation_id.clone(),
+            page_id: operation_scope.clone(),
+        })
+        .map_err(|cause: AppError| OptimisticMutationError {
+            message: cause.message,
+            committed: cause.committed,
+            operation_id,
+            scope_id: operation_scope,
+            body: operation_body,
+        })
 }
 
 pub async fn save_block(
@@ -2736,9 +2958,9 @@ async fn signed_write(
 
 async fn sign_frame(target: &str, payload: &[u8], mut password: String) -> Result<Vec<u8>, String> {
     let key = user_key_path()?;
-    let encrypted = key_is_encrypted(&key)?;
+    require_encrypted_key(&key)?;
     let payload_hex = hex_encode(payload);
-    let input = signing_input(encrypted, &password, &payload_hex);
+    let input = signing_input(&password, &payload_hex);
     password.zeroize();
     let input = Zeroizing::new(input?);
     let mut command = tokio::process::Command::new(ducktape_binary());
@@ -2788,7 +3010,7 @@ async fn sign_frame(target: &str, payload: &[u8], mut password: String) -> Resul
     hex_decode(frame_hex.trim())
 }
 
-fn signing_input(encrypted: bool, password: &str, payload_hex: &str) -> Result<Vec<u8>, String> {
+fn signing_input(password: &str, payload_hex: &str) -> Result<Vec<u8>, String> {
     let invalid_password = password.len() > 16 * 1024
         || password
             .as_bytes()
@@ -2797,14 +3019,12 @@ fn signing_input(encrypted: bool, password: &str, payload_hex: &str) -> Result<V
     if invalid_password {
         return Err("key password is too long or contains a line delimiter".into());
     }
-    if encrypted && password.is_empty() {
+    if password.is_empty() {
         return Err("the local user key is locked; enter its password".into());
     }
     let mut input = Vec::with_capacity(password.len() + payload_hex.len() + 2);
-    if encrypted {
-        input.extend_from_slice(password.as_bytes());
-        input.push(b'\n');
-    }
+    input.extend_from_slice(password.as_bytes());
+    input.push(b'\n');
     input.extend_from_slice(payload_hex.as_bytes());
     input.push(b'\n');
     Ok(input)
@@ -2838,9 +3058,9 @@ async fn read_local_user_key() -> Option<Vec<u8>> {
 
 fn parse_user_key_status(status: &str) -> Option<Vec<u8>> {
     let mut fields = status.split_whitespace();
-    let kind = fields.next()?;
-    if !matches!(kind, "plaintext" | "encrypted") {
-        return None;
+    match fields.next()? {
+        "encrypted" => {}
+        _ => return None,
     }
     let key = fields.next()?;
     if fields.next().is_some() {
@@ -2862,7 +3082,7 @@ fn user_key_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot locate local user.key; set DUCKTAPE_USER_KEY".to_string())
 }
 
-fn key_is_encrypted(path: &std::path::Path) -> Result<bool, String> {
+fn require_encrypted_key(path: &std::path::Path) -> Result<(), String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("cannot read local user key at {}: {error}", path.display()))?;
     if metadata.len() > MAX_KEY_FILE_BYTES {
@@ -2876,7 +3096,11 @@ fn key_is_encrypted(path: &std::path::Path) -> Result<bool, String> {
         .map_err(|error| format!("cannot read local user key at {}: {error}", path.display()))?;
     let encrypted = read == prefix.len() && prefix == ENCRYPTED_KEY_PREFIX.as_bytes();
     prefix.zeroize();
-    Ok(encrypted)
+    if encrypted {
+        Ok(())
+    } else {
+        Err("local user key must use the encrypted v1 format".into())
+    }
 }
 
 fn ducktape_binary() -> PathBuf {
@@ -3283,21 +3507,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signer_stdin_only_includes_a_password_for_encrypted_keys() {
-        assert_eq!(signing_input(false, "ignored", "00").unwrap(), b"00\n");
-        assert_eq!(
-            signing_input(true, "secret", "00").unwrap(),
-            b"secret\n00\n"
-        );
-        assert!(signing_input(true, "", "00").is_err());
-        assert!(signing_input(true, "bad\nsecret", "00").is_err());
+    fn signer_requires_the_encrypted_v1_key_format() {
+        assert_eq!(signing_input("secret", "00").unwrap(), b"secret\n00\n");
+        assert!(signing_input("", "00").is_err());
+        assert!(signing_input("bad\nsecret", "00").is_err());
 
         let directory = tempfile::tempdir().unwrap();
         let key = directory.path().join("user.key");
         std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}ciphertext")).unwrap();
-        assert!(key_is_encrypted(&key).unwrap());
+        require_encrypted_key(&key).unwrap();
         std::fs::write(&key, "plaintext-key").unwrap();
-        assert!(!key_is_encrypted(&key).unwrap());
+        assert!(require_encrypted_key(&key).is_err());
 
         let public_key = "ab".repeat(32);
         assert_eq!(
@@ -3305,7 +3525,7 @@ mod tests {
             Some(vec![0xab; 32])
         );
         assert!(parse_user_key_status("absent\n").is_none());
-        assert!(parse_user_key_status("plaintext not-hex\n").is_none());
+        assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
         let reactors = BTreeSet::from([AuthorRef::User(vec![0xab; 32]), AuthorRef::System]);
         assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
         assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
@@ -3317,6 +3537,145 @@ mod tests {
         let error = committed_error("read failed".into());
         assert!(error.committed);
         assert_eq!(error.message, "read failed");
+    }
+
+    #[test]
+    fn concurrent_optimistic_messages_settle_independently() {
+        let pending = optimistic_message(
+            optimistic_message(Vec::new(), "first".into(), "message-a".into()),
+            "second".into(),
+            "message-b".into(),
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-a", "message-b"]
+        );
+
+        let canonical = |id: &str, seq: i64, body: &str| ChatMessage {
+            id: id.into(),
+            seq,
+            author: "You".into(),
+            meta: format!("#{seq}"),
+            body: body.into(),
+            pending: false,
+            rev: 0,
+            edited: false,
+            deleted: false,
+            reply_count: 0,
+            thread_seq: 0,
+            reactions: Vec::new(),
+        };
+        let after_second = merge_message_send_result(
+            vec![canonical("message-b", 1, "second")],
+            pending,
+            "general".into(),
+            "general".into(),
+            "message-b".into(),
+        );
+        assert_eq!(after_second.len(), 2);
+        assert!(!after_second[0].pending);
+        assert_eq!(after_second[1].id, "message-a");
+        assert!(after_second[1].pending);
+
+        let settled = merge_message_send_result(
+            vec![
+                canonical("message-b", 1, "second"),
+                canonical("message-a", 2, "first"),
+            ],
+            after_second,
+            "general".into(),
+            "general".into(),
+            "message-a".into(),
+        );
+        assert_eq!(
+            settled
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-b", "message-a"]
+        );
+        assert!(settled.iter().all(|message| !message.pending));
+
+        let after_stale_response = merge_message_send_result(
+            vec![canonical("message-b", 1, "second")],
+            settled,
+            "general".into(),
+            "general".into(),
+            "message-b".into(),
+        );
+        assert_eq!(
+            after_stale_response
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["message-b", "message-a"]
+        );
+    }
+
+    #[test]
+    fn concurrent_blocks_preserve_pending_position_then_accept_canonical_order() {
+        let block = |id: &str, pending: bool| PageBlock {
+            key: page_block_key(id),
+            id: id.into(),
+            parent: "page".into(),
+            kind: "Text".into(),
+            text: id.into(),
+            pending,
+            checked: false,
+            prefix: String::new(),
+            child_count: 0,
+            mark_count: 0,
+        };
+        let current = vec![block("x", false), block("a", true), block("b", true)];
+        let after_b = merge_block_insert_result(
+            vec![block("x", false), block("b", false)],
+            current,
+            "page".into(),
+            "page".into(),
+            "b".into(),
+        );
+        assert_eq!(
+            after_b
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "a", "b"]
+        );
+        assert!(after_b[1].pending);
+
+        let settled = merge_block_insert_result(
+            vec![block("x", false), block("b", false), block("a", false)],
+            after_b,
+            "page".into(),
+            "page".into(),
+            "a".into(),
+        );
+        assert_eq!(
+            settled
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "b", "a"]
+        );
+        assert!(settled.iter().all(|block| !block.pending));
+
+        let after_stale_response = merge_block_insert_result(
+            vec![block("x", false), block("b", false)],
+            settled,
+            "page".into(),
+            "page".into(),
+            "b".into(),
+        );
+        assert_eq!(
+            after_stale_response
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "b", "a"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3769,10 +4128,15 @@ mod tests {
             after.len()
         );
 
-        let optimistic =
-            optimistic_block(after, "inserted".into(), "Text".into(), "pending".into());
+        let optimistic = optimistic_block(
+            after,
+            "inserted".into(),
+            "Text".into(),
+            "pending".into(),
+            "block-pending".into(),
+        );
         let pending = &optimistic[2];
-        assert!(pending.id.starts_with("pending-block-"));
+        assert_eq!(pending.id, "block-pending");
         assert_eq!(pending.key, page_block_key(&pending.id));
         assert_eq!(pending.parent, "page");
         assert_eq!(optimistic[1].id, "nested");

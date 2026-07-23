@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 // the consensus signature scheme is ed25519, the only wired variant — see
-// `consensus::ConsensusScheme`'s rekey/respawn contract for what a scheme
-// migration would take (an epoch teardown-respawn, not a constant flip).
+// `consensus::ConsensusScheme`'s rekey/respawn contract for a scheme change
+// (an epoch teardown-respawn, not a constant flip).
 /// the module-code fetch cap: the largest content-addressed code artifact (a
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a
@@ -136,85 +136,6 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// at every height, and keep doing so forever. Experiments therefore live
 /// unwired in `crates/labs` and appear in no genesis set.
 pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;
-
-/// Canonical committed-state revisions for the production module set.
-///
-/// Keep this alphabetically ordered and bump a module's revision in the same
-/// change that alters its canonical snapshot/root encoding. The registry
-/// parity test compares these declarations with the live module trait values.
-pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
-    ("agent", 1),
-    ("automations", 2),
-    ("capability", 2),
-    // 1 (UNCHANGED at the wasm cutover): chat/pages are STORE-BACKED ports —
-    // the wasm module wraps the SAME host-constructed qmdb store the native
-    // module drove (`WasmModule::with_store`), so root() is the same merkle
-    // root over the same committed op log, byte-for-byte. only the executor
-    // moved into wasm; the canonical state encoding never changed shape, so
-    // no schema fence and no re-genesis (pinned by wasm_{pages,chat}_parity).
-    ("chat", 1),
-    ("directory", 1),
-    // 2: the wasm adapter port — the native canonical snapshot persisted as one
-    // host-KV value, a TOTAL schema break from the native root (visible from
-    // genesis: native empties to four zero counts, the map-backed guest store to
-    // one). its query surface stays COMMITTED-ONLY regardless of caller via the
-    // kernel's committed-query lane (`with_committed_queries`) — no ctx-routed
-    // enrichment survives (the former assignee facade retired to saga). beta
-    // re-genesis, no shim.
-    ("dispatch", 2),
-    // 1 (UNCHANGED at the wasm cutover): files is the ROOT-CONTINUOUS port —
-    // the guest runs pure duckfs-core over the WIT object plane while the host
-    // keeps the disk odb + refs file behind a `FilesOdbBacking`
-    // (`WasmModule::with_odb`). the committed encoding is unchanged (the refs
-    // image) and `root() = sha256(encode_refs)` is byte-identical on both
-    // runtimes, so ONLY the executor moved into wasm — no schema fence and no
-    // re-genesis (pinned by `wasm_files_parity`; pre-cutover workspaces reopen
-    // unchanged). the per-commit distinct-object-read cap
-    // (`duckfs_core::MAX_OBJECT_READS_PER_OP`) is a FILES CONSENSUS RULE enforced
-    // in the shared core, so native `Files` and the wasm tenant reject the
-    // identical oversized commit — uniform across runtimes by construction (the
-    // guest hits it before the kernel's equal `wasm_host::MAX_OBJECT_READS`).
-    // noded/simnode/demo keep composing the NATIVE `Files`, which is
-    // root-identical, so they never diverge.
-    ("files", 1),
-    // 2: the root domain + snapshot magic reset to v1 tags (no-versioning
-    // sweep) — the preimage bytes changed.
-    ("forge", 2),
-    // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
-    // revision 3 folds the `.duck` handle registry (the retired `duckdns`
-    // module's plane) into the same host-KV snapshot under one root — a
-    // state-schema break (beta re-genesis, no shim). governance stays at 2
-    // (identity moved to 3 when it absorbed the client ACL — see below). The
-    // per-network chain id still rides the GENESIS-CONFIG `__config`.
-    ("gateway", 3),
-    ("governance", 2),
-    ("hello", 1),
-    // 3: identity absorbed the submit-door client ACL (the retired `clients`
-    // module's ed25519 key set) as a tail folded into its account snapshot/root
-    // — a state-schema break from revision 2 (beta re-genesis, no shim).
-    ("identity", 3),
-    ("inbox", 2),
-    // 2: the module code registry alone — the protocol-version half (and its
-    // snapshot section) was removed with the no-versioning reset.
-    ("lifecycle", 2),
-    // 1: store-backed wasm port, root-continuous — see the chat note above.
-    ("pages", 1),
-    // Current adapter-backed Runs state layout.
-    ("runs", 1),
-    // 2: the wasm adapter port (saga's empty-map root coincides with the
-    // empty host-KV root, but every written state re-encodes — a break).
-    ("saga", 2),
-    ("tagging", 2),
-    // 3: the tasks+jobs merge — the `tasks` work module now hosts BOTH the task
-    // board and the (former `jobs`) job board, so its canonical snapshot/root
-    // encoding is the two boards concatenated (revision 2 was the wasm port).
-    ("tasks", 3),
-    ("valset", 1),
-];
-
-pub(crate) fn current_state_schema_fingerprint() -> [u8; 32] {
-    host::state_schema_fingerprint(MODULE_STATE_SCHEMAS.iter().copied())
-}
 
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on

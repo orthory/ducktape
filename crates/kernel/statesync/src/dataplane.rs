@@ -51,8 +51,7 @@ pub const MAX_FRAME_LEN: u64 = 64 * 1024 * 1024;
 ///
 /// network byte order (BE), not the wire crate's LE convention: this frame
 /// prefix lives on the raw stream body, outside `wire.rs`'s length-prefixed
-/// helpers, so it has no compatibility obligation to their encoding — see the
-/// module doc's flag-day note.
+/// helpers, so it uses its own framing convention.
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     writer
         .write_all(&(bytes.len() as u64).to_be_bytes())

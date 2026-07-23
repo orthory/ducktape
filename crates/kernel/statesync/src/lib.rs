@@ -275,9 +275,6 @@ pub struct Manifest {
     /// the epoch has not finalized past its base — the joiner then spawns on
     /// the epoch's genesis floor instead).
     pub floor_cert: Option<Vec<u8>>,
-    /// Canonical ordered module/state-schema fingerprint of the serving
-    /// binary. A joiner checks this before opening any destination substrate.
-    pub state_schema: [u8; 32],
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -420,7 +417,9 @@ pub enum SyncResponse {
     /// pairs, in db order. empty means the source ships nothing (index off,
     /// poisoned, or nothing attached) — the joiner just falls back to the
     /// from-state rebuild. chunks come back as [`SyncResponse::Chunk`].
-    IndexModules { entries: Vec<(String, u64)> },
+    IndexModules {
+        entries: Vec<(String, u64)>,
+    },
     /// the tip's consensus coordinates — the [`SyncRequest::TipCoords`] answer.
     TipCoords(TipCoords),
     Error(String),
@@ -428,14 +427,20 @@ pub enum SyncResponse {
     /// holds them, `None` when it does not — an honest miss, never an error
     /// (the requester's fan-out treats a miss and an old peer's `Error`
     /// identically: try the next peer).
-    Blob { bytes: Option<Vec<u8>> },
+    Blob {
+        bytes: Option<Vec<u8>>,
+    },
     /// the [`SyncRequest::BlobInfo`] answer: the blob's total length when
     /// held, `None` on an honest miss.
-    BlobInfo { len: Option<u64> },
+    BlobInfo {
+        len: Option<u64>,
+    },
     /// the [`SyncRequest::BlobRange`] answer: the window's bytes when held
     /// (shorter than asked at the blob's tail, empty past it), `None` on an
     /// honest miss.
-    BlobRange { bytes: Option<Vec<u8>> },
+    BlobRange {
+        bytes: Option<Vec<u8>>,
+    },
 }
 
 impl SyncResponse {
@@ -608,7 +613,6 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 }
                 None => out.push(0),
             }
-            out.extend_from_slice(&m.state_schema);
             out.extend_from_slice(&(m.entries.len() as u64).to_le_bytes());
             for e in &m.entries {
                 wire::put_str(&mut out, &e.module_id);
@@ -750,7 +754,6 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
                 t => return Err(WireError::BadTag("floor_cert", t)),
             };
-            let state_schema = wire::take_array::<32>(&mut buf)?;
             let n = wire::take_u64(&mut buf)?;
             // each entry costs at least its id length prefix + root + kind, so
             // a forged count can never drive allocation past the buffer.
@@ -807,7 +810,6 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 participants,
                 residents,
                 floor_cert,
-                state_schema,
                 entries,
             })
         }
@@ -972,7 +974,9 @@ pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: 
 // the 4-tuple mirrors the fixed wire layout; a named type would just indirect it.
 #[allow(clippy::type_complexity)]
 pub fn decode_rpc_authed(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
-    let (requester, rest) = bytes.split_first_chunk::<32>().ok_or(WireError::Truncated)?;
+    let (requester, rest) = bytes
+        .split_first_chunk::<32>()
+        .ok_or(WireError::Truncated)?;
     let (proof, rest) = rest.split_first_chunk::<64>().ok_or(WireError::Truncated)?;
     let (id_bytes, body) = rest.split_first_chunk::<8>().ok_or(WireError::Truncated)?;
     Ok((requester, proof, u64::from_le_bytes(*id_bytes), body))
@@ -1076,7 +1080,6 @@ pub struct BoundaryCoords {
 #[derive(Debug, Clone)]
 struct Capture {
     app_hash: StateRoot,
-    state_schema: [u8; 32],
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
     /// shipped-index archive blobs, keyed by database name — the unverified
@@ -1094,7 +1097,6 @@ struct Capture {
 #[derive(Debug, Clone)]
 pub struct CaptureData {
     app_hash: StateRoot,
-    state_schema: [u8; 32],
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
 }
@@ -1159,7 +1161,6 @@ pub async fn capture_boundary(
         id,
         CaptureData {
             app_hash: snapshot.app_hash,
-            state_schema: host.state_schema_fingerprint(),
             coords: coords.clone(),
             modules,
         },
@@ -1242,7 +1243,6 @@ impl SyncServer {
                     id,
                     Capture {
                         app_hash: data.app_hash,
-                        state_schema: data.state_schema,
                         coords: data.coords,
                         modules: data.modules,
                         index_blobs: None,
@@ -1286,7 +1286,6 @@ impl SyncServer {
             participants: capture.coords.participants.clone(),
             residents: capture.coords.residents.clone(),
             floor_cert: capture.coords.floor_cert.clone(),
-            state_schema: capture.state_schema,
             entries: capture
                 .modules
                 .iter()
@@ -1324,7 +1323,9 @@ impl SyncServer {
             // host did not intercept — answer honestly instead of wedging.
             // (the lane was briefly retired with the prompt plane; the wasm
             // code-distribution plane is its new, live consumer.)
-            SyncRequest::Blob { .. } | SyncRequest::BlobInfo { .. } | SyncRequest::BlobRange { .. } => {
+            SyncRequest::Blob { .. }
+            | SyncRequest::BlobInfo { .. }
+            | SyncRequest::BlobRange { .. } => {
                 return Err("blob requests are answered by the host layer".into());
             }
             SyncRequest::Frames {
@@ -1461,7 +1462,6 @@ impl SyncServer {
             id,
             Capture {
                 app_hash: id.app_hash,
-                state_schema: [0; 32],
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
                 index_blobs: None,
@@ -1478,7 +1478,6 @@ impl SyncServer {
             id,
             CaptureData {
                 app_hash: id.app_hash,
-                state_schema: [0; 32],
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
             },
@@ -1759,7 +1758,10 @@ pub async fn fetch_index_modules<C: SyncClient>(
     client: &C,
     boundary: BoundaryId,
 ) -> Result<Vec<(String, u64)>, SyncError> {
-    match client.request(SyncRequest::IndexModules { boundary }).await? {
+    match client
+        .request(SyncRequest::IndexModules { boundary })
+        .await?
+    {
         SyncResponse::IndexModules { entries } => Ok(entries),
         SyncResponse::Error(e) => Err(SyncError::Server(e)),
         other => Err(SyncError::UnexpectedResponse(other.kind_name())),
@@ -1773,10 +1775,12 @@ pub async fn fetch_index_db<C: SyncClient>(
     boundary: BoundaryId,
     db: &str,
 ) -> Result<Vec<u8>, SyncError> {
-    fetch_chunked(client, db, "index chunk", |offset| SyncRequest::IndexChunk {
+    fetch_chunked(client, db, "index chunk", |offset| {
+        SyncRequest::IndexChunk {
         boundary,
         db: db.to_string(),
         offset,
+        }
     })
     .await
 }
@@ -2068,7 +2072,6 @@ mod tests {
                 // non-empty: exercises the additive resident wire tail.
                 residents: vec![vec![5u8; 32]],
                 floor_cert: Some(vec![0xCC; 96]),
-                state_schema: [0xAB; 32],
                 entries: vec![
                     ManifestEntry {
                         module_id: "kv".into(),
@@ -2098,7 +2101,6 @@ mod tests {
                 participants: vec![vec![3u8; 32]],
                 residents: vec![],
                 floor_cert: None,
-                state_schema: [0xAB; 32],
                 entries: vec![],
             }),
             SyncResponse::Chunk {
@@ -2240,7 +2242,6 @@ mod tests {
         bytes.extend_from_slice(&3u64.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.push(0); // floor_cert: None
-        bytes.extend_from_slice(&[0xAB; 32]); // state_schema
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
     }
@@ -2257,12 +2258,10 @@ mod tests {
             participants: vec![],
             residents: vec![],
             floor_cert: None,
-            state_schema: [0xAB; 32],
             entries: vec![],
         });
         let bytes = encode_response(&resp);
-        // drop the trailing residents-count and entries-count u64s + part of
-        // the state schema, landing inside the manifest tail.
+        // Drop bytes from the trailing entry/resident counts.
         for cut in 1..=21 {
             let torn = &bytes[..bytes.len() - cut];
             assert!(

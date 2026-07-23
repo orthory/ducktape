@@ -398,15 +398,12 @@ impl DispatchPool {
                                 Err("attempt cancelled before provider start".into())
                             } else {
                                 match providers.resolve(&job.capability) {
-                                    Ok(provider) => {
-                                        match crate::envelope::prepare(&job.input) {
+                                    Ok(provider) => match crate::envelope::prepare(&job.input) {
                                             Ok(mut prepared) => {
-                                                prepared.ctx.run_key =
-                                                    Some(run_key_for(&job.saga_id));
+                                            prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
                                                 prepared.ctx.executing_node = Some(executing_node);
                                                 prepared.ctx.limits = job.demands.clone();
-                                                prepared.ctx.cancellation =
-                                                    Some(cancellation.clone());
+                                            prepared.ctx.cancellation = Some(cancellation.clone());
                                                 execute(
                                                     &job,
                                                     prepared,
@@ -419,8 +416,7 @@ impl DispatchPool {
                                                 .map_err(clean_error)
                                             }
                                             Err(error) => Err(clean_error(error)),
-                                        }
-                                    }
+                                    },
                                     Err(error) => Err(clean_error(error)),
                                 }
                             }
@@ -3186,10 +3182,7 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn flat_and_v2_payloads_fail_the_saga_loudly() {
-        // FLAG DAY: the flat-string passthrough and the v2 tolerance are gone
-        // — both deliver a loud Err result (the saga settles a failed
-        // attempt), and the provider is never invoked.
+    async fn untagged_and_unknown_version_payloads_fail_the_saga_loudly() {
         let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (pool, mut rx) = pool_with(providers, 4);
 
@@ -3205,13 +3198,13 @@ format = "text"
         let err = outcome.unwrap_err();
         assert!(err.contains("no ducktape_run envelope marker"), "got {err}");
 
-        let mut v2: serde_json::Value = serde_json::from_slice(&envelope_payload()).unwrap();
-        v2["ducktape_run"] = serde_json::json!(2);
+        let mut unknown: serde_json::Value = serde_json::from_slice(&envelope_payload()).unwrap();
+        unknown["ducktape_run"] = serde_json::json!(2);
         pool.run(&effect_with_payload(
             "s2",
             0,
             Some(b"me"),
-            v2.to_string().as_bytes(),
+            unknown.to_string().as_bytes(),
         ))
         .await
         .unwrap();
@@ -3359,12 +3352,7 @@ format = "text"
 
         // (1) the minimal shape (empty facets) still decodes and still yields
         //     response_text via the runs contract.
-        let minimal = assemble_runner_result(
-            "the answer",
-            &receipt,
-            Sink::Chain,
-            Status::Ok,
-        );
+        let minimal = assemble_runner_result("the answer", &receipt, Sink::Chain, Status::Ok);
         let parsed: RunsRunnerResult = serde_json::from_slice(&minimal)
             .expect("minimal bytes deserialize into the runs contract");
         assert_eq!(parsed.ducktape_runner_result, 1);

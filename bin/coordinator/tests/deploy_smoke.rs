@@ -35,7 +35,6 @@ async fn help_prints_usage_without_binding() {
     assert!(stdout.contains("--workers <1|4>"));
     assert!(stdout.contains("--metrics-interval <secs>"));
     assert!(stdout.contains("--genesis-set <network.toml>"));
-    assert!(stdout.contains("--allow-anonymous"));
     assert!(
         output.stderr.is_empty(),
         "help should not announce a bound coordinator"
@@ -46,7 +45,6 @@ async fn help_prints_usage_without_binding() {
 async fn cli_rejects_missing_and_unknown_flags() {
     for args in [
         vec!["--listen"],
-        vec!["--listen", "--allow-anonymous"],
         vec!["--relay-listen"],
         vec!["--relay-listen", "not-an-addr"],
         vec!["--workers"],
@@ -111,7 +109,7 @@ async fn deployed_coordinator_binary_answers_a_bind_request() {
         k.copy_from_slice(signer.public_key().as_ref());
         NodeKey(k)
     };
-    let client = NatClient::bind_multi_auth(key, vec![addr], signer, None)
+    let client = NatClient::bind(key, vec![addr], signer, None)
         .await
         .expect("bind client");
     let reflexive = timeout(Duration::from_secs(5), client.discover_reflexive())

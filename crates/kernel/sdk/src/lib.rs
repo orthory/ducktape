@@ -447,17 +447,6 @@ pub trait Module {
     /// this module's genesis-assigned id (e.g. "documents", "forge").
     fn id(&self) -> ModuleId;
 
-    /// Revision of this module's canonical committed-state encoding.
-    ///
-    /// Bump this whenever `root()` or installable snapshot bytes change shape
-    /// in a way an older/newer binary cannot decode byte-for-byte. This is a
-    /// clean-break fence, not a migration selector: recovery compares the
-    /// ordered production module/revision fingerprint before opening module
-    /// storage and refuses an incompatible workspace without mutating it.
-    fn state_schema_revision(&self) -> u32 {
-        1
-    }
-
     /// the module's current authenticated root. called by the host to fold into
     /// the global app-hash after a block applies.
     fn root(&self) -> StateRoot;
@@ -560,7 +549,7 @@ pub trait Module {
     /// ATOMICALLY with that commit — inside the same fsync'd durability unit
     /// as the module's own state advance (e.g. the duckfs refs-file envelope,
     /// or a qmdb commit-metadata slot) — or `None` when the module tracks no
-    /// cursor (the default: the in-memory cohort and legacy disk modules).
+    /// cursor (the default for modules without an atomic cursor substrate).
     ///
     /// recovery consults this to BOUND-AND-VERIFY a trailing durable commit
     /// whose journal seal was lost to a power cut: a disk module whose live
@@ -687,5 +676,4 @@ mod tests {
             StateSyncHandle::Unsupported { .. }
         ));
     }
-
 }

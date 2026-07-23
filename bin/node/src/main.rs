@@ -46,17 +46,16 @@
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-
 use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
 
 mod agent_plane;
+mod airlock_serve;
 mod blob_fetch;
 mod boot;
-mod code_plane;
-mod term_plane;
 mod cli;
 mod cli_args;
+mod code_plane;
 mod config;
 mod constants;
 mod drain_actions;
@@ -64,7 +63,6 @@ mod explorer;
 mod first_contact_join;
 mod fs_cli;
 mod gateway_plane;
-mod airlock_serve;
 mod gateway_routes;
 mod host_reads;
 mod host_resources;
@@ -89,35 +87,36 @@ mod resident_dispatch;
 mod resource_limits;
 mod rpc;
 mod sync;
+mod term_plane;
 mod userkey;
 mod userkey_cli;
 mod util;
 mod validator;
 mod voice;
 mod voice_plane;
+use crate::util::fatal;
 use config::Resolved;
+#[cfg(test)]
+use directory::{DirQuery, DirReply, decode_reply, encode_query};
+use duckfs_disk::SyncScratch;
 #[cfg(test)]
 use explorer::sealed_frame_block_row;
 #[cfg(test)]
 use noded::projection::project_root_op;
+use recovery::Recovery;
 #[cfg(test)]
 use replica::promotion::{
     PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
     joiner_manifest_fetch_retry,
 };
 #[cfg(test)]
+use sdk::{Msg, StateRoot};
+#[cfg(test)]
 use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
 use util::hex;
-#[cfg(test)]
-use directory::{DirQuery, DirReply, decode_reply, encode_query};
-use crate::util::fatal;
-use duckfs_disk::SyncScratch;
-use recovery::Recovery;
-#[cfg(test)]
-use sdk::{Msg, StateRoot};
 
 fn main() {
     resource_limits::cap_malloc_arenas();
@@ -262,10 +261,7 @@ fn gateway_can_start(
              loopback address"
         );
     }
-    !sync_only
-        && gateway_listen.is_some()
-        && api_is_loopback
-        && wireguard_listen.is_some()
+    !sync_only && gateway_listen.is_some() && api_is_loopback && wireguard_listen.is_some()
 }
 
 fn run_node(
@@ -366,11 +362,8 @@ fn run_node(
     // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
     // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
     // override — see capability-host. host-local only, never consensus.
-    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
-    // as today — relocating them would be a live (non-dormant) durability change.
-    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root),
-    // which is out of <storage>; the pre-existing non-portable D7 gap is a
-    // separate, migration-aware hardening (tracked as a follow-up).
+    // Persistent agent workspaces stay under <storage>; portable run mounts
+    // live under agent_runs_root outside it.
     let agent_dirs = capability_host::AgentDirs::under(&storage);
     // 15s instead of commonware's 60s default: this read/write deadline is
     // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.

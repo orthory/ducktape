@@ -179,20 +179,44 @@ on leave_huddle_submit
   run leave_huddle(connected_rpc, password, active_channel) -> chat_mutated _ | mutation_failed _
 
 on send_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || empty(trim(message_draft))
+  return if loading || empty(active_channel) || active_channel_archived || empty(trim(message_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
-  mutation_phase = "message"
   pending_message = trim(message_draft)
+  pending_message_id = fresh_operation_id("message")
   message_draft = ""
-  messages = optimistic_message(messages, pending_message)
+  messages = optimistic_message(messages, pending_message, pending_message_id)
   error = ""
-  run send_message(connected_rpc, password, active_channel, pending_message) -> chat_mutated _ | mutation_failed _
+  run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message) -> message_sent _ | message_send_failed _
+
+on message_sent(next)
+  channels = next.data.channels
+  return if active_channel != next.channel_id || next.data.active_channel != next.channel_id
+  messages = merge_message_send_result(next.data.messages, messages, active_channel, next.data.active_channel, next.operation_id)
+  active_channel_name = next.data.active_channel_name
+  active_channel_archived = next.data.active_channel_archived
+  active_channel_members_only = next.data.active_channel_members_only
+  active_channel_huddle_count = next.data.active_channel_huddle_count
+  channel_members = next.data.channel_members
+  error = ""
+
+on message_send_failed(cause)
+  return if active_channel != cause.scope_id
+  messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
+  failed_message_draft = remember_failed_draft(failed_message_draft, message_draft, cause.body, cause.committed)
+  message_draft = restore_draft(message_draft, cause.body, cause.committed)
+  error = cause.message
+  live_dirty = live_dirty || cause.committed
+  return if !live_dirty || loading || sync_phase == "refreshing"
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on chat_updated(next)
   channels = next.channels
-  messages = next.messages
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -250,7 +274,7 @@ on chat_mutated(next)
   reply_draft = message_text_after_failure(reply_draft, "message-edit", active_thread_seq <= 0)
   pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
   message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
-  messages = next.messages
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -260,7 +284,6 @@ on chat_mutated(next)
   live_thread_generation = live_thread_generation + 1
   pending_channel = ""
   channel_create_open = false
-  pending_message = ""
   mutation_phase = "idle"
   error = ""
   return if !live_dirty
@@ -283,7 +306,7 @@ on chat_resized(_, height)
   chat_height = height
 
 on open_message_actions(seq, body, rev)
-  return if seq <= 0 || mutation_phase != "idle"
+  return if seq <= 0
   message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
@@ -294,7 +317,7 @@ on open_message_actions(seq, body, rev)
     task widget focus-next
 
 on open_message_actions_accessibly(seq, body, rev)
-  return if seq <= 0 || mutation_phase != "idle"
+  return if seq <= 0
   message_menu_y = 0.0
   selected_message_seq = seq
   selected_message_rev = rev
@@ -305,7 +328,7 @@ on open_message_actions_accessibly(seq, body, rev)
     task widget focus-next
 
 on open_message_reactions(seq, body, rev)
-  return if seq <= 0 || mutation_phase != "idle"
+  return if seq <= 0
   message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
@@ -316,7 +339,7 @@ on open_message_reactions(seq, body, rev)
     task widget focus-next
 
 on arm_message_delete(seq, body, rev)
-  return if seq <= 0 || mutation_phase != "idle"
+  return if seq <= 0
   selected_message_seq = seq
   selected_message_rev = rev
   message_action = "delete"
@@ -326,7 +349,7 @@ on arm_message_delete(seq, body, rev)
     task widget focus-next
 
 on begin_message_edit(seq, body, rev)
-  return if seq <= 0 || mutation_phase != "idle"
+  return if seq <= 0
   selected_message_seq = seq
   selected_message_rev = rev
   message_action = "editing"
@@ -334,7 +357,7 @@ on begin_message_edit(seq, body, rev)
   task widget focus #workspace-tabs/message-edit
 
 on open_thread_for(seq)
-  return if seq <= 0 || mutation_phase != "idle" || empty(active_channel)
+  return if seq <= 0 || empty(active_channel)
   channel_settings_open = false
   selected_message_seq = 0
   selected_message_rev = 0
@@ -354,7 +377,7 @@ on open_thread_for(seq)
   run load_thread(connected_rpc, active_channel, seq, 0, 0, false, thread_generation) -> thread_loaded _ | thread_failed _
 
 on cancel_message_action
-  return if selected_message_seq <= 0 || mutation_phase != "idle"
+  return if selected_message_seq <= 0
   message_action = "toolbar"
 
 on clear_message_selection
@@ -480,8 +503,9 @@ on send_reply_submit
   sync_phase = "idle"
   mutation_phase = "reply"
   pending_reply = trim(reply_draft)
+  pending_reply_id = fresh_operation_id("reply")
   reply_draft = ""
-  thread_messages = optimistic_message(thread_messages, pending_reply)
+  thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
   run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply) -> thread_mutated _ | reply_mutation_failed _
 

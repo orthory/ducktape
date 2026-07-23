@@ -144,6 +144,7 @@ use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use kv::Kv;
+use lifecycle::Lifecycle;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
 use noded::{
     BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
@@ -153,9 +154,8 @@ use pages::Pages;
 use saga::SagaModule;
 use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
-use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
-use lifecycle::Lifecycle;
+use tasks::Tasks;
 use valset::Valset;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
@@ -784,8 +784,7 @@ fn run_sim(
             Some("tasks".into()),
             Some("tasks".into()),
         )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2) — mandatory for envelope composition.
+        // The portable composer pins its source head from duckfs/files.
         .with_files_module("files")
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
@@ -1330,7 +1329,11 @@ impl Sim {
     /// the `CommittedInfo` for an APPLIED one-op commit; `None` if the op was
     /// rejected (the step/peer reply reports no commit, the submitter got the
     /// rejection). `op_hash` re-stages the payload (idempotent, content-address).
-    fn committed_info(&self, drained: &[DrainedFrame], kind: &'static str) -> Option<CommittedInfo> {
+    fn committed_info(
+        &self,
+        drained: &[DrainedFrame],
+        kind: &'static str,
+    ) -> Option<CommittedInfo> {
         let frame = drained.iter().find(|d| d.op.is_some())?;
         if frame.disposition != node::Disposition::Applied {
             return None;
@@ -1552,7 +1555,10 @@ async fn sim_auto(State(handle): State<ControlState>, Json(req): Json<AutoReques
     }
 }
 
-async fn sim_persona(State(handle): State<ControlState>, Json(req): Json<PersonaRequest>) -> Response {
+async fn sim_persona(
+    State(handle): State<ControlState>,
+    Json(req): Json<PersonaRequest>,
+) -> Response {
     match control(handle, |reply| SimCommand::SetPersona {
         persona: req.persona,
         reply,

@@ -195,7 +195,7 @@ fn is_zero(n: &u32) -> bool {
 
 /// whether a [`ResourceCaps`] is the empty default — used to keep the empty
 /// record's serialized JSON (and its `MAX_AGENT_RECORD_BYTES` size check)
-/// byte-lean, so a pre-v4-shaped record is unchanged on the wire.
+/// byte-lean.
 pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
     *c == ResourceCaps::default()
 }

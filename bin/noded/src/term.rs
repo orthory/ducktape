@@ -254,7 +254,12 @@ impl TermRing {
 
     /// chunks with `seq > after`, up to `budget`, plus the ring's floor seq (so
     /// a reader that fell behind an eviction learns it lagged).
-    pub fn read_after(&self, session: &str, after: u64, budget: usize) -> (Vec<(u64, String)>, u64) {
+    pub fn read_after(
+        &self,
+        session: &str,
+        after: u64,
+        budget: usize,
+    ) -> (Vec<(u64, String)>, u64) {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
         inner.touch += 1;
         let touch = inner.touch;
@@ -343,7 +348,13 @@ impl TermCommandRing {
     /// order. Off-consensus and observational, so this stays honest to the
     /// origin's numbering rather than inventing a local one.
     pub fn append_remote(&self, event: TermCommandEvent) {
-        self.push(&event.session, Some(event.seq), &event.origin, &event.text, false);
+        self.push(
+            &event.session,
+            Some(event.seq),
+            &event.origin,
+            &event.text,
+            false,
+        );
     }
 
     fn push(
@@ -475,15 +486,14 @@ pub struct Command {
 /// drop-driven teardown the pump takes on EOF, no separate cancel needed.
 /// how a session is driven — chosen at create, enforced for its whole life.
 ///
-/// `Single` (the default): ONE member, RAW keystrokes straight to the pty — the
+/// `Single`: one member, raw keystrokes straight to the pty — the
 /// solo terminal. `Shared`: ordered, attributed `TermCommand`s through the lane
 /// (the consensus-ready path). The two are MUTUALLY EXCLUSIVE per session: a
 /// shared session refuses raw input (else a keystroke would bypass the total
 /// order), and a single session refuses commands (it has no lane/consumer).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionMode {
-    #[default]
     Single,
     Shared,
 }
@@ -932,9 +942,8 @@ pub fn backend_from_env() -> SandboxBackend {
 #[derive(Deserialize)]
 pub struct CreateSessionBody {
     pub agent: String,
-    /// `"single"` (default, back-compat) = raw-keystroke solo terminal;
+    /// `"single"` = raw-keystroke solo terminal;
     /// `"shared"` = ordered `TermCommand` lane.
-    #[serde(default)]
     pub mode: SessionMode,
 }
 
@@ -1029,10 +1038,12 @@ mod tests {
         }
         // the first-touched session aged out; the newest survives.
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
-        assert!(!ring
+        assert!(
+            !ring
             .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
             .0
-            .is_empty());
+                .is_empty()
+        );
     }
 
     // ----- the ordered command-log ring (a focused twin of TermRing) -----
@@ -1161,10 +1172,12 @@ mod tests {
         }
         // the first-touched session aged out; the newest survives.
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
-        assert!(!ring
+        assert!(
+            !ring
             .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
             .0
-            .is_empty());
+                .is_empty()
+        );
     }
 
     #[test]

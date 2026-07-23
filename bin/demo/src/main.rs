@@ -7,16 +7,8 @@
 //!
 //! run: `cargo run -p demo`
 
-use statesync::qmdb::QmdbStore;
 use agent::AgentModule;
-use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg,
-};
-use runs::{RunsModule, run_id_for};
-use runs::{
-    RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
-    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
-};
+use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, encode_msg as agent_encode_msg};
 use automations::Automations;
 use chat::Chat;
 use chat::{
@@ -29,13 +21,13 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, decode_reply, encode_msg, encode_query};
-use gateway::Gateway;
 use files::Files;
 use forge::Forge;
 use forge::{
     ForgeMsg, ForgeQuery, ForgeReply, decode_reply as forge_decode_reply,
     encode_msg as forge_encode_msg, encode_query as forge_encode_query,
 };
+use gateway::Gateway;
 use greeter::Greeter;
 use host::{BlockContext, Host};
 use identity::Identity;
@@ -44,12 +36,18 @@ use inbox::{
     InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
     encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
 };
+use runs::{RunsModule, run_id_for};
+use runs::{
+    RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query,
+};
 use saga::SagaModule;
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
     encode_query as saga_encode_query,
 };
 use sdk::{Msg, Origin};
+use statesync::qmdb::QmdbStore;
 use tasks::Tasks;
 use valset::Valset;
 use valset::{
@@ -547,14 +545,20 @@ async fn demo_genesis(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
 ) -> Host {
-    let kv = kv::Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
+    let kv = kv::Kv::new(
+        "kv",
+        Box::new(QmdbStore::init(context.child("kv"), "kv").await),
+    );
     let directory = Directory::new("directory");
     let greeter = Greeter::new("greeter");
     let forge = Forge::init("forge", forge_repo.to_path_buf())
         .expect("forge init")
         .with_chat("chat");
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-        .with_tagging("tagging");
+    let chat = Chat::new(
+        "chat",
+        Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+    )
+    .with_tagging("tagging");
     let valset = Valset::new("valset");
     let saga = SagaModule::new("saga");
     let dispatch = dispatch::DispatchModule::new("dispatch", "saga");
@@ -577,7 +581,7 @@ async fn demo_genesis(
         Some("tasks".into()),
         Some("tasks".into()),
     )
-    // the duckfs/files module the portable (v3) composer pins its source
+    // the duckfs/files module the portable composer pins its source
     // head from (W2) — mandatory for envelope composition.
     .with_files_module("files");
     let automations = Automations::new("automations", "chat", "tasks", "inbox");
@@ -623,7 +627,10 @@ mod tests {
             let mut want: Vec<String> =
                 host::topology::DEMO.iter().map(|s| s.to_string()).collect();
             want.sort_unstable();
-            assert_eq!(got, want, "demo genesis set must equal host::topology::DEMO");
+            assert_eq!(
+                got, want,
+                "demo genesis set must equal host::topology::DEMO"
+            );
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

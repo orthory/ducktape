@@ -39,7 +39,7 @@ fn network_shape_joiner_parks_until_promote() {
     // is already crossed by then), which is all `invite`/`promote` need.
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
-    // the MANUAL flavor (token-less v2 blob): the pubkey travels out-of-band
+    // In the manual flow, the pubkey travels out-of-band
     // and no lobby announce happens — the tokened flavor has its own e2e
     // (join_request_e2e).
     let invite = cluster.invite();
@@ -59,8 +59,14 @@ fn network_shape_joiner_parks_until_promote() {
     // adopts the set.
     let cfg = cluster.config_file(1);
     let toml = std::fs::read_to_string(&cfg).expect("read friend node.toml");
-    assert!(toml.contains("sync_index = false"), "generated file carries the key");
-    std::fs::write(&cfg, toml.replace("sync_index = false", "sync_index = true"))
+    assert!(
+        toml.contains("sync_index = false"),
+        "generated file carries the key"
+    );
+    std::fs::write(
+        &cfg,
+        toml.replace("sync_index = false", "sync_index = true"),
+    )
         .expect("write friend node.toml");
 
     cluster.spawn(1);
@@ -100,7 +106,10 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("promote-reboot");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -134,7 +143,10 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
             value: "landed".into(),
         }),
     );
-    poll_until("the promoted friend to serve the founder's write", CONVERGE, || {
+    poll_until(
+        "the promoted friend to serve the founder's write",
+        CONVERGE,
+        || {
         cluster
             .query(
                 1,
@@ -148,7 +160,8 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
                 DirReply::Value(Some(v)) if v == "landed" => Some(()),
                 _ => None,
             })
-    });
+        },
+    );
     // …and the promoted friend's own ordered lane finalizes into the widened
     // quorum (a halted founder can never land this).
     cluster.submit(
@@ -438,7 +451,10 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("staged-admission");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -480,7 +496,11 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             other => panic!("expected Validators, got {other:?}"),
         })
         .expect("valset validators readable");
-    assert_eq!(validators.len(), 1, "the quorum still seats ONLY the founder");
+    assert_eq!(
+        validators.len(),
+        1,
+        "the quorum still seats ONLY the founder"
+    );
     let residents = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
         .and_then(|raw| valset::decode_reply(&raw).ok())
@@ -498,27 +518,38 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     // (2) the SERVING resident: the same local read surfaces a validator
     //     binds, answered from the resident's own pre-synced boundary.
     //     rpc status names the served boundary…
-    poll("the resident to serve rpc status", Box::new(|| {
+    poll(
+        "the resident to serve rpc status",
+        Box::new(|| {
         let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
         st["ok"] == serde_json::json!(true)
             && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
-    }));
+        }),
+    );
     //     …module reads answer from the RESIDENT's surface (the tier split is
     //     visible through the resident itself, not just the founder)…
-    poll("the resident to serve valset reads", Box::new(|| {
+    poll(
+        "the resident to serve valset reads",
+        Box::new(|| {
         cluster
             .query(1, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(
+                .is_some_and(|r| {
+                    matches!(
                 r,
                 ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
-            ))
-    }));
+                    )
+                })
+        }),
+    );
     //     …the http app surface answers its status route from the same host…
     {
         let (status, body) = nettest::http_text(cluster.http_ports[1], "GET", "/v1/status");
         assert_eq!(status, 200, "resident /v1/status must answer 200:\n{body}");
-        assert!(body.contains("\"height\""), "resident /v1/status carries a height:\n{body}");
+        assert!(
+            body.contains("\"height\""),
+            "resident /v1/status carries a height:\n{body}"
+        );
     }
     //     …a write LANDS through the submit relay: the resident signs with its
     //     own key, ships the frame to the validator, and the rpc reply holds
@@ -541,7 +572,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     );
     //     …and the resident READS ITS OWN WRITE once its follow arm crosses
     //     the boundary that carries it…
-    poll("the resident to serve its own relayed write", Box::new(|| {
+    poll(
+        "the resident to serve its own relayed write",
+        Box::new(|| {
         cluster
             .query(
                 1,
@@ -552,7 +585,8 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             )
             .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "landed"))
-    }));
+        }),
+    );
     //     …and the follow is CONTINUOUS: a value the founder finalizes now
     //     becomes readable through the resident within a few boundaries.
     cluster.submit(
@@ -563,7 +597,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             value: "fresh".into(),
         }),
     );
-    poll("the resident to serve the followed write", Box::new(|| {
+    poll(
+        "the resident to serve the followed write",
+        Box::new(|| {
         cluster
             .query(
                 1,
@@ -574,12 +610,16 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             )
             .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
-    }));
+        }),
+    );
     //     …and the DERIVED tier follows the boundary too: the explorer
     //     records the followed boundary (an honest boundary row — verified
     //     height + app-hash, frame-derived fields empty)…
-    poll("the resident explorer to record a followed boundary", Box::new(|| {
-        let (status, body) = common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
+    poll(
+        "the resident explorer to record a followed boundary",
+        Box::new(|| {
+            let (status, body) =
+                common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
         status == 200
             && body["blocks"].as_array().is_some_and(|rows| {
                 rows.iter().any(|b| {
@@ -588,7 +628,8 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
                         && !b["commit_hash"].as_str().unwrap_or_default().is_empty()
                 })
             })
-    }));
+        }),
+    );
     //     …and /v1/index/* answers from healthy read models. under the
     //     replica pipeline the resident FOLDS blocks, so watermarks advance
     //     per block PAST the ascension heal's backfill floor (the old
@@ -596,7 +637,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     era is exactly what the fold retired). polled: a heal drops the
     //     watermark FIRST (crash-safety by re-trigger), so a read racing an
     //     in-flight heal legitimately sees 0 for a moment.
-    poll("the resident index to report folding watermarks", Box::new(|| {
+    poll(
+        "the resident index to report folding watermarks",
+        Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
@@ -606,7 +649,8 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             && index_status["backfilled"]["directory"]
                 .as_u64()
                 .is_some_and(|floor| floor <= watermark)
-    }));
+        }),
+    );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
     cluster.kill(1);
@@ -618,7 +662,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             value: "alive".into(),
         }),
     );
-    poll("a finalized op with the resident down", Box::new(|| {
+    poll(
+        "a finalized op with the resident down",
+        Box::new(|| {
         cluster
             .query(
                 0,
@@ -629,7 +675,8 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             )
             .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
-    }));
+        }),
+    );
 
     // (4) a restarted resident parks straight back into resident mode — the
     //     pre-sync left NO checkpoint manifest behind. (the config-time
@@ -639,10 +686,12 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     it then SERVES again from a fresh pre-sync.
     cluster.spawn(1);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
-    poll("the restarted resident to serve reads again", Box::new(|| {
-        cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"]
-            == serde_json::json!(true)
-    }));
+    poll(
+        "the restarted resident to serve reads again",
+        Box::new(|| {
+            cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"] == serde_json::json!(true)
+        }),
+    );
 
     // (5) resident remove: the ceremony verb revokes standing. committed
     //     state clears, and the resident — whose respawned log is fresh, so
@@ -654,12 +703,15 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         out.contains("revoked resident standing"),
         "unexpected resident remove output:\n{out}"
     );
-    poll("the revoke to clear resident standing", Box::new(|| {
+    poll(
+        "the revoke to clear resident standing",
+        Box::new(|| {
         cluster
             .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, ValsetReply::Residents(v) if v.is_empty()))
-    }));
+        }),
+    );
     cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
     //     a second run is an honest no-op — the inverted guard, end to end.
     let (ok, out) = cluster.run_membership_verb("resident remove", &friend_key);
@@ -679,15 +731,20 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         out.contains("granted resident standing"),
         "unexpected re-grant output:\n{out}"
     );
-    poll("the re-grant to restore resident standing", Box::new(|| {
+    poll(
+        "the re-grant to restore resident standing",
+        Box::new(|| {
         cluster
             .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
             .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(
+                .is_some_and(|r| {
+                    matches!(
                 r,
                 ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
-            ))
-    }));
+                    )
+                })
+        }),
+    );
     cluster.submit(
         0,
         "directory",
@@ -696,7 +753,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             value: "back".into(),
         }),
     );
-    poll("the re-granted resident to resume the follow", Box::new(|| {
+    poll(
+        "the re-granted resident to resume the follow",
+        Box::new(|| {
         cluster
             .query(
                 1,
@@ -707,7 +766,8 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             )
             .and_then(|raw| directory::decode_reply(&raw).ok())
             .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
-    }));
+        }),
+    );
 
     // (7) promote: the warm resident becomes a validator through the replica
     //     promotion collapse — it checkpoints its OWN folded state and
@@ -716,7 +776,10 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
-    assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
+    assert!(
+        out.contains("admitted"),
+        "unexpected promote output:\n{out}"
+    );
     cluster.wait_marker(1, "admitted at epoch", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let residents = cluster

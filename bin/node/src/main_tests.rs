@@ -17,24 +17,9 @@ fn gateway_requires_a_loopback_node_api_and_real_overlay() {
         wireguard,
     ));
     for allowed in [
-        gateway_can_start(
-            false,
-            Some("127.0.0.1:0"),
-            Some("0.0.0.0:8844"),
-            wireguard,
-        ),
-        gateway_can_start(
-            true,
-            Some("127.0.0.1:0"),
-            Some("127.0.0.1:8844"),
-            wireguard,
-        ),
-        gateway_can_start(
-            false,
-            Some("127.0.0.1:0"),
-            Some("127.0.0.1:8844"),
-            None,
-        ),
+        gateway_can_start(false, Some("127.0.0.1:0"), Some("0.0.0.0:8844"), wireguard),
+        gateway_can_start(true, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), wireguard),
+        gateway_can_start(false, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), None),
     ] {
         assert!(!allowed);
     }
@@ -61,7 +46,6 @@ fn test_manifest(
         participants: vec![test_me()],
         residents: vec![],
         floor_cert,
-        state_schema: crate::constants::current_state_schema_fingerprint(),
         entries: vec![],
     }
 }
@@ -558,16 +542,8 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
         let signer = ed25519::PrivateKey::from_seed(81);
         let durable_store = TestDiskStore::default();
         let base_host = mixed_durability_host(durable_store.clone(), 0);
-        let base_manifest = Manifest::capture(
-            &base_host,
-            None,
-            0,
-            0,
-            vec![test_me()],
-            vec![],
-            None,
-            0,
-            1,)
+        let base_manifest =
+            Manifest::capture(&base_host, None, 0, 0, vec![test_me()], vec![], None, 0, 1)
         .expect("base manifest");
 
         let mut expected = mixed_durability_host(TestDiskStore::default(), 0);
@@ -580,7 +556,6 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             participants: vec![test_me()],
             residents: vec![],
             floor_cert: Some(vec![1, 2, 3]),
-            state_schema: crate::constants::current_state_schema_fingerprint(),
             entries: vec![],
         };
 

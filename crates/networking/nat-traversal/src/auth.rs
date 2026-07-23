@@ -43,21 +43,15 @@ pub struct Authenticator {
 }
 
 /// The coordinator's authorization policy. PUBLIC data only.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum AuthPolicy {
-    /// Public coordination. `require_pop=true` is the deployed default;
-    /// `false` is the legacy fully-open shape (tests / `--allow-anonymous`).
-    Open { require_pop: bool },
+    /// Public coordination: every request proves possession of its node key.
+    #[default]
+    Public,
     /// Private coordination: PoP + admission against the pinned genesis set.
     Private {
         genesis_set: Vec<ed25519::PublicKey>,
     },
-}
-
-impl Default for AuthPolicy {
-    fn default() -> Self {
-        AuthPolicy::Open { require_pop: false }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -179,11 +173,6 @@ pub(crate) fn verify_request_using(
     auth: &Authenticator,
     resolve_subject: impl FnOnce(NodeKey) -> Option<ed25519::PublicKey>,
 ) -> Result<(), AuthError> {
-    // Legacy fully-open: no checks at all.
-    if let AuthPolicy::Open { require_pop: false } = policy {
-        return Ok(());
-    }
-
     // 1. Freshness.
     if now.abs_diff(auth.timestamp) > window {
         return Err(AuthError::Stale);
@@ -238,7 +227,7 @@ mod tests {
     fn pop_only_accepts_self_signed_and_rejects_forged() {
         let node = key(1);
         let subject = nk(&node.public_key());
-        let policy = AuthPolicy::Open { require_pop: true };
+        let policy = AuthPolicy::Public;
         let now = 1_000_000;
 
         let good = sign_authenticator(&node, INNER, now, None);
@@ -260,7 +249,7 @@ mod tests {
     fn stale_timestamp_is_rejected_both_directions() {
         let node = key(1);
         let subject = nk(&node.public_key());
-        let policy = AuthPolicy::Open { require_pop: true };
+        let policy = AuthPolicy::Public;
         let a = sign_authenticator(&node, INNER, 1_000_000, None);
         // 31s in the past and future both exceed the 30s window.
         assert_eq!(
@@ -274,18 +263,6 @@ mod tests {
         // 30s exactly is still fresh.
         assert_eq!(
             verify_request(&policy, 1_000_030, 30, subject, INNER, &a),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn fully_open_accepts_anything() {
-        let subject = NodeKey([9u8; 32]); // not even a valid pubkey
-        let policy = AuthPolicy::Open { require_pop: false };
-        let node = key(3);
-        let auth = sign_authenticator(&node, INNER, 0, None); // wrong signer, ancient ts
-        assert_eq!(
-            verify_request(&policy, 5_000_000, 30, subject, INNER, &auth),
             Ok(())
         );
     }
@@ -384,7 +361,7 @@ mod tests {
         // valid point in this commonware version — its non-canonical y reduces
         // mod p — so it would surface as `BadPop`, not `BadSubjectKey`.)
         let subject = NodeKey([2u8; 32]);
-        let policy = AuthPolicy::Open { require_pop: true };
+        let policy = AuthPolicy::Public;
         let node = key(1);
         let auth = sign_authenticator(&node, INNER, 1_000_000, None);
         assert_eq!(

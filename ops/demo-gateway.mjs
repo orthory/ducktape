@@ -104,7 +104,7 @@ async function main() {
   }
 
   const data = Buffer.from(INDEX_HTML);
-  // v2: the file table lives off consensus in .manifest.json; the signed route
+  // The file table lives off consensus in .manifest.json; the signed route
   // binds only the manifest's SHA-256.
   const manifest = {
     default_path: "index.html",

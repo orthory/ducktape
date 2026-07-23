@@ -63,7 +63,6 @@ pub type ModuleEventStream = futures::stream::BoxStream<'static, Result<ModuleEv
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Status {
     pub height: u64,
-    #[serde(default)]
     pub public_key: String,
 }
 
@@ -108,8 +107,6 @@ enum StreamFrame {
         topic: String,
         detail: String,
     },
-    #[serde(other)]
-    Other,
 }
 
 #[derive(Deserialize)]
@@ -344,7 +341,7 @@ fn decode_stream_message(
         StreamFrame::Error { topic, detail } => Some(Err(Error::new(format!(
             "RPC stream topic {topic} failed: {detail}"
         )))),
-        StreamFrame::Heartbeat | StreamFrame::Other => None,
+        StreamFrame::Heartbeat => None,
     }
 }
 
@@ -466,6 +463,21 @@ mod tests {
             decode_stream_message(Ok(Message::Text(unexpected.into())), &expected)
                 .unwrap()
                 .is_err()
+        );
+
+        let unknown = r#"{"type":"retired_frame"}"#;
+        assert!(
+            decode_stream_message(Ok(Message::Text(unknown.into())), &expected)
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn status_requires_the_current_shape() {
+        assert!(
+            serde_json::from_str::<Status>(r#"{"height":7}"#).is_err(),
+            "a status without public_key must not receive a removed default"
         );
     }
 

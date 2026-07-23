@@ -231,10 +231,8 @@ impl ResidentDispatch {
             // it before any local replacement is offered below. Plain absence
             // still needs a confirming read so a transient flap cannot
             // duplicate a run.
-            let superseded = retired.contains(key)
-                || newest
-                    .get(&key.0)
-                    .is_some_and(|attempt| *attempt > key.1);
+            let superseded =
+                retired.contains(key) || newest.get(&key.0).is_some_and(|attempt| *attempt > key.1);
             if !superseded && !entry.missed {
                 entry.missed = true;
                 if !matches!(entry.stage, Stage::Settled) {
@@ -352,7 +350,10 @@ impl ResidentDispatch {
     /// rejected / refused re-queues the op for the next tick while committed
     /// state still names the attempt.
     pub(crate) fn on_reply(&mut self, frame: &node::FrameId, applied: bool) -> Option<AttemptKey> {
-        let key = self.work.iter().find_map(|(key, entry)| match &entry.stage {
+        let key = self
+            .work
+            .iter()
+            .find_map(|(key, entry)| match &entry.stage {
             Stage::InFlight { frame: f, .. } if f == frame => Some(key.clone()),
             _ => None,
         })?;
@@ -391,11 +392,7 @@ async fn assigned_pending(host: &Host, me: &[u8]) -> Option<Vec<WorkerRequest>> 
 /// per-saga view can: terminal state, a higher attempt, or a changed assignee
 /// all prove the old local process must stop on this first read. An unreadable
 /// or older view is inconclusive and preserves the two-read flap tolerance.
-async fn attempt_projection(
-    host: &Host,
-    me: &[u8],
-    key: &AttemptKey,
-) -> Option<AttemptProjection> {
+async fn attempt_projection(host: &Host, me: &[u8], key: &AttemptKey) -> Option<AttemptProjection> {
     let reply = host
         .query(
             "saga",
@@ -624,7 +621,7 @@ format = "text"
                 kind: WORK_SPEC_KIND.into(),
                 dispatch_id: "d1".into(),
                 capability: "alpha".into(),
-                // a minimal v3 run envelope: the oracle's prepare() rejects
+                // A minimal current run envelope: the oracle's prepare() rejects
                 // marker-less flat payloads post-flag-day. the test
                 // provisioner keeps the production-required workspace path.
                 payload: serde_json::json!({
@@ -767,7 +764,11 @@ format = "text"
         let retry = pump.plan(vec![request("job", 1)], now).await;
         assert_eq!(retry.len(), 1, "a new attempt is new work");
         assert_eq!(retry[0].0, ("job".to_string(), 1));
-        assert_eq!(executions.load(Ordering::SeqCst), 2, "one child per attempt");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "one child per attempt"
+        );
     }
 
     #[tokio::test]
@@ -924,8 +925,7 @@ format = "text"
             "the replacement starts off-loop"
         );
         tokio::time::timeout(Duration::from_secs(1), async {
-            while cancellations.load(Ordering::SeqCst) == 0
-                || executions.load(Ordering::SeqCst) < 2
+            while cancellations.load(Ordering::SeqCst) == 0 || executions.load(Ordering::SeqCst) < 2
             {
                 tokio::task::yield_now().await;
             }

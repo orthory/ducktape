@@ -31,12 +31,17 @@ fn command_output(out: &std::process::Output) -> String {
 /// pubkey hex — the join code every targeted invite locks to. `join --dir <dir>`
 /// reuses this identity, so the join-side target self-check passes.
 fn keygen(dir: &Path) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args(["key", "--dir"])
         .arg(dir)
         .output()
         .expect("run keygen");
-    assert!(out.status.success(), "keygen failed:\n{}", command_output(&out));
+    assert!(
+        out.status.success(),
+        "keygen failed:\n{}",
+        command_output(&out)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -116,7 +121,8 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args([
             "init",
             "--name",
@@ -133,7 +139,8 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
 
     keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
         .output()
@@ -145,7 +152,8 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
     );
     let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args([
             "join",
             &blob,
@@ -193,7 +201,8 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     let founder = dir.path().join("founder");
     let friend = dir.path().join("friend");
 
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args([
             "init",
             "--name",
@@ -229,7 +238,8 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
         .expect("seed mesh-state.json");
 
     keygen(&friend);
-    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let invite = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args(["invite", "--config"])
         .arg(founder.join("node.toml"))
         .output()
@@ -241,7 +251,8 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     );
     let blob = String::from_utf8_lossy(&invite.stdout).trim().to_string();
 
-    let join = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let join = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args([
             "join",
             &blob,
@@ -303,7 +314,8 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
     let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
     drop(wg_probe);
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args([
             "init",
             "--name",
@@ -334,7 +346,8 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     let log_path = dir.path().join("founder-heal.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .arg("run")
         .arg("--config")
         .arg(founder.join("node.toml"))
@@ -358,7 +371,10 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
     };
 
     // act 1 — dark: the plane reports the outage and keeps the node up.
-    let (saw_unavailable, log) = wait_for("coordinator rendezvous unavailable", Duration::from_secs(25));
+    let (saw_unavailable, log) = wait_for(
+        "coordinator rendezvous unavailable",
+        Duration::from_secs(25),
+    );
     let still_running = child.try_wait().expect("poll node").is_none();
     if !saw_unavailable || !still_running {
         let _ = child.kill();
@@ -382,11 +398,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
         let sock = tokio::net::UdpSocket::bind(coord_addr)
             .await
             .expect("bind the late coordinator");
-        nat_traversal::run_coordinator(
-            sock,
-            nat_traversal::AuthPolicy::Open { require_pop: false },
-        )
-        .await;
+        nat_traversal::run_coordinator(sock, nat_traversal::AuthPolicy::Public).await;
     });
 
     // ...and the running node registers on its own: establishment retries at
@@ -423,7 +435,8 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     let wg_probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("wg port probe");
     let wg_port = wg_probe.local_addr().expect("wg probe addr").port();
     drop(wg_probe);
-    let init = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .args([
             "init",
             "--name",
@@ -458,7 +471,8 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
     let log_path = dir.path().join("founder-run.log");
     let out = std::fs::File::create(&log_path).expect("create node log");
     let err = out.try_clone().expect("clone node log handle");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .arg("node")
         .arg("run")
         .arg("--config")
         .arg(founder.join("node.toml"))

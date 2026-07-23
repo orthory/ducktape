@@ -39,13 +39,13 @@
 //! dispatch's query surface must not see a same-block staged write, on either
 //! runtime — the contract runs' consensus-visible sibling reads rely on.
 
+use dispatch::{
+    DispatchMsg, DispatchQuery, DispatchReply, OutputContract, Routing, decode_reply, encode_msg,
+    encode_query,
+};
 use host::{BlockContext, FinalizedBlock, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
-use dispatch::{
-    decode_reply, encode_msg, encode_query, DispatchMsg, DispatchQuery, DispatchReply,
-    OutputContract, Routing,
-};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `dispatch` module's guest port by
@@ -55,9 +55,6 @@ const DISPATCH_WASM: &[u8] = include_bytes!("fixtures/dispatch.component.wasm");
 fn wasm_dispatch() -> WasmModule {
     WasmModule::from_bytes("dispatch", DISPATCH_WASM)
         .expect("load component")
-        // adapter port persists the native canonical snapshot as one host-KV
-        // value — the revision-2 declaration bin/node makes at cutover.
-        .with_state_schema_revision(2)
         // dispatch's query surface is committed-only regardless of caller (the
         // native contract): a same-block staged write must never leak into a
         // mid-block sibling read. this is Task 4's genesis wiring, pinned here.
@@ -395,7 +392,11 @@ async fn reject(
         saga_before,
         "wasm saga log moved on reject"
     );
-    assert_ne!(root_of(native), root_of(wasm), "schema break at block {height}");
+    assert_ne!(
+        root_of(native),
+        root_of(wasm),
+        "schema break at block {height}"
+    );
 }
 
 /// a recipe with every field populated — the case-1 registration.
@@ -435,7 +436,15 @@ async fn block_boundary_inner() {
 
     // CASE 1: RegisterRecipe (all fields populated) accepted on both; a
     // re-registration of the same recipe_id rejected on both.
-    accept(&mut native, &mut wasm, 1, alice.clone(), op(&full_recipe()), true).await;
+    accept(
+        &mut native,
+        &mut wasm,
+        1,
+        alice.clone(),
+        op(&full_recipe()),
+        true,
+    )
+    .await;
     reject(
         &mut native,
         &mut wasm,
@@ -457,17 +466,31 @@ async fn block_boundary_inner() {
         max_attempts: Some(5),
     };
     accept(&mut native, &mut wasm, 3, alice.clone(), op(&update), true).await;
-    reject(&mut native, &mut wasm, 4, bob.clone(), op(&update), "not owned").await;
+    reject(
+        &mut native,
+        &mut wasm,
+        4,
+        bob.clone(),
+        op(&update),
+        "not owned",
+    )
+    .await;
 
     // the update committed IDENTICALLY on both runtimes (a between-blocks
     // committed-only read — no lane divergence yet).
     let n_recipe = recipe(&native, "summarize").await;
     let w_recipe = recipe(&wasm, "summarize").await;
-    assert_eq!(n_recipe, w_recipe, "committed recipe diverges across runtimes");
+    assert_eq!(
+        n_recipe, w_recipe,
+        "committed recipe diverges across runtimes"
+    );
     let DispatchReply::Recipe(Some(r)) = &n_recipe else {
         panic!("recipe committed: {n_recipe:?}");
     };
-    assert_eq!(r.description, "summarize, tersely", "the owner's update landed");
+    assert_eq!(
+        r.description, "summarize, tersely",
+        "the owner's update landed"
+    );
     assert_eq!(r.max_attempts, 5);
     assert_eq!(r.capability, "alpha", "an unset field kept its value");
     assert_eq!(r.output_contract, OutputContract::Json);
@@ -566,7 +589,10 @@ async fn snapshot_install_inner() {
         })
         .expect("capture finalized snapshot");
     let entry = snap.module("dispatch").expect("dispatch in the snapshot");
-    assert_eq!(entry.root, live_root, "the snapshot root is the live module root");
+    assert_eq!(
+        entry.root, live_root,
+        "the snapshot root is the live module root"
+    );
     let StateSyncHandle::SnapshotBytes(bytes) = &entry.state_sync else {
         panic!(
             "the dispatch guest must serve self-contained snapshot bytes, got {:?}",

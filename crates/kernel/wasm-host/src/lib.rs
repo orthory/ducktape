@@ -74,7 +74,9 @@ mod bindings {
 }
 
 use bindings::Module as ModuleWorld;
-use bindings::ducktape::module::host::{self, Env as WitEnv, Error as WitError, Origin as WitOrigin};
+use bindings::ducktape::module::host::{
+    self, Env as WitEnv, Error as WitError, Origin as WitOrigin,
+};
 
 /// default per-dispatch fuel budget: the deterministic termination bound. It is
 /// identical on every validator, so a runaway guest traps at the same point on
@@ -179,10 +181,7 @@ pub trait OdbBacking: HostOdb {
     /// fresh substrate with no envelope yet — the per-commit recovery cursor
     /// [`Module::durable_commit_height`] surfaces so trailing-block recovery can
     /// verify a disk substrate that committed a block whose journal seal was lost
-    /// to a crash. byte-identical to native `Files::durable_commit_height`
-    /// (`module.rs`): dropping it would silently downgrade a wasm files tenant's
-    /// crash recovery from `SelectiveReplay` to `AssumeApplied`, so this rides the
-    /// backing to keep the cutover recovery-continuous, not just root-continuous.
+    /// to a crash. This keeps the files recovery path verifiable.
     fn durable_commit_height(&self) -> Option<u64>;
 }
 
@@ -314,7 +313,7 @@ struct HostData {
     /// finishes cleanly.
     pending: Option<PendingRead>,
     /// a ctx-less run (plain [`Module::query`]) has no SIBLING resolver: a memo
-    /// miss on module-root/query-module answers the pre-cutover stub surface
+    /// miss on module-root/query-module answers the ctx-less stub surface
     /// (root `None`, query `unsupported`) instead of pausing the run. state
     /// reads are NOT sealed — the injected store is the module's own state and
     /// is always resolvable, ctx or not.
@@ -495,10 +494,6 @@ pub struct WasmModule {
     /// the block boundary. always empty for non-object tenants.
     staged_objects: BTreeMap<Vec<u8>, Vec<u8>>,
     fuel: u64,
-    /// the canonical committed-state revision this tenant declares (see
-    /// [`Module::state_schema_revision`]). a byte-compatible port keeps the
-    /// native module's revision; a port that changes the state layout bumps it.
-    state_schema_revision: u32,
     /// serve QUERY rounds from committed state ALONE — the staged overlay is
     /// dropped for the read (execute rounds are untouched). opt-in, for a ported
     /// native module whose query surface was committed-only regardless of caller
@@ -532,7 +527,6 @@ impl WasmModule {
             staged: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
-            state_schema_revision: 1,
             committed_queries: false,
             block_height: None,
         })
@@ -625,15 +619,6 @@ impl WasmModule {
                 unreachable!("resolve_object_read only handles object-plane reads")
             }
         }
-    }
-
-    /// declare a non-default canonical-state revision (the recovery/state-sync
-    /// schema fence). a ported module that KEPT its native predecessor's byte
-    /// encoding keeps its revision (directory: 1); a port that changed the
-    /// layout must bump it in the same change, exactly like a native module.
-    pub fn with_state_schema_revision(mut self, revision: u32) -> Self {
-        self.state_schema_revision = revision;
-        self
     }
 
     /// serve this tenant's QUERY rounds from committed state ALONE — drop the
@@ -836,7 +821,9 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, SdkError> {
     // each entry costs at least two 8-byte length prefixes — a forged count can
     // never over-allocate.
     if count > (buf.len() / 16) as u64 {
-        return Err(SdkError::Module("snapshot entry count exceeds buffer".into()));
+        return Err(SdkError::Module(
+            "snapshot entry count exceeds buffer".into(),
+        ));
     }
     let mut committed = BTreeMap::new();
     let mut prev: Option<Vec<u8>> = None;
@@ -930,8 +917,7 @@ impl Module for WasmModule {
     }
 
     /// map mode: sha256 over the canonical host-KV encoding. store mode: the
-    /// injected store's REAL merkle root, verbatim — the same value the native
-    /// module computed pre-cutover, so the app-hash is continuous.
+    /// injected store's real Merkle root.
     fn root(&self) -> StateRoot {
         match &self.backing {
             StateBacking::Map { committed } => Self::root_of(committed),
@@ -943,10 +929,6 @@ impl Module for WasmModule {
         }
     }
 
-    fn state_schema_revision(&self) -> u32 {
-        self.state_schema_revision
-    }
-
     fn code_hash(&self) -> Option<Vec<u8>> {
         Some(self.code_hash.clone())
     }
@@ -954,8 +936,7 @@ impl Module for WasmModule {
     /// only an ODB substrate tracks a durable-commit cursor (the native files
     /// recovery bookkeeping it inherits); Map/Store tenants self-durably commit
     /// through their own stores and expose no cursor (the trait default `None`).
-    /// delegating this keeps the files cutover recovery-continuous — a trailing
-    /// unsealed files block still heals via `SelectiveReplay`, exactly as native.
+    /// Delegating this lets recovery verify a trailing unsealed files block.
     fn durable_commit_height(&self) -> Option<u64> {
         match &self.backing {
             StateBacking::Map { .. } | StateBacking::Store { .. } => None,
@@ -1013,7 +994,8 @@ impl Module for WasmModule {
     /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
     /// driven at a clean block boundary, never mid-block.
     fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
-        let component = Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
+        let component =
+            Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
         self.component = component;
         self.code_hash = sha256(component_bytes);
         self.staged.clear();
@@ -1070,7 +1052,9 @@ impl Module for WasmModule {
                 Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
                 {
                     Err(e) => Err(module_err(e)),
-                    Ok(inst) => inst.call_execute(&mut store, &msg.payload).map_err(module_err),
+                    Ok(inst) => inst
+                        .call_execute(&mut store, &msg.payload)
+                        .map_err(module_err),
                 },
             };
 
@@ -1315,8 +1299,7 @@ impl Module for WasmModule {
         // tell an odb backing to drop any block-local pending too (native
         // `Fs::abort_block`; a disk backing may sweep orphan object files). in
         // the fatal-or-complete commit model the backing has no pending here
-        // unless a commit failed partway, so this is a forward-compat safety
-        // hook for Task 4's disk cleanup.
+        // unless a commit failed partway.
         match &mut self.backing {
             StateBacking::Odb { backing } => backing.discard_block(),
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}

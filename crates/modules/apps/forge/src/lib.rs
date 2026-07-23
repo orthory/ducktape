@@ -119,8 +119,8 @@ use git2::Oid;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};
 use sha2::{Digest, Sha256};
 
-use crate::refs::{norm_branch, RepoState, INTEGRATION_BRANCH, MAIN_BRANCH};
-use crate::tracker::{author_from_origin, parse_hex_oid, Tracker};
+use crate::refs::{INTEGRATION_BRANCH, MAIN_BRANCH, RepoState, norm_branch};
+use crate::tracker::{Tracker, author_from_origin, parse_hex_oid};
 
 /// the well-known repo an empty `repo` field maps to — the single-repo wire
 /// (see the module docstring).
@@ -430,8 +430,12 @@ impl Forge {
         let Some(chat) = self.chat_target.clone() else {
             return Ok(());
         };
-        let message_id = self.staged_tracker_mut().next_sys_message_id(repo, number)?;
-        ctx.emit_msg(tracker::system_line_msg(&chat, repo, number, message_id, text));
+        let message_id = self
+            .staged_tracker_mut()
+            .next_sys_message_id(repo, number)?;
+        ctx.emit_msg(tracker::system_line_msg(
+            &chat, repo, number, message_id, text,
+        ));
         Ok(())
     }
 
@@ -482,7 +486,12 @@ impl Forge {
                 .as_deref()
                 .map(|b| parse_oid(b, "new_oid"))
                 .transpose()?;
-            state.stage_update(&u.ref_name, prev, new, new.is_some().then(|| digest.unwrap()))?;
+            state.stage_update(
+                &u.ref_name,
+                prev,
+                new,
+                new.is_some().then(|| digest.unwrap()),
+            )?;
         }
         Ok(())
     }
@@ -504,10 +513,6 @@ impl Module for Forge {
 
     /// 2: the root domain + snapshot magic reset to v1 tags with the
     /// no-versioning sweep — same layout, different preimage bytes.
-    fn state_schema_revision(&self) -> u32 {
-        2
-    }
-
     /// the composed state root — pure, no IO. see the composition invariant.
     fn root(&self) -> StateRoot {
         let entries = self.repos.iter().map(|(n, s)| (n.as_str(), &s.refs));
@@ -613,7 +618,9 @@ impl Module for Forge {
             ForgeMsg::SetItemState { repo, number, open } => {
                 let name = norm_repo(&repo)?;
                 author_from_origin(&ctx.env().origin)?;
-                if let Some(verb) = self.staged_tracker_mut().set_state(&name, number, open, now)?
+                if let Some(verb) = self
+                    .staged_tracker_mut()
+                    .set_state(&name, number, open, now)?
                 {
                     self.emit_system_line(ctx, &name, number, &format!("{verb} this"))?;
                 }
@@ -651,7 +658,8 @@ impl Module for Forge {
                     ));
                 }
                 state.stage_update(&target, Some(prev_target), Some(merge), Some(digest))?;
-                self.staged_tracker_mut().merge_pr(&name, number, merge, now)?;
+                self.staged_tracker_mut()
+                    .merge_pr(&name, number, merge, now)?;
                 self.emit_system_line(ctx, &name, number, "merged this pull request")?;
                 Ok(())
             }
@@ -666,7 +674,14 @@ impl Module for Forge {
                 let name = norm_repo(&repo)?;
                 let author = author_from_origin(&ctx.env().origin)?;
                 self.staged_tracker_mut().submit_review(
-                    &name, number, author, verdict, body, &commit_oid, comments, now,
+                    &name,
+                    number,
+                    author,
+                    verdict,
+                    body,
+                    &commit_oid,
+                    comments,
+                    now,
                 )?;
                 let line = match verdict {
                     ReviewVerdict::Approve => Some("approved these changes"),
@@ -749,14 +764,19 @@ impl Module for Forge {
                     )));
                 }
                 let source_branch = item.source_branch.ok_or_else(|| {
-                    Error::Module(format!("forge: pull request #{number} has no source branch"))
+                    Error::Module(format!(
+                        "forge: pull request #{number} has no source branch"
+                    ))
                 })?;
                 let target_branch = item.target_branch.ok_or_else(|| {
-                    Error::Module(format!("forge: pull request #{number} has no target branch"))
+                    Error::Module(format!(
+                        "forge: pull request #{number} has no target branch"
+                    ))
                 })?;
-                let state = self.repos.get(&name).ok_or_else(|| {
-                    Error::Module(format!("forge: no repo {name:?}"))
-                })?;
+                let state = self
+                    .repos
+                    .get(&name)
+                    .ok_or_else(|| Error::Module(format!("forge: no repo {name:?}")))?;
                 let source = state.refs.get(&source_branch).copied().ok_or_else(|| {
                     Error::Module(format!(
                         "forge: pull request #{number} source branch {source_branch:?} is not materialized"
@@ -946,14 +966,7 @@ mod tests {
         let source_tree_oid =
             git::build_tree(&repo, Some(&target_tree), "feature.txt", blob).unwrap();
         let source_tree = repo.find_tree(source_tree_oid).unwrap();
-        let source = git::commit(
-            &repo,
-            &source_tree,
-            Some(&target_commit),
-            "feature",
-            2,
-        )
-        .unwrap();
+        let source = git::commit(&repo, &source_tree, Some(&target_commit), "feature", 2).unwrap();
         git::update_ref(&repo, "refs/heads/dev", target).unwrap();
         git::update_ref(&repo, "refs/heads/feature", source).unwrap();
         let state = forge.repos.get_mut("demo").unwrap();
@@ -988,12 +1001,8 @@ mod tests {
         let blob = repo.blob(content).unwrap();
         for index in 0..files {
             let tree = repo.find_tree(tree_oid).unwrap();
-            tree_oid = git::build_tree(
-                &repo,
-                Some(&tree),
-                &format!("feature-{index:04}.txt"),
-                blob,
-            )
+            tree_oid =
+                git::build_tree(&repo, Some(&tree), &format!("feature-{index:04}.txt"), blob)
             .unwrap();
         }
         let tree = repo.find_tree(tree_oid).unwrap();
@@ -1012,12 +1021,10 @@ mod tests {
     fn pr_diff_pins_oids_and_returns_a_reviewable_patch() {
         let base = tmp_base("pr-diff");
         let (forge, source, target) = materialized_pr(&base, b"reviewable\n");
-        let bytes = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::PrDiff {
+        let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
                 repo: "demo".into(),
                 number: 1,
-            },
-        )))
+        })))
         .unwrap();
         let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
             panic!("wrong reply")
@@ -1039,12 +1046,10 @@ mod tests {
         let base = tmp_base("pr-diff-cap");
         let content = vec![b'x'; MAX_PR_DIFF_BYTES + 4096];
         let (forge, _, _) = materialized_pr(&base, &content);
-        let bytes = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::PrDiff {
+        let bytes = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
                 repo: "demo".into(),
                 number: 1,
-            },
-        )))
+        })))
         .unwrap();
         let ForgeReply::PrDiff(diff) = decode_reply(&bytes).unwrap() else {
             panic!("wrong reply")
@@ -1160,8 +1165,7 @@ mod tests {
         new_root.insert("mode.txt", old_blob, 0o100755).unwrap();
         new_root.insert("added.txt", new_blob, 0o100644).unwrap();
         let new_tree = repo.find_tree(new_root.write().unwrap()).unwrap();
-        let source =
-            git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
+        let source = git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
 
         let (patch, truncated, files_changed, _, _) = git::bounded_diff(
             &repo,
@@ -1210,8 +1214,7 @@ mod tests {
             .insert("entry-00000.txt", new_blob, 0o100644)
             .unwrap();
         let new_tree = repo.find_tree(new_builder.write().unwrap()).unwrap();
-        let source =
-            git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
+        let source = git::commit(&repo, &new_tree, Some(&target_commit), "source", 2).unwrap();
 
         let result = git::bounded_diff(
             &repo,
@@ -1250,14 +1253,7 @@ mod tests {
             tree_oid = builder.write().unwrap();
         }
         let source_tree = repo.find_tree(tree_oid).unwrap();
-        let source = git::commit(
-            &repo,
-            &source_tree,
-            Some(&target_commit),
-            "source",
-            2,
-        )
-        .unwrap();
+        let source = git::commit(&repo, &source_tree, Some(&target_commit), "source", 2).unwrap();
 
         let result = git::bounded_diff(
             &repo,
@@ -1288,15 +1284,13 @@ mod tests {
         let target_commit = repo.find_commit(target).unwrap();
         let blob = repo.blob(b"will disappear\n").unwrap();
         let mut source_builder = repo.treebuilder(None).unwrap();
-        source_builder.insert("missing.txt", blob, 0o100644).unwrap();
-        let source_tree = repo
-            .find_tree(source_builder.write().unwrap())
+        source_builder
+            .insert("missing.txt", blob, 0o100644)
             .unwrap();
-        let source =
-            git::commit(&repo, &source_tree, Some(&target_commit), "source", 2).unwrap();
+        let source_tree = repo.find_tree(source_builder.write().unwrap()).unwrap();
+        let source = git::commit(&repo, &source_tree, Some(&target_commit), "source", 2).unwrap();
         let hex = blob.to_string();
-        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..]))
-            .unwrap();
+        std::fs::remove_file(repo.path().join("objects").join(&hex[..2]).join(&hex[2..])).unwrap();
 
         let result = git::bounded_diff(
             &repo,
@@ -1317,19 +1311,12 @@ mod tests {
     fn pr_diff_rejects_too_many_changed_files_before_patch_generation() {
         let base = tmp_base("pr-diff-many-files");
         let (mut forge, _, target) = materialized_pr(&base, b"initial\n");
-        let source = replace_pr_source_with_files(
-            &mut forge,
-            &base,
-            target,
-            MAX_PR_DIFF_FILES + 1,
-            b"x\n",
-        );
-        let err = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::PrDiff {
+        let source =
+            replace_pr_source_with_files(&mut forge, &base, target, MAX_PR_DIFF_FILES + 1, b"x\n");
+        let err = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
                 repo: "demo".into(),
                 number: 1,
-            },
-        )))
+        })))
         .unwrap_err()
         .to_string();
         assert!(err.contains("diff is too large to serve"), "{err}");
@@ -1347,12 +1334,10 @@ mod tests {
         let base = tmp_base("pr-diff-large-blob");
         let content = vec![b'x'; MAX_PR_DIFF_BLOB_BYTES + 1];
         let (forge, source, target) = materialized_pr(&base, &content);
-        let err = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::PrDiff {
+        let err = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
                 repo: "demo".into(),
                 number: 1,
-            },
-        )))
+        })))
         .unwrap_err()
         .to_string();
         assert!(err.contains("diff is too large to serve"), "{err}");
@@ -1376,12 +1361,10 @@ mod tests {
             .unwrap()
             .refs
             .insert("feature".into(), missing);
-        let err = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::PrDiff {
+        let err = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
                 repo: "demo".into(),
                 number: 1,
-            },
-        )))
+        })))
         .unwrap_err()
         .to_string();
         assert!(err.contains("not fully materialized"), "{err}");
@@ -1404,12 +1387,10 @@ mod tests {
                 body: String::new(),
             },
         );
-        let err = futures::executor::block_on(forge.query(&encode_query(
-            &ForgeQuery::PrDiff {
+        let err = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::PrDiff {
                 repo: "demo".into(),
                 number: 1,
-            },
-        )))
+        })))
         .unwrap_err()
         .to_string();
         assert!(err.contains("issue, not a pull request"), "{err}");
@@ -1508,7 +1489,8 @@ mod tests {
 
         // stale CAS rejects; fresh CAS force-moves the feature branch.
         let mut ctx = ctx_at(2);
-        assert!(exec(
+        assert!(
+            exec(
             &mut forge,
             &mut ctx,
             &ForgeMsg::PushRefs {
@@ -1521,7 +1503,8 @@ mod tests {
                 pack_digest: Some(digest.clone()),
             },
         )
-        .is_err());
+            .is_err()
+        );
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         let mut ctx = ctx_at(3);
@@ -1543,7 +1526,8 @@ mod tests {
         // deleting main is refused; deleting the feature branch works and is
         // pack-free.
         let mut ctx = ctx_at(4);
-        assert!(exec(
+        assert!(
+            exec(
             &mut forge,
             &mut ctx,
             &ForgeMsg::PushRefs {
@@ -1556,7 +1540,8 @@ mod tests {
                 pack_digest: None,
             },
         )
-        .is_err());
+            .is_err()
+        );
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         let mut ctx = ctx_at(5);
@@ -1592,7 +1577,9 @@ mod tests {
     #[test]
     fn tracker_issue_pr_review_merge_flow() {
         let base = tmp_base("tracker");
-        let mut forge = Forge::init("forge", base.clone()).unwrap().with_chat("chat");
+        let mut forge = Forge::init("forge", base.clone())
+            .unwrap()
+            .with_chat("chat");
         let digest = vec![9u8; 32];
 
         // seed a repo with release main, integration dev, and a feature branch
@@ -1639,8 +1626,9 @@ mod tests {
         futures::executor::block_on(forge.commit_block()).unwrap();
         assert_eq!(ctx.msgs().len(), 1);
         assert_eq!(ctx.msgs()[0].target, "chat");
-        let chat::ChatMsg::CreateChannel { channel_id, name, .. } =
-            chat::decode_msg(&ctx.msgs()[0].payload).unwrap()
+        let chat::ChatMsg::CreateChannel {
+            channel_id, name, ..
+        } = chat::decode_msg(&ctx.msgs()[0].payload).unwrap()
         else {
             panic!("expected CreateChannel")
         };
@@ -1666,7 +1654,8 @@ mod tests {
 
         // a PR from an unborn branch rejects.
         let mut ctx = ctx_with_origin(4, user_origin(2));
-        assert!(exec(
+        assert!(
+            exec(
             &mut forge,
             &mut ctx,
             &ForgeMsg::OpenPr {
@@ -1677,7 +1666,8 @@ mod tests {
                 target_branch: String::new(),
             },
         )
-        .is_err());
+            .is_err()
+        );
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         // review with a line comment + approval system line.
@@ -1706,7 +1696,8 @@ mod tests {
         // merge: stale target CAS rejects; the real one moves dev AND marks
         // the PR merged in one block.
         let mut ctx = ctx_with_origin(6, user_origin(2));
-        assert!(exec(
+        assert!(
+            exec(
             &mut forge,
             &mut ctx,
             &ForgeMsg::MergePr {
@@ -1718,7 +1709,8 @@ mod tests {
                 pack_digest: hex(&digest),
             },
         )
-        .is_err());
+            .is_err()
+        );
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         let mut ctx = ctx_with_origin(7, user_origin(2));
@@ -1741,11 +1733,9 @@ mod tests {
         // committed state: release main stays put, dev advances, and the PR is
         // merged with its review recorded.
         assert_eq!(forge.read_head("demo"), Some(oid('a').to_string()));
-        let refs = futures::executor::block_on(
-            forge.query(&encode_query(&ForgeQuery::ListRefs {
+        let refs = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::ListRefs {
                 repo: "demo".into(),
-            })),
-        )
+        })))
         .unwrap();
         let ForgeReply::Refs(refs) = decode_reply(&refs).unwrap() else {
             panic!("refs missing")
@@ -1754,24 +1744,26 @@ mod tests {
             refs.iter().find(|head| head.name == "dev").unwrap().head,
             oid('c').to_string()
         );
-        let reply = futures::executor::block_on(
-            forge.query(&encode_query(&ForgeQuery::GetItem {
+        let reply = futures::executor::block_on(forge.query(&encode_query(&ForgeQuery::GetItem {
                 repo: "demo".into(),
                 number: 2,
-            })),
-        )
+        })))
         .unwrap();
         let ForgeReply::Item(Some(item)) = decode_reply(&reply).unwrap() else {
             panic!("item missing")
         };
         assert_eq!(item.summary.state, ItemState::Merged);
-        assert_eq!(item.merge_oid.as_deref(), Some(oid('c').to_string().as_str()));
+        assert_eq!(
+            item.merge_oid.as_deref(),
+            Some(oid('c').to_string().as_str())
+        );
         assert_eq!(item.reviews.len(), 1);
         assert_eq!(item.channel_id, "forge:demo:2");
 
         // a merged PR cannot merge/close again.
         let mut ctx = ctx_with_origin(8, user_origin(2));
-        assert!(exec(
+        assert!(
+            exec(
             &mut forge,
             &mut ctx,
             &ForgeMsg::SetItemState {
@@ -1780,17 +1772,17 @@ mod tests {
                 open: false,
             },
         )
-        .is_err());
+            .is_err()
+        );
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         // tracker survives restart via the persisted file.
         drop(forge);
         let reopened = Forge::init("forge", base.clone()).unwrap();
-        let reply = futures::executor::block_on(
-            reopened.query(&encode_query(&ForgeQuery::ListItems {
+        let reply =
+            futures::executor::block_on(reopened.query(&encode_query(&ForgeQuery::ListItems {
                 repo: "demo".into(),
-            })),
-        )
+            })))
         .unwrap();
         let ForgeReply::Items(items) = decode_reply(&reply).unwrap() else {
             panic!("wrong reply")
@@ -1806,7 +1798,9 @@ mod tests {
     fn tracker_root_is_reproducible_across_namespaces() {
         let run = |tag: &str| {
             let base = tmp_base(tag);
-            let mut forge = Forge::init("forge", base.clone()).unwrap().with_chat("chat");
+            let mut forge = Forge::init("forge", base.clone())
+                .unwrap()
+                .with_chat("chat");
             let mut ctx = ctx_at(1);
             exec_commit(
                 &mut forge,
@@ -1870,7 +1864,9 @@ mod tests {
     #[test]
     fn snapshot_round_trips_branches_and_tracker() {
         let base = tmp_base("snap");
-        let mut forge = Forge::init("forge", base.clone()).unwrap().with_chat("chat");
+        let mut forge = Forge::init("forge", base.clone())
+            .unwrap()
+            .with_chat("chat");
 
         // Real fixture objects on main, then a second branch on the same oid —
         // its objects exist, so the snapshot pack closes.
@@ -1910,11 +1906,10 @@ mod tests {
         let mut fresh = Forge::init("forge", rt.clone()).unwrap();
         fresh.install(&snap, root).unwrap();
         assert_eq!(fresh.root(), root, "install reproduces the root");
-        let reply = futures::executor::block_on(
-            fresh.query(&encode_query(&ForgeQuery::ListItems {
+        let reply =
+            futures::executor::block_on(fresh.query(&encode_query(&ForgeQuery::ListItems {
                 repo: "demo".into(),
-            })),
-        )
+            })))
         .unwrap();
         let ForgeReply::Items(items) = decode_reply(&reply).unwrap() else {
             panic!("wrong reply")

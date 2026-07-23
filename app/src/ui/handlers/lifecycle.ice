@@ -104,7 +104,7 @@ on workspace_connected(next)
   status = next.status
   block_height = next.height
   channels = next.channels
-  messages = next.messages
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -112,7 +112,7 @@ on workspace_connected(next)
   active_channel_huddle_count = next.active_channel_huddle_count
   channel_members = next.channel_members
   pages = next.pages
-  blocks = next.blocks
+  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
@@ -158,7 +158,7 @@ on workspace_refreshed(next)
   pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
   message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
   pending_message = retain_for_endpoint(pending_message, active_channel, next.active_channel)
-  messages = next.messages
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -192,7 +192,7 @@ on workspace_refreshed(next)
   block_actions_open = block_actions_open && !empty(selected_block_id)
   block_insert_open = block_insert_open && active_page == next.active_page
   block_insert_after_id = refreshed_selected_block(next.blocks, block_insert_after_id)
-  blocks = next.blocks
+  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
   page_delete_armed = page_delete_armed && active_page == next.active_page
   page_title_selected = page_title_selected && active_page == next.active_page
   active_page = next.active_page
@@ -266,18 +266,11 @@ on mutation_failed(cause)
   message_edit_draft = message_text_after_failure(message_edit_draft, mutation_phase, cause.committed)
   mutation_phase = mutation_failure_phase(cause.committed)
   channel_draft = restore_draft(channel_draft, pending_channel, cause.committed)
-  failed_message_draft = remember_failed_draft(failed_message_draft, message_draft, pending_message, cause.committed)
-  message_draft = restore_draft(message_draft, pending_message, cause.committed)
   page_draft = restore_draft(page_draft, pending_page, cause.committed)
-  block_draft = restore_draft(block_draft, pending_block, cause.committed)
   reply_draft = restore_draft(reply_draft, pending_reply, cause.committed)
-  messages = rollback_messages(messages, cause.committed)
   thread_messages = rollback_messages(thread_messages, cause.committed)
-  blocks = rollback_blocks(blocks, cause.committed)
   pending_channel = ""
-  pending_message = ""
   pending_page = ""
-  pending_block = ""
   pending_reply = ""
   error = cause.message
   live_dirty = live_dirty || cause.committed

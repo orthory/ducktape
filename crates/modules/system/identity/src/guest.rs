@@ -19,9 +19,7 @@
 //! resolves through the runtime's memoized replay), commit the INNER module,
 //! save the canonical snapshot back as OUTER staged writes — is the `agent` guest port
 //! verbatim; see that crate for the equivalence argument
-//! spelled out. the persisted encoding is the native canonical snapshot as ONE
-//! host-KV value: a STATE-SCHEMA BREAK versus the native root (revision 2;
-//! beta networks re-genesis, no back-compat shim). the WebAuthn / P-256 member
+//! spelled out. The canonical snapshot is stored as one host-KV value. The WebAuthn / P-256 member
 //! verifies run IN the guest — pure-Rust p256, deterministic on wasm32.
 
 use crate::Identity;

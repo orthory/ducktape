@@ -24,17 +24,15 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use agent::AgentModule;
-use runs::RunsModule;
 use automations::Automations;
 use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use gateway::Gateway;
-use tagging::TaggingModule;
 use files::Files;
 use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
+use gateway::Gateway;
 use host::{BlockContext, Host, SubmitError};
 use identity::Identity;
 use inbox::Inbox;
@@ -44,10 +42,12 @@ use noded::{
     NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row, hex_root,
 };
 use pages::Pages;
+use runs::RunsModule;
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
-use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
+use tagging::TaggingModule;
+use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — the `sim_base`
 /// selection of the single-source [`host::topology`] (identical to simnode's
@@ -218,9 +218,8 @@ fn run_node(
     // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
     // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
     // override — see capability-host. host-local only, never consensus.
-    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
-    // as today — relocating them would be a live (non-dormant) durability change.
-    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root).
+    // Persistent agent workspaces stay under <storage>; portable run mounts
+    // live under agent_runs_root outside it.
     let agent_dirs = capability_host::AgentDirs::under(&storage);
     // keys the portable run-root's per-node salt + D7 validation (oracle_workers).
     let storage_for_runs = storage.clone();
@@ -232,7 +231,10 @@ fn run_node(
         // automations bridging chat events into chat/tasks/inbox follow-ups,
         // jobs for deferred work, pages + forge for the substrate-backed
         // stores, and files (duckfs) for the content plane.
-        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
+        let chat = Chat::new(
+            "chat",
+            Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+        )
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         // the task plane: recipe manifests + capability dispatch with
@@ -254,9 +256,7 @@ fn run_node(
             Some("tasks".into()),
             Some("tasks".into()),
         )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2). its presence is what selects the v3 composer; unwired,
-        // the composer emits the v2 wire.
+        // The portable composer pins its source head from duckfs/files.
         .with_files_module("files")
         // the forge module the composer resolves forge:<repo>:<n> channels
         // against and the PR sink queries; unwired, forge-channel mentions
@@ -266,7 +266,10 @@ fn run_node(
         // the pages effects lane (pages.comment / pages.set_checked) writes
         // to; unwired, both degrade to breadcrumbs.
         .with_pages_module("pages");
-        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
+        let pages = Pages::new(
+            "pages",
+            Box::new(QmdbStore::init(context.child("pages"), "pages").await),
+        )
             .with_tagging("tagging");
         // forge shares the files body plane so a Push's packfile — uploaded to
         // the blob lane before the op is submitted — materializes locally; the
@@ -350,11 +353,7 @@ fn run_node(
         // because its heights are already spent above it. views re-derive
         // from local canonical state at the floor; module-level op history
         // below it starts over at the boundary, visibly via /v1/index/status.
-        match noded::rebuild_stale_modules(
-            &index,
-            &host,
-            indexer::RebuildMeta { height, time: 0 },
-        )
+        match noded::rebuild_stale_modules(&index, &host, indexer::RebuildMeta { height, time: 0 })
         .await
         {
             Ok(rebuilt) => {
@@ -453,7 +452,10 @@ fn run_node(
                         0,
                         index.is_poisoned(),
                         MODULE_IDS.iter().map(|id| {
-                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                            (
+                                (*id).to_string(),
+                                index.applied_height(id).unwrap_or_default(),
+                            )
                         }),
                     );
                     let modules = MODULE_IDS
@@ -494,7 +496,10 @@ fn run_node(
                         0,
                         index.is_poisoned(),
                         MODULE_IDS.iter().map(|id| {
-                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+                            (
+                                (*id).to_string(),
+                                index.applied_height(id).unwrap_or_default(),
+                            )
                         }),
                     );
                     // the context owns the registry; encode it to OpenMetrics text.
@@ -531,8 +536,7 @@ async fn submit_and_drain(
     msg: Msg,
 ) -> Result<BlockSummary, String> {
     let (included, events) =
-        match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await
-    {
+        match submit_one(host, height, index, blobs, stream_hub, metrics, origin, msg).await {
             Ok(out) => out,
             Err(SubmitError::Fatal(err)) => {
                 tracing::error!(target: "ducktape::node", error = %err, "FATAL: halting");
@@ -686,7 +690,13 @@ async fn submit_one(
     }));
     // the shared index-fold epilogue (store poisons itself on error, staying
     // loud on every later block until rebuilt).
-    noded::projection::apply_block_to_index(index, *height, consensus_time, record, &out.dispatches);
+    noded::projection::apply_block_to_index(
+        index,
+        *height,
+        consensus_time,
+        record,
+        &out.dispatches,
+    );
 
     // fan the block out live after the derived index had its chance to
     // materialize rows. no subscribers is fine.

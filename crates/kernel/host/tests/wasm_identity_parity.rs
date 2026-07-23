@@ -22,19 +22,19 @@
 //! verifies run IN the guest — deterministic pure-Rust p256 on wasm32 — and
 //! must answer byte-identically to the native module.
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use commonware_cryptography::ed25519::PrivateKey;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{
-    add_member_preimage, bind_preimage, encode_msg, encode_query, unbind_preimage,
-    remove_member_preimage, Identity, IdentityMsg, IdentityQuery, KeyKind, MemberAuth,
-    MemberProof, IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS,
-    IDENTITY_UNBIND_NS, MAX_QUERY_LIMIT,
+    IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
+    Identity, IdentityMsg, IdentityQuery, KeyKind, MAX_QUERY_LIMIT, MemberAuth, MemberProof,
+    add_member_preimage, bind_preimage, encode_msg, encode_query, remove_member_preimage,
+    unbind_preimage,
 };
 use sdk::{Error, Module as _, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
-use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
+use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `identity` module's guest port by
@@ -49,14 +49,12 @@ const CHAIN_ID: &str = "test-chain";
 /// initial store carrying the `__config` genesis parameters — exactly the
 /// production construction (`bin/node/src/host_state.rs`).
 fn wasm_identity_with_chain(chain_id: &str) -> WasmModule {
-    let mut module = WasmModule::from_bytes("identity", IDENTITY_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the identity
-        // canonical state.
-        .with_state_schema_revision(3);
+    let mut module = WasmModule::from_bytes("identity", IDENTITY_WASM).expect("load component");
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module.install(&bytes, root).expect("install genesis config");
+    module
+        .install(&bytes, root)
+        .expect("install genesis config");
     module
 }
 
@@ -127,7 +125,7 @@ fn wa_pub(k: &p256::ecdsa::SigningKey) -> Vec<u8> {
     k.verifying_key().to_sec1_bytes().to_vec()
 }
 fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    use p256::ecdsa::{signature::Signer as _, Signature};
+    use p256::ecdsa::{Signature, signature::Signer as _};
     // challenge = SHA256(namespace ‖ preimage), mirroring identity's scheme.
     let mut chal = Sha256::new();
     chal.update(ns);
@@ -170,7 +168,11 @@ fn msg(m: &IdentityMsg) -> Msg {
 
 fn bind(founder: &Ed, node: &[u8], nonce: u64) -> Msg {
     msg(&IdentityMsg::BindNode {
-        authorizer: ed_auth(founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, nonce)),
+        authorizer: ed_auth(
+            founder,
+            IDENTITY_BIND_NS,
+            &bind_preimage(CHAIN_ID, node, nonce),
+        ),
     })
 }
 
@@ -270,7 +272,11 @@ impl World {
         vec![ed_pub(&self.founder_a), ed_pub(&self.founder_b)]
     }
     fn nodes(&self) -> Vec<Vec<u8>> {
-        vec![self.node_a.clone(), self.node_b.clone(), self.node_c.clone()]
+        vec![
+            self.node_a.clone(),
+            self.node_b.clone(),
+            self.node_c.clone(),
+        ]
     }
     fn members(&self) -> Vec<Vec<u8>> {
         vec![
@@ -347,8 +353,26 @@ async fn same_ops_inner() {
 
     // sibling-only blocks (valset grants for the resident tier) hold the
     // identity roots on both runtimes.
-    roundtrip(&mut native, &mut wasm, &w, 1, Origin::System, grant(&w.node_b), false).await;
-    roundtrip(&mut native, &mut wasm, &w, 2, Origin::System, grant(&w.node_c), false).await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &w,
+        1,
+        Origin::System,
+        grant(&w.node_b),
+        false,
+    )
+    .await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &w,
+        2,
+        Origin::System,
+        grant(&w.node_c),
+        false,
+    )
+    .await;
 
     // h3: a VALIDATOR founds account A (valset gate resolves through the wasm
     // runtime's memoized replay; the bind cert verifies IN the guest).
@@ -411,8 +435,13 @@ async fn same_ops_inner() {
     // h7: founder A admits a WebAuthn PASSKEY — the raw ECDSA-P256 assertion
     // envelope (authData ‖ SHA256(clientDataJSON)) verifies inside the wasm
     // guest, byte-identically to the native module. A's nonce: 2.
-    let preimage =
-        add_member_preimage(CHAIN_ID, &a_id, &wa_pub(&w.passkey), KeyKind::WebauthnP256, 2);
+    let preimage = add_member_preimage(
+        CHAIN_ID,
+        &a_id,
+        &wa_pub(&w.passkey),
+        KeyKind::WebauthnP256,
+        2,
+    );
     roundtrip(
         &mut native,
         &mut wasm,
@@ -531,8 +560,14 @@ async fn same_ops_inner() {
     // error-shaped queries reject identically too (needle containment — the
     // wasm runtime wraps the native reason in its wit-error rendering).
     let junk = b"definitely-not-json".to_vec();
-    let n_err = native.query("identity", &junk).await.expect_err("native rejects");
-    let w_err = wasm.query("identity", &junk).await.expect_err("wasm rejects");
+    let n_err = native
+        .query("identity", &junk)
+        .await
+        .expect_err("native rejects");
+    let w_err = wasm
+        .query("identity", &junk)
+        .await
+        .expect_err("wasm rejects");
     let Error::Module(n_msg) = n_err else {
         panic!("native query error shape: {n_err:?}");
     };

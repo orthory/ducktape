@@ -11,8 +11,8 @@
 //! written, and each pack must hash-verify object by object BEFORE any ref moves
 //! — by asserting the rejected module's root AND its on-disk repos stay untouched.
 //!
-//! these tests drive the SINGLE default repo (empty `repo` -> back-compat
-//! default); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
+//! these tests drive the SINGLE default repo (`repo: ""` is its canonical
+//! address); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
 
 mod support;
 

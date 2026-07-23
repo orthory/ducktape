@@ -14,8 +14,8 @@
 
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use inbox::{
-    decode_reply, encode_msg, encode_query, Inbox, InboxMsg, InboxQuery, InboxReply,
-    Notification, MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES, MAX_QUERY_LIMIT,
+    Inbox, InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES,
+    MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
@@ -25,11 +25,7 @@ use wasm_host::WasmModule;
 const INBOX_WASM: &[u8] = include_bytes!("fixtures/inbox.component.wasm");
 
 fn wasm_inbox() -> WasmModule {
-    WasmModule::from_bytes("inbox", INBOX_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the inbox
-        // canonical state — the same declaration bin/node makes.
-        .with_state_schema_revision(2)
+    WasmModule::from_bytes("inbox", INBOX_WASM).expect("load component")
 }
 
 /// a stand-in producer module that, on any op, emits an inbox `Deliver`

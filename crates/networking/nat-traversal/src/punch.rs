@@ -94,12 +94,12 @@ pub fn drive_simulated(
     //    the coordinator) and the coordinator records the observed mapped addr.
     let a_mapped = a_nat.send(internal(&a_key), coord_addr());
     let b_mapped = b_nat.send(internal(&b_key), coord_addr());
-    coord.handle(a_mapped, Msg::Register { key: a_key });
-    coord.handle(b_mapped, Msg::Register { key: b_key });
+    coord.handle_verified(a_key, a_mapped, Msg::Register { key: a_key });
+    coord.handle_verified(b_key, b_mapped, Msg::Register { key: b_key });
 
     // 2. A looks up B; the coordinator returns B's reflexive and issues
     //    PunchSync to both mapped addresses.
-    let out = coord.handle(a_mapped, Msg::Lookup { key: b_key });
+    let out = coord.handle_verified(a_key, a_mapped, Msg::Lookup { key: b_key });
     let mut a_peer = None;
     let mut b_peer = None;
     for (dst, msg) in out {
@@ -188,7 +188,8 @@ pub fn drive_rebind_reconnect(
     //    re-observes `new_a_mapped` as the source and applies the nonce guard.
     //    Supersession is asserted end-to-end by step 5's re-resolution below (a
     //    stale mapping would resolve the OLD reflexive and fail `NoReflexive`).
-    let _ = coord.handle(
+    let _ = coord.handle_verified(
+        a_key,
         new_a_mapped,
         Msg::Readvertise {
             key: a_key,
@@ -199,7 +200,7 @@ pub fn drive_rebind_reconnect(
     // 5. B re-resolves: its Lookup now returns A's NEW reflexive, and the
     //    coordinator fans out PunchSync to both the new A mapping and B.
     let b_mapped = a_plan0_b_mapped(b_key, b_nat);
-    let out = coord.handle(b_mapped, Msg::Lookup { key: a_key });
+    let out = coord.handle_verified(b_key, b_mapped, Msg::Lookup { key: a_key });
     let mut b_peer = None; // A's new reflexive, as B sees it
     let mut a_peer = None; // B's reflexive, as A sees it (via the fan-out)
     for (dst, msg) in out {
@@ -272,10 +273,10 @@ mod tests {
     ) -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
         let a_mapped = a_nat.send(internal(&a_key), coord_addr());
         let b_mapped = b_nat.send(internal(&b_key), coord_addr());
-        coord.handle(a_mapped, Msg::Register { key: a_key });
-        coord.handle(b_mapped, Msg::Register { key: b_key });
+        coord.handle_verified(a_key, a_mapped, Msg::Register { key: a_key });
+        coord.handle_verified(b_key, b_mapped, Msg::Register { key: b_key });
 
-        let out = coord.handle(a_mapped, Msg::Lookup { key: b_key });
+        let out = coord.handle_verified(a_key, a_mapped, Msg::Lookup { key: b_key });
         let mut a_peer = None;
         let mut b_peer = None;
         for (dst, msg) in out {

@@ -36,9 +36,7 @@ use wasm_host::WasmModule;
 const AGENT_WASM: &[u8] = include_bytes!("fixtures/agent.component.wasm");
 
 fn wasm_agent() -> WasmModule {
-    WasmModule::from_bytes("agent", AGENT_WASM)
-        .expect("load component")
-        .with_state_schema_revision(1)
+    WasmModule::from_bytes("agent", AGENT_WASM).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
@@ -298,27 +296,8 @@ async fn same_ops_inner() {
     let mut native = native_host();
     let mut wasm = wasm_host_();
 
-    assert_eq!(
-        native
-            .state_schema()
-            .into_iter()
-            .find(|(id, _)| id == "agent")
-            .map(|(_, revision)| revision),
-        Some(1),
-        "the native agent encoding is v1"
-    );
-    assert_eq!(
-        wasm.state_schema()
-            .into_iter()
-            .find(|(id, _)| id == "agent")
-            .map(|(_, revision)| revision),
-        Some(1),
-        "the adapter-backed agent encoding is v1"
-    );
-
-    // the adapter SCHEMA-BREAK pin, agent-shaped: the empty canonical map and
-    // the empty host-KV store share the 8-zero-byte preimage, so genesis roots
-    // COINCIDE and the adapter break surfaces at the first committed write.
+    // The empty canonical map and host-KV store share the same preimage, so
+    // parity becomes observable after the first committed write.
     assert_ne!(
         root_of(&native),
         StateRoot::ZERO,

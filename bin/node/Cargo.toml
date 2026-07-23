@@ -28,9 +28,7 @@ directory = { workspace = true }
 valset = { workspace = true }
 governance = { workspace = true }
 # the invite-accept verb drives governance ops through the local rpc.
-# the network lifecycle module: the no-downtime protocol-version coordinator AND
-# the module code registry, one genesis-wired module. read_upgrade_state reads
-# its committed boundary snapshot; height-gated live code swaps are realized
+# the network module-code registry. Height-gated live code swaps are realized
 # through the blobstore-backed CodeSource.
 lifecycle = { workspace = true }
 wasm-host = { workspace = true }
@@ -120,7 +118,7 @@ sha2 = { workspace = true }
 toml = "0.8"
 # identity keygen entropy (`Signer::random`).
 rand = "0.8"
-# `user.key` v2 codec (src/userkey.rs): mnemonic <-> seed encoding, argon2id
+# encrypted `user.key` v1 codec: mnemonic <-> seed encoding, argon2id
 # KEK derivation, and the XChaCha20-Poly1305 AEAD wrapping it at rest.
 bip39 = { workspace = true }
 argon2 = { workspace = true }
@@ -147,11 +145,11 @@ objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
-# hand-mirrored the NodeCommand actor). dev-only feature: resolver v2 keeps it
+# hand-mirrored the NodeCommand actor). dev-only feature keeps it
 # out of the production `ducktape` binary build.
 noded = { path = "../noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
-# dev-only feature: resolver v2 keeps it out of the production binary build.
+# dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
 # paused-clock unit tests (`#[tokio::test(start_paused = true)]`) — the

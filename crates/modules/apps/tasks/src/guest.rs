@@ -13,11 +13,8 @@
 //! the whole-state dispatch model and its equivalence argument are spelled out
 //! in `agent`'s guest port (a whole-state tenant) and `guest-adapter`; tasks is
 //! the same shape: a pure `SnapshotBytes` module whose canonical snapshot is
-//! persisted as ONE host-KV value per dispatch. that host-KV encoding is a
-//! STATE-SCHEMA BREAK versus the native root (revision 3 — the tasks+jobs merge
-//! folded the former `jobs` module's job board into this one, so the canonical
-//! snapshot is now the task board and job board concatenated; beta networks
-//! re-genesis, no back-compat shim).
+//! persisted as one host-KV value per dispatch. The canonical snapshot
+//! contains the task board followed by the job board.
 
 use crate::Tasks;
 

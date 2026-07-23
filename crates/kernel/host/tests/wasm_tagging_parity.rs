@@ -20,9 +20,7 @@
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use tagging::{
-    decode_event, encode_msg, Author, EntityRef, TagEvent, TaggingModule, TaggingMsg,
-};
+use tagging::{Author, EntityRef, TagEvent, TaggingModule, TaggingMsg, decode_event, encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `tagging` module's guest port by
@@ -37,11 +35,7 @@ const MAX_TAGS_PER_EVENT: usize = 16;
 const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
 
 fn wasm_tagging() -> WasmModule {
-    WasmModule::from_bytes("tagging", TAGGING_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the tagging
-        // canonical state — the declaration bin/node makes at cutover.
-        .with_state_schema_revision(2)
+    WasmModule::from_bytes("tagging", TAGGING_WASM).expect("load component")
 }
 
 /// EXACTLY the production wiring in bin/node's host state — the direct-owner
@@ -246,7 +240,11 @@ async fn same_ops_inner() {
     let ops: Vec<(Origin, Msg, bool)> = vec![
         // h1: acceptance DEPENDS on the sibling read: module_root("chat") must
         // resolve Some through the wasm runtime's memoized replay.
-        (from_module("agent"), op(&subscribe("chat", "general")), true),
+        (
+            from_module("agent"),
+            op(&subscribe("chat", "general")),
+            true,
+        ),
         // h2: idempotent re-subscribe stages nothing.
         (
             from_module("agent"),
@@ -706,7 +704,10 @@ async fn multi_dispatch_inner() {
 
     // and the accepted subscription is LIVE: a tag on "warm" delivers.
     for (h, host) in [(4u64, &mut native), (4u64, &mut wasm)] {
-        host.submit_at(block(h, from_module("chat")), op(&user_tag("warm", 3, vec![])))
+        host.submit_at(
+            block(h, from_module("chat")),
+            op(&user_tag("warm", 3, vec![])),
+        )
             .await
             .expect("tag on the accepted subscription");
     }

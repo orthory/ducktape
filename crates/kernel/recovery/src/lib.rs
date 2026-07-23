@@ -89,49 +89,6 @@ use host::{BlockContext, DispatchRecord, Host, SubmitError};
 use node::{BlockSeal, BlockSink, Disposition, decode_batch};
 use sdk::{ModuleId, StateRoot};
 
-/// Stable machine-readable marker consumed by the native shell when a node
-/// refuses a clean-break-incompatible workspace.
-pub const STATE_SCHEMA_INCOMPATIBLE_MARKER: &str = "DUCKTAPE_STATE_SCHEMA_INCOMPATIBLE";
-
-/// A checkpoint was produced by a different canonical module-state schema.
-/// This is not corruption and is never repaired in place: changing snapshot
-/// bytes would rewrite module roots, the app hash, and sealed history.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "{STATE_SCHEMA_INCOMPATIBLE_MARKER}: workspace state schema {found} is incompatible with this binary ({expected}); workspace data was not modified. Archive this workspace and create a fresh workspace. Ducktape identity and account keys are stored outside workspace state and must be preserved."
-)]
-pub struct IncompatibleStateSchema {
-    expected: FingerprintDisplay,
-    found: FingerprintDisplay,
-}
-
-/// Compare a persisted schema fingerprint with the binary's production
-/// schema.
-pub fn check_state_schema(
-    found: [u8; 32],
-    expected: [u8; 32],
-) -> Result<(), IncompatibleStateSchema> {
-    if found == expected {
-        return Ok(());
-    }
-    Err(IncompatibleStateSchema {
-        expected: FingerprintDisplay(expected),
-        found: FingerprintDisplay(found),
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FingerprintDisplay([u8; 32]);
-
-impl std::fmt::Display for FingerprintDisplay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
-    }
-}
-
 /// runtime bounds every store here needs (same alias the storage crate uses:
 /// `Storage + Clock + Metrics`).
 pub use commonware_storage::Context;
@@ -197,7 +154,6 @@ const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
 fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     sdk::codec::push_bytes(out, b);
@@ -438,9 +394,6 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
-    /// Fingerprint of the exact ordered module/state-schema set that produced
-    /// this checkpoint.
-    pub state_schema: [u8; 32],
 }
 
 impl Manifest {
@@ -473,7 +426,6 @@ impl Manifest {
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
         put_keys(&mut out, &self.residents);
-        out.extend_from_slice(&self.state_schema);
         out
     }
 
@@ -506,7 +458,6 @@ impl Manifest {
         let oplog_pos = c.u64("oplog pos")?;
         let next_seq = c.u64("next seq")?;
         let residents = get_keys(&mut c)?;
-        let state_schema = c.array::<32>("state schema fingerprint")?;
         c.finish("manifest")?;
         Ok(Self {
             height,
@@ -520,7 +471,6 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
-            state_schema,
         })
     }
 
@@ -588,17 +538,7 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
-            state_schema: host.state_schema_fingerprint(),
         })
-    }
-
-    /// Clean-break state-schema preflight. Call this before opening or
-    /// installing any module substrate.
-    pub fn preflight_state_schema(
-        &self,
-        expected: [u8; 32],
-    ) -> Result<(), IncompatibleStateSchema> {
-        check_state_schema(self.state_schema, expected)
     }
 }
 
@@ -1307,8 +1247,7 @@ where
                         // "durable" = already at this block's post-root OR raced
                         // strictly past it: either way a per-block-durable disk
                         // substrate committed here and must NOT be re-committed.
-                        let all_durable =
-                            (0..changed.len()).all(|i| at_post_of[i] || ahead_of[i]);
+                        let all_durable = (0..changed.len()).all(|i| at_post_of[i] || ahead_of[i]);
                         let all_pre = at_pre_of.iter().all(|&b| b);
                         if all_durable {
                             // nothing to re-commit: the disk cohort already holds
@@ -1472,14 +1411,8 @@ where
                 .map(|(id, _)| id.clone())
                 .collect();
             let disposition = if moved.is_empty() {
-                let (disposition, dispatches) = apply_block(
-                    host,
-                    height,
-                    &frame,
-                    None,
-                    code_source.as_ref(),
-                )
-                .await?;
+                let (disposition, dispatches) =
+                    apply_block(host, height, &frame, None, code_source.as_ref()).await?;
                 if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
                         height,
@@ -1495,9 +1428,8 @@ where
             } else {
                 // classify for its FAIL-CLOSED rules (an unexplained mover
                 // alongside a verified claimant, or a >1-substrate claim, is
-                // damage). both surviving plans then RE-DERIVE: the legacy
-                // seal-the-observed-roots path (AssumeApplied) is exact only
-                // if every effect of the block is visible in the moved roots
+                // damage). Every accepted case then RE-DERIVES: sealing the
+                // observed roots is exact only if every effect of the block is visible in the moved roots
                 // — unknowable here, because a member's dispatch follow-ups
                 // fan into modules the frame never names, and any in-memory
                 // write among them died with the process. sealing observed
@@ -1506,7 +1438,7 @@ where
                 // trailing [capability + chat] batch); re-derivation is a
                 // deterministic no-op when nothing was lost, and the
                 // reconstruction when something was.
-                let _ = trailing::classify_trailing(height, &moved, &trailing_claims)?;
+                trailing::classify_trailing(height, &moved, &trailing_claims)?;
                 {
                     // re-execute the durable WAL frame committing ONLY the
                     // still-at-pre cohort — reconstructing the writes the
@@ -1542,9 +1474,7 @@ where
                     // moved without a frame that could have moved it.
                     let targets = frame_targets(&frame);
                     for id in &moved {
-                        if !dispatches.iter().any(|d| d.module == *id)
-                            && !targets.contains(id)
-                        {
+                        if !dispatches.iter().any(|d| d.module == *id) && !targets.contains(id) {
                             return Err(Error::Torn(format!(
                                 "trailing block {height} neither dispatched nor targeted \
                                  module {id}, which durably committed it — the observed \
@@ -1632,8 +1562,7 @@ async fn apply_block(
     expect: Option<Disposition>,
     code_source: &dyn host::CodeSource,
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
-    let (disposition, dispatches) =
-        replay_batch(host, height, frame, None, code_source).await?;
+    let (disposition, dispatches) = replay_batch(host, height, frame, None, code_source).await?;
     if let Some(expect) = expect
         && disposition != expect
     {
@@ -1873,7 +1802,6 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
-            state_schema: [0xAB; 32],
         }
     }
 
@@ -1884,26 +1812,6 @@ mod tests {
         assert_eq!(decoded, m);
         assert_eq!(decoded.snapshot("directory"), Some(b"dir-bytes".as_ref()));
         assert_eq!(decoded.root("valset"), Some(StateRoot([3; 32])));
-    }
-
-    #[test]
-    fn schema_mismatch_clean_breaks_with_actionable_error() {
-        let decoded = Manifest::decode(&sample_manifest().encode()).expect("roundtrip");
-        let error = decoded
-            .preflight_state_schema([0xCD; 32])
-            .expect_err("mismatched schema must clean-break");
-        let message = error.to_string();
-        assert!(message.contains(STATE_SCHEMA_INCOMPATIBLE_MARKER));
-        assert!(message.contains("workspace data was not modified"));
-    }
-
-    #[test]
-    fn schema_revision_changes_the_preflight_identity() {
-        let revision_one = host::state_schema_fingerprint([("runs", 1)]);
-        let revision_two = host::state_schema_fingerprint([("runs", 2)]);
-        assert_ne!(revision_one, revision_two);
-        assert!(check_state_schema(revision_two, revision_two).is_ok());
-        assert!(check_state_schema(revision_one, revision_two).is_err());
     }
 
     #[test]

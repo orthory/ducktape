@@ -18,8 +18,7 @@
 //! primary router for that address space: class -> claimant module. claims
 //! are first-come-first-served ([`CapabilityMsg::ClaimClass`]), and there is
 //! deliberately NO unclaim op — removing a claim would dangle every address
-//! already routed through it, so a claim is permanent until a future,
-//! explicitly-migrated handoff op exists. the address-parsing helpers below
+//! already routed through it, so claims are permanent. the address-parsing helpers below
 //! ([`parse_classed_address`], [`class_of`]) are the single source of truth
 //! for the separators, so later dispatch work cannot drift from the registry.
 
@@ -105,7 +104,9 @@ pub fn validate_resources(resources: &BTreeMap<String, u64>) -> Result<(), Strin
     for (key, value) in resources {
         validate_tag(key).map_err(|e| format!("resource dimension {key:?}: {e}"))?;
         if *value == 0 {
-            return Err(format!("resource dimension {key:?} is zero (omit it instead)"));
+            return Err(format!(
+                "resource dimension {key:?} is zero (omit it instead)"
+            ));
         }
     }
     Ok(())
@@ -283,8 +284,9 @@ mod tests {
         // keys obey the ONE tag rule (charset/length), values must be non-zero
         assert!(validate_resources(&res(&[("Cores", 8)])).is_err());
         assert!(validate_resources(&res(&[("cores", 0)])).is_err());
-        let too_many: BTreeMap<String, u64> =
-            (0..=MAX_RESOURCE_DIMS).map(|i| (format!("d{i}"), 1)).collect();
+        let too_many: BTreeMap<String, u64> = (0..=MAX_RESOURCE_DIMS)
+            .map(|i| (format!("d{i}"), 1))
+            .collect();
         assert!(validate_resources(&too_many).is_err());
     }
 

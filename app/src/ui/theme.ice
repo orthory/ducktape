@@ -1,12 +1,14 @@
 font ui family="Inter" weight=normal stretch=normal style=normal default=true
+font medium family="Inter" weight=medium stretch=normal style=normal
+font display family="Inter" weight=bold stretch=normal style=normal
 font mono family=mono weight=normal stretch=normal style=normal
 
 theme
-  bg #101012ee
-  surface #202023d8
+  bg #101012fc
+  surface #202023fa
   popover #262629ff
-  sidebar #18181bdc
-  elevated #29292ddc
+  sidebar #18181bf0
+  elevated #29292dfc
   fg #f2f2f4
   muted #a0a0a7
   primary #d8d8dc

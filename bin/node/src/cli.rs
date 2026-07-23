@@ -183,8 +183,7 @@ fn peer_line(
         " msgs_tx={} msgs_rx={}",
         peer.msgs_sent, peer.msgs_received
     ));
-    let dt_secs =
-        (second.sampled_at_ms.saturating_sub(first.sampled_at_ms)).max(1) as f64 / 1000.0;
+    let dt_secs = (second.sampled_at_ms.saturating_sub(first.sampled_at_ms)).max(1) as f64 / 1000.0;
     if let Some(base) = baseline {
         let tx_rate = (peer.msgs_sent.saturating_sub(base.msgs_sent)) as f64 / dt_secs;
         let rx_rate = (peer.msgs_received.saturating_sub(base.msgs_received)) as f64 / dt_secs;
@@ -401,7 +400,7 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the WireGuard bootstrap: endpoints are minted from the advertised host
     // (the listen IP is usually unspecified) + the plane's UDP ports; the
     // mesh port is where the joiner dials this member's overlay ULA once the
-    // tunnel routes. the bootstrap is MANDATORY in v2 (the overlay plane
+    // tunnel routes. the bootstrap is mandatory (the overlay plane
     // carries the data planes and the sealed first-contact intro) — and the
     // network shape always runs the plane (`wireguard_listen` is required).
     let wg_listen: std::net::SocketAddr = raw
@@ -527,13 +526,7 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         role,
         expires,
     );
-    let blob_string = config::encode_invite(
-        &invite_descriptor,
-        &token,
-        &wireguard,
-        &fronts,
-        &key,
-    )?;
+    let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
     if role == config::InviteRole::Client {
         eprintln!(
             "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
@@ -1217,8 +1210,8 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
 /// this node's own pubkey.
 ///
 /// honesty: leaving is NOT unilateral when this account lacks the proposal's
-/// required power. this casts only its account ballot (or the legacy node
-/// ballot), and member remove prints the remaining threshold plus the command
+/// required power. This casts only its account ballot, and member remove
+/// prints the remaining threshold plus the command
 /// other voters run (`member remove <this key>`).
 fn cmd_member_leave(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = args.selector.config_path()?;
@@ -1296,10 +1289,12 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // would gate-fail terminally at the lobby; fail at paste time with the
     // right pointer instead.
     if invite.token.role == config::InviteRole::Client {
-        return Err("this is a CLIENT invite — it grants submit access, not a node. \
+        return Err(
+            "this is a CLIENT invite — it grants submit access, not a node. \
                     redeem it with `ducktape user redeem-invite <blob> --node \
                     <member-http-url> --key <user.key>`"
-            .into());
+                .into(),
+        );
     }
     let mut descriptor = invite.descriptor.clone();
     let explicit_dir = args.dir.is_some();
@@ -1313,7 +1308,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     };
     std::fs::create_dir_all(&dir)?;
     // mint (or reuse) this workspace dir's identity. Every invite is bearer
-    // (기명 dropped in v2): there is no target to match, so any freshly minted
+    // (invites are bearer credentials): there is no target to match, so any freshly minted
     // key may redeem — the OOB "hand the inviter your join code first" step is
     // gone. The redeeming key is bound by the join proof and the token is
     // single-use, so a paste simply admits whoever runs it.
@@ -1324,7 +1319,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // (network shape only — a dev-seed or incomplete file aborts) survive,
     // working defaults fill the rest. computed BEFORE anything lands on disk
     // so a corrupt existing node.toml aborts the join without leaving a
-    // half-migrated dir.
+    // partially written dir.
     let net = &args.plumbing;
     let plumbing = config::merged_plumbing(
         &dir,
@@ -1338,15 +1333,11 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
-    if config::invite_requires_reachability_defaults(&invite) {
-        // a WireGuard or Coordinated invite makes the reachability plane the
-        // dial path: fold the inviter's (and every offered front's) overlay
-        // ULA into this joiner's reach hints so the mesh can dial them the
-        // moment a tunnel is up.
+    // Fold the inviter's and every offered front's overlay ULA into this
+    // joiner's reach hints so the mesh can dial them once a tunnel is up.
         {
             let wg = &invite.wireguard;
-            let issuer_identity =
-                wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+        let issuer_identity = wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
                     .map_err(|e| format!("inviter identity: {e:?}"))?;
             let inviter_ula =
                 wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), issuer_identity);
@@ -1355,10 +1346,6 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
                 reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
             });
         }
-        // every offered front gets the same overlay-ULA Direct hint the inviter
-        // does: once ANY candidate's tunnel comes up, the mesh dialer can reach
-        // that member's overlay ULA and ride the mesh from there. A hint whose
-        // tunnel never comes up simply fails to dial — harmless.
         for front in &invite.fronts {
             let Ok(member) = ed25519::PublicKey::decode(&front.member_key[..]) else {
                 continue;
@@ -1372,7 +1359,6 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
                 reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),
             });
         }
-    }
     descriptor.save(&dir.join("network.toml"))?;
     // identity was minted + target-checked at the top of the join.
     config::write_node_toml(&dir, &plumbing)?;
@@ -1384,7 +1370,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     config::save_invite_fronts(&dir, &invite.fronts)?;
     {
         // the tunnel bootstrap the joining node dials BEFORE any p2p (always
-        // present in v2); kept beside the token so `run_node` brings the
+        // present); kept beside the token so `run_node` brings the
         // interface up first.
         config::save_invite_wireguard(&dir, &invite.token.issuer, &invite.wireguard)?;
         // mint the WireGuard identity NOW so the run's plane and intro
@@ -1465,7 +1451,10 @@ mod tests {
                 if token == "help" {
                     continue;
                 }
-                assert!(bash.contains(token), "ducktape.bash missing token {token:?}");
+                assert!(
+                    bash.contains(token),
+                    "ducktape.bash missing token {token:?}"
+                );
                 assert!(zsh.contains(token), "ducktape.zsh missing token {token:?}");
                 for arg in sub.get_arguments() {
                     if arg.is_hide_set() {
@@ -1482,7 +1471,11 @@ mod tests {
                 walk(sub, bash, zsh);
             }
         }
-        walk(&<crate::Cli as clap::CommandFactory>::command(), &bash, &zsh);
+        walk(
+            &<crate::Cli as clap::CommandFactory>::command(),
+            &bash,
+            &zsh,
+        );
     }
 
     /// the grammar's own consistency check (conflicting ids, broken flatten,
@@ -1541,7 +1534,10 @@ mod tests {
 
         let without_baseline = peer_line(&second.peers[0], None, &first, &second);
         assert!(!without_baseline.contains("tx/s="), "{without_baseline}");
-        assert!(!without_baseline.contains("sync_B/s="), "{without_baseline}");
+        assert!(
+            !without_baseline.contains("sync_B/s="),
+            "{without_baseline}"
+        );
     }
 
     #[test]

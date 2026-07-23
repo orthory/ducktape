@@ -4,8 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 # host-side worker for dispatch WorkSpec saga effects: resolve the capability
-# to a local provider, assemble the run-envelope input (or feed a legacy flat
-# payload verbatim), submit the raw answer. no prompt text is AUTHORED here,
+# to a local provider, assemble the run-envelope input, submit the raw answer.
+# no prompt text is AUTHORED here,
 # no output parsing opinions, no credential handling — contract enforcement
 # is the dispatch module's consensus-side validation.
 [dependencies]

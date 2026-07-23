@@ -5,10 +5,9 @@
 //! the store's root, and qmdb's batch canonicalizes mutations by hashed key,
 //! so the native logical-key commit order and the wasm hashed-key drain order
 //! produce the same op log), the same query replies, and the same resolver
-//! sync surface. the state schema revision therefore STAYS 1 — this cutover
-//! changes the executor, not one committed byte — and this proof pins that
-//! explicitly, unlike the whole-state adapter ports whose roots diverge by
-//! declared schema break.
+//! sync surface. this cutover changes the executor, not one committed byte, and
+//! this proof pins that explicitly, unlike whole-state adapter ports whose root
+//! representations differ.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
@@ -213,7 +212,7 @@ fn same_ops_identical_roots_block_by_block() {
 
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
         // (empty) qmdb store, so unlike the whole-state ports the roots are
-        // EQUAL, not a declared schema break.
+        // EQUAL.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
 
         // the host's snapshot orchestration sees the wasm tenant exactly as it
@@ -456,13 +455,6 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
         )
         .expect("load component");
 
-        // the committed encoding is UNCHANGED (same store, same op log, same
-        // root — proven above), so the canonical-state revision must stay 1:
-        // pre-cutover workspaces reopen without a schema fence.
-        assert_eq!(Module::state_schema_revision(&native), 1);
-        assert_eq!(Module::state_schema_revision(&wasm), 1);
-
-        // and the declared sync surface is verbatim the native declaration.
         let n_handle = native.state_sync_handle().expect("native handle");
         let w_handle = wasm.state_sync_handle().expect("wasm handle");
         assert_eq!(n_handle, w_handle, "sync handles diverge");

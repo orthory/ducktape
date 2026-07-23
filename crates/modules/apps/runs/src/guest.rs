@@ -60,8 +60,7 @@
 //!
 //! the persisted encoding is the native module's canonical snapshot stored as
 //! ONE host-KV value (plus the ring under its own key), so the wasm root is
-//! the host-KV encoding over the three reserved keys. This is the current v1
-//! Runs state schema registered at genesis.
+//! the host-KV encoding over the three reserved keys.
 
 use crate::RunsModule;
 use guest_adapter::{Guest, WitCtx, block_on, host, load_state, save_state};
@@ -101,7 +100,7 @@ struct Component;
 /// the native module at THIS dispatch's state: genesis shape when nothing was
 /// ever persisted, else the persisted snapshot verify-then-adopted against its
 /// persisted root. an install failure is host-store corruption surfaced as a
-/// deterministic rejection, never a silent re-genesis.
+/// deterministic rejection.
 fn loaded_module() -> Result<RunsModule, host::Error> {
     let mut module = RunsModule::new(
         MODULE_ID,

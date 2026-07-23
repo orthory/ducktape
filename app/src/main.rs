@@ -677,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn optimistic_send_never_erases_the_next_draft() {
+    fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
         let (mut app, _) = Ducktape::__boot();
         app.connected = true;
         app.loading = false;
@@ -685,46 +685,64 @@ mod tests {
         app.message_draft = "first".into();
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
-        assert_eq!(app.mutation_phase, "message");
+        let first_id = app.messages[0].id.clone();
+        assert_eq!(app.mutation_phase, "idle");
         assert!(app.message_draft.is_empty());
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].pending);
 
         app.message_draft = "second".into();
-        let _ = app.__update(__DucktapeMessage::ChatMutated(backend::ChatData {
-            channels: Vec::new(),
-            messages: vec![backend::ChatMessage {
-                id: "message-1".into(),
-                seq: 1,
-                author: "you".into(),
-                meta: "#1".into(),
-                body: "first".into(),
-                pending: false,
-                rev: 0,
-                edited: false,
-                deleted: false,
-                reply_count: 0,
-                thread_seq: 0,
-                reactions: Vec::new(),
-            }],
-            active_channel: "general".into(),
-            active_channel_name: "general".into(),
-            active_channel_archived: false,
-            active_channel_members_only: false,
-            active_channel_huddle_count: 0,
-            channel_members: Vec::new(),
-            selected_message_seq: 0,
-            selected_message_rev: 0,
-            selected_message_body: String::new(),
-            active_thread_seq: 0,
-            thread_target_seq: 0,
-            thread_messages: Vec::new(),
-            thread_next_reply_offset: 0,
-            thread_has_more: false,
+        let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let second_id = app.messages[1].id.clone();
+        assert_ne!(first_id, second_id);
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.messages.iter().all(|message| message.pending));
+
+        app.message_draft = "third".into();
+        let _ = app.__update(__DucktapeMessage::MessageSent(backend::ChatSendResult {
+            operation_id: first_id.clone(),
+            channel_id: "general".into(),
+            data: backend::ChatData {
+                channels: Vec::new(),
+                messages: vec![backend::ChatMessage {
+                    id: first_id,
+                    seq: 1,
+                    author: "you".into(),
+                    meta: "#1".into(),
+                    body: "first".into(),
+                    pending: false,
+                    rev: 0,
+                    edited: false,
+                    deleted: false,
+                    reply_count: 0,
+                    thread_seq: 0,
+                    reactions: Vec::new(),
+                }],
+                active_channel: "general".into(),
+                active_channel_name: "general".into(),
+                active_channel_archived: false,
+                active_channel_members_only: false,
+                active_channel_huddle_count: 0,
+                channel_members: Vec::new(),
+                selected_message_seq: 0,
+                selected_message_rev: 0,
+                selected_message_body: String::new(),
+                active_thread_seq: 0,
+                thread_target_seq: 0,
+                thread_messages: Vec::new(),
+                thread_next_reply_offset: 0,
+                thread_has_more: false,
+            },
         }));
-        assert_eq!(app.message_draft, "second");
+        assert_eq!(app.message_draft, "third");
         assert_eq!(app.mutation_phase, "idle");
         assert!(!app.messages[0].pending);
+        assert_eq!(app.messages[1].id, second_id);
+        assert!(app.messages[1].pending);
+
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains("stack #message(message.id) width=fill"));
+        assert!(!view.contains("#message(message.seq)"));
     }
 
     #[test]
@@ -775,13 +793,13 @@ mod tests {
             .unwrap()
             .0;
         assert!(toolbar.contains("mouse enter=message_entered(message.seq)"));
-        assert!(toolbar.contains("if !message.deleted && hovered"));
-        assert!(toolbar.contains("if !message.deleted && !hovered"));
+        assert!(toolbar.contains("if !message.deleted && !message.pending && hovered"));
+        assert!(toolbar.contains("if !message.deleted && !message.pending && !hovered"));
         assert!(toolbar.contains("-> open_message_actions_accessibly("));
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
         assert!(components.contains(
-            "text message.author size=12.0 wrapping=none @font-bold text-fg\n        text message.meta size=10.0 wrapping=none @text-muted\n        space width=fill"
+            "text message.author size=13.0 wrapping=none font=medium @text-fg\n        text message.meta size=11.0 wrapping=none @text-muted\n        space width=fill"
         ));
         assert!(toolbar.contains("bg=popover"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
@@ -866,7 +884,8 @@ mod tests {
         app.thread_generation = 4;
         app.thread_loading = true;
         app.active_thread_seq = 1;
-        app.thread_messages = backend::optimistic_message(Vec::new(), "old thread".into());
+        app.thread_messages =
+            backend::optimistic_message(Vec::new(), "old thread".into(), "pending-old".into());
         app.reply_draft = "old reply".into();
 
         let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
@@ -921,7 +940,11 @@ mod tests {
         assert_eq!(app.thread_messages[1].body, "first");
         assert_eq!(app.thread_next_reply_offset, 2);
 
-        app.thread_messages = backend::optimistic_message(app.thread_messages, "third".into());
+        app.thread_messages = backend::optimistic_message(
+            app.thread_messages,
+            "third".into(),
+            "pending-third".into(),
+        );
         app.pending_reply = "third".into();
         app.mutation_phase = "reply".into();
         let _ = app.__update(__DucktapeMessage::ThreadMutated(message(4, 1, "third")));
@@ -935,8 +958,11 @@ mod tests {
         partial.active_thread_seq = 1;
         partial.thread_next_reply_offset = 256;
         partial.thread_has_more = true;
-        partial.thread_messages =
-            backend::optimistic_message(vec![message(1, 0, "root")], "new tail".into());
+        partial.thread_messages = backend::optimistic_message(
+            vec![message(1, 0, "root")],
+            "new tail".into(),
+            "pending-tail".into(),
+        );
         partial.mutation_phase = "reply".into();
         let _ = partial.__update(__DucktapeMessage::ThreadMutated(message(
             300, 1, "new tail",
@@ -1086,6 +1112,74 @@ mod tests {
         assert!(view.contains(
             "container width=fill padding-left=36.0\n                    PageTitleEditor"
         ));
+    }
+
+    #[test]
+    fn macos_shell_uses_flat_system_materials() {
+        let ui = concat!(
+            include_str!("ui/app.ice"),
+            include_str!("ui/backend.ice"),
+            include_str!("ui/state.ice"),
+            include_str!("ui/theme.ice"),
+            include_str!("ui/view.ice"),
+            include_str!("ui/components/shell.ice"),
+            include_str!("ui/components/chat.ice"),
+            include_str!("ui/components/pages.ice"),
+            include_str!("ui/handlers/lifecycle.ice"),
+            include_str!("ui/handlers/chat.ice"),
+            include_str!("ui/handlers/pages.ice"),
+        );
+        for gradient in ["linear(", "radial(", "conic("] {
+            assert!(!ui.contains(gradient), "{gradient}");
+        }
+
+        let app = include_str!("ui/app.ice");
+        assert!(app.contains("transparent true"));
+        assert!(app.contains("titlebar-transparent true"));
+        assert!(app.contains("fullsize-content-view true"));
+        assert!(app.contains("font \"../../assets/InterVariable.ttf\""));
+
+        let theme = include_str!("ui/theme.ice");
+        assert!(theme.contains("font ui family=\"Inter\" weight=normal"));
+        assert!(theme.contains("bg #101012fc"));
+        assert!(theme.contains("sidebar #18181bf0"));
+
+        let shell = include_str!("ui/components/shell.ice");
+        assert!(shell.contains(
+            "container width=240.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar"
+        ));
+    }
+
+    #[test]
+    fn compact_controls_share_a_single_geometry_and_type_scale() {
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains("padding=6.2 text-size=13.0 line-height=1.2"));
+        assert!(view.contains("padding=6.6 text-size=14.0 line-height=1.2"));
+        assert!(view.contains("button \"Send\" disabled="));
+        assert!(view.contains("height=30.0 padding=7.0 -> send_message_submit"));
+
+        let components = concat!(
+            include_str!("ui/components/shell.ice"),
+            include_str!("ui/components/chat.ice"),
+            include_str!("ui/components/pages.ice"),
+        );
+        assert!(components.contains("row width=fill height=fill spacing=9.0 align=center"));
+        for line in view.lines().chain(components.lines()).filter(|line| {
+            [
+                "button \"+\" label",
+                "button \"×\" label",
+                "button \"…\" label",
+            ]
+            .iter()
+            .any(|needle| line.contains(needle))
+        }) {
+            assert!(line.contains("width="), "{line}");
+            assert!(line.contains("height="), "{line}");
+        }
+        for obsolete_size in ["size=10.0", "size=12.0", "text-size=12.0"] {
+            assert!(!view.contains(obsolete_size), "{obsolete_size}");
+            assert!(!components.contains(obsolete_size), "{obsolete_size}");
+        }
     }
 
     #[test]
@@ -1638,12 +1732,19 @@ mod tests {
         app.message_draft = "retry me".into();
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
-        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
-            message: "rejected".into(),
-            committed: false,
-        }));
+        let operation_id = app.messages[0].id.clone();
+        let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+            backend::OptimisticMutationError {
+                message: "rejected".into(),
+                committed: false,
+                operation_id,
+                scope_id: "general".into(),
+                body: "retry me".into(),
+            },
+        ));
 
         assert_eq!(app.message_draft, "retry me");
+        assert!(app.failed_message_draft.is_empty());
         assert!(app.messages.is_empty());
         assert_eq!(app.error, "rejected");
         assert_eq!(app.mutation_phase, "idle");
@@ -1658,11 +1759,17 @@ mod tests {
         app.message_draft = "first".into();
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
+        let operation_id = app.messages[0].id.clone();
         app.message_draft = "second".into();
-        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
-            message: "rejected".into(),
-            committed: false,
-        }));
+        let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+            backend::OptimisticMutationError {
+                message: "rejected".into(),
+                committed: false,
+                operation_id,
+                scope_id: "general".into(),
+                body: "first".into(),
+            },
+        ));
 
         assert_eq!(app.message_draft, "second");
         assert_eq!(app.failed_message_draft, "first");
@@ -1682,22 +1789,27 @@ mod tests {
         app.message_draft = "committed once".into();
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
-        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
-            message: "read failed after commit".into(),
-            committed: true,
-        }));
+        let operation_id = app.messages[0].id.clone();
+        let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+            backend::OptimisticMutationError {
+                message: "read failed after commit".into(),
+                committed: true,
+                operation_id,
+                scope_id: "general".into(),
+                body: "committed once".into(),
+            },
+        ));
 
         assert!(app.message_draft.is_empty());
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].pending);
-        assert_eq!(app.mutation_phase, "recovering");
+        assert_eq!(app.mutation_phase, "idle");
         assert_eq!(app.sync_phase, "refreshing");
-        assert_eq!(app.block_autosave_generation, 1);
 
-        app.message_draft = "must wait".into();
+        app.message_draft = "still available".into();
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
-        assert_eq!(app.messages.len(), 1);
-        assert_eq!(app.mutation_phase, "recovering");
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.mutation_phase, "idle");
     }
 
     #[test]
@@ -1753,7 +1865,11 @@ mod tests {
         app.thread_generation = 4;
         app.thread_loading = true;
         app.mutation_phase = "recovering".into();
-        app.thread_messages = backend::optimistic_message(Vec::new(), "committed reply".into());
+        app.thread_messages = backend::optimistic_message(
+            Vec::new(),
+            "committed reply".into(),
+            "pending-committed".into(),
+        );
 
         let _ = app.__update(__DucktapeMessage::ThreadFailed(backend::HydrationError {
             generation: 4,
@@ -1775,16 +1891,23 @@ mod tests {
         app.block_draft = "retry heading".into();
 
         let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
-        assert_eq!(app.mutation_phase, "block");
+        let operation_id = app.blocks[0].id.clone();
+        assert_eq!(app.mutation_phase, "idle");
         assert!(app.block_draft.is_empty());
         assert_eq!(app.blocks[0].kind, "Heading 2");
         assert!(app.blocks[0].pending);
 
-        let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
-            message: "rejected".into(),
-            committed: false,
-        }));
+        let _ = app.__update(__DucktapeMessage::BlockAddFailed(
+            backend::OptimisticMutationError {
+                message: "rejected".into(),
+                committed: false,
+                operation_id,
+                scope_id: "welcome".into(),
+                body: "retry heading".into(),
+            },
+        ));
         assert_eq!(app.block_draft, "retry heading");
+        assert!(app.orphaned_block_drafts.is_empty());
         assert!(app.blocks.is_empty());
         assert_eq!(app.mutation_phase, "idle");
     }

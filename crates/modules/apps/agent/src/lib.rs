@@ -822,10 +822,6 @@ impl Module for AgentModule {
         self.id.clone()
     }
 
-    fn state_schema_revision(&self) -> u32 {
-        1
-    }
-
     /// state-based commitment: sha256 over the canonical committed encoding —
     /// a length-prefixed fold of every agent field in sorted-key order.
     /// sensitive to every field, so any transition moves the root. the

@@ -45,11 +45,13 @@ state
   live_thread_generation:i64 = 0
   reply_draft = ""
   pending_reply = ""
+  pending_reply_id = ""
   channel_draft = ""
   channel_create_open = false
   pending_channel = ""
   message_draft = ""
   pending_message = ""
+  pending_message_id = ""
   failed_message_draft = ""
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
@@ -68,6 +70,7 @@ state
   new_block_kind = "Text"
   block_draft = ""
   pending_block = ""
+  pending_block_id = ""
   block_insert_open = false
   block_insert_after_id = ""
   selected_block_id = ""

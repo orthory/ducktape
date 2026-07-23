@@ -4,7 +4,7 @@ How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
 the reference modules are `crates/guests/hello-wasm` (v1),
-`crates/guests/hello-wasm-v2` (its live-update target), and
+`crates/guests/hello-wasm-replacement` (its live-update target), and
 `crates/guests/sibling-wasm` (the cross-module-read reference). The first
 REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
 the `directory` module, bytes-compatible with the native implementation it
@@ -83,7 +83,7 @@ encodings — is your compatibility surface across updates:
 - Keep it byte-stable, or make N+1 read both layouts and migrate lazily on
   write. There is no offline migration hook: the swap boundary is a plain block
   boundary.
-- `hello-wasm-v2` demonstrates the discipline: same `count` key, same
+- `hello-wasm-replacement` demonstrates the discipline: same `count` key, same
   little-endian `u64` value, different logic (`inc` steps 100, not 1).
 
 ## Build: crate → component

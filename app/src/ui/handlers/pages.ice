@@ -155,19 +155,18 @@ on pages_resized(_, height)
   pages_height = height
 
 on open_block_insert(key, after_id)
-  return if loading || mutation_phase != "idle" || empty(active_page)
+  return if loading || empty(active_page)
   block_insert_after_id = after_id
   block_insert_open = true
   task widget focus #workspace-tabs/key(key)/block-insert-row(block_insert_after_id)/block-insert
 
 on open_root_block_insert
-  return if loading || mutation_phase != "idle" || empty(active_page)
+  return if loading || empty(active_page)
   block_insert_after_id = ""
   block_insert_open = true
   task widget focus #workspace-tabs/block-insert-row(block_insert_after_id)/block-insert
 
 on close_block_insert
-  return if mutation_phase != "idle"
   block_insert_open = false
   block_insert_after_id = ""
 
@@ -192,19 +191,39 @@ on discard_orphaned_comment_draft(draft)
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
 
 on add_block_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
+  return if loading || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
-  mutation_phase = "block"
   pending_block = block_draft
+  pending_block_id = fresh_operation_id("block")
   block_draft = ""
-  blocks = optimistic_block(blocks, block_insert_after_id, new_block_kind, pending_block)
+  blocks = optimistic_block(blocks, block_insert_after_id, new_block_kind, pending_block, pending_block_id)
   error = ""
-  run add_block(connected_rpc, password, active_page, block_insert_after_id, new_block_kind, pending_block) -> pages_mutated _ | mutation_failed _
+  run add_block(connected_rpc, password, active_page, block_insert_after_id, new_block_kind, pending_block_id, pending_block) -> block_added _ | block_add_failed _
+
+on block_added(next)
+  pages = next.data.pages
+  return if active_page != next.page_id || next.data.active_page != next.page_id
+  blocks = merge_block_insert_result(next.data.blocks, blocks, active_page, next.data.active_page, next.operation_id)
+  active_page_title = next.data.active_page_title
+  active_page_parent = next.data.active_page_parent
+  error = ""
+
+on block_add_failed(cause)
+  return if active_page != cause.scope_id
+  blocks = rollback_pending_block(blocks, cause.operation_id, cause.committed)
+  orphaned_block_drafts = remember_failed_block(orphaned_block_drafts, block_draft, cause.body, cause.committed)
+  block_draft = restore_draft(block_draft, cause.body, cause.committed)
+  error = cause.message
+  live_dirty = live_dirty || cause.committed
+  return if !live_dirty || loading || sync_phase == "refreshing"
+  live_dirty = false
+  hydration_generation = hydration_generation + 1
+  sync_phase = "refreshing"
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on select_block(key, id, kind, text, checked, open_actions)
-  return if mutation_phase != "idle"
   block_menu_x = pages_pointer_x
   block_menu_y = block_action_menu_y(pages_pointer_y, pages_height)
   block_actions_open = open_actions
@@ -535,7 +554,7 @@ on pages_updated(next)
   block_comment_draft = ""
   pending_block_comment = ""
   pages = next.pages
-  blocks = next.blocks
+  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
@@ -560,15 +579,14 @@ on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
   block_autosave_generation = block_autosave_generation + 1
   pages = next.pages
-  blocks = next.blocks
+  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
+  block_insert_open = block_insert_open && active_page == next.active_page
+  block_insert_after_id = refreshed_selected_block(next.blocks, block_insert_after_id)
   active_page = next.active_page
   active_page_title = next.active_page_title
   active_page_parent = next.active_page_parent
   pending_page = ""
   page_create_open = false
-  pending_block = ""
-  block_insert_open = false
-  block_insert_after_id = ""
   block_actions_open = false
   selected_block_id = next.selected_block_id
   selected_block_kind = next.selected_block_kind

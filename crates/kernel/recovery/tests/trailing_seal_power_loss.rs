@@ -198,7 +198,7 @@ type Cell = Rc<RefCell<DiskCell>>;
 struct CursorDisk {
     id: ModuleId,
     cell: Cell,
-    /// whether the double REPORTS its cursor: `false` models a legacy disk
+    /// whether the double REPORTS its cursor: `false` models a current disk
     /// substrate with no cursor (kv/chat/document today) — the fail-closed
     /// baseline the fix must not alter.
     report_cursor: bool,
@@ -458,7 +458,10 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
             .expect("a cursor-bound trailing commit recovers");
 
         assert_eq!(recovered.height, Some(1), "tip block recovered");
-        assert!(recovered.rolled_forward, "the unsealed tip was rolled forward");
+        assert!(
+            recovered.rolled_forward,
+            "the unsealed tip was rolled forward"
+        );
         // APP-HASH CONTINUITY: byte-identical to what the live node composed
         // after the tip block — what the network sealed.
         assert_eq!(recovered.app_hash, tip_hash);
@@ -479,9 +482,11 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
         let mut fanout2 = Fanout::new("fanout", &["disk"]);
         fanout2.install(manifest.snapshot("fanout").expect("snapshot"));
         let disk2 = CursorDisk::reopen("disk", cell.clone());
-        let mut host2 =
-            Host::genesis(vec![Box::new(fanout2), Box::new(disk2)]).expect("genesis");
-        let again = recovery.recover(&mut host2, &manifest).await.expect("again");
+        let mut host2 = Host::genesis(vec![Box::new(fanout2), Box::new(disk2)]).expect("genesis");
+        let again = recovery
+            .recover(&mut host2, &manifest)
+            .await
+            .expect("again");
         assert!(!again.rolled_forward, "the roll-forward sealed the tip");
         assert_eq!(again.app_hash, recovered.app_hash, "idempotent app-hash");
         assert_eq!(cell.borrow().counter, 2, "still no extra disk commit");
@@ -633,7 +638,11 @@ fn a_lost_trailing_seal_without_a_cursor_still_fail_stops() {
             matches!(err, recovery::Error::Torn(_)),
             "expected Error::Torn, got {err:?}"
         );
-        assert_eq!(cell.borrow().counter, 2, "the refused replay touched nothing");
+        assert_eq!(
+            cell.borrow().counter,
+            2,
+            "the refused replay touched nothing"
+        );
     });
 }
 
@@ -701,7 +710,11 @@ fn a_cursor_claiming_the_wrong_trailing_height_still_fail_stops() {
             matches!(err, recovery::Error::Torn(_)),
             "expected Error::Torn, got {err:?}"
         );
-        assert_eq!(cell.borrow().counter, 2, "the refused replay touched nothing");
+        assert_eq!(
+            cell.borrow().counter,
+            2,
+            "the refused replay touched nothing"
+        );
     });
 }
 
@@ -770,7 +783,11 @@ fn a_cursor_with_no_trailing_wal_record_still_fail_stops() {
             matches!(err, recovery::Error::Torn(_)),
             "expected Error::Torn, got {err:?}"
         );
-        assert_eq!(cell.borrow().counter, 99, "the refused replay touched nothing");
+        assert_eq!(
+            cell.borrow().counter,
+            99,
+            "the refused replay touched nothing"
+        );
     });
 }
 

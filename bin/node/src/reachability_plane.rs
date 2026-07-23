@@ -72,21 +72,9 @@ where
         return true;
     };
     let nonce = msg.nonce.clone();
-    // a pre-verify refusal goes out in the CLEAR (no joiner key trusted yet).
-    let refuse_cleartext = |detail: String| {
-        lobby::encode_intro_ack(&lobby::IntroAck {
-            nonce: nonce.clone(),
-            reply: lobby::IntroReply::Refused { detail },
-        })
-    };
     let verified = match lobby::verify_intro(&msg, binding) {
         Ok(v) => v,
-        Err(e) => {
-            if path == IntroPath::Direct {
-                ack(refuse_cleartext(e)).await;
-            }
-            return true;
-        }
+        Err(_) => return true,
     };
     // past verification we hold the joiner's WG key: every reply from here is
     // SEALED to it, so an `Admitted`'s coordinator capability never crosses the
@@ -635,8 +623,8 @@ async fn reachability_plane(
                         sock,
                         me,
                         coords.clone(),
-                        Some(signer.clone()),
-                        coord_cap,
+                        signer.clone(),
+                        coord_cap.clone(),
                     )
                 });
             match client {
@@ -663,14 +651,14 @@ async fn reachability_plane(
                         reason = "rendezvous_socket_unusable",
                         "continuing without rendezvous; direct/front paths still work"
                     );
-                    reachability::NatResolver::bind(me, Vec::new(), None)
+                    reachability::NatResolver::bind(me, Vec::new(), (signer.clone(), coord_cap))
                         .await
                         .expect("empty-coordinator pass-through resolver is infallible")
                 }
             }
         }
         _ => {
-            let auth = Some((signer.clone(), coord_cap));
+            let auth = (signer.clone(), coord_cap.clone());
             match reachability::NatResolver::bind(me, coords.clone(), auth).await {
                 Ok(resolver) => resolver,
                 // bind can only fail LOCALLY now (its own UDP socket); an
@@ -683,7 +671,7 @@ async fn reachability_plane(
                         reason = "rendezvous_socket_unusable",
                         "continuing without rendezvous; direct/front paths still work"
                     );
-                    reachability::NatResolver::bind(me, Vec::new(), None)
+                    reachability::NatResolver::bind(me, Vec::new(), (signer.clone(), coord_cap))
                         .await
                         .expect("empty-coordinator pass-through resolver is infallible")
                 }
@@ -731,7 +719,8 @@ async fn reachability_plane(
     // is idempotent — the orchestrator below loads the same file, so a failure
     // here means the plane is unusable for inbound joins; log and disable the
     // listeners rather than take the node down (the plane is an overlay).
-    let intro_keypair = match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file) {
+    let intro_keypair = match reachability::WireGuardKeypair::load_or_generate(&wireguard_key_file)
+    {
         Ok((keypair, _)) => Some(std::sync::Arc::new(keypair)),
         Err(e) => {
             tracing::warn!(

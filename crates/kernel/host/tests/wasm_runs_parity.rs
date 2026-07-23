@@ -88,9 +88,7 @@ use wasm_host::WasmModule;
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 
 fn wasm_runs() -> WasmModule {
-    WasmModule::from_bytes("runs", RUNS_WASM)
-        .expect("load component")
-        .with_state_schema_revision(1)
+    WasmModule::from_bytes("runs", RUNS_WASM).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`) — the exact
