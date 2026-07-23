@@ -60,7 +60,7 @@ gotcha, the 2-validator-quorum teardown caveat).
 6. **A and B publish their reflexive endpoints and rendezvous.** `[NAT-DEPENDENT]` — the node drives lookup and punch through `NatResolver`; success depends on the observed NAT mappings being punchable.
 7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NAT-DEPENDENT]` — the library path is CI-proven and the node drives it, but a NAT pair that cannot punch fails honestly because there is no relay fallback.
 8. **On hole-punch failure, resolution fails honestly.** `[BY DESIGN]` — there is no relay fallback (the DERP-style relay was removed 2026-07-06; the coordinator is rendezvous-only). A pair that cannot punch surfaces a `PeerFailed` or falls back only to a real advertised endpoint if one exists; a symmetric↔symmetric pair with no routable endpoint needs a different entry path.
-9. **Real state-sync / app-hash flows over the tunnel.** `[NAT-DEPENDENT]` — depends on steps 6-7 establishing a direct path.
+9. **Real state-sync / root-hash flows over the tunnel.** `[NAT-DEPENDENT]` — depends on steps 6-7 establishing a direct path.
 
 ## What you CAN demo today vs. what proves the tunnel
 

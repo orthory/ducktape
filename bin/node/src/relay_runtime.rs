@@ -322,8 +322,8 @@ fn resolve_resident_hold(hold: ResidentHold, outcome: relay::RelayOutcome) {
         | (ResidentHold::Rpc(tx), relay::RelayOutcome::Refused { detail }) => {
             let _ = tx.send(RpcReply::err(detail));
         }
-        (ResidentHold::Http(tx), relay::RelayOutcome::Applied { height, app_hash }) => {
-            let _ = tx.send(Ok(noded::BlockSummary { height, app_hash }));
+        (ResidentHold::Http(tx), relay::RelayOutcome::Applied { height, root_hash }) => {
+            let _ = tx.send(Ok(noded::BlockSummary { height, root_hash }));
         }
         (ResidentHold::Http(tx), relay::RelayOutcome::Rejected { detail })
         | (ResidentHold::Http(tx), relay::RelayOutcome::Refused { detail }) => {

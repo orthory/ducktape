@@ -7,7 +7,7 @@ version.workspace = true
 # stands up a real `authenticated::discovery` encrypted TCP mesh to its peers,
 # runs a live simplex Engine (via consensus::SimplexOrderer, over the REAL tokio
 # runtime + discovery channels — NOT p2p::simulated) driving an OrderedNode over
-# host::Host, and prints its evolving app-hash so a demo script can assert two
+# host::Host, and prints its evolving root-hash so a demo script can assert two
 # OS processes converge over real sockets.
 [[bin]]
 name = "ducktape"

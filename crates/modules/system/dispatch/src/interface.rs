@@ -86,7 +86,7 @@ pub enum OutputContract {
 }
 
 /// one registered what-to-run manifest — an ordered-op registration, so which
-/// capability and contract a recipe binds is part of the app-hash. `owner` is
+/// capability and contract a recipe binds is part of the root-hash. `owner` is
 /// the registration origin and gates every mutation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Recipe {

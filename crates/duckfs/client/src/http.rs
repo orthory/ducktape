@@ -104,7 +104,7 @@ fn error_message(resp: reqwest::blocking::Response) -> String {
 struct BlockSummaryWire {
     height: u64,
     #[allow(dead_code)]
-    app_hash: String,
+    root_hash: String,
 }
 
 /// `{entries, next}` — the paged shape `ls`/`find` share.

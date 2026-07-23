@@ -1,7 +1,7 @@
 //! reactor-seam scenarios: the block-COMPOSITION seams the real host and the
 //! sim driver own, not any one module's semantics. every block here is
 //! composed by the REAL `host::Host` (route → drain FIFO under
-//! `MAX_DISPATCHES` → commit-or-abort → recompose app-hash), driven over
+//! `MAX_DISPATCHES` → commit-or-abort → recompose root-hash), driven over
 //! noded's exact /v1 wire plus the /sim control lane. what these pin:
 //!
 //! - the self-retriggering rule: an automation that posts into its own hooked
@@ -13,7 +13,7 @@
 //! - saga's callback-poison wedge cap: a callback that would wedge a saga at
 //!   Pending forever is rejected at trigger time, minting no saga and no block.
 //! - whole-registry determinism: one script over (almost) every registered
-//!   module walks byte-identical app-hashes on two fresh dirs, and through the
+//!   module walks byte-identical root-hashes on two fresh dirs, and through the
 //!   auto and stepped commit paths alike — the standing guard against
 //!   HashMap-iteration / wall-clock nondeterminism creeping into any module.
 //! - restart/resume: the sim's own height-resume-above-the-watermark path
@@ -95,7 +95,7 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
     );
 
     let before = sim.status();
-    let before_hash = before["app_hash"].as_str().expect("app hash").to_string();
+    let before_hash = before["root_hash"].as_str().expect("root hash").to_string();
     let before_height = before["height"].as_u64().expect("height");
 
     // a USER post fires the rule; the rule's own reply is MODULE-authored, so
@@ -109,9 +109,9 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
         "the rule fire rides the triggering block — no runaway follow-up blocks"
     );
     // the block COMMITTED — the guard prevented the loop, so there was never a
-    // BudgetExceeded abort (which would have rolled the app-hash back unchanged).
+    // BudgetExceeded abort (which would have rolled the root-hash back unchanged).
     assert_ne!(
-        sim.status()["app_hash"].as_str().map(str::to_string),
+        sim.status()["root_hash"].as_str().map(str::to_string),
         Some(before_hash),
         "the triggering block committed atomically, not aborted"
     );
@@ -290,7 +290,7 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
 /// TWO modules stay absent (see the report): `files` (duckfs takes a BINARY
 /// op-frame, not a JSON submit) and `forge` (a libgit2-on-disk module whose
 /// determinism is repo-internal — its own e2e owns it, and it stays out of this
-/// cross-dir app-hash-equality assertion). `gateway` was the third until its
+/// cross-dir root-hash-equality assertion). `gateway` was the third until its
 /// SetRoute MemberAuthorization ceremony joined the sweep here — a route the
 /// account's founding Ed25519 member signs, keyed on the just-bound node.
 fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
@@ -445,7 +445,7 @@ fn gateway_set_route(key: &Ed, node: &str) -> Value {
 }
 
 /// run the script through the HOLD path (submit parks, a step commits it),
-/// collecting the app-hash committed at every height.
+/// collecting the root-hash committed at every height.
 fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &[]);
@@ -455,7 +455,7 @@ fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> 
         sim.await_sim_state("held", 1);
         let report = sim.step();
         hashes.push(
-            report["committed"]["app_hash"]
+            report["committed"]["root_hash"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{target} did not commit: {report}"))
                 .to_string(),
@@ -467,7 +467,7 @@ fn run_stepped(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> 
 }
 
 /// run the script through the AUTO path (each submit commits inline); the
-/// receipt IS the commit, carrying the same per-height app-hash.
+/// receipt IS the commit, carrying the same per-height root-hash.
 fn run_auto(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
@@ -475,18 +475,18 @@ fn run_auto(script: &[(&'static str, Value, Option<String>)]) -> Vec<String> {
         .iter()
         .map(|(target, payload, origin)| {
             let receipt = sim.submit_ok(target, payload.clone(), origin.as_deref());
-            receipt["app_hash"]
+            receipt["root_hash"]
                 .as_str()
-                .unwrap_or_else(|| panic!("{target} receipt has no app hash: {receipt}"))
+                .unwrap_or_else(|| panic!("{target} receipt has no root hash: {receipt}"))
                 .to_string()
         })
         .collect()
 }
 
 #[test]
-fn the_whole_registry_walks_identical_app_hashes() {
+fn the_whole_registry_walks_identical_root_hashes() {
     let script = sweep_script();
-    // same script, two fresh storage dirs → byte-identical app-hash at EVERY
+    // same script, two fresh storage dirs → byte-identical root-hash at EVERY
     // height. any HashMap-iteration or wall-clock read in any touched module
     // would fork one of these.
     assert_eq!(
@@ -495,7 +495,7 @@ fn the_whole_registry_walks_identical_app_hashes() {
         "the same script on two fresh dirs diverged"
     );
     // the two commit paths (auto's inline drain vs. hold's stepped commit) must
-    // walk the identical app-hashes for the identical script — per height, and
+    // walk the identical root-hashes for the identical script — per height, and
     // so also at the final tip.
     assert_eq!(
         run_stepped(&script),
@@ -509,8 +509,8 @@ fn the_whole_registry_walks_identical_app_hashes() {
 /// the sim resumes height ABOVE the index watermark (`index.resume_height()`) —
 /// sim-only code otherwise untested. kill the child, respawn on the SAME storage
 /// dir, and the chain continues: height does not restart at 0, the qmdb-backed
-/// module state (and hence the app-hash) survives the boot, a query serves the
-/// persisted data, and a new commit lands at watermark+1 with a moved app-hash.
+/// module state (and hence the root-hash) survives the boot, a query serves the
+/// persisted data, and a new commit lands at watermark+1 with a moved root-hash.
 #[test]
 fn a_restart_on_the_same_storage_resumes_height_and_state() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -522,7 +522,7 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         let status = sim.status();
         (
             status["height"].as_u64().expect("height"),
-            status["app_hash"].as_str().expect("app hash").to_string(),
+            status["root_hash"].as_str().expect("root hash").to_string(),
         )
         // the sim (and its child) drops here: Drop kills + waits, releasing the
         // storage before the respawn opens it.
@@ -538,9 +538,9 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "height resumed above the watermark, not restarted at 0: {status}"
     );
     assert_eq!(
-        status["app_hash"].as_str(),
+        status["root_hash"].as_str(),
         Some(pre_hash.as_str()),
-        "committed module state survived the restart (app-hash byte-identical)"
+        "committed module state survived the restart (root-hash byte-identical)"
     );
 
     // the persisted channels are served from the reloaded qmdb.
@@ -551,7 +551,7 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "the qmdb-backed channels reloaded from disk: {channels}"
     );
 
-    // a NEW commit continues the chain at watermark+1 with a changed app-hash.
+    // a NEW commit continues the chain at watermark+1 with a changed root-hash.
     let receipt = sim.submit_ok("chat", create_channel("hall", "Hall"), Some("owner"));
     assert_eq!(
         receipt["height"],
@@ -559,8 +559,8 @@ fn a_restart_on_the_same_storage_resumes_height_and_state() {
         "the new block continues the height: {receipt}"
     );
     assert_ne!(
-        sim.status()["app_hash"].as_str(),
+        sim.status()["root_hash"].as_str(),
         Some(pre_hash.as_str()),
-        "the new commit moved the app-hash off the resumed root"
+        "the new commit moved the root-hash off the resumed root"
     );
 }

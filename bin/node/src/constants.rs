@@ -132,7 +132,7 @@ pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// `host_state::ProductionModules` registry by the parity test in `host_state`;
 /// the topology's own tests pin the selection to today's 20.
 ///
-/// A module here is in the app-hash: every node must run it, agree on its root
+/// A module here is in the root-hash: every node must run it, agree on its root
 /// at every height, and keep doing so forever. Experiments therefore live
 /// unwired in `crates/labs` and appear in no genesis set.
 pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;

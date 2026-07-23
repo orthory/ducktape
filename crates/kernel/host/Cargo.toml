@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 # the deterministic state-machine spine: a module registry, the dispatch +
-# local-only follow-up drain, and app-hash composition over the registered
+# local-only follow-up drain, and root-hash composition over the registered
 # modules (`global_root` — sha2 is its one hashing dep). depends on sdk (the
 # contract); it knows nothing of any concrete module beyond `dyn Module`.
 [dependencies]

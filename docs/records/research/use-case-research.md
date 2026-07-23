@@ -17,14 +17,14 @@ methods reach the same conclusion independently, confidence is high.
    requirement, and the in-scope surface is everyday collaboration tooling —
    chat, documents, and AI-assistant output. Incumbents satisfy it by bolting
    separately licensed compliance layers (Microsoft Purview) onto a centralized
-   trusted host. "The app-hash *is* the audit trail" attacks exactly that gap.
+   trusted host. "The root-hash *is* the audit trail" attacks exactly that gap.
 2. **But the direct attack on that market is not the wedge.** The ideation
    judges independently scored the head-on play (duck-supervision, 17a-4
    archiving with the designated third party as a validator) at 5.3: it demands
    rip-and-replace of the firm's comms, the fine-driving failure mode
    (off-channel WhatsApp) is outside any platform's reach, and the web caveats
    agree — the enforcement wave wound down under the Atkins SEC in 2025–26, and
-   regulatory acceptance of a BFT app-hash as an Option A mechanism is untested
+   regulatory acceptance of a BFT root-hash as an Option A mechanism is untested
    (17a-4(f)(3)(v) third-party undertakings have no decentralized answer yet).
 3. **Both methods converge on the same beachhead: sovereign / air-gapped /
    multi-site deployments.** Web evidence: Bundeswehr's Matrix-based
@@ -33,7 +33,7 @@ methods reach the same conclusion independently, confidence is high.
    but only degraded — push, invites, previews, notices all assume internet.
    Ideation: courier-sync (market 6 / feasibility 8) — sites converge via
    chunked state sync or signed op-log segments over sneakernet/data diodes,
-   where deterministic replay to a byte-identical app-hash makes the courier,
+   where deterministic replay to a byte-identical root-hash makes the courier,
    the USB stick, and the diode untrusted by construction. Weak moat
    (single-org hash chain gets close), but the best product-market-maturity fit
    on the board and the platform wedge into estates that buy appliances.
@@ -54,7 +54,7 @@ methods reach the same conclusion independently, confidence is high.
    only direct market-pull claim 0–3; the ideation judges scored every
    agent-centric idea low (agent-staff moat 2, agent-underwriter market 2,
    envoy-negotiation market 2). Anchored agent runs (model/prompt hashes in the
-   app-hash, ContextPin) are a differentiator layered on the wedges above —
+   root-hash, ContextPin) are a differentiator layered on the wedges above —
    e.g. model-register's SR 11-7 / EU AI Act play — not a standalone product.
 
 ## Part A — Verified market evidence (web pass, cited)
@@ -124,8 +124,8 @@ fit on current architecture. Full report: workflow `wf_320395eb-ac6`.
 
 | # | Idea | Avg | m/mk/f | One-line |
 |---|------|-----|--------|----------|
-| 1 | **deal-spine** | 6.3 | 7/4/8 | M&A/JV deal room; commit-then-reveal disclosures via vault ciphertext in the app-hash; the op log is the evidentiary record both parties leave with |
-| 2 | **courier-sync** | 6.0 | 4/6/8 | Multi-site + air-gapped workspace; signed op-log segments over sneakernet/diode; replay-to-app-hash makes the courier untrusted |
+| 1 | **deal-spine** | 6.3 | 7/4/8 | M&A/JV deal room; commit-then-reveal disclosures via vault ciphertext in the root-hash; the op log is the evidentiary record both parties leave with |
+| 2 | **courier-sync** | 6.0 | 4/6/8 | Multi-site + air-gapped workspace; signed op-log segments over sneakernet/diode; replay-to-root-hash makes the courier untrusted |
 | 3 | **model-register** | 6.0 | 5/5/8 | SR 11-7 / EU AI Act model-risk ledger; three lines of defense as governance-gated validators; extends agent v2's registry pattern |
 | 4 | **gxp-batch-ledger** | 6.0 | 6/6/6 | 21 CFR Part 11 batch records; sponsor + CDMO + QA validators; batch release = replay against the recipe hash |
 | 5 | **split-ledger** | 6.0 | 6/5/7 | JV/franchise/JIB profit-sharing settlement; split rules amendable only by counterparty quorum; audit = local replay |
@@ -147,7 +147,7 @@ moat 2 — a good product whose BFT substrate is pure overhead single-org).
 - **Per-event pricing against existing budget lines.** Per-deal vs VDR spend,
   per-batch vs batch value, bps on settled volume vs audit cost.
 - **Fresh-genesis short-lived networks are a feature** (deals, batches,
-  projects: spin up → seal terminal app-hash → archive; recurring archival fee
+  projects: spin up → seal terminal root-hash → archive; recurring archival fee
   is revenue for not running anything). Matches the no-backwards-compat posture.
 - **Recurring honest weakness: garbage-in.** Consensus hardens the record, not
   the capture. Ideas that don't launder external sensor/ERP data survive;
@@ -195,7 +195,7 @@ moat 2 — a good product whose BFT substrate is pure overhead single-org).
 
 ## Open questions (carried forward)
 
-- Would SEC/FINRA accept a BFT app-hash + deterministic effects ledger as
+- Would SEC/FINRA accept a BFT root-hash + deterministic effects ledger as
   satisfying 17a-4(f)(2)(i)(A), and how does a no-single-host deployment
   handle the (f)(3)(v) third-party undertakings (Cohasset-style assessment)?
 - Is there measurable buyer demand (RFPs, budget lines — not vendor marketing)

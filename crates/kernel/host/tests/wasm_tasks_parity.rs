@@ -5,9 +5,8 @@
 //! IDENTICAL query replies across BOTH boards (the assigned-list task board AND
 //! the first-claim job board), and their roots move in lockstep (move on commit,
 //! hold on abort AND on an accepted no-op). the roots THEMSELVES differ — the
-//! port persists the native canonical snapshot as one host-KV value, a declared
-//! state-schema break (revision 3, the merge) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! port persists the native canonical snapshot as one host-KV value, an
+//! intentional greenfield root break pinned by this proof.
 
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Error, Msg, Origin, StateRoot};

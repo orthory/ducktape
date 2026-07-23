@@ -9,7 +9,7 @@ Ducktape is a consensus-based workplace super-app: a single BFT-replicated state
 machine that hosts isolated product modules such as pages, forge, chat, and
 agent workflows. Each module owns its authenticated state substrate and exposes
 only a 32-byte root to the host. The host composes those module roots into the
-global app-hash that consensus commits.
+global root-hash that consensus commits.
 
 <ModuleMap client:visible />
 
@@ -21,14 +21,14 @@ ops.
 
 ## Current Status
 
-- The module contract, host registry, global app-hash, ordered node path,
+- The module contract, host registry, global root-hash, ordered node path,
   commonware Simplex orderer, saga/worker async seam, and several root-backed
   product modules exist in the repository.
 - The demo registers the platform modules and product modules together, then
-  shows their roots moving under one composed app-hash.
+  shows their roots moving under one composed root-hash.
 - State sync exists for QMDB-backed modules, forge, and snapshot-style modules;
   the node e2e suite proves joiners can rebuild over the live state-sync wire and
-  land on the source app-hash.
+  land on the source root-hash.
 - Dynamic valset wiring, live admission, restart recovery, video huddles, and
   the module code-swap registry are implemented. There is no protocol
   versioning: with no live network yet, breaking changes re-genesis. The

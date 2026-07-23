@@ -252,7 +252,7 @@ fn snapshot_round_trips_and_tampering_is_refused() {
         let root = host.module_root("vaults").expect("root");
         let finalized = host::FinalizedBlock {
             height: 2,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
         let sdk::StateSyncHandle::SnapshotBytes(bytes) = host
             .capture_finalized_snapshot(finalized)

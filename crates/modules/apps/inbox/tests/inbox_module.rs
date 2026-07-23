@@ -540,7 +540,7 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
     block_on(async {
         let mut host =
             Host::genesis(vec![Box::new(Inbox::new(INBOX)), Box::new(Producer)]).expect("genesis");
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let out = host
             .submit_at(
@@ -556,7 +556,7 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
             )
             .await
             .expect("submit producer op");
-        assert_ne!(out.app_hash, app0, "the atomic delivery moves the app-hash");
+        assert_ne!(out.root_hash, app0, "the atomic delivery moves the root-hash");
 
         let items = host_list(&host, "alice").await;
         assert_eq!(items.len(), 1, "the follow-up delivered in the same block");

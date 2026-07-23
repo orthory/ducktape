@@ -285,7 +285,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
     // snapshot the chain tip BEFORE the doomed submit.
     let before = sim.status();
     let before_height = before["height"].as_u64().expect("height");
-    let before_hash = before["app_hash"].as_str().expect("app hash").to_string();
+    let before_hash = before["root_hash"].as_str().expect("root hash").to_string();
 
     // the triggering post fires both rules; the second CreateTask collides with
     // the first's staged id, and the WHOLE block aborts (P2) — the op is rejected
@@ -309,7 +309,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
 
     // NO STATE survives: the rejected op journals a block (validator parity — so
     // the HEIGHT advances by one) but the atomic abort rolled back every write,
-    // so the app-hash is byte-identical, the triggering message never entered
+    // so the root-hash is byte-identical, the triggering message never entered
     // chat, no task landed, and neither rule recorded a fire.
     let after = sim.status();
     assert_eq!(
@@ -318,9 +318,9 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         "the rejected op sealed its own block (validator parity): {after}"
     );
     assert_eq!(
-        after["app_hash"].as_str(),
+        after["root_hash"].as_str(),
         Some(before_hash.as_str()),
-        "app-hash unmoved (the rejected op rolled back): {after}"
+        "root-hash unmoved (the rejected op rolled back): {after}"
     );
     let message = sim.query(
         "chat",

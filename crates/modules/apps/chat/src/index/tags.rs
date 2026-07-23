@@ -1,6 +1,6 @@
 //! hashtag tags on the derived chat view — extraction, postings, catalog,
 //! and the tag queries. node-local like everything in this index: no key
-//! written here is ever part of any `root()`/app-hash.
+//! written here is ever part of any `root()`/root-hash.
 //!
 //! key spaces (inside chat's per-module index database, next to `tok/`):
 //! - `tag/{label}/{channel}/{rseq}` — one posting per (tag, message), value =
@@ -9,12 +9,10 @@
 //!   streams straight off one scan, and a label's newest live seq is the
 //!   first posting under its prefix.
 //! - `tagcat/{channel}/{label}`      — [`TagCat`]: the count of LIVE messages
-//!   carrying the tag in that channel. count only: the fold's [`ApplyCtx`] is
+//!   carrying the tag in that channel. count only: the fold's reads are
 //!   get-only, so a stored `last_seq` could not be re-derived when the newest
 //!   tagged message is deleted — instead `last_seq` is read at query time from
-//!   the newest posting, which the reversed key makes an O(1) probe. keeping
-//!   the catalog a pure function of the live head set is also exactly what
-//!   makes the from-state rebuild reproduce it byte-for-byte.
+//!   the newest posting, which the reversed key makes an O(1) probe.
 //!
 //! extraction grammar (see the design doc): `#` + 1..=64 chars of Unicode
 //! letters/digits/`_`/`-` (Hangul included), opened only at start-of-text or
@@ -28,10 +26,13 @@
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-use indexer::search::DEFAULT_POSTING_CAP;
-use indexer::{ApplyCtx, Derived, Error, Result, ViewReader};
+use index_guest::search::DEFAULT_POSTING_CAP;
+use index_guest::{Fail, MAX_SCAN_LIMIT, StateRead, Writes};
 
-use super::{DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, MsgRow, TokRef, msg_key};
+use super::{
+    DEFAULT_SEARCH_LIMIT, FAIL_BAD_REQUEST, FAIL_ROW_DECODE, MAX_SEARCH_LIMIT, MsgRow, TokRef,
+    msg_key,
+};
 use crate::{Block, Mark};
 
 /// distinct tag labels indexed per message; later tags are dropped.
@@ -75,10 +76,10 @@ pub(super) fn catalog_key(channel: &str, label: &str) -> String {
     format!("tagcat/{channel}/{label}")
 }
 
-/// the catalog value for `count` — one encoder so fold and rebuild write
+/// the catalog value for `count` — one encoder so every write path produces
 /// byte-identical entries.
-pub(super) fn encode_catalog(count: u64) -> Result<Vec<u8>> {
-    serde_json::to_vec(&TagCat { count }).map_err(|e| Error::Mapper(e.to_string()))
+fn encode_catalog(count: u64) -> Result<Vec<u8>, Fail> {
+    serde_json::to_vec(&TagCat { count }).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
 }
 
 // ── extraction ──────────────────────────────────────────────────────────────
@@ -161,10 +162,10 @@ pub(super) fn labels(blocks: &[Block]) -> Vec<String> {
 // ── fold maintenance ────────────────────────────────────────────────────────
 
 /// delete the tag postings of `row`'s current tag set (the edit/delete
-/// counterpart of the postings `row_entries` emits).
-pub(super) fn delete_postings(out: &mut Derived, row: &MsgRow) {
+/// counterpart of the postings `put_row_and_toks` emits).
+pub(super) fn delete_postings(out: &mut Writes, row: &MsgRow) {
     for label in &row.tags {
-        out.delete(tag_key(label, &row.channel_id, row.seq));
+        index_guest::delete(out, tag_key(label, &row.channel_id, row.seq));
     }
 }
 
@@ -172,27 +173,33 @@ pub(super) fn delete_postings(out: &mut Derived, row: &MsgRow) {
 /// but not `old` count up, labels in `old` but not `new` count down (their
 /// entry is deleted at zero). a post passes `old = []`, a delete `new = []`.
 pub(super) fn fold_catalog(
-    ctx: &ApplyCtx,
-    out: &mut Derived,
+    read: &impl StateRead,
+    out: &mut Writes,
     channel: &str,
     old: &[String],
     new: &[String],
-) -> Result<()> {
+) -> Result<(), Fail> {
     for label in new.iter().filter(|l| !old.contains(l)) {
-        bump(ctx, out, channel, label, 1)?;
+        bump(read, out, channel, label, 1)?;
     }
     for label in old.iter().filter(|l| !new.contains(l)) {
-        bump(ctx, out, channel, label, -1)?;
+        bump(read, out, channel, label, -1)?;
     }
     Ok(())
 }
 
-fn bump(ctx: &ApplyCtx, out: &mut Derived, channel: &str, label: &str, delta: i64) -> Result<()> {
+fn bump(
+    read: &impl StateRead,
+    out: &mut Writes,
+    channel: &str,
+    label: &str,
+    delta: i64,
+) -> Result<(), Fail> {
     let key = catalog_key(channel, label);
-    let count = match ctx.get(key.as_bytes())? {
+    let count = match read.get(key.as_bytes()) {
         Some(bytes) => {
             serde_json::from_slice::<TagCat>(&bytes)
-                .map_err(|e| Error::Mapper(e.to_string()))?
+                .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?
                 .count
         }
         None => 0,
@@ -203,9 +210,9 @@ fn bump(ctx: &ApplyCtx, out: &mut Derived, channel: &str, label: &str, delta: i6
         count.saturating_sub(delta.unsigned_abs())
     };
     if count == 0 {
-        out.delete(key);
+        index_guest::delete(out, key);
     } else {
-        out.put(key, encode_catalog(count)?);
+        index_guest::put(out, key, encode_catalog(count)?);
     }
     Ok(())
 }
@@ -213,17 +220,17 @@ fn bump(ctx: &ApplyCtx, out: &mut Derived, channel: &str, label: &str, delta: i6
 // ── serving ─────────────────────────────────────────────────────────────────
 
 /// walk every entry under `prefix`, page by page.
-fn scan_all<F>(reader: &ViewReader, prefix: &str, mut f: F) -> Result<()>
+fn scan_all<F>(read: &impl StateRead, prefix: &str, mut f: F) -> Result<(), Fail>
 where
-    F: FnMut(&[u8], &[u8]) -> Result<()>,
+    F: FnMut(&[u8], &[u8]) -> Result<(), Fail>,
 {
     let mut cursor: Option<String> = None;
     loop {
-        let page = reader.scan(
+        let page = read.scan_page(
             prefix.as_bytes(),
             cursor.as_deref().map(str::as_bytes),
-            indexer::MAX_SCAN_LIMIT,
-        )?;
+            MAX_SCAN_LIMIT,
+        );
         for (key, value) in &page.entries {
             f(key, value)?;
         }
@@ -235,8 +242,8 @@ where
     Ok(())
 }
 
-fn decode_tok(value: &[u8]) -> Result<TokRef> {
-    serde_json::from_slice(value).map_err(|e| Error::Mapper(e.to_string()))
+fn decode_tok(value: &[u8]) -> Result<TokRef, Fail> {
+    serde_json::from_slice(value).map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
 }
 
 /// a label's newest live seq in one channel: the first posting under the
@@ -247,16 +254,16 @@ fn decode_tok(value: &[u8]) -> Result<TokRef> {
 /// relative to each other, so the first stored-channel match IS the max.
 /// bounded by the posting cap like every tag walk; a prefix that exhausts the
 /// cap without a match reports none.
-fn newest_seq(reader: &ViewReader, label: &str, channel: &str) -> Result<Option<u64>> {
+fn newest_seq(read: &impl StateRead, label: &str, channel: &str) -> Result<Option<u64>, Fail> {
     let prefix = tag_channel_prefix(label, channel);
     let mut cursor: Option<String> = None;
     let mut walked = 0usize;
     loop {
-        let page = reader.scan(
+        let page = read.scan_page(
             prefix.as_bytes(),
             cursor.as_deref().map(str::as_bytes),
-            indexer::MAX_SCAN_LIMIT,
-        )?;
+            MAX_SCAN_LIMIT,
+        );
         for (_, value) in &page.entries {
             if walked == DEFAULT_POSTING_CAP {
                 return Ok(None);
@@ -279,10 +286,10 @@ fn newest_seq(reader: &ViewReader, label: &str, channel: &str) -> Result<Option<
 /// channel aggregated per label), ordered count desc then tag asc, clamped
 /// like search.
 pub(super) fn serve_tags(
-    reader: &ViewReader,
+    read: &impl StateRead,
     channel_id: Option<String>,
     limit: Option<usize>,
-) -> Result<Vec<TagRow>> {
+) -> Result<Vec<TagRow>, Fail> {
     let limit = limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
         .clamp(1, MAX_SEARCH_LIMIT);
@@ -293,7 +300,7 @@ pub(super) fn serve_tags(
     // label → (aggregated count, channels carrying it — for last_seq probes).
     let mut agg: std::collections::BTreeMap<String, (u64, Vec<String>)> =
         std::collections::BTreeMap::new();
-    scan_all(reader, &prefix, |key, value| {
+    scan_all(read, &prefix, |key, value| {
         let rest = String::from_utf8_lossy(&key[prefix.len()..]);
         // a label never contains `/` (tag chars only), so the LAST segment is
         // the label and everything before it is the channel.
@@ -315,7 +322,7 @@ pub(super) fn serve_tags(
             },
         };
         let count = serde_json::from_slice::<TagCat>(value)
-            .map_err(|e| Error::Mapper(e.to_string()))?
+            .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?
             .count;
         let entry = agg.entry(label).or_insert((0, Vec::new()));
         entry.0 += count;
@@ -334,7 +341,7 @@ pub(super) fn serve_tags(
     for (label, count, channels) in rows {
         let mut last_seq = 0u64;
         for channel in &channels {
-            if let Some(seq) = newest_seq(reader, &label, channel)? {
+            if let Some(seq) = newest_seq(read, &label, channel)? {
                 last_seq = last_seq.max(seq);
             }
         }
@@ -355,15 +362,15 @@ pub(super) fn serve_tags(
 /// sub-channels (`tag/{label}/g/` catches channel `g/0`). collects up to the
 /// posting cap and ranks by time like `Search`.
 pub(super) fn serve_tag_search(
-    reader: &ViewReader,
+    read: &impl StateRead,
     tag: &str,
     channel_id: Option<String>,
     limit: Option<usize>,
-) -> Result<Vec<MsgRow>> {
+) -> Result<Vec<MsgRow>, Fail> {
     let label = normalize(tag.trim().trim_start_matches('#'));
     if label.is_empty() || label.chars().count() > MAX_TAG_CHARS || !label.chars().all(is_tag_char)
     {
-        return Err(Error::View("not a valid tag".into()));
+        return Err(Fail::new(FAIL_BAD_REQUEST, "not a valid tag"));
     }
     let limit = limit
         .unwrap_or(DEFAULT_SEARCH_LIMIT)
@@ -376,11 +383,11 @@ pub(super) fn serve_tag_search(
     let mut cursor: Option<String> = None;
     let mut walked = 0usize;
     'walk: loop {
-        let page = reader.scan(
+        let page = read.scan_page(
             prefix.as_bytes(),
             cursor.as_deref().map(str::as_bytes),
-            indexer::MAX_SCAN_LIMIT,
-        )?;
+            MAX_SCAN_LIMIT,
+        );
         for (_, value) in &page.entries {
             if walked == DEFAULT_POSTING_CAP {
                 break 'walk;
@@ -402,9 +409,9 @@ pub(super) fn serve_tag_search(
     refs.truncate(limit);
     let mut hits = Vec::with_capacity(refs.len());
     for r in refs {
-        if let Some(bytes) = reader.get(msg_key(&r.channel_id, r.seq).as_bytes())? {
-            let row: MsgRow =
-                serde_json::from_slice(&bytes).map_err(|e| Error::Mapper(e.to_string()))?;
+        if let Some(bytes) = read.get(msg_key(&r.channel_id, r.seq).as_bytes()) {
+            let row: MsgRow = serde_json::from_slice(&bytes)
+                .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
             hits.push(row);
         }
     }

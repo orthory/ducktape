@@ -108,12 +108,25 @@ BUILDER_MODULES := \
   crates/modules/system/gateway crates/modules/system/governance \
   crates/modules/system/saga
 
+# Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
+# `index-guest` feature): guest-builder --index writes the canonical
+# index.wasm (core wasm, no componentize) into the module directory, which
+# noded embeds via include_bytes!. The reference testmap mapper is the
+# indexer crate's test fixture and rides the same sweep.
+INDEX_MODULES := \
+  crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
+  crates/modules/system/saga \
+  crates/kernel/index-guest/testmap
+
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
 	  $(CARGO) run -q -p guest-builder -- $$m && \
 	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@for m in $(INDEX_MODULES); do \
+	  $(CARGO) run -q -p guest-builder -- --index $$m || exit 1; \
 	done
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-replacement
@@ -153,6 +166,9 @@ wasm-modules-check:
 	  id=$$(basename $$m) && \
 	  cmp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
+	done
+	@for m in $(INDEX_MODULES); do \
+	  test -f $$m/index.wasm || { echo "missing $$m/index.wasm (make wasm-modules)"; exit 1; }; \
 	done
 	@echo "wasm module artifacts are mutually consistent"
 

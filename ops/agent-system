@@ -102,7 +102,7 @@ const post = (pathname, body) =>
 const query = (target, queryBody) => post("/v1/query", { target, query: queryBody });
 const submit = (target, payload) => post("/v1/submit", { target, payload });
 const receipt = (value) =>
-  console.log(`height=${value.height} app=${value.appHash}${value.opHash ? ` op=${value.opHash}` : ""}`);
+  console.log(`height=${value.height} root=${value.root_hash}${value.op_hash ? ` op=${value.op_hash}` : ""}`);
 
 const stdin = async () => {
   let text = "";
@@ -152,8 +152,8 @@ switch (command) {
     break;
   case "status": {
     const value = await request("/v1/status");
-    const key = value.publicKey ?? value.public_key ?? value.node_key ?? "unknown";
-    console.log(`${key}@nodes.duck height=${value.height ?? "?"} app=${value.appHash ?? value.app_hash ?? "?"}`);
+    const key = value.public_key ?? "unknown";
+    console.log(`${key}@nodes.duck height=${value.height ?? "?"} root=${value.root_hash ?? "?"}`);
     break;
   }
   case "q":

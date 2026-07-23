@@ -5,17 +5,16 @@
 //! verdicts, their committed reads agree between blocks, and their roots move in
 //! lockstep (move on a committed write, hold on an aborted one). the roots
 //! THEMSELVES differ — the port persists the native canonical snapshot as one
-//! host-KV value, a declared state-schema break (revision 2) — and this proof
-//! pins that difference so it can never be mistaken for accidental compatibility.
+//! host-KV value, an intentional greenfield root break pinned by this proof.
 //!
-//! ## why the schema break shows from GENESIS here (unlike tagging)
+//! ## why the root break shows from GENESIS here (unlike tagging)
 //!
 //! tagging's empty canonical encoding is a lone zero count, byte-identical to
 //! the empty host-KV store, so its genesis roots COINCIDE and the break onsets
 //! at the first write. dispatch's empty encoding is FOUR zero counts (recipes,
 //! dispatches, mailbox, next_seq — 32 bytes) while the empty map-backed store is
 //! a lone zero count (8 bytes): different preimages, so the sha256 roots differ
-//! before any write. the revision-2 break is therefore TOTAL for dispatch, and
+//! before any write. the root break is therefore TOTAL for dispatch, and
 //! the matrix asserts `native_root != wasm_root` at genesis and after every op.
 //!
 //! ## why there are no sibling reads on the accept path
@@ -585,7 +584,7 @@ async fn snapshot_install_inner() {
     let snap = wasm
         .capture_finalized_snapshot(FinalizedBlock {
             height: 2,
-            app_hash: wasm.app_hash(),
+            root_hash: wasm.root_hash(),
         })
         .expect("capture finalized snapshot");
     let entry = snap.module("dispatch").expect("dispatch in the snapshot");

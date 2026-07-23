@@ -38,11 +38,17 @@ pub use job_board::{
     MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
 };
 
-// the derived-tier materialized view over the task board; registered only by
-// serving binaries. native-only: `indexer` drags unix-only IO, and the index is
-// node-local derived state -- the wasm guest port builds without it.
-#[cfg(feature = "native")]
+// the derived-tier materialized view over the task board: the PURE decision
+// core (fold + view over index_guest::StateRead), compiled everywhere and
+// unit-tested natively. the engine shell that runs it inside the module's
+// index database is `index_guest` below.
 pub mod index;
+
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
 
 use sdk::codec::Cursor;
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};

@@ -52,7 +52,7 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
         assert_ne!(ok_id, bad_id, "distinct frames get distinct ids");
 
         // both ops flush into ONE batch -> ONE block at ONE height with TWO
-        // member outcomes sharing the block app-hash.
+        // member outcomes sharing the block root-hash.
         node.flush_batch().await.expect("flush");
         node.drain_delivered().await.expect("drain");
         let drained = node.take_drained();
@@ -90,9 +90,9 @@ fn drained_outcomes_correlate_submits_with_dispositions() {
             .expect("a decoded-then-rejected frame still carries its op");
         assert!(bad_op.dispatches.is_empty(), "a rejected op leaves no trace");
         // per-frame boundary capture: the reject rolled back, so both frames
-        // settled at the same composed app-hash the node now reports.
-        assert_eq!(ok_frame.app_hash, node.app_hash());
-        assert_eq!(bad_frame.app_hash, node.app_hash());
+        // settled at the same composed root-hash the node now reports.
+        assert_eq!(ok_frame.root_hash, node.root_hash());
+        assert_eq!(bad_frame.root_hash, node.root_hash());
 
         // node-local observability: the rejected frame carries the MODULE's
         // verbatim reason string (a submitter's held reply surfaces it), while

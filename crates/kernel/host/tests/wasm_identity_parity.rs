@@ -3,9 +3,8 @@
 //! behind `guest-adapter`) and the native `Identity` module answer the SAME op
 //! sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 2) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! the port persists the native canonical snapshot as one host-KV value, an
+//! intentional greenfield root break pinned by this proof.
 //!
 //! identity is the first ported module whose native constructor takes a
 //! PER-NETWORK parameter: the chain id every certificate preimage folds in. a

@@ -4,9 +4,7 @@
 //! with IDENTICAL routing decisions, and their roots move in lockstep (move on
 //! commit, hold on no-ops and abort). the roots THEMSELVES differ from the
 //! first committed write — the port persists the native canonical snapshot as
-//! one host-KV value, a declared state-schema break (revision 2) — and this
-//! proof pins that difference so it can never be mistaken for accidental
-//! compatibility.
+//! one host-KV value, an intentional greenfield root break pinned by this proof.
 //!
 //! tagging is a CROSS-MODULE plane, which is the point of this tenant: a
 //! Subscribe's acceptance depends on a SIBLING read (`ctx.module_root(source)`)

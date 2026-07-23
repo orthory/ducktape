@@ -31,7 +31,7 @@ impl Module for Greeter {
         self.id.clone()
     }
 
-    /// stateless — contributes a constant root to the app-hash.
+    /// stateless — contributes a constant root to the root-hash.
     fn root(&self) -> StateRoot {
         StateRoot::ZERO
     }

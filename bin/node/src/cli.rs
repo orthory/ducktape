@@ -84,11 +84,11 @@ fn cmd_list() -> CommandResult {
 /// stdout:
 ///
 /// ```text
-/// height=<h> app_hash=<hex>
+/// height=<h> root_hash=<hex>
 /// ```
 ///
 /// `height=none` means no block has finalized yet. `--json` emits the rpc's
-/// full status object (height, app_hash, every module root). requires the
+/// full status object (height, root_hash, every module root). requires the
 /// node to be up — the same local rpc lane as `member status`.
 fn cmd_node_status(args: StatusArgs) -> CommandResult {
     let cfg_path = args.selector.config_path()?;
@@ -110,8 +110,8 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
         Some(h) => h.to_string(),
         None => "none".into(),
     };
-    let app_hash = status["app_hash"].as_str().unwrap_or("");
-    println!("height={height} app_hash={app_hash}");
+    let root_hash = status["root_hash"].as_str().unwrap_or("");
+    println!("height={height} root_hash={root_hash}");
     Ok(())
 }
 

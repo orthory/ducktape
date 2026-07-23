@@ -167,7 +167,7 @@ fn snapshot_reconstructs_root_and_content_on_a_fresh_module() {
     assert_eq!(dst.root(), StateRoot::ZERO);
     dst.install(&bytes, root).unwrap();
 
-    // THE PROPERTY: identical composed root — the app-hash linkage a joiner needs.
+    // THE PROPERTY: identical composed root — the root-hash linkage a joiner needs.
     assert_eq!(
         dst.root(),
         root,
@@ -388,7 +388,7 @@ fn empty_state_installed_over_a_born_repo_unbinds_it_durably() {
 
     // durability: a re-init re-adopts refs from DISK — if install had only
     // cleared the cached head and left the default repo's ref, the old root
-    // would resurrect here and the app-hash would diverge from ZERO.
+    // would resurrect here and the root-hash would diverge from ZERO.
     drop(dst);
     let reopened = Forge::init("forge", dst_base).unwrap();
     assert_eq!(reopened.root(), StateRoot::ZERO, "the on-disk ref is gone");

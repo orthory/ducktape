@@ -186,14 +186,14 @@ consumers (inbox's opaque `member`, chat admin gating) can resolve through
 
 ## Consensus impact and rollout
 
-Adding the module is a **module-set change**: the genesis app-hash moves even
+Adding the module is a **module-set change**: the genesis root-hash moves even
 at zero root. Fresh networks simply include it. Existing dev networks take
 the established coordinated path (same class as the video-calls engine-bank
 change): rebuild or genesis-bump in lockstep. Nothing else moves — no frame
 change, no existing module root change, no p2p channel addition, no namespace
 change. `MODULE_IDS` grows by `"identity"` and the genesis host registers the
 module on every binary that composes the full set (`bin/node`, `bin/noded`,
-`bin/simnode`, demo/test hosts) so app-hash parity holds across node styles.
+`bin/simnode`, demo/test hosts) so root-hash parity holds across node styles.
 
 ## Error handling
 
@@ -217,10 +217,10 @@ module on every binary that composes the full set (`bin/node`, `bin/noded`,
   unbind from a different origin (recovery); setname bound/unbound/overlong;
   member-gate on/off; staged-overlay read-your-writes; commit/abort;
   snapshot/install roundtrip + strict-decode rejections; root stability.
-- **Host/genesis**: module registers in every host composition; app-hash
+- **Host/genesis**: module registers in every host composition; root-hash
   parity across `bin/node`/`noded`/`simnode` genesis.
 - **Node integration**: two in-process nodes (cluster-style test), one user
-  key binds both; `UserOf` resolves identically on both; convergent app-hash.
+  key binds both; `UserOf` resolves identically on both; convergent root-hash.
 - **App**: unit tests for `nodeToUser` resolution order and the auto-bind
   state machine; existing store tests keep passing (profiles fallback).
 - **e2e (manual/QA)**: fleet or tauri-debug run — two workspaces on one

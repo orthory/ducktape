@@ -380,7 +380,7 @@ where
 /// a power cut AFTER the disk committed it. before the fix boot fail-stopped
 /// with a false `Error::Torn` at block 0 (the disk's live root — post-block-1
 /// — matched no recorded post-root); with the per-commit height cursor bound
-/// to the trailing WAL record, boot recovers WITH app-hash continuity and
+/// to the trailing WAL record, boot recovers WITH root-hash continuity and
 /// without ever re-committing the disk.
 #[test]
 fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
@@ -426,7 +426,7 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         let tip = node.finalized().expect("boundary");
-        let tip_hash = node.app_hash();
+        let tip_hash = node.root_hash();
         assert_eq!(tip.height, 1);
         assert_eq!(cell.borrow().counter, 2, "disk committed both blocks");
         assert_eq!(cell.borrow().height, Some(1), "cursor rode the tip commit");
@@ -458,14 +458,11 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
             .expect("a cursor-bound trailing commit recovers");
 
         assert_eq!(recovered.height, Some(1), "tip block recovered");
-        assert!(
-            recovered.rolled_forward,
-            "the unsealed tip was rolled forward"
-        );
-        // APP-HASH CONTINUITY: byte-identical to what the live node composed
+        assert!(recovered.rolled_forward, "the unsealed tip was rolled forward");
+        // ROOT-HASH CONTINUITY: byte-identical to what the live node composed
         // after the tip block — what the network sealed.
-        assert_eq!(recovered.app_hash, tip_hash);
-        assert_eq!(host.app_hash(), tip_hash);
+        assert_eq!(recovered.root_hash, tip_hash);
+        assert_eq!(host.root_hash(), tip_hash);
         // the disk was NEVER re-committed: no op-log root move, no fork.
         assert_eq!(cell.borrow().counter, 2, "no re-commit of the durable disk");
         assert_eq!(
@@ -488,7 +485,7 @@ fn a_lost_trailing_seal_with_a_height_cursor_recovers() {
             .await
             .expect("again");
         assert!(!again.rolled_forward, "the roll-forward sealed the tip");
-        assert_eq!(again.app_hash, recovered.app_hash, "idempotent app-hash");
+        assert_eq!(again.root_hash, recovered.root_hash, "idempotent root-hash");
         assert_eq!(cell.borrow().counter, 2, "still no extra disk commit");
     });
 }
@@ -536,7 +533,7 @@ fn a_lost_trailing_seal_heals_the_fanned_out_cohort_too() {
             .expect("submit block 1");
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
-        let tip_hash = node.app_hash();
+        let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 2);
         assert_eq!(cell.borrow().height, Some(1));
         drop(node);
@@ -558,8 +555,8 @@ fn a_lost_trailing_seal_heals_the_fanned_out_cohort_too() {
             .expect("mixed trailing block heals");
 
         assert_eq!(recovered.height, Some(1));
-        assert_eq!(recovered.app_hash, tip_hash, "app-hash continuity");
-        assert_eq!(host.app_hash(), tip_hash);
+        assert_eq!(recovered.root_hash, tip_hash, "root-hash continuity");
+        assert_eq!(host.root_hash(), tip_hash);
         // block 0 healed via the sealed torn path, block 1 via the trailing
         // selective replay: the in-memory cohort holds BOTH writes again.
         assert_eq!(

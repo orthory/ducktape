@@ -18,7 +18,7 @@
 - `ops/build-with.sh cargo check -p files --no-default-features` must stay green (should be untouched by this plan).
 - Cached cargo re-emits no warnings: `touch` a changed `.rs` before trusting a clippy/check pass.
 - ~600-line soft cap per file; new logic goes in new focused files (`ledger.rs`, `sandbox.rs`, `host_resources.rs`).
-- **FLAG DAY:** capability + saga snapshot/root encodings change → app-hash moves. Pre-existing networks must re-genesis. Say so in the PR body.
+- **FLAG DAY:** capability + saga snapshot/root encodings change → root-hash moves. Pre-existing networks must re-genesis. Say so in the PR body.
 - **Behavior change:** `announce_capabilities` default flips ON→OFF (opt-in serving). Say so in the PR body.
 - Wire compat: every new wire field uses `#[serde(default)]` so old JSON still decodes; Rust construction sites are fixed in the same task that adds the field (workspace must compile at every commit).
 - Commit messages end with `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.

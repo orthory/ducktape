@@ -4,8 +4,8 @@
 //! failure. three properties:
 //!
 //! (a) a block whose drain FAILS partway leaves EVERY module's root unchanged —
-//!     full rollback, no trace (`app_hash` byte-identical to pre-block);
-//! (b) a successful multi-write block commits ALL writes together (the app-hash
+//!     full rollback, no trace (`root_hash` byte-identical to pre-block);
+//! (b) a successful multi-write block commits ALL writes together (the root-hash
 //!     reflects them, and is recompute-stable);
 //! (c) read-your-writes: a later op in the SAME block sees an earlier staged
 //!     write (through a cross-module `ctx.query`), before any commit.
@@ -95,7 +95,7 @@ fn failed_block_rolls_back_every_module() {
 
         let dir0 = host.module_root(DIR).unwrap();
         let kv0 = host.module_root(KV).unwrap();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let err = host
             .submit(Msg {
@@ -109,7 +109,7 @@ fn failed_block_rolls_back_every_module() {
             host::SubmitError::Rejected(Error::Module("boom".into()))
         );
 
-        // no trace: every root and the app-hash are byte-identical to pre-block.
+        // no trace: every root and the root-hash are byte-identical to pre-block.
         assert_eq!(
             host.module_root(DIR).unwrap(),
             dir0,
@@ -117,9 +117,9 @@ fn failed_block_rolls_back_every_module() {
         );
         assert_eq!(host.module_root(KV).unwrap(), kv0, "kv must roll back");
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             app0,
-            "app-hash must be unchanged after a failed block"
+            "root-hash must be unchanged after a failed block"
         );
 
         // the staged value is truly gone — not merely root-invisible.
@@ -170,7 +170,7 @@ fn budget_exceeded_also_rolls_back() {
             Host::genesis(vec![Box::new(Directory::new(DIR)), Box::new(Looper)]).expect("genesis");
 
         let dir0 = host.module_root(DIR).unwrap();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let err = host
             .submit(Msg {
@@ -187,9 +187,9 @@ fn budget_exceeded_also_rolls_back() {
             "directory must roll back on budget exhaustion"
         );
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             app0,
-            "app-hash unchanged after a budget-exceeded block"
+            "root-hash unchanged after a budget-exceeded block"
         );
     });
 }
@@ -208,7 +208,7 @@ fn successful_multi_write_block_commits_all_together() {
 
         let dir0 = host.module_root(DIR).unwrap();
         let kv0 = host.module_root(KV).unwrap();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let out = host
             .submit(Msg {
@@ -226,13 +226,13 @@ fn successful_multi_write_block_commits_all_together() {
         );
         assert_ne!(host.module_root(KV).unwrap(), kv0, "kv must commit");
         assert_ne!(
-            out.app_hash, app0,
-            "app-hash must reflect the committed writes"
+            out.root_hash, app0,
+            "root-hash must reflect the committed writes"
         );
         assert_eq!(
-            out.app_hash,
-            host.app_hash(),
-            "app-hash must be recompute-stable"
+            out.root_hash,
+            host.root_hash(),
+            "root-hash must be recompute-stable"
         );
 
         // and the values are readable post-commit.

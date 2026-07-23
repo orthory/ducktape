@@ -12,7 +12,7 @@
 //! 5. an oversized `set_output` is a deterministic rejection of the parent
 //!    (and its continuation then fires with the `Err` relay);
 //! 6. determinism: two hosts fed identical envelope ops land identical
-//!    app-hashes and traces;
+//!    root-hashes and traces;
 //! 7. a bare op (no continuation) produces no derived unit — `submit_block`
 //!    over pairs is byte-identical to before.
 //!
@@ -310,7 +310,7 @@ fn oversized_output_rejects_parent_continuation_gets_err() {
     });
 }
 
-// (6) determinism: two hosts, same envelope ops → identical app-hash.
+// (6) determinism: two hosts, same envelope ops → identical root-hash.
 #[test]
 fn continuation_lane_is_deterministic() {
     block_on(async {
@@ -346,7 +346,7 @@ fn continuation_lane_is_deterministic() {
             .submit_block_ops(BlockContext::default(), ops())
             .await
             .expect("h2");
-        assert_eq!(o1.app_hash, o2.app_hash, "identical app-hashes");
+        assert_eq!(o1.root_hash, o2.root_hash, "identical root-hashes");
         assert_eq!(
             o1.continuations.len(),
             o2.continuations.len(),

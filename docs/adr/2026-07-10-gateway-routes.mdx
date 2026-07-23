@@ -7,11 +7,11 @@ Date: 2026-07-10. Status: **Accepted**.
 > **name → AccountId → route** pipeline (same deps, one concern). The `.duck`
 > handle plane is an internal facet of the merged module: `SetHandle`/`Resolve`
 > are variants of the unified `GatewayMsg`/`GatewayQuery`, and a single
-> `gateway-wasm` guest carries both planes (state-schema revision 3, a flag day
-> — old networks re-genesis). The invariants below are unchanged: the 32-byte
+> `gateway-wasm` guest carries both planes. This is the only genesis format;
+> greenfield networks re-genesis for the cutover. The invariants below are unchanged: the 32-byte
 > origin requirement for `.duck` names, the gateway stores no node address, and
-> `duck://` resolution stays stateless. The separate `duckdns` crate survives
-> only for the frozen native-v1 compatibility registry.
+> `duck://` resolution stays stateless. The `duckdns` crate is shared support,
+> not a separate consensus module.
 
 ## Context
 

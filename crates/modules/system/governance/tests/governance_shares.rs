@@ -469,12 +469,12 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             ProposalStatus::Rejected
         );
 
-        // The extension is app-hashed and survives state sync byte-for-byte.
+        // The extension is root-hashed and survives state sync byte-for-byte.
         let root = host.module_root("governance").expect("root");
         let sdk::StateSyncHandle::SnapshotBytes(bytes) = host
             .capture_finalized_snapshot(host::FinalizedBlock {
                 height: 26,
-                app_hash: host.app_hash(),
+                root_hash: host.root_hash(),
             })
             .expect("capture")
             .module("governance")
@@ -546,12 +546,12 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         assert!(!inactive.active);
         assert_eq!(inactive.total, 110, "switching modes retains allocations");
 
-        // The explicit inactive-mode override is app-hashed and state-syncable.
+        // The explicit inactive-mode override is root-hashed and state-syncable.
         let inactive_root = host.module_root("governance").expect("inactive root");
         let sdk::StateSyncHandle::SnapshotBytes(inactive_bytes) = host
             .capture_finalized_snapshot(host::FinalizedBlock {
                 height: 30,
-                app_hash: host.app_hash(),
+                root_hash: host.root_hash(),
             })
             .expect("capture inactive mode")
             .module("governance")

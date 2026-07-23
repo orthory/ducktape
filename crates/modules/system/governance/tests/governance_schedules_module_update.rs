@@ -391,7 +391,7 @@ fn snapshot_install_round_trips_module_update_proposals() {
         let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
             let finalized = host::FinalizedBlock {
                 height: 1,
-                app_hash: host.app_hash(),
+                root_hash: host.root_hash(),
             };
             host.capture_finalized_snapshot(finalized)
                 .expect("capture")

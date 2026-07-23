@@ -895,7 +895,7 @@ fn an_aborted_block_binds_no_session() {
     );
 }
 
-// ---- committed state: the app-hash and the snapshot ---------------------------
+// ---- committed state: the root-hash and the snapshot ---------------------------
 
 #[test]
 fn a_session_moves_the_root_and_round_trips_through_a_snapshot() {
@@ -908,7 +908,7 @@ fn a_session_moves_the_root_and_round_trips_through_a_snapshot() {
     exec(&mut m, &mut ctx, &open(&run_id, &SESSION_KEY)).unwrap();
     commit(&mut m);
     let opened = m.root();
-    assert_ne!(opened, before, "opening a session moves the app-hash");
+    assert_ne!(opened, before, "opening a session moves the root-hash");
 
     // spending an action moves it again — the counter is the id salt, so a
     // validator that replayed a different count would mint different ids.
@@ -916,7 +916,7 @@ fn a_session_moves_the_root_and_round_trips_through_a_snapshot() {
     exec(&mut m, &mut ctx, &act(&run_id, comment("b-p"))).unwrap();
     commit(&mut m);
     let spent = m.root();
-    assert_ne!(spent, opened, "spending an action moves the app-hash");
+    assert_ne!(spent, opened, "spending an action moves the root-hash");
 
     // the snapshot carries the session, and the joiner re-derives the root from
     // the decoded bytes — the consensus-agreed root, never the peer, is the

@@ -1,6 +1,6 @@
 //! the saga ledger — the DETERMINISTIC half of the async engine.
 //!
-//! a pure state-machine module (in the app-hash) that records async work in
+//! a pure state-machine module (in the root-hash) that records async work in
 //! flight: one effect, one agreed result, domain-agnostic. it keeps
 //! `directory`'s shape — an in-memory `BTreeMap` with a `pending` overlay
 //! staged during a block and merged at the boundary, and a state-based
@@ -59,7 +59,7 @@
 //! recorded trigger origin per id. there is no lazy retention sweep — a
 //! terminal saga stays in the root preimage until its owner prunes it.
 //!
-//! `root()` folds in every field, so any transition moves the app-hash. a
+//! `root()` folds in every field, so any transition moves the root-hash. a
 //! joiner rebuilds this module from a peer via [`SagaModule::snapshot`] /
 //! [`SagaModule::install`]: the snapshot ships the committed map in the exact
 //! canonical encoding `root()` hashes, and install re-derives the root from
@@ -70,11 +70,17 @@
 mod interface;
 pub use interface::*;
 
-// the usage ledger: a node-local derived index over this module's op stream.
-// native-only: `indexer` drags unix-only IO that cannot cross into the wasm
-// guest, and the ledger is a serving-binary view, never consensus state.
-#[cfg(feature = "native")]
+// the usage ledger: the PURE decision core (fold + view over
+// index_guest::StateRead), compiled everywhere and unit-tested natively.
+// the engine shell that runs it inside the module's index database is
+// `index_guest` below.
 pub mod index;
+
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -372,7 +378,7 @@ pub struct SagaModule {
     capability_registry: Option<ModuleId>,
     /// genesis config, not state: identical on every node by construction.
     policy: LeasePolicy,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     sagas: BTreeMap<String, Saga>,
     /// this block's staged writes, read ahead of `sagas` (read-your-writes)
     /// but merged in — and reflected in `root()` — only at `commit_block`.

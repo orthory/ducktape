@@ -135,7 +135,7 @@ fn joiner_enters_through_a_sentry() {
 
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
-    cluster.wait_marker(0, "converged app_hash=", CONVERGE);
+    cluster.wait_marker(0, "converged root_hash=", CONVERGE);
 
     // the friend starts an out-of-mesh node whose ONLY entry point is the
     // sentry; it must PARK until admitted. an UNINVITED key is (correctly)
@@ -170,9 +170,9 @@ fn joiner_enters_through_a_sentry() {
     // the parked node syncs the boundary and promotes — every byte of that
     // handshake + state-sync crossed the sentry pipe.
     cluster.wait_marker(joiner, "admitted at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(joiner, "synced root_hash=", CONVERGE);
     cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
-    cluster.wait_marker(joiner, "recovered app_hash=", CONVERGE);
+    cluster.wait_marker(joiner, "recovered root_hash=", CONVERGE);
 
     // sanity check that node 0 was reachable through the forwarder at all — a
     // corroboration, not the proof. the real proof is structural + functional:
@@ -208,12 +208,12 @@ fn joiner_enters_through_a_sentry() {
     });
     assert_eq!(value, "hi back");
 
-    // no fork: identical status app-hashes once both sides quiesce (the founder
+    // no fork: identical status root-hashes once both sides quiesce (the founder
     // stayed alive throughout — 2-of-2 quorum must not tear down mid-read).
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
-        cluster.status(0)["app_hash"],
-        cluster.status(joiner)["app_hash"],
+        cluster.status(0)["root_hash"],
+        cluster.status(joiner)["root_hash"],
         "founder and promoted friend disagree on state"
     );
 }

@@ -133,7 +133,7 @@ hot-swaps every block (`crates/kernel/node/src/lib.rs:1201`), proven by
 `crates/kernel/host/tests/module_swap.rs`.
 
 That machinery is **R=n height-gated** (governance → all-validator readiness → activation height,
-`crates/system/upgrade/src/lib.rs:253-296`) because a code swap moves app-hash. **A stylesheet does
+`crates/system/upgrade/src/lib.rs:253-296`) because a code swap moves root-hash. **A stylesheet does
 not.** Routing a CSS fix through a governance vote and a full-validator roll would make UI iteration
 *slower* than today.
 
@@ -345,7 +345,7 @@ Two wasm halves, published together — no `bun`, no web bundle, no `provider.js
 `submits` is unchanged: the install-time grant that becomes the session key's `KeyScope.targets` —
 declared by the package, approved by the user, **enforced by consensus**, deliberately *not* scoped to
 the serving module. The view stays a **separate artifact** from the module because finding 6 still
-holds: a widget-tree tweak must not ride the R=n governance swap that moves app-hash.
+holds: a widget-tree tweak must not ride the R=n governance swap that moves root-hash.
 
 ### A2. Publish and pin — unchanged
 
@@ -495,7 +495,7 @@ blocking B.
 
 - `crates/kernel/host/tests/module_swap.rs` is the template for B's tests.
 - **Scope:** a key scoped to `chat` signing to `vaults` is dropped at the drain, no state change,
-  app-hash continuity across the boundary.
+  root-hash continuity across the boundary.
 - **Expiry:** a key past `expires_at` is refused at height `h+1`.
 - **Preimage binding:** an `AddMemberKey` whose scope is stripped after signing fails verification.
 - **Account resolution:** a second member key signing to `chat` produces the *same* `AuthorRef` as the

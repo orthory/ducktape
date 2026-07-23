@@ -190,7 +190,7 @@ fn synced_store_reconstructs_source_root() {
             .expect("sync_from");
         let synced = Pages::new("dst", Box::new(store));
 
-        // THE PROPERTY: identical qmdb root — the app-hash linkage a joiner
+        // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
         assert_eq!(
             synced.root(),

@@ -83,8 +83,8 @@ pub enum RelayMsg {
     Reply { frame_id: [u8; 32], outcome: RelayOutcome },
 }
 pub enum RelayOutcome {
-    /// drained Applied at `height` with the block's `app_hash`.
-    Applied { height: u64, app_hash: String },
+    /// drained Applied at `height` with the block's `root_hash`.
+    Applied { height: u64, root_hash: String },
     /// finalized but deterministically rejected.
     Rejected { detail: String },
     /// refused at the door (bad frame / origin lacks resident standing) or
@@ -131,7 +131,7 @@ Register `CHANNEL_SUBMIT_RELAY`; add a select arm:
    `SUBMIT_HOLD` budget as local submits.
 
 The drain arm that resolves `pending_submits` also resolves `pending_relays`:
-Applied → `Reply{Applied{height, app_hash}}` (the per-block boundary hash, as
+Applied → `Reply{Applied{height, root_hash}}` (the per-block boundary hash, as
 for local holds), Rejected → `Reply{Rejected}`, expiry → `Reply{Refused}`.
 Discards stay held — the cutover carry keeps the FrameId alive.
 
@@ -152,7 +152,7 @@ the validator path serves it). Replace both write refusals:
   `pending_relayed: HashMap<FrameId, (ReplySlot, Instant)>` where `ReplySlot`
   is the rpc reply sender or the app-surface oneshot.
 - On `RelayMsg::Reply`: resolve the slot — `Applied` maps to `RpcReply::ok()`
-  / `Ok(BlockSummary{height, app_hash})`; `Rejected`/`Refused` map to the
+  / `Ok(BlockSummary{height, root_hash})`; `Rejected`/`Refused` map to the
   error path verbatim.
 - Expiry: swept on the serve-window tick with the `SUBMIT_HOLD` budget — the
   validator's own hold, not a longer one. A larger budget buys nothing: the

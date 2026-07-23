@@ -121,7 +121,7 @@ fn ceiling_discards_and_cutover_rebases_heights() {
         );
         // the carried batch is the new epoch's first block at engine view 0 —
         // base 2 = height 2, advancing the boundary strictly (1 -> 2). both
-        // carried members share that one height and its one app-hash.
+        // carried members share that one height and its one root-hash.
         let boundary = node.finalized().expect("boundary");
         assert_eq!(boundary.height, 2, "engine view 0 + base 2 = height 2");
         assert_eq!(

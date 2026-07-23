@@ -5,7 +5,7 @@ import { GraphFlow, type SemanticEdge, type SemanticNode } from './GraphFlow.cli
 /**
  * From submitted op to committed block, as a horizontal pipeline: signed op
  * frames batch on a ~1s cadence into a super-frame, Simplex agrees the batch,
- * the node applies it as one block, the app-hash is sealed, and effects leave
+ * the node applies it as one block, the root-hash is sealed, and effects leave
  * the hot path and re-enter later as ordinary ordered ops. Curated from the
  * consensus / node / saga ground truth.
  */
@@ -15,7 +15,7 @@ const nodes: SemanticNode[] = [
   { id: 'batch', label: 'Batch super-frame', sub: '~1s cadence', category: 'network' },
   { id: 'simplex', label: 'Simplex agree', sub: 'BFT view + finalize', category: 'kernel' },
   { id: 'drain', label: 'Node drain', sub: 'apply as one block', category: 'kernel' },
-  { id: 'apphash', label: 'App-hash + seal', sub: 'modules execute · roots', category: 'store' },
+  { id: 'roothash', label: 'Root-hash + seal', sub: 'modules execute · roots', category: 'store' },
   { id: 'effects', label: 'Effects re-enter', sub: 'saga → worker → op', category: 'system' },
 ]
 
@@ -23,8 +23,8 @@ const edges: SemanticEdge[] = [
   { from: 'frames', to: 'batch', label: 'enqueue' },
   { from: 'batch', to: 'simplex', label: 'order', kind: 'order' },
   { from: 'simplex', to: 'drain', label: 'deliver', kind: 'order' },
-  { from: 'drain', to: 'apphash', label: 'commit', kind: 'commit' },
-  { from: 'apphash', to: 'effects', label: 'emit' },
+  { from: 'drain', to: 'roothash', label: 'commit', kind: 'commit' },
+  { from: 'roothash', to: 'effects', label: 'emit' },
   { from: 'effects', to: 'frames', label: 're-enter' },
 ]
 
@@ -39,7 +39,7 @@ export function ConsensusFlow({ height = 340 }: { height?: number }) {
   return (
     <GraphFlow
       title="Consensus & block commit"
-      description="Signed op frames batch on a ~1s cadence into a super-frame that Simplex agrees; the node applies the finalized batch as one block with an agreed height and time, seals the app-hash, and lets effects rejoin later as ordinary ordered ops."
+      description="Signed op frames batch on a ~1s cadence into a super-frame that Simplex agrees; the node applies the finalized batch as one block with an agreed height and time, seals the root-hash, and lets effects rejoin later as ordinary ordered ops."
       nodes={nodes}
       edges={edges}
       legend={legend}

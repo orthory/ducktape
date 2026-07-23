@@ -319,12 +319,12 @@ fn a_rejected_batch_member_is_isolated_and_the_rest_commit() {
 
 /// DETERMINISM: the same N ops as ONE batch block vs as N single blocks reach an
 /// identical LOGICAL state (every key resolves to the same value) but a DIFFERENT
-/// authenticated root and app-hash. this is the reality worth pinning: kv's
+/// authenticated root and root-hash. this is the reality worth pinning: kv's
 /// substrate is a commonware qmdb with a SEQUENTIAL merkle strategy, so the root
 /// commits to the commit-BOUNDARY structure (one commit vs three), not just the
 /// key→value map — folding N writes into one block is NOT root-equivalent to N
 /// single blocks even for the identical writes. so batching is observable in the
-/// app-hash: a joiner must agree on block structure, not merely on final values.
+/// root-hash: a joiner must agree on block structure, not merely on final values.
 #[test]
 fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
     // identical genesis on both sims: same valset seed, same module set. kv is
@@ -373,10 +373,10 @@ fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
         );
     }
 
-    // but the authenticated ROOT and app-hash DIFFER: the qmdb sequential merkle
+    // but the authenticated ROOT and root-hash DIFFER: the qmdb sequential merkle
     // commits to the commit-boundary structure, so one block ≠ three blocks even
     // for identical writes. (all OTHER module roots stay genesis-identical, so
-    // the app-hash gap is entirely the kv root gap — a clean isolation of the
+    // the root-hash gap is entirely the kv root gap — a clean isolation of the
     // effect.)
     assert_ne!(
         kv_root(&a),
@@ -384,8 +384,8 @@ fn one_batch_and_n_single_blocks_reach_the_same_values_but_different_roots() {
         "kv roots must differ: block structure is authenticated:\nA {a}\nB {b}"
     );
     assert_ne!(
-        a["app_hash"], b["app_hash"],
-        "the app-hash reflects the kv root gap"
+        a["root_hash"], b["root_hash"],
+        "the root-hash reflects the kv root gap"
     );
 }
 
@@ -579,8 +579,8 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     assert_eq!(a["height"], 1, "the batch is one block");
     assert_eq!(b["height"], n, "the singles are {n} blocks");
     assert_ne!(
-        a["app_hash"], b["app_hash"],
-        "the app-hash reflects the diverging roots"
+        a["root_hash"], b["root_hash"],
+        "the root-hash reflects the diverging roots"
     );
 
     // qmdb-backed modules authenticate the commit boundary → roots DIFFER.

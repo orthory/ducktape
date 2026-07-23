@@ -14,7 +14,7 @@ product depth다.
 
 - **Network state sync.** running validator는 state-sync wire protocol(manifest,
   chunked snapshot, `serve_sync`를 통한 live qmdb op-range serving)을 serve한다.
-  joiner는 모든 module을 그 위에서 rebuild하고 source app-hash를 합성한다.
+  joiner는 모든 module을 그 위에서 rebuild하고 source root-hash를 합성한다.
 - **Dynamic valset orchestration.** `ValsetOrchestrator`는 finalized valset state를
   watch하고 deterministic cutover를 schedule하며, new participant set 위로 engine을
   respawn하고 channel을 rotate한다.
@@ -33,7 +33,7 @@ product depth다.
 ## Durability And Promotion
 
 - ~~Restart/recovery from persisted state~~: shipped. write-ahead op journal과
-  periodic checkpoint가 composed app-hash를 boot에서 recover하고, engine은 persisted
+  periodic checkpoint가 composed root-hash를 boot에서 recover하고, engine은 persisted
   epoch와 finalization floor 뒤에서 기존 journal partition으로 respawn한다. 남은
   edge는 checkpoint 없는 pre-recovery storage dir이 migrate되지 않고 loud failure로
   끝나는 것이다.

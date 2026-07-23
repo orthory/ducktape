@@ -14,7 +14,7 @@
 
 - Signing namespaces exactly: `IDENTITY_BIND_NS = b"ducktape-identity-bind-v1"`, `IDENTITY_UNBIND_NS = b"ducktape-identity-unbind-v1"`.
 - Display-name limit 64 bytes (profiles' `MAX_NAME_LEN`); query page cap 256 (`MAX_QUERY_LIMIT`).
-- The module id is `"identity"`; it joins every host composition (`bin/node` genesis/restore/joiner, `bin/noded`, `bin/simnode`, `bin/demo`) or app-hash parity breaks.
+- The module id is `"identity"`; it joins every host composition (`bin/node` genesis/restore/joiner, `bin/noded`, `bin/simnode`, `bin/demo`) or root-hash parity breaks.
 - Adding the module is a module-set change: existing networks need a genesis rebuild; this is accepted (dev-stage networks, same class as the video-calls engine-bank change).
 - `Frame`, valset, governance, mesh, NAT, WireGuard code paths must NOT change.
 - Determinism: no wall clock, no randomness inside the module; ed25519 verify in `execute` is allowed (pure).
@@ -417,7 +417,7 @@ Expected hits: `bin/node/src/main.rs` ×3 (genesis/restore/joiner), `bin/noded/s
 Run: `cargo build -p node-bin -p noded -p simnode -p demo 2>&1 | tail -5` (package names per each `Cargo.toml`; verify with `grep '^name' bin/*/Cargo.toml`)
 Expected: clean build.
 Run: `cargo test -p noded module_category` (the category enumeration test) and `cargo test -p demo`
-Expected: PASS — `joiner_rebuilds_global_app_hash` in demo proves the new module composes into app-hash parity.
+Expected: PASS — `joiner_rebuilds_global_root_hash` in demo proves the new module composes into root-hash parity.
 
 - [ ] **Step 3: Run the node's own test suite (slow, but the joiner/cluster proofs live here)**
 
@@ -639,7 +639,7 @@ git commit -m "feat(app): user-grouped members roster + linked-devices settings 
 **Interfaces:**
 - Consumes: the cluster harness's submit + query plumbing; `identity::{encode_msg, encode_query, decode_reply}`; `config::mint_bind_cert`.
 
-- [ ] **Step 1: Write the test:** spin the harness's standard 2-validator network (chain id from the harness); create one user key (`from_seed(42)`); node A submits `BindNode` (cert nonce 0), await finalization; node B submits its own `BindNode` (cert nonce 1); query `UserOf(A)` and `UserOf(B)` on BOTH nodes → same `user_key`, `nodes` len 2, and both nodes' app-hash / identity module root agree. Then `UnbindNode(A)` signed nonce 2 submitted FROM node B → `UserOf(A)` → null on both.
+- [ ] **Step 1: Write the test:** spin the harness's standard 2-validator network (chain id from the harness); create one user key (`from_seed(42)`); node A submits `BindNode` (cert nonce 0), await finalization; node B submits its own `BindNode` (cert nonce 1); query `UserOf(A)` and `UserOf(B)` on BOTH nodes → same `user_key`, `nodes` len 2, and both nodes' root-hash / identity module root agree. Then `UnbindNode(A)` signed nonce 2 submitted FROM node B → `UserOf(A)` → null on both.
 - [ ] **Step 2: Run it** — `cargo test -p node-bin identity_two_nodes_one_user -- --nocapture 2>&1 | tail -15`
 Expected: PASS.
 - [ ] **Step 3: Commit**

@@ -1,4 +1,4 @@
-//! the network lifecycle module: the app-hashed commitment to WHICH code every
+//! the network lifecycle module: the root-hashed commitment to WHICH code every
 //! hot-swappable module runs.
 //!
 //! it holds, folded into a single `root()`: per hot-swappable module, the
@@ -103,7 +103,7 @@ impl Lifecycle {
     /// GENESIS seeding: install a module's initial active code hash directly into
     /// committed state, BEFORE the host registers this instance. deterministic
     /// and identical on every node (a different seed set composes a different
-    /// genesis app-hash and the network forks at genesis). never valid after
+    /// genesis root-hash and the network forks at genesis). never valid after
     /// genesis: live changes go through `RegisterModule`/`ScheduleSwap` ops.
     pub fn seed(&mut self, module_id: impl Into<String>, code_hash: Vec<u8>) {
         assert_eq!(
@@ -414,7 +414,7 @@ impl Lifecycle {
 
         let mut next = self.read().clone();
 
-        // flip every armed swap's active hash into the app-hash.
+        // flip every armed swap's active hash into the root-hash.
         for id in armed_swaps {
             if let Some(entry) = next.modules.get_mut(&id)
                 && let Some(swap) = entry.pending.take()

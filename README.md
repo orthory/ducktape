@@ -6,8 +6,8 @@ way CosmWasm isolates contracts, but in native Rust.
 
 Each module owns its authenticated state substrate and exposes exactly one
 32-byte root to the host. The host dispatches modules over BFT consensus and
-composes the sorted module roots into a global app-hash that consensus commits.
-If two nodes agree on the app-hash, they agree on every module's state.
+composes the sorted module roots into a global root-hash that consensus commits.
+If two nodes agree on the root-hash, they agree on every module's state.
 
 ## The Module Rule
 
@@ -26,7 +26,7 @@ The tree groups by function into three layers — module / kernel / networking:
 
 | Path | Contents |
 | --- | --- |
-| `crates/kernel/` | The platform: `sdk` (module contract + codec), `host` (submit/execute loop, app-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `wasm-host` (pinned wasmtime runtime for hot-swappable module components) |
+| `crates/kernel/` | The platform: `sdk` (module contract + codec), `host` (submit/execute loop, root-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `wasm-host` (pinned wasmtime runtime for hot-swappable module components) |
 | `crates/networking/` | The netstack: host-side transport infra — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net` — plus the consensus modules that govern it, `duckdns` and `gateway` (the merged name→AccountId→route module) |
 | `crates/modules/system/` | System modules and their host-side counterparts: `kv` (byte-KV), `valset` (ed25519 validator membership), `clients`, `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `airlock` (exec/credential gateway), plus `blobstore`, `dispatch-oracle`, `capability-host` |
 | `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`), `jobs` (first-claim-wins work board) |
@@ -89,7 +89,7 @@ cargo test --workspace
 ```
 
 Run the in-process super-app demo — registers the platform and product modules
-together and shows their roots moving under one composed app-hash:
+together and shows their roots moving under one composed root-hash:
 
 ```sh
 cargo run -p demo
@@ -98,14 +98,14 @@ cargo run -p demo
 Run the real-socket cluster e2e — REAL node processes over localhost TCP,
 driven through the rpc: BFT convergence, a chat product loop, a governance
 vote, a live epoch cutover, a crash-fault liveness check, and a sync-only
-joiner rebuilding every module to the identical app-hash:
+joiner rebuilding every module to the identical root-hash:
 
 ```sh
 cargo test -p node-bin --test cluster_e2e
 ```
 
 Run the joiner state-sync proof — a fresh joiner rebuilds every module and
-lands on the source app-hash:
+lands on the source root-hash:
 
 ```sh
 cargo test -p demo --test network_joiner_full
@@ -224,7 +224,7 @@ Korean) under `docs/src/content/docs`.
 ## Status
 
 The platform spine is checked in and verified: the module contract, host
-registry, global app-hash, ordered node path, commonware Simplex orderer,
+registry, global root-hash, ordered node path, commonware Simplex orderer,
 the saga async seam, and several root-backed product modules, plus state
 sync for QMDB-backed, forge, and snapshot-style modules.
 

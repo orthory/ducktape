@@ -6,7 +6,7 @@ version.workspace = true
 # the ducktape node daemon: owns ONE embedded `host::Host` on a dedicated
 # actor thread (the host is deliberately non-Send) and exposes it to clients
 # over http + websocket — POST /v1/submit (one msg = one block), POST /v1/query
-# (read committed state), GET /v1/status (version + app-hash + module roots),
+# (read committed state), GET /v1/status (version + root-hash + module roots),
 # POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a block-finalized event
 # stream). every ducktape app build is a client of this process: the web build
 # dials it directly; the native Iced build spawns or adopts its managed
@@ -61,10 +61,12 @@ duckfs-core = { workspace = true }
 # the node-local op-receipt blob store (the http blob lane): op payloads staged
 # at submit time, served back by digest. re-exported by `src/blobs.rs`.
 blobstore = { workspace = true }
-# the derived read-model tier: the actor materializes per-module fluent31
-# indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
-# each module registers its `::index` mapper as its own view endpoint.
+# the derived read-model tier: the actor feeds per-module fluent31 databases
+# as blocks commit; each module's bundled wasm index guest folds them and
+# serves its view endpoint. /v1/index/* serves snapshot reads.
 indexer = { workspace = true }
+# decoding the borsh op-row envelopes for the /v1/index/*/ops json projection.
+borsh = { workspace = true }
 # the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
 # it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
 # no self-dial. NOT a consensus-path crate — a client engine, OS-side only.

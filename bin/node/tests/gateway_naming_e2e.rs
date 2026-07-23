@@ -65,7 +65,7 @@ fn account_name_converges_without_node_discovery() {
     }
     for idx in 0..2 {
         cluster.wait_marker(idx, "rpc listening on", READY);
-        cluster.wait_marker(idx, "converged app_hash=", READY);
+        cluster.wait_marker(idx, "converged root_hash=", READY);
     }
 
     let member = ed25519::PrivateKey::from_seed(42);

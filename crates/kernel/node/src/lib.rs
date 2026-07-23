@@ -56,7 +56,7 @@ impl From<host::SubmitError> for Error {
 // fan it out to peers) converges only for order-INdependent module roots (a
 // state-based `directory` root). a qmdb root is op-log/MMR-order-DEPENDENT:
 // the same SET of ops in different orders yields a different root, so the
-// instant two validators apply in different orders their app-hash FORKS.
+// instant two validators apply in different orders their root-hash FORKS.
 //
 // the fix is an AGREED TOTAL ORDER. a locally-originated msg is **NOT** applied
 // on submission — that optimistic echo is exactly what forks the chain the
@@ -135,7 +135,7 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 // message cap — and commonware's `Sender::send` ASSERTS on that cap, so a
 // full-CHUNK_SIZE duckfs putblob panicked the proposer's gossip task instead
 // of rejecting (#215). the wire bytes are NOT consensus state (only the
-// app-hash must match across nodes), but every validator must speak the same
+// root-hash must match across nodes), but every validator must speak the same
 // codec — changing it is a flag-day, fine while the network rebuilds anyway.
 
 /// hard cap on ONE encoded op frame, enforced as a CLEAN deterministic
@@ -326,7 +326,7 @@ pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
 // authenticated authorship live on each member, never on the container. the
 // container's own content address is `frame_id(&batch_bytes)`; the orderer
 // orders these containers, and [`OrderedNode::drain_delivered`] decodes one into
-// its members and applies them as ONE block at ONE height under ONE app-hash.
+// its members and applies them as ONE block at ONE height under ONE root-hash.
 
 /// hard cap on ONE encoded batch super-frame — the packing target for
 /// [`OrderedNode::flush_batch`]. equal to [`MAX_FRAME_BYTES`]: a single member
@@ -725,11 +725,11 @@ pub struct DrainedFrame {
     /// the app height stamped for this frame's view (`view_base + view`).
     pub height: u64,
     pub disposition: Disposition,
-    /// the composed app-hash after this frame settled. a rejected frame rolls
+    /// the composed root-hash after this frame settled. a rejected frame rolls
     /// back and a discarded one never runs (hash unchanged from the previous
     /// block in both cases) — recorded regardless, so every outcome carries
     /// the boundary it left behind.
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
     /// the decoded op this frame carried. `None` when there was nothing to
     /// decode: a frame discarded at the cutover ceiling (dropped before
     /// decoding) or one whose decode/signature check failed.
@@ -847,8 +847,8 @@ pub struct BlockSeal {
     /// every registered module's `(id, root)` AFTER this block settled, in
     /// registry (sorted-id) order — [`host::Host::module_roots`].
     pub roots: Vec<(sdk::ModuleId, StateRoot)>,
-    /// the composed app-hash after this block settled.
-    pub app_hash: StateRoot,
+    /// the composed root-hash after this block settled.
+    pub root_hash: StateRoot,
 }
 
 /// the recovery seam on the ordered lane: a write-ahead journal for finalized
@@ -967,7 +967,7 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// agreed-delivery order.
     events: Vec<Event>,
     /// the latest APPLIED consensus boundary: the last drained APP HEIGHT
-    /// (`view_base + engine view`) plus the app-hash after that drain settled.
+    /// (`view_base + engine view`) plus the root-hash after that drain settled.
     /// this is what a state-sync service serves from
     /// (`host::Host::capture_finalized_snapshot` demands exactly this pair) —
     /// `None` until the first frame applies.
@@ -1299,7 +1299,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
 
     /// SUBMIT — propose a locally-originated msg into the agreed order. framed
     /// with `(origin, seq)` for a tie-free order key + replay identity. does NOT
-    /// touch the local host: `app_hash()` is unchanged until the order delivers
+    /// touch the local host: `root_hash()` is unchanged until the order delivers
     /// this frame back through [`OrderedNode::drain_delivered`] (the semantic
     /// shift — no optimistic echo). returns the frame's [`FrameId`] so the
     /// caller can recognize this op's outcome in [`OrderedNode::take_drained`].
@@ -1412,9 +1412,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
 
     /// DRAIN — apply every BATCH the order delivered, STRICTLY in agreed order.
     /// each delivered `(view, frame)` is ONE batch super-frame applied via
-    /// `host.submit_block` as ONE block at ONE height under ONE app-hash, with
+    /// `host.submit_block` as ONE block at ONE height under ONE root-hash, with
     /// per-member outcomes surfaced as N [`DrainedFrame`]s (all sharing that
-    /// app-hash). returns the count of BATCHES processed (0 when idle) so a test
+    /// root-hash). returns the count of BATCHES processed (0 when idle) so a test
     /// can drive to a fixpoint deterministically.
     ///
     /// ## rejected vs fatal
@@ -1485,7 +1485,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                                 id: frame_id(member),
                                 height,
                                 disposition: Disposition::Discarded,
-                                app_hash: self.host.app_hash(),
+                                root_hash: self.host.root_hash(),
                                 op: None,
                                 reason: None,
                             });
@@ -1495,7 +1495,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id: batch_id,
                         height,
                         disposition: Disposition::Discarded,
-                        app_hash: self.host.app_hash(),
+                        root_hash: self.host.root_hash(),
                         op: None,
                         reason: None,
                     }),
@@ -1537,7 +1537,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id: batch_id,
                         height,
                         disposition: Disposition::Rejected,
-                        app_hash: self.host.app_hash(),
+                        root_hash: self.host.root_hash(),
                         op: None,
                         reason: Some("batch decode failed".to_string()),
                     });
@@ -1554,7 +1554,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // caught deterministically by the module's own (origin, seq) dedup —
             // identically live and on recovery replay. a member that fails to
             // decode is a deterministic no-op: EXCLUDED from the ops and recorded
-            // Rejected after the block settles (it shares the block app-hash).
+            // Rejected after the block settles (it shares the block root-hash).
             // the rest carry their identity parallel to `ops`, in member (=
             // applied, = enqueue/FIFO) order, for building the drained records.
             let mut ops: Vec<host::BlockOp> = Vec::new();
@@ -1623,7 +1623,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         id: batch_id,
                         height,
                         disposition: Disposition::Rejected,
-                        app_hash: self.host.app_hash(),
+                        root_hash: self.host.root_hash(),
                         op: None,
                         reason: Some(member_reason(e.to_string())),
                     });
@@ -1632,14 +1632,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     continue;
                 }
             };
-            // N DrainedFrames per batch, all sharing the ONE post-batch app-hash.
-            let batch_hash = outcome.app_hash;
+            // N DrainedFrames per batch, all sharing the ONE post-batch root-hash.
+            let batch_hash = outcome.root_hash;
             self.events.extend(outcome.events);
-            // the block-level seal disposition is DRAIN-based, not app-hash-based:
+            // the block-level seal disposition is DRAIN-based, not root-hash-based:
             // a block is Applied iff it ran real work — any member applied, or a
             // once-per-block System injection dispatched. this is identical live,
             // on forward replay, AND on a torn-heal's PARTIAL commit (which aborts
-            // the already-durable mover, so its app-hash cannot be trusted). exactly
+            // the already-durable mover, so its root-hash cannot be trusted). exactly
             // one seal per batch, below.
             let has_system = !outcome.system_dispatches.is_empty();
             // surface the injections' dispatch traces beside the member
@@ -1695,7 +1695,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 // like a member's, and an APPLIED continuation is real work:
                 // it moves state, so it must reach the seal disposition or a
                 // continuation-only block would seal Rejected with a moved
-                // app-hash and recovery could never reproduce it.
+                // root-hash and recovery could never reproduce it.
                 let continuation = op_cont.map(|cont| {
                     let released = cont_outcomes[i]
                         .take()
@@ -1723,7 +1723,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     id: mid,
                     height,
                     disposition,
-                    app_hash: batch_hash,
+                    root_hash: batch_hash,
                     op: Some(DrainedOp {
                         origin: op_origin,
                         target: op_target,
@@ -1736,7 +1736,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 });
             }
             // members that failed to decode: recorded AFTER the outcome so they
-            // share the block app-hash. custody ends — a decode-fail can never
+            // share the block root-hash. custody ends — a decode-fail can never
             // apply, so it must not be carried at a cutover.
             for (mid, decode_reason) in decode_fail {
                 self.outstanding.remove(&mid);
@@ -1744,7 +1744,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     id: mid,
                     height,
                     disposition: Disposition::Rejected,
-                    app_hash: batch_hash,
+                    root_hash: batch_hash,
                     op: None,
                     reason: Some(decode_reason),
                 });
@@ -1756,7 +1756,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             };
             self.seal(height, block_disp).await?;
             // the block spine. NOTHING in this repo ever said "height H produced
-            // app-hash X" — and fork triage, upgrade verification, and "is my node
+            // root-hash X" — and fork triage, upgrade verification, and "is my node
             // keeping up" all start exactly there.
             //
             // gated on `any_applied`: an idle chain heartbeats a nop block every
@@ -1767,7 +1767,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     target: "ducktape::consensus",
                     height,
                     view,
-                    app_hash = %hex_root(&batch_hash),
+                    root_hash = %hex_root(&batch_hash),
                     applied = applied_count,
                     rejected = rejected_count,
                     "block committed"
@@ -1800,7 +1800,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             if self.finalized.is_none_or(|f| height > f.height) {
                 self.finalized = Some(host::FinalizedBlock {
                     height,
-                    app_hash: self.host.app_hash(),
+                    root_hash: self.host.root_hash(),
                 });
                 self.finalized_view = Some(view);
             }
@@ -1809,13 +1809,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     }
 
     /// journal a settled block's outcome: disposition + the post-block root
-    /// vector (the replay positions) + the composed app-hash.
+    /// vector (the replay positions) + the composed root-hash.
     async fn seal(&mut self, height: u64, disposition: Disposition) -> Result<(), Error> {
         let seal = BlockSeal {
             height,
             disposition,
             roots: self.host.module_roots(),
-            app_hash: self.host.app_hash(),
+            root_hash: self.host.root_hash(),
         };
         self.sink.seal(&seal).await
     }
@@ -1834,9 +1834,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.finalized_view
     }
 
-    /// the current app-hash of the wrapped host.
-    pub fn app_hash(&self) -> StateRoot {
-        self.host.app_hash()
+    /// the current root-hash of the wrapped host.
+    pub fn root_hash(&self) -> StateRoot {
+        self.host.root_hash()
     }
 
     /// take the events accumulated by applied blocks since the last call. the
@@ -1902,7 +1902,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// to drive `Host::set_active_version` across the registry at `H` (design §4).
     /// this sets non-hashed dual-path branch selectors only; it never mutates
     /// hashed state (that rides the in-block System `Advance` the host drain
-    /// injects), so it cannot move the app-hash on its own.
+    /// injects), so it cannot move the root-hash on its own.
     pub fn host_mut(&mut self) -> &mut Host {
         &mut self.host
     }

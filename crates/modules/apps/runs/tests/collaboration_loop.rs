@@ -10,7 +10,7 @@
 //! AGENT) plus the task action commit in that delivery block (pruning the
 //! pending entry — the dispatch module keeps the history) → a second
 //! composition replaying the identical op sequence lands on the
-//! byte-identical app-hash — the oracle-as-op laundering that makes a
+//! byte-identical root-hash — the oracle-as-op laundering that makes a
 //! non-deterministic LLM consensus-safe (N2).
 //!
 //! the JOBS lane rides the same plane: a submitted `agent/{id}` job is
@@ -591,12 +591,12 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         assert_eq!(record.status, AgentStatus::Active);
         assert_eq!(record.capability, "mock-llm-1");
 
-        (host.app_hash(), oracle_op)
+        (host.root_hash(), oracle_op)
     });
 
     // ---- instance two: replay the identical op sequence -------------------
     // a fresh composition applies the same six blocks and must land on the
-    // byte-identical app-hash: the LLM's non-determinism was laundered into
+    // byte-identical root-hash: the LLM's non-determinism was laundered into
     // an ordered op, so replay is pure state-machine (N2).
     let replayed_hash = deterministic::Runner::default().start(|context| async move {
         let mut host = genesis(context).await;
@@ -613,12 +613,12 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
             .await
             .expect("replayed delivery block");
         assert_eq!(pending_run(&host, &replay_run_id).await, None);
-        outcome.app_hash
+        outcome.root_hash
     });
 
     assert_eq!(
         settled_hash, replayed_hash,
-        "two instances, one op sequence -> byte-identical app-hash"
+        "two instances, one op sequence -> byte-identical root-hash"
     );
     assert_ne!(settled_hash, StateRoot::ZERO);
 }

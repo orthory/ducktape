@@ -6,9 +6,9 @@
 //!   * the host's out-of-block `realize_module_swaps(H, src)` fetches the
 //!     committed target hash's bytes, verifies sha256, and swaps the component
 //!     KEEPING the host-owned state — the module's `root()` (and thus the
-//!     app-hash) is byte-identical across the swap itself;
+//!     root-hash) is byte-identical across the swap itself;
 //!   * the drain injects EXACTLY ONE System-origin modreg `Advance` in block `H`,
-//!     flipping the committed active hash into the app-hash (the consensus
+//!     flipping the committed active hash into the root-hash (the consensus
 //!     commitment to the new code);
 //!   * block `H`'s ops execute the NEW logic over the KEPT state (2 + 100, never
 //!     102-from-zero and never 3);
@@ -151,7 +151,7 @@ fn realize(host: &mut Host, height: u64, src: &dyn CodeSource) -> Result<(), Err
     block_on(host.realize_module_swaps(height, src))
 }
 
-/// drive the WHOLE swap scenario and return the final app-hash — shared by the
+/// drive the WHOLE swap scenario and return the final root-hash — shared by the
 /// headline proof and the cross-node determinism check.
 fn run_swap_scenario() -> (Host, StateRoot) {
     let mut host = host_with_wasm();
@@ -187,7 +187,7 @@ fn run_swap_scenario() -> (Host, StateRoot) {
     // block: its root op runs replacement logic and the drain's injected modreg Advance
     // flips the committed active hash in the same block.
     let wasm_root_before = host.module_root("hello").expect("hello root");
-    let app_hash_before = host.app_hash();
+    let root_hash_before = host.root_hash();
     realize(&mut host, H, &src).expect("swap realizes at H");
     assert_eq!(
         host.module_root("hello").expect("hello root"),
@@ -195,9 +195,9 @@ fn run_swap_scenario() -> (Host, StateRoot) {
         "the swap keeps the host-owned state: root is byte-identical"
     );
     assert_eq!(
-        host.app_hash(),
-        app_hash_before,
-        "code is invisible to the app-hash: realization alone moves nothing"
+        host.root_hash(),
+        root_hash_before,
+        "code is invisible to the root-hash: realization alone moves nothing"
     );
     // idempotent: a second realization at the same height is a no-op.
     realize(&mut host, H, &src).expect("re-realize is Ok");
@@ -221,7 +221,7 @@ fn run_swap_scenario() -> (Host, StateRoot) {
     submit(&mut host, H + 1, Origin::External(vec![7; 32]), inc_msg());
     assert_eq!(count(&host), 203, "replacement keeps stepping by 100");
 
-    let final_hash = host.app_hash();
+    let final_hash = host.root_hash();
     (host, final_hash)
 }
 
@@ -233,12 +233,12 @@ fn live_swap_at_boundary_keeps_state_and_runs_new_code() {
 }
 
 /// two independent nodes running the identical finalized sequence land on the
-/// identical app-hash — the swap realization introduces no per-node divergence.
+/// identical root-hash — the swap realization introduces no per-node divergence.
 #[test]
 fn deterministic_across_nodes() {
     let (_, a) = run_swap_scenario();
     let (_, b) = run_swap_scenario();
-    assert_eq!(a, b, "same sequence, same app-hash on both nodes");
+    assert_eq!(a, b, "same sequence, same root-hash on both nodes");
 }
 
 /// FAIL-CLOSED: a node that lacks the armed hash's bytes — or holds bytes that
@@ -304,7 +304,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         let snap = source
             .capture_finalized_snapshot(host::FinalizedBlock {
                 height: H + 1,
-                app_hash: source.app_hash(),
+                root_hash: source.root_hash(),
             })
             .expect("finalized snapshot");
         snap.modules

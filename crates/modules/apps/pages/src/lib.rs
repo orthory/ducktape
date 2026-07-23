@@ -14,7 +14,7 @@
 //! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
 //! to [`Pages::new`], so this crate never names a storage crate. the module's
 //! authenticated [`StateRoot`] IS the store's merkle root, so it flows
-//! directly into the global app-hash via `host::global_root`.
+//! directly into the global root-hash via `host::global_root`.
 //!
 //! ## keys are hashed to a fixed width
 //!
@@ -54,11 +54,17 @@
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
-// the derived-tier materialized view; registered only by serving binaries —
-// native-only (indexer drags fluent31's unix IO), never consensus state, so
-// the wasm guest builds without it.
-#[cfg(feature = "native")]
+// the derived-tier materialized view: the PURE decision core (fold + view
+// over index_guest::StateRead), compiled everywhere and unit-tested
+// natively. the engine shell that runs it inside the module's index
+// database is `index_guest` below.
 pub mod index;
+
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
 
 use std::collections::BTreeMap;
 

@@ -1,7 +1,7 @@
 //! sim e2e: a REAL spawned `ducktape-simnode` driven over its /v1 + /sim
 //! wires. what this suite pins is the DRIVER's contract — held submits commit
 //! only on step, the logical clock makes identical scripts reproduce identical
-//! app-hashes, personas shape the receipt/ring exactly like the two real
+//! root-hashes, personas shape the receipt/ring exactly like the two real
 //! nodes, and peer blocks commit past a parked submit queue. the /v1 routes
 //! themselves are noded's (covered by noded's own router/daemon suites), and
 //! module SEMANTICS live in core_scenarios.rs — this file stays about the
@@ -51,9 +51,9 @@ fn held_submit_commits_only_on_step() {
 }
 
 #[test]
-fn same_script_same_app_hash() {
+fn same_script_same_root_hash() {
     // the whole point of the logical clock: two fresh sims fed an identical
-    // op script must walk identical app-hashes, block by block.
+    // op script must walk identical root-hashes, block by block.
     let run = || -> Vec<String> {
         let storage = tempfile::tempdir().expect("storage dir");
         let sim = Sim::spawn(storage.path(), &[]);
@@ -70,7 +70,7 @@ fn same_script_same_app_hash() {
             sim.await_sim_state("held", 1);
             let report = sim.step();
             hashes.push(
-                report["committed"]["app_hash"]
+                report["committed"]["root_hash"]
                     .as_str()
                     .expect("step committed")
                     .to_string(),
@@ -79,7 +79,7 @@ fn same_script_same_app_hash() {
             assert_eq!(code, 200);
         }
         hashes.push(
-            sim.status()["app_hash"]
+            sim.status()["root_hash"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
@@ -154,10 +154,10 @@ fn personas_shape_receipts_and_ring() {
 }
 
 #[test]
-fn auto_and_step_commit_paths_walk_identical_app_hashes() {
+fn auto_and_step_commit_paths_walk_identical_root_hashes() {
     // hold mode commits through step_once, auto mode through handle_submit's
     // inline drain — two code paths, one logical clock. the same script must
-    // walk the same app-hashes through either, or a refactor of one path has
+    // walk the same root-hashes through either, or a refactor of one path has
     // quietly forked the sim's determinism contract.
     let script = || {
         [
@@ -181,7 +181,7 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
                 let report = sim.step();
                 let (code, _) = pending.join().expect("submit thread");
                 assert_eq!(code, 200);
-                report["committed"]["app_hash"]
+                report["committed"]["root_hash"]
                     .as_str()
                     .expect("step committed")
                     .to_string()
@@ -197,9 +197,9 @@ fn auto_and_step_commit_paths_walk_identical_app_hashes() {
             .map(|(target, payload)| {
                 // auto mode: the submit reply IS the commit receipt.
                 let receipt = sim.submit_ok(target, payload, None);
-                receipt["app_hash"]
+                receipt["root_hash"]
                     .as_str()
-                    .expect("receipt app hash")
+                    .expect("receipt root hash")
                     .to_string()
             })
             .collect()

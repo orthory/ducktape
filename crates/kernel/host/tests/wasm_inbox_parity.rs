@@ -3,9 +3,8 @@
 //! and the native `Inbox` module answer the SAME op sequence with IDENTICAL
 //! query replies, and their roots move in lockstep (move on commit, hold on
 //! no-ops and abort). the roots THEMSELVES differ — the port persists the
-//! native canonical snapshot as one host-KV value, a declared state-schema
-//! break (revision 2) — and this proof pins that difference so it can never be
-//! mistaken for accidental compatibility.
+//! native canonical snapshot as one host-KV value, an intentional greenfield
+//! root break pinned by this proof.
 //!
 //! the inbox's primary writer is a SIBLING module's follow-up (`emit_msg`), so
 //! the op matrix includes a delivery emitted by a stub producer module — the

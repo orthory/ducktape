@@ -3,9 +3,8 @@
 //! behind `guest-adapter`) and the native `Gateway` module answer the SAME op
 //! sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 3) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! the port persists the native canonical snapshot as one host-KV value, an
+//! intentional greenfield root break pinned by this proof.
 //!
 //! gateway now owns the WHOLE `.duck` name → AccountId → route pipeline: BOTH
 //! the route plane AND the `.duck` handle plane absorbed from the retired
