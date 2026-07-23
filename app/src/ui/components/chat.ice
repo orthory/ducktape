@@ -39,7 +39,7 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
       pressed bg=danger/26 text=fg border=danger/34
 
 component RichLine(block:ChatBlock)
-  flex width=fill wrap gap=5.0 align-items=start
+  flex width=fill wrap column-gap=0.0 row-gap=4.0 align-items=start
     for span in block.spans
       if span.highlight
         text span.text size=14.0 line-height=1.45 font=medium @text-primary

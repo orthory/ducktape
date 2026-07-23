@@ -3568,9 +3568,15 @@ fn word_spans(spans: &[chat::Span]) -> Vec<ChatSpan> {
         });
         let mention = span.marks.iter().any(|m| matches!(m, chat::Mark::Mention(_)));
         let highlight = link.is_some() || mention;
-        for word in span.text.split_whitespace() {
+        // Keep the trailing space baked into each token so a wrapping flex with
+        // zero column-gap reproduces exact spacing around mark boundaries (a
+        // comma right after a bold run stays attached, not " ,").
+        for token in span.text.split_inclusive(' ') {
+            if token.is_empty() {
+                continue;
+            }
             out.push(ChatSpan {
-                text: word.to_string(),
+                text: token.to_string(),
                 bold,
                 italic,
                 highlight,
