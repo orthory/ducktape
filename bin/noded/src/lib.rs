@@ -76,7 +76,13 @@ pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStag
 // the node-local, off-chain interactive terminal-session plane. public so
 // `main.rs` can build the manager and wire it onto the handle.
 pub mod term;
-pub use term::{TermChunkEvent, TermCommandEvent, TermCommandRing, TermRing, TerminalSessions};
+pub use term::{
+    CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing, TermError,
+    TermRing, TerminalSessions,
+};
+
+pub mod term_remote;
+pub use term_remote::{RemoteSessions, SessionInputWire, SessionJob, SessionLane};
 // PR2 consensus command source: the chat<->pty bridge (channel scheme + the
 // off-loop projector that drives committed chat commands into a session's pty).
 mod term_consensus;
