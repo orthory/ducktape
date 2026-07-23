@@ -74,7 +74,21 @@ impl Gateway {
     /// return the scoped session token. ECDHs the attested key, so the token can
     /// only be opened by this client — a relaying node cannot read it.
     pub async fn open_session(&self, seal_pk: &[u8; 32], sub: &str) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false).await?;
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false, None).await?;
+        Ok(token)
+    }
+
+    /// Open a session that CLAIMS to act on behalf of `account` — the grant
+    /// subject a co-hosted lending gateway checks against its on-chain credential
+    /// record. Refused (`credential_not_granted`) if the account is neither the
+    /// owner nor a grantee.
+    pub async fn open_session_as(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+        account: &[u8],
+    ) -> Result<String> {
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false, Some(account)).await?;
         Ok(token)
     }
 
@@ -85,7 +99,7 @@ impl Gateway {
         seal_pk: &[u8; 32],
         sub: &str,
     ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true).await
+        self.open_session_with(seal_pk, sub, true, None).await
     }
 
     async fn open_session_with(
@@ -93,6 +107,7 @@ impl Gateway {
         seal_pk: &[u8; 32],
         sub: &str,
         body_seal: bool,
+        account: Option<&[u8]>,
     ) -> Result<(String, handshake::SessionKeys)> {
         let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
         let resp: SessionResponse = self
@@ -101,6 +116,7 @@ impl Gateway {
                 sub: sub.to_string(),
                 client_eph_pk_b64: BASE64.encode(client_eph_pk),
                 body_seal,
+                account_b64: account.map(|a| BASE64.encode(a)),
             })
             .send()
             .await?

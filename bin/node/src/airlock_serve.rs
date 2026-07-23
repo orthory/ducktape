@@ -38,6 +38,10 @@ use std::path::{Path, PathBuf};
 use airlock::seal::SealKeypair;
 use airlock::server::{AttestMode, GatewayConfig};
 use airlock::wire::{CredentialKind, CredentialPayload};
+use futures::SinkExt as _;
+use futures::channel::{mpsc, oneshot};
+use gateway::{GatewayQuery, GatewayReply, credential_use_allowed};
+use noded::NodeCommand;
 
 const ANTHROPIC_BASE: &str = "https://api.anthropic.com";
 const OPENAI_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -52,6 +56,13 @@ pub struct AirlockServe {
     pub seeds: Vec<(String, CredentialKind, CredentialPayload)>,
     /// requested loopback port, or `None` for an ephemeral one.
     pub port: Option<u16>,
+    /// Whether this gateway LENDS credentials to other accounts — the self-host
+    /// store path, whose credentials are registered on-chain with owner-signed
+    /// grants. When set, the caller wires the committed-state grant gate (see
+    /// [`committed_grant_check`]) so a session claiming an ungranted account is
+    /// refused at the owner's own gateway. The TEE env path (a single, locally
+    /// configured enclave credential) is not lent, so it leaves the gate off.
+    pub grant_gated: bool,
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -89,21 +100,19 @@ impl AirlockServe {
             .map(|payload| (name, CredentialKind::Claude, payload))
             .into_iter()
             .collect();
+        let (anthropic_base, openai_base, oauth_token_url, oauth_client_id) = base_fields();
         let cfg = GatewayConfig {
             attest: AttestMode::Tsm(attest),
             seal_keypair: None,
-            anthropic_base: env_nonempty("DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE")
-                .unwrap_or_else(|| ANTHROPIC_BASE.into()),
-            openai_base: env_nonempty("DUCKTAPE_AIRLOCK_SERVE_OPENAI_BASE")
-                .unwrap_or_else(|| OPENAI_BASE.into()),
-            oauth_token_url: env_nonempty("DUCKTAPE_AIRLOCK_SERVE_OAUTH_TOKEN_URL")
-                .unwrap_or_else(|| OAUTH_TOKEN_URL.into()),
-            oauth_client_id: env_nonempty("DUCKTAPE_AIRLOCK_SERVE_OAUTH_CLIENT_ID")
-                .unwrap_or_else(|| OAUTH_CLIENT_ID.into()),
+            anthropic_base,
+            openai_base,
+            oauth_token_url,
+            oauth_client_id,
             session_ttl_secs: 3600,
             max_requests: 4096,
         };
-        Ok(Self { cfg, seeds, port })
+        // A single, locally-configured enclave credential — not lent, no grant gate.
+        Ok(Self { cfg, seeds, port, grant_gated: false })
     }
 
     /// Serve from the disk-backed store when it holds at least one credential.
@@ -117,24 +126,86 @@ impl AirlockServe {
             return Ok(None);
         }
         let seal = load_or_create_seal_keypair(&root)?;
+        let (anthropic_base, openai_base, oauth_token_url, oauth_client_id) = base_fields();
         let cfg = GatewayConfig {
             attest: AttestMode::SelfHost,
             seal_keypair: Some(seal),
-            anthropic_base: ANTHROPIC_BASE.into(),
-            openai_base: OPENAI_BASE.into(),
-            oauth_token_url: OAUTH_TOKEN_URL.into(),
-            oauth_client_id: OAUTH_CLIENT_ID.into(),
+            anthropic_base,
+            openai_base,
+            oauth_token_url,
+            oauth_client_id,
             session_ttl_secs: 3600,
             max_requests: 4096,
         };
-        Ok(Some(Self { cfg, seeds, port: None }))
+        // Store credentials are registered on-chain with owner-signed grants, so
+        // the owner's own gateway enforces those grants (see `committed_grant_check`).
+        Ok(Some(Self { cfg, seeds, port: None, grant_gated: true }))
     }
+}
+
+/// The upstream base fields, honoring the `DUCKTAPE_AIRLOCK_SERVE_*` overrides and
+/// defaulting to the production endpoints. Shared by both serve paths so the
+/// self-host store can be pointed at a test or proxy upstream the same way the
+/// TEE path already can.
+fn base_fields() -> (String, String, String, String) {
+    (
+        env_nonempty("DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE").unwrap_or_else(|| ANTHROPIC_BASE.into()),
+        env_nonempty("DUCKTAPE_AIRLOCK_SERVE_OPENAI_BASE").unwrap_or_else(|| OPENAI_BASE.into()),
+        env_nonempty("DUCKTAPE_AIRLOCK_SERVE_OAUTH_TOKEN_URL").unwrap_or_else(|| OAUTH_TOKEN_URL.into()),
+        env_nonempty("DUCKTAPE_AIRLOCK_SERVE_OAUTH_CLIENT_ID").unwrap_or_else(|| OAUTH_CLIENT_ID.into()),
+    )
 }
 
 /// The credential store root: one dir per credential under `<storage>/airlock-creds/`,
 /// plus `seal.key` at the top.
 pub fn cred_store_root(storage: &Path) -> PathBuf {
     storage.join("airlock-creds")
+}
+
+/// Build the co-hosted-lending grant gate the owner's own gateway enforces: given
+/// a credential name and the account a session claims, resolve THIS node's
+/// committed gateway record and answer whether that account may draw on it (owner
+/// or a granted account, per [`credential_use_allowed`]). Wired only for the
+/// self-host store path, whose credentials carry owner-signed on-chain grants.
+pub fn committed_grant_check(commands: mpsc::Sender<NodeCommand>) -> airlock::server::GrantCheck {
+    std::sync::Arc::new(move |name: String, account: Vec<u8>| {
+        let commands = commands.clone();
+        Box::pin(async move { grant_allows(commands, &name, &account).await })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    })
+}
+
+/// The grant decision behind [`committed_grant_check`]. Refuses on a missing
+/// record or any query failure — a credential the node cannot prove a grant for
+/// is never lent (fail closed).
+async fn grant_allows(commands: mpsc::Sender<NodeCommand>, name: &str, account: &[u8]) -> bool {
+    match committed_credential_record(commands, name).await {
+        Ok(Some(record)) => credential_use_allowed(&record, account),
+        Ok(None) | Err(_) => false,
+    }
+}
+
+/// Read one credential record from this node's committed gateway-module state over
+/// the actor command lane (the same lane the credential resolver and provisioner
+/// use), so the gate sees exactly what consensus committed.
+async fn committed_credential_record(
+    mut commands: mpsc::Sender<NodeCommand>,
+    name: &str,
+) -> Result<Option<gateway::CredentialRecord>, String> {
+    let (reply, rx) = oneshot::channel();
+    commands
+        .send(NodeCommand::Query {
+            target: "gateway".to_string(),
+            req: gateway::encode_query(&GatewayQuery::Credential { name: name.to_string() }),
+            reply,
+        })
+        .await
+        .map_err(|_| "node actor is gone".to_string())?;
+    let bytes = rx.await.map_err(|_| "node actor dropped the query reply".to_string())??;
+    match gateway::decode_reply(&bytes)? {
+        GatewayReply::Credential(record) => Ok(record),
+        other => Err(format!("gateway returned an unexpected reply: {other:?}")),
+    }
 }
 
 /// Load every credential in the store as a gateway seed. A dir missing its `kind`
