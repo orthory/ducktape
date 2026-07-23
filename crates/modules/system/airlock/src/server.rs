@@ -4,6 +4,8 @@
 //! never leave memory; the operator cannot read the sealed credential back out.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -103,6 +105,9 @@ struct AppState {
     /// Per-name sealed-request nonces already served — replay dedupe. Bounded
     /// by the request budget per name; dies with the process like every key.
     seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
+    /// The co-hosted-lending grant gate (see [`GrantCheck`]). `None` on gateways
+    /// that never lend, where every known credential opens without a grant check.
+    grant_check: Option<GrantCheck>,
 }
 
 fn now_secs() -> u64 {
@@ -115,9 +120,39 @@ fn now_secs() -> u64 {
 /// vendor roots, so this seam grants no forgery power.
 pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> + Send + Sync>;
 
+/// The co-hosted-lending grant gate, injected by the node. Given a credential
+/// `name` and the account the session claims to act on behalf of, it answers
+/// whether that account may draw on the credential — the node resolves this
+/// against its own COMMITTED gateway-module record (owner or a granted account).
+/// `None` on gateways that never lend (owner-local, TEE): the claimed account is
+/// then unread. A `false` answer 403s the session before any handshake work.
+pub type GrantCheck =
+    Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
 /// Build the gateway router and report the vendor ("tdx"/"snp"/"self-host").
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
     build_seeded(cfg, Vec::new())
+}
+
+/// Like [`build_seeded`], but with the co-hosted-lending grant gate wired: the
+/// node's own committed-state grant lookup. Only the credential-lending node
+/// embed calls this; every other build path leaves the gate off.
+pub fn build_seeded_gated(
+    cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+) -> Result<(Router, String)> {
+    match cfg.attest.clone() {
+        AttestMode::Tsm(spec) => {
+            let mode = if spec == "auto" {
+                tsm_probe_provider()?
+            } else {
+                spec.parse::<attest::AttestMode>()?
+            };
+            build_with_quoter_gated(cfg, mode.as_str(), tsm_quoter(mode), seeds, grant_check)
+        }
+        AttestMode::SelfHost => build_self_host(cfg, seeds, grant_check),
+    }
 }
 
 /// Like [`build`], but seed the store with named credentials directly instead of
@@ -130,17 +165,7 @@ pub fn build_seeded(
     cfg: GatewayConfig,
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
 ) -> Result<(Router, String)> {
-    match cfg.attest.clone() {
-        AttestMode::Tsm(spec) => {
-            let mode = if spec == "auto" {
-                tsm_probe_provider()?
-            } else {
-                spec.parse::<attest::AttestMode>()?
-            };
-            build_with_quoter(cfg, mode.as_str(), tsm_quoter(mode), seeds)
-        }
-        AttestMode::SelfHost => build_self_host(cfg, seeds),
-    }
+    build_seeded_gated(cfg, seeds, None)
 }
 
 fn tsm_quoter(expected: attest::AttestMode) -> Quoter {
@@ -151,10 +176,20 @@ fn tsm_quoter(expected: attest::AttestMode) -> Quoter {
 /// Mints/takes the enclave seal key, mints the session key, and calls `quoter`
 /// once on the freshly bound REPORTDATA.
 pub fn build_with_quoter(
+    cfg: GatewayConfig,
+    vendor: &str,
+    quoter: Quoter,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+) -> Result<(Router, String)> {
+    build_with_quoter_gated(cfg, vendor, quoter, seeds, None)
+}
+
+fn build_with_quoter_gated(
     mut cfg: GatewayConfig,
     vendor: &str,
     quoter: Quoter,
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
 ) -> Result<(Router, String)> {
     let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
@@ -162,7 +197,7 @@ pub fn build_with_quoter(
 
     let report_data = attest::make_report_data(&seal_kp.public_bytes(), &sess_pk.to_bytes());
     let quote = quoter(&report_data)?;
-    assemble(cfg, vendor.to_string(), quote, seal_kp, sess_sk, sess_pk, seeds)
+    assemble(cfg, vendor.to_string(), quote, seal_kp, sess_sk, sess_pk, seeds, grant_check)
 }
 
 /// Non-TEE build: no quote, vendor "self-host". The broker pins the seal_pk from
@@ -170,11 +205,12 @@ pub fn build_with_quoter(
 fn build_self_host(
     mut cfg: GatewayConfig,
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
 ) -> Result<(Router, String)> {
     let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
     let sess_pk = sess_sk.verifying_key();
-    assemble(cfg, "self-host".to_string(), Vec::new(), seal_kp, sess_sk, sess_pk, seeds)
+    assemble(cfg, "self-host".to_string(), Vec::new(), seal_kp, sess_sk, sess_pk, seeds, grant_check)
 }
 
 /// Shared assembly: build the named store from the seeds, wire the state and the
@@ -189,6 +225,7 @@ fn assemble(
     sess_sk: SigningKey,
     sess_pk: VerifyingKey,
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
 ) -> Result<(Router, String)> {
     let mut creds = HashMap::new();
     for (name, kind, payload) in seeds {
@@ -213,6 +250,7 @@ fn assemble(
         creds: Mutex::new(creds),
         budgets: Mutex::new(HashMap::new()),
         seen_nonces: Mutex::new(HashMap::new()),
+        grant_check,
     });
 
     let app = Router::new()
@@ -354,6 +392,19 @@ async fn credential(
     Ok(StatusCode::OK)
 }
 
+/// Run the injected grant gate for one session request: the claimed account must
+/// be present and base64-decodable, and the node's lookup must allow it. A
+/// missing or malformed claimed account is a refusal, never a bypass.
+async fn grant_allows(check: &GrantCheck, req: &SessionRequest) -> bool {
+    let Some(account_b64) = &req.account_b64 else {
+        return false;
+    };
+    let Ok(account) = BASE64.decode(account_b64) else {
+        return false;
+    };
+    check(req.sub.clone(), account).await
+}
+
 async fn session(
     State(st): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
@@ -364,6 +415,15 @@ async fn session(
     let known_credential = st.creds.lock().unwrap().contains_key(&req.sub);
     if !known_credential {
         return Err(AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()));
+    }
+    // Co-hosted lending: when a grant gate is wired, the session's claimed account
+    // must be the owner or a granted account of the on-chain record. Refuse before
+    // any handshake work — a session for an ungranted account never opens.
+    if let Some(check) = &st.grant_check {
+        let granted = grant_allows(check, &req).await;
+        if !granted {
+            return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));
+        }
     }
     // Enclave side of the handshake: derive the shared key from the client's
     // ephemeral key and our static seal secret, then seal the token under it — so

@@ -515,6 +515,7 @@ async fn unknown_credential_name_is_refused_at_session_open() {
             sub: "missing".into(),
             client_eph_pk_b64: "AAAA".into(),
             body_seal: false,
+            account_b64: None,
         })
         .send()
         .await
@@ -557,6 +558,52 @@ async fn codex_credential_proxies_to_the_openai_upstream() {
 
     let seen = round_trip_via(&gw, &gateway_url, &seal_pk, "cx").await;
     assert_eq!(seen, "Bearer tok-codex", "a codex session hits the openai upstream with its bearer");
+}
+
+#[tokio::test]
+async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
+    let upstream = boot_echo_upstream().await;
+    let kp = SealKeypair::generate();
+    let seal_pk = kp.public_bytes();
+    // The injected gate: only the account `granted` may draw on the credential —
+    // the node's committed-record lookup, stubbed to one allowed account here.
+    let check: airlock::server::GrantCheck = std::sync::Arc::new(|_name: String, account: Vec<u8>| {
+        Box::pin(async move { account == b"granted" })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+    });
+    let (app, _) = server::build_seeded_gated(
+        self_host_cfg(Some(kp), upstream.clone(), String::new()),
+        vec![("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
+            access_token: "tok-a".into(),
+        })],
+        Some(check),
+    )
+    .unwrap();
+    let gateway_url = spawn(app).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    // Granted account: the session opens and the round-trip carries the real token.
+    let token = gw.open_session_as(&seal_pk, "a", b"granted").await.expect("granted session opens");
+    let seen = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(seen, "Bearer tok-a");
+
+    // Ungranted account: refused at session open with 403.
+    let err = gw.open_session_as(&seal_pk, "a", b"stranger").await.unwrap_err();
+    assert!(err.to_string().contains("403"), "an ungranted account must 403: {err}");
+
+    // No claimed account at all: the gate is mandatory once wired — omitting the
+    // account is a refusal, never a bypass.
+    let err = gw.open_session(&seal_pk, "a").await.unwrap_err();
+    assert!(err.to_string().contains("403"), "an accountless session must 403: {err}");
 }
 
 #[test]

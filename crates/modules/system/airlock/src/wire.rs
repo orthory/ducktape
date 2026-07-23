@@ -59,6 +59,14 @@ pub struct SessionRequest {
     /// Sealed-body session: bodies are AEAD'd broker<->enclave (`bodyseal`)
     /// and the enclave refuses plaintext. Echoed into the token claims.
     pub body_seal: bool,
+    /// The account (base64) the caller CLAIMS to act on behalf of — the grant
+    /// subject. Only load-bearing on a co-hosted lending gateway, where the node
+    /// wires a grant lookup that checks this account against the on-chain
+    /// credential record; a session claiming an ungranted account is refused
+    /// (`credential_not_granted`). `None` on gateways with no grant lookup (the
+    /// owner-local and TEE paths), where it is simply unread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_b64: Option<String>,
 }
 
 /// The token, AEAD-sealed under the handshake session key. Only the client that

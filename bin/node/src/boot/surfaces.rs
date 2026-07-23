@@ -127,11 +127,20 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             ))?;
             listener.set_nonblocking(true)?;
             let port = listener.local_addr()?.port();
+            // A lending gateway (the self-host store) enforces its own on-chain
+            // grants: a session claiming an account that is neither the owner nor a
+            // grantee is refused at the owner's gateway, not just at the compute
+            // node's broker. The gate reads THIS node's committed gateway record
+            // over the actor lane. The TEE path is not lent, so it leaves it off.
+            let grant_check = serve
+                .grant_gated
+                .then(|| crate::airlock_serve::committed_grant_check(http_handle.command_sender()));
             // Build — and thus ATTEST — BEFORE registering the route or claiming
             // to listen: a node that cannot attest must fail boot loudly here,
             // never register a route to a gateway that will not come up.
-            let (router, vendor) = airlock::server::build_seeded(serve.cfg, serve.seeds)
-                .map_err(|error| format!("airlock gateway: {error}"))?;
+            let (router, vendor) =
+                airlock::server::build_seeded_gated(serve.cfg, serve.seeds, grant_check)
+                    .map_err(|error| format!("airlock gateway: {error}"))?;
             crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
                 .map_err(|error| format!("register airlock gateway route: {error}"))?;
             tracing::info!(
