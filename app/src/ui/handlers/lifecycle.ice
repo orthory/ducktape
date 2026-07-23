@@ -53,6 +53,7 @@ on reconnect
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
+  reply_editor = editor("")
   pending_reply = ""
   pending_channel = ""
   pending_message = ""
@@ -298,8 +299,9 @@ on dismiss_failed_message
   failed_message_draft = ""
 
 on restore_failed_reply
-  return if empty(failed_reply_draft) || !empty(reply_draft)
+  return if empty(failed_reply_draft) || !empty(trim(editor_text(reply_editor)))
   reply_draft = failed_reply_draft
+  reply_editor = editor(reply_draft)
   failed_reply_draft = ""
   task widget focus #workspace-tabs/reply
 

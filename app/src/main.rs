@@ -41,6 +41,10 @@ mod tests {
         app.message_editor.text().trim().to_string()
     }
 
+    fn reply_composer(app: &Ducktape) -> String {
+        app.reply_editor.text().trim().to_string()
+    }
+
     fn workspace(
         generation: i64,
         active_channel: &str,
@@ -428,7 +432,7 @@ mod tests {
         app.thread_messages = vec![message(9, "thread root", false)];
         app.thread_next_reply_offset = 3;
         app.thread_has_more = true;
-        app.reply_draft = "reply in progress".into();
+        app.reply_editor = compose("reply in progress");
         app.message_editor = compose("next message");
         app.mutation_phase = "message".into();
         app.pending_message = "sent message".into();
@@ -463,7 +467,7 @@ mod tests {
         assert_eq!(app.thread_messages.len(), 1);
         assert_eq!(app.thread_next_reply_offset, 3);
         assert!(app.thread_has_more);
-        assert_eq!(app.reply_draft, "reply in progress");
+        assert_eq!(reply_composer(&app), "reply in progress");
         assert_eq!(composer(&app), "next message");
         assert_eq!(app.mutation_phase, "idle");
     }
@@ -1041,14 +1045,14 @@ mod tests {
         app.active_thread_seq = 1;
         app.thread_messages =
             backend::optimistic_message(Vec::new(), "old thread".into(), "pending-old".into());
-        app.reply_draft = "old reply".into();
+        app.reply_editor = compose("old reply");
 
         let _ = app.__update(__DucktapeMessage::OpenThreadFor(2));
         assert_eq!(app.thread_generation, 5);
         assert!(app.thread_loading);
         assert_eq!(app.active_thread_seq, 2);
         assert!(app.thread_messages.is_empty());
-        assert!(app.reply_draft.is_empty());
+        assert!(reply_composer(&app).is_empty());
 
         let _ = app.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
             generation: 4,
@@ -1131,7 +1135,7 @@ mod tests {
         app.message_action = "editing".into();
         app.message_edit_draft = "node a edit".into();
         app.active_thread_seq = 1;
-        app.reply_draft = "node a reply".into();
+        app.reply_editor = compose("node a reply");
         app.selected_block_id = "same-id".into();
         app.block_edit_draft = "node a block".into();
         app.block_comments_open = true;
@@ -1148,7 +1152,7 @@ mod tests {
         assert_eq!(app.message_action, "toolbar");
         assert!(app.message_edit_draft.is_empty());
         assert_eq!(app.active_thread_seq, 0);
-        assert!(app.reply_draft.is_empty());
+        assert!(reply_composer(&app).is_empty());
         assert!(app.selected_block_id.is_empty());
         assert!(app.block_edit_draft.is_empty());
         assert!(!app.block_comments_open);
@@ -1844,7 +1848,7 @@ mod tests {
         app.active_thread_seq = 7;
         app.thread_target_seq = 9;
         app.live_thread_generation = 3;
-        app.reply_draft = "typing".into();
+        app.reply_editor = compose("typing");
         app.thread_messages = backend::optimistic_message(
             backend::optimistic_message(Vec::new(), "pending first".into(), "pending-first".into()),
             "pending second".into(),
@@ -1875,7 +1879,7 @@ mod tests {
                 has_more: true,
             },
         ));
-        assert_eq!(app.reply_draft, "typing");
+        assert_eq!(reply_composer(&app), "typing");
         assert_eq!(app.thread_target_seq, 0);
         assert_eq!(app.thread_next_reply_offset, 5);
         assert!(app.thread_has_more);
@@ -2079,15 +2083,15 @@ mod tests {
         app.loading = false;
         app.active_channel = "general".into();
         app.active_thread_seq = 1;
-        app.reply_draft = "first".into();
+        app.reply_editor = compose("first");
 
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
         let first_id = app.thread_messages[0].id.clone();
         assert_eq!(app.mutation_phase, "idle");
-        assert!(app.reply_draft.is_empty());
+        assert!(reply_composer(&app).is_empty());
         assert!(app.thread_messages[0].pending);
 
-        app.reply_draft = "second".into();
+        app.reply_editor = compose("second");
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
         let second_id = app.thread_messages[1].id.clone();
         assert_ne!(first_id, second_id);
@@ -2127,14 +2131,14 @@ mod tests {
         app.loading = false;
         app.active_channel = "general".into();
         app.active_thread_seq = 1;
-        app.reply_draft = "first".into();
+        app.reply_editor = compose("first");
 
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
         let first_id = app.thread_messages[0].id.clone();
-        app.reply_draft = "second".into();
+        app.reply_editor = compose("second");
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
         let second_id = app.thread_messages[1].id.clone();
-        app.reply_draft = "newer draft".into();
+        app.reply_editor = compose("newer draft");
 
         let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
             backend::OptimisticMutationError {
@@ -2145,7 +2149,7 @@ mod tests {
                 body: "first".into(),
             },
         ));
-        assert_eq!(app.reply_draft, "newer draft");
+        assert_eq!(reply_composer(&app), "newer draft");
         assert_eq!(app.failed_reply_draft, "first");
         assert_eq!(app.thread_messages.len(), 1);
         assert_eq!(app.thread_messages[0].id, second_id);
@@ -2154,11 +2158,11 @@ mod tests {
         assert!(!app.thread_loading);
 
         let _ = app.__update(__DucktapeMessage::RestoreFailedReply);
-        assert_eq!(app.reply_draft, "newer draft");
+        assert_eq!(reply_composer(&app), "newer draft");
         assert_eq!(app.failed_reply_draft, "first");
-        app.reply_draft.clear();
+        app.reply_editor = compose("");
         let _ = app.__update(__DucktapeMessage::RestoreFailedReply);
-        assert_eq!(app.reply_draft, "first");
+        assert_eq!(reply_composer(&app), "first");
         assert!(app.failed_reply_draft.is_empty());
     }
 
@@ -2170,7 +2174,7 @@ mod tests {
         app.connected_rpc = "http://node".into();
         app.active_channel = "general".into();
         app.active_thread_seq = 1;
-        app.reply_draft = "committed".into();
+        app.reply_editor = compose("committed");
 
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
         let operation_id = app.thread_messages[0].id.clone();
@@ -2185,17 +2189,17 @@ mod tests {
         ));
         assert_eq!(app.thread_messages.len(), 1);
         assert!(app.thread_messages[0].pending);
-        assert!(app.reply_draft.is_empty());
+        assert!(reply_composer(&app).is_empty());
         assert!(app.failed_reply_draft.is_empty());
         assert_eq!(app.mutation_phase, "idle");
         assert!(!app.thread_loading);
         assert_eq!(app.sync_phase, "refreshing");
 
-        app.reply_draft = "still available".into();
+        app.reply_editor = compose("still available");
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
         assert_eq!(app.thread_messages.len(), 2);
         assert!(app.thread_messages.iter().all(|message| message.pending));
-        assert!(app.reply_draft.is_empty());
+        assert!(reply_composer(&app).is_empty());
     }
 
     #[test]

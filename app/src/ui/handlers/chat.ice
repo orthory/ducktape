@@ -49,6 +49,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
+  reply_editor = editor("")
   pending_reply = ""
   error = ""
   run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_updated _ | failed _
@@ -79,6 +80,7 @@ on choose_channel(id)
   live_thread_generation = live_thread_generation + 1
   thread_loading = false
   reply_draft = ""
+  reply_editor = editor("")
   pending_reply = ""
   error = ""
   run load_chat(connected_rpc, id) -> chat_updated _ | failed _
@@ -113,6 +115,7 @@ on toggle_channel_settings
   thread_has_more = false
   thread_loading = false
   reply_draft = ""
+  reply_editor = editor("")
   pending_reply = ""
 
 on rename_channel_submit
@@ -247,6 +250,7 @@ on chat_updated(next)
 
 on chat_mutated(next)
   message_draft = trim(editor_text(message_editor))
+  reply_draft = trim(editor_text(reply_editor))
   channels = next.channels
   failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == next.active_channel)
   selected_message_seq = refreshed_required_message_seq(next.messages, active_channel, next.active_channel, selected_message_seq)
@@ -280,6 +284,7 @@ on chat_mutated(next)
   reply_draft = retain_for_endpoint(reply_draft, active_channel, next.active_channel)
   pending_reply = retain_for_endpoint(pending_reply, active_channel, next.active_channel)
   reply_draft = message_text_after_failure(reply_draft, "message-edit", active_thread_seq <= 0)
+  reply_editor = editor(reply_draft)
   pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
   message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
   message_editor = editor(message_draft)
@@ -465,6 +470,7 @@ on open_thread_for(seq)
   thread_next_reply_offset = 0
   thread_has_more = false
   reply_draft = ""
+  reply_editor = editor("")
   pending_reply = ""
   error = ""
   run load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
@@ -568,6 +574,7 @@ on close_thread
   thread_message_action = "toolbar"
   thread_edit_draft = ""
   reply_draft = ""
+  reply_editor = editor("")
   pending_reply = ""
 
 on edit_message_submit
@@ -633,14 +640,15 @@ on remove_reaction_at(seq, emoji)
   run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_mutated _ | mutation_failed _
 
 on send_reply_submit
-  return if loading || thread_loading || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
+  return if loading || thread_loading || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(editor_text(reply_editor)))
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
-  pending_reply = trim(reply_draft)
+  pending_reply = trim(editor_text(reply_editor))
   pending_reply_id = fresh_operation_id("reply")
   reply_draft = ""
+  reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
   run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply) -> thread_reply_sent _ | thread_reply_send_failed _
@@ -649,8 +657,9 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, reply_draft, cause.body, cause.committed)
-  reply_draft = restore_draft(reply_draft, cause.body, cause.committed)
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, trim(editor_text(reply_editor)), cause.body, cause.committed)
+  reply_draft = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
+  reply_editor = editor(reply_draft)
   thread_next_reply_offset = thread_offset_after_reply(thread_next_reply_offset, thread_has_more, cause.committed)
   error = cause.message
   live_dirty = live_dirty || cause.committed
