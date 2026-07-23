@@ -234,7 +234,9 @@ impl CliProvider {
         let workdir = self.ensure_writable_workdir(ctx)?;
         let workdir = canonical_mount_path(&workdir, "sandbox workdir")?;
         let config_home = self.prepare_config_home(&workdir, ctx)?;
-        let broker = self.start_broker().await?;
+        // no per-run airlock resolution is wired into interactive sessions yet;
+        // the env/host-credential path is unchanged.
+        let broker = self.start_broker(None).await?;
         let auth = RunAuth {
             config_home: config_home.as_deref(),
             broker: broker.as_ref().map(|b| &b.endpoint),
