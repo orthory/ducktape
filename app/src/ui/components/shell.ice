@@ -16,13 +16,18 @@ component WorkspaceTabs(status:str, loading:bool)
   state
     tab = "chat"
     connection_open = false
+    sidebar_width = 240.0
   on select_tab(next)
     tab = next
   on toggle_connection
     connection_open = !connection_open
+  on sidebar_dragged(dx, dy)
+    return if dx < 0.0 && sidebar_width + dx < 180.0
+    return if dx > 0.0 && sidebar_width + dx > 460.0
+    sidebar_width = sidebar_width + dx
   container width=fill height=fill clip=true bg=bg border=white/6 border-w=1.0 px-snap=true
     row width=fill height=fill
-      container width=240.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar clip=true
+      container width=sidebar_width height=fill padding=12.0 padding-top=38.0 bg=sidebar clip=true
         col width=fill height=fill spacing=8.0
           Brand
           space height=6.0
@@ -86,8 +91,9 @@ component WorkspaceTabs(status:str, loading:bool)
             pressed bg=white/11
           if connection_open
             slot connection
-      container width=1.0 height=fill bg=white/8
-        text ""
+      resize-handle drag=sidebar_dragged cursor=resize-horizontal
+        container width=6.0 height=fill bg=white/8
+          text ""
       col width=fill height=fill padding-top=28.0
         slot notice
         match tab
