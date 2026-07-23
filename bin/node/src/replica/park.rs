@@ -327,7 +327,7 @@ pub(super) async fn park(
     let mut replica_watermark: Option<u64> = None;
     // served seals awaiting the post-fold cross-check: a BACKFILLED
     // frame's trust is the served seal, verified against what OUR
-    // fold produced (height -> served (disposition, app_hash)).
+    // fold produced (height -> served (disposition, root_hash)).
     let mut pending_seal_checks: std::collections::HashMap<u64, ServedSeal> =
         std::collections::HashMap::new();
     let mut blocks_since_checkpoint: u64 = 0;
@@ -345,9 +345,9 @@ pub(super) async fn park(
     // the last checkpoint's (height, oplog position) — the prune
     // anchor: the journal below it drops once the floor passes it.
     let mut replica_prev_ckpt: (Option<u64>, u64) = (None, 0);
-    // the app-hash of the last boundary the derived tier followed:
+    // the root-hash of the last boundary the derived tier followed:
     // the index feed (heal + explorer row + ws event) fires only when
-    // the verified app-hash MOVED. an unchanged hash is an idle
+    // the verified root-hash MOVED. an unchanged hash is an idle
     // stride — state is byte-identical, the read models are already
     // exact, and the explorer stays as quiet as the validator's nop
     // gate keeps it. in-memory on purpose: after a restart the first
@@ -358,7 +358,7 @@ pub(super) async fn park(
     // a checkpoint that routed us here (it names this key a resident,
     // not a participant) is a real recovery base: replay the journal
     // exactly as a validator restart would — restore the checkpoint
-    // host, fold the retained suffix, verify the recomposed app-hash
+    // host, fold the retained suffix, verify the recomposed root-hash
     // — and enter the park loop ALREADY serving at the recovered tip.
     // no re-bootstrap: the fold driver closes any offline gap over
     // the Frames lane the moment the first certificate's parent
@@ -410,7 +410,7 @@ pub(super) async fn park(
             replica_store.pin(frame.clone());
         }
         let tip = rec.height.unwrap_or(rec.view_base);
-        let root = rec.app_hash;
+        let root = rec.root_hash;
         let follower = consensus::FollowerOrderer::new(replica_store.clone());
         // the replica fold realizes code-registry swaps through the SAME source
         // recovery replay used (wired at Recovery::open).
@@ -421,7 +421,7 @@ pub(super) async fn park(
             recovery,
             rec.height.map(|height| host::FinalizedBlock {
                 height,
-                app_hash: root,
+                root_hash: root,
             }),
             rec.view_base,
         );
@@ -449,7 +449,7 @@ pub(super) async fn park(
             replayed = rec.applied,
             already_on_disk = rec.skipped,
             rolled_forward = rec.rolled_forward,
-            app_hash = %hex(&root),
+            root_hash = %hex(&root),
             "replica: restart replayed the journal"
         );
         // the e2e / operator serve marker, truthful here too: the
@@ -458,8 +458,8 @@ pub(super) async fn park(
             target: "ducktape::statesync",
             node = %label,
             height = tip,
-            app_hash = %hex(&root),
-            "resident: pre-synced boundary {tip} app_hash={}", hex(&root)
+            root_hash = %hex(&root),
+            "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
         heal_index(&index, node_r.host(), tip, &label).await;
         last_indexed_root = Some(root);
@@ -668,7 +668,7 @@ pub(super) async fn park(
                                     RpcReply {
                                         status: Some(RpcStatus {
                                             height: Some(*height),
-                                            app_hash: hex(&node_r.host().app_hash()),
+                                            root_hash: hex(&node_r.host().root_hash()),
                                             modules,
                                         }),
                                         ..RpcReply::ok()
@@ -812,10 +812,10 @@ pub(super) async fn park(
                                 // pre-first-sync the surface still answers (the
                                 // app's liveness heartbeat): a zeroed status is
                                 // honest — no boundary is served yet.
-                                let (height, app_hash, modules) = match &serving {
+                                let (height, root_hash, modules) = match &serving {
                                     Some((height, node_r)) => (
                                         *height,
-                                        hex(&node_r.host().app_hash()),
+                                        hex(&node_r.host().root_hash()),
                                         MODULE_IDS
                                             .iter()
                                             .map(|m| noded::ModuleStatus {
@@ -833,7 +833,7 @@ pub(super) async fn park(
                                 };
                                 let _ = reply.send(noded::NodeStatus {
                                     version: env!("CARGO_PKG_VERSION").into(),
-                                    app_hash,
+                                    root_hash,
                                     height,
                                     modules,
                                     public_key: status_public_key.clone(),
@@ -1740,7 +1740,7 @@ pub(super) async fn park(
                             for bytes in &caught.frame_bytes {
                                 replica_store.put(bytes.clone());
                             }
-                            let root = host.app_hash();
+                            let root = host.root_hash();
                             // the fold pipeline: the follower orderer
                             // in the engine's seat of the SAME
                             // OrderedNode a validator drains, this
@@ -1758,7 +1758,7 @@ pub(super) async fn park(
                                 recovery,
                                 Some(host::FinalizedBlock {
                                     height: tip,
-                                    app_hash: root,
+                                    root_hash: root,
                                 }),
                                 m.view_base,
                             );
@@ -1785,15 +1785,15 @@ pub(super) async fn park(
                                 target: "ducktape::statesync",
                                 node = %label,
                                 height = tip,
-                                app_hash = %hex(&root),
-                                "resident: pre-synced boundary {tip} app_hash={}", hex(&root)
+                                root_hash = %hex(&root),
+                                "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
                             );
                             tracing::info!(
                                 target: "ducktape::consensus",
                                 node = %label,
                                 height = tip,
                                 epoch = m.epoch,
-                                app_hash = %hex(&root),
+                                root_hash = %hex(&root),
                                 "replica: following the head from {tip}"
                             );
                             // the derived tier starts exact at the
@@ -1994,7 +1994,7 @@ pub(super) async fn park(
                 serving.take().expect("checked serving above");
             let mut base = m.clone();
             base.height = folded_tip;
-            base.app_hash = node_r.host().app_hash();
+            base.root_hash = node_r.host().root_hash();
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Draining);
             tracing::info!(
                 event = "node_phase_transition",
@@ -2097,19 +2097,19 @@ pub(super) async fn park(
                         continue;
                     }
                 };
-                let host_hash = host.app_hash();
+                let host_hash = host.root_hash();
                 tracing::debug!(
                     target: "ducktape::join",
                     synced_height = m.height,
-                    synced_hash = %hex(&m.app_hash),
+                    synced_hash = %hex(&m.root_hash),
                     latest_height = latest.height,
-                    latest_hash = %hex(&latest.app_hash),
+                    latest_hash = %hex(&latest.root_hash),
                     host_hash = %hex(&host_hash),
-                    latest_matches_host = latest.app_hash == host_hash,
+                    latest_matches_host = latest.root_hash == host_hash,
                     latest_floor_present = latest.floor_cert.is_some(),
                     "admission revalidate"
                 );
-                if let Err(e) = reopen_preflight_synced_host(&host, m.app_hash) {
+                if let Err(e) = reopen_preflight_synced_host(&host, m.root_hash) {
                     fatal!(label, "promotion preflight failed: {e}");
                 }
                 match choose_promotion_boundary(host_hash, &latest, &me_bytes) {
@@ -2117,7 +2117,7 @@ pub(super) async fn park(
                         tracing::debug!(
                             target: "ducktape::join",
                             chosen_height = boundary.height,
-                            chosen_hash = %hex(&boundary.app_hash),
+                            chosen_hash = %hex(&boundary.root_hash),
                             chosen_floor_present = boundary.floor_cert.is_some(),
                             source = %source.as_str(),
                             "promotion boundary chosen"
@@ -2150,8 +2150,8 @@ pub(super) async fn park(
                     target: "ducktape::join",
                     node = %label,
                     height = m.height,
-                    synced_hash = %hex(&m.app_hash),
-                    latest_hash = %hex(&latest.app_hash),
+                    synced_hash = %hex(&m.root_hash),
+                    latest_hash = %hex(&latest.root_hash),
                     "boundary drifted during sync; discarding scratch and retrying"
                 );
             }
@@ -2171,7 +2171,7 @@ pub(super) async fn park(
     };
     tracing::info!(
         target: "ducktape::statesync",
-        "node={label} synced app_hash={}", hex(&host.app_hash())
+        "node={label} synced root_hash={}", hex(&host.root_hash())
     );
 
     // the optional shipped-index warm start rides the same sync

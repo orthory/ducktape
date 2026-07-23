@@ -9,7 +9,7 @@ import { ArchitectureStack } from '../../../../../components/diagram/Architectur
 
 Ducktape는 다섯 가지 invariant를 중심으로 설계되어 있다. 이 규칙들은 스타일
 선호가 아니라, 독립 validator들이 같은 agreed operation order에서 같은
-app-hash를 계산하게 만드는 조건이다.
+root-hash를 계산하게 만드는 조건이다.
 
 ## Isolation
 
@@ -36,7 +36,7 @@ clean drain이면 touched module마다 `commit_block`을 호출하고, error 또
 dispatch budget breach가 있으면 `abort_block`을 호출한다. 실패한 block은
 module root를 바꾸지 않는다.
 
-## App-Hash Commits to Everything
+## Root-Hash Commits to Everything
 
 중요한 durable state는 module root 아래에 있어야 한다. global root는
 `(module_id, module_root)` pair를 정렬해 hash한 값이다. QMDB root, forge의

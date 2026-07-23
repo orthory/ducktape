@@ -48,7 +48,7 @@ registry schedules that at an agreed height.
 The operational lifecycle is:
 
 1. **Register.** Genesis wires a module instance under its stable `ModuleId`.
-   Its initial `root()` becomes part of the first global app-hash.
+   Its initial `root()` becomes part of the first global root-hash.
 2. **Read committed state.** Between blocks, `query`, `query_with`,
    `serve_sync`, and `state_sync_handle` describe or read committed state only.
    They must not observe staged writes.
@@ -82,7 +82,7 @@ Each module chooses the state substrate that fits it:
 - Snapshot-style modules can commit canonical bytes.
 
 The host does not inspect those internal schemas. It asks for a root and folds
-that root into the global app-hash.
+that root into the global root-hash.
 
 ## Cross-Module Interaction
 

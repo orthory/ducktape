@@ -101,7 +101,7 @@ pub fn project_block(
         let mut applied_ops = 0usize;
         let mut rejected_ops = 0usize;
         let mut block_hash = None;
-        let mut block_app_hash = None;
+        let mut block_root_hash = None;
         let mut sealed_hash = None;
         while i < drained.len() && drained[i].height == height {
             let frame = &drained[i];
@@ -109,7 +109,7 @@ pub fn project_block(
             if frame.disposition == node::Disposition::Discarded {
                 continue;
             }
-            sealed_hash = Some(frame.app_hash);
+            sealed_hash = Some(frame.root_hash);
             if let (node::Disposition::Applied, Some(op)) = (&frame.disposition, &frame.op) {
                 applied = true;
                 latency_us = latency_us.saturating_add(op.latency_us);
@@ -141,7 +141,7 @@ pub fn project_block(
                 };
                 if block_hash.is_none() {
                     block_hash = Some(frame.id);
-                    block_app_hash = Some(frame.app_hash);
+                    block_root_hash = Some(frame.root_hash);
                 }
                 ops.push(project_root_op(
                     blobs,
@@ -183,7 +183,7 @@ pub fn project_block(
             block_row(&BlockRecord {
                 height,
                 hash: block_hash.map(|hash| hex_bytes(&hash)).unwrap_or_default(),
-                commit_hash: block_app_hash.map(|hash| hex_root(&hash)).unwrap_or_default(),
+                commit_hash: block_root_hash.map(|hash| hex_root(&hash)).unwrap_or_default(),
                 ops,
             })
         });
@@ -259,7 +259,7 @@ mod tests {
             id: [id; 32],
             height,
             disposition,
-            app_hash: StateRoot([root; sdk::ROOT_LEN]),
+            root_hash: StateRoot([root; sdk::ROOT_LEN]),
             op,
             reason: None,
         }

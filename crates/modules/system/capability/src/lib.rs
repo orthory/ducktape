@@ -93,7 +93,7 @@ pub struct CapabilityRegistry {
     /// the valset module consulted to gate announcements to current members;
     /// `None` runs ungated (the single-node daemon carries no valset).
     valset_id: Option<ModuleId>,
-    /// committed registry — what `root()` and the app-hash commit to. a node
+    /// committed registry — what `root()` and the root-hash commit to. a node
     /// key never maps to an entry with empty tags: empty tags means absent.
     announced: BTreeMap<Vec<u8>, NodeEntry>,
     /// per-block staged replacements: the entry stages a full declarative

@@ -54,7 +54,7 @@ type SnapshotMembership = (BTreeSet<Vec<u8>>, BTreeSet<Vec<u8>>);
 
 pub struct Valset {
     id: ModuleId,
-    /// committed membership — what `root()` and the app-hash commit to.
+    /// committed membership — what `root()` and the root-hash commit to.
     validators: BTreeSet<Vec<u8>>,
     /// membership changes staged during the current block: `true` == staged add,
     /// `false` == staged remove. read ahead of `validators` (read-your-writes),

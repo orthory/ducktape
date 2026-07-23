@@ -34,7 +34,7 @@ the PR clearly: **consensus: requires lockstep upgrade of live networks**
 
 `bin/node/src/main.rs` — construct a `CapabilityAnnouncer` (main.rs:516-581)
 in the joiner/resident park loop, active once the node has synced (after the
-`synced app_hash=` point, main.rs:6434) and holds committed resident
+`synced root_hash=` point, main.rs:6434) and holds committed resident
 standing. Reuse `capability_host::discover()` for the payload and the
 state-driven `maybe_announce()` idempotence (it compares against the
 committed registry each tick, so re-announce loops and restarts stay quiet

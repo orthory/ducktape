@@ -16,7 +16,7 @@
 
 - Every commit: `git -c commit.gpgsign=false commit ...`, trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 - **No mono-files:** explicit file layouts below are mandatory; ~600-line soft cap per file. `bin/noded/src/lib.rs` is already over cap — Task 2 extracts the duckfs surface rather than growing it.
-- **Determinism boundary (spec):** nothing in this phase touches `execute → state → root()` except the additive `HasChunks` *query* (queries are not part of the app-hash; adding a variant is consensus-safe). The purity gate `cargo check -p files --no-default-features` stays green after every task.
+- **Determinism boundary (spec):** nothing in this phase touches `execute → state → root()` except the additive `HasChunks` *query* (queries are not part of the root-hash; adding a variant is consensus-safe). The purity gate `cargo check -p files --no-default-features` stays green after every task.
 - **Error-string contracts** the engine keys on (pin them in tests, never restate them loosely): `"files: conflict: <path> changed since base"` (`crates/apps/files/src/fs.rs:1024`), `"files: base snapshot not resolvable"` (`fs.rs:835-837`), `"files: chunk not available"` (`fs.rs:1015`). Over HTTP these arrive as 400 `{"error": <msg>}` (`bin/noded/src/lib.rs:465,1133`).
 - Atomicity is non-negotiable: >`MAX_CHANGES_PER_COMMIT` (4096) changed paths **fails with a clear error before any op is submitted** — never split into multiple commits (spec: the commit is the atomic unit).
 - Gates per task: `cargo test -p <touched crates>`; `cargo check --workspace`; `cargo fmt -- --check` on touched crates; `cargo clippy -p <touched crates> -- -D warnings` (note the repo's `--no-deps` reconciliation note from the Phase-2 backlog if host/dispatch/saga noise appears).
@@ -133,13 +133,13 @@ The engine must stage only chunks the cluster lacks. No probe exists. Presence =
 ### Task 8: `HttpNode` transport + full-stack daemon proof
 
 **Files:**
-- Create: `crates/system/duckfs-client/src/http.rs` — `HttpNode::new(base_url)` (reqwest blocking, short connect timeout, no proxy surprises): `stage_chunk` → `POST /v1/files/stage` raw body → `{digest}`; `commit` → `POST /v1/files/commit` (snake_case `CommitBody`, `bin/noded/src/lib.rs:1207`) → **camelCase** `BlockSummary` `{height, appHash}`; reads → the GET endpoints (snake_case replies); `has_chunks` → `GET /v1/files/has-chunks?ids=`; `pin` → `POST /v1/files/pin`; status ≥400 with `{"error": msg}` → `ApiError::Rejected(msg)` (404 → `NotFound`) — the conflict strings must pass through verbatim.
+- Create: `crates/system/duckfs-client/src/http.rs` — `HttpNode::new(base_url)` (reqwest blocking, short connect timeout, no proxy surprises): `stage_chunk` → `POST /v1/files/stage` raw body → `{digest}`; `commit` → `POST /v1/files/commit` (snake_case `CommitBody`, `bin/noded/src/lib.rs:1207`) → **camelCase** `BlockSummary` `{height, rootHash}`; reads → the GET endpoints (snake_case replies); `has_chunks` → `GET /v1/files/has-chunks?ids=`; `pin` → `POST /v1/files/pin`; status ≥400 with `{"error": msg}` → `ApiError::Rejected(msg)` (404 → `NotFound`) — the conflict strings must pass through verbatim.
 - Create: `crates/system/duckfs-client/tests/http_contract.rs` — a hand-rolled `std::net::TcpListener` stub (the `daemon_e2e.rs` raw-HTTP house style, inverted) serving canned responses; asserts exact request lines/bodies and error mapping. No axum dev-dep needed.
 - Modify: `bin/noded/tests/daemon_e2e.rs` + `bin/noded/Cargo.toml` (dev-dep `duckfs-client`) — the real proof: against a spawned `ducktape-noded`, engine `checkout → edit → commit → second checkout` round-trip through `HttpNode`, including one >1 MiB file (stage path) and one conflict (two checkouts, same path) surfacing a `ConflictReport`.
 
 **Interfaces:** Produces the shipping transport. Consumes Tasks 2, 6, 7.
 
-- [ ] **Step 1 (RED):** contract test: `stage_chunk(b"abc")` sends `POST /v1/files/stage` with body `abc` and parses `{digest}`; commit reply parses camelCase `appHash`. Red: no `http.rs`.
+- [ ] **Step 1 (RED):** contract test: `stage_chunk(b"abc")` sends `POST /v1/files/stage` with body `abc` and parses `{digest}`; commit reply parses camelCase `rootHash`. Red: no `http.rs`.
 - [ ] **Step 2:** implement; contract green.
 - [ ] **Step 3 (RED→GREEN):** the daemon_e2e round-trip above.
 - [ ] **Step 4:** gates: `cargo test -p duckfs-client -p noded`, workspace check, fmt/clippy. Commit `feat(duckfs-client): blocking http transport + real-daemon round-trip`.

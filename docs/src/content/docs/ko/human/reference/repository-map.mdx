@@ -14,7 +14,7 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/kernel/sdk`: module contract, context, message, event, effect, origin,
   deterministic environment, `StateRoot`, 공유 snapshot codec(`sdk::codec`).
 - `crates/kernel/host`: registry, dispatch, follow-up drain, block commit/abort
-  lifecycle, global app-hash composition, non-deterministic worker
+  lifecycle, global root-hash composition, non-deterministic worker
   seam(`host::worker`).
 - `crates/kernel/node`: host와 orderer 사이의 loopback 및 ordered node seam.
 - `crates/kernel/consensus`: commonware Simplex orderer, content store, relay,
@@ -23,7 +23,7 @@ workspace는 platform layer별로 구성되어 있다.
 - `crates/kernel/recovery`: restart durability — op journal, checkpoint,
   boot-time replay.
 - `crates/kernel/indexer`: finalized op stream에서 파생되는 node-local read
-  index. app-hash에는 절대 포함되지 않는다.
+  index. root-hash에는 절대 포함되지 않는다.
 - `crates/system/capability-host`: capability seam 뒤의 machine-local executor
   provider.
 

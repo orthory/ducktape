@@ -65,7 +65,7 @@ fn a_commit_fault_halts_the_drain_with_fatal() {
         node.flush_batch().await.expect("flush 1");
         let applied = node.drain_delivered().await.expect("first drain is clean");
         assert_eq!(applied, 1);
-        let after_first = node.app_hash();
+        let after_first = node.root_hash();
 
         node.submit(&sk(1), 1, op.clone()).await.expect("submit 2");
         node.flush_batch().await.expect("flush 2");
@@ -80,11 +80,11 @@ fn a_commit_fault_halts_the_drain_with_fatal() {
             matches!(err, node::Error::Fatal(ref f) if f.module == "bomb"),
             "expected Error::Fatal for the bomb module, got {err:?}"
         );
-        // the drain halted at the fault: the app-hash still reflects exactly
+        // the drain halted at the fault: the root-hash still reflects exactly
         // the last CLEAN block (op 2's commit failed, op 3 never applied —
         // executes stayed at 2, not 3).
         assert_eq!(
-            node.app_hash(),
+            node.root_hash(),
             after_first,
             "no further block published a root"
         );

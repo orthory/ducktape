@@ -41,7 +41,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             // identity without a second channel.
                             Ok(BlockSummary {
                                 height: 7,
-                                app_hash: String::from_utf8_lossy(&origin).into_owned(),
+                                root_hash: String::from_utf8_lossy(&origin).into_owned(),
                             })
                         }
                     };
@@ -49,7 +49,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 }
                 // the signed-frame lane, answered as BOTH real binaries answer
                 // it: the origin is the frame's VERIFIED signer, never a caller
-                // string. echoed back through app_hash — the same origin probe
+                // string. echoed back through root_hash — the same origin probe
                 // the frameless arm above uses.
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let result = match node::decode_frame(&frame) {
@@ -57,7 +57,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                             assert_eq!(msg.target, "chat");
                             Ok(BlockSummary {
                                 height: 11,
-                                app_hash: noded::hex_bytes(&key),
+                                root_hash: noded::hex_bytes(&key),
                             })
                         }
                         Ok((origin, ..)) => Err(format!("a frame cannot carry {origin:?}")),
@@ -77,7 +77,7 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                 NodeCommand::Status { reply } => {
                     let _ = reply.send(NodeStatus {
                         version: "9.9.9".into(),
-                        app_hash: "cd".repeat(32),
+                        root_hash: "cd".repeat(32),
                         height: 3,
                         modules: vec![ModuleStatus {
                             id: "chat".into(),
@@ -150,7 +150,7 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
     assert_eq!(body["height"], 7);
     // the fake actor echoes the stamped origin here — no origin sent, so the
     // daemon default applies
-    assert_eq!(body["app_hash"], "noded");
+    assert_eq!(body["root_hash"], "noded");
 }
 
 #[tokio::test]
@@ -172,7 +172,7 @@ async fn submit_stamps_the_client_origin() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["app_hash"], "jess");
+    assert_eq!(body["root_hash"], "jess");
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -221,7 +221,7 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
     // the actor echoes the origin it VERIFIED — the signer's public key, which
     // no part of the request could have claimed.
     assert_eq!(
-        body["app_hash"],
+        body["root_hash"],
         noded::hex_bytes(signer.public_key().as_ref())
     );
     // the receipt addresses the op PAYLOAD, exactly as the frameless lane does.
@@ -371,7 +371,7 @@ async fn query_returns_the_decoded_module_reply() {
 }
 
 #[tokio::test]
-async fn status_reports_app_hash_height_and_module_roots() {
+async fn status_reports_root_hash_height_and_module_roots() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, None);
 
@@ -388,7 +388,7 @@ async fn status_reports_app_hash_height_and_module_roots() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["version"], "9.9.9");
-    assert_eq!(body["app_hash"], "cd".repeat(32));
+    assert_eq!(body["root_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
@@ -1091,7 +1091,7 @@ fn spawn_files_actor(
                         Some(err) => Err(err.to_string()),
                         None => Ok(BlockSummary {
                             height: 9,
-                            app_hash: "ab".repeat(32),
+                            root_hash: "ab".repeat(32),
                         }),
                     };
                     let _ = reply.send(result);

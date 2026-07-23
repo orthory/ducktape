@@ -1,6 +1,6 @@
 //! the saga ledger — the DETERMINISTIC half of the async engine.
 //!
-//! a pure state-machine module (in the app-hash) that records async work in
+//! a pure state-machine module (in the root-hash) that records async work in
 //! flight: one effect, one agreed result, domain-agnostic. it keeps
 //! `directory`'s shape — an in-memory `BTreeMap` with a `pending` overlay
 //! staged during a block and merged at the boundary, and a state-based
@@ -59,7 +59,7 @@
 //! recorded trigger origin per id. there is no lazy retention sweep — a
 //! terminal saga stays in the root preimage until its owner prunes it.
 //!
-//! `root()` folds in every field, so any transition moves the app-hash. a
+//! `root()` folds in every field, so any transition moves the root-hash. a
 //! joiner rebuilds this module from a peer via [`SagaModule::snapshot`] /
 //! [`SagaModule::install`]: the snapshot ships the committed map in the exact
 //! canonical encoding `root()` hashes, and install re-derives the root from
@@ -372,7 +372,7 @@ pub struct SagaModule {
     capability_registry: Option<ModuleId>,
     /// genesis config, not state: identical on every node by construction.
     policy: LeasePolicy,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     sagas: BTreeMap<String, Saga>,
     /// this block's staged writes, read ahead of `sagas` (read-your-writes)
     /// but merged in — and reflected in `root()` — only at `commit_block`.

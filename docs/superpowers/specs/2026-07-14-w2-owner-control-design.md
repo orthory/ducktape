@@ -201,9 +201,9 @@ votes are weighed*.
   first-class `Actor::Node`; it is not an app path, so it is not the "bespoke
   lane" the migration deletes.
 
-### App-hash + gates
+### Root-hash + gates
 
-Genesis app-hash MOVES (governance-wasm rebuild) — re-seed required (accepted).
+Genesis root-hash MOVES (governance-wasm rebuild) — re-seed required (accepted).
 Gates: `cargo test -p simnode` (standing gate — extended with `governance_frames.rs`:
 account-signed admit/demote ceremonies over the real frame wire + a no-standing
 rejection); governance/identity module tests (+ account-member-key path);

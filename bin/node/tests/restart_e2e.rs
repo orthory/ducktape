@@ -2,7 +2,7 @@
 //! recovery. one OS-process solo validator (a network of one: simplex with
 //! participants = {self} is live) is crashed with SIGKILL and later shut down
 //! gracefully; each respawn over the SAME storage dir must recover the
-//! composed app-hash WITHOUT re-running genesis, resume the finalized
+//! composed root-hash WITHOUT re-running genesis, resume the finalized
 //! boundary, and keep finalizing new ops over its reopened consensus journal
 //! (the anti-equivocation record makes a fresh-journal respawn unsafe, so
 //! liveness after respawn is the property that proves the journal reopened).
@@ -78,16 +78,16 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     // the replay suffix and leave the rows to the index's fsync timing).
     cluster.extra_toml.push("checkpoint_blocks = 100000".into());
     cluster.spawn(0);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
 
     // real state across two of the substrates the checkpoint has to cover:
     // directory is in-memory canonical-bytes (dies without recovery).
     write_and_confirm(&cluster, 0, "who", "ducktape");
     write_and_confirm(&cluster, 0, "where", "a-worktree");
     let before = cluster.status(0);
-    let app_hash_before = before["app_hash"]
+    let root_hash_before = before["root_hash"]
         .as_str()
-        .expect("status app_hash")
+        .expect("status root_hash")
         .to_string();
     let height_before = before["height"].as_u64().expect("status height");
 
@@ -113,17 +113,17 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     cluster.kill(0);
 
     // respawn over the SAME storage dir. the node must RECOVER, not re-run
-    // genesis: the greppable marker flips from `genesis app_hash=` to
-    // `recovered app_hash=`.
+    // genesis: the greppable marker flips from `genesis root_hash=` to
+    // `recovered root_hash=`.
     cluster.spawn(0);
-    let recovered = cluster.wait_marker(0, "recovered app_hash=", Duration::from_secs(30));
+    let recovered = cluster.wait_marker(0, "recovered root_hash=", Duration::from_secs(30));
     let recovered_hash = recovered.split_whitespace().next().expect("recovered hash");
     assert_eq!(
-        recovered_hash, app_hash_before,
-        "recovered app-hash must be byte-identical to the pre-crash boundary"
+        recovered_hash, root_hash_before,
+        "recovered root-hash must be byte-identical to the pre-crash boundary"
     );
     assert!(
-        cluster.marker(0, "genesis app_hash=").is_none(),
+        cluster.marker(0, "genesis root_hash=").is_none(),
         "a restart must not re-run genesis"
     );
 
@@ -133,7 +133,7 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     // read and the kill — state-identical, height +n.)
     let after = poll_until("status after recovery", Duration::from_secs(30), || {
         let s = cluster.status(0);
-        (s["app_hash"] == before["app_hash"]).then_some(s)
+        (s["root_hash"] == before["root_hash"]).then_some(s)
     });
     assert!(after["height"].as_u64().expect("height") >= height_before);
     assert_eq!(dir_value(&cluster, 0, "who").as_deref(), Some("ducktape"));
@@ -207,9 +207,9 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     cluster.wait_exit(0, Duration::from_secs(15));
 
     cluster.spawn(0);
-    cluster.wait_marker(0, "recovered app_hash=", Duration::from_secs(30));
+    cluster.wait_marker(0, "recovered root_hash=", Duration::from_secs(30));
     assert!(
-        cluster.marker(0, "genesis app_hash=").is_none(),
+        cluster.marker(0, "genesis root_hash=").is_none(),
         "the second restart must not re-run genesis either"
     );
     // everything from BOTH earlier lives is present...
@@ -238,15 +238,15 @@ fn solo_validator_survives_sigterm_restart() {
     let _guard = common::serial();
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.spawn(0);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
 
     // land real state the checkpoint must carry across the signal.
     write_and_confirm(&cluster, 0, "quit", "gracefully");
     write_and_confirm(&cluster, 0, "via", "sigterm");
     let before = cluster.status(0);
-    let app_hash_before = before["app_hash"]
+    let root_hash_before = before["root_hash"]
         .as_str()
-        .expect("status app_hash")
+        .expect("status root_hash")
         .to_string();
     let height_before = before["height"].as_u64().expect("status height");
 
@@ -262,14 +262,14 @@ fn solo_validator_survives_sigterm_restart() {
 
     // ---- restart: must RECOVER (not re-run genesis) to the exact tip --------
     cluster.spawn(0);
-    let recovered = cluster.wait_marker(0, "recovered app_hash=", Duration::from_secs(30));
+    let recovered = cluster.wait_marker(0, "recovered root_hash=", Duration::from_secs(30));
     let recovered_hash = recovered.split_whitespace().next().expect("recovered hash");
     assert_eq!(
-        recovered_hash, app_hash_before,
-        "recovered app-hash after a graceful SIGTERM must be byte-identical to the pre-signal boundary"
+        recovered_hash, root_hash_before,
+        "recovered root-hash after a graceful SIGTERM must be byte-identical to the pre-signal boundary"
     );
     assert!(
-        cluster.marker(0, "genesis app_hash=").is_none(),
+        cluster.marker(0, "genesis root_hash=").is_none(),
         "a SIGTERM restart must not re-run genesis (no brick)"
     );
 
@@ -278,7 +278,7 @@ fn solo_validator_survives_sigterm_restart() {
         Duration::from_secs(30),
         || {
             let s = cluster.status(0);
-            (s["app_hash"] == before["app_hash"]).then_some(s)
+            (s["root_hash"] == before["root_hash"]).then_some(s)
         },
     );
     assert!(after["height"].as_u64().expect("height") >= height_before);
@@ -390,7 +390,7 @@ fn solo_validator_duckfs_bytes_survive_crash() {
     // genesis manifest, which replay-from-genesis cannot reconcile by root alone).
     cluster.extra_toml.push("checkpoint_blocks = 1".into());
     cluster.spawn(0);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
 
     // ---- seed non-trivial duckfs state --------------------------------------
     // (1) two inline files in nested dirs, one commit off the empty tree.
@@ -482,22 +482,22 @@ fn solo_validator_duckfs_bytes_survive_crash() {
         files_read(&cluster, 0, "/shared/a", 0, 64).as_deref(),
         Some(b"alpha".as_ref())
     );
-    let app_hash_before = cluster.status(0)["app_hash"]
+    let root_hash_before = cluster.status(0)["root_hash"]
         .as_str()
-        .expect("status app_hash")
+        .expect("status root_hash")
         .to_string();
 
     // ---- crash: SIGKILL, no goodbye -----------------------------------------
     cluster.kill(0);
     cluster.spawn(0);
-    let recovered = cluster.wait_marker(0, "recovered app_hash=", Duration::from_secs(30));
+    let recovered = cluster.wait_marker(0, "recovered root_hash=", Duration::from_secs(30));
     let recovered_hash = recovered.split_whitespace().next().expect("recovered hash");
     assert_eq!(
-        recovered_hash, app_hash_before,
-        "recovered app-hash must be byte-identical to the pre-crash boundary (duckfs root included)"
+        recovered_hash, root_hash_before,
+        "recovered root-hash must be byte-identical to the pre-crash boundary (duckfs root included)"
     );
     assert!(
-        cluster.marker(0, "genesis app_hash=").is_none(),
+        cluster.marker(0, "genesis root_hash=").is_none(),
         "a duckfs restart must not re-run genesis"
     );
 
@@ -573,7 +573,7 @@ fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence()
     // `checkpoint_blocks` override — the default cadence IS the point.
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.spawn(0);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(30));
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
 
     // THREE sequential duckfs commits — three per-block-durable disk blocks past
     // the genesis checkpoint (the multi-block history the review flagged). paths
@@ -615,23 +615,23 @@ fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence()
         files_stat(&cluster, 0, "/shared/hist/c").map(|_| ())
     });
 
-    let app_hash_before = cluster.status(0)["app_hash"]
+    let root_hash_before = cluster.status(0)["root_hash"]
         .as_str()
-        .expect("status app_hash")
+        .expect("status root_hash")
         .to_string();
 
     // ---- crash: SIGKILL, no goodbye — the disk is 3 blocks past the checkpoint.
     cluster.kill(0);
     cluster.spawn(0);
-    let recovered = cluster.wait_marker(0, "recovered app_hash=", Duration::from_secs(30));
+    let recovered = cluster.wait_marker(0, "recovered root_hash=", Duration::from_secs(30));
     let recovered_hash = recovered.split_whitespace().next().expect("recovered hash");
     assert_eq!(
-        recovered_hash, app_hash_before,
+        recovered_hash, root_hash_before,
         "a disk substrate several blocks ahead of the checkpoint must recover \
          byte-identically at the DEFAULT cadence (no checkpoint_blocks=1 crutch)"
     );
     assert!(
-        cluster.marker(0, "genesis app_hash=").is_none(),
+        cluster.marker(0, "genesis root_hash=").is_none(),
         "recovery must not re-run genesis"
     );
 

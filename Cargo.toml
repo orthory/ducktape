@@ -6,7 +6,7 @@
 # not mechanism ("system" always means system *modules*). layout:
 #   crates/kernel/   — the platform: sdk (the module contract + sdk::codec),
 #                      sdk-testkit (dev-only test doubles for the sdk boundary
-#                      traits), host (submit/execute loop, app-hash composition,
+#                      traits), host (submit/execute loop, root-hash composition,
 #                      the host::worker seam), node (ordered replication),
 #                      consensus (BFT orderer), statesync, recovery, indexer,
 #                      wasm-host (runs a ducktape:module component as a native
@@ -47,7 +47,7 @@
 #                      coordinator (STUN rendezvous), guest-builder (module →
 #                      wasm component packaging tool)
 # the host dispatches modules over BFT consensus and composes each authenticated
-# root into the global app-hash. cosmwasm's isolation *pattern*, native rust.
+# root into the global root-hash. cosmwasm's isolation *pattern*, native rust.
 
 [workspace]
 resolver = "2"
@@ -193,7 +193,7 @@ chacha20poly1305 = "0.10"
 zeroize = "1"
 
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
-# per-module indexer tier ONLY: nothing the app-hash commits to may live in it
+# per-module indexer tier ONLY: nothing the root-hash commits to may live in it
 # (evaluated and rejected as a canonical substrate — see handoff/restart-recovery.md).
 # default-features = false drops the in-database WASM layer (wasmtime).
 fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }

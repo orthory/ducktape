@@ -13,7 +13,7 @@ command가 claim을 증명하는지, 어떤 invariant를 완화하면 위험한�
 ## Working Model
 
 - `crates/kernel/sdk`를 module contract의 source of truth로 본다.
-- `crates/kernel/host`를 app-hash boundary로 본다.
+- `crates/kernel/host`를 root-hash boundary로 본다.
 - `crates/kernel/consensus`와 `bin/node`를 ordered delivery path로 본다.
 - `docs/src/content/docs`는 language와 reader로 나뉜 Nimbus route tree다.
 

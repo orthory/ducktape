@@ -41,7 +41,7 @@
 //! registration is exactly the atomicity the caller wants.
 //!
 //! `root()` folds in every scope and subscriber, so any transition moves the
-//! app-hash. a joiner rebuilds this module from a peer via
+//! root-hash. a joiner rebuilds this module from a peer via
 //! [`TaggingModule::snapshot`] / [`TaggingModule::install`]: the snapshot
 //! ships the committed map in the exact canonical encoding `root()` hashes,
 //! and install re-derives the root from the decoded temporaries before
@@ -152,7 +152,7 @@ pub struct TaggingModule {
     /// registered module could make that module reject the foreign event and
     /// abort the content block.
     direct_owners: BTreeSet<ModuleId>,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     committed: Committed,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in only at `commit_block`. a staged

@@ -1,6 +1,6 @@
 ---
 name: module-dev
-description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — MODULE_IDS, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the app-hash, the registry parity test, include_bytes compilation, or wasm-modules-check.
+description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — MODULE_IDS, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash, the registry parity test, include_bytes compilation, or wasm-modules-check.
 ---
 
 # Module development — the end-to-end wiring runbook
@@ -13,7 +13,7 @@ A module is four layers: native crate (the logic) → wasm guest (the packaging)
 cutover pattern). This skill is the wiring checklist that record doesn't cover.
 External/third-party authoring rides `ducktape-quack`, not this path.
 
-## Decide first: genesis registration is an app-hash break
+## Decide first: genesis registration is a root-hash break
 
 A module in `MODULE_IDS` joins the genesis set: every existing workspace fails
 closed, dev networks re-genesis. Post-genesis admission (lifecycle

@@ -245,10 +245,10 @@ fn validator_push_fans_pack_to_every_validator_before_consensus() {
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.spawn(0);
     cluster.spawn(1);
-    cluster.wait_marker(0, "genesis app_hash=", Duration::from_secs(60));
-    cluster.wait_marker(1, "genesis app_hash=", Duration::from_secs(60));
-    cluster.wait_marker(0, "converged app_hash=", CONVERGE);
-    cluster.wait_marker(1, "converged app_hash=", CONVERGE);
+    cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(60));
+    cluster.wait_marker(1, "genesis root_hash=", Duration::from_secs(60));
+    cluster.wait_marker(0, "converged root_hash=", CONVERGE);
+    cluster.wait_marker(1, "converged root_hash=", CONVERGE);
 
     let source = tempfile::tempdir().expect("git source dir");
     git_ok(source.path(), &["init"]);

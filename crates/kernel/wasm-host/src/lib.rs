@@ -34,7 +34,7 @@
 //!     [`WasmModule::with_store`]): the root IS the store's merkle root and
 //!     sync is the store's resolver lane, so a native module already written
 //!     over `Box<dyn MerkleStore>` ports with a ROOT-CONTINUOUS cutover — the
-//!     same ops commit the same store ops and the app-hash never moves. store
+//!     same ops commit the same store ops and the root-hash never moves. store
 //!     reads are async, so `state-get` misses ride the SAME memoized-replay
 //!     machinery as sibling reads (bounded by [`MAX_STORE_READS`]); the staged
 //!     overlay and the commit/abort boundary are identical in both backings.
@@ -131,7 +131,7 @@ pub trait HostOdb {
 /// durable refs file (Task 4), or the in-memory mock the kernel tests drive.
 ///
 /// the crux is `root()` = `StateRoot(sha256(refs_bytes()))` — the canonical refs
-/// image, NOT the host-KV encoding — so a wasm files tenant's app-hash is
+/// image, NOT the host-KV encoding — so a wasm files tenant's root-hash is
 /// byte-identical to native files' `sha256(encode_refs)` and the cutover moves
 /// no root. the guest sees the refs image through the ordinary `state-*` lane
 /// under [`REFS_KEY`] (state-get serves the committed image staged-over, state-set
@@ -485,7 +485,7 @@ pub struct WasmModule {
     component: Component,
     /// sha256 of the component bytes currently loaded — the CODE identity the
     /// host reconciles against the registry's committed active hash. NOT part of
-    /// `root()` (code is invisible to the app-hash); per-node realization only.
+    /// `root()` (code is invisible to the root-hash); per-node realization only.
     code_hash: Vec<u8>,
     backing: StateBacking,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
@@ -660,7 +660,7 @@ impl WasmModule {
     /// The authenticated root of the committed store: SHA-256 over
     /// [`WasmModule::encode_state`]. Deterministic and idempotent — the same
     /// scheme the native map-backed modules use, so it composes into the global
-    /// app-hash exactly like any other module root.
+    /// root-hash exactly like any other module root.
     fn root_of(committed: &BTreeMap<Vec<u8>, Vec<u8>>) -> StateRoot {
         let mut h = Sha256::new();
         h.update(Self::encode_state(committed));
@@ -871,7 +871,7 @@ fn deterministic_config() -> Config {
     c.wasm_component_model(true);
     c.consume_fuel(true);
     // float ops emit ONE canonical NaN bit pattern: a guest computing floats
-    // can never leak host-hardware NaN payloads into state or the app-hash.
+    // can never leak host-hardware NaN payloads into state or the root-hash.
     c.cranelift_nan_canonicalization(true);
     c.wasm_simd(false);
     c.wasm_relaxed_simd(false);
@@ -931,7 +931,7 @@ impl Module for WasmModule {
 
     /// map mode: sha256 over the canonical host-KV encoding. store mode: the
     /// injected store's REAL merkle root, verbatim — the same value the native
-    /// module computed pre-cutover, so the app-hash is continuous.
+    /// module computed pre-cutover, so the root-hash is continuous.
     fn root(&self) -> StateRoot {
         match &self.backing {
             StateBacking::Map { committed } => Self::root_of(committed),
@@ -1009,7 +1009,7 @@ impl Module for WasmModule {
 
     /// Replace the component code IN PLACE, keeping the host-owned state store.
     /// This is the live-update primitive: same store, new logic, and the root is
-    /// computed from the (untouched) store — so app-hash is continuous across the
+    /// computed from the (untouched) store — so root-hash is continuous across the
     /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
     /// driven at a clean block boundary, never mid-block.
     fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {

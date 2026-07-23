@@ -876,7 +876,7 @@ fn snapshot_install_round_trips_and_rejects_tampering() {
             // reach the handle through the host's finalized-snapshot surface.
             let finalized = host::FinalizedBlock {
                 height: 2,
-                app_hash: host.app_hash(),
+                root_hash: host.root_hash(),
             };
             host.capture_finalized_snapshot(finalized)
                 .expect("capture")

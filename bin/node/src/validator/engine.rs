@@ -169,7 +169,7 @@ pub(super) async fn resume(
         .unwrap_or_else(|| "none".to_string());
     let recovered_hash = resumed
         .as_ref()
-        .map(|rec| hex(&rec.app_hash))
+        .map(|rec| hex(&rec.root_hash))
         .unwrap_or_else(|| "none".to_string());
     let replayed = resumed.as_ref().map(|rec| rec.applied).unwrap_or(0);
     let boot_floor_height = latest_floor
@@ -201,7 +201,7 @@ pub(super) async fn resume(
             recovery,
             rec.height.map(|height| host::FinalizedBlock {
                 height,
-                app_hash: rec.app_hash,
+                root_hash: rec.root_hash,
             }),
             rec.view_base,
         ),
@@ -245,14 +245,14 @@ pub(super) async fn resume(
         );
     }
 
-    // the genesis app-hash BEFORE any op — the demo asserts this agrees across
+    // the genesis root-hash BEFORE any op — the demo asserts this agrees across
     // processes (a fork here would be a genesis-determinism bug, not consensus).
     // a RESTORED boot prints its recovered line above instead.
     if resumed.is_none() {
-        let genesis_hash = node.app_hash();
+        let genesis_hash = node.root_hash();
         tracing::info!(
             target: "ducktape::consensus",
-            "node={label} genesis app_hash={}", hex(&genesis_hash)
+            "node={label} genesis root_hash={}", hex(&genesis_hash)
         );
     }
 

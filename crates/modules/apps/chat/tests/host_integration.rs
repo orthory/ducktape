@@ -74,7 +74,7 @@ impl Module for Recorder {
     }
 
     // a content commitment good enough for the test: notification count plus
-    // a byte sum, so any committed difference moves the root (and app-hash).
+    // a byte sum, so any committed difference moves the root (and root-hash).
     fn root(&self) -> StateRoot {
         let committed = self.committed.borrow();
         let mut root = [0u8; 32];
@@ -130,7 +130,7 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
         let chat = chat_on!(context, "chat");
         let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
         let root0 = host.module_root("chat").unwrap();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let out1 = host
             .submit_at(
@@ -144,7 +144,7 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
             .await
             .unwrap();
         assert_ne!(host.module_root("chat").unwrap(), root0);
-        assert_ne!(out1.app_hash, app0);
+        assert_ne!(out1.root_hash, app0);
 
         host.submit_at(
             as_user(1),
@@ -183,7 +183,7 @@ fn host_rolls_back_failed_chat_blocks() {
         let chat = chat_on!(context, "chat");
         let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
         let root0 = host.module_root("chat").unwrap();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let err = host
             .submit_at(
@@ -200,7 +200,7 @@ fn host_rolls_back_failed_chat_blocks() {
             .unwrap_err();
         assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(host.module_root("chat").unwrap(), root0);
-        assert_eq!(host.app_hash(), app0);
+        assert_eq!(host.root_hash(), app0);
     });
 }
 
@@ -209,7 +209,7 @@ fn default_empty_external_origin_is_rejected() {
     deterministic::Runner::default().start(|context| async move {
         let chat = chat_on!(context, "chat");
         let mut host = Host::genesis(vec![Box::new(chat)]).unwrap();
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         // Host::submit uses BlockContext::default() = Origin::External(vec![]),
         // which must never pass as an authenticated author.
@@ -222,7 +222,7 @@ fn default_empty_external_origin_is_rejected() {
             .await
             .unwrap_err();
         assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
-        assert_eq!(host.app_hash(), app0);
+        assert_eq!(host.root_hash(), app0);
     });
 }
 
@@ -296,7 +296,7 @@ fn hook_notifications_commit_atomically_with_the_post() {
         .unwrap();
         let chat_root = host.module_root("chat").unwrap();
         let recorder_root = host.module_root("recorder").unwrap();
-        let app_hash = host.app_hash();
+        let root_hash = host.root_hash();
 
         let err = host
             .submit_at(
@@ -314,7 +314,7 @@ fn hook_notifications_commit_atomically_with_the_post() {
         assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(host.module_root("chat").unwrap(), chat_root);
         assert_eq!(host.module_root("recorder").unwrap(), recorder_root);
-        assert_eq!(host.app_hash(), app_hash);
+        assert_eq!(host.root_hash(), root_hash);
         assert_eq!(
             recorded.borrow().len(),
             1,

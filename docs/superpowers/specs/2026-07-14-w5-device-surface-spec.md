@@ -64,7 +64,7 @@ Why origin-gated over user-signed (`UnbindNode`'s member-cert model):
 `NodeMeta { label: Option<String> }`. `AccountView.nodes: Vec<Vec<u8>>` →
 `Vec<NodeView>` (`{ node_key, label }`). The label lives welded to its node —
 no parallel list to desync (correctness at the auth-adjacent `account.nodes`
-read the gateway does). Genesis app-hash moves; QA networks need re-seed.
+read the gateway does). Genesis root-hash moves; QA networks need re-seed.
 
 ### D4 — cross-network cache = localStorage, panel-local (no store slice)
 
@@ -90,7 +90,7 @@ mechanically.
 `crates/examples/identity-wasm/component.wasm` (committed, `include_bytes!` in
 `bin/node/src/host_state.rs`), the wasm compiled FROM the native crate. So a
 native-crate change is NOT live on a real node — and worse, desyncs the wire —
-until the component is rebuilt. This is precisely the app-hash move the ledger
+until the component is rebuilt. This is precisely the root-hash move the ledger
 flags (re-seed QA nets).
 
 Regen command (the identity block of `make wasm-modules`):

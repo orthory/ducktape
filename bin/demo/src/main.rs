@@ -1,7 +1,7 @@
 //! a runnable super-app demo: twenty registered modules — including QMDB-backed
 //! KV and EVM state, Git/DuckFS substrates, collaboration apps, and system
 //! routing modules — dispatched over ONE host, showing
-//! the app-hash evolve as typed cross-module ops flow, ending on the
+//! the root-hash evolve as typed cross-module ops flow, ending on the
 //! agent-collaboration beat: a mention becomes a run and a pending saga in one
 //! block.
 //!
@@ -78,7 +78,7 @@ fn main() {
             host::topology::DEMO.len()
         );
         println!("forge repo       : {}", forge_repo.display());
-        println!("genesis app-hash : {:?}", host.app_hash());
+        println!("genesis root-hash : {:?}", host.root_hash());
         println!(
             "genesis forge root (unborn git repo): {:?}",
             host.module_root("forge").unwrap()
@@ -104,7 +104,7 @@ fn main() {
             .await
             .expect("submit block 1");
         println!("\n[block 1] directory <- Set(name = world)");
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 2: trigger greeter. it QUERIES directory (typed, cross-module),
         // then emits typed follow-up writes to directory + kv — all in one block.
@@ -116,7 +116,7 @@ fn main() {
             .await
             .expect("submit block 2");
         println!("\n[block 2] greeter(name): query directory -> write greeting to directory + kv");
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 3: tracker state is consensus-owned; Git objects are built by
         // clients and enter through the node's PushRefs data-plane lane, which
@@ -133,7 +133,7 @@ fn main() {
             .await
             .expect("submit block 3");
         println!("\n[block 3] forge <- OpenIssue — consensus-owned tracker state");
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
         println!(
             "  forge root     : {:?}",
             host.module_root("forge").unwrap()
@@ -215,7 +215,7 @@ fn main() {
             .expect("submit block 4");
         println!("\n[block 4] chat <- CreateChannel(general) — authorship from origin");
         println!("  chat root      : {:?}", host.module_root("chat").unwrap());
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 5: a root message, a thread reply, and a reaction — three ops,
         // three blocks; sequences come from the channel's head_seq counter.
@@ -291,13 +291,13 @@ fn main() {
                     .collect::<Vec<_>>()
             );
             println!("  chat root      : {:?}", host.module_root("chat").unwrap());
-            println!("  app-hash       : {:?}", out.app_hash);
+            println!("  root-hash       : {:?}", out.root_hash);
         }
 
         // block 6: a NEW validator JOINs the permissionless ed25519 valset. derive
         // the key deterministically from a fixed seed (any 32 bytes is a valid
         // ed25519 seed) so the demo is reproducible. the valset root moves off
-        // ZERO and folds another module's commitment into the app-hash.
+        // ZERO and folds another module's commitment into the root-hash.
         let seed = [7u8; 32];
         let new_validator = PrivateKey::decode(&seed[..])
             .expect("32-byte seed is a valid ed25519 private key")
@@ -336,10 +336,10 @@ fn main() {
             "  valset root    : {:?}",
             host.module_root("valset").unwrap()
         );
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 7: the agent-collaboration loop (design §3). register an agent
-        // (which model+prompt it runs is committed into the app-hash), watch
+        // (which model+prompt it runs is committed into the root-hash), watch
         // the chat channel under a Mention policy — the watch and chat's hook
         // registration commit atomically — enable the runs module as the
         // jobs-board worker by admin op (not genesis config), then post a message MENTIONING the
@@ -479,7 +479,7 @@ fn main() {
         println!(
             "  (post + tag + engagement + run + dispatch + trigger: ONE block — the P2 cascade)"
         );
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // block 8: the INBOX notification queue. modules deliver to a member as
         // a follow-up so the notification commits atomically with its cause; here
@@ -526,15 +526,15 @@ fn main() {
                 );
             }
         }
-        println!("  app-hash       : {:?}", out.app_hash);
+        println!("  root-hash       : {:?}", out.root_hash);
 
         // every registered module, straight from the registry — the same set
-        // (and sorted-id order) the app-hash composes over.
+        // (and sorted-id order) the root-hash composes over.
         println!("\nmodule roots:");
         for (id, root) in host.module_roots() {
             println!("  {id:>11} : {root:?}");
         }
-        println!("\nfinal app-hash   : {:?}", host.app_hash());
+        println!("\nfinal root-hash   : {:?}", host.root_hash());
     });
 }
 

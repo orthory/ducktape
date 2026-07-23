@@ -1,6 +1,6 @@
 //! Genesis-composition parity: the sim's default (and `--with-valset`) genesis
 //! sets ARE the `sim_base` (+ `sim_valset`) selections of the single-source
-//! `host::topology`, and the default set's app-hash is byte-identical to the
+//! `host::topology`, and the default set's root-hash is byte-identical to the
 //! pre-topology composition. The daemon parity lane pins the same `sim_base`
 //! against noded; this pins the sim composer against the topology it now draws
 //! from, and guards C4's "no construction change" invariant with a golden hash.
@@ -9,11 +9,11 @@ mod harness;
 
 use harness::Sim;
 
-/// The default 14-native-module sim genesis app-hash, captured from the
+/// The default 14-native-module sim genesis root-hash, captured from the
 /// pre-C4 composition. C4 moved only the id-LIST source (into `host::topology`);
 /// the native genesis vec is untouched, so this must stay byte-identical — a
 /// change here means a construction change slipped in with the id-list swap.
-const DEFAULT_GENESIS_APP_HASH: &str =
+const DEFAULT_GENESIS_ROOT_HASH: &str =
     "0a81571979950afc077681d9645f368eb8eed5a938c217245db7ef65f4e51b0d";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
@@ -38,9 +38,9 @@ fn default_genesis_composes_topology_sim_base() {
         "sim default genesis composes topology sim_base, in registry order"
     );
     assert_eq!(
-        status["app_hash"].as_str().expect("app_hash is a string"),
-        DEFAULT_GENESIS_APP_HASH,
-        "default sim genesis app-hash must be byte-identical across the topology swap"
+        status["root_hash"].as_str().expect("root_hash is a string"),
+        DEFAULT_GENESIS_ROOT_HASH,
+        "default sim genesis root-hash must be byte-identical across the topology swap"
     );
 }
 

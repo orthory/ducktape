@@ -4,7 +4,7 @@
 //! — a module rename plus a payload reshape — now fails to compile instead).
 //!
 //! `cluster_lifecycle` is the port of demo-2node.sh's assertion spec:
-//!   1. genesis app-hashes agree            -> genesis determinism
+//!   1. genesis root-hashes agree            -> genesis determinism
 //!   2. all validators converge             -> payload relay + live BFT
 //!   3. converged hashes agree              -> no cross-process fork
 //!   4. converged != genesis                -> ops actually applied
@@ -13,7 +13,7 @@
 //!   7. admission cutover                   -> the passed proposal seats the
 //!      key at one boundary; node 3 syncs the frozen boundary and promotes
 //!   8. post-cutover post reads on node 2   -> the respawned engines finalize
-//!   9. status app-hashes agree             -> the boundary a joiner rebuilds
+//!   9. status root-hashes agree             -> the boundary a joiner rebuilds
 //!  10. sync-only joiner hash parity        -> network statesync, full rebuild
 //!
 //! `quorum_tolerates_one_fault` covers what the demo never could: with 4
@@ -122,9 +122,9 @@ fn cluster_lifecycle() {
     cluster.spawn(1);
     cluster.spawn(2);
 
-    // 1. genesis determinism: identical module registry -> identical app-hash.
+    // 1. genesis determinism: identical module registry -> identical root-hash.
     let genesis: Vec<String> = (0..3)
-        .map(|i| cluster.wait_marker(i, "genesis app_hash=", Duration::from_secs(60)))
+        .map(|i| cluster.wait_marker(i, "genesis root_hash=", Duration::from_secs(60)))
         .collect();
     assert_eq!(genesis[0], genesis[1], "genesis fork between nodes 0 and 1");
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
@@ -136,16 +136,16 @@ fn cluster_lifecycle() {
     // installed) the three lines can legitimately sample different heights —
     // per the harness contract it proves liveness, never hash equality.
     let converged: Vec<String> = (0..3)
-        .map(|i| cluster.wait_marker(i, "converged app_hash=", CONVERGE))
+        .map(|i| cluster.wait_marker(i, "converged root_hash=", CONVERGE))
         .collect();
 
     // 3. no cross-process fork: the state assertion goes through the rpc
     // (the harness-documented pattern) — poll until every validator reports
-    // the same status app-hash. a real fork never reconciles, so it fails
+    // the same status root-hash. a real fork never reconciles, so it fails
     // this poll's budget; sampling skew settles within a block or two.
-    poll_until("status app-hashes to agree across validators", FINALIZE, || {
+    poll_until("status root-hashes to agree across validators", FINALIZE, || {
         let hashes: Vec<serde_json::Value> = (0..3)
-            .map(|i| cluster.status(i)["app_hash"].clone())
+            .map(|i| cluster.status(i)["root_hash"].clone())
             .collect();
         (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
     });
@@ -283,7 +283,7 @@ fn cluster_lifecycle() {
     }
 
     // 8c. the explorer surface: the held submit finalized a NON-EMPTY block,
-    // so /v1/blocks must carry it — frame hash, per-block commit app-hash,
+    // so /v1/blocks must carry it — frame hash, per-block commit root-hash,
     // the submitting validator's VERIFIED key as proposer, and the dispatch
     // trace — while the heartbeat nops that tick the idle chain never appear.
     let (code, body) = cluster.http(0, "GET", "/v1/blocks", None);
@@ -305,8 +305,8 @@ fn cluster_lifecycle() {
     assert_eq!(op["target"], "directory");
     assert_eq!(op["disposition"], "applied");
     assert_eq!(
-        submitted["commit_hash"], block["app_hash"],
-        "explorer commit hash must equal the held reply's app-hash"
+        submitted["commit_hash"], block["root_hash"],
+        "explorer commit hash must equal the held reply's root-hash"
     );
     assert_eq!(
         op["proposer"].as_str().unwrap_or_default(),
@@ -400,7 +400,7 @@ fn cluster_lifecycle() {
     );
 
     // 9. quiesce, then the boundary every joiner must rebuild: identical
-    // status app-hashes across validators — and the app surface reports the
+    // status root-hashes across validators — and the app surface reports the
     // same hash as the rpc (one state, two wires). both node-2 reads happen
     // AFTER the quiesce with nothing left in flight, so a mismatch means the
     // two wires project different host state, not a straggling block.
@@ -408,20 +408,20 @@ fn cluster_lifecycle() {
     let status0 = cluster.status(0);
     let status1 = cluster.status(1);
     assert_eq!(
-        status0["app_hash"], status1["app_hash"],
-        "post-rpc status app-hashes disagree"
+        status0["root_hash"], status1["root_hash"],
+        "post-rpc status root-hashes disagree"
     );
     let (code, http_status) = cluster.http(2, "GET", "/v1/status", None);
     assert_eq!(code, 200, "app-surface status failed");
-    let http_hash = http_status["app_hash"].as_str().unwrap_or_default();
+    let http_hash = http_status["root_hash"].as_str().unwrap_or_default();
     assert!(
         !http_hash.is_empty(),
-        "app-surface status carries app_hash: {http_status}"
+        "app-surface status carries root_hash: {http_status}"
     );
     assert_eq!(
-        cluster.status(2)["app_hash"].as_str().unwrap_or_default(),
+        cluster.status(2)["root_hash"].as_str().unwrap_or_default(),
         http_hash,
-        "the app surface and the rpc disagree on node 2's app-hash"
+        "the app surface and the rpc disagree on node 2's root-hash"
     );
     assert_eq!(http_status["operations"]["role"], "validator");
     assert_eq!(http_status["operations"]["phase"], "validating");
@@ -444,9 +444,9 @@ fn cluster_lifecycle() {
             .is_some_and(|indexes| indexes.iter().any(|index| index["module"] == "directory")),
         "status carries bounded index watermarks: {http_status}"
     );
-    let boundary = status0["app_hash"]
+    let boundary = status0["root_hash"]
         .as_str()
-        .expect("status carries app_hash");
+        .expect("status carries root_hash");
 
     // 9b. the direct-peer surface: a meshed, finalizing validator holds its
     // co-members open on the tracker, so `/v1/peers` must list them —
@@ -486,7 +486,7 @@ fn cluster_lifecycle() {
     );
 
     // 10. the sync-only joiner rebuilds EVERY module over the statesync
-    // channel from node 0 and must compose the identical app-hash. node 3's
+    // channel from node 0 and must compose the identical root-hash. node 3's
     // slot is reused as a FRESH resident: kill the promoted validator
     // (quorum(4) = 3 keeps the network live — nops move heights, not state,
     // so the step-9 boundary hash stands) and wipe its state.
@@ -496,10 +496,10 @@ fn cluster_lifecycle() {
     assert!(ok, "sync-only joiner failed:\n{log}");
     let synced = log
         .lines()
-        .find_map(|l| l.split("synced app_hash=").nth(1))
-        .expect("joiner printed a synced app-hash")
+        .find_map(|l| l.split("synced root_hash=").nth(1))
+        .expect("joiner printed a synced root-hash")
         .trim();
-    assert_eq!(synced, boundary, "joiner rebuilt a DIFFERENT app-hash");
+    assert_eq!(synced, boundary, "joiner rebuilt a DIFFERENT root-hash");
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn quorum_tolerates_one_fault() {
         cluster.spawn(i);
     }
     for i in 0..4 {
-        cluster.wait_marker(i, "converged app_hash=", CONVERGE);
+        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
     }
 
     // crash-kill one validator; the other three still form a quorum.

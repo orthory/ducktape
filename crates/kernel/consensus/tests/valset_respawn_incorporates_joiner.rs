@@ -21,7 +21,7 @@
 //!   epoch 1: an op submitted ONLY to v4 (the NEW validator) finalizes on all
 //!            FIVE. B could only finalize if v4 led a view AND the four incumbents
 //!            counted its proposal toward quorum -> the join changed the consensus
-//!            set. that is incorporation; app-hash-free, unforgeable.
+//!            set. that is incorporation; root-hash-free, unforgeable.
 //!
 //! schemes are built the PRODUCTION way (`Scheme::signer`, as bin/node does), not
 //! the mocks fixture, so the 4-subset and 5-superset share identical keys. the

@@ -309,7 +309,7 @@ fn run_node(
 
         tracing::info!(
             target: "ducktape::consensus",
-            app_hash = %hex_root(&host.app_hash()),
+            root_hash = %hex_root(&host.root_hash()),
             "noded genesis"
         );
 
@@ -337,7 +337,7 @@ fn run_node(
         // log persists under --storage, and a counter restarting at 0 would
         // re-use indexed heights — every new block silently skipped.
         let mut height = index.resume_height().expect("read index watermarks");
-        stream_hub.prime(height, hex_root(&host.app_hash()));
+        stream_hub.prime(height, hex_root(&host.root_hash()));
         if height > 0 {
             tracing::info!(
                 target: "ducktape::modules",
@@ -469,7 +469,7 @@ fn run_node(
                         .collect();
                     let _ = reply.send(NodeStatus {
                         version: env!("CARGO_PKG_VERSION").into(),
-                        app_hash: hex_root(&host.app_hash()),
+                        root_hash: hex_root(&host.root_hash()),
                         height,
                         modules,
                         // the embedded daemon has no mesh identity — clients
@@ -653,7 +653,7 @@ async fn submit_one(
 
     let block = BlockSummary {
         height: *height,
-        app_hash: hex_root(&out.app_hash),
+        root_hash: hex_root(&out.root_hash),
     };
     // fold this block into the Prometheus series (before `out` is consumed).
     metrics.record_block(*height, latency_us, &out.dispatches);
@@ -672,7 +672,7 @@ async fn submit_one(
     let record = Some(block_row(&BlockRecord {
         height: *height,
         hash: String::new(),
-        commit_hash: hex_root(&out.app_hash),
+        commit_hash: hex_root(&out.root_hash),
         // the embedded daemon lane is 1-op-1-block (one host.submit per block),
         // so the block carries exactly one member op.
         ops: vec![noded::projection::project_root_op(
@@ -690,7 +690,7 @@ async fn submit_one(
 
     // fan the block out live after the derived index had its chance to
     // materialize rows. no subscribers is fine.
-    stream_hub.publish_block(block.height, block.app_hash.clone());
+    stream_hub.publish_block(block.height, block.root_hash.clone());
 
     Ok((block, out.events))
 }

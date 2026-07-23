@@ -4,7 +4,7 @@
 //! root is op-log/MMR-order-DEPENDENT) and an in-memory `directory` module (whose
 //! root is state-based/order-INdependent). the SAME op-set arrives at every node
 //! in a DIFFERENT order. under an AGREED TOTAL ORDER ([`RoundOrderer`]) all nodes
-//! apply the identical sequence and converge on a BYTE-IDENTICAL app-hash —
+//! apply the identical sequence and converge on a BYTE-IDENTICAL root-hash —
 //! INCLUDING the order-dependent qmdb root.
 //!
 //! the negative control swaps ONLY the orderer for [`ArrivalOrderer`] (raw
@@ -13,7 +13,7 @@
 //! swap-only divergence proves the agreed order is load-bearing, not decoration.
 //!
 //! the semantic shift is asserted directly: after every node `submit`s but before
-//! any node drains, every app-hash is still genesis — a locally-originated msg is
+//! any node drains, every root-hash is still genesis — a locally-originated msg is
 //! NOT applied optimistically on the ordered lane.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -123,13 +123,13 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
             nodes.push(OrderedNode::new(host, RoundOrderer::new()));
         }
 
-        // identical genesis module set -> identical genesis app-hash.
-        let genesis = nodes[0].app_hash();
+        // identical genesis module set -> identical genesis root-hash.
+        let genesis = nodes[0].root_hash();
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 genesis,
-                "identical genesis -> identical app-hash"
+                "identical genesis -> identical root-hash"
             );
         }
         let genesis_kv = nodes[0].host().module_root("kv").unwrap();
@@ -153,9 +153,9 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
         // applied optimistically; the originator is NOT ahead.
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 genesis,
-                "no optimistic echo: submit does not advance app-hash"
+                "no optimistic echo: submit does not advance root-hash"
             );
         }
 
@@ -169,20 +169,20 @@ fn n_validators_converge_under_agreed_order_including_qmdb_root() {
             }
         }
 
-        // THE MILESTONE: byte-identical app-hash on every validator, moved off
+        // THE MILESTONE: byte-identical root-hash on every validator, moved off
         // genesis, INCLUDING the order-dependent qmdb root.
-        let converged = nodes[0].app_hash();
+        let converged = nodes[0].root_hash();
         let converged_kv = nodes[0].host().module_root("kv").unwrap();
         assert_ne!(
             converged, genesis,
-            "the applied ops moved the app-hash off genesis"
+            "the applied ops moved the root-hash off genesis"
         );
         assert_ne!(converged_kv, genesis_kv, "the qmdb root moved off genesis");
         for n in &nodes {
             assert_eq!(
-                n.app_hash(),
+                n.root_hash(),
                 converged,
-                "all validators converge on identical app-hash"
+                "all validators converge on identical root-hash"
             );
             assert_eq!(
                 n.host().module_root("kv").unwrap(),
@@ -211,7 +211,7 @@ fn arrival_order_forks_the_qmdb_root_but_not_the_directory_root() {
         );
 
         // sanity: they start converged.
-        assert_eq!(a.app_hash(), b.app_hash(), "identical genesis");
+        assert_eq!(a.root_hash(), b.root_hash(), "identical genesis");
 
         feed_and_drain(&mut a, &ops).await;
         feed_and_drain(&mut b, &reversed).await;
@@ -232,11 +232,11 @@ fn arrival_order_forks_the_qmdb_root_but_not_the_directory_root() {
             "the order-INdependent directory root stays equal under the same arrival swap"
         );
 
-        // and the whole app-hash forks (it folds in the forked qmdb root).
+        // and the whole root-hash forks (it folds in the forked qmdb root).
         assert_ne!(
-            a.app_hash(),
-            b.app_hash(),
-            "the composed app-hash forks with the qmdb root"
+            a.root_hash(),
+            b.root_hash(),
+            "the composed root-hash forks with the qmdb root"
         );
     });
 }
@@ -261,9 +261,9 @@ fn agreed_order_converges_where_arrival_order_forks_same_two_nodes() {
             "the SAME opposite arrival orders CONVERGE the qmdb root once agreed-ordered"
         );
         assert_eq!(
-            a.app_hash(),
-            b.app_hash(),
-            "and the whole app-hash converges"
+            a.root_hash(),
+            b.root_hash(),
+            "and the whole root-hash converges"
         );
     });
 }

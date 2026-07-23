@@ -27,7 +27,7 @@
 //! block time is a LOGICAL clock (`SIM_EPOCH_MS + height * SIM_BLOCK_MS`) —
 //! the one wall-clock read in noded's block path (`consensus_time`) is what
 //! made replays non-reproducible, so the same op script always produces the
-//! same app-hash here. reads (query/status) always serve committed state:
+//! same root-hash here. reads (query/status) always serve committed state:
 //! held ops are invisible until stepped, which is consensus semantics.
 //!
 //! the sim actor IS an [`OrderedNode`]`<`[`StepOrderer`]`, `[`NullSink`]`>` —
@@ -51,7 +51,7 @@
 //! EITHER the single-op `{target, payload, origin?}` shape OR a multi-op
 //! `{ops: [{target, payload, origin?}, …]}` shape: the ops array commits ONE
 //! block with N members through the host's `submit_block` batch engine (per-op
-//! isolation, one shared app-hash), and the reply carries a per-member
+//! isolation, one shared root-hash), and the reply carries a per-member
 //! applied/rejected verdict so a test can pin the host's abort-all-and-replay
 //! member isolation.
 //!
@@ -197,7 +197,7 @@ struct SimSnapshot {
 #[derive(Clone, Serialize)]
 struct CommittedInfo {
     height: u64,
-    app_hash: String,
+    root_hash: String,
     op_hash: String,
     target: String,
     /// `held` (a client submit released by this step), `oracle` (a worker
@@ -266,7 +266,7 @@ struct MemberInfo {
 #[derive(Serialize)]
 struct BatchInfo {
     height: u64,
-    app_hash: String,
+    root_hash: String,
     /// one entry per input op, in input order.
     members: Vec<MemberInfo>,
 }
@@ -851,7 +851,7 @@ fn run_sim(
         // reads this line off stdout; readiness is `/v1/status`.
         tracing::info!(
             target: "ducktape::consensus",
-            app_hash = %hex_root(&host.app_hash()),
+            root_hash = %hex_root(&host.root_hash()),
             "genesis"
         );
 
@@ -859,7 +859,7 @@ fn run_sim(
         // fresh dir this is 0; on a (discouraged) reused dir it keeps op-log
         // heights monotonic instead of silently skipping every new block.
         let resume_height = index.resume_height().expect("read index watermarks");
-        stream_hub.prime(resume_height, hex_root(&host.app_hash()));
+        stream_hub.prime(resume_height, hex_root(&host.root_hash()));
 
         // wrap the host on the ordered lane, over the scripted FIFO orderer.
         // `view_base = resume_height + 1` bases the first drained block (engine
@@ -1136,7 +1136,7 @@ impl Sim {
 
     /// commit N ops as ONE block, returning per-member verdicts. the batch twin
     /// of [`Self::commit_peer`]: `submit_decoded` each, flush into ONE batch (one
-    /// block, one app-hash, per-op isolation), and read each member's
+    /// block, one root-hash, per-op isolation), and read each member's
     /// applied/rejected disposition from the drain — the shared `project_block`
     /// already wrote the block's one row (all members, each with its disposition)
     /// and the per-module index feed. an empty `ops` produces no ordered frame
@@ -1145,7 +1145,7 @@ impl Sim {
         let (drained, events) = self.commit_block(ops).await?;
         self.settle(&drained, events).await;
         // the batch is ONE block: every member frame shares its height and the
-        // one post-batch app-hash the drain sealed.
+        // one post-batch root-hash the drain sealed.
         let members = drained
             .iter()
             .filter_map(|d| {
@@ -1160,7 +1160,7 @@ impl Sim {
             .collect();
         Ok(BatchInfo {
             height: self.height(),
-            app_hash: hex_root(&self.node.app_hash()),
+            root_hash: hex_root(&self.node.root_hash()),
             members,
         })
     }
@@ -1220,9 +1220,9 @@ impl Sim {
                 projection.record,
                 &projection.dispatches,
             );
-            if let Some(app_hash) = projection.sealed_hash {
+            if let Some(root_hash) = projection.sealed_hash {
                 self.stream_hub
-                    .publish_block(projection.height, hex_root(&app_hash));
+                    .publish_block(projection.height, hex_root(&root_hash));
             }
         }
         Ok((drained, self.node.take_events()))
@@ -1319,7 +1319,7 @@ impl Sim {
         };
         let block = BlockSummary {
             height: frame.height,
-            app_hash: hex_root(&frame.app_hash),
+            root_hash: hex_root(&frame.root_hash),
         };
         match frame.disposition {
             node::Disposition::Applied => Ok(block),
@@ -1338,7 +1338,7 @@ impl Sim {
         let op = frame.op.as_ref()?;
         Some(CommittedInfo {
             height: frame.height,
-            app_hash: hex_root(&frame.app_hash),
+            root_hash: hex_root(&frame.root_hash),
             op_hash: hex_bytes(&self.blobs.put_chunk(op.payload.clone())),
             target: op.target.clone(),
             kind,
@@ -1361,7 +1361,7 @@ impl Sim {
             .collect();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
-            app_hash: hex_root(&host.app_hash()),
+            root_hash: hex_root(&host.root_hash()),
             height: self.height(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty

@@ -18,7 +18,7 @@ modreg's hash pin, the gateway's route, content-addressed bytes. The file only c
 install it can be thrown away and reconstructed from the network.
 
 **Standing principle (finding 6 of the companion spec):** the two wasm halves in one package ride
-different rails. Module code moves app-hash, so it rides the R=n governance rail (vote → readiness
+different rails. Module code moves root-hash, so it rides the R=n governance rail (vote → readiness
 → activation height). The view does not, so it rides the SetRoute-flip rail (no vote, minutes). One
 package, two lifecycles.
 
@@ -49,7 +49,7 @@ The registration machinery is **fully built as of PR #630 (2026-07-16)**:
   and the governance door, above every shipping `MAX_PROTOCOL_VERSION` — and a compile-time assert
   in `bin/node/src/constants.rs` blocks raising past it until the restore half (below) exists.
 - Proven end to end in `crates/kernel/host/tests/module_register.rs`: boundary instantiation,
-  app-hash determinism across nodes, fail-closed on missing/tampered bytes and missing factory,
+  root-hash determinism across nodes, fail-closed on missing/tampered bytes and missing factory,
   unready-never-arms.
 - Byte distribution **already existed**: the code plane / blobstore, mesh fetch by hash
   (`bin/node/src/blob_fetch.rs` `FetchingCodeSource`), operator staging via
@@ -183,8 +183,8 @@ author ──quack build──▶ .quack ──share (chat/files/web)──▶ a
 - **register** (governance; new module ids only) — **landed in PR #630**: `RegisterModule` proposal
   → vote → modreg `ScheduleRegister` (admission entry, empty active hash) → validators auto-verify
   bytes and `SignalReady` (R=n latch) → at the activation height the host instantiates through
-  `ModuleFactory` and registers. Registering a module changes app-hash by construction (the
-  registry set is what `app_hash()` composes over), which is exactly why it rides the R=n rail.
+  `ModuleFactory` and registers. Registering a module changes root-hash by construction (the
+  registry set is what `root_hash()` composes over), which is exactly why it rides the R=n rail.
   Version-gated at `ADMISSION_ACTIVATION_VERSION = 4`; live ids (native or otherwise) are refused
   via a `ctx.module_root` door; a duplicate-id refusal fails the governance Execute atomically.
 - **install** (member, local) — verify layers 1–4, mint the per-module session key
@@ -203,7 +203,7 @@ author ──quack build──▶ .quack ──share (chat/files/web)──▶ a
   backward compatibility is the module's own responsibility).
 - **revoke / uninstall** — member uninstall = `RemoveMemberKey` (session key) + local view drop.
   Network kill of a malicious package = swap to inert code (module *deletion* does not exist —
-  its state is in app-hash; the tombstone swap is deactivation, using existing machinery).
+  its state is in root-hash; the tombstone swap is deactivation, using existing machinery).
   Publisher key compromise = identity `RemoveMemberKey`; subsequent installs fail layer 2, and
   view flips fail the `view_publisher` check.
 
@@ -346,7 +346,7 @@ the framework repo as those ABIs freeze.
 
 - **ViewHost hot-swap:** the four-case matrix above, against a fake runtime (lands first).
 - **Registration:** landed and green — `crates/kernel/host/tests/module_register.rs` proves
-  boundary activation, app-hash continuity across nodes, fail-closed on missing bytes/factory, and
+  boundary activation, root-hash continuity across nodes, fail-closed on missing bytes/factory, and
   unready-never-arms; governance-side admission/cancel/atomic-refusal in
   `governance_schedules_module_update.rs`.
 - **Envelope:** a package whose artifact bytes are swapped after signing fails layer 1; a package

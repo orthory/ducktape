@@ -7,7 +7,7 @@
 //!     modreg's admission-pending record (empty active hash), queries fail;
 //!   * `realize_module_swaps(H, src)` fetches the committed initial hash's
 //!     bytes, verifies sha256, INSTANTIATES the module through the wired
-//!     [`ModuleFactory`], and registers it — the app-hash grows by exactly the
+//!     [`ModuleFactory`], and registers it — the root-hash grows by exactly the
 //!     new module's (empty) root, identically on every node;
 //!   * block `H`'s drain-injected `Advance` flips the committed active hash;
 //!   * the module executes from `H` over fresh state;
@@ -133,7 +133,7 @@ fn realize(host: &mut Host, height: u64, src: &dyn CodeSource) -> Result<(), Err
     block_on(host.realize_module_swaps(height, src))
 }
 
-/// drive the WHOLE admission and return the final app-hash — shared by the
+/// drive the WHOLE admission and return the final root-hash — shared by the
 /// headline proof and the cross-node determinism check.
 fn run_admission_scenario() -> (Host, StateRoot) {
     let mut host = bare_host(true);
@@ -157,20 +157,20 @@ fn run_admission_scenario() -> (Host, StateRoot) {
     realize(&mut host, H - 1, &src).expect("below H is Ok");
     assert!(host.module_root("kanban").is_none(), "not registered below H");
 
-    // THE BOUNDARY: realization instantiates + registers, growing the app-hash
+    // THE BOUNDARY: realization instantiates + registers, growing the root-hash
     // by the new module's (empty) root — deterministically.
-    let app_hash_before = host.app_hash();
+    let root_hash_before = host.root_hash();
     realize(&mut host, H, &src).expect("admission realizes at H");
     assert!(host.module_root("kanban").is_some(), "registered at H");
     assert_ne!(
-        host.app_hash(),
-        app_hash_before,
-        "unlike a swap, an admission changes the registry set and thus the app-hash"
+        host.root_hash(),
+        root_hash_before,
+        "unlike a swap, an admission changes the registry set and thus the root-hash"
     );
     // idempotent: a second realization at the same height is a no-op.
-    let after_first = host.app_hash();
+    let after_first = host.root_hash();
     realize(&mut host, H, &src).expect("re-realize is Ok");
-    assert_eq!(host.app_hash(), after_first, "re-realization moves nothing");
+    assert_eq!(host.root_hash(), after_first, "re-realization moves nothing");
 
     // block H: the module executes over fresh state; the drain's injected
     // Advance flips the committed active hash in the same block.
@@ -185,7 +185,7 @@ fn run_admission_scenario() -> (Host, StateRoot) {
     submit(&mut host, H + 1, Origin::External(vec![9; 32]), inc_msg());
     assert_eq!(count(&host), 2);
 
-    let final_hash = host.app_hash();
+    let final_hash = host.root_hash();
     (host, final_hash)
 }
 
@@ -197,12 +197,12 @@ fn admission_at_boundary_instantiates_and_runs_the_new_module() {
 }
 
 /// two independent nodes running the identical finalized sequence land on the
-/// identical app-hash — admission introduces no per-node divergence.
+/// identical root-hash — admission introduces no per-node divergence.
 #[test]
 fn admission_is_deterministic_across_nodes() {
     let (_, a) = run_admission_scenario();
     let (_, b) = run_admission_scenario();
-    assert_eq!(a, b, "identical histories, identical app-hashes");
+    assert_eq!(a, b, "identical histories, identical root-hashes");
 }
 
 /// a node that does not hold the bytes at the boundary FAILS CLOSED.

@@ -48,7 +48,7 @@ pub enum ServerFrame {
     Event { topic: String, cursor: String, op: StreamOpRow },
     Tail { topic: String, cursor: String, item: TailItem },
     Lagged { topic: String, cursor: String },
-    Heartbeat { height: u64, app_hash: String, time_ms: u64, interval_ms: u64 },
+    Heartbeat { height: u64, root_hash: String, time_ms: u64, interval_ms: u64 },
     Error { topic: String, code: StreamErrorCode, detail: String },
 }
 
@@ -91,12 +91,12 @@ legal; frames flow when the ring appears — no unavailable race).
 
 `StreamHub` (cheap Clone) replaces `NodeHandle.events`:
 - `blocks: tokio::sync::broadcast::Sender<BlockNote>` where
-  `struct BlockNote { height: u64, app_hash: String }` (internal, not wire).
+  `struct BlockNote { height: u64, root_hash: String }` (internal, not wire).
   Buffer = existing `EVENT_BUFFER`.
 - cached tip `Arc<std::sync::RwLock<Option<(u64, String)>>>`.
 - `logs: LogRing`, `run_output: RunOutputRegistry` (both Arc-backed clones).
-- `publish_block(height, app_hash)` — set tip, then send note (send may fail
-  with no subscribers; fine). `prime(height, app_hash)` — set tip only.
+- `publish_block(height, root_hash)` — set tip, then send note (send may fail
+  with no subscribers; fine). `prime(height, root_hash)` — set tip only.
 
 `LogRing`: `Arc<Mutex<VecDeque<(u64 seq, String line)>>>` capped at
 `LOG_RING_CAPACITY` + `tokio::sync::watch::<u64>` latest-seq for wakeups.
@@ -150,9 +150,9 @@ Unsubscribe: drop topics; no ack. Malformed client text frame → one
 `Error{topic:"", badFrame}`, never close. Binary client frames ignored.
 Outbound send failure → session ends (client hung up).
 
-Heartbeat: every tick, `Heartbeat{height, app_hash, time_ms:
+Heartbeat: every tick, `Heartbeat{height, root_hash, time_ms:
 unix-millis, interval_ms: HEARTBEAT_INTERVAL_MS}` from the cached tip;
-unprimed tip → `height: 0, app_hash: ""` (clients ignore tip at height 0 but
+unprimed tip → `height: 0, root_hash: ""` (clients ignore tip at height 0 but
 still treat the frame as liveness).
 
 ### A2. `bin/noded/src/lib.rs` rewiring
@@ -180,7 +180,7 @@ still treat the frame as liveness).
 - `bin/node/src/main.rs`: replace the three `http_events.send(...)` sites
   (:7481, :7869, :9867) with `hub.publish_block(height, hex(...))`; rename the
   binding from `http_events` to `stream_hub`. Prime near the index wiring
-  (~:6002) from `index.resume_height()` with an empty app hash.
+  (~:6002) from `index.resume_height()` with an empty root hash.
 - `bin/node` tracing: convert the init at :2971 to
   `tracing_subscriber::registry()` with (a) the existing stderr fmt layer
   (same env filter + ansi behavior as today) and (b) a ring fmt layer

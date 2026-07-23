@@ -1,11 +1,11 @@
 //! node-side tx batch aggregation: many op-frames enqueued via `submit`, packed
 //! by ONE `flush_batch` into a batch super-frame, and applied by
 //! `drain_delivered` as ONE block — ONE height, ONE `pre_apply`, ONE seal, ONE
-//! shared app-hash — with N per-member [`DrainedFrame`]s (one per op). the two
+//! shared root-hash — with N per-member [`DrainedFrame`]s (one per op). the two
 //! properties pinned here:
 //!
 //!  1. three distinct APPLYING frames in one batch => three DrainedFrames all at
-//!     the SAME height, all with the SAME app-hash, DISTINCT FrameIds, exactly
+//!     the SAME height, all with the SAME root-hash, DISTINCT FrameIds, exactly
 //!     ONE BlockSeal recorded for that height, and the finalized boundary
 //!     advanced by exactly one block;
 //!  2. a mixed batch (a member rejects) => per-member Applied/Applied/Rejected at
@@ -104,12 +104,12 @@ fn three_applying_frames_form_one_block_at_one_height() {
         let drained = node.take_drained();
         assert_eq!(drained.len(), 3, "one DrainedFrame per member");
 
-        // all three at the SAME height, the SAME app-hash, DISTINCT FrameIds.
+        // all three at the SAME height, the SAME root-hash, DISTINCT FrameIds.
         let h = drained[0].height;
         assert_eq!(h, 0, "the batch is the first block, at height 0");
         for d in &drained {
             assert_eq!(d.height, h, "every member shares the block height");
-            assert_eq!(d.app_hash, node.app_hash(), "every member shares the batch app-hash");
+            assert_eq!(d.root_hash, node.root_hash(), "every member shares the batch root-hash");
             assert_eq!(d.disposition, Disposition::Applied);
         }
         let mut ids: Vec<_> = drained.iter().map(|d| d.id).collect();
@@ -128,7 +128,7 @@ fn three_applying_frames_form_one_block_at_one_height() {
         // the finalized boundary advanced by exactly one block.
         let boundary = node.finalized().expect("boundary set");
         assert_eq!(boundary.height, 0, "finalized advanced by exactly one block");
-        assert_eq!(boundary.app_hash, node.app_hash());
+        assert_eq!(boundary.root_hash, node.root_hash());
     });
 }
 
@@ -150,11 +150,11 @@ fn a_mixed_batch_rejects_one_member_at_the_shared_height() {
         let drained = node.take_drained();
         assert_eq!(drained.len(), 3);
 
-        // one shared height + one shared app-hash across all three members.
+        // one shared height + one shared root-hash across all three members.
         let h = drained[0].height;
         for d in &drained {
             assert_eq!(d.height, h, "all members share the block height");
-            assert_eq!(d.app_hash, node.app_hash(), "all members share the batch app-hash");
+            assert_eq!(d.root_hash, node.root_hash(), "all members share the batch root-hash");
         }
 
         let disp = |id| drained.iter().find(|d| d.id == id).expect("drained").disposition;

@@ -6,7 +6,7 @@ version.workspace = true
 # the ducktape node daemon: owns ONE embedded `host::Host` on a dedicated
 # actor thread (the host is deliberately non-Send) and exposes it to clients
 # over http + websocket — POST /v1/submit (one msg = one block), POST /v1/query
-# (read committed state), GET /v1/status (version + app-hash + module roots),
+# (read committed state), GET /v1/status (version + root-hash + module roots),
 # POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a block-finalized event
 # stream). every ducktape app build is a client of this process: the web build
 # dials it directly; the native Iced build spawns or adopts its managed

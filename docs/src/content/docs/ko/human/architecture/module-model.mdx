@@ -38,7 +38,7 @@ lifecycle code registry가 agreed height에 스케줄한다.
 운영 lifecycle은 다음 순서다.
 
 1. **Register.** genesis가 module instance를 안정적인 `ModuleId` 아래에 wiring한다.
-   초기 `root()`는 첫 global app-hash에 포함된다.
+   초기 `root()`는 첫 global root-hash에 포함된다.
 2. **Read committed state.** block 사이에서 `query`, `query_with`, `serve_sync`,
    `state_sync_handle`은 committed state만 설명하거나 읽는다. staged write를
    관측하면 안 된다.
@@ -71,7 +71,7 @@ block 적용을 멈춰야 한다.
 - Snapshot-style module은 canonical byte를 commit할 수 있다.
 
 호스트는 내부 schema를 해석하지 않는다. root를 요청하고 그 root를 global
-app-hash에 fold한다.
+root-hash에 fold한다.
 
 ## Cross-Module Interaction
 

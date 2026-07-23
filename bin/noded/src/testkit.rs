@@ -171,7 +171,7 @@ pub fn run_actor(
                         .collect();
                     let _ = reply.send(NodeStatus {
                         version: env!("CARGO_PKG_VERSION").into(),
-                        app_hash: hex_root(&host.app_hash()),
+                        root_hash: hex_root(&host.root_hash()),
                         height,
                         modules,
                         public_key: String::new(),
@@ -211,7 +211,7 @@ async fn commit(
             *height = next;
             Ok(BlockSummary {
                 height: *height,
-                app_hash: hex_root(&out.app_hash),
+                root_hash: hex_root(&out.root_hash),
             })
         }
         Err(err) => Err(err.to_string()),

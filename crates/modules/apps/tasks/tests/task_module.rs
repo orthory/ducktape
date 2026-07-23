@@ -169,7 +169,7 @@ fn failed_write_rolls_back_task_state() {
             .expect("genesis");
 
         let root0 = host.module_root(TASKS).expect("tasks root");
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let err = host
             .submit(Msg {
@@ -193,9 +193,9 @@ fn failed_write_rolls_back_task_state() {
             "failed block must leave task root unchanged"
         );
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             app0,
-            "failed block must leave app-hash unchanged"
+            "failed block must leave root-hash unchanged"
         );
         assert!(
             host_tasks(&host).await.is_empty(),
@@ -205,10 +205,10 @@ fn failed_write_rolls_back_task_state() {
 }
 
 #[test]
-fn app_hash_changes_when_task_state_changes() {
+fn root_hash_changes_when_task_state_changes() {
     block_on(async {
         let mut host = Host::genesis(vec![Box::new(Tasks::new(TASKS))]).expect("genesis");
-        let app0 = host.app_hash();
+        let app0 = host.root_hash();
 
         let created = host
             .submit_at(
@@ -222,10 +222,10 @@ fn app_hash_changes_when_task_state_changes() {
             .await
             .expect("create task");
         assert_ne!(
-            created.app_hash, app0,
-            "create must move the global app-hash"
+            created.root_hash, app0,
+            "create must move the global root-hash"
         );
-        assert_eq!(created.app_hash, host.app_hash());
+        assert_eq!(created.root_hash, host.root_hash());
 
         let updated = host
             .submit_at(
@@ -239,8 +239,8 @@ fn app_hash_changes_when_task_state_changes() {
             .await
             .expect("update task status");
         assert_ne!(
-            updated.app_hash, created.app_hash,
-            "status changes must move the global app-hash"
+            updated.root_hash, created.root_hash,
+            "status changes must move the global root-hash"
         );
 
         let tasks = host_tasks(&host).await;

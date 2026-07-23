@@ -5,7 +5,7 @@
 //! to [`Kv::new`], so this crate never names a storage crate. the module's
 //! authenticated [`StateRoot`] IS the store's merkle root — a real
 //! cryptographic commitment to the whole store, refreshed on every commit — so
-//! it flows directly into the global app-hash via `host::global_root`.
+//! it flows directly into the global root-hash via `host::global_root`.
 //!
 //! ## keys are hashed to a fixed width
 //!
@@ -198,7 +198,7 @@ mod tests {
     use statesync::qmdb::QmdbStore;
 
     // a fixed-root stand-in module, so we can prove the kv root composes into the
-    // global app-hash alongside another module.
+    // global root-hash alongside another module.
     struct StubModule;
     #[async_trait::async_trait(?Send)]
     impl Module for StubModule {
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn real_qmdb_root_flows_into_app_hash() {
+    fn real_qmdb_root_flows_into_root_hash() {
         deterministic::Runner::default().start(|context| async move {
             let mut kv = kv_on!(context, "kv");
             let stub = StubModule;
@@ -255,11 +255,11 @@ mod tests {
             assert_eq!(kv.get(b"k1").await.as_deref(), Some(b"v1".as_ref()));
             assert_eq!(kv.get(b"k2").await.as_deref(), Some(b"v2".as_ref()));
 
-            // the kv merkle root genuinely flows into the composed app-hash: only
+            // the kv merkle root genuinely flows into the composed root-hash: only
             // kv changed between r1 and r2, yet the global root differs.
             assert_ne!(
                 app1, app2,
-                "mutating only the kv module must change the global app-hash"
+                "mutating only the kv module must change the global root-hash"
             );
         });
     }

@@ -153,7 +153,7 @@ pub(crate) async fn run(
         target: "ducktape::statesync",
         node = %label,
         height = manifest.height,
-        app_hash = %hex(&manifest.app_hash),
+        root_hash = %hex(&manifest.root_hash),
         "manifest ready"
     );
 
@@ -208,7 +208,7 @@ pub(crate) async fn run(
             );
             tracing::info!(
                 target: "ducktape::statesync",
-                "node={label} synced app_hash={}", hex(&host.app_hash())
+                "node={label} synced root_hash={}", hex(&host.root_hash())
             );
         }
         Err(e) => {

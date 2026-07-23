@@ -12,7 +12,7 @@ non-deterministic worker seam으로 나눈다.
 
 ## Saga
 
-saga module은 app-hash 아래 continuation state를 저장한다. trigger는 pending
+saga module은 root-hash 아래 continuation state를 저장한다. trigger는 pending
 work를 기록하고 worker request를 effect로 emit한다. pending state는 결정적이며
 다른 module state처럼 commit된다.
 

@@ -6,7 +6,7 @@ Date: 2026-07-10
 
 ## Summary
 
-Today `/v1/ws` pushes a payload-free `{type:"block", height, appHash}` frame,
+Today `/v1/ws` pushes a payload-free `{type:"block", height, rootHash}` frame,
 so the app store refires ~18 parallel queries on **every** block tick and runs
 a separate 3s `/v1/status` liveness poll. This spec replaces `/v1/ws` with a
 **typed multiplexed topic-subscription WebSocket**: one socket carries
@@ -55,7 +55,7 @@ Server → client (tag `"type"`, camelCase):
 - `lagged { topic, cursor }` — the catch-up budget was exceeded or the resume
   cursor fell below the retained floor; the stream has jumped to `cursor`; the
   client adopts it and snapshot-refetches the gap over HTTP.
-- `heartbeat { height, appHash, timeMs, intervalMs }` — periodic (3s), always
+- `heartbeat { height, rootHash, timeMs, intervalMs }` — periodic (3s), always
   on, no subscription needed; `intervalMs` lets the client watchdog self-tune.
 - `error { topic, code: unknownTopic|unavailable|badCursor, detail }` —
   per-topic refusal; the socket stays open. Malformed client frames get one
@@ -67,7 +67,7 @@ Topics: `module:<id>` (validated against the index store's module catalog),
 ## Node architecture
 
 **StreamHub** replaces the raw `broadcast::Sender<WsFrame>` on `NodeHandle`:
-an internal `BlockNote { height, app_hash }` broadcast, a cached tip for
+an internal `BlockNote { height, root_hash }` broadcast, a cached tip for
 heartbeats (`hub.prime(...)` at boot), the log ring, and the run-output
 registry. The `NodeCommand` actor seam is untouched — the hub is read-side
 only.

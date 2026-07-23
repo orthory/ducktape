@@ -14,7 +14,7 @@
 //!    parent, and releases the continuation in the same block — surfaced on
 //!    [`node::DrainedOp::continuation`];
 //! 7. determinism: two nodes fed the identical envelope-carrying batch drain
-//!    identical app-hashes, dispositions, and continuation traces.
+//!    identical root-hashes, dispositions, and continuation traces.
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
@@ -214,7 +214,7 @@ fn drain_applies_the_envelope_and_releases_the_continuation() {
 }
 
 // (7) determinism: two nodes fed the IDENTICAL envelope-carrying batch drain
-// the identical app-hash, dispositions, and continuation traces.
+// the identical root-hash, dispositions, and continuation traces.
 #[test]
 fn identical_envelope_batches_drain_identically_on_two_nodes() {
     block_on(async {
@@ -230,13 +230,13 @@ fn identical_envelope_batches_drain_identically_on_two_nodes() {
             while n.drain_delivered().await.expect("drain") != 0 {}
         }
 
-        assert_eq!(n1.app_hash(), n2.app_hash(), "identical app-hashes");
+        assert_eq!(n1.root_hash(), n2.root_hash(), "identical root-hashes");
         let (d1, d2) = (n1.take_drained(), n2.take_drained());
         assert_eq!(d1.len(), d2.len());
         for (a, b) in d1.iter().zip(&d2) {
             assert_eq!(a.id, b.id);
             assert_eq!(a.disposition, b.disposition);
-            assert_eq!(a.app_hash, b.app_hash);
+            assert_eq!(a.root_hash, b.root_hash);
             let (oa, ob) = (a.op.as_ref().expect("op"), b.op.as_ref().expect("op"));
             assert_eq!(oa.dispatches, ob.dispatches, "identical member traces");
             match (&oa.continuation, &ob.continuation) {

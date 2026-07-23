@@ -32,7 +32,7 @@ Threshold cryptography wants the opposite. A `(t,n)` distributed key is generate
 
 - **Fused (validator = key holder).** Ferveo/Penumbra run DKG per-epoch over the validator set, weighted by stake; drand's nodes *are* the threshold-BLS holders and reshare on membership change; Lit's network nodes hold PKP shares in TEEs. Clean conceptually, and "MPC over consensus" in the literal sense. **But it re-opens the exact conflict the codebase already rejected** — you'd owe a resharing protocol wired into the respawn path, and every routine validator churn becomes a cryptographic ceremony.
 
-- **Decoupled (key committee ≠ validator set) — RECOMMENDED.** The custody committee is its own membership set, *seated and rotated by governance* but not by the consensus engine. Its shares are **module state** (part of the app-hash / snapshot), not consensus-engine state, so a respawn doesn't touch them. Resharing runs only when governance explicitly changes committee membership — far rarer than epoch cutover, and completely off the respawn hot path. The consensus log still orders every ceremony message, so you keep total-order coordination without coupling key lifetime to engine lifetime.
+- **Decoupled (key committee ≠ validator set) — RECOMMENDED.** The custody committee is its own membership set, *seated and rotated by governance* but not by the consensus engine. Its shares are **module state** (part of the root-hash / snapshot), not consensus-engine state, so a respawn doesn't touch them. Resharing runs only when governance explicitly changes committee membership — far rarer than epoch cutover, and completely off the respawn hot path. The consensus log still orders every ceremony message, so you keep total-order coordination without coupling key lifetime to engine lifetime.
 
 The decoupled model is the only one that respects the teardown-respawn contract instead of fighting it.
 
@@ -86,7 +86,7 @@ The decoupled model is the only one that respects the teardown-respawn contract 
   │   • every ceremony msg (DKG round, sign/decrypt request, reshare)  │
   │     is an ORDERED OP → the log is the non-equivocating coordinator │
   │     (ROAST-robustness for free; retries are just more ops)         │
-  │   • commitments/transcripts + verification live in app-hash        │
+  │   • commitments/transcripts + verification live in root-hash        │
   └───────────────────────────────┬──────────────────────────────────┘
                                    │  ordered ceremony frames
                     KEY PLANE  (new — the only genuinely novel code)

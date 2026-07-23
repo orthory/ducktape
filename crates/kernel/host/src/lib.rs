@@ -5,13 +5,13 @@
 //! `execute`, then drains the intents that execute emitted. emitted [`Msg`]s are
 //! re-dispatched as LOCAL-ONLY follow-up ops (never re-broadcast); emitted
 //! [`Event`]s/[`Effect`]s are collected and handed back for the effectful node
-//! layer (out of scope this slice). after the drain, the app-hash is recomposed
+//! layer (out of scope this slice). after the drain, the root-hash is recomposed
 //! over the registry via [`global_root`].
 //!
 //! ## determinism
 //!
 //! `submit` is a pure function of `(registry state, msg, env)`:
-//! - the registry is a [`BTreeMap`], so snapshot + app-hash iteration is sorted
+//! - the registry is a [`BTreeMap`], so snapshot + root-hash iteration is sorted
 //!   and order-stable across nodes;
 //! - the follow-up queue is FIFO and dispatched purely locally;
 //! - the drain is hard-capped at [`MAX_DISPATCHES`], so it always terminates
@@ -39,7 +39,7 @@ use sha2::{Digest, Sha256};
 pub mod topology;
 pub mod worker;
 
-/// compute the global app-hash over `modules` — the composition consensus
+/// compute the global root-hash over `modules` — the composition consensus
 /// commits to: a deterministic hash over every module's `(id, root)`. because
 /// a module's own [`StateRoot`] already commits to its children (a qmdb merkle
 /// root commits to its keys; a git HEAD oid commits to the whole repo tree),
@@ -49,7 +49,7 @@ pub mod worker;
 /// global root or the chain forks — so modules are sorted by id, and each id is
 /// length-prefixed before hashing (otherwise ("ab", r) and ("a", "b"||r) would
 /// collide). deliberately a plain sorted hash, NOT a qmdb-of-heads: qmdb's root
-/// is an order-dependent HISTORY commitment, while an app-hash must be
+/// is an order-dependent HISTORY commitment, while a root-hash must be
 /// `f(current state)` — order-independent + idempotent — so a state-synced node
 /// computes the same root. upgrade to a small merkle tree only when a light
 /// client needs log-n membership proofs.
@@ -72,7 +72,7 @@ pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
 ///
 /// Entries are sorted by module id before hashing, so registry construction
 /// order is irrelevant. Length-prefixing keeps ids unambiguous; the domain tag
-/// prevents this digest from being confused with an app hash.
+/// prevents this digest from being confused with a root hash.
 pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, u32)>) -> [u8; 32] {
     let mut modules: Vec<(&str, u32)> = modules.into_iter().collect();
     modules.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -209,8 +209,8 @@ pub struct DispatchRecord {
 /// the result of applying one block (`submit`).
 #[derive(Debug)]
 pub struct BlockOutcome {
-    /// the app-hash over the registry after the drain settled.
-    pub app_hash: StateRoot,
+    /// the root-hash over the registry after the drain settled.
+    pub root_hash: StateRoot,
     /// events emitted during the block, in dispatch order — observability, and
     /// the lane the host-owned worker seam claims off-consensus work from.
     pub events: Vec<Event>,
@@ -227,11 +227,11 @@ pub struct BlockOutcome {
 /// members); an op that rejects DETERMINISTICALLY is isolated — its stage rolled
 /// back and the accepted ops replayed — so the committed state is exactly the
 /// accepted subset applied in input order. every applied member shares the ONE
-/// post-batch [`app_hash`](BatchOutcome::app_hash).
+/// post-batch [`root_hash`](BatchOutcome::root_hash).
 #[derive(Debug)]
 pub struct BatchOutcome {
-    /// the one post-batch app-hash, shared by every applied member.
-    pub app_hash: StateRoot,
+    /// the one post-batch root-hash, shared by every applied member.
+    pub root_hash: StateRoot,
     /// one outcome per input op, in input order.
     pub members: Vec<MemberOutcome>,
     /// derived continuation members, `(parent input index, outcome)` in
@@ -375,8 +375,8 @@ fn cap_relay_reason(reason: &Error) -> String {
 pub struct FinalizedBlock {
     /// finalized block height.
     pub height: u64,
-    /// app-hash consensus committed at `height`.
-    pub app_hash: StateRoot,
+    /// root-hash consensus committed at `height`.
+    pub root_hash: StateRoot,
 }
 
 /// one module's committed root plus the sync surface it can currently serve.
@@ -387,11 +387,11 @@ pub struct ModuleSnapshot {
     pub state_sync: StateSyncHandle,
 }
 
-/// a consistent registry view captured at a finalized app-hash boundary.
+/// a consistent registry view captured at a finalized root-hash boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizedSnapshot {
     pub height: u64,
-    pub app_hash: StateRoot,
+    pub root_hash: StateRoot,
     pub modules: Vec<ModuleSnapshot>,
 }
 
@@ -433,7 +433,7 @@ pub enum BoundaryPhase {
 /// error inside `commit_block`, a module that could not discard its stage) hit
 /// only THIS node — its registry state is now indeterminate relative to its
 /// peers. the only sound response is fail-stop: surface the fault and stop
-/// applying blocks; continuing would silently fork this node's app-hash.
+/// applying blocks; continuing would silently fork this node's root-hash.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FatalError {
     /// the module whose boundary hook failed.
@@ -512,7 +512,7 @@ impl From<Error> for SubmitError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SnapshotError {
     /// the caller asked for a boundary that no longer matches the host state.
-    AppHashMismatch {
+    RootHashMismatch {
         expected: StateRoot,
         actual: StateRoot,
     },
@@ -523,9 +523,9 @@ pub enum SnapshotError {
 impl core::fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::AppHashMismatch { expected, actual } => write!(
+            Self::RootHashMismatch { expected, actual } => write!(
                 f,
-                "finalized app-hash mismatch: expected {expected:?}, actual {actual:?}",
+                "finalized root-hash mismatch: expected {expected:?}, actual {actual:?}",
             ),
             Self::Module { id, source } => {
                 write!(
@@ -542,7 +542,7 @@ impl std::error::Error for SnapshotError {}
 /// the deterministic state machine: a module registry + dispatch + drain.
 #[derive(Default)]
 pub struct Host {
-    /// deterministic iteration order is load-bearing for snapshot + app-hash.
+    /// deterministic iteration order is load-bearing for snapshot + root-hash.
     registry: BTreeMap<ModuleId, Box<dyn Module>>,
     /// instantiates post-genesis ADMISSIONS at the activation boundary.
     /// `None` fails closed the moment an admission arms — never before.
@@ -741,8 +741,8 @@ impl Host {
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;
     /// the consensus half is the in-block [`Host::pending_lifecycle_advance`] tick
-    /// that flips the committed active hash into the app-hash. code is invisible
-    /// to `root()`, so a swap keeps the module's state and the app-hash is
+    /// that flips the committed active hash into the root-hash. code is invisible
+    /// to `root()`, so a swap keeps the module's state and the root-hash is
     /// byte-continuous across it.
     ///
     /// keyed PURELY on committed registry state + `height`, so it reconstructs
@@ -820,8 +820,8 @@ impl Host {
             match current {
                 Some(_) => self.swap_module_code(&m.module_id, &bytes)?,
                 None => {
-                    // the admission path: registration changes app-hash by
-                    // construction (the registry set is what `app_hash`
+                    // the admission path: registration changes root-hash by
+                    // construction (the registry set is what `root_hash`
                     // composes over), which is exactly why it rides the same
                     // readiness/height gate as a swap and realizes at one
                     // deterministic boundary on every validator.
@@ -846,8 +846,8 @@ impl Host {
         Ok(())
     }
 
-    /// the current app-hash: [`global_root`] over the registered modules.
-    pub fn app_hash(&self) -> StateRoot {
+    /// the current root-hash: [`global_root`] over the registered modules.
+    pub fn root_hash(&self) -> StateRoot {
         let mods: Vec<&dyn Module> = self.registry.values().map(|b| b.as_ref()).collect();
         global_root(&mods)
     }
@@ -858,7 +858,7 @@ impl Host {
     }
 
     /// every registered module's `(id, root)`, in registry (sorted-id) order —
-    /// the exact input [`Host::app_hash`] composes over. a recovery journal
+    /// the exact input [`Host::root_hash`] composes over. a recovery journal
     /// seals each applied block with these so a restarted node can locate every
     /// module's replay position by root equality.
     pub fn module_roots(&self) -> Vec<(ModuleId, StateRoot)> {
@@ -902,8 +902,8 @@ impl Host {
 
     /// capture the committed registry view for a finalized block.
     ///
-    /// The caller supplies the finalized app-hash from consensus. The host
-    /// recomputes its current app-hash first and refuses to serve if it has
+    /// The caller supplies the finalized root-hash from consensus. The host
+    /// recomputes its current root-hash first and refuses to serve if it has
     /// already advanced, preventing a node from labeling current module state as
     /// an older height. Because this borrows `&self`, it can only run outside the
     /// mutable `submit_at` block lifecycle; module roots and state-sync handles
@@ -912,10 +912,10 @@ impl Host {
         &self,
         finalized: FinalizedBlock,
     ) -> Result<FinalizedSnapshot, SnapshotError> {
-        let actual = self.app_hash();
-        if actual != finalized.app_hash {
-            return Err(SnapshotError::AppHashMismatch {
-                expected: finalized.app_hash,
+        let actual = self.root_hash();
+        if actual != finalized.root_hash {
+            return Err(SnapshotError::RootHashMismatch {
+                expected: finalized.root_hash,
                 actual,
             });
         }
@@ -941,7 +941,7 @@ impl Host {
 
         Ok(FinalizedSnapshot {
             height: finalized.height,
-            app_hash: finalized.app_hash,
+            root_hash: finalized.root_hash,
             modules,
         })
     }
@@ -960,7 +960,7 @@ impl Host {
     /// later `execute` erroring, or [`Error::BudgetExceeded`]) it calls
     /// [`Module::abort_block`] on every touched module, so a half-applied block
     /// leaves NO trace — every module root is byte-identical to its pre-block
-    /// value. the app-hash is recomposed AFTER the commit, so it reflects exactly
+    /// value. the root-hash is recomposed AFTER the commit, so it reflects exactly
     /// the committed state.
     ///
     /// ## the two failure modes
@@ -995,7 +995,7 @@ impl Host {
             Ok((events, dispatches)) => {
                 // clean drain: publish every touched module's staged writes. this
                 // is the ONLY place a module's state advances, so recompose the
-                // app-hash AFTER. a commit failure is FATAL, not a rejection: the
+                // root-hash AFTER. a commit failure is FATAL, not a rejection: the
                 // modules before this one in registry order already published,
                 // so the block is half-committed on this node alone.
                 for id in &touched {
@@ -1010,7 +1010,7 @@ impl Host {
                     }
                 }
                 Ok(BlockOutcome {
-                    app_hash: self.app_hash(),
+                    root_hash: self.root_hash(),
                     events,
                     dispatches,
                 })
@@ -1043,7 +1043,7 @@ impl Host {
     }
 
     /// apply a BATCH of ops as ONE block: per-op isolation, a SINGLE commit
-    /// boundary, and ONE post-batch app-hash shared by every applied member.
+    /// boundary, and ONE post-batch root-hash shared by every applied member.
     ///
     /// each op is drained in input order on top of the prior accepted ops' staged
     /// writes (read-your-writes across members). an op that rejects
@@ -1084,7 +1084,7 @@ impl Host {
     }
 
     /// RECOVERY-ONLY selective-commit variant of [`Host::submit_block`]: identical
-    /// per-op isolation and single-app-hash composition, but at the boundary it
+    /// per-op isolation and single-root-hash composition, but at the boundary it
     /// partitions the touched set — commit the modules in `commit_only`, abort the
     /// rest. this heals a TORN block at boot: a block that committed a
     /// per-block-durable disk substrate (already at its sealed post-root on disk)
@@ -1359,9 +1359,9 @@ impl Host {
             }
         }
 
-        // 6. ONE app-hash over the committed registry, shared by every member.
+        // 6. ONE root-hash over the committed registry, shared by every member.
         Ok(BatchOutcome {
-            app_hash: self.app_hash(),
+            root_hash: self.root_hash(),
             members: results.into_iter().map(Option::unwrap).collect(),
             continuations,
             events,
@@ -1471,7 +1471,7 @@ impl Host {
         // DETERMINISTIC ACTIVATION INJECTION. at a finalized boundary where the
         // committed `lifecycle` module holds an armed code swap, append EXACTLY
         // ONE System-origin `Advance` so the module reconciles its own
-        // app-hashed state in-block (flip every armed active hash — the
+        // root-hashed state in-block (flip every armed active hash — the
         // consensus commitment to the new code; the actual component swap is
         // realized out-of-block by `realize_module_swaps`). it rides this drain
         // (not the respawn side-path), so live, recovery-replay, and state-sync
