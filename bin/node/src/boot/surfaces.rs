@@ -99,13 +99,15 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         }
         _ => None,
     };
-    // An embedded airlock gateway (credential-provider node, DUCKTAPE_AIRLOCK_SERVE):
-    // run it in-process on loopback and register its port as the `airlock` gateway
-    // route, so a compute node can reach it over the overlay (airlock.<handle>.duck).
-    // Bound here (out of the runtime) like the browser gateway; served on the
-    // app-surface thread below. Only when the gateway plane is up to serve it; route
-    // PUBLICATION stays a one-time signed operator step.
-    let airlock_bits = match crate::airlock_serve::AirlockServe::from_env() {
+    // An embedded airlock gateway (credential-provider node): either the
+    // disk-backed self-host store (`user cred add`) or the TEE env path
+    // (DUCKTAPE_AIRLOCK_SERVE). Run it in-process on loopback and register its
+    // port as the `airlock` gateway route, so a compute node can reach it over
+    // the overlay (airlock.<handle>.duck). Bound here (out of the runtime) like
+    // the browser gateway; served on the app-surface thread below. Only when the
+    // gateway plane is up to serve it; route PUBLICATION stays a one-time signed
+    // operator step.
+    let airlock_bits = match crate::airlock_serve::AirlockServe::resolve(storage) {
         None => None,
         Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
         Some(Ok(serve)) if !sync_only && gateway_enabled => {
@@ -118,7 +120,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             // Build — and thus ATTEST — BEFORE registering the route or claiming
             // to listen: a node that cannot attest must fail boot loudly here,
             // never register a route to a gateway that will not come up.
-            let (router, vendor) = airlock::server::build_seeded(serve.cfg, serve.credential)
+            let (router, vendor) = airlock::server::build_seeded(serve.cfg, serve.seeds)
                 .map_err(|error| format!("airlock gateway: {error}"))?;
             crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
                 .map_err(|error| format!("register airlock gateway route: {error}"))?;
