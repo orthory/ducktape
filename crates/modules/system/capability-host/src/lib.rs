@@ -291,12 +291,6 @@ pub struct RunContext {
     /// consensus data; the resolver builds it host-side from committed state
     /// before the provider spawns.
     pub airlock: Option<broker::AirlockConfig>,
-    /// the ACCOUNT this run acts on behalf of — the credential-grant subject
-    /// (the submitting node's account, read from committed saga origin). Carried
-    /// beside `airlock` so the broker's gateway session can name whom the
-    /// traffic is attributed to. `None` (the default) = a host-credential run
-    /// acting for no distinct account.
-    pub on_behalf: Option<Vec<u8>>,
 }
 
 /// which child stream produced one live output line.
@@ -6171,7 +6165,6 @@ printf '%s\n' "$PATH"
             portable: true,
             context_doc: None,
             airlock: None,
-            on_behalf: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();

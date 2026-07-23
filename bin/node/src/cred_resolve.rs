@@ -136,7 +136,11 @@ impl NodeCredentialResolver {
     /// Build the broker's self-host config from a granted record: reach the
     /// owner's gateway at `<airlock>.<owner-handle>.duck` through this node's
     /// browser gateway, pinning the on-chain seal_pk (no TEE quote in self-host).
-    async fn build_airlock(&self, record: &CredentialRecord) -> Result<AirlockConfig, String> {
+    async fn build_airlock(
+        &self,
+        record: &CredentialRecord,
+        on_behalf: Vec<u8>,
+    ) -> Result<AirlockConfig, String> {
         let Some(via) = self.via.clone() else {
             return Err("this node has no browser gateway to route credential traffic".into());
         };
@@ -152,6 +156,7 @@ impl NodeCredentialResolver {
             authority: format!("{AIRLOCK_ROUTE}.{handle}.duck"),
             via,
             seal_pk: record.seal_pk,
+            account: on_behalf,
         };
         Ok(AirlockConfig::self_host(&resolved))
     }
@@ -169,8 +174,8 @@ impl CredentialResolver for NodeCredentialResolver {
             SagaOrigin::Module(_) | SagaOrigin::System => None,
         };
         let (record, on_behalf) = authorize(credential, record, &origin, account)?;
-        let airlock = self.build_airlock(&record).await?;
-        Ok(Resolved { airlock, on_behalf })
+        let airlock = self.build_airlock(&record, on_behalf).await?;
+        Ok(Resolved { airlock })
     }
 }
 

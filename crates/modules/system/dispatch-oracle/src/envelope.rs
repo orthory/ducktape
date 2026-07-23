@@ -120,8 +120,8 @@ pub struct Prepared {
     pub workspace: PortablePlan,
     /// the named gateway credential this run draws on, surfaced verbatim from
     /// the envelope. `None` for every ordinary composer output. The pool
-    /// resolves it (on the executing node) into `ctx.airlock`/`ctx.on_behalf`
-    /// before the provider spawns; a resolve refusal fails the attempt.
+    /// resolves it (on the executing node) into `ctx.airlock` before the
+    /// provider spawns; a resolve refusal fails the attempt.
     pub credential: Option<String>,
 }
 

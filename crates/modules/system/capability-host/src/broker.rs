@@ -1230,16 +1230,21 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         }
         AirlockTrust::PinnedSealPk(pk) => (*pk, true),
     };
+    // A lending session names the account it draws the grant on behalf of, so the
+    // owner's gateway can check it against the on-chain record and 403 an
+    // ungranted account (`credential_not_granted`). `None` on the env/Attested
+    // path, which runs no grant gate — the account is then simply unsent.
+    let handshake = match &cfg.account {
+        Some(account) => gateway.open_session_sealed_as(&seal_pk, &cfg.sub, account).await,
+        None => gateway.open_session_sealed(&seal_pk, &cfg.sub).await,
+    };
     // On the pinned path a handshake failure IS the trust failure: the gateway's
     // real seal key differs from the pin, so the sealed session token cannot be
     // opened. Surface it as a named error BEFORE any credentialed request.
-    let (token, keys) = gateway
-        .open_session_sealed(&seal_pk, &cfg.sub)
-        .await
-        .map_err(|e| match pinned {
-            true => "gateway_seal_pk_mismatch".to_string(),
-            false => format!("airlock handshake: {e}"),
-        })?;
+    let (token, keys) = handshake.map_err(|e| match pinned {
+        true => "gateway_seal_pk_mismatch".to_string(),
+        false => format!("airlock handshake: {e}"),
+    })?;
     Ok((AirlockSession { gateway, seal_pk, sub: cfg.sub, token, keys }, base))
 }
 
@@ -1275,6 +1280,11 @@ pub struct ResolvedCredential {
     pub authority: String,
     pub via: String,
     pub seal_pk: [u8; 32],
+    /// the ACCOUNT the run acts on behalf of — the credential-grant subject the
+    /// owner's gateway checks the session against (the owner itself, or a granted
+    /// account). Sent as the sealed session's `account_b64`; without it a
+    /// grant-gated gateway refuses every session `credential_not_granted`.
+    pub account: Vec<u8>,
 }
 
 /// How the broker decides to trust a gateway's seal key — the one discriminant
@@ -1298,6 +1308,10 @@ pub struct AirlockConfig {
     gateway: AirlockGateway,
     trust: AirlockTrust,
     sub: String,
+    /// self-host lending: the grant subject the session claims to act on behalf
+    /// of, sent as `account_b64` so the owner's grant-gated gateway can enforce
+    /// the grant. `None` on the env/Attested path (no grant gate).
+    account: Option<Vec<u8>>,
     /// attest=snp: the pinned AMD platform generation (parsed at config time).
     snp_product: Option<SnpProduct>,
     /// attest=snp: an out-of-band VCEK (file READ at config time); KDS otherwise.
@@ -1319,6 +1333,7 @@ impl AirlockConfig {
             },
             trust: AirlockTrust::PinnedSealPk(resolved.seal_pk),
             sub: resolved.name.clone(),
+            account: Some(resolved.account.clone()),
             snp_product: None,
             snp_vcek: None,
             pccs_url: None,
@@ -1378,6 +1393,8 @@ impl AirlockConfig {
             gateway,
             trust: AirlockTrust::Attested { measurement, attest },
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
+            // the boundary/TEE path runs no grant gate; the account is unsent.
+            account: None,
             snp_product,
             snp_vcek,
             pccs_url: env_nonempty("DUCKTAPE_AIRLOCK_PCCS_URL"),
@@ -2785,6 +2802,7 @@ mod tests {
             gateway: AirlockGateway::Local { url: gateway_url },
             trust: AirlockTrust::Attested { measurement: meas, attest: "snp".into() },
             sub: "test-sub".into(),
+            account: None,
             snp_product: None, // the test roots override supplies the chain
             snp_vcek: None,
             pccs_url: None,
@@ -2831,6 +2849,7 @@ mod tests {
                 attest: "snp".into(),
             },
             sub: "test-sub".into(),
+            account: None,
             snp_product: None,
             snp_vcek: None,
             pccs_url: None,
@@ -3020,7 +3039,117 @@ mod tests {
             authority: "owner.duck".into(),
             via: via.into(),
             seal_pk,
+            account: b"owner-account".to_vec(),
         }
+    }
+
+    /// Like [`boot_self_host_gateway`] but with the co-hosted-lending grant gate
+    /// wired: a session opens only when its claimed `account_b64` equals
+    /// `granted`. This is the production self-host mode (`user cred add` builds an
+    /// always-gated gateway), so a broker that fails to send the account 403s
+    /// here before any credentialed request.
+    async fn boot_grant_gated_gateway(
+        upstream: &str,
+        seal_kp: airlock::seal::SealKeypair,
+        seeds: Vec<(
+            String,
+            airlock::wire::CredentialKind,
+            airlock::wire::CredentialPayload,
+        )>,
+        granted: Vec<u8>,
+    ) -> String {
+        let check: airlock::server::GrantCheck = std::sync::Arc::new(move |_sub, account| {
+            let granted = granted.clone();
+            Box::pin(async move { account == granted })
+        });
+        let (app, vendor) = airlock::server::build_seeded_gated(
+            airlock::server::GatewayConfig {
+                attest: airlock::server::AttestMode::SelfHost,
+                seal_keypair: Some(seal_kp),
+                anthropic_base: upstream.into(),
+                openai_base: upstream.into(),
+                oauth_token_url: format!("{upstream}/oauth/token"),
+                oauth_client_id: "test-client".into(),
+                session_ttl_secs: 3600,
+                max_requests: 100,
+            },
+            seeds,
+            Some(check),
+        )
+        .unwrap();
+        assert_eq!(vendor, "self-host");
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The production round-trip the lending e2e never exercises through the
+    /// broker: a grant-GATED self-host gateway (what `user cred add` always
+    /// builds) admits the broker's sealed session ONLY because the broker names
+    /// the granted account in `account_b64`. A broker that dropped the account
+    /// (the bug this guards) would 403 `credential_not_granted` at session open.
+    #[tokio::test]
+    async fn broker_sends_the_grant_account_to_a_gated_gateway() {
+        let upstream = bearer_upstream("tok-grant").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_grant_gated_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+            )],
+            b"grantee".to_vec(),
+        )
+        .await;
+        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        rc.account = b"grantee".to_vec();
+        let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig::self_host(&rc))
+            .await
+            .expect("a granted account opens the gated session");
+        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+            .await
+            .unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", broker.endpoint.base_url))
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("AIRLOCK-OK"), "gated self-host round-trip");
+    }
+
+    /// The gate's teeth: an UNGRANTED account is refused at session open, before
+    /// any credentialed request — the broker's account reaches the gate and the
+    /// gate says no.
+    #[tokio::test]
+    async fn broker_session_is_refused_for_an_ungranted_account() {
+        let upstream = bearer_upstream("tok-grant").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_grant_gated_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+            )],
+            b"grantee".to_vec(),
+        )
+        .await;
+        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        rc.account = b"stranger".to_vec();
+        let refused = AnthropicAuth::airlock(AirlockConfig::self_host(&rc)).await;
+        assert!(refused.is_err(), "an ungranted account must not open a session");
     }
 
     #[tokio::test]

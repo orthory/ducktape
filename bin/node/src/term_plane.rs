@@ -556,6 +556,9 @@ async fn serve_create(
         authority,
         via: control.local_gateway_via.clone(),
         seal_pk: admit.seal_pk,
+        // the creator (a mesh peer, or the owner itself) is who draws on the
+        // credential; the owner's gateway checks THIS account against the grant.
+        account: creator_account,
     };
     let attach = PeerAttach {
         creator_node: peer.0,
