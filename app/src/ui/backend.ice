@@ -27,10 +27,12 @@ extern crate::backend
   AutosaveResult(generation:i64, written:bool)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   LiveUpdate(kind:str, status:str, height:i64)
+  ComposerCmd()
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
   container-style avatar_style(r:f64, g:f64, b:f64)
+  editor-binding composer_keys() -> ComposerCmd
   connect(rpc:str) -> WorkspaceData ! AppError
   stream live_events(rpc:str) -> LiveUpdate
   refresh(rpc:str, channel_id:str, page_id:str, generation:i64) -> WorkspaceData ! HydrationError

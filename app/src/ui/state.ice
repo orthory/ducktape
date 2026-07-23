@@ -52,6 +52,7 @@ state
   channel_create_open = false
   pending_channel = ""
   message_draft = ""
+  message_editor:editor = ""
   pending_message = ""
   pending_message_id = ""
   failed_message_draft = ""

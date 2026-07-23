@@ -33,6 +33,14 @@ mod tests {
         }
     }
 
+    fn compose(text: &str) -> iced::widget::text_editor::Content {
+        iced::widget::text_editor::Content::with_text(text)
+    }
+
+    fn composer(app: &Ducktape) -> String {
+        app.message_editor.text().trim().to_string()
+    }
+
     fn workspace(
         generation: i64,
         active_channel: &str,
@@ -421,7 +429,7 @@ mod tests {
         app.thread_next_reply_offset = 3;
         app.thread_has_more = true;
         app.reply_draft = "reply in progress".into();
-        app.message_draft = "next message".into();
+        app.message_editor = compose("next message");
         app.mutation_phase = "message".into();
         app.pending_message = "sent message".into();
 
@@ -456,7 +464,7 @@ mod tests {
         assert_eq!(app.thread_next_reply_offset, 3);
         assert!(app.thread_has_more);
         assert_eq!(app.reply_draft, "reply in progress");
-        assert_eq!(app.message_draft, "next message");
+        assert_eq!(composer(&app), "next message");
         assert_eq!(app.mutation_phase, "idle");
     }
 
@@ -686,23 +694,24 @@ mod tests {
         app.connected = true;
         app.loading = false;
         app.active_channel = "general".into();
-        app.message_draft = "first".into();
+        app.message_editor = compose("first");
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         let first_id = app.messages[0].id.clone();
         assert_eq!(app.mutation_phase, "idle");
         assert!(app.message_draft.is_empty());
+        assert!(composer(&app).is_empty());
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].pending);
 
-        app.message_draft = "second".into();
+        app.message_editor = compose("second");
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         let second_id = app.messages[1].id.clone();
         assert_ne!(first_id, second_id);
         assert_eq!(app.messages.len(), 2);
         assert!(app.messages.iter().all(|message| message.pending));
 
-        app.message_draft = "third".into();
+        app.message_editor = compose("third");
         let _ = app.__update(__DucktapeMessage::MessageSent(backend::ChatSendResult {
             operation_id: first_id.clone(),
             channel_id: "general".into(),
@@ -744,7 +753,7 @@ mod tests {
                 thread_has_more: false,
             },
         }));
-        assert_eq!(app.message_draft, "third");
+        assert_eq!(composer(&app), "third");
         assert_eq!(app.mutation_phase, "idle");
         assert!(!app.messages[0].pending);
         assert_eq!(app.messages[1].id, second_id);
@@ -1011,7 +1020,7 @@ mod tests {
         app.block_comments_open = true;
         app.block_comments_target = "same-id".into();
         app.block_comment_draft = "node a comment".into();
-        app.message_draft = "node a message".into();
+        app.message_editor = compose("node a message");
         app.page_search_draft = "node a search".into();
 
         let _ = app.__update(__DucktapeMessage::Reconnect);
@@ -1029,6 +1038,7 @@ mod tests {
         assert!(app.block_comments_target.is_empty());
         assert!(app.block_comment_draft.is_empty());
         assert!(app.message_draft.is_empty());
+        assert!(composer(&app).is_empty());
         assert!(app.page_search_draft.is_empty());
 
         let _ = app.__update(__DucktapeMessage::Failed(backend::AppError {
@@ -1044,14 +1054,14 @@ mod tests {
         app.loading = false;
         app.connected_rpc = "http://node-a".into();
         app.rpc = "http://node-a/".into();
-        app.message_draft = "next message".into();
+        app.message_editor = compose("next message");
         app.failed_message_draft = "unsent message".into();
 
         let _ = app.__update(__DucktapeMessage::Reconnect);
 
         assert_eq!(app.rpc, "http://node-a");
         assert_eq!(app.connected_rpc, "http://node-a");
-        assert_eq!(app.message_draft, "next message");
+        assert_eq!(composer(&app), "next message");
         assert_eq!(app.failed_message_draft, "unsent message");
     }
 
@@ -1191,7 +1201,9 @@ mod tests {
     fn compact_controls_share_a_single_geometry_and_type_scale() {
         let view = include_str!("ui/view.ice");
         assert!(view.contains("padding=6.2 text-size=13.0 line-height=1.2"));
-        assert!(view.contains("padding=6.6 text-size=14.0 line-height=1.2"));
+        assert!(view.contains(
+            "min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word"
+        ));
         assert!(view.contains("button \"Send\" disabled="));
         assert!(view.contains("height=30.0 padding=7.0 -> send_message_submit"));
         assert!(
@@ -1231,6 +1243,40 @@ mod tests {
             assert!(!view.contains(obsolete_size), "{obsolete_size}");
             assert!(!components.contains(obsolete_size), "{obsolete_size}");
         }
+    }
+
+    #[test]
+    fn composer_enter_sends_and_shift_enter_inserts_a_newline() {
+        use iced::keyboard::key::{Named, NativeCode, Physical};
+        use iced::keyboard::{Key, Modifiers};
+        use iced::widget::text_editor::{Binding, KeyPress, Status};
+
+        fn press(key: Key, modifiers: Modifiers) -> KeyPress {
+            KeyPress {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: Physical::Unidentified(NativeCode::Unidentified),
+                modifiers,
+                text: None,
+                status: Status::Focused { is_hovered: false },
+            }
+        }
+
+        let enter = Key::Named(Named::Enter);
+        // Plain Enter raises the custom send command routed to send_message_submit.
+        assert_eq!(
+            backend::composer_keys(press(enter.clone(), Modifiers::empty())),
+            Some(Binding::Custom(backend::ComposerCmd)),
+        );
+        // Shift+Enter keeps iced's native newline insertion — never a send.
+        assert_eq!(
+            backend::composer_keys(press(enter, Modifiers::SHIFT)),
+            Some(Binding::Enter),
+        );
+        // Any other key passes through to its native binding, not a send.
+        let passthrough =
+            backend::composer_keys(press(Key::Named(Named::ArrowLeft), Modifiers::empty()));
+        assert!(!matches!(passthrough, Some(Binding::Custom(_))));
     }
 
     #[test]
@@ -1801,7 +1847,7 @@ mod tests {
         app.connected = true;
         app.loading = false;
         app.active_channel = "general".into();
-        app.message_draft = "retry me".into();
+        app.message_editor = compose("retry me");
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         let operation_id = app.messages[0].id.clone();
@@ -1815,6 +1861,7 @@ mod tests {
             },
         ));
 
+        assert_eq!(composer(&app), "retry me");
         assert_eq!(app.message_draft, "retry me");
         assert!(app.failed_message_draft.is_empty());
         assert!(app.messages.is_empty());
@@ -1828,11 +1875,11 @@ mod tests {
         app.connected = true;
         app.loading = false;
         app.active_channel = "general".into();
-        app.message_draft = "first".into();
+        app.message_editor = compose("first");
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         let operation_id = app.messages[0].id.clone();
-        app.message_draft = "second".into();
+        app.message_editor = compose("second");
         let _ = app.__update(__DucktapeMessage::MessageSendFailed(
             backend::OptimisticMutationError {
                 message: "rejected".into(),
@@ -1843,10 +1890,11 @@ mod tests {
             },
         ));
 
-        assert_eq!(app.message_draft, "second");
+        assert_eq!(composer(&app), "second");
         assert_eq!(app.failed_message_draft, "first");
-        app.message_draft.clear();
+        app.message_editor = compose("");
         let _ = app.__update(__DucktapeMessage::RestoreFailedMessage);
+        assert_eq!(composer(&app), "first");
         assert_eq!(app.message_draft, "first");
         assert!(app.failed_message_draft.is_empty());
     }
@@ -1858,7 +1906,7 @@ mod tests {
         app.loading = false;
         app.connected_rpc = "http://node".into();
         app.active_channel = "general".into();
-        app.message_draft = "committed once".into();
+        app.message_editor = compose("committed once");
 
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         let operation_id = app.messages[0].id.clone();
@@ -1878,7 +1926,7 @@ mod tests {
         assert_eq!(app.mutation_phase, "idle");
         assert_eq!(app.sync_phase, "refreshing");
 
-        app.message_draft = "still available".into();
+        app.message_editor = compose("still available");
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
         assert_eq!(app.messages.len(), 2);
         assert_eq!(app.mutation_phase, "idle");

@@ -288,7 +288,7 @@ view
             if !empty(failed_message_draft)
               row width=fill spacing=6.0 align=center
                 text "An earlier message wasn’t sent" width=fill size=13.0 @text-muted
-                button "Restore" disabled=(!empty(message_draft) || mutation_phase != "idle") height=28.0 padding=5.0 -> restore_failed_message
+                button "Restore" disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle") height=28.0 padding=5.0 -> restore_failed_message
                   active bg=white/9 text=fg border=white/11 border-w=1.0 r=7.0
                   hovered bg=white/14
                   pressed bg=white/18
@@ -300,12 +300,12 @@ view
                   pressed bg=white/15
             container width=fill padding=8.0 bg=surface border=white/13 border-w=1.0 r=13.0 shadow=black/24 shadow-y=3.0 shadow-blur=18.0
               flex width=fill gap=8.0 align-items=center
-                input "" #message label="Message" <-> message_draft hint="Message #general…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) submit=send_message_submit width=fill padding=6.6 text-size=14.0 line-height=1.2
+                editor #message <-> message_editor placeholder="Message #general…" disabled=(loading || !connected || empty(active_channel) || active_channel_archived) min-height=44.0 max-height=150.0 size=14.0 line-height=1.3 padding=6.6 wrapping=word key-binding=composer_keys() -> send_message_submit
                   active bg=transparent border=transparent value=fg placeholder=muted selection=primary/40 border-w=0.0 r=9.0
                   hovered bg=white/4 border=white/8 border-w=1.0
                   focused bg=white/6 border=primary/45 border-w=1.0
                   disabled value=muted
-                button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(message_draft))) width=66.0 height=30.0 padding=7.0 -> send_message_submit
+                button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))) width=66.0 height=30.0 padding=7.0 -> send_message_submit
                   active bg=primary text=fg border=primaryhi/50 border-w=1.0 r=10.0 shadow=black/26 shadow-y=2.0 shadow-blur=9.0
                   hovered bg=primaryhi text=fg
                   pressed bg=primary text=fg

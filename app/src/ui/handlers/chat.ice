@@ -179,13 +179,14 @@ on leave_huddle_submit
   run leave_huddle(connected_rpc, password, active_channel) -> chat_mutated _ | mutation_failed _
 
 on send_message_submit
-  return if loading || empty(active_channel) || active_channel_archived || empty(trim(message_draft))
+  return if loading || empty(active_channel) || active_channel_archived || empty(trim(editor_text(message_editor)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "idle"
-  pending_message = trim(message_draft)
+  pending_message = trim(editor_text(message_editor))
   pending_message_id = fresh_operation_id("message")
   message_draft = ""
+  message_editor = editor("")
   messages = optimistic_message(messages, pending_message, pending_message_id)
   error = ""
   run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message) -> message_sent _ | message_send_failed _
@@ -204,8 +205,9 @@ on message_sent(next)
 on message_send_failed(cause)
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
-  failed_message_draft = remember_failed_draft(failed_message_draft, message_draft, cause.body, cause.committed)
-  message_draft = restore_draft(message_draft, cause.body, cause.committed)
+  failed_message_draft = remember_failed_draft(failed_message_draft, trim(editor_text(message_editor)), cause.body, cause.committed)
+  message_draft = restore_draft(trim(editor_text(message_editor)), cause.body, cause.committed)
+  message_editor = editor(message_draft)
   error = cause.message
   live_dirty = live_dirty || cause.committed
   return if !live_dirty || loading || sync_phase == "refreshing"
@@ -244,6 +246,7 @@ on chat_updated(next)
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on chat_mutated(next)
+  message_draft = trim(editor_text(message_editor))
   channels = next.channels
   failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == next.active_channel)
   selected_message_seq = refreshed_required_message_seq(next.messages, active_channel, next.active_channel, selected_message_seq)
@@ -275,6 +278,7 @@ on chat_mutated(next)
   reply_draft = message_text_after_failure(reply_draft, "message-edit", active_thread_seq <= 0)
   pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
   message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
+  message_editor = editor(message_draft)
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name

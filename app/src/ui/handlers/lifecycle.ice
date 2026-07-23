@@ -8,7 +8,8 @@ on reconnect
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
   password = retain_for_endpoint(password, connected_rpc, rpc)
   channel_draft = retain_for_endpoint(channel_draft, connected_rpc, rpc)
-  message_draft = retain_for_endpoint(message_draft, connected_rpc, rpc)
+  message_draft = retain_for_endpoint(trim(editor_text(message_editor)), connected_rpc, rpc)
+  message_editor = editor(message_draft)
   failed_message_draft = retain_for_endpoint(failed_message_draft, connected_rpc, rpc)
   failed_reply_draft = retain_for_endpoint(failed_reply_draft, connected_rpc, rpc)
   chat_search_draft = retain_for_endpoint(chat_search_draft, connected_rpc, rpc)
@@ -284,8 +285,9 @@ on dismiss_error
   error = ""
 
 on restore_failed_message
-  return if empty(failed_message_draft) || !empty(message_draft) || mutation_phase != "idle"
+  return if empty(failed_message_draft) || !empty(trim(editor_text(message_editor))) || mutation_phase != "idle"
   message_draft = failed_message_draft
+  message_editor = editor(message_draft)
   failed_message_draft = ""
 
 on dismiss_failed_message

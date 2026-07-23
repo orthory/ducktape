@@ -372,6 +372,29 @@ pub struct LiveUpdate {
     pub height: i64,
 }
 
+/// Custom command the multiline composer's key bindings raise. It carries no
+/// data: the only Custom binding is "send", routed straight to
+/// `send_message_submit`, which reads the editor text itself.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ComposerCmd;
+
+/// Editor key bindings for the message composer: plain Enter sends (raised as a
+/// Custom command), every other key press — Shift+Enter included, which iced
+/// maps to a newline insertion — keeps its native binding.
+pub fn composer_keys(
+    event: iced::widget::text_editor::KeyPress,
+) -> Option<iced::widget::text_editor::Binding<ComposerCmd>> {
+    let enter_pressed = matches!(
+        event.key,
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+    );
+    let sends = enter_pressed && !event.modifiers.shift();
+    if sends {
+        return Some(iced::widget::text_editor::Binding::Custom(ComposerCmd));
+    }
+    iced::widget::text_editor::Binding::from_key_press(event)
+}
+
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
