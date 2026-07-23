@@ -2450,6 +2450,100 @@ fn mark_message_groups(messages: &mut [ChatMessage]) {
     }
 }
 
+/// One page of older history, returned to the reducer with the generation that
+/// requested it so a stale load can be discarded.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HistoryPageData {
+    pub generation: i64,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// True when the oldest loaded root is not the channel's first message, i.e.
+/// there is older history to page in.
+pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
+    messages.first().is_some_and(|message| message.seq > 1)
+}
+
+/// The seq of the oldest loaded root (the ceiling for the next older page).
+pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
+    messages.first().map_or(0, |message| message.seq)
+}
+
+/// Prepend an older page ahead of the current timeline, de-duped by seq, sorted
+/// oldest-first, and re-grouped so the seam between pages regroups correctly.
+pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let known: BTreeSet<i64> = messages.iter().map(|message| message.seq).collect();
+    let mut merged: Vec<ChatMessage> = older
+        .into_iter()
+        .filter(|message| !known.contains(&message.seq))
+        .chain(messages)
+        .collect();
+    merged.sort_by_key(|message| message.seq);
+    mark_message_groups(&mut merged);
+    merged
+}
+
+/// Load the page of root messages immediately older than `before_seq`.
+pub async fn load_older_messages(
+    rpc: String,
+    channel_id: String,
+    before_seq: i64,
+    generation: i64,
+) -> Result<HistoryPageData, HydrationError> {
+    let result = async {
+        let rpc = rpc_client(&rpc)?;
+        let before = u64::try_from(before_seq).unwrap_or(0);
+        let mut cursor = before.saturating_sub(1);
+        let mut roots = Vec::new();
+        while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
+            let limit = chat::MAX_QUERY_LIMIT.min(cursor);
+            let from_seq = cursor - limit + 1;
+            let reply: ChatReply = rpc
+                .query(
+                    "chat",
+                    &ChatQuery::MessagesRange {
+                        channel_id: channel_id.clone(),
+                        from_seq,
+                        limit,
+                    },
+                )
+                .await?;
+            let messages = match reply {
+                ChatReply::Messages(messages) => messages,
+                _ => return Err("node returned an invalid message list".to_string()),
+            };
+            roots.extend(
+                messages
+                    .into_iter()
+                    .filter(|message| message.head.thread.is_none()),
+            );
+            if from_seq == 1 {
+                break;
+            }
+            cursor = from_seq - 1;
+        }
+        roots.sort_by_key(|message| message.seq);
+        let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
+        roots.drain(..excess);
+        let current_user = local_user_key().await;
+        let messages: Vec<ChatMessage> = roots
+            .into_iter()
+            .map(|message| chat_message(message, current_user.as_deref()))
+            .collect();
+        Ok(messages)
+    }
+    .await;
+    result
+        .map(|messages| HistoryPageData {
+            generation,
+            messages,
+        })
+        .map_err(|message| HydrationError {
+            generation,
+            message,
+        })
+}
+
 async fn load_messages_around(
     rpc: &RpcClient,
     channel_id: &str,
@@ -4166,6 +4260,42 @@ mod tests {
         // 1 opens the list; 2 shares alice -> continuation; 3 switches to bob -> header;
         // 4 is deleted -> header; 5 follows a deleted message -> header.
         assert_eq!(shown, vec![true, false, true, true, true]);
+    }
+
+    #[test]
+    fn history_pagination_prepends_older_and_flags_more() {
+        let msg = |seq: i64| ChatMessage {
+            id: format!("m{seq}"),
+            seq,
+            author: "alice".into(),
+            meta: format!("#{seq}"),
+            body: "body".into(),
+            blocks: paragraph_blocks("body"),
+            pending: false,
+            rev: 0,
+            edited: false,
+            deleted: false,
+            reply_count: 0,
+            thread_seq: 0,
+            show_author: false,
+            initial: "A".into(),
+            avatar_r: 0.4,
+            avatar_g: 0.4,
+            avatar_b: 0.9,
+            reactions: Vec::new(),
+        };
+        // oldest loaded root is seq 3 -> older history exists.
+        let loaded = vec![msg(3), msg(4), msg(5)];
+        assert!(history_has_older(loaded.clone()));
+        assert_eq!(oldest_message_seq(loaded.clone()), 3);
+        // prepend an older page whose last item (seq 3) duplicates the current head.
+        let merged = prepend_history(loaded, vec![msg(1), msg(2), msg(3)]);
+        assert_eq!(
+            merged.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // now the oldest loaded root is seq 1 -> no more history to page.
+        assert!(!history_has_older(merged));
     }
 
     #[test]

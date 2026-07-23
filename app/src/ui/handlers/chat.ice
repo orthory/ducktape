@@ -433,6 +433,24 @@ on thread_page_failed(cause)
   sync_phase = "refreshing"
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
+on load_more_history
+  return if history_loading || loading || mutation_phase != "idle" || empty(active_channel) || empty(messages) || !history_has_older(messages)
+  history_generation = history_generation + 1
+  history_loading = true
+  error = ""
+  run load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
+
+on history_loaded(next)
+  return if next.generation != history_generation || !history_loading
+  messages = prepend_history(messages, next.messages)
+  history_loading = false
+  error = ""
+
+on history_failed(cause)
+  return if cause.generation != history_generation
+  history_loading = false
+  error = cause.message
+
 on thread_failed(cause)
   return if cause.generation != thread_generation || !thread_loading
   thread_loading = false

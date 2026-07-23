@@ -10,6 +10,7 @@ extern crate::backend
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   LiveThreadData(generation:i64, channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
+  HistoryPageData(generation:i64, messages:[ChatMessage])
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
   ChatSearchData(generation:i64, hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
@@ -34,6 +35,7 @@ extern crate::backend
   stream live_events(rpc:str) -> LiveUpdate
   refresh(rpc:str, channel_id:str, page_id:str, generation:i64) -> WorkspaceData ! HydrationError
   retry_refresh(rpc:str, channel_id:str, page_id:str, generation:i64, attempt:i64) -> WorkspaceData ! HydrationError
+  load_older_messages(rpc:str, channel_id:str, before_seq:i64, generation:i64) -> HistoryPageData ! HydrationError
   sync fresh_operation_id(prefix:str) -> str
   sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
   sync merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
@@ -42,6 +44,9 @@ extern crate::backend
   sync contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   sync merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
+  sync history_has_older(messages:[ChatMessage]) -> bool
+  sync oldest_message_seq(messages:[ChatMessage]) -> i64
+  sync prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
   sync thread_offset_after_reply(offset:i64, has_more:bool, committed:bool) -> i64
   sync optimistic_block(blocks:[PageBlock], after_id:str, kind:str, text:str, id:str) -> [PageBlock]
   sync merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]

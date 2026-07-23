@@ -43,6 +43,8 @@ state
   thread_loading = false
   thread_generation:i64 = 0
   live_thread_generation:i64 = 0
+  history_loading = false
+  history_generation:i64 = 0
   reply_draft = ""
   pending_reply = ""
   pending_reply_id = ""

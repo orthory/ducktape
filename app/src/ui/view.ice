@@ -162,6 +162,12 @@ view
                   sensor show=chat_resized resize=chat_resized
                     scroll direction=vertical width=fill height=fill
                       col width=fill spacing=1.0
+                        if history_has_older(messages)
+                          container width=fill align-x=center padding-top=4.0 padding-bottom=8.0
+                            button "Load older messages" disabled=(history_loading || mutation_phase != "idle") height=30.0 padding=6.0 -> load_more_history
+                              active bg=white/6 text=muted border=white/10 border-w=1.0 r=8.0
+                              hovered bg=white/10 text=fg border=white/14
+                              pressed bg=white/14 text=fg
                         for message in messages
                           col width=fill spacing=0.0
                             if message.show_author
