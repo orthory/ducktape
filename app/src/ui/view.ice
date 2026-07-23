@@ -108,9 +108,9 @@ view
                   hovered bg=white/9 text=fg
                   pressed bg=white/14
     chat:
-      container width=fill height=fill padding=14.0 bg=transparent clip=true px-snap=true
+      container width=fill height=fill bg=transparent clip=true px-snap=true
         row width=fill height=fill
-          col width=fill height=fill spacing=9.0
+          col width=fill height=fill spacing=9.0 padding=14.0
             if !empty(active_channel)
               row width=fill height=28.0 spacing=7.0 align=center
                 container width=22.0 height=22.0 align-x=center align-y=center bg=white/10 border=white/16 border-w=1.0 r=7.0
@@ -122,7 +122,6 @@ view
                   text "Members" size=11.0 @text-muted
                 if active_channel_huddle_count > 0
                   text active_channel_huddle_count size=11.0 @text-muted
-                text len(messages) size=11.0 @text-muted
                 input "" #chat-search label="Search messages" <-> chat_search_draft hint="Search messages" disabled=(!connected || chat_searching) submit=search_chat_submit width=180.0 padding=6.2 text-size=13.0 line-height=1.2
                   active bg=transparent border=white/10 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                   hovered bg=white/4 border=white/14
@@ -155,7 +154,7 @@ view
               stack width=fill height=fill
                 mouse move=chat_pointer_moved
                   sensor show=chat_resized resize=chat_resized
-                    scroll direction=vertical width=fill height=fill
+                    scroll direction=vertical width=fill height=fill anchor-y=end
                       col width=fill spacing=1.0
                         for message in messages
                           stack #message(message.id) width=fill
@@ -281,9 +280,9 @@ view
                   pressed bg=fg text=bg
                   disabled bg=fg/28 text=bg/12
           if channel_settings_open && !empty(active_channel)
-            container width=1.0 height=fill bg=separator
+            container width=1.0 height=fill bg=white/8
               text ""
-            container width=286.0 height=fill padding=10.0 bg=surface
+            container width=300.0 height=fill padding=12.0 bg=surface
               col width=fill height=fill spacing=8.0
                 row width=fill height=28.0 spacing=6.0 align=center
                   text "Channel details" width=fill size=13.0 font=medium @text-fg
@@ -343,9 +342,9 @@ view
                       for member in channel_members
                         ChatMemberRow member=member disabled=(mutation_phase != "idle")
           if active_thread_seq > 0 && !channel_settings_open
-            container width=1.0 height=fill bg=separator
+            container width=1.0 height=fill bg=white/8
               text ""
-            container width=286.0 height=fill padding=10.0 bg=surface
+            container width=300.0 height=fill padding=12.0 bg=surface
               col width=fill height=fill spacing=8.0
                 row width=fill height=28.0 spacing=6.0 align=center
                   if thread_target_seq <= 0

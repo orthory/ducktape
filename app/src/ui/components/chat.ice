@@ -39,13 +39,17 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
 
 component MessageContents(message:ChatMessage)
   row width=fill spacing=9.0 align=start
-    container width=30.0 height=30.0 align-x=center align-y=center bg=white/7 border=white/8 border-w=1.0 r=8.0
-      text "•" size=13.0 @text-muted
+    if message.show_author
+      container width=30.0 height=30.0 align-x=center align-y=center bg=white/7 border=white/8 border-w=1.0 r=8.0
+        text message.initial size=13.0 font=medium @text-fg
+    if !message.show_author
+      space width=30.0
     col width=fill spacing=3.0
-      row width=fill spacing=6.0 align=center
-        text message.author size=13.0 wrapping=none font=medium @text-fg
-        text message.meta size=11.0 wrapping=none @text-muted
-        space width=fill
+      if message.show_author
+        row width=fill spacing=6.0 align=center
+          text message.author size=13.0 wrapping=none font=medium @text-fg
+          text message.meta size=11.0 wrapping=none @text-muted
+          space width=fill
       text message.body width=fill size=13.0 wrapping=word @text-fg
       if message.reply_count > 0 || !empty(message.reactions)
         row width=fill spacing=5.0 align=center

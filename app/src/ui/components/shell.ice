@@ -90,9 +90,8 @@ component WorkspaceTabs(status:str, loading:bool)
         text ""
       col width=fill height=fill padding-top=28.0
         slot notice
-        col width=fill height=fill padding=12.0 padding-top=4.0
-          match tab
-            "chat"
-              slot chat
-            _
-              slot pages
+        match tab
+          "chat"
+            slot chat
+          _
+            slot pages

@@ -23,6 +23,8 @@ mod tests {
             deleted,
             reply_count: 0,
             thread_seq: 0,
+            show_author: true,
+            initial: "U".into(),
             reactions: Vec::new(),
         }
     }
@@ -714,6 +716,8 @@ mod tests {
                     deleted: false,
                     reply_count: 0,
                     thread_seq: 0,
+                    show_author: true,
+                    initial: "U".into(),
                     reactions: Vec::new(),
                 }],
                 active_channel: "general".into(),
@@ -797,8 +801,12 @@ mod tests {
         assert!(!toolbar.contains("hovered || selected"));
         assert_eq!(toolbar.matches("width=26.0 height=26.0").count(), 4);
         assert!(components.contains(
-            "text message.author size=13.0 wrapping=none font=medium @text-fg\n        text message.meta size=11.0 wrapping=none @text-muted\n        space width=fill"
+            "text message.author size=13.0 wrapping=none font=medium @text-fg\n          text message.meta size=11.0 wrapping=none @text-muted\n          space width=fill"
         ));
+        // Slack-style grouping: the avatar + author header only renders for a
+        // run's first message; continuations keep the body aligned via a gutter.
+        assert!(components.contains("if message.show_author\n      container width=30.0 height=30.0"));
+        assert!(components.contains("if !message.show_author\n      space width=30.0"));
         assert!(toolbar.contains("bg=popover"));
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
@@ -923,6 +931,8 @@ mod tests {
             deleted: false,
             reply_count: 0,
             thread_seq,
+            show_author: true,
+            initial: "U".into(),
             reactions: Vec::new(),
         };
         let (mut app, _) = Ducktape::__boot();

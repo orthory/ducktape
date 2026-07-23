@@ -58,6 +58,8 @@ pub struct ChatMessage {
     pub deleted: bool,
     pub reply_count: i64,
     pub thread_seq: i64,
+    pub show_author: bool,
+    pub initial: String,
     pub reactions: Vec<ChatReaction>,
 }
 
@@ -339,6 +341,8 @@ pub fn optimistic_message(
         deleted: false,
         reply_count: 0,
         thread_seq: 0,
+        show_author: true,
+        initial: "Y".into(),
         reactions: Vec::new(),
     });
     messages
@@ -2361,10 +2365,31 @@ async fn load_messages(
     let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
     roots.drain(..excess);
     let current_user = local_user_key().await;
-    Ok(roots
+    let mut messages: Vec<ChatMessage> = roots
         .into_iter()
         .map(|message| chat_message(message, current_user.as_deref()))
-        .collect())
+        .collect();
+    mark_message_groups(&mut messages);
+    Ok(messages)
+}
+
+/// Slack-style grouping: a message shows its avatar + author header only when it
+/// opens a run — the first message, or one whose author differs from the message
+/// above it. Deleted messages always break a run (neither joins nor extends one).
+fn mark_message_groups(messages: &mut [ChatMessage]) {
+    let opens_run: Vec<bool> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            index == 0
+                || message.deleted
+                || messages[index - 1].deleted
+                || messages[index - 1].author != message.author
+        })
+        .collect();
+    for (message, show) in messages.iter_mut().zip(opens_run) {
+        message.show_author = show;
+    }
 }
 
 async fn load_messages_around(
@@ -2566,6 +2591,8 @@ fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> Chat
         deleted: message.head.deleted,
         reply_count: number_i64(message.head.reply_count),
         thread_seq: number_i64(message.head.thread.unwrap_or(0)),
+        show_author: true,
+        initial: avatar_initial(&message.head.author),
         reactions: message
             .reactions
             .into_iter()
@@ -3233,6 +3260,22 @@ fn author_name(author: &AuthorRef) -> String {
     }
 }
 
+/// The single-glyph avatar label for an author: the first alphanumeric character
+/// of its identity, uppercased (the hex fingerprint for a user, the id for an
+/// agent/module). Falls back to a neutral dot when there is nothing to show.
+fn avatar_initial(author: &AuthorRef) -> String {
+    let source = match author {
+        AuthorRef::User(key) => short_hex(key),
+        AuthorRef::Agent { agent_id, .. } => agent_id.clone(),
+        AuthorRef::Module(module) => module.clone(),
+        AuthorRef::System => "system".into(),
+    };
+    source
+        .chars()
+        .find(char::is_ascii_alphanumeric)
+        .map_or_else(|| "•".into(), |c| c.to_ascii_uppercase().to_string())
+}
+
 fn short_hex(bytes: &[u8]) -> String {
     let mut output = String::new();
     for byte in bytes.iter().take(4) {
@@ -3576,6 +3619,8 @@ mod tests {
             deleted: false,
             reply_count: 0,
             thread_seq: 0,
+            show_author: true,
+            initial: "Y".into(),
             reactions: Vec::new(),
         };
         let after_second = merge_message_send_result(
@@ -3623,6 +3668,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["message-b", "message-a"]
         );
+    }
+
+    #[test]
+    fn message_groups_collapse_consecutive_authors() {
+        let msg = |seq: i64, author: &str, deleted: bool| ChatMessage {
+            id: format!("m{seq}"),
+            seq,
+            author: author.into(),
+            meta: format!("#{seq}"),
+            body: "body".into(),
+            pending: false,
+            rev: 0,
+            edited: false,
+            deleted,
+            reply_count: 0,
+            thread_seq: 0,
+            show_author: false,
+            initial: "A".into(),
+            reactions: Vec::new(),
+        };
+        let mut messages = vec![
+            msg(1, "alice", false),
+            msg(2, "alice", false),
+            msg(3, "bob", false),
+            msg(4, "bob", true),
+            msg(5, "bob", false),
+        ];
+        mark_message_groups(&mut messages);
+        let shown: Vec<bool> = messages.iter().map(|message| message.show_author).collect();
+        // 1 opens the list; 2 shares alice -> continuation; 3 switches to bob -> header;
+        // 4 is deleted -> header; 5 follows a deleted message -> header.
+        assert_eq!(shown, vec![true, false, true, true, true]);
     }
 
     #[test]
