@@ -59,6 +59,7 @@ mod cli;
 mod cli_args;
 mod config;
 mod constants;
+mod cred_cli;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
