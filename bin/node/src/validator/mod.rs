@@ -54,6 +54,9 @@ pub(crate) async fn run_validator(
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
+    session_manager: Option<noded::TerminalSessions>,
+    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    local_gateway_via: String,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
@@ -209,7 +212,7 @@ pub(crate) async fn run_validator(
         planes.clone(),
         sync_monitor,
         gateway_requests,
-        gateway_commands,
+        gateway_commands.clone(),
         gateway_workspace,
         blobs.clone(),
         initial_member_keys,
@@ -239,7 +242,9 @@ pub(crate) async fn run_validator(
             stream_hub.run_output(),
         );
         // the terminal-session plane: forwards a session's output ring and
-        // ordered command log to peers, so a member on another node streams it.
+        // ordered command log to peers, hosts the directed create/close +
+        // creator-gated input control lanes, and drains the guest-side session
+        // lane (the client half).
         crate::term_plane::spawn(
             label.clone(),
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
@@ -249,6 +254,10 @@ pub(crate) async fn run_validator(
             planes.clone(),
             stream_hub.terminals(),
             stream_hub.term_commands(),
+            session_manager,
+            gateway_commands,
+            local_gateway_via,
+            session_requests,
         );
         // the module-code plane: serves push/pull transfers and drains the
         // admin RPC's stage fan-outs. same overlay book as the agent plane.
