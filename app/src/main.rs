@@ -17,6 +17,7 @@ mod tests {
             author: "user".into(),
             meta: format!("#{seq}"),
             body: body.into(),
+            blocks: backend::paragraph_blocks(body),
             pending: false,
             rev: 2,
             edited: false,
@@ -25,6 +26,9 @@ mod tests {
             thread_seq: 0,
             show_author: true,
             initial: "U".into(),
+            avatar_r: 0.4,
+            avatar_g: 0.4,
+            avatar_b: 0.9,
             reactions: Vec::new(),
         }
     }
@@ -710,6 +714,7 @@ mod tests {
                     author: "you".into(),
                     meta: "#1".into(),
                     body: "first".into(),
+                    blocks: backend::paragraph_blocks("first"),
                     pending: false,
                     rev: 0,
                     edited: false,
@@ -718,6 +723,9 @@ mod tests {
                     thread_seq: 0,
                     show_author: true,
                     initial: "U".into(),
+                    avatar_r: 0.4,
+                    avatar_g: 0.4,
+                    avatar_b: 0.9,
                     reactions: Vec::new(),
                 }],
                 active_channel: "general".into(),
@@ -925,6 +933,7 @@ mod tests {
             author: "user".into(),
             meta: format!("#{seq}"),
             body: body.into(),
+            blocks: backend::paragraph_blocks(body),
             pending: false,
             rev: 0,
             edited: false,
@@ -933,6 +942,9 @@ mod tests {
             thread_seq,
             show_author: true,
             initial: "U".into(),
+            avatar_r: 0.4,
+            avatar_g: 0.4,
+            avatar_b: 0.9,
             reactions: Vec::new(),
         };
         let (mut app, _) = Ducktape::__boot();

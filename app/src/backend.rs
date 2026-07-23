@@ -45,13 +45,14 @@ pub struct ChatMember {
     pub label: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
     pub seq: i64,
     pub author: String,
     pub meta: String,
     pub body: String,
+    pub blocks: Vec<ChatBlock>,
     pub pending: bool,
     pub rev: i64,
     pub edited: bool,
@@ -60,7 +61,58 @@ pub struct ChatMessage {
     pub thread_seq: i64,
     pub show_author: bool,
     pub initial: String,
+    pub avatar_r: f64,
+    pub avatar_g: f64,
+    pub avatar_b: f64,
     pub reactions: Vec<ChatReaction>,
+}
+
+// `f64` avatar tint keeps `Hash` off the derive; hash the bit pattern instead so
+// `ChatData`/`WorkspaceData` can still derive `Hash` for view memoization.
+impl std::hash::Hash for ChatMessage {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.seq.hash(state);
+        self.author.hash(state);
+        self.meta.hash(state);
+        self.body.hash(state);
+        self.blocks.hash(state);
+        self.pending.hash(state);
+        self.rev.hash(state);
+        self.edited.hash(state);
+        self.deleted.hash(state);
+        self.reply_count.hash(state);
+        self.thread_seq.hash(state);
+        self.show_author.hash(state);
+        self.initial.hash(state);
+        self.avatar_r.to_bits().hash(state);
+        self.avatar_g.to_bits().hash(state);
+        self.avatar_b.to_bits().hash(state);
+        self.reactions.hash(state);
+    }
+}
+
+/// One rendered block of a message body. `kind` is `paragraph` | `code` |
+/// `quote` | `divider`. Plain paragraphs/quotes carry their exact text in
+/// `text` (`rich=false`); formatted ones carry word-level `spans` for a
+/// wrapping flex render (`rich=true`).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatBlock {
+    pub kind: String,
+    pub text: String,
+    pub lang: String,
+    pub rich: bool,
+    pub spans: Vec<ChatSpan>,
+}
+
+/// A word-level run of a rich paragraph/quote, carrying its inline marks.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatSpan {
+    pub text: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub highlight: bool,
+    pub link: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -329,12 +381,15 @@ pub fn optimistic_message(
     body: String,
     message_id: String,
 ) -> Vec<ChatMessage> {
+    let (avatar_r, avatar_g, avatar_b) = avatar_rgb_for("You");
+    let blocks = paragraph_blocks(&body);
     messages.push(ChatMessage {
         id: message_id,
         seq: -1,
         author: "You".into(),
         meta: "Sending…".into(),
         body,
+        blocks,
         pending: true,
         rev: 0,
         edited: false,
@@ -343,6 +398,9 @@ pub fn optimistic_message(
         thread_seq: 0,
         show_author: true,
         initial: "Y".into(),
+        avatar_r,
+        avatar_g,
+        avatar_b,
         reactions: Vec::new(),
     });
     messages
@@ -1326,7 +1384,7 @@ pub async fn send_message(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: required_id(message_id, "message")?,
-                blocks: vec![chat::Block::paragraph(body)],
+                blocks: parse_message(&body),
                 thread: None,
                 as_agent: None,
             }),
@@ -1496,7 +1554,7 @@ pub async fn send_reply(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: message_id.clone(),
-                blocks: vec![chat::Block::paragraph(body)],
+                blocks: parse_message(&body),
                 thread: Some(root_seq),
                 as_agent: None,
             }),
@@ -1539,7 +1597,7 @@ pub async fn edit_message(
             chat::encode_msg(&ChatMsg::EditMessage {
                 channel_id: channel_id.clone(),
                 seq,
-                blocks: vec![chat::Block::paragraph(body)],
+                blocks: parse_message(&body),
                 base_rev: Some(base_rev),
             }),
             password,
@@ -2575,6 +2633,12 @@ fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> Chat
     } else {
         format!("#{}", message.seq)
     };
+    let (avatar_r, avatar_g, avatar_b) = avatar_rgb(&message.head.author);
+    let blocks = if message.head.deleted {
+        vec![deleted_block()]
+    } else {
+        blocks_view(&message.head.blocks)
+    };
     ChatMessage {
         id: message.head.message_id,
         seq: number_i64(message.seq),
@@ -2585,6 +2649,7 @@ fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> Chat
         } else {
             message_body(&message.head.blocks)
         },
+        blocks,
         pending: false,
         rev: i64::from(message.head.rev),
         edited,
@@ -2593,6 +2658,9 @@ fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> Chat
         thread_seq: number_i64(message.head.thread.unwrap_or(0)),
         show_author: true,
         initial: avatar_initial(&message.head.author),
+        avatar_r,
+        avatar_g,
+        avatar_b,
         reactions: message
             .reactions
             .into_iter()
@@ -3251,6 +3319,268 @@ fn span_text(spans: &[chat::Span]) -> String {
     spans.iter().map(|span| span.text.as_str()).collect()
 }
 
+/// Parse composer text into wire `Block`s: fenced ```code``` (optional language),
+/// `>` quotes, `---`/`***` dividers, and paragraphs with inline `**bold**` /
+/// `__bold__`, `*italic*` / `_italic_`, and bare `http(s)` links. Everything the
+/// `chat` wire enums can round-trip — nothing client-only.
+pub fn parse_message(input: &str) -> Vec<chat::Block> {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let trimmed = line.trim();
+        let opens_fence = trimmed.starts_with("```");
+        let is_divider = trimmed == "---" || trimmed == "***";
+        let is_quote = trimmed.starts_with('>');
+        let is_blank = trimmed.is_empty();
+        if opens_fence {
+            index = push_code_block(&lines, index, trimmed, &mut blocks);
+        } else if is_divider {
+            blocks.push(chat::Block::Divider);
+            index += 1;
+        } else if is_quote {
+            index = push_quote_block(&lines, index, &mut blocks);
+        } else if is_blank {
+            index += 1;
+        } else {
+            index = push_paragraph_block(&lines, index, &mut blocks);
+        }
+    }
+    if blocks.is_empty() {
+        blocks.push(chat::Block::paragraph(input.trim().to_string()));
+    }
+    blocks
+}
+
+fn push_code_block(
+    lines: &[&str],
+    start: usize,
+    opener: &str,
+    blocks: &mut Vec<chat::Block>,
+) -> usize {
+    let lang = opener.trim_start_matches('`').trim().to_string();
+    let mut index = start + 1;
+    let mut code = Vec::new();
+    while index < lines.len() && lines[index].trim() != "```" {
+        code.push(lines[index]);
+        index += 1;
+    }
+    let closed = index < lines.len();
+    blocks.push(chat::Block::Code {
+        lang: (!lang.is_empty()).then_some(lang),
+        text: code.join("\n"),
+    });
+    if closed { index + 1 } else { index }
+}
+
+fn push_quote_block(lines: &[&str], start: usize, blocks: &mut Vec<chat::Block>) -> usize {
+    let mut index = start;
+    let mut quoted = Vec::new();
+    while index < lines.len() && lines[index].trim().starts_with('>') {
+        let stripped = lines[index].trim().trim_start_matches('>').trim_start();
+        quoted.push(stripped.to_string());
+        index += 1;
+    }
+    blocks.push(chat::Block::Quote(inline_spans(&quoted.join(" "))));
+    index
+}
+
+fn push_paragraph_block(lines: &[&str], start: usize, blocks: &mut Vec<chat::Block>) -> usize {
+    let mut index = start;
+    let mut paragraph = Vec::new();
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        let breaks = trimmed.is_empty()
+            || trimmed.starts_with('>')
+            || trimmed.starts_with("```")
+            || trimmed == "---"
+            || trimmed == "***";
+        if breaks {
+            break;
+        }
+        paragraph.push(trimmed);
+        index += 1;
+    }
+    blocks.push(chat::Block::Paragraph(inline_spans(&paragraph.join(" "))));
+    index
+}
+
+/// Scan a single line of text for inline marks, emitting marked `Span`s. Marks do
+/// not nest; the first matching delimiter wins. Bare `http(s)://` runs become
+/// `Link`s.
+fn inline_spans(text: &str) -> Vec<chat::Span> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<chat::Span> = Vec::new();
+    let mut plain = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let url = url_len(&chars, index);
+        let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
+        let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
+        if let Some(len) = url {
+            flush_plain(&mut plain, &mut spans);
+            let target: String = chars[index..index + len].iter().collect();
+            spans.push(chat::Span {
+                text: target.clone(),
+                marks: vec![chat::Mark::Link(target)],
+            });
+            index += len;
+        } else if let Some((inner, len)) = bold {
+            flush_plain(&mut plain, &mut spans);
+            spans.push(chat::Span {
+                text: inner,
+                marks: vec![chat::Mark::Bold],
+            });
+            index += len;
+        } else if let Some((inner, len)) = italic {
+            flush_plain(&mut plain, &mut spans);
+            spans.push(chat::Span {
+                text: inner,
+                marks: vec![chat::Mark::Italic],
+            });
+            index += len;
+        } else {
+            plain.push(chars[index]);
+            index += 1;
+        }
+    }
+    flush_plain(&mut plain, &mut spans);
+    if spans.is_empty() {
+        spans.push(chat::Span::plain(String::new()));
+    }
+    spans
+}
+
+fn flush_plain(plain: &mut String, spans: &mut Vec<chat::Span>) {
+    if !plain.is_empty() {
+        spans.push(chat::Span::plain(std::mem::take(plain)));
+    }
+}
+
+/// If `chars[at..]` opens a bare link, its length in chars; else `None`.
+fn url_len(chars: &[char], at: usize) -> Option<usize> {
+    let rest: String = chars[at..].iter().collect();
+    let starts_link = rest.starts_with("http://") || rest.starts_with("https://");
+    if !starts_link {
+        return None;
+    }
+    let len = chars[at..]
+        .iter()
+        .take_while(|c| !c.is_whitespace())
+        .count();
+    (len > 0).then_some(len)
+}
+
+/// If `chars[at..]` opens with `marker` and has a later closing `marker`, the
+/// enclosed text and the total consumed length (markers included).
+fn fenced(chars: &[char], at: usize, marker: &str) -> Option<(String, usize)> {
+    let marks: Vec<char> = marker.chars().collect();
+    let opens = chars[at..].starts_with(marks.as_slice());
+    if !opens {
+        return None;
+    }
+    let body_start = at + marks.len();
+    let mut cursor = body_start;
+    while cursor + marks.len() <= chars.len() {
+        if chars[cursor..].starts_with(marks.as_slice()) {
+            let inner: String = chars[body_start..cursor].iter().collect();
+            if inner.is_empty() {
+                return None;
+            }
+            return Some((inner, cursor + marks.len() - at));
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Convert wire `Block`s into the render model the view iterates over.
+fn blocks_view(blocks: &[chat::Block]) -> Vec<ChatBlock> {
+    blocks.iter().map(block_view).collect()
+}
+
+/// A single plain paragraph render block — for optimistic sends and fixtures
+/// that never carry inline marks.
+pub fn paragraph_blocks(text: &str) -> Vec<ChatBlock> {
+    vec![ChatBlock {
+        kind: "paragraph".into(),
+        text: text.to_string(),
+        lang: String::new(),
+        rich: false,
+        spans: Vec::new(),
+    }]
+}
+
+fn deleted_block() -> ChatBlock {
+    ChatBlock {
+        kind: "paragraph".into(),
+        text: "Message deleted".into(),
+        lang: String::new(),
+        rich: false,
+        spans: Vec::new(),
+    }
+}
+
+fn block_view(block: &chat::Block) -> ChatBlock {
+    match block {
+        chat::Block::Paragraph(spans) => rich_block("paragraph", spans),
+        chat::Block::Quote(spans) => rich_block("quote", spans),
+        chat::Block::Code { lang, text } => ChatBlock {
+            kind: "code".into(),
+            text: text.clone(),
+            lang: lang.clone().unwrap_or_default(),
+            rich: false,
+            spans: Vec::new(),
+        },
+        chat::Block::Divider => ChatBlock {
+            kind: "divider".into(),
+            text: String::new(),
+            lang: String::new(),
+            rich: false,
+            spans: Vec::new(),
+        },
+    }
+}
+
+/// A paragraph/quote block. Plain runs keep their exact text for a single
+/// wrapping `text`; any inline mark switches to word-level `spans` a wrapping
+/// flex can reflow.
+fn rich_block(kind: &str, spans: &[chat::Span]) -> ChatBlock {
+    let marked = spans.iter().any(|span| !span.marks.is_empty());
+    ChatBlock {
+        kind: kind.into(),
+        text: span_text(spans),
+        lang: String::new(),
+        rich: marked,
+        spans: if marked { word_spans(spans) } else { Vec::new() },
+    }
+}
+
+fn word_spans(spans: &[chat::Span]) -> Vec<ChatSpan> {
+    let mut out = Vec::new();
+    for span in spans {
+        let bold = span.marks.iter().any(|m| matches!(m, chat::Mark::Bold));
+        let italic = span.marks.iter().any(|m| matches!(m, chat::Mark::Italic));
+        let link = span.marks.iter().find_map(|mark| match mark {
+            chat::Mark::Link(url) => Some(url.clone()),
+            _ => None,
+        });
+        let mention = span.marks.iter().any(|m| matches!(m, chat::Mark::Mention(_)));
+        let highlight = link.is_some() || mention;
+        for word in span.text.split_whitespace() {
+            out.push(ChatSpan {
+                text: word.to_string(),
+                bold,
+                italic,
+                highlight,
+                link: link.clone().unwrap_or_default(),
+            });
+        }
+    }
+    out
+}
+
 fn author_name(author: &AuthorRef) -> String {
     match author {
         AuthorRef::User(key) => format!("user {}", short_hex(key)),
@@ -3260,20 +3590,61 @@ fn author_name(author: &AuthorRef) -> String {
     }
 }
 
-/// The single-glyph avatar label for an author: the first alphanumeric character
-/// of its identity, uppercased (the hex fingerprint for a user, the id for an
-/// agent/module). Falls back to a neutral dot when there is nothing to show.
-fn avatar_initial(author: &AuthorRef) -> String {
-    let source = match author {
+/// The stable identity string an avatar is derived from: the hex fingerprint for
+/// a user, the id for an agent/module. Both the initial glyph and the tint hash
+/// off this so a given author always looks the same.
+fn avatar_source(author: &AuthorRef) -> String {
+    match author {
         AuthorRef::User(key) => short_hex(key),
         AuthorRef::Agent { agent_id, .. } => agent_id.clone(),
         AuthorRef::Module(module) => module.clone(),
         AuthorRef::System => "system".into(),
-    };
+    }
+}
+
+/// The single-glyph avatar label for an author: the first alphanumeric character
+/// of its identity, uppercased. Falls back to a neutral dot when there is
+/// nothing to show.
+fn avatar_initial(author: &AuthorRef) -> String {
+    initial_of(&avatar_source(author))
+}
+
+fn initial_of(source: &str) -> String {
     source
         .chars()
         .find(char::is_ascii_alphanumeric)
         .map_or_else(|| "•".into(), |c| c.to_ascii_uppercase().to_string())
+}
+
+/// Curated avatar tints — saturated mid-tones that keep near-white initials
+/// legible, indexed by a stable hash of the author identity.
+const AVATAR_PALETTE: [(u8, u8, u8); 8] = [
+    (0x60, 0x62, 0xe8), // indigo
+    (0x8a, 0x5c, 0xf0), // violet
+    (0xc7, 0x4a, 0xae), // fuchsia
+    (0xdc, 0x4f, 0x66), // rose
+    (0xc2, 0x6a, 0x24), // amber
+    (0x1a, 0x9d, 0x6e), // emerald
+    (0x0e, 0x8f, 0x96), // teal
+    (0x2f, 0x7a, 0xe0), // blue
+];
+
+/// The avatar tint for an author as linear 0..1 RGB, ready for `color.rgb`.
+pub fn avatar_rgb(author: &AuthorRef) -> (f64, f64, f64) {
+    avatar_rgb_for(&avatar_source(author))
+}
+
+/// The avatar tint for a bare identity string (used for optimistic/local authors).
+pub fn avatar_rgb_for(source: &str) -> (f64, f64, f64) {
+    let hash = source
+        .bytes()
+        .fold(0u32, |acc, byte| acc.wrapping_mul(31).wrapping_add(u32::from(byte)));
+    let (r, g, b) = AVATAR_PALETTE[(hash as usize) % AVATAR_PALETTE.len()];
+    (
+        f64::from(r) / 255.0,
+        f64::from(g) / 255.0,
+        f64::from(b) / 255.0,
+    )
 }
 
 fn short_hex(bytes: &[u8]) -> String {
@@ -3586,6 +3957,66 @@ mod tests {
     }
 
     #[test]
+    fn parse_message_maps_markdown_onto_wire_blocks() {
+        let input = "Hello **world** and *friends*\n\n> quote me\n> across lines\n\n```rust\nfn main() {}\n```\n\nvisit https://ducktape.example for more";
+        let blocks = parse_message(input);
+        assert_eq!(blocks.len(), 4);
+
+        // paragraph 1: plain / bold / plain / italic runs
+        let chat::Block::Paragraph(spans) = &blocks[0] else {
+            panic!("first block is a paragraph");
+        };
+        assert_eq!(spans[0].text, "Hello ");
+        assert!(spans[0].marks.is_empty());
+        assert_eq!(spans[1].text, "world");
+        assert_eq!(spans[1].marks, vec![chat::Mark::Bold]);
+        assert_eq!(spans[3].text, "friends");
+        assert_eq!(spans[3].marks, vec![chat::Mark::Italic]);
+
+        // quote joins its lines
+        let chat::Block::Quote(quote) = &blocks[1] else {
+            panic!("second block is a quote");
+        };
+        assert_eq!(span_text(quote), "quote me across lines");
+
+        // fenced code keeps its language + raw text
+        let chat::Block::Code { lang, text } = &blocks[2] else {
+            panic!("third block is code");
+        };
+        assert_eq!(lang.as_deref(), Some("rust"));
+        assert_eq!(text, "fn main() {}");
+
+        // bare url becomes a link mark
+        let chat::Block::Paragraph(spans) = &blocks[3] else {
+            panic!("fourth block is a paragraph");
+        };
+        let link = spans
+            .iter()
+            .find(|span| matches!(span.marks.first(), Some(chat::Mark::Link(_))))
+            .expect("a link span");
+        assert_eq!(link.text, "https://ducktape.example");
+        assert_eq!(
+            link.marks,
+            vec![chat::Mark::Link("https://ducktape.example".into())]
+        );
+
+        // round-trips into the flattened body + render model
+        assert!(message_body(&blocks).contains("Hello world and friends"));
+        let view = blocks_view(&blocks);
+        assert_eq!(view[0].kind, "paragraph");
+        assert!(view[0].rich, "formatted paragraph renders as spans");
+        assert!(view[0].spans.iter().any(|span| span.bold && span.text == "world"));
+        assert_eq!(view[2].kind, "code");
+        assert_eq!(view[2].text, "fn main() {}");
+
+        // a plain message stays a single non-rich paragraph
+        let plain = blocks_view(&parse_message("just text here"));
+        assert_eq!(plain.len(), 1);
+        assert!(!plain[0].rich);
+        assert_eq!(plain[0].text, "just text here");
+    }
+
+    #[test]
     fn post_commit_hydration_errors_are_not_retryable() {
         let error = committed_error("read failed".into());
         assert!(error.committed);
@@ -3613,6 +4044,7 @@ mod tests {
             author: "You".into(),
             meta: format!("#{seq}"),
             body: body.into(),
+            blocks: paragraph_blocks(body),
             pending: false,
             rev: 0,
             edited: false,
@@ -3621,6 +4053,9 @@ mod tests {
             thread_seq: 0,
             show_author: true,
             initial: "Y".into(),
+            avatar_r: 0.4,
+            avatar_g: 0.4,
+            avatar_b: 0.9,
             reactions: Vec::new(),
         };
         let after_second = merge_message_send_result(
@@ -3678,6 +4113,7 @@ mod tests {
             author: author.into(),
             meta: format!("#{seq}"),
             body: "body".into(),
+            blocks: paragraph_blocks("body"),
             pending: false,
             rev: 0,
             edited: false,
@@ -3686,6 +4122,9 @@ mod tests {
             thread_seq: 0,
             show_author: false,
             initial: "A".into(),
+            avatar_r: 0.4,
+            avatar_g: 0.4,
+            avatar_b: 0.9,
             reactions: Vec::new(),
         };
         let mut messages = vec![
