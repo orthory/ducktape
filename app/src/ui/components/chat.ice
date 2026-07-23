@@ -22,7 +22,8 @@ component ChannelButton(channel:ChatChannel, selected:bool)
             text "#" width=18.0 size=13.0 align-x=center @text-muted
           text channel.name width=fill size=13.0 wrapping=none @text-muted
           if channel.archived
-            text "archived" size=11.0 @text-muted
+            container padding=2.0 padding-left=6.0 padding-right=6.0 bg=white/5 border=white/12 border-w=1.0 r=5.0
+              text "Archived" size=11.0 font=medium @text-muted
           if !channel.archived && channel.huddle_count > 0
             text channel.huddle_count size=11.0 @text-muted
         active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
@@ -105,22 +106,32 @@ component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled
                 hovered bg=white/9 text=fg
                 pressed bg=white/13 text=fg
 
+component ThreadMessageBody(message:ChatMessage)
+  row width=fill spacing=9.0 align=start
+    container width=30.0 height=30.0 align-x=center align-y=center bg=white/7 border=white/8 border-w=1.0 r=8.0
+      text message.initial size=13.0 font=medium @text-fg
+    col width=fill spacing=3.0
+      row width=fill spacing=6.0 align=center
+        text message.author size=13.0 wrapping=none font=medium @text-fg
+        text message.meta size=11.0 wrapping=none @text-muted
+        space width=fill
+      text message.body width=fill size=13.0 wrapping=word @text-fg
+      if !empty(message.reactions)
+        row width=fill spacing=5.0 align=center
+          for reaction in message.reactions
+            container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/5 border=white/9 border-w=1.0 r=7.0
+              row spacing=4.0 align=center
+                text reaction.emoji size=11.0 @text-fg
+                text reaction.count size=11.0 @text-muted
+
 component ThreadMessageCard(message:ChatMessage, selected:bool)
   stack width=fill
     if selected
       container width=fill padding=8.0 bg=white/6 border=white/8 border-w=1.0 r=8.0
-        col width=fill spacing=3.0
-          row width=fill spacing=7.0 align=center
-            text message.author width=fill size=13.0 font=medium @text-fg
-            text message.meta size=11.0 @text-muted
-          text message.body width=fill size=13.0 wrapping=word @text-fg
+        ThreadMessageBody message=message
     if !selected
       container width=fill padding=8.0 bg=transparent border=transparent border-w=1.0 r=8.0
-        col width=fill spacing=3.0
-          row width=fill spacing=7.0 align=center
-            text message.author width=fill size=13.0 font=medium @text-fg
-            text message.meta size=11.0 @text-muted
-          text message.body width=fill size=13.0 wrapping=word @text-fg
+        ThreadMessageBody message=message
 
 component ChatSearchResult(hit:ChatSearchHit)
   button label=hit.text width=fill padding=7.0 -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)

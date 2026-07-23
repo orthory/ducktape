@@ -20,7 +20,7 @@ view
             disabled bg=fg/36 text=bg/14
     chat_sidebar:
       col width=fill height=fill spacing=7.0
-        row width=fill padding-left=7.0 padding-right=7.0 align=center
+        row width=fill padding-left=7.0 padding-right=7.0 spacing=6.0 align=center
           text "CHANNELS" width=fill size=11.0 font=medium @text-muted
           text len(channels) size=11.0 @text-muted
           if !channel_create_open
@@ -58,7 +58,7 @@ view
               ChannelButton channel=channel selected=(channel.id == active_channel)
     pages_sidebar:
       col width=fill height=fill spacing=7.0
-        row width=fill padding-left=7.0 padding-right=7.0 align=center
+        row width=fill padding-left=7.0 padding-right=7.0 spacing=6.0 align=center
           text "PAGES" width=fill size=11.0 font=medium @text-muted
           text len(pages) size=11.0 @text-muted
           if !page_create_open
@@ -154,7 +154,7 @@ view
               stack width=fill height=fill
                 mouse move=chat_pointer_moved
                   sensor show=chat_resized resize=chat_resized
-                    scroll direction=vertical width=fill height=fill anchor-y=end
+                    scroll direction=vertical width=fill height=fill
                       col width=fill spacing=1.0
                         for message in messages
                           stack #message(message.id) width=fill
@@ -274,11 +274,11 @@ view
                   hovered bg=white/4 border=white/8 border-w=1.0
                   focused bg=white/7 border=white/14 border-w=1.0
                   disabled value=muted
-                button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(message_draft))) height=30.0 padding=7.0 -> send_message_submit
+                button "Send" disabled=(loading || !connected || empty(active_channel) || active_channel_archived || empty(trim(message_draft))) width=62.0 height=30.0 padding=7.0 -> send_message_submit
                   active bg=fg/90 text=bg border=white/5 border-w=1.0 r=10.0 shadow=black/14 shadow-y=2.0 shadow-blur=7.0
                   hovered bg=fg/80 text=bg
                   pressed bg=fg text=bg
-                  disabled bg=fg/28 text=bg/12
+                  disabled bg=white/8 text=muted
           if channel_settings_open && !empty(active_channel)
             container width=1.0 height=fill bg=white/8
               text ""
