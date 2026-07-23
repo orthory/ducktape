@@ -147,7 +147,8 @@ pub enum StreamErrorCode {
     BadFrame,
 }
 
-/// Owned mirror of indexer::OpRow's exact serde output.
+/// The ws projection of one stored (borsh) op row — the same json row shape
+/// the /v1/index/*/ops lane serves.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StreamOpRow {
     pub height: u64,
@@ -175,6 +176,28 @@ pub enum StreamOriginKind {
     External,
     Module,
     System,
+}
+
+/// project one stored (borsh) op row onto the ws frame shape — the same
+/// json row the /v1/index/*/ops lane serves.
+fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
+    let payload: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
+    let payload_hex = payload.is_none().then(|| crate::hex_bytes(&row.payload));
+    StreamOpRow {
+        height: row.height,
+        seq: row.seq,
+        time: row.time,
+        origin: StreamOrigin {
+            kind: match row.origin.kind {
+                indexer::OriginKind::External => StreamOriginKind::External,
+                indexer::OriginKind::Module => StreamOriginKind::Module,
+                indexer::OriginKind::System => StreamOriginKind::System,
+            },
+            id: row.origin.id,
+        },
+        payload,
+        payload_hex,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1139,12 +1162,12 @@ fn catch_up_module(
         let entry_count = page.entries.len();
         for (key, value) in page.entries {
             let key = String::from_utf8_lossy(&key).into_owned();
-            let op = match serde_json::from_slice::<StreamOpRow>(&value) {
-                Ok(row) => row,
+            let op = match borsh::from_slice::<indexer::OpRow>(&value) {
+                Ok(row) => stream_op_row(row),
                 Err(_) => {
                     frames.push(unavailable(
                         topic,
-                        "stored op row was not json — rebuild the index",
+                        "stored op row was not a borsh envelope — rebuild the index",
                     ));
                     return CatchUpResult::drop(frames);
                 }
@@ -1577,14 +1600,15 @@ fn append_change_paths(change: &Change, paths: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
 
-    use indexer::{AppliedOp, BlockOps, OriginTag, RebuildMeta};
+    use indexer::{AppliedOp, BlockOps, IndexModule, OriginTag};
     use serde_json::json;
 
     use super::*;
 
     fn temp_store(modules: &[&str]) -> (tempfile::TempDir, Arc<indexer::IndexStore>) {
         let dir = tempfile::TempDir::new().expect("temp index dir");
-        let store = indexer::IndexStore::open(dir.path(), modules).expect("open index");
+        let bare: Vec<IndexModule> = modules.iter().map(|id| IndexModule::bare(id)).collect();
+        let store = indexer::IndexStore::open(dir.path(), &bare).expect("open index");
         (dir, Arc::new(store))
     }
 
@@ -1661,15 +1685,7 @@ mod tests {
     #[test]
     fn resume_below_backfill_floor_lagged_to_live_watermark() {
         let (_dir, store) = temp_store(&["chat"]);
-        store
-            .mark_backfilled(
-                "chat",
-                RebuildMeta {
-                    height: 10,
-                    time: 0,
-                },
-            )
-            .expect("mark backfilled");
+        store.mark_backfilled("chat", 10).expect("mark backfilled");
         let (state, lagged) = prepare_topic(
             "module:chat",
             Some(&"op/0000000000000005/0000".to_string()),
@@ -1863,9 +1879,11 @@ mod tests {
         assert_eq!(json["origin"], "alice");
         assert_eq!(json["text"], "list files");
         // a caught-up reader sees nothing new.
-        assert!(catch_up_term_command("term-cmd:s", "s", &mut seq, &ring)
-            .frames
-            .is_empty());
+        assert!(
+            catch_up_term_command("term-cmd:s", "s", &mut seq, &ring)
+                .frames
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2029,5 +2047,4 @@ mod tests {
             })
         ));
     }
-
 }

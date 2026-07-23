@@ -72,7 +72,6 @@ pub(super) struct RuntimeWiring {
 pub(super) async fn finish(
     context: &commonware_runtime::tokio::Context,
     index: &indexer::IndexStore,
-    host: &Host,
     resumed: Option<&recovery::Recovered>,
     recovery_manifest_for_resume: Option<&recovery::Manifest>,
     boot_fold: crate::explorer::IndexFold<'_>,
@@ -105,7 +104,7 @@ pub(super) async fn finish(
     // state that has verified against the boundary root-hash.
     drop(boot_fold);
     if let Some(boot_height) = resumed.as_ref().and_then(|r| r.height) {
-        heal_index(index, host, boot_height, &label).await;
+        heal_index(index, boot_height, &label);
     }
 
     let member_keys = match resume_member_keys(resumed, validators) {

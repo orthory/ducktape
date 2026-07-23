@@ -1,78 +1,68 @@
-//! fold / query / parity tests for the derived tag index (`index/tags.rs`).
+//! fold / query tests for the derived tag index (`index/tags.rs`).
 //! extraction unit tests live next to the extractor; these drive the whole
-//! mapper through a real [`IndexStore`] exactly like `index.rs`'s own tests
+//! decision core over the map harness exactly like `index.rs`'s own tests
 //! (whose tiny harness is deliberately duplicated here rather than shared —
 //! the two suites stay independently readable).
 
-use super::{ChatViewReply, MsgRow, TagRow, tags};
-use crate::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Span, encode_msg};
-use indexer::{AppliedOp, BlockOps, Error, IndexStore, OriginTag};
+use std::collections::BTreeMap;
 
-fn store(dir: &std::path::Path) -> IndexStore {
-    IndexStore::open(dir, &["chat"])
-        .expect("open store")
-        .with_indexer(Box::new(super::ChatIndex::default()))
-}
+use super::{ChatViewReply, MsgRow, TagRow, fold_op, serve_view, tags};
+use crate::{Block, ChatMsg, Span, encode_msg};
+use index_guest::{OpRow, OriginTag, apply_to_map};
 
-fn op(msg: &ChatMsg) -> AppliedOp {
-    AppliedOp {
-        module: "chat".into(),
+type Map = BTreeMap<Vec<u8>, Vec<u8>>;
+
+fn op(height: u64, msg: &ChatMsg) -> OpRow {
+    OpRow {
+        height,
+        seq: 0,
+        time: 1_000 + height,
         origin: OriginTag::external("jess"),
         payload: encode_msg(msg),
     }
 }
 
-fn post(channel: &str, id: &str, text: &str) -> AppliedOp {
-    op(&ChatMsg::PostMessage {
+fn post(channel: &str, id: &str, text: &str) -> ChatMsg {
+    ChatMsg::PostMessage {
         channel_id: channel.into(),
         message_id: id.into(),
         blocks: vec![Block::paragraph(text)],
         thread: None,
         as_agent: None,
-    })
+    }
 }
 
-fn edit(channel: &str, seq: u64, text: &str) -> AppliedOp {
-    op(&ChatMsg::EditMessage {
+fn edit(channel: &str, seq: u64, text: &str) -> ChatMsg {
+    ChatMsg::EditMessage {
         channel_id: channel.into(),
         seq,
         blocks: vec![Block::paragraph(text)],
         base_rev: None,
-    })
+    }
 }
 
-fn delete(channel: &str, seq: u64) -> AppliedOp {
-    op(&ChatMsg::DeleteMessage {
+fn delete(channel: &str, seq: u64) -> ChatMsg {
+    ChatMsg::DeleteMessage {
         channel_id: channel.into(),
         seq,
-    })
+    }
 }
 
-fn apply(store: &IndexStore, height: u64, ops: Vec<AppliedOp>) {
-    store
-        .apply_block(&BlockOps {
-            height,
-            time: 1_000 + height,
-            ops,
-            record: None,
-        })
-        .expect("apply");
+fn fold(map: &mut Map, height: u64, msg: &ChatMsg) {
+    let writes = fold_op(&op(height, msg), map).expect("fold");
+    apply_to_map(map, writes);
 }
 
-fn hits(store: &IndexStore, req: serde_json::Value) -> Vec<MsgRow> {
-    let bytes = store
-        .view("chat", &serde_json::to_vec(&req).unwrap())
-        .expect("view");
+fn hits(map: &Map, req: serde_json::Value) -> Vec<MsgRow> {
+    let bytes = serve_view(map, &serde_json::to_vec(&req).unwrap()).expect("view");
     match serde_json::from_slice(&bytes).expect("reply decodes") {
         ChatViewReply::Hits(hits) => hits,
         other => panic!("expected hits, got {other:?}"),
     }
 }
 
-fn tag_rows(store: &IndexStore, req: serde_json::Value) -> Vec<TagRow> {
-    let bytes = store
-        .view("chat", &serde_json::to_vec(&req).unwrap())
-        .expect("view");
+fn tag_rows(map: &Map, req: serde_json::Value) -> Vec<TagRow> {
+    let bytes = serve_view(map, &serde_json::to_vec(&req).unwrap()).expect("view");
     match serde_json::from_slice(&bytes).expect("reply decodes") {
         ChatViewReply::Tags(rows) => rows,
         other => panic!("expected tags, got {other:?}"),
@@ -87,25 +77,13 @@ fn ids(rows: &[MsgRow]) -> Vec<&str> {
 
 #[test]
 fn posts_index_tags_and_catalog() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(
-        &store,
-        1,
-        vec![post("general", "m1", "shipping #rust today")],
-    );
-    apply(
-        &store,
-        2,
-        vec![post("general", "m2", "more #rust and #wasm")],
-    );
-    apply(&store, 3, vec![post("random", "m3", "#rust elsewhere")]);
+    let mut map = Map::new();
+    fold(&mut map, 1, &post("general", "m1", "shipping #rust today"));
+    fold(&mut map, 2, &post("general", "m2", "more #rust and #wasm"));
+    fold(&mut map, 3, &post("random", "m3", "#rust elsewhere"));
 
     // channel-scoped catalog: count desc, then tag asc; last_seq = newest live.
-    let rows = tag_rows(
-        &store,
-        serde_json::json!({"tags": {"channel_id": "general"}}),
-    );
+    let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "general"}}));
     assert_eq!(
         rows,
         vec![
@@ -124,16 +102,16 @@ fn posts_index_tags_and_catalog() {
 
     // no channel aggregates counts across channels; last_seq is the max of
     // the per-channel newest (seq spaces are per-channel).
-    let rows = tag_rows(&store, serde_json::json!({"tags": {}}));
+    let rows = tag_rows(&map, serde_json::json!({"tags": {}}));
     assert_eq!(rows[0].tag, "rust");
     assert_eq!(rows[0].count, 3);
     assert_eq!(rows[0].last_seq, 2);
 
     // tag search: exact label, newest first, channel scope honored.
-    let all = hits(&store, serde_json::json!({"tag_search": {"tag": "rust"}}));
+    let all = hits(&map, serde_json::json!({"tag_search": {"tag": "rust"}}));
     assert_eq!(ids(&all), ["m3", "m2", "m1"]);
     let scoped = hits(
-        &store,
+        &map,
         serde_json::json!({"tag_search": {"tag": "rust", "channel_id": "general"}}),
     );
     assert_eq!(ids(&scoped), ["m2", "m1"]);
@@ -143,14 +121,13 @@ fn posts_index_tags_and_catalog() {
 
 #[test]
 fn tag_search_matches_exact_label_not_prefix() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(&store, 1, vec![post("g", "m1", "#rust")]);
-    apply(&store, 2, vec![post("g", "m2", "#rustlang")]);
+    let mut map = Map::new();
+    fold(&mut map, 1, &post("g", "m1", "#rust"));
+    fold(&mut map, 2, &post("g", "m2", "#rustlang"));
 
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "rust"}})
         )),
         ["m1"]
@@ -158,7 +135,7 @@ fn tag_search_matches_exact_label_not_prefix() {
     // the query normalizes: `#Rust` (as clicked in the app) finds `#rust`.
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "#Rust"}})
         )),
         ["m1"]
@@ -167,15 +144,14 @@ fn tag_search_matches_exact_label_not_prefix() {
 
 #[test]
 fn hangul_tags_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(&store, 1, vec![post("g", "m1", "이번 주 #한글-지원 작업")]);
+    let mut map = Map::new();
+    fold(&mut map, 1, &post("g", "m1", "이번 주 #한글-지원 작업"));
 
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
+    let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(rows[0].tag, "한글-지원");
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "#한글-지원"}})
         )),
         ["m1"]
@@ -184,12 +160,11 @@ fn hangul_tags_round_trip() {
 
 #[test]
 fn code_blocks_and_link_spans_do_not_index_tags() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(
-        &store,
+    let mut map = Map::new();
+    fold(
+        &mut map,
         1,
-        vec![op(&ChatMsg::PostMessage {
+        &ChatMsg::PostMessage {
             channel_id: "g".into(),
             message_id: "m1".into(),
             blocks: vec![
@@ -205,39 +180,38 @@ fn code_blocks_and_link_spans_do_not_index_tags() {
             ],
             thread: None,
             as_agent: None,
-        })],
+        },
     );
 
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
+    let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].tag, "yes");
-    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "nope"}})).is_empty());
+    assert!(hits(&map, serde_json::json!({"tag_search": {"tag": "nope"}})).is_empty());
 }
 
 #[test]
 fn edit_diffs_old_and_new_tag_sets() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(&store, 1, vec![post("g", "m1", "#old #keep")]);
-    apply(&store, 2, vec![edit("g", 1, "#keep #new")]);
+    let mut map = Map::new();
+    fold(&mut map, 1, &post("g", "m1", "#old #keep"));
+    fold(&mut map, 2, &edit("g", 1, "#keep #new"));
 
-    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "old"}})).is_empty());
+    assert!(hits(&map, serde_json::json!({"tag_search": {"tag": "old"}})).is_empty());
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "keep"}})
         )),
         ["m1"]
     );
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "new"}})
         )),
         ["m1"]
     );
     // the catalog moved by the diff: `old` is gone at count zero.
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
+    let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(
         rows,
         vec![
@@ -257,16 +231,15 @@ fn edit_diffs_old_and_new_tag_sets() {
 
 #[test]
 fn delete_removes_postings_and_decrements_catalog() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(&store, 1, vec![post("g", "m1", "#x first")]);
-    apply(&store, 2, vec![post("g", "m2", "#x second")]);
-    apply(&store, 3, vec![delete("g", 2)]);
+    let mut map = Map::new();
+    fold(&mut map, 1, &post("g", "m1", "#x first"));
+    fold(&mut map, 2, &post("g", "m2", "#x second"));
+    fold(&mut map, 3, &delete("g", 2));
 
     // the NEWEST tagged message died: count decrements AND last_seq falls
     // back to the surviving posting (the catalog stores no last_seq — it is
     // read off the newest live posting, so no stale maximum survives).
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
+    let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(
         rows,
         vec![TagRow {
@@ -276,40 +249,32 @@ fn delete_removes_postings_and_decrements_catalog() {
         }]
     );
     assert_eq!(
-        ids(&hits(
-            &store,
-            serde_json::json!({"tag_search": {"tag": "x"}})
-        )),
+        ids(&hits(&map, serde_json::json!({"tag_search": {"tag": "x"}}))),
         ["m1"]
     );
 
     // deleting the last carrier drops the catalog entry entirely.
-    apply(&store, 4, vec![delete("g", 1)]);
-    assert!(tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}})).is_empty());
-    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "x"}})).is_empty());
+    fold(&mut map, 4, &delete("g", 1));
+    assert!(tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}})).is_empty());
+    assert!(hits(&map, serde_json::json!({"tag_search": {"tag": "x"}})).is_empty());
 }
 
 #[test]
-fn same_block_post_then_edit_folds_tags_through_the_overlay() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(
-        &store,
-        1,
-        vec![
-            post("g", "m1", "#draft words"),
-            edit("g", 1, "#final words"),
-        ],
-    );
-    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "draft"}})).is_empty());
+fn same_batch_post_then_edit_folds_tags_through_applied_writes() {
+    let mut map = Map::new();
+    // one feed batch: the edit's decision reads the post's applied writes.
+    fold(&mut map, 1, &post("g", "m1", "#draft words"));
+    fold(&mut map, 1, &edit("g", 1, "#final words"));
+
+    assert!(hits(&map, serde_json::json!({"tag_search": {"tag": "draft"}})).is_empty());
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "final"}})
         )),
         ["m1"]
     );
-    let rows = tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}}));
+    let rows = tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}}));
     assert_eq!(
         rows,
         vec![TagRow {
@@ -322,45 +287,39 @@ fn same_block_post_then_edit_folds_tags_through_the_overlay() {
 
 #[test]
 fn sixteen_tag_cap_binds_at_the_fold() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
+    let mut map = Map::new();
     let text: String = (0..20).map(|i| format!("#tag{i:02} ")).collect();
-    apply(&store, 1, vec![post("g", "m1", &text)]);
+    fold(&mut map, 1, &post("g", "m1", &text));
 
     let rows = tag_rows(
-        &store,
+        &map,
         serde_json::json!({"tags": {"channel_id": "g", "limit": 100}}),
     );
     assert_eq!(rows.len(), tags::MAX_TAGS_PER_MESSAGE);
     assert_eq!(
-        hits(&store, serde_json::json!({"tag_search": {"tag": "tag15"}})).len(),
+        hits(&map, serde_json::json!({"tag_search": {"tag": "tag15"}})).len(),
         1
     );
-    assert!(hits(&store, serde_json::json!({"tag_search": {"tag": "tag16"}})).is_empty());
+    assert!(hits(&map, serde_json::json!({"tag_search": {"tag": "tag16"}})).is_empty());
 }
 
 // ── queries: clamps and validation ──────────────────────────────────────────
 
 #[test]
 fn limits_default_and_clamp_like_search() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
+    let mut map = Map::new();
     for i in 0..25u64 {
-        apply(
-            &store,
-            1 + i,
-            vec![post("g", &format!("m{i}"), "#hot take")],
-        );
+        fold(&mut map, 1 + i, &post("g", &format!("m{i}"), "#hot take"));
     }
 
     // default page = 20, newest first.
-    let page = hits(&store, serde_json::json!({"tag_search": {"tag": "hot"}}));
+    let page = hits(&map, serde_json::json!({"tag_search": {"tag": "hot"}}));
     assert_eq!(page.len(), 20);
     assert_eq!(page[0].message_id, "m24");
     // zero clamps up to one, oversize clamps down to the max (100 ≥ 25 = all).
     assert_eq!(
         hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "hot", "limit": 0}})
         )
         .len(),
@@ -368,7 +327,7 @@ fn limits_default_and_clamp_like_search() {
     );
     assert_eq!(
         hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "hot", "limit": 100000}})
         )
         .len(),
@@ -377,49 +336,45 @@ fn limits_default_and_clamp_like_search() {
 
     // the catalog query clamps the same way.
     let many: String = (0..3).map(|i| format!("#t{i} ")).collect();
-    apply(&store, 100, vec![post("g", "mt", &many)]);
+    fold(&mut map, 100, &post("g", "mt", &many));
     assert_eq!(
-        tag_rows(&store, serde_json::json!({"tags": {"limit": 0}})).len(),
+        tag_rows(&map, serde_json::json!({"tags": {"limit": 0}})).len(),
         1
     );
 }
 
 #[test]
 fn invalid_tag_queries_are_view_errors() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
-    apply(&store, 1, vec![post("g", "m1", "#ok")]);
+    let mut map = Map::new();
+    fold(&mut map, 1, &post("g", "m1", "#ok"));
     let long = "a".repeat(65);
     for bad in ["", "#", "two words", long.as_str()] {
         let req = serde_json::json!({"tag_search": {"tag": bad}});
-        let err = store
-            .view("chat", &serde_json::to_vec(&req).unwrap())
-            .unwrap_err();
+        let err = serve_view(&map, &serde_json::to_vec(&req).unwrap()).unwrap_err();
         assert!(
-            matches!(err, Error::View(_)),
-            "tag {bad:?} should be a view error"
+            err.message.contains("not a valid tag"),
+            "tag {bad:?} should be a view error, got {err:?}"
         );
     }
 }
 
 #[test]
 fn slash_channel_ids_do_not_leak_across_tag_scopes() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(dir.path());
+    let mut map = Map::new();
     // channel "g/0" nests INSIDE "g"'s key prefixes (`tag/{label}/g/`,
     // `tagcat/g/`), and its posting keys even sort AHEAD of g's own (the
     // sub-channel's '0' < the rseq's leading hex 'f') — the worst case for
     // prefix-structural scoping. its #shared lands at seq 2 in its own
     // channel, so any leak is value-distinguishable from g's seq-1 posting.
-    apply(&store, 1, vec![post("g", "m1", "#shared")]);
-    apply(&store, 2, vec![post("g/0", "m2", "#subonly")]);
-    apply(&store, 3, vec![post("g/0", "m3", "#shared")]);
+    fold(&mut map, 1, &post("g", "m1", "#shared"));
+    fold(&mut map, 2, &post("g/0", "m2", "#subonly"));
+    fold(&mut map, 3, &post("g/0", "m3", "#shared"));
 
     // Tags scoped to g: no bogus "0/shared" label off the sub-channel's
     // catalog row, no count leak, and last_seq reads g's OWN newest posting
     // (a structural-prefix leak would report the sub-channel's seq 2).
     assert_eq!(
-        tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g"}})),
+        tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g"}})),
         vec![TagRow {
             tag: "shared".into(),
             count: 1,
@@ -428,7 +383,7 @@ fn slash_channel_ids_do_not_leak_across_tag_scopes() {
     );
     // Tags scoped to the sub-channel see exactly its own rows.
     assert_eq!(
-        tag_rows(&store, serde_json::json!({"tags": {"channel_id": "g/0"}})),
+        tag_rows(&map, serde_json::json!({"tags": {"channel_id": "g/0"}})),
         vec![
             TagRow {
                 tag: "shared".into(),
@@ -446,216 +401,28 @@ fn slash_channel_ids_do_not_leak_across_tag_scopes() {
     // TagSearch scopes on the STORED channel id, exactly like Search.
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "shared", "channel_id": "g"}})
         )),
         ["m1"]
     );
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "shared", "channel_id": "g/0"}})
         )),
         ["m3"]
     );
 
     // no channel scope still aggregates both channels.
-    let all = tag_rows(&store, serde_json::json!({"tags": {}}));
+    let all = tag_rows(&map, serde_json::json!({"tags": {}}));
     let shared = all.iter().find(|r| r.tag == "shared").expect("aggregated");
     assert_eq!((shared.count, shared.last_seq), (2, 2));
     assert_eq!(
         ids(&hits(
-            &store,
+            &map,
             serde_json::json!({"tag_search": {"tag": "shared"}})
         )),
         ["m3", "m1"]
-    );
-}
-
-// ── fold vs rebuild parity ──────────────────────────────────────────────────
-
-/// canonical chat state standing in for the module's query surface, paging
-/// two views at a time like `index.rs`'s rebuild harness.
-struct CanonicalChat {
-    channels: Vec<crate::Channel>,
-    views: Vec<crate::MessageView>,
-}
-
-#[async_trait::async_trait(?Send)]
-impl indexer::StateReader for CanonicalChat {
-    async fn query(&self, req: &[u8]) -> indexer::Result<Vec<u8>> {
-        let reply = match crate::decode_query(req).map_err(Error::State)? {
-            ChatQuery::Channels => ChatReply::Channels(self.channels.clone()),
-            ChatQuery::MessagesRange {
-                channel_id,
-                from_seq,
-                ..
-            } => ChatReply::Messages(
-                self.views
-                    .iter()
-                    .filter(|v| v.channel_id == channel_id && v.seq >= from_seq)
-                    .take(2)
-                    .cloned()
-                    .collect(),
-            ),
-            other => return Err(Error::State(format!("unexpected query {other:?}"))),
-        };
-        Ok(crate::encode_reply(&reply))
-    }
-}
-
-fn canonical_channel(id: &str, head_seq: u64) -> crate::Channel {
-    crate::Channel {
-        id: id.into(),
-        name: id.into(),
-        created_at: 900,
-        head_seq,
-        post_policy: crate::PostPolicy::Open,
-        hooks: Vec::new(),
-        pinned: Vec::new(),
-        huddle: Vec::new(),
-        owner: None,
-        archived: false,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn canonical_view(
-    channel: &str,
-    seq: u64,
-    head_seq: u64,
-    message_id: &str,
-    text: &str,
-    created_at: u64,
-    rev: u32,
-    deleted: bool,
-) -> crate::MessageView {
-    crate::MessageView {
-        channel_id: channel.into(),
-        seq,
-        head: crate::MessageHead {
-            message_id: message_id.into(),
-            author: AuthorRef::User(b"jess".to_vec()),
-            blocks: vec![Block::paragraph(text)],
-            created_at,
-            rev,
-            edited_at: (rev > 0).then_some(created_at + 1),
-            base_rev: None,
-            deleted,
-            thread: None,
-            reply_count: 0,
-            last_reply_seq: None,
-        },
-        reactions: Vec::new(),
-        channel_head_seq: head_seq,
-    }
-}
-
-#[tokio::test]
-async fn rebuild_reproduces_the_folded_tag_index() {
-    // store A: the tag state folds op by op, including an edit that swaps a
-    // tag set and a delete of a tag's newest carrier.
-    let dir_a = tempfile::tempdir().unwrap();
-    let folded = store(dir_a.path());
-    apply(&folded, 1, vec![post("g", "m1", "#alpha #beta launch")]);
-    apply(&folded, 2, vec![post("g", "m2", "#gamma interim")]);
-    apply(&folded, 3, vec![edit("g", 2, "#alpha interim")]);
-    apply(&folded, 4, vec![post("g", "m3", "#alpha again")]);
-    apply(&folded, 5, vec![delete("g", 3)]);
-    apply(&folded, 6, vec![post("q", "m4", "#alpha crosses channels")]);
-
-    // store B: rebuilt from canonical heads equal to A's FINAL live state.
-    // created_at mirrors A's fold times so newest-first ranking agrees.
-    let dir_b = tempfile::tempdir().unwrap();
-    let rebuilt = store(dir_b.path());
-    let state = CanonicalChat {
-        channels: vec![canonical_channel("g", 3), canonical_channel("q", 1)],
-        views: vec![
-            canonical_view("g", 1, 3, "m1", "#alpha #beta launch", 1_001, 0, false),
-            canonical_view("g", 2, 3, "m2", "#alpha interim", 1_002, 1, false),
-            canonical_view("g", 3, 3, "m3", "", 1_004, 0, true),
-            canonical_view("q", 1, 1, "m4", "#alpha crosses channels", 1_006, 0, false),
-        ],
-    };
-    rebuilt
-        .rebuild_module(
-            "chat",
-            &state,
-            indexer::RebuildMeta {
-                height: 50,
-                time: 0,
-            },
-        )
-        .await
-        .expect("rebuild");
-
-    // the catalog re-derives identically — per channel and aggregated.
-    for req in [
-        serde_json::json!({"tags": {"channel_id": "g"}}),
-        serde_json::json!({"tags": {"channel_id": "q"}}),
-        serde_json::json!({"tags": {}}),
-    ] {
-        assert_eq!(
-            tag_rows(&folded, req.clone()),
-            tag_rows(&rebuilt, req),
-            "catalog parity"
-        );
-    }
-    assert_eq!(
-        tag_rows(&folded, serde_json::json!({"tags": {"channel_id": "g"}})),
-        vec![
-            TagRow {
-                tag: "alpha".into(),
-                count: 2,
-                last_seq: 2
-            },
-            TagRow {
-                tag: "beta".into(),
-                count: 1,
-                last_seq: 1
-            },
-        ]
-    );
-
-    // the postings re-derive an exact hit set (rows differ only by `height`,
-    // the rebuild's NAMED degradation — compare identity + tag sets).
-    for tag in ["alpha", "beta", "gamma"] {
-        let req = serde_json::json!({"tag_search": {"tag": tag}});
-        let a: Vec<_> = hits(&folded, req.clone())
-            .into_iter()
-            .map(|r| {
-                (
-                    r.channel_id,
-                    r.seq,
-                    r.message_id,
-                    r.time,
-                    r.tags,
-                    r.edited,
-                    r.deleted,
-                )
-            })
-            .collect();
-        let b: Vec<_> = hits(&rebuilt, req)
-            .into_iter()
-            .map(|r| {
-                (
-                    r.channel_id,
-                    r.seq,
-                    r.message_id,
-                    r.time,
-                    r.tags,
-                    r.edited,
-                    r.deleted,
-                )
-            })
-            .collect();
-        assert_eq!(a, b, "posting parity for #{tag}");
-    }
-    assert_eq!(
-        ids(&hits(
-            &folded,
-            serde_json::json!({"tag_search": {"tag": "alpha"}})
-        )),
-        ["m4", "m2", "m1"]
     );
 }

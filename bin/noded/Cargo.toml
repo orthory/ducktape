@@ -61,10 +61,12 @@ duckfs-core = { workspace = true }
 # the node-local op-receipt blob store (the http blob lane): op payloads staged
 # at submit time, served back by digest. re-exported by `src/blobs.rs`.
 blobstore = { workspace = true }
-# the derived read-model tier: the actor materializes per-module fluent31
-# indexes as blocks commit; /v1/index/* serves snapshot reads of them, and
-# each module registers its `::index` mapper as its own view endpoint.
+# the derived read-model tier: the actor feeds per-module fluent31 databases
+# as blocks commit; each module's bundled wasm index guest folds them and
+# serves its view endpoint. /v1/index/* serves snapshot reads.
 indexer = { workspace = true }
+# decoding the borsh op-row envelopes for the /v1/index/*/ops json projection.
+borsh = { workspace = true }
 # the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
 # it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
 # no self-dial. NOT a consensus-path crate — a client engine, OS-side only.

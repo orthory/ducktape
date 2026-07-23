@@ -195,7 +195,6 @@ pub(crate) async fn run_validator(
     } = wiring::finish(
         &context,
         &index,
-        &host,
         resumed.as_ref(),
         recovery_manifest_for_resume.as_ref(),
         boot_fold,

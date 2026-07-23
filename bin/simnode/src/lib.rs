@@ -144,6 +144,7 @@ use identity::Identity;
 use inbox::Inbox;
 use indexer::IndexStore;
 use kv::Kv;
+use lifecycle::Lifecycle;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
 use noded::{
     BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
@@ -153,9 +154,8 @@ use pages::Pages;
 use saga::SagaModule;
 use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
-use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
-use lifecycle::Lifecycle;
+use tasks::Tasks;
 use valset::Valset;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
@@ -389,23 +389,9 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     let forge_repo = storage.join("forge-git");
 
     // the durable block index: /v1/blocks and /v1/index/* read it, the sim
-    // actor feeds it block-by-block — same wiring as the real daemons.
-    let index_dir = storage.join("index");
-    let index = IndexStore::open(&index_dir, &module_ids)
-        .map(|store| {
-            Arc::new(
-                store
-                    .with_indexer(Box::new(chat::index::ChatIndex::new("chat")))
-                    .with_indexer(Box::new(tasks::index::TasksIndex::new("tasks")))
-                    .with_indexer(Box::new(pages::index::PagesIndex::new("pages"))),
-            )
-        })
-        .map_err(|err| {
-            format!(
-                "open module index at {}: {err} (derived tier — delete the directory to rebuild)",
-                index_dir.display()
-            )
-        })?;
+    // actor feeds it block-by-block — noded's construction site verbatim, so
+    // the sim runs the SAME bundled wasm index guests as the real daemons.
+    let index = noded::open_index_store(&storage, &module_ids)?;
 
     // the log ring is a process-GLOBAL subscriber (and stacks a panic hook per
     // call), so wire it ONLY under `install_log` — the binary does; an embedder
@@ -1330,7 +1316,11 @@ impl Sim {
     /// the `CommittedInfo` for an APPLIED one-op commit; `None` if the op was
     /// rejected (the step/peer reply reports no commit, the submitter got the
     /// rejection). `op_hash` re-stages the payload (idempotent, content-address).
-    fn committed_info(&self, drained: &[DrainedFrame], kind: &'static str) -> Option<CommittedInfo> {
+    fn committed_info(
+        &self,
+        drained: &[DrainedFrame],
+        kind: &'static str,
+    ) -> Option<CommittedInfo> {
         let frame = drained.iter().find(|d| d.op.is_some())?;
         if frame.disposition != node::Disposition::Applied {
             return None;
@@ -1552,7 +1542,10 @@ async fn sim_auto(State(handle): State<ControlState>, Json(req): Json<AutoReques
     }
 }
 
-async fn sim_persona(State(handle): State<ControlState>, Json(req): Json<PersonaRequest>) -> Response {
+async fn sim_persona(
+    State(handle): State<ControlState>,
+    Json(req): Json<PersonaRequest>,
+) -> Response {
     match control(handle, |reply| SimCommand::SetPersona {
         persona: req.persona,
         reply,

@@ -388,7 +388,7 @@ pub(super) async fn park(
         // heal the derived index against the CHECKPOINT boundary
         // before replay, so the suffix folds land contiguously.
         if let Some(ckpt_height) = ckpt.height {
-            heal_index(&index, &host, ckpt_height, &label).await;
+            heal_index(&index, ckpt_height, &label);
         }
         let mut recovery = recovery_slot
             .take()
@@ -461,7 +461,7 @@ pub(super) async fn park(
             root_hash = %hex(&root),
             "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
-        heal_index(&index, node_r.host(), tip, &label).await;
+        heal_index(&index, tip, &label);
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
@@ -1800,7 +1800,7 @@ pub(super) async fn park(
                             // ascension tip; per-block folds keep it
                             // current from here (no more healing).
                             if last_indexed_root.as_ref() != Some(&root) {
-                                heal_index(&index, node_r.host(), tip, &label).await;
+                                heal_index(&index, tip, &label);
                                 if let Err(err) = index.apply_block_record(
                                     tip,
                                     boundary_block_row(tip, &root),

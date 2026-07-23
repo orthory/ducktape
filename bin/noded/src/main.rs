@@ -345,26 +345,19 @@ fn run_node(
                 "noded module index resumed"
             );
         }
-        // heal modules whose watermark trails the resume floor — a wiped (or
+        // stamp modules whose watermark trails the resume floor — a wiped (or
         // torn) per-module database that forward folding can never refill,
-        // because its heights are already spent above it. views re-derive
-        // from local canonical state at the floor; module-level op history
-        // below it starts over at the boundary, visibly via /v1/index/status.
-        match noded::rebuild_stale_modules(
-            &index,
-            &host,
-            indexer::RebuildMeta { height, time: 0 },
-        )
-        .await
-        {
-            Ok(rebuilt) => {
-                for (module, rows) in rebuilt {
+        // because its heights are already spent above it. its feed and views
+        // start over at the boundary, visibly via /v1/index/status; history
+        // below it re-enters only by replaying blocks through the feed.
+        match noded::stamp_stale_modules(&index, height) {
+            Ok(stamped) => {
+                for module in stamped {
                     tracing::info!(
                         target: "ducktape::modules",
                         module,
                         height,
-                        rows,
-                        "noded module index re-derived from state"
+                        "noded module index stamped backfilled at the boundary"
                     );
                 }
             }
