@@ -102,6 +102,21 @@ impl Gateway {
         self.open_session_with(seal_pk, sub, true, None).await
     }
 
+    /// Sealed-body session that ALSO claims to act on behalf of `account` — the
+    /// grant subject a co-hosted lending gateway checks against its on-chain
+    /// credential record (see [`Self::open_session_as`]), but body-sealed. The
+    /// production broker uses this on the self-host path so the owner's gateway
+    /// learns which account is drawing on the credential; refused
+    /// (`credential_not_granted`) if the account is neither owner nor grantee.
+    pub async fn open_session_sealed_as(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+        account: &[u8],
+    ) -> Result<(String, handshake::SessionKeys)> {
+        self.open_session_with(seal_pk, sub, true, Some(account)).await
+    }
+
     async fn open_session_with(
         &self,
         seal_pk: &[u8; 32],
