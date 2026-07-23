@@ -1,6 +1,6 @@
 component Brand()
   row width=fill spacing=9.0 align=center
-    container width=28.0 height=28.0 align-x=center align-y=center bg=white/10 border=white/18 border-w=1.0 r=8.0
+    container width=28.0 height=28.0 align-x=center align-y=center bg=white/7 border=white/13 border-w=1.0 r=8.0 shadow=black/8 shadow-y=1.0 shadow-blur=5.0
       text "D" size=13.0 font=medium @text-fg
     col width=fill spacing=0.0
       text "Ducktape" size=13.0 font=medium @text-fg
@@ -20,7 +20,7 @@ component WorkspaceTabs(status:str, loading:bool)
     tab = next
   on toggle_connection
     connection_open = !connection_open
-  container width=fill height=fill clip=true bg=bg border=white/4 border-w=1.0 px-snap=true
+  container width=fill height=fill clip=true bg=bg border=white/6 border-w=1.0 px-snap=true
     row width=fill height=fill
       container width=240.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar clip=true
         col width=fill height=fill spacing=8.0
@@ -35,31 +35,33 @@ component WorkspaceTabs(status:str, loading:bool)
                   row width=fill height=fill spacing=9.0 align=center
                     text "#" width=18.0 size=14.0 align-x=center font=medium @text-fg
                     text "Chat" width=fill size=13.0 font=medium @text-fg
-                  active bg=white/8 text=fg border=white/12 border-w=1.0 r=10.0
-                  pressed bg=selection
+                  active bg=white/9 text=fg border=white/13 border-w=1.0 r=10.0
+                  hovered bg=white/11 text=fg border=white/16
+                  pressed bg=white/14
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill height=fill spacing=9.0 align=center
                     text "▤" width=18.0 size=14.0 align-x=center @text-muted
                     text "Pages" width=fill size=13.0 @text-muted
-                  active bg=transparent text=muted r=10.0
-                  hovered bg=white/7 text=fg
-                  pressed bg=selection text=fg
+                  active bg=transparent text=muted border=transparent border-w=1.0 r=10.0
+                  hovered bg=white/6 text=fg border=white/8
+                  pressed bg=white/10 text=fg
             _
               col width=fill spacing=3.0
                 button label="Chat" width=fill height=34.0 padding=7.0 -> select_tab("chat")
                   row width=fill height=fill spacing=9.0 align=center
                     text "#" width=18.0 size=14.0 align-x=center @text-muted
                     text "Chat" width=fill size=13.0 @text-muted
-                  active bg=transparent text=muted r=10.0
-                  hovered bg=white/7 text=fg
-                  pressed bg=selection text=fg
+                  active bg=transparent text=muted border=transparent border-w=1.0 r=10.0
+                  hovered bg=white/6 text=fg border=white/8
+                  pressed bg=white/10 text=fg
                 button label="Pages" width=fill height=34.0 padding=7.0 -> select_tab("pages")
                   row width=fill height=fill spacing=9.0 align=center
                     text "▤" width=18.0 size=14.0 align-x=center font=medium @text-fg
                     text "Pages" width=fill size=13.0 font=medium @text-fg
-                  active bg=white/8 text=fg border=white/12 border-w=1.0 r=10.0
-                  pressed bg=selection
-          container width=fill height=1.0 bg=separator
+                  active bg=white/9 text=fg border=white/13 border-w=1.0 r=10.0
+                  hovered bg=white/11 text=fg border=white/16
+                  pressed bg=white/14
+          container width=fill height=1.0 bg=white/6
             text ""
           match tab
             "chat"
@@ -68,7 +70,7 @@ component WorkspaceTabs(status:str, loading:bool)
               slot pages_sidebar
           button label="Connection" width=fill height=28.0 padding=7.0 -> toggle_connection
             row width=fill height=fill spacing=7.0 align=center
-              container width=7.0 height=7.0 bg=fg/55 r=3.5
+              container width=7.0 height=7.0 bg=fg/48 border=white/16 border-w=1.0 r=3.5
                 text ""
               text "Connection" size=11.0 font=medium @text-muted
               if loading
@@ -79,12 +81,12 @@ component WorkspaceTabs(status:str, loading:bool)
                 text "⌄" size=14.0 @text-muted
               if !connection_open
                 text "›" size=14.0 @text-muted
-            active bg=transparent text=muted r=8.0
-            hovered bg=white/7 text=fg
-            pressed bg=white/12
+            active bg=white/3 text=muted border=white/6 border-w=1.0 r=8.0
+            hovered bg=white/7 text=fg border=white/10
+            pressed bg=white/11
           if connection_open
             slot connection
-      container width=1.0 height=fill bg=separator
+      container width=1.0 height=fill bg=white/8
         text ""
       col width=fill height=fill padding-top=28.0
         slot notice

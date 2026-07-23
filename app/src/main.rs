@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_shell_uses_flat_system_materials() {
+    fn macos_shell_uses_layered_system_materials() {
         let ui = concat!(
             include_str!("ui/app.ice"),
             include_str!("ui/backend.ice"),
@@ -1141,8 +1141,15 @@ mod tests {
 
         let theme = include_str!("ui/theme.ice");
         assert!(theme.contains("font ui family=\"Inter\" weight=normal"));
-        assert!(theme.contains("bg #101012fc"));
-        assert!(theme.contains("sidebar #18181bf0"));
+        for material in [
+            "bg #101012de",
+            "surface #202023d9",
+            "popover #262629de",
+            "sidebar #18181bdb",
+            "elevated #29292dde",
+        ] {
+            assert!(theme.contains(material), "{material}");
+        }
 
         let shell = include_str!("ui/components/shell.ice");
         assert!(shell.contains(

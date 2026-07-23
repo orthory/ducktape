@@ -4,11 +4,11 @@ font display family="Inter" weight=bold stretch=normal style=normal
 font mono family=mono weight=normal stretch=normal style=normal
 
 theme
-  bg #101012fc
-  surface #202023fa
-  popover #262629ff
-  sidebar #18181bf0
-  elevated #29292dfc
+  bg #101012de
+  surface #202023d9
+  popover #262629de
+  sidebar #18181bdb
+  elevated #29292dde
   fg #f2f2f4
   muted #a0a0a7
   primary #d8d8dc
@@ -18,4 +18,4 @@ theme
   subtle #ffffff10
   selection #ffffff20
   separator #ffffff08
-  shadow #00000090
+  shadow #00000070
