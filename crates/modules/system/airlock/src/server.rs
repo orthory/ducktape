@@ -20,20 +20,40 @@ use base64::Engine as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
-use crate::attest::{self, AttestMode};
+use crate::attest;
 use crate::bodyseal;
 use crate::handshake;
 use crate::seal::{self, SealKeypair};
 use crate::token::{self, Claims};
 use crate::wire::{
-    AttestationResponse, CredentialPayload, CredentialUpload, SessionRequest, SessionResponse,
+    AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
+    SessionResponse,
 };
 
-/// Everything the gateway needs to serve. Keys are minted inside [`build`].
+/// How the gateway proves its seal key to the broker.
+#[derive(Clone)]
+pub enum AttestMode {
+    /// configfs-tsm hardware attestation. Carries the operator's requested
+    /// vendor: `tdx` | `snp` | `auto` (auto probes the silicon).
+    Tsm(String),
+    /// No TEE. There is no quote; the trust anchor is the seal_pk published on
+    /// consensus, which the broker pins. The gateway serves an empty quote under
+    /// vendor `self-host`.
+    SelfHost,
+}
+
+/// Everything the gateway needs to serve. Keys are minted inside [`build`]
+/// unless `seal_keypair` injects one (the self-host path pins the on-chain key).
 pub struct GatewayConfig {
-    /// tdx | snp | auto.
-    pub attest: String,
+    pub attest: AttestMode,
+    /// The enclave seal keypair. `None` mints a fresh one — the TEE path binds it
+    /// into the quote. Self-host injects the on-chain-published keypair so the
+    /// broker's pinned seal_pk matches what this gateway seals under.
+    pub seal_keypair: Option<SealKeypair>,
+    /// Upstream base for `CredentialKind::Claude` credentials.
     pub anthropic_base: String,
+    /// Upstream base for `CredentialKind::Codex` credentials.
+    pub openai_base: String,
     pub oauth_token_url: String,
     pub oauth_client_id: String,
     pub session_ttl_secs: u64,
@@ -42,6 +62,7 @@ pub struct GatewayConfig {
 
 struct Config {
     anthropic_base: String,
+    openai_base: String,
     oauth_token_url: String,
     oauth_client_id: String,
     session_ttl_secs: u64,
@@ -54,24 +75,33 @@ struct Oauth {
     expires_at: u64,
 }
 
+/// One named credential: its vendor, its (refreshable) token state, and a
+/// single-flight gate so two concurrent proxied calls never double-spend one
+/// rotating refresh token.
+struct CredEntry {
+    kind: CredentialKind,
+    oauth: Mutex<Oauth>,
+    refresh_gate: tokio::sync::Mutex<()>,
+}
+
 struct AppState {
     seal_kp: SealKeypair,
     sess_sk: SigningKey,
     sess_pk: VerifyingKey,
     quote: Vec<u8>,
-    /// "tdx" | "snp" — advertised so the client picks the right verifier.
+    /// "tdx" | "snp" | "self-host" — advertised so the client picks the right
+    /// verifier (or, for self-host, pins the on-chain seal_pk instead).
     vendor: String,
     http: reqwest::Client,
     cfg: Config,
-    oauth: Mutex<Option<Oauth>>,
-    /// Single-flight gate around the OAuth refresh: held across the token POST so
-    /// two concurrent callers cannot both spend the same rotating refresh token.
-    refresh_gate: tokio::sync::Mutex<()>,
-    /// Remaining request budget per session `sub`. Refillable by asking for a new
-    /// /session and unbounded in `sub`; the overlay ACL gates who may reach it.
+    /// The named credential store, keyed by credential name (== session `sub`).
+    /// Seeded at build and/or filled by sealed `/credential` uploads.
+    creds: Mutex<HashMap<String, Arc<CredEntry>>>,
+    /// Remaining request budget per session `sub` (credential name). Refilled by
+    /// asking for a new /session; the overlay ACL gates who may reach it.
     budgets: Mutex<HashMap<String, u32>>,
-    /// Per-sub sealed-request nonces already served — replay dedupe. Bounded
-    /// by the request budget per sub; dies with the process like every key.
+    /// Per-name sealed-request nonces already served — replay dedupe. Bounded
+    /// by the request budget per name; dies with the process like every key.
     seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
 }
 
@@ -85,52 +115,85 @@ fn now_secs() -> u64 {
 /// vendor roots, so this seam grants no forgery power.
 pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> + Send + Sync>;
 
-/// Build the gateway router and report the vendor ("tdx"/"snp").
-/// Resolves `cfg.attest` to a configfs-tsm quoter; `auto` probes the hardware
-/// for the vendor.
+/// Build the gateway router and report the vendor ("tdx"/"snp"/"self-host").
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
-    build_seeded(cfg, None)
+    build_seeded(cfg, Vec::new())
 }
 
-/// Like [`build`], but seed the enclave with an initial credential directly
-/// instead of waiting for a sealed `/credential` upload. Used when the credential
-/// provider IS the gateway process (the node embed): there is no host-vs-enclave
-/// boundary to seal across, so the credential is handed in-process. A `Bearer` is
-/// static (no rotation); a `Refresh` is refreshed lazily on first proxied call.
+/// Like [`build`], but seed the store with named credentials directly instead of
+/// waiting for sealed `/credential` uploads. Used when the credential provider IS
+/// the gateway process (the node embed): there is no host-vs-enclave boundary to
+/// seal across, so credentials are handed in-process. A `Bearer` is static (no
+/// rotation); a claude `Refresh` is refreshed lazily; a codex `Refresh` is
+/// refused (bearer-only lane).
 pub fn build_seeded(
     cfg: GatewayConfig,
-    initial_credential: Option<CredentialPayload>,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
 ) -> Result<(Router, String)> {
-    let mode = if cfg.attest == "auto" {
-        tsm_probe_provider()?
-    } else {
-        cfg.attest.parse::<AttestMode>()?
-    };
-    build_with_quoter(cfg, mode.as_str(), tsm_quoter(mode), initial_credential)
+    match cfg.attest.clone() {
+        AttestMode::Tsm(spec) => {
+            let mode = if spec == "auto" {
+                tsm_probe_provider()?
+            } else {
+                spec.parse::<attest::AttestMode>()?
+            };
+            build_with_quoter(cfg, mode.as_str(), tsm_quoter(mode), seeds)
+        }
+        AttestMode::SelfHost => build_self_host(cfg, seeds),
+    }
 }
 
-fn tsm_quoter(expected: AttestMode) -> Quoter {
+fn tsm_quoter(expected: attest::AttestMode) -> Quoter {
     Box::new(move |rd| tsm_gen_quote(Some(expected), rd).map(|(_, quote)| quote))
 }
 
-/// Build the gateway with an injected quote generator, optionally seeding an
-/// initial in-process credential (see [`build_seeded`]). Mints the enclave keys
-/// and calls `quoter` once on the freshly bound REPORTDATA.
+/// Build the gateway with an injected quote generator (see [`build_seeded`]).
+/// Mints/takes the enclave seal key, mints the session key, and calls `quoter`
+/// once on the freshly bound REPORTDATA.
 pub fn build_with_quoter(
-    cfg: GatewayConfig,
+    mut cfg: GatewayConfig,
     vendor: &str,
     quoter: Quoter,
-    initial_credential: Option<CredentialPayload>,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
 ) -> Result<(Router, String)> {
-    // Enclave-bound keys, memory only.
-    let seal_kp = SealKeypair::generate();
+    let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
     let sess_pk = sess_sk.verifying_key();
 
-    let seal_pk = seal_kp.public_bytes();
-    let report_data = attest::make_report_data(&seal_pk, &sess_pk.to_bytes());
+    let report_data = attest::make_report_data(&seal_kp.public_bytes(), &sess_pk.to_bytes());
     let quote = quoter(&report_data)?;
-    let vendor = vendor.to_string();
+    assemble(cfg, vendor.to_string(), quote, seal_kp, sess_sk, sess_pk, seeds)
+}
+
+/// Non-TEE build: no quote, vendor "self-host". The broker pins the seal_pk from
+/// consensus, so there is nothing to attest here.
+fn build_self_host(
+    mut cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+) -> Result<(Router, String)> {
+    let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
+    let sess_sk = SigningKey::generate(&mut OsRng);
+    let sess_pk = sess_sk.verifying_key();
+    assemble(cfg, "self-host".to_string(), Vec::new(), seal_kp, sess_sk, sess_pk, seeds)
+}
+
+/// Shared assembly: build the named store from the seeds, wire the state and the
+/// router. The two build paths differ only in vendor/quote/keys, all resolved
+/// before this point.
+#[allow(clippy::too_many_arguments)]
+fn assemble(
+    cfg: GatewayConfig,
+    vendor: String,
+    quote: Vec<u8>,
+    seal_kp: SealKeypair,
+    sess_sk: SigningKey,
+    sess_pk: VerifyingKey,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+) -> Result<(Router, String)> {
+    let mut creds = HashMap::new();
+    for (name, kind, payload) in seeds {
+        creds.insert(name, Arc::new(cred_entry(kind, payload)?));
+    }
 
     let state = Arc::new(AppState {
         seal_kp,
@@ -141,26 +204,13 @@ pub fn build_with_quoter(
         http: reqwest::Client::new(),
         cfg: Config {
             anthropic_base: cfg.anthropic_base,
+            openai_base: cfg.openai_base,
             oauth_token_url: cfg.oauth_token_url,
             oauth_client_id: cfg.oauth_client_id,
             session_ttl_secs: cfg.session_ttl_secs,
             max_requests: cfg.max_requests,
         },
-        oauth: Mutex::new(initial_credential.map(|credential| match credential {
-            // static bearer: used as-is, never refreshed (expires_at = MAX).
-            CredentialPayload::Bearer { access_token } => Oauth {
-                access_token,
-                refresh_token: String::new(),
-                expires_at: u64::MAX,
-            },
-            // refresh token: exchanged lazily on the first proxied call (expires_at = 0).
-            CredentialPayload::Refresh { refresh_token } => Oauth {
-                access_token: String::new(),
-                refresh_token,
-                expires_at: 0,
-            },
-        })),
-        refresh_gate: tokio::sync::Mutex::new(()),
+        creds: Mutex::new(creds),
         budgets: Mutex::new(HashMap::new()),
         seen_nonces: Mutex::new(HashMap::new()),
     });
@@ -169,11 +219,33 @@ pub fn build_with_quoter(
         .route("/attestation", get(attestation))
         .route("/credential", post(credential))
         .route("/session", post(session))
-        // Proxy the whole Anthropic /v1/* surface (Claude Code calls
-        // /v1/messages and /v1/messages/count_tokens, not just messages).
+        // Proxy the whole /v1/* surface (Claude Code calls /v1/messages and
+        // /v1/messages/count_tokens, not just messages).
         .route("/v1/{*rest}", any(proxy))
         .with_state(state);
     Ok((app, vendor))
+}
+
+/// Turn a seed/upload payload into a [`CredEntry`]. A `Bearer` is static
+/// (`expires_at = MAX`, never refreshed); a claude `Refresh` starts empty and is
+/// exchanged lazily; a codex `Refresh` is rejected — codex is bearer-only in v1.
+fn cred_entry(kind: CredentialKind, payload: CredentialPayload) -> Result<CredEntry> {
+    let oauth = match (kind, payload) {
+        (_, CredentialPayload::Bearer { access_token }) => Oauth {
+            access_token,
+            refresh_token: String::new(),
+            expires_at: u64::MAX,
+        },
+        (CredentialKind::Claude, CredentialPayload::Refresh { refresh_token }) => Oauth {
+            access_token: String::new(),
+            refresh_token,
+            expires_at: 0,
+        },
+        (CredentialKind::Codex, CredentialPayload::Refresh { .. }) => {
+            bail!("codex credentials must be a static bearer token; oauth refresh is not supported")
+        }
+    };
+    Ok(CredEntry { kind, oauth: Mutex::new(oauth), refresh_gate: tokio::sync::Mutex::new(()) })
 }
 
 /// Serve an already-built gateway router. The node embed BUILDS (and thus
@@ -190,14 +262,14 @@ pub async fn serve_router(listener: tokio::net::TcpListener, app: Router) -> Res
 /// `provider` attribute names the vendor. `expected` is the operator's requested
 /// vendor (`None` = auto); a mismatch errors. Untested off-hardware.
 fn tsm_gen_quote(
-    expected: Option<AttestMode>,
+    expected: Option<attest::AttestMode>,
     report_data: &[u8; attest::REPORT_DATA_LEN],
-) -> Result<(AttestMode, Vec<u8>)> {
+) -> Result<(attest::AttestMode, Vec<u8>)> {
     use std::fs;
     let dir = format!("/sys/kernel/config/tsm/report/airlock-{}", std::process::id());
     fs::create_dir(&dir)
         .with_context(|| format!("create {dir} (are we inside a TDX/SEV-SNP guest?)"))?;
-    let result = (|| -> Result<(AttestMode, Vec<u8>)> {
+    let result = (|| -> Result<(attest::AttestMode, Vec<u8>)> {
         let provider =
             fs::read_to_string(format!("{dir}/provider")).context("read configfs-tsm provider")?;
         let detected = provider_to_mode(provider.trim())?;
@@ -218,17 +290,17 @@ fn tsm_gen_quote(
     result
 }
 
-fn provider_to_mode(provider: &str) -> Result<AttestMode> {
+fn provider_to_mode(provider: &str) -> Result<attest::AttestMode> {
     match provider {
-        "tdx_guest" => Ok(AttestMode::Tdx),
-        "sev_guest" => Ok(AttestMode::Snp),
+        "tdx_guest" => Ok(attest::AttestMode::Tdx),
+        "sev_guest" => Ok(attest::AttestMode::Snp),
         other => bail!("unsupported configfs-tsm provider {other:?} (want tdx_guest/sev_guest)"),
     }
 }
 
 /// Probe the configfs-tsm provider to learn the hardware vendor without
 /// generating a quote (the `auto` mode).
-fn tsm_probe_provider() -> Result<AttestMode> {
+fn tsm_probe_provider() -> Result<attest::AttestMode> {
     use std::fs;
     let dir = format!("/sys/kernel/config/tsm/report/airlock-probe-{}", std::process::id());
     fs::create_dir(&dir)
@@ -266,31 +338,19 @@ async fn credential(
     let payload: CredentialPayload = serde_json::from_slice(&pt)
         .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("bad payload: {e}")))?;
 
-    match payload {
-        CredentialPayload::Refresh { refresh_token } => {
-            *st.oauth.lock().unwrap() = Some(Oauth {
-                access_token: String::new(),
-                refresh_token,
-                expires_at: 0,
-            });
-            // Prove the credential works now, so a later /v1/messages isn't the
-            // first time we learn it's broken.
-            refresh_now(&st).await.map_err(|e| {
-                AppErr(StatusCode::BAD_GATEWAY, format!("initial refresh failed: {e}"))
-            })?;
-        }
-        CredentialPayload::Bearer { access_token } => {
-            // Static access token: used as-is. `expires_at = u64::MAX` so `proxy`
-            // never treats it as stale (there is no refresh token to rotate); a
-            // token that has actually expired surfaces as an upstream 401. Nothing
-            // the owner is still using gets invalidated.
-            *st.oauth.lock().unwrap() = Some(Oauth {
-                access_token,
-                refresh_token: String::new(),
-                expires_at: u64::MAX,
-            });
-        }
+    let entry = Arc::new(
+        cred_entry(up.kind, payload).map_err(|e| AppErr(StatusCode::BAD_REQUEST, e.to_string()))?,
+    );
+    // A claude refresh credential starts with no access token — prove it works
+    // now, so a later /v1/messages isn't the first time we learn it's broken. A
+    // static bearer already holds its token; nothing to probe.
+    let needs_probe = entry.oauth.lock().unwrap().access_token.is_empty();
+    if needs_probe {
+        refresh_now(&st.cfg, &st.http, &entry).await.map_err(|e| {
+            AppErr(StatusCode::BAD_GATEWAY, format!("initial refresh failed: {e}"))
+        })?;
     }
+    st.creds.lock().unwrap().insert(up.name, entry);
     Ok(StatusCode::OK)
 }
 
@@ -298,6 +358,13 @@ async fn session(
     State(st): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, AppErr> {
+    // A session names the credential it draws on; refuse an unknown name before
+    // any handshake work (the broker resolves the name from consensus first, so
+    // a miss here is a race or a stale record).
+    let known_credential = st.creds.lock().unwrap().contains_key(&req.sub);
+    if !known_credential {
+        return Err(AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()));
+    }
     // Enclave side of the handshake: derive the shared key from the client's
     // ephemeral key and our static seal secret, then seal the token under it — so
     // only the client that ECDH'd against the *attested* seal_pk can open it.
@@ -358,6 +425,15 @@ async fn proxy_inner(
     if claims.exp < now {
         return Err(AppErr(StatusCode::UNAUTHORIZED, "session token expired".into()));
     }
+    // The session's `sub` names the credential it draws on; resolve it now — its
+    // kind selects the upstream and its own token state is what we refresh/spend.
+    let entry = st
+        .creds
+        .lock()
+        .unwrap()
+        .get(&claims.sub)
+        .cloned()
+        .ok_or_else(|| AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()))?;
     // Sealed-body session: re-derive the handshake keys statelessly from the
     // claims' ephemeral pk, unseal the request, and REFUSE plaintext — a
     // stolen bearer alone (visible to path hosts) cannot produce a sealable
@@ -430,28 +506,29 @@ async fn proxy_inner(
     }
 
     // Ensure a fresh access token, then swap session token -> real credential.
-    let stale = st
-        .oauth
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|o| o.access_token.is_empty() || o.expires_at <= now)
-        .unwrap_or(true);
+    let stale = {
+        let o = entry.oauth.lock().unwrap();
+        o.access_token.is_empty() || o.expires_at <= now
+    };
     if stale {
-        refresh_now(st)
+        refresh_now(&st.cfg, &st.http, &entry)
             .await
             .map_err(|e| AppErr(StatusCode::BAD_GATEWAY, format!("refresh: {e}")))?;
     }
-    let access = st
-        .oauth
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|o| o.access_token.clone())
-        .filter(|a| !a.is_empty())
-        .ok_or_else(|| AppErr(StatusCode::BAD_GATEWAY, "no credential loaded".into()))?;
+    let access = {
+        let o = entry.oauth.lock().unwrap();
+        if o.access_token.is_empty() {
+            return Err(AppErr(StatusCode::BAD_GATEWAY, "no credential loaded".into()));
+        }
+        o.access_token.clone()
+    };
 
-    let url = format!("{}{}", st.cfg.anthropic_base.trim_end_matches('/'), path_and_query);
+    // Upstream base is chosen by the credential's vendor kind.
+    let upstream_base = match entry.kind {
+        CredentialKind::Claude => &st.cfg.anthropic_base,
+        CredentialKind::Codex => &st.cfg.openai_base,
+    };
+    let url = format!("{}{}", upstream_base.trim_end_matches('/'), path_and_query);
     let mut rb = st.http.request(method, &url).body(body.to_vec());
     // Forward the caller's headers verbatim, minus ones we own or that would
     // break the relay. bearer_auth then plants the real credential.
@@ -522,27 +599,26 @@ async fn proxy_inner(
         .map_err(|e| AppErr(StatusCode::INTERNAL_SERVER_ERROR, format!("build response: {e}")))
 }
 
-/// Exchange the refresh token for a fresh access token (and rotated refresh
-/// token), single-flighted so concurrent callers never double-spend it.
-async fn refresh_now(st: &AppState) -> Result<()> {
-    let _gate = st.refresh_gate.lock().await;
+/// Exchange one credential's refresh token for a fresh access token (and rotated
+/// refresh token), single-flighted per credential so concurrent callers never
+/// double-spend it.
+async fn refresh_now(cfg: &Config, http: &reqwest::Client, entry: &CredEntry) -> Result<()> {
+    let _gate = entry.refresh_gate.lock().await;
     // Re-check under the gate — a caller we queued behind may have just done it.
     let refresh = {
-        let g = st.oauth.lock().unwrap();
-        let o = g.as_ref().context("no credential to refresh")?;
+        let o = entry.oauth.lock().unwrap();
         if !o.access_token.is_empty() && o.expires_at > now_secs() {
             return Ok(());
         }
         o.refresh_token.clone()
     };
 
-    let resp = st
-        .http
-        .post(&st.cfg.oauth_token_url)
+    let resp = http
+        .post(&cfg.oauth_token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh.as_str()),
-            ("client_id", st.cfg.oauth_client_id.as_str()),
+            ("client_id", cfg.oauth_client_id.as_str()),
         ])
         .send()
         .await?;
@@ -557,13 +633,11 @@ async fn refresh_now(st: &AppState) -> Result<()> {
     let expires_in = j["expires_in"].as_u64().unwrap_or(3600);
 
     let now = now_secs();
-    let mut g = st.oauth.lock().unwrap();
-    if let Some(o) = g.as_mut() {
-        o.access_token = access;
-        if let Some(r) = new_refresh {
-            o.refresh_token = r; // memory-only; lost on restart, re-seal to recover
-        }
-        o.expires_at = now + expires_in.saturating_sub(60);
+    let mut o = entry.oauth.lock().unwrap();
+    o.access_token = access;
+    if let Some(r) = new_refresh {
+        o.refresh_token = r; // memory-only; lost on restart, re-seal to recover
     }
+    o.expires_at = now + expires_in.saturating_sub(60);
     Ok(())
 }

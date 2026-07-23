@@ -18,8 +18,10 @@ use tokio::net::TcpListener;
 
 use airlock::attest::{self, Measurement};
 use airlock::client::Gateway;
-use airlock::server::{self, GatewayConfig};
+use airlock::seal::SealKeypair;
+use airlock::server::{self, AttestMode, GatewayConfig};
 use airlock::testkit::SnpTestEnclave;
+use airlock::wire::{AttestationResponse, CredentialKind, CredentialPayload, SessionRequest};
 
 /// 48-byte measurement (all 0x11) shared by the gateway and the verifying client.
 fn measurement() -> Measurement {
@@ -70,8 +72,10 @@ async fn spawn(app: Router) -> String {
 async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
     let (app, vendor) = server::build_with_quoter(
         GatewayConfig {
-            attest: "snp".into(),
+            attest: AttestMode::Tsm("snp".into()),
+            seal_keypair: None,
             anthropic_base: upstream.into(),
+            openai_base: String::new(),
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
@@ -79,7 +83,7 @@ async fn boot_gateway(upstream: &str, enclave: &Arc<SnpTestEnclave>) -> String {
         },
         "snp",
         enclave.quoter(),
-        None,
+        Vec::new(),
     )
     .unwrap();
     assert_eq!(vendor, "snp");
@@ -114,9 +118,12 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
 
     // Credential Provider: verify the quote, then seal + upload the refresh token.
     let seal_pk = attested_seal_pk(&gw, &enclave).await;
-    gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
-        refresh_token: "ref-seed".into(),
-    })
+    gw.upload_sealed_credential(
+        &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
+        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+    )
     .await
     .unwrap();
 
@@ -203,9 +210,12 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
     let gw = Gateway::local(gateway_url.clone());
 
     let seal_pk = attested_seal_pk(&gw, &enclave).await;
-    gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
-        refresh_token: "ref-seed".into(),
-    })
+    gw.upload_sealed_credential(
+        &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
+        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+    )
     .await
     .unwrap();
 
@@ -259,9 +269,12 @@ async fn a_sealed_session_refuses_a_plaintext_body() {
     let gw = Gateway::local(gateway_url.clone());
 
     let seal_pk = attested_seal_pk(&gw, &enclave).await;
-    gw.upload_sealed_credential(&seal_pk, &airlock::wire::CredentialPayload::Refresh {
-        refresh_token: "ref-seed".into(),
-    })
+    gw.upload_sealed_credential(
+        &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
+        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+    )
     .await
     .unwrap();
     let (token, _keys) = gw.open_session_sealed(&seal_pk, "test-sub").await.unwrap();
@@ -315,8 +328,10 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
     let enclave = enclave();
     let (router, vendor) = server::build_with_quoter(
         GatewayConfig {
-            attest: "snp".into(),
+            attest: AttestMode::Tsm("snp".into()),
+            seal_keypair: None,
             anthropic_base: upstream.clone(),
+            openai_base: String::new(),
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
@@ -324,7 +339,11 @@ async fn build_seeded_uses_the_initial_credential_without_upload() {
         },
         "snp",
         enclave.quoter(),
-        Some(airlock::wire::CredentialPayload::Bearer { access_token: "seeded-tok".into() }),
+        vec![(
+            "sub".into(),
+            CredentialKind::Claude,
+            CredentialPayload::Bearer { access_token: "seeded-tok".into() },
+        )],
     )
     .unwrap();
     assert_eq!(vendor, "snp");
@@ -384,6 +403,8 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
     let seal_pk = attested_seal_pk(&gw, &enclave).await;
     gw.upload_sealed_credential(
         &seal_pk,
+        "test-sub",
+        CredentialKind::Claude,
         &airlock::wire::CredentialPayload::Bearer { access_token: "static-access-xyz".into() },
     )
     .await
@@ -405,4 +426,146 @@ async fn static_bearer_credential_is_used_without_any_oauth_refresh() {
         0,
         "a static bearer must NOT trigger an OAuth refresh (no rotation)"
     );
+}
+
+// -------- self-host mode: named multi-credential store + per-kind upstream --------
+
+/// A self-host `GatewayConfig` (no TEE, empty quote). `seal_keypair` is injected
+/// so the test client can handshake against a known seal_pk — the self-host trust
+/// anchor is the pinned key, not a verified quote.
+fn self_host_cfg(
+    seal_keypair: Option<SealKeypair>,
+    anthropic_base: String,
+    openai_base: String,
+) -> GatewayConfig {
+    GatewayConfig {
+        attest: AttestMode::SelfHost,
+        seal_keypair,
+        anthropic_base,
+        openai_base,
+        oauth_token_url: String::new(),
+        oauth_client_id: String::new(),
+        session_ttl_secs: 3600,
+        max_requests: 100,
+    }
+}
+
+/// An upstream that echoes back the `Authorization` header the gateway sent, so a
+/// round-trip reveals exactly which credential's token the proxy planted.
+async fn boot_echo_upstream() -> String {
+    async fn echo(headers: HeaderMap) -> Response {
+        let got = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        ([("content-type", "text/plain")], got).into_response()
+    }
+    spawn(Router::new().route("/v1/messages", post(echo))).await
+}
+
+/// Open a session for `name` and POST once; return the `Authorization` header the
+/// upstream saw (the echo upstream reflects it in the body).
+async fn round_trip_via(gw: &Gateway, gateway_url: &str, seal_pk: &[u8; 32], name: &str) -> String {
+    let token = gw.open_session(seal_pk, name).await.unwrap();
+    reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/messages"))
+        .bearer_auth(&token)
+        .body("{}")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn sessions_route_to_the_named_credential() {
+    let upstream = boot_echo_upstream().await;
+    let kp = SealKeypair::generate();
+    let seal_pk = kp.public_bytes();
+    let (app, vendor) = server::build_seeded(
+        self_host_cfg(Some(kp), upstream.clone(), String::new()),
+        vec![
+            ("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
+                access_token: "tok-a".into(),
+            }),
+            ("b".into(), CredentialKind::Claude, CredentialPayload::Bearer {
+                access_token: "tok-b".into(),
+            }),
+        ],
+    )
+    .unwrap();
+    assert_eq!(vendor, "self-host");
+    let gateway_url = spawn(app).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seen_a = round_trip_via(&gw, &gateway_url, &seal_pk, "a").await;
+    let seen_b = round_trip_via(&gw, &gateway_url, &seal_pk, "b").await;
+    assert_eq!(seen_a, "Bearer tok-a");
+    assert_eq!(seen_b, "Bearer tok-b");
+}
+
+#[tokio::test]
+async fn unknown_credential_name_is_refused_at_session_open() {
+    let (app, _) =
+        server::build_seeded(self_host_cfg(None, String::new(), String::new()), vec![]).unwrap();
+    let gateway_url = spawn(app).await;
+    // The name check precedes the handshake, so the eph field is unread here.
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_url}/session"))
+        .json(&SessionRequest {
+            sub: "missing".into(),
+            client_eph_pk_b64: "AAAA".into(),
+            body_seal: false,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn self_host_attestation_reports_no_quote() {
+    let (app, _) =
+        server::build_seeded(self_host_cfg(None, String::new(), String::new()), vec![]).unwrap();
+    let gateway_url = spawn(app).await;
+    let att: AttestationResponse = reqwest::Client::new()
+        .get(format!("{gateway_url}/attestation"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(att.vendor, "self-host");
+    assert!(att.quote_b64.is_empty());
+}
+
+#[tokio::test]
+async fn codex_credential_proxies_to_the_openai_upstream() {
+    let openai = boot_echo_upstream().await;
+    let kp = SealKeypair::generate();
+    let seal_pk = kp.public_bytes();
+    // anthropic_base is a bogus URL: a codex session must never touch it.
+    let (app, _) = server::build_seeded(
+        self_host_cfg(Some(kp), "http://anthropic.invalid".into(), openai.clone()),
+        vec![("cx".into(), CredentialKind::Codex, CredentialPayload::Bearer {
+            access_token: "tok-codex".into(),
+        })],
+    )
+    .unwrap();
+    let gateway_url = spawn(app).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let seen = round_trip_via(&gw, &gateway_url, &seal_pk, "cx").await;
+    assert_eq!(seen, "Bearer tok-codex", "a codex session hits the openai upstream with its bearer");
+}
+
+#[test]
+fn codex_refresh_seed_is_refused_at_build() {
+    let result = server::build_seeded(
+        self_host_cfg(None, String::new(), String::new()),
+        vec![("cx".into(), CredentialKind::Codex, CredentialPayload::Refresh {
+            refresh_token: "r".into(),
+        })],
+    );
+    assert!(result.is_err(), "codex refresh seeds must be rejected (bearer-only lane)");
 }

@@ -15,7 +15,8 @@ use base64::Engine as _;
 use crate::handshake;
 use crate::seal;
 use crate::wire::{
-    AttestationResponse, CredentialPayload, CredentialUpload, SessionRequest, SessionResponse,
+    AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
+    SessionResponse,
 };
 
 /// Topology-agnostic handle to a gateway.
@@ -114,17 +115,24 @@ impl Gateway {
     }
 
     /// Seal `payload` (a refresh token or a static bearer) to the ALREADY-VERIFIED
-    /// `seal_pk` and upload it. The gateway never sees it in the clear.
+    /// `seal_pk` and upload it under the credential `name`/`kind`. The gateway
+    /// never sees the secret in the clear; the name/kind are cleartext routing.
     pub async fn upload_sealed_credential(
         &self,
         seal_pk: &[u8; 32],
+        name: &str,
+        kind: CredentialKind,
         payload: &CredentialPayload,
     ) -> Result<()> {
         let payload = serde_json::to_vec(payload)?;
         let sealed = seal::seal(seal_pk, &payload);
         let status = self
             .route(self.http.post(self.url("/credential")))
-            .json(&CredentialUpload { sealed_b64: BASE64.encode(sealed) })
+            .json(&CredentialUpload {
+                name: name.to_string(),
+                kind,
+                sealed_b64: BASE64.encode(sealed),
+            })
             .send()
             .await?
             .status();
