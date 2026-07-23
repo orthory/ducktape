@@ -694,7 +694,7 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                                 handle_term_input(&handle, &topics, &session, &data).await;
                             }
                             Ok(ClientMsg::TermResize { session, cols, rows }) => {
-                                handle_term_resize(&handle, &topics, &session, cols, rows);
+                                handle_term_resize(&handle, &topics, &session, cols, rows).await;
                             }
                             Ok(ClientMsg::TermCommand { session, text, origin }) => {
                                 handle_term_command(&handle, &topics, &session, origin, text);
@@ -824,6 +824,28 @@ fn term_entitled(topics: &BTreeMap<String, TopicState>, session: &str) -> bool {
 /// never a panic. Never logs the bytes; the unentitled refusal logs no id (an
 /// id the caller isn't entitled to is not the node's to echo into the
 /// webview-streamed log ring).
+/// the host node a session's input must be forwarded to, or `None` for a local
+/// session (write to this node's pty). Just the guest-side registry lookup.
+fn forward_target(handle: &NodeHandle, session: &str) -> Option<[u8; 32]> {
+    handle.remote_sessions().host_of(session)
+}
+
+/// forward one input event to the session's host over the guest lane. A missing
+/// lane or a full channel drops the frame (never a panic); never logs the bytes.
+async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::SessionInputWire) {
+    let Some(lane) = handle.session_lane() else {
+        tracing::warn!(target: "ducktape::term", reason = "no_session_lane", "term input dropped");
+        return;
+    };
+    if lane
+        .send(crate::SessionJob::Input { host, event })
+        .await
+        .is_err()
+    {
+        tracing::warn!(target: "ducktape::term", reason = "input_forward_failed", "term input dropped");
+    }
+}
+
 async fn handle_term_input(
     handle: &NodeHandle,
     topics: &BTreeMap<String, TopicState>,
@@ -832,6 +854,20 @@ async fn handle_term_input(
 ) {
     if !term_entitled(topics, session) {
         tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term input dropped");
+        return;
+    }
+    // a remote session lives on a host peer — forward the keystrokes there rather
+    // than writing a (nonexistent) local pty.
+    if let Some(host) = forward_target(handle, session) {
+        forward_input(
+            handle,
+            host,
+            crate::SessionInputWire::Input {
+                session: session.to_string(),
+                data_b64: data_b64.to_string(),
+            },
+        )
+        .await;
         return;
     }
     let Some(terminals) = handle.terminals() else {
@@ -859,7 +895,7 @@ async fn handle_term_input(
 
 /// resize a session's pty. Same entitlement gate + no-op-on-unknown discipline
 /// as input.
-fn handle_term_resize(
+async fn handle_term_resize(
     handle: &NodeHandle,
     topics: &BTreeMap<String, TopicState>,
     session: &str,
@@ -868,6 +904,20 @@ fn handle_term_resize(
 ) {
     if !term_entitled(topics, session) {
         tracing::warn!(target: "ducktape::term", reason = "unentitled_session", "term resize dropped");
+        return;
+    }
+    // a remote session's window change forwards to its host.
+    if let Some(host) = forward_target(handle, session) {
+        forward_input(
+            handle,
+            host,
+            crate::SessionInputWire::Resize {
+                session: session.to_string(),
+                cols,
+                rows,
+            },
+        )
+        .await;
         return;
     }
     let Some(terminals) = handle.terminals() else {

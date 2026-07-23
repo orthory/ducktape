@@ -119,6 +119,14 @@ pub struct NodeHandle {
     /// `/v1/term/*` routes answer 503 there and ws `TermInput`/`TermResize` are
     /// no-ops. off-chain, node-local: never consensus state.
     pub(crate) terminals: Option<crate::term::TerminalSessions>,
+    /// the guest-side remote-session request lane into the overlay client half
+    /// (mirrors [`Self::gateway`]). `None` on a handle without a mesh — a cross-
+    /// node create answers 503 there. off-chain, like the gateway lane.
+    pub(crate) session_lane: Option<crate::term_remote::SessionLane>,
+    /// the guest-side session-id → host-node registry. Always present (Default):
+    /// a remote create remembers its host here; the ws input/resize handlers read
+    /// it to pick the forward lane over the absent local session.
+    pub(crate) remote_sessions: crate::term_remote::RemoteSessions,
 }
 
 impl NodeHandle {
@@ -149,6 +157,8 @@ impl NodeHandle {
             code_stage: None,
             admin: crate::admin::AdminConfig::default(),
             terminals: None,
+            session_lane: None,
+            remote_sessions: crate::term_remote::RemoteSessions::default(),
         };
         (handle, cmd_rx, hub)
     }
@@ -219,6 +229,24 @@ impl NodeHandle {
     /// the terminal-session manager, if one is wired.
     pub(crate) fn terminals(&self) -> Option<&crate::term::TerminalSessions> {
         self.terminals.as_ref()
+    }
+
+    /// wire the guest-side remote-session request lane so a cross-node create/
+    /// close/input can reach the overlay client half. only the daemon that owns a
+    /// mesh wires one; a handle without it 503s a cross-node create.
+    pub fn with_session_lane(mut self, lane: crate::term_remote::SessionLane) -> Self {
+        self.session_lane = Some(lane);
+        self
+    }
+
+    /// the guest-side remote-session request lane, if one is wired.
+    pub(crate) fn session_lane(&self) -> Option<&crate::term_remote::SessionLane> {
+        self.session_lane.as_ref()
+    }
+
+    /// the guest-side session-id → host-node registry (always present).
+    pub(crate) fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
+        &self.remote_sessions
     }
 
     /// Point gateway requests at the full node's authenticated overlay

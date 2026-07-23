@@ -1244,6 +1244,7 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
 }
 
 /// Where the airlock gateway lives.
+#[derive(Clone, Debug)]
 enum AirlockGateway {
     /// Same machine (Credential Provider == Computation Provider): a loopback URL.
     Local { url: String },
@@ -1281,6 +1282,7 @@ pub struct ResolvedCredential {
 /// reads the seal_pk out of the attested REPORTDATA; `PinnedSealPk` is the
 /// self-host anchor: the seal_pk published on consensus, pinned directly, with
 /// no quote to verify.
+#[derive(Clone, Debug)]
 pub enum AirlockTrust {
     Attested { measurement: String, attest: String },
     PinnedSealPk([u8; 32]),
@@ -1291,6 +1293,7 @@ pub enum AirlockTrust {
 /// consensus-resolved credential ([`self_host`], which pins the on-chain
 /// seal_pk). Absent on the default broker path (a host-held Anthropic credential
 /// → api.anthropic.com), which is unchanged.
+#[derive(Clone, Debug)]
 pub struct AirlockConfig {
     gateway: AirlockGateway,
     trust: AirlockTrust,
@@ -3057,6 +3060,37 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         let body = resp.text().await.unwrap();
         assert!(body.contains("AIRLOCK-OK"), "sealed self-host round-trip: {body}");
+    }
+
+    #[tokio::test]
+    async fn run_context_airlock_resolves_the_upstream_over_env() {
+        // the per-run AirlockConfig a RunContext carries reaches the broker
+        // through resolve_anthropic_upstream (the seam start_broker feeds
+        // start_anthropic): an explicit config wins outright and reads no env, so
+        // the self-host gateway is resolved even with DUCKTAPE_AIRLOCK_* unset.
+        let upstream = bearer_upstream("tok-ctx").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-ctx".into() },
+            )],
+        )
+        .await;
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        ));
+        let (auth, _url) = resolve_anthropic_upstream(Some(cfg)).await.unwrap();
+        assert!(
+            matches!(auth, AnthropicAuth::Airlock(_)),
+            "an explicit RunContext airlock resolves to the self-host gateway, not env/host"
+        );
     }
 
     #[tokio::test]
