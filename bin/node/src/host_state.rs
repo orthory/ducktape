@@ -519,7 +519,7 @@ fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
         GATEWAY_WASM_COMPONENT,
         &[("chain_id", bindings.identity_chain_id.as_bytes())],
         "gateway",
-        3,
+        4,
     )
 }
 

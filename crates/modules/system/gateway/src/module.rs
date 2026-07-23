@@ -31,8 +31,11 @@ use valset::{
 
 use crate::registry::Registry as RoutesRegistry;
 use crate::{
-    GATEWAY_ROUTE_NS, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteRecord,
-    RouteStatement, decode_msg, decode_query, encode_reply, route_signing_preimage,
+    CredentialGrantStatement, GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS, GatewayMsg, GatewayQuery,
+    GatewayReply, MemberAuthorization, RemoveCredentialStatement, RouteRecord, RouteStatement,
+    SetCredentialStatement, decode_msg, decode_query, encode_reply, grant_credential_preimage,
+    remove_credential_preimage, revoke_credential_preimage, route_signing_preimage,
+    set_credential_preimage,
 };
 
 /// domain tag separating the merged root digest from either sub-root and from
@@ -274,6 +277,154 @@ impl Gateway {
             })
             .map_err(Error::Module)
     }
+
+    /// The shared credential authority check, mirroring [`Self::set_route`]'s
+    /// signer gate: the origin node must be bound to `owner_account`, the
+    /// signer must be a current Ed25519 member key of that account, and the
+    /// signature must verify over `preimage` under [`GATEWAY_CREDENTIAL_NS`].
+    async fn verify_credential_owner(
+        &self,
+        ctx: &dyn Ctx,
+        origin: &[u8],
+        chain_id: &str,
+        owner_account: &[u8],
+        authorization: &MemberAuthorization,
+        preimage: &[u8],
+    ) -> Result<(), Error> {
+        if chain_id != self.chain_id {
+            return Err(Error::Module(
+                "gateway: credential belongs to another chain".into(),
+            ));
+        }
+        let account = self.account_of_node(ctx, origin).await?;
+        if account.account_id != owner_account {
+            return Err(Error::Module(
+                "gateway: credential owner does not own the publisher node".into(),
+            ));
+        }
+        let signer_is_current = account
+            .member_keys
+            .iter()
+            .any(|member| member.pubkey == authorization.signer && member.kind == KeyKind::Ed25519);
+        if !signer_is_current {
+            return Err(Error::Module(
+                "gateway: signer is not a current Ed25519 account member".into(),
+            ));
+        }
+        let proof = MemberProof::Signature {
+            sig: authorization.signature.clone(),
+        };
+        if !verify_authority(
+            KeyKind::Ed25519,
+            &authorization.signer,
+            None,
+            GATEWAY_CREDENTIAL_NS,
+            preimage,
+            &proof,
+        ) {
+            return Err(Error::Module(
+                "gateway: credential signature does not verify".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn set_credential(
+        &mut self,
+        ctx: &dyn Ctx,
+        origin: &[u8],
+        statement: SetCredentialStatement,
+        authorization: MemberAuthorization,
+    ) -> Result<(), Error> {
+        if statement.record.publisher_node != origin {
+            return Err(Error::Module(
+                "gateway: publisher does not match the authenticated origin".into(),
+            ));
+        }
+        let preimage = set_credential_preimage(&statement).map_err(Error::Module)?;
+        self.verify_credential_owner(
+            ctx,
+            origin,
+            &statement.chain_id,
+            &statement.record.owner_account,
+            &authorization,
+            &preimage,
+        )
+        .await?;
+        self.routes
+            .set_credential(statement.record)
+            .map_err(Error::Module)
+    }
+
+    async fn remove_credential(
+        &mut self,
+        ctx: &dyn Ctx,
+        origin: &[u8],
+        statement: RemoveCredentialStatement,
+        authorization: MemberAuthorization,
+    ) -> Result<(), Error> {
+        let preimage = remove_credential_preimage(&statement).map_err(Error::Module)?;
+        self.verify_credential_owner(
+            ctx,
+            origin,
+            &statement.chain_id,
+            &statement.owner_account,
+            &authorization,
+            &preimage,
+        )
+        .await?;
+        self.routes
+            .remove_credential(&statement.name, &statement.owner_account)
+            .map_err(Error::Module)
+    }
+
+    async fn grant_credential(
+        &mut self,
+        ctx: &dyn Ctx,
+        origin: &[u8],
+        statement: CredentialGrantStatement,
+        authorization: MemberAuthorization,
+    ) -> Result<(), Error> {
+        let preimage = grant_credential_preimage(&statement).map_err(Error::Module)?;
+        self.verify_credential_owner(
+            ctx,
+            origin,
+            &statement.chain_id,
+            &statement.owner_account,
+            &authorization,
+            &preimage,
+        )
+        .await?;
+        self.routes
+            .grant_credential(&statement.name, &statement.owner_account, statement.account)
+            .map_err(Error::Module)
+    }
+
+    async fn revoke_credential(
+        &mut self,
+        ctx: &dyn Ctx,
+        origin: &[u8],
+        statement: CredentialGrantStatement,
+        authorization: MemberAuthorization,
+    ) -> Result<(), Error> {
+        let preimage = revoke_credential_preimage(&statement).map_err(Error::Module)?;
+        self.verify_credential_owner(
+            ctx,
+            origin,
+            &statement.chain_id,
+            &statement.owner_account,
+            &authorization,
+            &preimage,
+        )
+        .await?;
+        self.routes
+            .revoke_credential(
+                &statement.name,
+                &statement.owner_account,
+                &statement.account,
+            )
+            .map_err(Error::Module)
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -299,6 +450,34 @@ impl Module for Gateway {
                 statement,
                 authorization,
             } => self.set_route(ctx, &origin, statement, authorization).await,
+            GatewayMsg::SetCredential {
+                statement,
+                authorization,
+            } => {
+                self.set_credential(ctx, &origin, statement, authorization)
+                    .await
+            }
+            GatewayMsg::RemoveCredential {
+                statement,
+                authorization,
+            } => {
+                self.remove_credential(ctx, &origin, statement, authorization)
+                    .await
+            }
+            GatewayMsg::GrantCredential {
+                statement,
+                authorization,
+            } => {
+                self.grant_credential(ctx, &origin, statement, authorization)
+                    .await
+            }
+            GatewayMsg::RevokeCredential {
+                statement,
+                authorization,
+            } => {
+                self.revoke_credential(ctx, &origin, statement, authorization)
+                    .await
+            }
         }
     }
 
@@ -314,11 +493,21 @@ impl Module for Gateway {
                         .map_err(Error::Module)?,
                 )))
             }
-            GatewayQuery::Get { account_id, name } => Ok(encode_reply(&GatewayReply::Route(
-                Box::new(self.routes.route(&account_id, &name).map_err(Error::Module)?),
-            ))),
+            GatewayQuery::Get { account_id, name } => {
+                Ok(encode_reply(&GatewayReply::Route(Box::new(
+                    self.routes
+                        .route(&account_id, &name)
+                        .map_err(Error::Module)?,
+                ))))
+            }
             GatewayQuery::List { account_id } => Ok(encode_reply(&GatewayReply::Routes(
                 self.routes.routes(&account_id).map_err(Error::Module)?,
+            ))),
+            GatewayQuery::Credential { name } => Ok(encode_reply(&GatewayReply::Credential(
+                self.routes.credential(&name).map_err(Error::Module)?,
+            ))),
+            GatewayQuery::Credentials {} => Ok(encode_reply(&GatewayReply::Credentials(
+                self.routes.credentials(),
             ))),
         }
     }
