@@ -30,6 +30,8 @@ on reconnect
   connected = false
   channels = []
   messages = []
+  channel_reads = []
+  unread_boundary = 0
   active_channel = ""
   active_channel_name = ""
   active_channel_archived = false
@@ -107,6 +109,8 @@ on workspace_connected(next)
   status = next.status
   block_height = next.height
   channels = next.channels
+  channel_reads = initial_channel_reads(next.channels, channel_reads)
+  unread_boundary = 0
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
@@ -162,6 +166,8 @@ on workspace_refreshed(next)
   pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
   message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
   pending_message = retain_for_endpoint(pending_message, active_channel, next.active_channel)
+  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name

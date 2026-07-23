@@ -55,7 +55,7 @@ view
         scroll direction=vertical width=fill height=fill
           col width=fill spacing=2.0
             for channel in channels
-              ChannelButton channel=channel selected=(channel.id == active_channel)
+              ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)
     pages_sidebar:
       col width=fill height=fill spacing=7.0
         row width=fill padding-left=7.0 padding-right=7.0 spacing=6.0 align=center
@@ -170,6 +170,13 @@ view
                               pressed bg=white/14 text=fg
                         for message in messages
                           col width=fill spacing=0.0
+                            if unread_boundary > 0 && message.seq == first_unread_seq(messages, unread_boundary)
+                              row width=fill spacing=8.0 align=center padding-top=8.0 padding-bottom=2.0
+                                container width=fill height=1.0 bg=primary/40
+                                  text ""
+                                text "New messages" size=11.0 wrapping=none font=medium @text-primaryhi
+                                container width=fill height=1.0 bg=primary/40
+                                  text ""
                             if message.show_author
                               space height=10.0
                             stack #message(message.id) width=fill

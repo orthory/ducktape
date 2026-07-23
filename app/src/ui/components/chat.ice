@@ -1,4 +1,4 @@
-component ChannelButton(channel:ChatChannel, selected:bool)
+component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
   col width=fill
     if selected
       button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
@@ -16,16 +16,26 @@ component ChannelButton(channel:ChatChannel, selected:bool)
     if !selected
       button label=channel.name width=fill height=34.0 padding=7.0 -> choose_channel(channel.id)
         row width=fill height=fill spacing=9.0 align=center
-          if channel.members_only
+          if channel.members_only && unread
+            text "◆" width=16.0 size=11.0 align-x=center @text-primaryhi
+          if channel.members_only && !unread
             text "◆" width=16.0 size=11.0 align-x=center @text-muted
-          if !channel.members_only
+          if !channel.members_only && unread
+            text "#" width=16.0 size=15.0 align-x=center font=medium @text-primaryhi
+          if !channel.members_only && !unread
             text "#" width=16.0 size=15.0 align-x=center @text-muted
-          text channel.name width=fill size=14.0 wrapping=none @text-muted
+          if unread
+            text channel.name width=fill size=14.0 wrapping=none font=medium @text-fg
+          if !unread
+            text channel.name width=fill size=14.0 wrapping=none @text-muted
           if channel.archived
             container padding=2.0 padding-left=6.0 padding-right=6.0 bg=white/6 border=white/12 border-w=1.0 r=6.0
               text "Archived" size=11.0 font=medium @text-muted
           if !channel.archived && channel.huddle_count > 0
             text channel.huddle_count size=11.0 @text-muted
+          if unread
+            container width=8.0 height=8.0 bg=primaryhi r=4.0
+              text ""
         active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
         hovered bg=white/6 text=fg border=white/9
         pressed bg=white/10 text=fg border=white/12

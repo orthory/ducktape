@@ -2,6 +2,7 @@ extern crate::backend
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
   ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
+  ChannelRead(channel:str, seq:i64)
   ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_r:f64, avatar_g:f64, avatar_b:f64, reactions:[ChatReaction])
@@ -69,6 +70,13 @@ extern crate::backend
   sync refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
   sync refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
   sync refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
+  sync channel_last_read(reads:[ChannelRead], channel:str) -> i64
+  sync channel_head_seq(channels:[ChatChannel], channel:str) -> i64
+  sync mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
+  sync channel_is_unread(reads:[ChannelRead], channel:str, head_seq:i64) -> bool
+  sync initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
+  sync frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
+  sync first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
   sync thread_generation_after_refresh(generation:i64, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> i64
   sync thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   sync retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]

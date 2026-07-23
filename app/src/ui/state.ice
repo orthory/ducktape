@@ -17,6 +17,8 @@ state
   error = ""
   channels:[ChatChannel] = []
   messages:[ChatMessage] = []
+  channel_reads:[ChannelRead] = []
+  unread_boundary:i64 = 0
   active_channel = ""
   active_channel_name = ""
   active_channel_archived = false

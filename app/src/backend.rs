@@ -45,6 +45,15 @@ pub struct ChatMember {
     pub label: String,
 }
 
+/// Client-local read cursor for one channel: the newest `seq` this device has
+/// "seen". There is no wire read-cursor — this list lives only in app state and
+/// is never sent to the node.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChannelRead {
+    pub channel: String,
+    pub seq: i64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
@@ -802,6 +811,113 @@ pub fn refreshed_channel_value(current_channel: String, next_channel: String, va
     } else {
         0
     }
+}
+
+// --- Client-local unread tracking (no wire read-cursor) ------------------
+//
+// `channel_reads` is a per-channel last-seen `seq`. `unread_boundary` is that
+// value FROZEN at the moment you entered the current channel, used only to
+// place the in-channel "New messages" divider for this visit.
+
+fn last_read_of(reads: &[ChannelRead], channel: &str) -> i64 {
+    reads
+        .iter()
+        .find(|read| read.channel == channel)
+        .map_or(0, |read| read.seq)
+}
+
+fn head_seq_of(channels: &[ChatChannel], channel: &str) -> i64 {
+    channels
+        .iter()
+        .find(|entry| entry.id == channel)
+        .map_or(0, |entry| entry.head_seq)
+}
+
+pub fn channel_last_read(reads: Vec<ChannelRead>, channel: String) -> i64 {
+    last_read_of(&reads, &channel)
+}
+
+pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
+    head_seq_of(&channels, &channel)
+}
+
+/// Upsert `channel`'s read cursor to `max(existing, seq)`. An empty channel id
+/// (no channel selected / disconnected) is inert.
+pub fn mark_channel_read(
+    mut reads: Vec<ChannelRead>,
+    channel: String,
+    seq: i64,
+) -> Vec<ChannelRead> {
+    if channel.is_empty() {
+        return reads;
+    }
+    if let Some(read) = reads.iter_mut().find(|read| read.channel == channel) {
+        read.seq = read.seq.max(seq);
+        return reads;
+    }
+    reads.push(ChannelRead { channel, seq });
+    reads
+}
+
+/// A channel is unread when its newest `seq` is past what this device has seen.
+/// `initial_channel_reads` seeds every channel at connect, so a caught-up
+/// channel has `last_read == head_seq` and never lights up spuriously; the
+/// cursor only lags once new messages actually arrive.
+pub fn channel_is_unread(reads: Vec<ChannelRead>, channel: String, head_seq: i64) -> bool {
+    head_seq > last_read_of(&reads, &channel)
+}
+
+/// On first connect, seed each not-yet-tracked channel's cursor to its own head
+/// so the session starts fully caught up. Existing entries are preserved.
+pub fn initial_channel_reads(
+    channels: Vec<ChatChannel>,
+    existing: Vec<ChannelRead>,
+) -> Vec<ChannelRead> {
+    let mut reads = existing;
+    for channel in channels {
+        let tracked = reads.iter().any(|read| read.channel == channel.id);
+        if !tracked {
+            reads.push(ChannelRead {
+                channel: channel.id,
+                seq: channel.head_seq,
+            });
+        }
+    }
+    reads
+}
+
+/// Where to freeze the "New messages" divider when entering a channel. Only
+/// re-freezes on an actual channel change — a same-channel refresh keeps the
+/// divider still. Returns 0 (no divider) when arriving already caught up, so a
+/// caught-up channel never grows a divider above your own later sends or live
+/// arrivals during the visit.
+pub fn frozen_unread_boundary(
+    reads: Vec<ChannelRead>,
+    channels: Vec<ChatChannel>,
+    current_channel: String,
+    next_channel: String,
+    current_boundary: i64,
+) -> i64 {
+    if current_channel == next_channel {
+        return current_boundary;
+    }
+    let last_read = last_read_of(&reads, &next_channel);
+    let head = head_seq_of(&channels, &next_channel);
+    let arrived_with_unread = head > last_read;
+    if arrived_with_unread { last_read } else { 0 }
+}
+
+/// The `seq` of the first message past `boundary` (messages are seq-ascending),
+/// or 0 when the visit started caught up (`boundary <= 0`) or nothing is unread.
+/// Pending optimistic messages carry `seq == -1`, so they never anchor a divider.
+pub fn first_unread_seq(messages: Vec<ChatMessage>, boundary: i64) -> i64 {
+    if boundary <= 0 {
+        return 0;
+    }
+    messages
+        .iter()
+        .find(|message| message.seq > boundary)
+        .map_or(0, |message| message.seq)
 }
 
 pub fn thread_generation_after_refresh(
@@ -5027,6 +5143,115 @@ mod tests {
         assert_eq!(
             block_move(&[parent, page], "child-page", "outdent").unwrap(),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
+        let channel = |id: &str, head: i64| ChatChannel {
+            id: id.into(),
+            name: id.into(),
+            archived: false,
+            members_only: false,
+            huddle_count: 0,
+            head_seq: head,
+        };
+        let read = |channel: &str, seq: i64| ChannelRead {
+            channel: channel.into(),
+            seq,
+        };
+        let message = |seq: i64, pending: bool| ChatMessage {
+            id: format!("m{seq}"),
+            seq: if pending { -1 } else { seq },
+            author: "u".into(),
+            meta: String::new(),
+            body: String::new(),
+            blocks: Vec::new(),
+            pending,
+            rev: 0,
+            edited: false,
+            deleted: false,
+            reply_count: 0,
+            thread_seq: 0,
+            show_author: true,
+            initial: "U".into(),
+            avatar_r: 0.0,
+            avatar_g: 0.0,
+            avatar_b: 0.0,
+            reactions: Vec::new(),
+        };
+
+        let reads = vec![read("general", 100), read("random", 30)];
+        let channels = vec![channel("general", 100), channel("random", 50)];
+
+        // channel_last_read / channel_head_seq: lookup, 0 when absent.
+        assert_eq!(channel_last_read(reads.clone(), "random".into()), 30);
+        assert_eq!(channel_last_read(reads.clone(), "missing".into()), 0);
+        assert_eq!(channel_head_seq(channels.clone(), "random".into()), 50);
+        assert_eq!(channel_head_seq(channels.clone(), "missing".into()), 0);
+
+        // mark_channel_read upserts to the max, adds absent, ignores empty id.
+        let marked = mark_channel_read(reads.clone(), "random".into(), 50);
+        assert_eq!(channel_last_read(marked.clone(), "random".into()), 50);
+        let lowered = mark_channel_read(marked, "random".into(), 40);
+        assert_eq!(channel_last_read(lowered, "random".into()), 50);
+        let added = mark_channel_read(reads.clone(), "new".into(), 7);
+        assert_eq!(channel_last_read(added, "new".into()), 7);
+        assert_eq!(
+            mark_channel_read(reads.clone(), String::new(), 9).len(),
+            reads.len()
+        );
+
+        // channel_is_unread: head past the seen cursor.
+        assert!(channel_is_unread(reads.clone(), "random".into(), 50));
+        assert!(!channel_is_unread(reads.clone(), "random".into(), 30));
+        assert!(!channel_is_unread(reads.clone(), "general".into(), 100));
+
+        // initial_channel_reads: seed absent channels to head, preserve existing.
+        let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
+        assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
+        assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
+        assert!(!channel_is_unread(seeded, "general".into(), 100));
+
+        // first_unread_seq: first message past the boundary; pending (seq -1)
+        // never anchors it; 0 when caught up.
+        let messages = vec![
+            message(31, false),
+            message(40, false),
+            message(50, false),
+            message(0, true),
+        ];
+        assert_eq!(first_unread_seq(messages.clone(), 30), 31);
+        assert_eq!(first_unread_seq(messages.clone(), 45), 50);
+        assert_eq!(first_unread_seq(messages.clone(), 50), 0);
+        assert_eq!(first_unread_seq(messages, 0), 0);
+
+        // frozen_unread_boundary: same channel is left untouched; a change
+        // re-freezes at the arrived channel's last-read, or 0 when caught up.
+        assert_eq!(
+            frozen_unread_boundary(
+                reads.clone(),
+                channels.clone(),
+                "random".into(),
+                "random".into(),
+                30
+            ),
+            30
+        );
+        assert_eq!(
+            frozen_unread_boundary(
+                reads.clone(),
+                channels.clone(),
+                "general".into(),
+                "random".into(),
+                999
+            ),
+            30
+        );
+        let caught_up = vec![read("general", 100), read("random", 50)];
+        assert_eq!(
+            frozen_unread_boundary(caught_up, channels, "general".into(), "random".into(), 999),
+            0
         );
     }
 

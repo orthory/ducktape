@@ -222,6 +222,8 @@ on message_send_failed(cause)
 on chat_updated(next)
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -288,6 +290,8 @@ on chat_mutated(next)
   pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
   message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
   message_editor = editor(message_draft)
+  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   active_channel = next.active_channel
   active_channel_name = next.active_channel_name

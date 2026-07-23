@@ -2232,4 +2232,134 @@ mod tests {
         assert!(app.blocks.is_empty());
         assert_eq!(app.mutation_phase, "idle");
     }
+
+    #[test]
+    fn a_channel_switch_freezes_the_unread_divider_while_a_same_channel_refresh_does_not() {
+        let channel = |id: &str, head: i64| backend::ChatChannel {
+            id: id.into(),
+            name: id.into(),
+            archived: false,
+            members_only: false,
+            huddle_count: 0,
+            head_seq: head,
+        };
+
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.active_channel = "general".into();
+        // I last read #random at seq 30; it has since grown to head 50.
+        app.channel_reads = vec![backend::ChannelRead {
+            channel: "random".into(),
+            seq: 30,
+        }];
+
+        // Switching INTO #random freezes the divider above the first unread
+        // (>30) and marks #random read up to head so its sidebar badge clears.
+        let mut switched = chat_data(
+            "random",
+            vec![
+                message(31, "a", false),
+                message(40, "b", false),
+                message(50, "c", false),
+            ],
+        );
+        switched.channels = vec![channel("general", 100), channel("random", 50)];
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(switched));
+        assert_eq!(app.active_channel, "random");
+        assert_eq!(app.unread_boundary, 30);
+        assert_eq!(
+            backend::first_unread_seq(app.messages.clone(), app.unread_boundary),
+            31
+        );
+        assert!(!backend::channel_is_unread(
+            app.channel_reads.clone(),
+            "random".into(),
+            50
+        ));
+
+        // A same-channel live refresh that brings a NEW message must NOT move
+        // the frozen boundary — the divider would jump as you read.
+        app.sync_phase = "refreshing".into();
+        let generation = app.hydration_generation;
+        let mut refreshed = workspace(
+            generation,
+            "random",
+            vec![
+                message(31, "a", false),
+                message(40, "b", false),
+                message(50, "c", false),
+                message(60, "d", false),
+            ],
+            "",
+            Vec::new(),
+        );
+        refreshed.channels = vec![channel("random", 60)];
+        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(refreshed));
+        assert_eq!(app.active_channel, "random");
+        assert_eq!(app.unread_boundary, 30);
+
+        // Arriving at a caught-up channel shows no divider (boundary 0).
+        app.channel_reads =
+            backend::mark_channel_read(app.channel_reads.clone(), "general".into(), 100);
+        let mut caught_up = chat_data("general", vec![message(100, "x", false)]);
+        caught_up.channels = vec![channel("general", 100), channel("random", 60)];
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(caught_up));
+        assert_eq!(app.active_channel, "general");
+        assert_eq!(app.unread_boundary, 0);
+    }
+
+    #[test]
+    fn unread_indicators_are_wired_client_local_only() {
+        // Sidebar badge: ChannelButton takes an `unread` flag and paints the
+        // accent (primaryhi) treatment + dot when set.
+        let components = include_str!("ui/components/chat.ice");
+        assert!(
+            components.contains(
+                "component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)"
+            )
+        );
+        assert!(
+            components.contains(
+                "if unread\n            container width=8.0 height=8.0 bg=primaryhi r=4.0"
+            )
+        );
+        assert!(components.contains(
+            "if unread\n            text channel.name width=fill size=14.0 wrapping=none font=medium @text-fg"
+        ));
+
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains(
+            "ChannelButton channel=channel selected=(channel.id == active_channel) unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)"
+        ));
+        // In-channel divider anchored on the first message past the frozen boundary.
+        assert!(view.contains(
+            "if unread_boundary > 0 && message.seq == first_unread_seq(messages, unread_boundary)"
+        ));
+        assert!(
+            view.contains(
+                "text \"New messages\" size=11.0 wrapping=none font=medium @text-primaryhi"
+            )
+        );
+
+        // Freeze happens on a real channel change; connect seeds caught-up.
+        let lifecycle = include_str!("ui/handlers/lifecycle.ice");
+        assert!(
+            lifecycle
+                .contains("channel_reads = initial_channel_reads(next.channels, channel_reads)")
+        );
+        let chat = include_str!("ui/handlers/chat.ice");
+        for handler in [chat, lifecycle] {
+            assert!(handler.contains(
+                "unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)"
+            ));
+            assert!(handler.contains(
+                "channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))"
+            ));
+        }
+
+        // Client-local only: no wire read-cursor leaked into the module surface.
+        let backend_ice = include_str!("ui/backend.ice");
+        assert!(!backend_ice.contains("read_cursor"));
+        assert!(!backend_ice.contains("mark_read(rpc"));
+    }
 }
