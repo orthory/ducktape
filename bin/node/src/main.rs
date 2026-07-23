@@ -50,6 +50,7 @@
 use commonware_cryptography::Signer;
 use commonware_runtime::{Runner, Supervisor};
 
+mod agent_cli;
 mod agent_plane;
 mod blob_fetch;
 mod boot;
@@ -193,6 +194,8 @@ enum Family {
     /// the duckfs working-copy CLI
     #[command(subcommand)]
     Fs(fs_cli::FsCmd),
+    /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
+    Agent(agent_cli::AgentArgs),
     /// the stdio MCP server an agent runner spawns
     Mcp,
 }
@@ -214,6 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),

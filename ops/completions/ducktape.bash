@@ -9,7 +9,7 @@ _ducktape() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local families="node user gateway fs mcp help --help -h version --version -V"
+    local families="node user gateway fs agent mcp help --help -h version --version -V"
 
     local node_verbs="run key init invite admit join list status peers resident member help"
     local node_resident="accept remove"
@@ -29,6 +29,8 @@ webauthn-challenge p256-payload cred help"
     local gateway_flags="--workspace -n --network --label --port"
     local fs_verbs="ls cat stat history diff checkout status commit pin help"
     local fs_flags="-n --network --json --node --message -m --no-rebase --snapshot --limit --prefix"
+    local agent_verbs="pty sched help"
+    local agent_flags="-n --network --node --cred --cpu --mem"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$families" -- "$cur") )
@@ -55,6 +57,7 @@ webauthn-challenge p256-payload cred help"
             ;;
         gateway) COMPREPLY=( $(compgen -W "$gateway_verbs $gateway_flags" -- "$cur") ) ;;
         fs)      COMPREPLY=( $(compgen -W "$fs_verbs $fs_flags" -- "$cur") ) ;;
+        agent)   COMPREPLY=( $(compgen -W "$agent_verbs $agent_flags" -- "$cur") ) ;;
     esac
 }
 
