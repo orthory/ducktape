@@ -207,6 +207,22 @@ view
                                   active bg=transparent text=fg r=6.0
                                   hovered bg=white/10
                                   pressed bg=white/15
+                                button "+ 😄" label="Add smile reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("😄")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 🎉" label="Add celebration reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("🎉")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 👀" label="Add eyes reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("👀")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
+                                button "+ 🙌" label="Add raised hands reaction" disabled=(mutation_phase != "idle" || active_channel_archived) height=26.0 padding=5.0 -> add_reaction_submit("🙌")
+                                  active bg=transparent text=fg r=6.0
+                                  hovered bg=white/10
+                                  pressed bg=white/15
                                 for message in messages
                                   if message.seq == selected_message_seq
                                     for reaction in message.reactions
