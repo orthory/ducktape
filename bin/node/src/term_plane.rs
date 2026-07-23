@@ -1014,25 +1014,38 @@ async fn owner_airlock_authority(
     commands: &fmpsc::Sender<NodeCommand>,
     owner_account: &[u8],
 ) -> Result<String, String> {
-    let reply = query(
-        commands,
-        "gateway",
-        gateway::encode_query(&gateway::GatewayQuery::Registrations {
-            from: 0,
-            limit: 10_000,
-        }),
-    )
-    .await?;
-    let registrations = match gateway::decode_reply(&reply)? {
-        gateway::GatewayReply::Registrations(registrations) => registrations,
-        _ => return Err("unexpected gateway registrations reply".into()),
-    };
-    let handle = registrations
-        .into_iter()
-        .find(|registration| registration.account_id.as_slice() == owner_account)
-        .map(|registration| registration.handle)
-        .ok_or_else(|| "credential owner has no registered duck handle".to_string())?;
-    Ok(format!("airlock.{handle}.duck"))
+    // the registrations query is paginated and the module HARD-CAPS a page at
+    // MAX_QUERY_LIMIT (a larger `limit` is rejected outright), so page through in
+    // MAX_QUERY_LIMIT chunks until the owner's handle is found or a short page
+    // marks the end of the listing.
+    let mut from = 0u64;
+    loop {
+        let reply = query(
+            commands,
+            "gateway",
+            gateway::encode_query(&gateway::GatewayQuery::Registrations {
+                from,
+                limit: gateway::MAX_QUERY_LIMIT,
+            }),
+        )
+        .await?;
+        let page = match gateway::decode_reply(&reply)? {
+            gateway::GatewayReply::Registrations(registrations) => registrations,
+            _ => return Err("unexpected gateway registrations reply".into()),
+        };
+        let owned = page
+            .iter()
+            .find(|registration| registration.account_id.as_slice() == owner_account);
+        if let Some(registration) = owned {
+            return Ok(format!("airlock.{}.duck", registration.handle));
+        }
+        let page_len = page.len() as u64;
+        let listing_exhausted = page_len < gateway::MAX_QUERY_LIMIT;
+        if listing_exhausted {
+            return Err("credential owner has no registered duck handle".into());
+        }
+        from += page_len;
+    }
 }
 
 #[cfg(test)]
