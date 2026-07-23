@@ -149,11 +149,15 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
         encode_query(&PageQuery::GetBlock {
             block_id: "gone".into(),
         }),
-        encode_query(&PageQuery::ThreadsForTargets {
-            targets: vec!["b1".into(), "home".into()],
+        encode_query(&PageQuery::ThreadsForTarget {
+            target: "b1".into(),
+            from: 0,
+            limit: 0,
         }),
-        encode_query(&PageQuery::CommentThread {
+        encode_query(&PageQuery::CommentsForThread {
             thread_id: "t1".into(),
+            from: 0,
+            limit: 0,
         }),
         encode_query(&PageQuery::GetComment {
             comment_id: "c1".into(),

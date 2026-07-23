@@ -2,9 +2,9 @@ use super::*;
 use agent::{ACTION_PAGES_COMMENT, ACTION_PAGES_SET_CHECKED};
 use pages::PageMsg;
 
-fn page_trigger_thread() -> pages::ThreadView {
-    pages::ThreadView {
-        thread: pages::Thread {
+fn page_trigger_thread() -> pages::CommentPage {
+    pages::CommentPage {
+        thread: pages::CommentThread {
             id: "thread-1".into(),
             target: "b-p".into(),
             opener: pages::AuthorRef::User(vec![4; 32]),
@@ -12,17 +12,21 @@ fn page_trigger_thread() -> pages::ThreadView {
             anchor: None,
             resolved: false,
             resolved_by: None,
-            comment_ids: vec!["comment-1".into()],
+            comment_count: 1,
         },
-        comments: vec![pages::Comment {
-            id: "comment-1".into(),
-            thread_id: "thread-1".into(),
-            author: pages::AuthorRef::User(vec![4; 32]),
-            text: "@bot review".into(),
-            created_at: 1,
-            edited_at: None,
-            deleted: false,
+        comments: vec![pages::CommentItem {
+            ordinal: 1,
+            comment: pages::Comment {
+                id: "comment-1".into(),
+                thread_id: "thread-1".into(),
+                author: pages::AuthorRef::User(vec![4; 32]),
+                text: "@bot review".into(),
+                created_at: 1,
+                edited_at: None,
+                deleted: false,
+            },
         }],
+        next_from: None,
     }
 }
 

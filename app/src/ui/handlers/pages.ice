@@ -33,6 +33,21 @@ on open_page_search_hit(page_id, block_id)
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
@@ -52,6 +67,21 @@ on choose_page(id)
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
@@ -102,6 +132,21 @@ on add_block_submit
 
 on select_block(id, kind, text, checked)
   return if mutation_phase != "idle"
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   selected_block_id = id
   selected_block_kind = kind
   selected_block_checked = checked
@@ -125,10 +170,193 @@ on clear_block_selection
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   block_edit_draft = ""
   block_autosave_status = "idle"
   block_autosave_generation = block_autosave_generation + 1
   block_delete_armed = false
+
+on open_block_comments
+  return if loading || mutation_phase != "idle" || empty(selected_block_id)
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = true
+  block_comments_target = selected_block_id
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = true
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  error = ""
+  run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+
+on close_block_comments
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
+
+on block_threads_loaded(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  block_comment_threads = next.threads
+  block_comment_thread_total = next.total
+  block_comment_threads_next_from = next.next_from
+  block_comment_threads_has_more = next.has_more
+  block_comment_threads_loading = false
+  error = ""
+
+on load_more_block_threads
+  return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || !block_comment_threads_has_more
+  block_comments_generation = block_comments_generation + 1
+  block_comment_threads_loading = true
+  error = ""
+  run load_block_threads(connected_rpc, block_comments_target, block_comment_threads_next_from, block_comments_generation) -> block_threads_page_loaded _ | block_threads_failed _
+
+on block_threads_page_loaded(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  block_comment_threads = append_page_comment_threads(block_comment_threads, next.threads)
+  block_comment_thread_total = next.total
+  block_comment_threads_next_from = next.next_from
+  block_comment_threads_has_more = next.has_more
+  block_comment_threads_loading = false
+  error = ""
+
+on block_threads_failed(cause)
+  return if cause.generation != block_comments_generation || !block_comments_open
+  block_comment_threads_loading = false
+  error = cause.message
+
+on open_block_comment_thread(id)
+  return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || empty(id)
+  block_comments_generation = block_comments_generation + 1
+  active_block_comment_thread = id
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = true
+  error = ""
+  run load_block_comment_page(connected_rpc, block_comments_target, active_block_comment_thread, 0, block_comments_generation) -> block_comment_page_loaded _ | block_comment_page_failed _
+
+on block_comment_page_loaded(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || next.thread_id != active_block_comment_thread || !block_comments_open
+  block_thread_comments = next.comments
+  block_thread_comments_next_from = next.next_from
+  block_thread_comments_has_more = next.has_more
+  block_thread_comments_loading = false
+  error = ""
+
+on load_more_block_comments
+  return if block_thread_comments_loading || block_comment_threads_loading || mutation_phase != "idle" || empty(active_block_comment_thread) || !block_thread_comments_has_more
+  block_comments_generation = block_comments_generation + 1
+  block_thread_comments_loading = true
+  error = ""
+  run load_block_comment_page(connected_rpc, block_comments_target, active_block_comment_thread, block_thread_comments_next_from, block_comments_generation) -> block_comment_page_appended _ | block_comment_page_failed _
+
+on block_comment_page_appended(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || next.thread_id != active_block_comment_thread || !block_comments_open
+  block_thread_comments = append_page_comments(block_thread_comments, next.comments)
+  block_thread_comments_next_from = next.next_from
+  block_thread_comments_has_more = next.has_more
+  block_thread_comments_loading = false
+  error = ""
+
+on block_comment_page_failed(cause)
+  return if cause.generation != block_comments_generation || !block_comments_open
+  block_thread_comments_loading = false
+  error = cause.message
+
+on close_block_comment_thread
+  block_comments_generation = block_comments_generation + 1
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+
+on create_block_thread_submit
+  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || block_comments_target != selected_block_id || empty(trim(block_comment_draft))
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "block-comment"
+  pending_block_comment = trim(block_comment_draft)
+  block_comment_draft = ""
+  block_comments_generation = block_comments_generation + 1
+  block_thread_comments_loading = true
+  error = ""
+  run create_block_thread(connected_rpc, password, block_comments_target, pending_block_comment, block_comments_generation) -> block_thread_created _ | block_thread_create_failed _
+
+on block_thread_created(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  active_block_comment_thread = next.thread_id
+  block_thread_comments = next.comments
+  block_thread_comments_next_from = next.next_from
+  block_thread_comments_has_more = next.has_more
+  block_thread_comments_loading = false
+  pending_block_comment = ""
+  mutation_phase = "idle"
+  live_dirty = false
+  error = ""
+  block_comments_generation = block_comments_generation + 1
+  block_comment_threads_loading = true
+  run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
+
+on block_thread_create_failed(cause)
+  block_comment_draft = restore_draft(block_comment_draft, pending_block_comment, cause.committed)
+  pending_block_comment = ""
+  mutation_phase = mutation_failure_phase(cause.committed)
+  block_thread_comments_loading = false
+  live_dirty = live_dirty || cause.committed
+  error = cause.message
+  block_comments_generation = block_comments_generation + 1
+  block_comment_threads_loading = true
+  run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_recovered _ | block_threads_recovery_failed _
+
+on block_threads_recovered(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
+  block_comment_threads = next.threads
+  block_comment_thread_total = next.total
+  block_comment_threads_next_from = next.next_from
+  block_comment_threads_has_more = next.has_more
+  block_comment_threads_loading = false
+  mutation_phase = "idle"
+  live_dirty = false
+  error = ""
+
+on block_threads_recovery_failed(cause)
+  return if cause.generation != block_comments_generation || !block_comments_open
+  block_comment_threads_loading = false
+  mutation_phase = "idle"
+  error = cause.message
 
 on block_text_changed(next)
   block_edit_draft = next
@@ -189,6 +417,21 @@ on remove_block_submit
   run remove_block(connected_rpc, password, active_page, selected_block_id) -> pages_mutated _ | mutation_failed _
 
 on pages_updated(next)
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   pages = next.pages
   blocks = next.blocks
   active_page = next.active_page
@@ -221,6 +464,21 @@ on pages_mutated(next)
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"

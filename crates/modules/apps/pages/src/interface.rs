@@ -218,8 +218,12 @@ pub enum PageMsg {
 pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_COMMENTS_PER_THREAD: usize = 4096;
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
-pub const MAX_QUERY_TARGETS: usize = 512;
 pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
+pub const MAX_COMMENT_AGENT_ID_BYTES: usize = 512;
+pub const DEFAULT_THREAD_PAGE_LIMIT: u16 = 32;
+pub const MAX_THREAD_PAGE_LIMIT: u16 = 64;
+pub const DEFAULT_COMMENT_PAGE_LIMIT: u16 = 8;
+pub const MAX_COMMENT_PAGE_LIMIT: u16 = 8;
 
 // client-minted id length caps (consensus constants). the shared DERIVED
 // blocks — the per-target thread index (a `Vec<thread_id>`, up to
@@ -234,6 +238,10 @@ pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
 pub const MAX_THREAD_ID_BYTES: usize = 512;
 pub const MAX_COMMENT_ID_BYTES: usize = 128;
 pub const MAX_COMMENT_TARGET_BYTES: usize = 512;
+/// Maximum bytes retained from an external or module origin in a comment
+/// author. Together with the page item limits, this bounds every comment query
+/// reply even when consensus receives a nonstandard origin.
+pub const MAX_COMMENT_AUTHOR_BYTES: usize = 512;
 
 /// whether a client-minted id serializes 1:1 (byte-for-byte) under
 /// `serde_json` — i.e. carries no escaping char. `serde_json` escapes `"`→
@@ -290,18 +298,49 @@ pub struct Comment {
     pub deleted: bool,
 }
 
-/// a thread plus its live (non-tombstoned) comments in order.
+/// Bounded public metadata for one comment thread. The stored [`Thread`]
+/// keeps its comment ids for consensus operations; query replies never expose
+/// that potentially-large vector.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct ThreadView {
-    pub thread: Thread,
-    pub comments: Vec<Comment>,
+pub struct CommentThread {
+    pub id: String,
+    pub target: String,
+    pub opener: AuthorRef,
+    pub created_at: u64,
+    pub anchor: Option<RelativeAnchor>,
+    pub resolved: bool,
+    pub resolved_by: Option<AuthorRef>,
+    /// Lifetime comment slots, including tombstones. This is the append cap
+    /// counter and therefore never decreases while the thread exists.
+    pub comment_count: u32,
 }
 
-/// the threads anchored to one target.
+/// One bounded page of threads anchored to a target. `from`/`next_from` are
+/// zero-based offsets into the target's deterministic sorted thread index.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TargetThreads {
+pub struct TargetThreadPage {
     pub target: String,
-    pub threads: Vec<ThreadView>,
+    pub threads: Vec<CommentThread>,
+    pub total: u32,
+    pub next_from: Option<u32>,
+}
+
+/// A live comment together with its stable 1-based position in the thread's
+/// lifetime slot sequence. Tombstones are skipped in `comments`, while the
+/// page cursor still advances over their slots.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CommentItem {
+    pub ordinal: u32,
+    pub comment: Comment,
+}
+
+/// One bounded page of live comments in a thread. `next_from` is the next
+/// zero-based lifetime slot to inspect, or `None` at the end.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CommentPage {
+    pub thread: CommentThread,
+    pub comments: Vec<CommentItem>,
+    pub next_from: Option<u32>,
 }
 
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
@@ -326,12 +365,23 @@ pub enum PageQuery {
     /// enumerate every page, served from the module's reserved index entry
     /// (sorted by id), with titles read from the live roots.
     ListPages,
-    /// every thread anchored to any of `targets` (block or page ids), grouped
-    /// by target. a page render calls this once with all visible block ids +
-    /// the page id. `targets` beyond [`MAX_QUERY_TARGETS`] are rejected.
-    ThreadsForTargets { targets: Vec<String> },
-    /// one thread with its live comments.
-    CommentThread { thread_id: String },
+    /// One bounded page of threads anchored to `target`. `limit == 0` selects
+    /// [`DEFAULT_THREAD_PAGE_LIMIT`]; larger values clamp to
+    /// [`MAX_THREAD_PAGE_LIMIT`].
+    ThreadsForTarget {
+        target: String,
+        from: u32,
+        limit: u16,
+    },
+    /// One bounded page of a thread's live comments. The cursor advances over
+    /// lifetime slots, including tombstones, so deletes cannot skip or
+    /// duplicate later comments. `limit == 0` selects
+    /// [`DEFAULT_COMMENT_PAGE_LIMIT`].
+    CommentsForThread {
+        thread_id: String,
+        from: u32,
+        limit: u16,
+    },
     /// one comment by id, tombstones included — the existence probe a module
     /// emitting `AddComment` follow-ups uses (comment ids are client-minted,
     /// so a squatted id would otherwise reject the follow-up and abort its
@@ -355,8 +405,8 @@ pub enum PageReply {
     Page(Option<Vec<Block>>),
     Block(Option<Block>),
     PageList(Vec<PageMeta>),
-    CommentThreads(Vec<TargetThreads>),
-    CommentThread(Option<ThreadView>),
+    ThreadPage(TargetThreadPage),
+    CommentPage(Option<CommentPage>),
     Comment(Option<Comment>),
 }
 
@@ -422,6 +472,23 @@ mod interface_tests {
                 mentions: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn comment_queries_are_paged() {
+        let threads = PageQuery::ThreadsForTarget {
+            target: "b1".into(),
+            from: 64,
+            limit: MAX_THREAD_PAGE_LIMIT,
+        };
+        assert_eq!(decode_query(&encode_query(&threads)).unwrap(), threads);
+
+        let comments = PageQuery::CommentsForThread {
+            thread_id: "t1".into(),
+            from: 8,
+            limit: MAX_COMMENT_PAGE_LIMIT,
+        };
+        assert_eq!(decode_query(&encode_query(&comments)).unwrap(), comments);
     }
 
     #[test]

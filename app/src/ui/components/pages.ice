@@ -76,6 +76,23 @@ component PageSearchResult(hit:PageSearchHit)
     hovered bg=white/9 text=fg border=white/10
     pressed bg=selection text=fg
 
+component PageCommentThreadButton(thread:PageCommentThread)
+  button label=thread.author description=thread.meta width=fill padding=6.0 -> open_block_comment_thread(thread.id)
+    row width=fill spacing=7.0 align=center
+      text thread.author width=fill size=11.0 wrapping=none @font-bold text-fg
+      text thread.meta size=10.0 wrapping=none @text-muted
+      text "›" size=12.0 @text-muted
+    active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+    hovered bg=white/8 text=fg border=white/9
+    pressed bg=selection text=fg
+
+component PageCommentCard(comment:PageComment)
+  col width=fill spacing=2.0 padding=6.0
+    row width=fill spacing=7.0 align=center
+      text comment.author width=fill size=10.0 wrapping=none @font-bold text-fg
+      text comment.meta size=10.0 wrapping=none @text-muted
+    text comment.text width=fill size=11.0 wrapping=word @text-fg
+
 component BlockContents(block:PageBlock)
   row width=fill spacing=7.0 align=start
     text block.prefix size=11.0 wrapping=none @text-muted

@@ -161,6 +161,60 @@ pub struct PagesData {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PageCommentThread {
+    pub id: String,
+    pub author: String,
+    pub meta: String,
+    pub resolved: bool,
+    pub comment_count: i64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PageComment {
+    pub id: String,
+    pub ordinal: i64,
+    pub author: String,
+    pub meta: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockThreadListData {
+    pub generation: i64,
+    pub target: String,
+    pub from: i64,
+    pub threads: Vec<PageCommentThread>,
+    pub total: i64,
+    pub next_from: i64,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockCommentData {
+    pub generation: i64,
+    pub target: String,
+    pub thread_id: String,
+    pub from: i64,
+    pub comments: Vec<PageComment>,
+    pub next_from: i64,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BlockCommentsRefreshData {
+    pub generation: i64,
+    pub target: String,
+    pub threads: Vec<PageCommentThread>,
+    pub total: i64,
+    pub threads_next_from: i64,
+    pub threads_has_more: bool,
+    pub thread_id: String,
+    pub comments: Vec<PageComment>,
+    pub comments_next_from: i64,
+    pub comments_has_more: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageSearchHit {
     pub page_id: String,
     pub block_id: String,
@@ -300,6 +354,32 @@ pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<Pa
     }
     blocks.retain(|block| !block.pending);
     blocks
+}
+
+pub fn append_page_comment_threads(
+    threads: Vec<PageCommentThread>,
+    next: Vec<PageCommentThread>,
+) -> Vec<PageCommentThread> {
+    threads
+        .into_iter()
+        .chain(next)
+        .map(|thread| (thread.id.clone(), thread))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
+pub fn append_page_comments(
+    comments: Vec<PageComment>,
+    next: Vec<PageComment>,
+) -> Vec<PageComment> {
+    comments
+        .into_iter()
+        .chain(next)
+        .map(|comment| (comment.ordinal, comment))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
 }
 
 pub fn restore_draft(current: String, pending: String, keep_pending: bool) -> String {
@@ -1124,6 +1204,151 @@ pub async fn load_page(
     .map_err(app_error)
 }
 
+pub async fn load_block_threads(
+    rpc: String,
+    target: String,
+    from: i64,
+    generation: i64,
+) -> Result<BlockThreadListData, HydrationError> {
+    let result = async {
+        let target = required_id(target, "block")?;
+        let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
+        let rpc = rpc_client(&rpc)?;
+        query_block_threads(&rpc, &target, from, generation).await
+    }
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
+}
+
+pub async fn load_block_comment_page(
+    rpc: String,
+    target: String,
+    thread_id: String,
+    from: i64,
+    generation: i64,
+) -> Result<BlockCommentData, HydrationError> {
+    let result = async {
+        let target = required_id(target, "block")?;
+        let thread_id = required_id(thread_id, "comment thread")?;
+        let from = u32::try_from(from).map_err(|_| "invalid comment offset".to_string())?;
+        let rpc = rpc_client(&rpc)?;
+        query_block_comment_page(&rpc, &target, &thread_id, from, generation)
+            .await?
+            .ok_or_else(|| "comment thread was not found".to_string())
+    }
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
+}
+
+pub async fn refresh_block_comments(
+    rpc: String,
+    target: String,
+    thread_id: String,
+    generation: i64,
+) -> Result<BlockCommentsRefreshData, HydrationError> {
+    let result = async {
+        if target.is_empty() {
+            return Ok(BlockCommentsRefreshData {
+                generation,
+                target,
+                threads: Vec::new(),
+                total: 0,
+                threads_next_from: 0,
+                threads_has_more: false,
+                thread_id: String::new(),
+                comments: Vec::new(),
+                comments_next_from: 0,
+                comments_has_more: false,
+            });
+        }
+        let target = required_id(target, "block")?;
+        let rpc = rpc_client(&rpc)?;
+        let threads = query_block_threads(&rpc, &target, 0, generation).await?;
+        let comments = if thread_id.is_empty() {
+            BlockCommentData {
+                generation,
+                target: target.clone(),
+                thread_id,
+                from: 0,
+                comments: Vec::new(),
+                next_from: 0,
+                has_more: false,
+            }
+        } else {
+            let thread_id = required_id(thread_id, "comment thread")?;
+            query_block_comment_page(&rpc, &target, &thread_id, 0, generation)
+                .await?
+                .unwrap_or(BlockCommentData {
+                    generation,
+                    target: target.clone(),
+                    thread_id: String::new(),
+                    from: 0,
+                    comments: Vec::new(),
+                    next_from: 0,
+                    has_more: false,
+                })
+        };
+        Ok(BlockCommentsRefreshData {
+            generation,
+            target,
+            threads: threads.threads,
+            total: threads.total,
+            threads_next_from: threads.next_from,
+            threads_has_more: threads.has_more,
+            thread_id: comments.thread_id,
+            comments: comments.comments,
+            comments_next_from: comments.next_from,
+            comments_has_more: comments.has_more,
+        })
+    }
+    .await;
+    result.map_err(|message| HydrationError {
+        generation,
+        message,
+    })
+}
+
+pub async fn create_block_thread(
+    rpc: String,
+    password: String,
+    target: String,
+    text: String,
+    generation: i64,
+) -> Result<BlockCommentData, AppError> {
+    async {
+        let target = required_id(target, "block")?;
+        let text = bounded_text(text, "comment", 16 * 1024)?;
+        let thread_id = fresh_id("thread");
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "pages",
+            pages::encode_msg(&PageMsg::AddComment {
+                thread_id: thread_id.clone(),
+                comment_id: fresh_id("comment"),
+                target: target.clone(),
+                text,
+                anchor: None,
+                mentions: Vec::new(),
+                as_agent: None,
+            }),
+            password,
+        )
+        .await?;
+        query_block_comment_page(&rpc, &target, &thread_id, 0, generation)
+            .await
+            .and_then(|page| page.ok_or_else(|| "comment thread was not found".to_string()))
+            .map_err(committed_error)
+    }
+    .await
+}
+
 pub async fn create_page(
     rpc: String,
     password: String,
@@ -1843,6 +2068,123 @@ fn reacted_by_user(reactors: &BTreeSet<AuthorRef>, current_user: Option<&[u8]>) 
             .iter()
             .any(|reactor| matches!(reactor, AuthorRef::User(key) if key == current_user))
     })
+}
+
+async fn query_block_threads(
+    rpc: &RpcClient,
+    target: &str,
+    from: u32,
+    generation: i64,
+) -> Result<BlockThreadListData, String> {
+    let reply: PageReply = rpc
+        .query(
+            "pages",
+            &PageQuery::ThreadsForTarget {
+                target: target.to_string(),
+                from,
+                limit: 0,
+            },
+        )
+        .await?;
+    let PageReply::ThreadPage(page) = reply else {
+        return Err("node returned an invalid comment thread page".into());
+    };
+    if page.target != target {
+        return Err("node returned comment threads for another block".into());
+    }
+    let has_more = page.next_from.is_some();
+    Ok(BlockThreadListData {
+        generation,
+        target: page.target,
+        from: i64::from(from),
+        threads: page.threads.into_iter().map(page_comment_thread).collect(),
+        total: i64::from(page.total),
+        next_from: page.next_from.map_or(0, i64::from),
+        has_more,
+    })
+}
+
+async fn query_block_comment_page(
+    rpc: &RpcClient,
+    target: &str,
+    thread_id: &str,
+    from: u32,
+    generation: i64,
+) -> Result<Option<BlockCommentData>, String> {
+    let reply: PageReply = rpc
+        .query(
+            "pages",
+            &PageQuery::CommentsForThread {
+                thread_id: thread_id.to_string(),
+                from,
+                limit: 0,
+            },
+        )
+        .await?;
+    let PageReply::CommentPage(page) = reply else {
+        return Err("node returned an invalid comment page".into());
+    };
+    let Some(page) = page else {
+        return Ok(None);
+    };
+    let is_expected_thread = page.thread.id == thread_id && page.thread.target == target;
+    if !is_expected_thread {
+        return Err("node returned comments for another block".into());
+    }
+    let has_more = page.next_from.is_some();
+    Ok(Some(BlockCommentData {
+        generation,
+        target: page.thread.target,
+        thread_id: page.thread.id,
+        from: i64::from(from),
+        comments: page.comments.into_iter().map(page_comment).collect(),
+        next_from: page.next_from.map_or(0, i64::from),
+        has_more,
+    }))
+}
+
+fn page_comment_thread(thread: pages::CommentThread) -> PageCommentThread {
+    let comment_count = i64::from(thread.comment_count);
+    let count_label = if comment_count == 1 {
+        "1 comment".to_string()
+    } else {
+        format!("{comment_count} comments")
+    };
+    PageCommentThread {
+        id: thread.id,
+        author: page_author_name(&thread.opener),
+        meta: if thread.resolved {
+            format!("{count_label} · resolved")
+        } else {
+            count_label
+        },
+        resolved: thread.resolved,
+        comment_count,
+    }
+}
+
+fn page_comment(item: pages::CommentItem) -> PageComment {
+    let edited = item.comment.edited_at.is_some();
+    PageComment {
+        id: item.comment.id,
+        ordinal: i64::from(item.ordinal),
+        author: page_author_name(&item.comment.author),
+        meta: if edited {
+            format!("#{} · edited", item.ordinal)
+        } else {
+            format!("#{}", item.ordinal)
+        },
+        text: item.comment.text,
+    }
+}
+
+fn page_author_name(author: &pages::AuthorRef) -> String {
+    match author {
+        pages::AuthorRef::User(key) => format!("user {}", short_hex(key)),
+        pages::AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
+        pages::AuthorRef::Module(module) => module.clone(),
+        pages::AuthorRef::System => "system".into(),
+    }
 }
 
 async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<PagesData, String> {
@@ -2857,6 +3199,44 @@ mod tests {
         assert_eq!(pages.blocks[2].id, "todo");
         assert_eq!(pages.blocks[2].prefix, "  ");
         assert!(pages.blocks[2].checked);
+
+        submit_test(
+            &rpc,
+            &signer,
+            13,
+            "pages",
+            pages::encode_msg(&PageMsg::AddComment {
+                thread_id: "thread-live".into(),
+                comment_id: "comment-live".into(),
+                target: "intro".into(),
+                text: "temporary".into(),
+                anchor: None,
+                mentions: Vec::new(),
+                as_agent: None,
+            }),
+        )
+        .await;
+        let comments =
+            refresh_block_comments(origin.clone(), "intro".into(), "thread-live".into(), 1)
+                .await
+                .unwrap();
+        assert_eq!(comments.thread_id, "thread-live");
+        submit_test(
+            &rpc,
+            &signer,
+            14,
+            "pages",
+            pages::encode_msg(&PageMsg::DeleteComment {
+                comment_id: "comment-live".into(),
+            }),
+        )
+        .await;
+        let comments =
+            refresh_block_comments(origin.clone(), "intro".into(), "thread-live".into(), 2)
+                .await
+                .unwrap();
+        assert!(comments.thread_id.is_empty());
+        assert!(comments.comments.is_empty());
 
         let refreshed = refresh(origin, "general".into(), "welcome".into(), 7)
             .await

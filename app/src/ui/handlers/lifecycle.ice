@@ -61,6 +61,21 @@ on reconnect
   selected_block_id = ""
   selected_block_kind = ""
   selected_block_checked = false
+  block_comments_generation = block_comments_generation + 1
+  block_comments_open = false
+  block_comments_target = ""
+  block_comment_threads = []
+  block_comment_thread_total = 0
+  block_comment_threads_next_from = 0
+  block_comment_threads_has_more = false
+  block_comment_threads_loading = false
+  active_block_comment_thread = ""
+  block_thread_comments = []
+  block_thread_comments_next_from = 0
+  block_thread_comments_has_more = false
+  block_thread_comments_loading = false
+  block_comment_draft = ""
+  pending_block_comment = ""
   page_title_selected = false
   block_edit_draft = ""
   block_autosave_status = "idle"
@@ -127,7 +142,8 @@ on workspace_refreshed(next)
   live_dirty = false
   hydration_generation = hydration_generation + 1
   sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+  block_comments_generation = block_comments_generation + 1
+  run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
 
 on live_updated(next)
   status = next.status
@@ -138,6 +154,28 @@ on live_updated(next)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   sync_phase = "refreshing"
+  block_comments_generation = block_comments_generation + 1
+  run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
+
+on live_block_comments_refreshed(next)
+  return if next.generation != block_comments_generation || next.target != block_comments_target
+  block_comment_threads_loading = false
+  block_thread_comments_loading = false
+  block_comment_threads = next.threads
+  block_comment_thread_total = next.total
+  block_comment_threads_next_from = next.threads_next_from
+  block_comment_threads_has_more = next.threads_has_more
+  active_block_comment_thread = next.thread_id
+  block_thread_comments = next.comments
+  block_thread_comments_next_from = next.comments_next_from
+  block_thread_comments_has_more = next.comments_has_more
+  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+
+on live_block_comments_failed(cause)
+  return if cause.generation != block_comments_generation
+  block_comment_threads_loading = false
+  block_thread_comments_loading = false
+  error = cause.message
   run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on refresh_failed(cause)

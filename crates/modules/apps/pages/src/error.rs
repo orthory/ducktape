@@ -42,8 +42,13 @@ pub(super) enum PageError {
     // ── comments ──
     /// a comment op arrived with an empty (pre-consensus) origin.
     EmptyOrigin,
+    /// an external or module origin was too large for bounded comment replies.
+    AuthorTooLarge,
     /// an AddComment carried an empty `as_agent` id.
     EmptyAgent,
+    /// an AddComment carried an `as_agent` id too large for bounded comment
+    /// query replies.
+    AgentIdTooLarge,
     /// an AddComment carried `as_agent` under a non-module origin — only
     /// genesis-trusted module code may attribute a comment to an agent.
     AgentNeedsModuleOrigin,
@@ -67,8 +72,6 @@ pub(super) enum PageError {
     TooManyComments,
     /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
     TooManyThreads,
-    /// a ThreadsForTargets query named more than [`MAX_QUERY_TARGETS`] targets.
-    TooManyTargets,
 }
 
 impl core::fmt::Display for PageError {
@@ -89,7 +92,9 @@ impl core::fmt::Display for PageError {
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
             PageError::EmptyOrigin => "empty origin",
+            PageError::AuthorTooLarge => "comment author is too large",
             PageError::EmptyAgent => "empty as_agent",
+            PageError::AgentIdTooLarge => "as_agent is too large",
             PageError::AgentNeedsModuleOrigin => "as_agent requires a module origin",
             PageError::ThreadNotFound => "thread not found",
             PageError::CommentNotFound => "comment not found",
@@ -100,7 +105,6 @@ impl core::fmt::Display for PageError {
             PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
-            PageError::TooManyTargets => "too many query targets",
         };
         f.write_str(s)
     }

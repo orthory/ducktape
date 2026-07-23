@@ -11,6 +11,11 @@ extern crate::backend
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   PageBlock(id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64, mark_count:i64)
   PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, selected_block_id:str, selected_block_kind:str, selected_block_text:str, selected_block_checked:bool, page_title_selected:bool)
+  PageCommentThread(id:str, author:str, meta:str, resolved:bool, comment_count:i64)
+  PageComment(id:str, ordinal:i64, author:str, meta:str, text:str)
+  BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
+  BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
+  BlockCommentsRefreshData(generation:i64, target:str, threads:[PageCommentThread], total:i64, threads_next_from:i64, threads_has_more:bool, thread_id:str, comments:[PageComment], comments_next_from:i64, comments_has_more:bool)
   PageSearchHit(page_id:str, block_id:str, kind:str, text:str)
   PageSearchData(generation:i64, hits:[PageSearchHit])
   AutosaveResult(generation:i64, written:bool)
@@ -29,6 +34,8 @@ extern crate::backend
   sync thread_offset_after_reply(offset:i64, has_more:bool) -> i64
   sync optimistic_block(blocks:[PageBlock], kind:str, text:str) -> [PageBlock]
   sync rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
+  sync append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
+  sync append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
@@ -60,6 +67,10 @@ extern crate::backend
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
   load_page(rpc:str, page_id:str, selected_block_id:str) -> PagesData ! AppError
+  load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError
+  load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
+  refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
+  create_block_thread(rpc:str, password:str, target:str, text:str, generation:i64) -> BlockCommentData ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
   autosave_page_title(rpc:str, password:str, page_id:str, title:str) -> bool ! AppError
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError

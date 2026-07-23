@@ -68,11 +68,11 @@ struct CaptureCtx {
     /// these pages by block id (the pages-effects target resolution).
     pages: BTreeMap<String, Vec<pages::Block>>,
     /// explicit committed page comment threads used by Pages-triggered runs.
-    page_threads: BTreeMap<String, pages::ThreadView>,
+    page_threads: BTreeMap<String, pages::CommentPage>,
     /// thread/comment ids the pages module already holds — the squat
-    /// simulation the CommentThread/GetComment freshness probes hit.
+    /// simulation the CommentsForThread/GetComment freshness probes hit.
     taken_page_ids: BTreeSet<String>,
-    /// target -> committed thread count served by the ThreadsForTargets arm
+    /// target -> committed thread count served by the ThreadsForTarget arm
     /// (the capacity probe); absent targets serve zero threads.
     page_target_threads: BTreeMap<String, usize>,
     /// the committed duckfs head served by the "files" Refs arm — the v3
@@ -151,7 +151,7 @@ impl CaptureCtx {
         self.pages.insert(page_id.into(), blocks);
         self
     }
-    fn with_page_thread(mut self, view: pages::ThreadView) -> Self {
+    fn with_page_thread(mut self, view: pages::CommentPage) -> Self {
         self.page_threads.insert(view.thread.id.clone(), view);
         self
     }
@@ -325,11 +325,11 @@ impl CaptureCtx {
     }
 }
 
-/// a minimal committed thread view, as the "pages" CommentThread arm serves a
+/// a minimal committed thread page, as the "pages" CommentsForThread arm serves a
 /// taken thread id.
-fn dummy_thread_view(id: &str) -> pages::ThreadView {
-    pages::ThreadView {
-        thread: pages::Thread {
+fn dummy_comment_page(id: &str) -> pages::CommentPage {
+    pages::CommentPage {
+        thread: pages::CommentThread {
             id: id.into(),
             target: "elsewhere".into(),
             opener: pages::AuthorRef::System,
@@ -337,9 +337,10 @@ fn dummy_thread_view(id: &str) -> pages::ThreadView {
             anchor: None,
             resolved: false,
             resolved_by: None,
-            comment_ids: Vec::new(),
+            comment_count: 0,
         },
         comments: Vec::new(),
+        next_from: None,
     }
 }
 
@@ -531,14 +532,33 @@ impl Ctx for CaptureCtx {
                             .cloned(),
                     )))
                 }
-                pages::PageQuery::CommentThread { thread_id } => {
-                    Ok(pages::encode_reply(&pages::PageReply::CommentThread(
-                        self.page_threads.get(&thread_id).cloned().or_else(|| {
+                pages::PageQuery::CommentsForThread {
+                    thread_id,
+                    from,
+                    limit,
+                } => {
+                    let limit = if limit == 0 {
+                        pages::DEFAULT_COMMENT_PAGE_LIMIT
+                    } else {
+                        limit.min(pages::MAX_COMMENT_PAGE_LIMIT)
+                    };
+                    let end = from.saturating_add(u32::from(limit));
+                    let page = self
+                        .page_threads
+                        .get(&thread_id)
+                        .cloned()
+                        .or_else(|| {
                             self.taken_page_ids
                                 .contains(&thread_id)
-                                .then(|| dummy_thread_view(&thread_id))
-                        }),
-                    )))
+                                .then(|| dummy_comment_page(&thread_id))
+                        })
+                        .map(|mut page| {
+                            page.comments
+                                .retain(|item| item.ordinal > from && item.ordinal <= end);
+                            page.next_from = (end < page.thread.comment_count).then_some(end);
+                            page
+                        });
+                    Ok(pages::encode_reply(&pages::PageReply::CommentPage(page)))
                 }
                 pages::PageQuery::GetComment { comment_id } => {
                     Ok(pages::encode_reply(&pages::PageReply::Comment(
@@ -547,19 +567,27 @@ impl Ctx for CaptureCtx {
                             .then(|| dummy_comment(&comment_id)),
                     )))
                 }
-                pages::PageQuery::ThreadsForTargets { targets } => {
-                    Ok(pages::encode_reply(&pages::PageReply::CommentThreads(
-                        targets
-                            .into_iter()
-                            .map(|target| {
-                                let count =
-                                    self.page_target_threads.get(&target).copied().unwrap_or(0);
-                                let threads = (0..count)
-                                    .map(|i| dummy_thread_view(&format!("t{i}")))
-                                    .collect();
-                                pages::TargetThreads { target, threads }
-                            })
-                            .collect(),
+                pages::PageQuery::ThreadsForTarget {
+                    target,
+                    from,
+                    limit,
+                } => {
+                    let total = self.page_target_threads.get(&target).copied().unwrap_or(0);
+                    let total = u32::try_from(total).map_err(|_| Error::QueryUnsupported)?;
+                    let limit = if limit == 0 {
+                        pages::DEFAULT_THREAD_PAGE_LIMIT
+                    } else {
+                        limit.min(pages::MAX_THREAD_PAGE_LIMIT)
+                    };
+                    let next = from.saturating_add(u32::from(limit));
+                    let next_from = (next < total).then_some(next);
+                    Ok(pages::encode_reply(&pages::PageReply::ThreadPage(
+                        pages::TargetThreadPage {
+                            target,
+                            threads: Vec::new(),
+                            total,
+                            next_from,
+                        },
                     )))
                 }
                 _ => Err(Error::QueryUnsupported),

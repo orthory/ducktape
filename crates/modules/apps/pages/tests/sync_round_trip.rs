@@ -21,8 +21,8 @@
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use pages::Pages;
 use pages::{
-    Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, ThreadView, decode_reply,
-    encode_msg, encode_query,
+    Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, decode_reply, encode_msg,
+    encode_query,
 };
 use sdk::{MerkleStore as _, Module, Msg, StateRoot};
 use sdk_testkit::TestCtx;
@@ -177,22 +177,24 @@ fn synced_store_reconstructs_source_root() {
         assert_eq!(page[1].text, "final");
 
         // the comment survived the sync too.
-        let view = match decode_reply(
+        let page = match decode_reply(
             &synced
-                .query(&encode_query(&PageQuery::CommentThread {
+                .query(&encode_query(&PageQuery::CommentsForThread {
                     thread_id: "th1".into(),
+                    from: 0,
+                    limit: 1,
                 }))
                 .await
                 .unwrap(),
         )
         .unwrap()
         {
-            PageReply::CommentThread(v) => v,
-            other => panic!("expected CommentThread, got {other:?}"),
+            PageReply::CommentPage(v) => v,
+            other => panic!("expected CommentPage, got {other:?}"),
         };
-        let view: ThreadView = view.expect("thread present after sync");
-        assert_eq!(view.comments.len(), 1);
-        assert_eq!(view.comments[0].text, "review this");
+        let page = page.expect("thread present after sync");
+        assert_eq!(page.comments.len(), 1);
+        assert_eq!(page.comments[0].comment.text, "review this");
     });
 }
 

@@ -400,6 +400,64 @@ view
                                   active bg=transparent text=muted r=7.0
                                   hovered bg=white/11 text=fg
                                   pressed bg=white/16
+                              if !block_comments_open
+                                row width=fill
+                                  button "Comments" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> open_block_comments
+                                    active bg=transparent text=muted r=7.0
+                                    hovered bg=white/11 text=fg
+                                    pressed bg=white/16
+                              if block_comments_open
+                                container width=fill padding=6.0 bg=black/12 border=white/9 border-w=1.0 r=8.0
+                                  col width=fill spacing=5.0
+                                    row width=fill spacing=6.0 align=center
+                                      text "Comments" width=fill size=10.0 @font-bold text-fg
+                                      if block_comment_thread_total > 0
+                                        text block_comment_thread_total size=10.0 @text-muted
+                                      if block_comment_threads_loading || block_thread_comments_loading
+                                        text "Loading…" size=10.0 @text-muted
+                                      button "×" label="Close comments" disabled=(mutation_phase != "idle") width=24.0 height=24.0 padding=4.0 -> close_block_comments
+                                        active bg=transparent text=muted r=6.0
+                                        hovered bg=white/10 text=fg
+                                        pressed bg=white/15
+                                    if empty(active_block_comment_thread)
+                                      container width=fill height=84.0 bg=white/3 r=7.0
+                                        scroll direction=vertical width=fill height=fill
+                                          col width=fill spacing=1.0 padding=3.0
+                                            if empty(block_comment_threads) && !block_comment_threads_loading
+                                              text "No comments yet" width=fill size=10.0 align-x=center @text-muted
+                                            for comment_thread in block_comment_threads
+                                              PageCommentThreadButton thread=comment_thread
+                                            if block_comment_threads_has_more
+                                              button "More" disabled=(block_comment_threads_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> load_more_block_threads
+                                                active bg=transparent text=muted r=6.0
+                                                hovered bg=white/9 text=fg
+                                                pressed bg=white/14
+                                    if !empty(active_block_comment_thread)
+                                      row width=fill spacing=5.0 align=center
+                                        button "← Threads" disabled=(block_thread_comments_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> close_block_comment_thread
+                                          active bg=transparent text=muted r=6.0
+                                          hovered bg=white/9 text=fg
+                                          pressed bg=white/14
+                                      container width=fill height=112.0 bg=white/3 r=7.0
+                                        scroll direction=vertical width=fill height=fill
+                                          col width=fill spacing=1.0 padding=3.0
+                                            for page_comment in block_thread_comments
+                                              PageCommentCard comment=page_comment
+                                            if block_thread_comments_has_more
+                                              button "More" disabled=(block_thread_comments_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> load_more_block_comments
+                                                active bg=transparent text=muted r=6.0
+                                                hovered bg=white/9 text=fg
+                                                pressed bg=white/14
+                                    row width=fill spacing=5.0 align=center
+                                      input "" #block-comment(scope_key(connected_rpc, selected_block_id)) label="New block comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=create_block_thread_submit width=fill padding=5.0 text-size=11.0 line-height=1.2
+                                        active bg=transparent border=white/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                                        focused bg=white/6 border=white/13
+                                        disabled value=muted
+                                      button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) height=26.0 padding=5.0 -> create_block_thread_submit
+                                        active bg=fg/88 text=bg border=white/5 border-w=1.0 r=8.0
+                                        hovered bg=fg/78 text=bg
+                                        pressed bg=fg text=bg
+                                        disabled bg=fg/25 text=bg/12
                               if selected_block_kind != "Divider"
                                 row width=fill spacing=6.0 align=center
                                   input "" #block-edit label="Edit block" <-> block_edit_draft change=block_text_changed hint="Block text" disabled=(mutation_phase != "idle") width=fill padding=6.0 text-size=12.0 line-height=1.2

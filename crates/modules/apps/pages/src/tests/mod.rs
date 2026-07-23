@@ -126,23 +126,35 @@ async fn apply_err_as(p: &mut Pages, m: &PageMsg, origin: sdk::Origin, needle: &
     );
     p.abort_block().await.unwrap();
 }
-async fn query_threads(p: &Pages, targets: &[&str]) -> Vec<TargetThreads> {
-    let q = PageQuery::ThreadsForTargets {
-        targets: targets.iter().map(|s| s.to_string()).collect(),
+async fn query_target_threads(p: &Pages, target: &str, from: u32, limit: u16) -> TargetThreadPage {
+    let q = PageQuery::ThreadsForTarget {
+        target: target.into(),
+        from,
+        limit,
     };
     match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
-        PageReply::CommentThreads(v) => v,
-        _ => panic!("expected CommentThreads"),
+        PageReply::ThreadPage(page) => page,
+        _ => panic!("expected ThreadPage"),
     }
 }
-async fn query_thread(p: &Pages, thread_id: &str) -> Option<ThreadView> {
-    let q = PageQuery::CommentThread {
+async fn query_thread_comments(
+    p: &Pages,
+    thread_id: &str,
+    from: u32,
+    limit: u16,
+) -> Option<CommentPage> {
+    let q = PageQuery::CommentsForThread {
         thread_id: thread_id.into(),
+        from,
+        limit,
     };
     match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
-        PageReply::CommentThread(v) => v,
-        _ => panic!("expected CommentThread"),
+        PageReply::CommentPage(page) => page,
+        _ => panic!("expected CommentPage"),
     }
+}
+async fn query_thread(p: &Pages, thread_id: &str) -> Option<CommentPage> {
+    query_thread_comments(p, thread_id, 0, MAX_COMMENT_PAGE_LIMIT).await
 }
 async fn query_comment(p: &Pages, comment_id: &str) -> Option<Comment> {
     let q = PageQuery::GetComment {

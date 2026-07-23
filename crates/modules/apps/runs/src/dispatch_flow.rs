@@ -355,26 +355,32 @@ impl RunsModule {
             .pages
             .as_deref()
             .ok_or_else(|| "pages module is not configured".to_string())?;
+        let expected_ordinal =
+            u32::try_from(ordinal).map_err(|_| "pages comment ordinal exceeds u32".to_string())?;
+        let from = expected_ordinal
+            .checked_sub(1)
+            .ok_or_else(|| "pages comment ordinal must be positive".to_string())?;
         let reply = ctx
             .query(
                 pages,
-                &pages::encode_query(&pages::PageQuery::CommentThread {
+                &pages::encode_query(&pages::PageQuery::CommentsForThread {
                     thread_id: thread_id.to_string(),
+                    from,
+                    limit: 1,
                 }),
             )
             .await
             .map_err(|e| format!("pages thread lookup failed: {e}"))?;
-        let view = match pages::decode_reply(&reply) {
-            Ok(pages::PageReply::CommentThread(Some(view))) => view,
+        let page = match pages::decode_reply(&reply) {
+            Ok(pages::PageReply::CommentPage(Some(page))) => page,
             Ok(_) => return Err(format!("pages thread is missing: {thread_id}")),
             Err(e) => return Err(format!("pages thread reply failed to decode: {e}")),
         };
-        let index = usize::try_from(ordinal.saturating_sub(1))
-            .map_err(|_| "pages comment ordinal exceeds host usize".to_string())?;
-        let comment = view
+        let comment = page
             .comments
-            .get(index)
-            .filter(|comment| !comment.deleted)
+            .into_iter()
+            .find(|item| item.ordinal == expected_ordinal)
+            .map(|item| item.comment)
             .ok_or_else(|| format!("pages comment is missing: {thread_id}/{ordinal}"))?;
         let author = match &comment.author {
             pages::AuthorRef::User(key) => format!("user:{}", crate::hex(key)),
@@ -386,14 +392,14 @@ impl RunsModule {
             .query(
                 pages,
                 &pages::encode_query(&pages::PageQuery::GetBlock {
-                    block_id: view.thread.target.clone(),
+                    block_id: page.thread.target.clone(),
                 }),
             )
             .await
             .map_err(|e| format!("pages target lookup failed: {e}"))?;
         let page_id = match pages::decode_reply(&block_reply) {
             Ok(pages::PageReply::Block(Some(block))) => block.page,
-            _ => return Err(format!("pages target is missing: {}", view.thread.target)),
+            _ => return Err(format!("pages target is missing: {}", page.thread.target)),
         };
         let mut portable = self.portable_inputs(ctx, agent, &[]).await?;
         let blocks = self.page_blocks(ctx, pages, &page_id).await;

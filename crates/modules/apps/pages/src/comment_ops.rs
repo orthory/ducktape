@@ -1,7 +1,9 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
-    MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
-    PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    AuthorRef, Comment, CommentItem, CommentPage, CommentThread, DEFAULT_COMMENT_PAGE_LIMIT,
+    DEFAULT_THREAD_PAGE_LIMIT, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_AUTHOR_BYTES,
+    MAX_COMMENT_ID_BYTES, MAX_COMMENT_PAGE_LIMIT, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
+    MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREAD_PAGE_LIMIT, MAX_THREADS_PER_TARGET,
+    Origin, PageError, PageMsg, Pages, TargetThreadPage, Thread, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -28,7 +30,11 @@ fn target_index_key(target: &str) -> String {
 fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
     match origin {
         Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
+        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
+            Err(PageError::AuthorTooLarge)
+        }
         Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
+        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
         Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
         Origin::System => Ok(AuthorRef::System),
     }
@@ -88,25 +94,105 @@ impl Pages {
         }
     }
 
-    /// a thread plus its LIVE (non-tombstoned) comments in order. `None` when
-    /// the thread is absent; a listed comment missing from the store is
-    /// corruption, surfaced loudly.
-    pub(super) async fn thread_view(
+    fn comment_thread(thread: &Thread) -> Result<CommentThread, PageError> {
+        Ok(CommentThread {
+            id: thread.id.clone(),
+            target: thread.target.clone(),
+            opener: thread.opener.clone(),
+            created_at: thread.created_at,
+            anchor: thread.anchor.clone(),
+            resolved: thread.resolved,
+            resolved_by: thread.resolved_by.clone(),
+            comment_count: u32::try_from(thread.comment_ids.len())
+                .map_err(|_| PageError::Corrupt)?,
+        })
+    }
+
+    pub(super) async fn target_thread_page(
+        &self,
+        target: &str,
+        from: u32,
+        limit: u16,
+    ) -> Result<TargetThreadPage, PageError> {
+        if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(target) {
+            return Err(PageError::IdTooLarge);
+        }
+        let ids = self.load_target_index(target).await?;
+        let start = (from as usize).min(ids.len());
+        let limit = if limit == 0 {
+            DEFAULT_THREAD_PAGE_LIMIT
+        } else {
+            limit.min(MAX_THREAD_PAGE_LIMIT)
+        };
+        let end = start.saturating_add(usize::from(limit)).min(ids.len());
+        let mut threads = Vec::with_capacity(end.saturating_sub(start));
+        for thread_id in &ids[start..end] {
+            let thread = self
+                .load_thread(thread_id)
+                .await?
+                .ok_or(PageError::Corrupt)?;
+            if thread.target != target {
+                return Err(PageError::Corrupt);
+            }
+            threads.push(Self::comment_thread(&thread)?);
+        }
+        let total = u32::try_from(ids.len()).map_err(|_| PageError::Corrupt)?;
+        let next_from = (end < ids.len())
+            .then(|| u32::try_from(end).map_err(|_| PageError::Corrupt))
+            .transpose()?;
+        Ok(TargetThreadPage {
+            target: target.to_string(),
+            threads,
+            total,
+            next_from,
+        })
+    }
+
+    pub(super) async fn comment_page(
         &self,
         thread_id: &str,
-    ) -> Result<Option<ThreadView>, PageError> {
-        let thread = match self.load_thread(thread_id).await? {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-        let mut comments = Vec::new();
-        for cid in &thread.comment_ids {
-            let c = self.load_comment(cid).await?.ok_or(PageError::Corrupt)?;
-            if !c.deleted {
-                comments.push(c);
-            }
+        from: u32,
+        limit: u16,
+    ) -> Result<Option<CommentPage>, PageError> {
+        if thread_id.len() > MAX_THREAD_ID_BYTES || !id_is_index_safe(thread_id) {
+            return Err(PageError::IdTooLarge);
         }
-        Ok(Some(ThreadView { thread, comments }))
+        let Some(thread) = self.load_thread(thread_id).await? else {
+            return Ok(None);
+        };
+        let start = (from as usize).min(thread.comment_ids.len());
+        let limit = if limit == 0 {
+            DEFAULT_COMMENT_PAGE_LIMIT
+        } else {
+            limit.min(MAX_COMMENT_PAGE_LIMIT)
+        };
+        let end = start
+            .saturating_add(usize::from(limit))
+            .min(thread.comment_ids.len());
+        let mut comments = Vec::with_capacity(end.saturating_sub(start));
+        for (offset, comment_id) in thread.comment_ids[start..end].iter().enumerate() {
+            let comment = self
+                .load_comment(comment_id)
+                .await?
+                .ok_or(PageError::Corrupt)?;
+            if comment.deleted {
+                continue;
+            }
+            let ordinal = start
+                .checked_add(offset)
+                .and_then(|index| index.checked_add(1))
+                .and_then(|index| u32::try_from(index).ok())
+                .ok_or(PageError::Corrupt)?;
+            comments.push(CommentItem { ordinal, comment });
+        }
+        let next_from = (end < thread.comment_ids.len())
+            .then(|| u32::try_from(end).map_err(|_| PageError::Corrupt))
+            .transpose()?;
+        Ok(Some(CommentPage {
+            thread: Self::comment_thread(&thread)?,
+            comments,
+            next_from,
+        }))
     }
 
     /// remove every comment thread (its comments + the target index) anchored
@@ -200,6 +286,9 @@ impl Pages {
                     Some(agent_id) => {
                         if agent_id.is_empty() {
                             return Err(PageError::EmptyAgent);
+                        }
+                        if agent_id.len() > MAX_COMMENT_AGENT_ID_BYTES {
+                            return Err(PageError::AgentIdTooLarge);
                         }
                         match author_from_origin(origin)? {
                             AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },

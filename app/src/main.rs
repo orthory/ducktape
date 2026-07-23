@@ -53,6 +53,7 @@ mod tests {
             "chat_search_draft",
             "page_draft",
             "block_draft",
+            "block_comment_draft",
             "page_search_draft",
         ];
         let overwrites_editable = refresh.lines().any(|line| {
@@ -320,6 +321,9 @@ mod tests {
         app.reply_draft = "node a reply".into();
         app.selected_block_id = "same-id".into();
         app.block_edit_draft = "node a block".into();
+        app.block_comments_open = true;
+        app.block_comments_target = "same-id".into();
+        app.block_comment_draft = "node a comment".into();
         app.message_draft = "node a message".into();
         app.page_search_draft = "node a search".into();
 
@@ -334,6 +338,9 @@ mod tests {
         assert!(app.reply_draft.is_empty());
         assert!(app.selected_block_id.is_empty());
         assert!(app.block_edit_draft.is_empty());
+        assert!(!app.block_comments_open);
+        assert!(app.block_comments_target.is_empty());
+        assert!(app.block_comment_draft.is_empty());
         assert!(app.message_draft.is_empty());
         assert!(app.page_search_draft.is_empty());
 
@@ -398,6 +405,200 @@ mod tests {
         let (app, _) = Ducktape::__boot();
         assert!(app.block_kinds.iter().any(|kind| kind == "Page"));
         assert!(!app.editable_block_kinds.iter().any(|kind| kind == "Page"));
+    }
+
+    #[test]
+    fn block_comments_stay_inside_the_selected_block_editor() {
+        let view = include_str!("ui/view.ice");
+        let selected = view
+            .split_once("if block.id == selected_block_id")
+            .unwrap()
+            .1;
+        assert!(selected.contains("open_block_comments"));
+        assert!(selected.contains("#block-comment(scope_key(connected_rpc, selected_block_id))"));
+        assert!(!view.contains("button \"Save\""));
+    }
+
+    #[test]
+    fn selecting_another_block_discards_a_stale_comment_page() {
+        let (mut app, _) = Ducktape::__boot();
+        app.mutation_phase = "idle".into();
+        let _ = app.__update(__DucktapeMessage::SelectBlock(
+            "block-a".into(),
+            "Text".into(),
+            "A".into(),
+            false,
+        ));
+        let _ = app.__update(__DucktapeMessage::OpenBlockComments);
+        let stale_generation = app.block_comments_generation;
+
+        let _ = app.__update(__DucktapeMessage::SelectBlock(
+            "block-b".into(),
+            "Text".into(),
+            "B".into(),
+            false,
+        ));
+        let _ = app.__update(__DucktapeMessage::BlockThreadsLoaded(
+            backend::BlockThreadListData {
+                generation: stale_generation,
+                target: "block-a".into(),
+                from: 0,
+                threads: vec![backend::PageCommentThread {
+                    id: "thread-a".into(),
+                    author: "Alice".into(),
+                    meta: "1".into(),
+                    resolved: false,
+                    comment_count: 1,
+                }],
+                total: 1,
+                next_from: 0,
+                has_more: false,
+            },
+        ));
+
+        assert_eq!(app.selected_block_id, "block-b");
+        assert!(!app.block_comments_open);
+        assert!(app.block_comment_threads.is_empty());
+    }
+
+    #[test]
+    fn comment_pages_merge_by_identity_and_ordinal() {
+        let thread = |id: &str, count: i64| backend::PageCommentThread {
+            id: id.into(),
+            author: "user".into(),
+            meta: count.to_string(),
+            resolved: false,
+            comment_count: count,
+        };
+        let comment = |ordinal, text: &str| backend::PageComment {
+            id: format!("comment-{ordinal}"),
+            ordinal,
+            author: "user".into(),
+            meta: format!("#{ordinal}"),
+            text: text.into(),
+        };
+
+        let threads = backend::append_page_comment_threads(
+            vec![thread("b", 1), thread("a", 1)],
+            vec![thread("b", 2), thread("c", 1)],
+        );
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(threads[1].comment_count, 2);
+
+        let comments = backend::append_page_comments(
+            vec![comment(1, "first"), comment(3, "old")],
+            vec![comment(2, "second"), comment(3, "new")],
+        );
+        assert_eq!(
+            comments
+                .iter()
+                .map(|comment| comment.ordinal)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(comments[2].text, "new");
+    }
+
+    #[test]
+    fn live_comment_refresh_updates_threads_without_touching_the_draft() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.mutation_phase = "idle".into();
+        app.sync_phase = "idle".into();
+        app.selected_block_id = "block-1".into();
+        app.block_comments_open = true;
+        app.block_comments_target = "block-1".into();
+        app.block_comment_draft = "draft stays".into();
+        app.active_block_comment_thread = "deleted-thread".into();
+        app.block_thread_comments = vec![backend::PageComment {
+            id: "stale-comment".into(),
+            ordinal: 1,
+            author: "user".into(),
+            meta: "#1".into(),
+            text: "stale".into(),
+        }];
+
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "changed".into(),
+            status: "Live".into(),
+            height: 8,
+        }));
+        let generation = app.block_comments_generation;
+        assert_eq!(app.sync_phase, "refreshing");
+        assert!(!app.block_comment_threads_loading);
+
+        let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
+            backend::BlockCommentsRefreshData {
+                generation,
+                target: "block-1".into(),
+                threads: vec![backend::PageCommentThread {
+                    id: "thread-1".into(),
+                    author: "user".into(),
+                    meta: "1".into(),
+                    resolved: false,
+                    comment_count: 1,
+                }],
+                total: 3,
+                threads_next_from: 0,
+                threads_has_more: false,
+                thread_id: String::new(),
+                comments: Vec::new(),
+                comments_next_from: 0,
+                comments_has_more: false,
+            },
+        ));
+
+        assert_eq!(app.block_comment_thread_total, 3);
+        assert_eq!(app.block_comment_draft, "draft stays");
+        assert!(app.active_block_comment_thread.is_empty());
+        assert!(app.block_thread_comments.is_empty());
+        assert!(!app.block_comment_threads_loading);
+    }
+
+    #[test]
+    fn block_comment_recovery_always_unlocks_mutations() {
+        let (mut failed, _) = Ducktape::__boot();
+        failed.block_comments_open = true;
+        failed.block_comments_generation = 7;
+        failed.block_comment_threads_loading = true;
+        failed.mutation_phase = "recovering".into();
+        let _ = failed.__update(__DucktapeMessage::BlockThreadsRecoveryFailed(
+            backend::HydrationError {
+                generation: 7,
+                message: "recovery read failed".into(),
+            },
+        ));
+        assert_eq!(failed.mutation_phase, "idle");
+        assert!(!failed.block_comment_threads_loading);
+
+        let (mut recovered, _) = Ducktape::__boot();
+        recovered.block_comments_open = true;
+        recovered.block_comments_target = "block-1".into();
+        recovered.selected_block_id = "block-1".into();
+        recovered.block_comments_generation = 8;
+        recovered.block_comment_threads_loading = true;
+        recovered.mutation_phase = "recovering".into();
+        recovered.error = "write result was uncertain".into();
+        let _ = recovered.__update(__DucktapeMessage::BlockThreadsRecovered(
+            backend::BlockThreadListData {
+                generation: 8,
+                target: "block-1".into(),
+                from: 0,
+                threads: Vec::new(),
+                total: 0,
+                next_from: 0,
+                has_more: false,
+            },
+        ));
+        assert_eq!(recovered.mutation_phase, "idle");
+        assert!(recovered.error.is_empty());
     }
 
     #[test]

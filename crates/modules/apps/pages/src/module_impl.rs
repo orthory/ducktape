@@ -1,7 +1,7 @@
 use super::{
-    AuthorRef, BlockKind, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId, Msg, PAGE_INDEX_KEY,
-    PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget, StateRoot,
-    StateSyncHandle, TagEvent, TaggingMsg, TargetThreads, decode_msg, decode_query, encode_reply,
+    AuthorRef, BlockKind, Ctx, Error, Module, ModuleId, Msg, PAGE_INDEX_KEY, PageError, PageMeta,
+    PageQuery, PageReply, Pages, ResolverSyncTarget, StateRoot, StateSyncHandle, TagEvent,
+    TaggingMsg, decode_msg, decode_query, encode_reply,
 };
 
 fn tag_author(author: &AuthorRef) -> tagging::Author {
@@ -147,30 +147,27 @@ impl Module for Pages {
                 }
                 Ok(encode_reply(&PageReply::PageList(pages)))
             }
-            PageQuery::ThreadsForTargets { targets } => {
-                if targets.len() > MAX_QUERY_TARGETS {
-                    return Err(Error::Module(PageError::TooManyTargets.to_string()));
-                }
-                let err = |e: PageError| Error::Module(e.to_string());
-                let mut out = Vec::with_capacity(targets.len());
-                for target in targets {
-                    let ids = self.load_target_index(&target).await.map_err(err)?;
-                    let mut threads = Vec::new();
-                    for tid in ids {
-                        if let Some(view) = self.thread_view(&tid).await.map_err(err)? {
-                            threads.push(view);
-                        }
-                    }
-                    out.push(TargetThreads { target, threads });
-                }
-                Ok(encode_reply(&PageReply::CommentThreads(out)))
-            }
-            PageQuery::CommentThread { thread_id } => {
-                let view = self
-                    .thread_view(&thread_id)
+            PageQuery::ThreadsForTarget {
+                target,
+                from,
+                limit,
+            } => {
+                let page = self
+                    .target_thread_page(&target, from, limit)
                     .await
-                    .map_err(|e| Error::Module(e.to_string()))?;
-                Ok(encode_reply(&PageReply::CommentThread(view)))
+                    .map_err(|error| Error::Module(error.to_string()))?;
+                Ok(encode_reply(&PageReply::ThreadPage(page)))
+            }
+            PageQuery::CommentsForThread {
+                thread_id,
+                from,
+                limit,
+            } => {
+                let page = self
+                    .comment_page(&thread_id, from, limit)
+                    .await
+                    .map_err(|error| Error::Module(error.to_string()))?;
+                Ok(encode_reply(&PageReply::CommentPage(page)))
             }
             PageQuery::GetComment { comment_id } => {
                 let comment = self

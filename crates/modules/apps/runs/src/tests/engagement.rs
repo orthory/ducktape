@@ -7,8 +7,8 @@ fn pages_comment_mention_dispatches_without_a_chat_watch() {
     let mut m = module()
         .with_files_module("files")
         .with_pages_module("pages");
-    let thread = pages::ThreadView {
-        thread: pages::Thread {
+    let thread = pages::CommentPage {
+        thread: pages::CommentThread {
             id: "thread-1".into(),
             target: "b-p".into(),
             opener: pages::AuthorRef::User(vec![4; 32]),
@@ -16,17 +16,21 @@ fn pages_comment_mention_dispatches_without_a_chat_watch() {
             anchor: None,
             resolved: false,
             resolved_by: None,
-            comment_ids: vec!["comment-1".into()],
+            comment_count: 1,
         },
-        comments: vec![pages::Comment {
-            id: "comment-1".into(),
-            thread_id: "thread-1".into(),
-            author: pages::AuthorRef::User(vec![4; 32]),
-            text: "@bot review this page".into(),
-            created_at: 1,
-            edited_at: None,
-            deleted: false,
+        comments: vec![pages::CommentItem {
+            ordinal: 1,
+            comment: pages::Comment {
+                id: "comment-1".into(),
+                thread_id: "thread-1".into(),
+                author: pages::AuthorRef::User(vec![4; 32]),
+                text: "@bot review this page".into(),
+                created_at: 1,
+                edited_at: None,
+                deleted: false,
+            },
         }],
+        next_from: None,
     };
     let mut ctx = CaptureCtx::new()
         .at(3)
