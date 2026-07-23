@@ -34,7 +34,7 @@ pub enum OpCmd {
     Join(JoinCmd),
     /// list registered workspaces (chain-id + config path)
     List,
-    /// the running node's tip: height + app hash (reads the local rpc)
+    /// the running node's tip: height + root hash (reads the local rpc)
     Status(StatusArgs),
     /// the running node's direct peers: connection, traffic, sync heights
     Peers(StatusArgs),

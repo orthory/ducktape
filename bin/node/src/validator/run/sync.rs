@@ -58,7 +58,7 @@ impl ValidatorRuntime<'_> {
                     Some(finalized) => {
                         let id = statesync::BoundaryId {
                             height: finalized.height,
-                            app_hash: finalized.app_hash,
+                            root_hash: finalized.root_hash,
                         };
                         if known.contains(&id) {
                             // the serve task holds this boundary's
@@ -121,7 +121,7 @@ impl ValidatorRuntime<'_> {
                     None => Err("no finalized boundary to serve yet".to_string()),
                     Some(f) => Ok(statesync::TipCoords {
                         height: f.height,
-                        app_hash: f.app_hash,
+                        root_hash: f.root_hash,
                         epoch: orchestrator.epoch(),
                         view_base: orchestrator.epoch_base(),
                         participants: participant_bytes(orchestrator),

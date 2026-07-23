@@ -4,7 +4,7 @@ import { GraphFlow, type SemanticEdge, type SemanticNode } from './GraphFlow.cli
 
 /**
  * The host-owned block lifecycle of a module: register → execute → drain
- * follow-ups → commit/abort → fold app-hash → serve finalized sync.
+ * follow-ups → commit/abort → fold root-hash → serve finalized sync.
  * Grounded in the `sdk` Module contract and the host block loop.
  */
 
@@ -16,7 +16,7 @@ const nodes: SemanticNode[] = [
   { id: 'drain', label: 'Drain FIFO', sub: 'follow-up queue', category: 'step' },
   { id: 'commit', label: 'commit_block', sub: 'publish staged writes', category: 'store' },
   { id: 'abort', label: 'abort_block', sub: 'reject / budget → rollback', category: 'external' },
-  { id: 'apphash', label: 'Fold app-hash', sub: 'recompose global root', category: 'store' },
+  { id: 'roothash', label: 'Fold root-hash', sub: 'recompose global root', category: 'store' },
   { id: 'serve', label: 'Serve sync', sub: 'finalized boundary', category: 'step' },
 ]
 
@@ -29,8 +29,8 @@ const edges: SemanticEdge[] = [
   { from: 'drain', to: 'execute', label: 'next msg' },
   { from: 'drain', to: 'commit', label: 'clean', kind: 'commit' },
   { from: 'drain', to: 'abort', label: 'reject' },
-  { from: 'commit', to: 'apphash', label: 'recompose', kind: 'commit' },
-  { from: 'apphash', to: 'serve', label: 'finalize', kind: 'commit' },
+  { from: 'commit', to: 'roothash', label: 'recompose', kind: 'commit' },
+  { from: 'roothash', to: 'serve', label: 'finalize', kind: 'commit' },
 ]
 
 const legend = [

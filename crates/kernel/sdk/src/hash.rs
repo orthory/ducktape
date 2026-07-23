@@ -1,5 +1,5 @@
 //! shared canonical-preimage helpers — the byte contracts that several crates
-//! must produce IDENTICALLY or the app-hash forks. deliberately dep-free (no
+//! must produce IDENTICALLY or the root-hash forks. deliberately dep-free (no
 //! `sha2`): `sdk` is the one crate every module and every wasm guest links, so
 //! it stays types + pure byte assembly. the SHA-256 step lives with each
 //! caller (which already carries `sha2`); the shared thing here is the exact
@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 /// it is checked against). SHA-256 over these bytes is the module root, and
 /// the bytes themselves are the snapshot format — so this function is a
 /// consensus byte contract: changing it moves every map-backed module root and
-/// the app-hash. `BTreeMap` iterates in sorted key order, so the encoding is
+/// the root-hash. `BTreeMap` iterates in sorted key order, so the encoding is
 /// deterministic across nodes.
 pub fn encode_pairs(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
     let mut out = Vec::new();

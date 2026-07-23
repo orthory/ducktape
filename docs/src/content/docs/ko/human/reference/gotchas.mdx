@@ -9,7 +9,7 @@ audience: human
 
 QMDB root는 operation log에 commit한다. 같은 최종 key-value state도 write order가
 다르면 다른 root가 될 수 있다. 코드를 보기 좋게 만들기 위해 write를 reorder하지
-말아야 한다. QMDB를 작은 global head map으로 쓰지 않는다. global app-hash는
+말아야 한다. QMDB를 작은 global head map으로 쓰지 않는다. global root-hash는
 state-based이고 idempotent해야 한다.
 
 ## Fixed-Width Sync Keys

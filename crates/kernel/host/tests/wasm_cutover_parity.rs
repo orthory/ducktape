@@ -3,7 +3,7 @@
 //! the same op sequence yields the same root() after every block, the same
 //! snapshot bytes, and the same query replies — and each side's snapshot
 //! installs into the other against the same root. a native→wasm cutover of
-//! this module therefore preserves the app-hash and restores pre-cutover
+//! this module therefore preserves the root-hash and restores pre-cutover
 //! workspaces unchanged.
 
 use directory::{
@@ -59,7 +59,7 @@ async fn same_ops_inner() {
     );
 
     // the same op sequence, block by block — roots stay identical at every
-    // boundary (this is the app-hash-continuity claim, module-locally).
+    // boundary (this is the root-hash-continuity claim, module-locally).
     let ops = [
         set("a", "1"),
         set("name", "world"),

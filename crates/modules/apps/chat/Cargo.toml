@@ -52,7 +52,7 @@ serde_json = { workspace = true }
 # the logical-key -> store-key hash (sha256); the store itself is injected.
 sha2 = { workspace = true }
 # voice submodule (crates/modules/apps/chat/src/voice): real-time media over the data
-# plane's datagram class. Off-consensus — no qmdb, no app-hash.
+# plane's datagram class. Off-consensus — no qmdb, no root-hash.
 data-plane = { workspace = true, optional = true }
 opus-rs = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }

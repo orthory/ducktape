@@ -191,7 +191,7 @@ New env: `DUCKTAPE_RUN_ACTION_URL`, `DUCKTAPE_RUN_ACTION_TOKEN`, and
 
 ## Flag day
 
-New `runs` state (the session registry) and two new ops move the app-hash.
+New `runs` state (the session registry) and two new ops move the root-hash.
 Pre-production, so a re-genesis is acceptable — but it IS a flag day and must be
 called out in the PR.
 

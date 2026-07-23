@@ -145,7 +145,7 @@ Logging around module execution is safe **because a module cannot observe it**: 
 
 Six PRs against `dev`, each independently shippable. **Delete the print in the same hunk that adds its event** — except the ten marker strings below, which are a live contract until S3.
 
-> **The marker allowlist** (`app/src-tauri/src/workspaces/phase.rs:34-48`, asserted by `bin/node/tests/invite_e2e.rs`). Do not delete or reword these prints before S3: `"joiner mode:"`, `"joining:"`, `"ADMITTED at height"`, `"admitted at epoch"`, `"resident: standing granted"`, `"synced app_hash="`, `"resident: pre-synced boundary"`, `"promoted:"`, `"FATAL"`, `"panicked at"`. Converting them to `tracing` is safe — both readers use `contains()` and the detail extractor falls back with `.unwrap_or(line)` — the message text survives in the rendered line.
+> **The marker allowlist** (`app/src-tauri/src/workspaces/phase.rs:34-48`, asserted by `bin/node/tests/invite_e2e.rs`). Do not delete or reword these prints before S3: `"joiner mode:"`, `"joining:"`, `"ADMITTED at height"`, `"admitted at epoch"`, `"resident: standing granted"`, `"synced root_hash="`, `"resident: pre-synced boundary"`, `"promoted:"`, `"FATAL"`, `"panicked at"`. Converting them to `tracing` is safe — both readers use `contains()` and the detail extractor falls back with `.unwrap_or(line)` — the message text survives in the rendered line.
 
 ---
 
@@ -348,7 +348,7 @@ Sites: `validator/boot.rs` (~21), `drain.rs:76` + `:614`, `sync/serve.rs` (5), `
 ```rust
 // bin/node/src/validator/run/drain.rs:76
 tracing::error!(target: "ducktape::consensus",
-                error = %e, height = node.finalized(), epoch, app_hash = %hex(&node.app_hash()),
+                error = %e, height = node.finalized(), epoch, root_hash = %hex(&node.root_hash()),
                 "FATAL: block-boundary fault — halting");  // "FATAL" preserved (marker allowlist)
 // then FLUSH before exit(1): process::exit skips every Drop, including LogRingWriter's.
 ```
@@ -367,15 +367,15 @@ Same class, same PR:
 **Files:** `crates/kernel/node/src/lib.rs`, `crates/kernel/host/src/lib.rs`, `bin/node/src/validator/run/drain.rs`, `bin/noded/src/lib.rs`.
 **Size:** ~4 files, ~60 lines. **Risk: LOW.** No wire change, no kernel command change.
 
-**(a) Nothing in this repo ever says "height H produced app-hash X."** Fork triage, upgrade verification, and *"is my node keeping up"* all start here. Every field is already in scope.
+**(a) Nothing in this repo ever says "height H produced root-hash X."** Fork triage, upgrade verification, and *"is my node keeping up"* all start here. Every field is already in scope.
 
 ```rust
-// crates/kernel/node/src/lib.rs:1318, beside `let batch_hash = outcome.app_hash;`
+// crates/kernel/node/src/lib.rs:1318, beside `let batch_hash = outcome.root_hash;`
 // gate on `applied`: an idle chain heartbeats a nop block every second and would fill
 // the ring with nothing.
 if any_applied {
     tracing::info!(target: "ducktape::consensus", height, view, epoch,
-                   app_hash = %hex(&batch_hash), members, applied, rejected,
+                   root_hash = %hex(&batch_hash), members, applied, rejected,
                    "block committed");
 } else {
     tracing::debug!(target: "ducktape::consensus", height, "idle block");

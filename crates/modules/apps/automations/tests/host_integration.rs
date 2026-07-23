@@ -136,7 +136,7 @@ fn user_post_fires_rule_and_creates_task_atomically() {
         host.submit_at(ctx, msg).await.expect("create rule");
 
         // a user post in "general" flows chat -> automations -> tasks in one block.
-        let app_before = host.app_hash();
+        let app_before = host.root_hash();
         let out = host
             .submit_at(
                 BlockContext {
@@ -148,7 +148,7 @@ fn user_post_fires_rule_and_creates_task_atomically() {
             )
             .await
             .expect("hook fires");
-        assert_ne!(out.app_hash, app_before, "the fire moved the app-hash");
+        assert_ne!(out.root_hash, app_before, "the fire moved the root-hash");
 
         let tasks = tasks_of(&host).await;
         assert_eq!(tasks.len(), 1, "the rule created exactly one task");
@@ -279,7 +279,7 @@ fn post_probe_collision_still_aborts_the_block() {
             ));
             host.submit_at(ctx, msg).await.expect("create rule");
         }
-        let app_before = host.app_hash();
+        let app_before = host.root_hash();
 
         let err = host
             .submit_at(
@@ -297,9 +297,9 @@ fn post_probe_collision_still_aborts_the_block() {
             "unexpected error: {err:?}"
         );
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             app_before,
-            "the aborted block left the app-hash untouched"
+            "the aborted block left the root-hash untouched"
         );
         assert!(tasks_of(&host).await.is_empty(), "no task landed");
         assert!(

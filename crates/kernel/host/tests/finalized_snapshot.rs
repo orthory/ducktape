@@ -1,5 +1,5 @@
 //! finalized snapshot capture: the host can expose the registry roots and
-//! per-module state-sync handles for the exact app-hash a finalized block
+//! per-module state-sync handles for the exact root-hash a finalized block
 //! produced. capture must not serve stale heights after the registry advances,
 //! and it must not expose staged writes from an aborted block.
 
@@ -89,8 +89,8 @@ impl Module for ResolverBackedModule {
     }
 }
 
-fn block(height: u64, app_hash: StateRoot) -> FinalizedBlock {
-    FinalizedBlock { height, app_hash }
+fn block(height: u64, root_hash: StateRoot) -> FinalizedBlock {
+    FinalizedBlock { height, root_hash }
 }
 
 fn ctx(height: u64) -> BlockContext {
@@ -102,14 +102,14 @@ fn ctx(height: u64) -> BlockContext {
 }
 
 #[test]
-fn snapshot_capture_uses_the_finalized_app_hash_boundary() {
+fn snapshot_capture_uses_the_finalized_root_hash_boundary() {
     deterministic::Runner::default().start(|_| async move {
         let mut host = Host::genesis(vec![
             Box::new(BytesModule::new(1)),
             Box::new(ResolverBackedModule),
         ])
         .expect("genesis");
-        let start_hash = host.app_hash();
+        let start_hash = host.root_hash();
 
         let err = host
             .submit_at(
@@ -125,7 +125,7 @@ fn snapshot_capture_uses_the_finalized_app_hash_boundary() {
 
         let after_abort = host
             .capture_finalized_snapshot(block(6, start_hash))
-            .expect("unchanged app-hash can still be served");
+            .expect("unchanged root-hash can still be served");
         let bytes = after_abort.module(BYTES_ID).expect("bytes module");
         assert_eq!(bytes.root, StateRoot([1u8; sdk::ROOT_LEN]));
         assert_eq!(
@@ -146,10 +146,10 @@ fn snapshot_capture_uses_the_finalized_app_hash_boundary() {
             .expect("committed block");
 
         let snapshot = host
-            .capture_finalized_snapshot(block(8, committed.app_hash))
-            .expect("current finalized app-hash must capture");
+            .capture_finalized_snapshot(block(8, committed.root_hash))
+            .expect("current finalized root-hash must capture");
         assert_eq!(snapshot.height, 8);
-        assert_eq!(snapshot.app_hash, committed.app_hash);
+        assert_eq!(snapshot.root_hash, committed.root_hash);
 
         let bytes = snapshot.module(BYTES_ID).expect("bytes module");
         assert_eq!(bytes.root, StateRoot([7u8; sdk::ROOT_LEN]));
@@ -180,13 +180,13 @@ fn snapshot_capture_uses_the_finalized_app_hash_boundary() {
             .await
             .expect("second committed block");
         let stale = host
-            .capture_finalized_snapshot(block(8, committed.app_hash))
+            .capture_finalized_snapshot(block(8, committed.root_hash))
             .expect_err("old boundary must not be served from new registry state");
         assert_eq!(
             stale,
-            SnapshotError::AppHashMismatch {
-                expected: committed.app_hash,
-                actual: moved.app_hash,
+            SnapshotError::RootHashMismatch {
+                expected: committed.root_hash,
+                actual: moved.root_hash,
             },
         );
     });

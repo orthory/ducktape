@@ -18,7 +18,7 @@ Ducktape state lives in two tiers with opposite contracts:
 | | canonical tier | derived tier (this spec) |
 | --- | --- | --- |
 | substrate | qmdb / git — authenticated | fluent31 — ordered, scannable |
-| in the app-hash | **always** (`Module::root()`) | **never** |
+| in the root-hash | **always** (`Module::root()`) | **never** |
 | cross-node | byte-identical by consensus | node-local, no determinism claim |
 | reads | point lookups, module `query` | scans, search, partitions, views |
 | consistency | exact at every height | **optimistic** — feed exact, views converge |

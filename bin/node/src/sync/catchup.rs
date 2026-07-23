@@ -27,9 +27,9 @@ pub(crate) async fn apply_verified_suffix_frame(
     // the served frame is a BATCH: decode its members (an envelope
     // re-applies WITH its continuation) and apply as ONE block, exactly like
     // the live drain and recovery replay, so the disposition, roots, and
-    // app-hash reproduce what the peer served. disposition is DRAIN-based
+    // root-hash reproduce what the peer served. disposition is DRAIN-based
     // (any member or released continuation applied, or a System injection
-    // ran), never app-hash-based.
+    // ran), never root-hash-based.
     let (outcome, dispatches) = match node::decode_batch(&served.frame) {
         Ok(members) => {
             let mut ops = Vec::new();
@@ -75,13 +75,13 @@ pub(crate) async fn apply_verified_suffix_frame(
             served.height, roots, served.roots
         ));
     }
-    let app_hash = host.app_hash();
-    if app_hash != served.app_hash {
+    let root_hash = host.root_hash();
+    if root_hash != served.root_hash {
         return Err(format!(
-            "served seal mismatch at height {}: app_hash {} != served {}",
+            "served seal mismatch at height {}: root_hash {} != served {}",
             served.height,
-            hex(&app_hash),
-            hex(&served.app_hash)
+            hex(&root_hash),
+            hex(&served.root_hash)
         ));
     }
     Ok(dispatches)
@@ -107,7 +107,7 @@ where
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),
         roots: host.module_roots(),
-        app_hash: host.app_hash(),
+        root_hash: host.root_hash(),
     };
     node::BlockSink::seal(recovery, &seal)
         .await
@@ -118,7 +118,7 @@ where
             height: frame.height,
             frame: &frame.frame,
             disposition: seal.disposition,
-            app_hash: seal.app_hash,
+            root_hash: seal.root_hash,
             dispatches: &dispatches,
         });
     }
@@ -220,11 +220,11 @@ pub(crate) async fn write_post_reboot_catchup_checkpoint<E>(
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
-    if host.app_hash() != target.app_hash {
+    if host.root_hash() != target.root_hash {
         return Err(format!(
             "catch-up checkpoint host hash {} does not match target {}",
-            hex(&host.app_hash()),
-            hex(&target.app_hash)
+            hex(&host.root_hash()),
+            hex(&target.root_hash)
         ));
     }
     let pending_cutover_view = catchup_pending_cutover_view(base_manifest, target, blocks)?;
@@ -298,12 +298,12 @@ where
             PostRebootCatchupError::Retry(format!("catch-up manifest unavailable: {e}"))
         })?;
         if tip.height <= current_height {
-            if tip.height == current_height && host.app_hash() != tip.app_hash {
+            if tip.height == current_height && host.root_hash() != tip.root_hash {
                 return Err(PostRebootCatchupError::Fatal(format!(
                     "catch-up source hash {} at height {} does not match recovered host {}",
-                    hex(&tip.app_hash),
+                    hex(&tip.root_hash),
                     tip.height,
-                    hex(&host.app_hash())
+                    hex(&host.root_hash())
                 )));
             }
             tracing::debug!(
@@ -318,7 +318,7 @@ where
                 to_height: current_height,
                 frames: total_frames,
                 target: target.or_else(|| {
-                    (tip.height == current_height && host.app_hash() == tip.app_hash).then_some(tip)
+                    (tip.height == current_height && host.root_hash() == tip.root_hash).then_some(tip)
                 }),
                 frame_bytes,
                 blocks,
@@ -368,11 +368,11 @@ where
         )
         .await
         .map_err(PostRebootCatchupError::Fatal)?;
-        if host.app_hash() != tip.app_hash {
+        if host.root_hash() != tip.root_hash {
             return Err(PostRebootCatchupError::Fatal(format!(
                 "catch-up frames landed at {}, target manifest {}",
-                hex(&host.app_hash()),
-                hex(&tip.app_hash)
+                hex(&host.root_hash()),
+                hex(&tip.root_hash)
             )));
         }
         current_height = tip.height;

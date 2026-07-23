@@ -210,7 +210,7 @@ pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
 /// the mode rides the agent's skill REFERENCE, not the skill document, because
 /// curation is per-agent: the same skill is one agent's persona and another's
 /// reference material. it lives in consensus (rather than in the document's own
-/// frontmatter) so "what does this agent always load" is visible to the app-hash
+/// frontmatter) so "what does this agent always load" is visible to the root-hash
 /// and to the UI.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -295,7 +295,7 @@ pub enum AgentRole {
 }
 
 /// one registered agent — an ordered-op registration, so which capability and
-/// which SKILLS an agent runs is part of the app-hash and auditable. `owner` is
+/// which SKILLS an agent runs is part of the root-hash and auditable. `owner` is
 /// the registration origin and gates every mutation of the record.
 ///
 /// `capability` names WHAT the run needs (an open-set registry tag like

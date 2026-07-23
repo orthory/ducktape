@@ -1,6 +1,6 @@
 //! the runs module — the collaboration loop's actor.
 //!
-//! a pure state-machine module (in the app-hash) holding channel watches and
+//! a pure state-machine module (in the root-hash) holding channel watches and
 //! the correlation entries for still-pending dispatches. the agents it runs
 //! are NOT its state: the agent registry (`crates/modules/apps/agent`) is the record
 //! book, and this module reads it by query — staged same-block registrations
@@ -101,7 +101,7 @@
 //! first in consensus order wins and the rest fall through silently.
 //!
 //! `root()` folds in every field of both maps, so any transition moves the
-//! app-hash. a joiner rebuilds this module from a peer via
+//! root-hash. a joiner rebuilds this module from a peer via
 //! [`RunsModule::snapshot`] / [`RunsModule::install`]: the snapshot ships the
 //! committed maps in the exact canonical encoding `root()` hashes, and
 //! install re-derives the root from the decoded temporaries before adopting
@@ -479,7 +479,7 @@ pub struct RunsModule {
     /// pages; page refs then compose no page section (a silent skip, never
     /// a failure).
     pages: Option<ModuleId>,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
     /// delivery; the dispatch module owns lifecycle and history.

@@ -217,7 +217,7 @@ mod tests {
             height,
             disposition: Disposition::Applied,
             roots: vec![],
-            app_hash: StateRoot([0; 32]),
+            root_hash: StateRoot([0; 32]),
         }
     }
 

@@ -14,7 +14,7 @@
 //! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
 //! to [`Pages::new`], so this crate never names a storage crate. the module's
 //! authenticated [`StateRoot`] IS the store's merkle root, so it flows
-//! directly into the global app-hash via `host::global_root`.
+//! directly into the global root-hash via `host::global_root`.
 //!
 //! ## keys are hashed to a fixed width
 //!

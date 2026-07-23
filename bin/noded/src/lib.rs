@@ -134,7 +134,7 @@ use crate::metrics::metrics;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockSummary {
     pub height: u64,
-    pub app_hash: String,
+    pub root_hash: String,
 }
 
 /// the `/v1/submit` reply: the block that INCLUDED the caller's op, plus the
@@ -145,7 +145,7 @@ pub struct BlockSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubmitReceipt {
     pub height: u64,
-    pub app_hash: String,
+    pub root_hash: String,
     pub op_hash: String,
 }
 
@@ -204,7 +204,7 @@ pub struct RootOp {
 }
 
 /// one non-empty finalized block, as the explorer reads it: the block's
-/// consensus coordinates (height, frame content hash, post-block app-hash) and
+/// consensus coordinates (height, frame content hash, post-block root-hash) and
 /// the member ops it AGGREGATED, each with its deterministic dispatch trace.
 /// stored as the block's row in the index store's blocks database
 /// ([`indexer::BlockOps::record`]) and served by `GET /v1/blocks`.
@@ -215,7 +215,7 @@ pub struct BlockRecord {
     /// empty on the embedded daemon's lane: nothing is framed or signed there,
     /// so the field stays honest rather than carrying a fabricated digest.
     pub hash: String,
-    /// hex of the composed app-hash after this block settled — the commit.
+    /// hex of the composed root-hash after this block settled — the commit.
     pub commit_hash: String,
     /// the member ops this block aggregated, in agreed (applied) order. empty
     /// for an idle/nop block (nothing but the heartbeat filler).
@@ -259,12 +259,12 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
     serde_json::to_vec(record).expect("a plain record struct serializes")
 }
 
-/// the status projection: daemon build version, global app-hash, and each
+/// the status projection: daemon build version, global root-hash, and each
 /// registered module's root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,
-    pub app_hash: String,
+    pub root_hash: String,
     pub height: u64,
     pub modules: Vec<ModuleStatus>,
     /// this node's mesh identity (hex ed25519 key) — what a client stamps
@@ -405,7 +405,7 @@ pub struct ModuleStatus {
 /// A module's presentation category — how the app's Modules view groups the
 /// registered set. This is catalog metadata the status projection attaches by
 /// id; it is not part of a module's consensus identity (that stays `id` +
-/// `root`) and never enters the app-hash.
+/// `root`) and never enters the root-hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleCategory {
@@ -688,7 +688,7 @@ async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>
             let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
             Json(SubmitReceipt {
                 height: block.height,
-                app_hash: block.app_hash,
+                root_hash: block.root_hash,
                 op_hash,
             })
             .into_response()
@@ -748,7 +748,7 @@ async fn submit_frame(
             let op_hash = hex_bytes(&handle.blobs.put_chunk(payload));
             Json(SubmitReceipt {
                 height: block.height,
-                app_hash: block.app_hash,
+                root_hash: block.root_hash,
                 op_hash,
             })
             .into_response()
@@ -909,7 +909,7 @@ mod tests {
     fn status_from_an_older_node_defaults_operational_state() {
         let status: NodeStatus = serde_json::from_value(serde_json::json!({
             "version": "0.1.0",
-            "app_hash": "",
+            "root_hash": "",
             "height": 0,
             "modules": []
         }))

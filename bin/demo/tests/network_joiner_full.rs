@@ -2,7 +2,7 @@
 //! running host purely through the statesync wire protocol — one manifest at
 //! one finalized boundary, chunked snapshot fetches for the snapshot-lane
 //! modules, live proof-carrying qmdb op-range fetches for the resolver-lane
-//! modules — and composes the source's exact app-hash.
+//! modules — and composes the source's exact root-hash.
 //!
 //! NOTHING crosses the boundary except protocol bytes. the transport is an
 //! in-process channel; the bytes, frames, and client code are identical to
@@ -91,7 +91,7 @@ fn tmp_repo(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
+fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
     let source_repo = tmp_repo("source");
     let joiner_repo = tmp_repo("joiner");
     let (source_dir, joiner_dir) = (source_repo.clone(), joiner_repo.clone());
@@ -212,7 +212,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         }
         let finalized = FinalizedBlock {
             height,
-            app_hash: host.app_hash(),
+            root_hash: host.root_hash(),
         };
 
         // ---- the wire ---------------------------------------------------------
@@ -225,7 +225,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
         let join_side = async move {
             let client = client_for_join;
             let manifest = fetch_manifest(&client).await.expect("manifest");
-            assert_eq!(manifest.app_hash, finalized.app_hash);
+            assert_eq!(manifest.root_hash, finalized.root_hash);
             assert_eq!(
                 manifest.entries.len(),
                 7,
@@ -326,7 +326,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             );
             let join_greeter = Greeter::new("greeter");
 
-            // --- THE property: the composed app-hash equals the manifest's ----
+            // --- THE property: the composed root-hash equals the manifest's ----
             // the rebuilt qmdb stores live under distinct storage ids inside this
             // ONE deterministic runner (a real joiner has its own disk); compose
             // under the canonical module ids exactly as `global_root` would see
@@ -370,8 +370,8 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_app_hash() {
             ];
             assert_eq!(
                 global_root(&mods),
-                manifest.app_hash,
-                "the joiner lands on the exact app-hash the source finalized"
+                manifest.root_hash,
+                "the joiner lands on the exact root-hash the source finalized"
             );
         };
 

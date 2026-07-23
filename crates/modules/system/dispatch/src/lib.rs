@@ -335,7 +335,7 @@ pub struct DispatchModule {
     id: ModuleId,
     /// the saga module dispatches trigger through — genesis config, not state.
     saga: ModuleId,
-    /// committed state — what `root()` and the app-hash commit to.
+    /// committed state — what `root()` and the root-hash commit to.
     committed: Committed,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in only at `commit_block`.

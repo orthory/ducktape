@@ -63,7 +63,7 @@ const edges: DiagramEdge[] = [
   edge('sdk-host', 'sdk', 'host', 'contract'),
   edge('host-state', 'host', 'state', 'read / stage'),
   edge('worker-host', 'worker', 'host', 'follow-ups'),
-  edge('host-node', 'host', 'node', 'app-hash', true),
+  edge('host-node', 'host', 'node', 'root-hash', true),
   edge('node-consensus', 'node', 'consensus', 'order', true),
   edge('node-sync', 'node', 'statesync', 'serve'),
 ]
@@ -79,7 +79,7 @@ export function ArchitectureStack({ height = 480 }: { height?: number }) {
   return (
     <DiagramFlow
       title="Ducktape platform stack"
-      description="Product and system modules depend only on the sdk contract. The host routes ordered ops, folds each module root into the global app-hash, and drives commit through the ordered node path under the Simplex BFT orderer."
+      description="Product and system modules depend only on the sdk contract. The host routes ordered ops, folds each module root into the global root-hash, and drives commit through the ordered node path under the Simplex BFT orderer."
       nodes={nodes}
       edges={edges}
       legend={legend}

@@ -223,7 +223,7 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
             Box::new(Recorder::new("agent", false)),
         ])
         .expect("genesis");
-        let genesis = host.app_hash();
+        let genesis = host.root_hash();
 
         let err = host
             .submit_at(
@@ -234,7 +234,7 @@ fn a_trigger_with_an_unknown_reply_to_is_rejected_up_front() {
             .expect_err("unknown reply_to must reject");
         assert!(matches!(err, host::SubmitError::Rejected(Error::Module(_))));
         assert_eq!(saga_view(&host, "s1").await, None, "no saga was created");
-        assert_eq!(host.app_hash(), genesis, "the rejected block left no trace");
+        assert_eq!(host.root_hash(), genesis, "the rejected block left no trace");
     });
 }
 
@@ -259,7 +259,7 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
         )
         .await
         .expect("the trigger itself is fine — agent is registered");
-        let pending_hash = host.app_hash();
+        let pending_hash = host.root_hash();
         let saga_pending = host.module_root("saga").unwrap();
 
         let err = host
@@ -278,7 +278,7 @@ fn a_failing_callback_arm_aborts_the_whole_block_and_the_saga_stays_pending() {
         );
         assert_eq!(host.module_root("saga").unwrap(), saga_pending);
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             pending_hash,
             "the aborted block left every root untouched"
         );
@@ -328,7 +328,7 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
             "the recorded lease matches the advertised one"
         );
         let non_assignee = keys.iter().find(|k| **k != assignee).unwrap().clone();
-        let pending_hash = host.app_hash();
+        let pending_hash = host.root_hash();
 
         // a finalized result from a NON-assignee is a deterministic no-op —
         // never an error, and no root moves.
@@ -343,9 +343,9 @@ fn strict_lease_rejects_a_non_assignee_and_accepts_the_assignee() {
             SagaStatus::Pending
         );
         assert_eq!(
-            host.app_hash(),
+            host.root_hash(),
             pending_hash,
-            "the no-op left the app-hash unchanged"
+            "the no-op left the root-hash unchanged"
         );
 
         // the assignee's result lands.

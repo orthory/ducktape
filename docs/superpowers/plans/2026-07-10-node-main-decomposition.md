@@ -161,7 +161,7 @@ Sanity check per commit: `git show --stat HEAD` — lines removed from `main.rs`
 - Modify: `bin/node/src/main.rs`
 
 **Interfaces:**
-- Produces: `pub(crate) fn explorer_root_op(…)`, `pub(crate) fn sealed_frame_block_row(…)`, `pub(crate) fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8>`, `pub(crate) struct IndexFold<'a>` (+ its `recovery::ReplaySink` impl; fields `pub(crate)` — constructed from `run_node`), `pub(crate) async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str)`, `pub(crate) fn ship_index_blobs(…)`, `pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(…)`
+- Produces: `pub(crate) fn explorer_root_op(…)`, `pub(crate) fn sealed_frame_block_row(…)`, `pub(crate) fn boundary_block_row(height: u64, root_hash: &StateRoot) -> Vec<u8>`, `pub(crate) struct IndexFold<'a>` (+ its `recovery::ReplaySink` impl; fields `pub(crate)` — constructed from `run_node`), `pub(crate) async fn heal_index(index: &indexer::IndexStore, host: &Host, boundary: u64, label: &str)`, `pub(crate) fn ship_index_blobs(…)`, `pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(…)`
 
 - [ ] **Step 1: Move.** Cut lines 1292–1566 (landmark: `fn explorer_root_op` through end of `stage_shipped_index`) into `bin/node/src/explorer.rs`. `use crate::util::hex;`.
 - [ ] **Step 2: Rewire.** `mod explorer;` + `use explorer::{boundary_block_row, explorer_root_op, heal_index, sealed_frame_block_row, ship_index_blobs, stage_shipped_index, IndexFold};`

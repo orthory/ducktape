@@ -20,7 +20,7 @@ impl Module for RunsModule {
     /// a length-prefixed fold of every watch, pending-entry, and agent-session
     /// field in sorted-key order. sensitive to every field, so any transition
     /// moves the root — opening a session, spending one of its actions, and
-    /// pruning it each move the app-hash, because the session registry IS the
+    /// pruning it each move the root-hash, because the session registry IS the
     /// mid-run ACL and every validator must hold the same one. the preimage IS
     /// the snapshot encoding.
     fn root(&self) -> StateRoot {

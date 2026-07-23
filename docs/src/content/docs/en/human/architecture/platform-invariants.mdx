@@ -8,7 +8,7 @@ import { ArchitectureStack } from '../../../../../components/diagram/Architectur
 <ArchitectureStack client:visible />
 
 Ducktape is built around five invariants. They are not style preferences; they
-are the rules that let independent validators derive the same app-hash from the
+are the rules that let independent validators derive the same root-hash from the
 same agreed operation order.
 
 Related: [Module Model](/en/human/architecture/module-model) expands the module
@@ -43,7 +43,7 @@ clean drain it calls `commit_block` for every touched module; on any error or
 dispatch-budget breach it calls `abort_block`. A failed block leaves module
 roots unchanged.
 
-## App-Hash Commits to Everything
+## Root-Hash Commits to Everything
 
 Every durable state that matters must sit under a module root. The global root is
 a sorted hash over `(module_id, module_root)` pairs. QMDB roots, forge's git-head

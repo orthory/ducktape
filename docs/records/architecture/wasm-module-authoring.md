@@ -8,7 +8,7 @@ the reference modules are `crates/guests/hello-wasm` (v1),
 `crates/guests/sibling-wasm` (the cross-module-read reference). The first
 REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
 the `directory` module, bytes-compatible with the native implementation it
-replaced (same root, same snapshot encoding: the cutover left the app-hash
+replaced (same root, same snapshot encoding: the cutover left the root-hash
 untouched).
 
 ## The model (design-B: host-owned state, guest as pure logic)
@@ -20,7 +20,7 @@ capability, staged during `execute` and published only at the block-commit
 boundary. Consequences you design around:
 
 - `root()` is host-computed from the host-owned store, never by the guest. A
-  code swap keeps the store, so the module's root — and with it the app-hash —
+  code swap keeps the store, so the module's root — and with it the root-hash —
   is byte-identical across the swap. **That is the live-update primitive.**
 - Never cache anything in guest globals/statics expecting it to survive: it
   will not. Read what you need via `state-get`, write via `state-set`.
@@ -128,7 +128,7 @@ content-addressed on the node blob plane. The flow:
    the boundary with `GovAction::CancelModuleUpdate`.
 4. At the first applied block at/after `activation_height`, two things happen
    on every node: the drain's injected lifecycle `Advance` flips the committed
-   active hash (in the app-hash), and the host's out-of-block realization
+   active hash (in the root-hash), and the host's out-of-block realization
    (`Host::realize_module_swaps`) verifies `sha256(bytes) == hash` and swaps
    the running component, keeping the host-owned state.
 
@@ -162,7 +162,7 @@ error), and choose the guest's state layout so the host store's canonical
 encoding reproduces the native root — if the native module already hashes
 `le-u64 count ‖ sorted (len‖key ‖ len‖value)`, storing the raw key/value bytes
 makes root(), snapshot(), and install() BYTE-IDENTICAL across the cutover: the
-app-hash does not move and pre-cutover workspaces restore unchanged. Pin that
+root-hash does not move and pre-cutover workspaces restore unchanged. Pin that
 claim with a parity test before wiring the module into `host_state`.
 
 Point your module's tests at a committed fixture (`include_bytes!`) so the

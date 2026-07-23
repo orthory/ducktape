@@ -239,7 +239,7 @@ All three of the following must hold before the epic merges to `dev`:
 2. **Cross-machine zero-exposure demo.** Two validators on separate machines
    behind real (punchable) NAT, neither exposing an inbound port, with a
    coordinator on a third box: they hole-punch a WireGuard tunnel; real
-   state-sync / app-hash flows over the tunnel. Extends the Ducktape-2
+   state-sync / root-hash flows over the tunnel. Extends the Ducktape-2
    live-join rig.
    *Procedure + honest status: `docs/deploy/cross-machine-zero-exposure-runbook.md`
    (every step tagged). Blocked on node wiring — see

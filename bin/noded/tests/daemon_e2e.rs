@@ -367,7 +367,7 @@ fn full_surface_blocks_authorship_and_ws() {
             "gateway"
         ]
     );
-    let genesis_hash = status["app_hash"].as_str().expect("app_hash").to_string();
+    let genesis_hash = status["root_hash"].as_str().expect("root_hash").to_string();
 
     // connect before submitting: the stream heartbeats without a subscription,
     // then module events catch up from the subscribed cursor.
@@ -383,7 +383,7 @@ fn full_surface_blocks_authorship_and_ws() {
         "op/0000000000000000/ffff"
     );
 
-    // one msg = one block; the summary echoes the new height + app-hash.
+    // one msg = one block; the summary echoes the new height + root-hash.
     let (code, block) = daemon.submit(
         "chat",
         serde_json::json!({
@@ -393,7 +393,7 @@ fn full_surface_blocks_authorship_and_ws() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
     assert_eq!(block["height"], 1);
-    assert_ne!(block["app_hash"].as_str(), Some(genesis_hash.as_str()));
+    assert_ne!(block["root_hash"].as_str(), Some(genesis_hash.as_str()));
 
     let (code, block) = daemon.submit(
         "chat",
@@ -849,9 +849,9 @@ fn per_module_index_serves_ops_and_views() {
 fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["app_hash"]
+    let genesis_hash = daemon.status()["root_hash"]
         .as_str()
-        .expect("app_hash")
+        .expect("root_hash")
         .to_string();
 
     // sha256 as 64-char lowercase hex — the digest rendering the lane returns.
@@ -912,13 +912,13 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
         "413 uses the error envelope: {err}"
     );
 
-    // the whole blob lane is off-consensus: no blocks, no app-hash movement.
+    // the whole blob lane is off-consensus: no blocks, no root-hash movement.
     let status = daemon.status();
     assert_eq!(status["height"], 0, "blob puts must not commit blocks");
     assert_eq!(
-        status["app_hash"].as_str(),
+        status["root_hash"].as_str(),
         Some(genesis_hash.as_str()),
-        "blob puts must not move the app hash"
+        "blob puts must not move the root hash"
     );
 }
 
@@ -935,9 +935,9 @@ fn blob_receipt_lane_round_trips_and_stays_off_consensus() {
 fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
-    let genesis_hash = daemon.status()["app_hash"]
+    let genesis_hash = daemon.status()["root_hash"]
         .as_str()
-        .expect("app_hash")
+        .expect("root_hash")
         .to_string();
 
     // refs on a fresh module: no head (the empty filesystem) and an empty window,
@@ -1005,7 +1005,7 @@ fn duckfs_surface_stage_commit_and_reads_round_trip() {
     let after_stage = daemon.status();
     assert_eq!(after_stage["height"], 2, "two stages committed two blocks");
     assert_ne!(
-        after_stage["app_hash"].as_str(),
+        after_stage["root_hash"].as_str(),
         Some(genesis_hash.as_str()),
         "staging moves the module root"
     );

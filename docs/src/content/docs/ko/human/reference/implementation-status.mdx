@@ -9,7 +9,7 @@ audience: human
 
 - `sdk`는 module contract와 deterministic system API를 정의한다.
 - `host`는 registry dispatch, FIFO follow-up drain, block commit/abort와
-  module root의 order-independent app-hash 합성을 소유한다.
+  module root의 order-independent root-hash 합성을 소유한다.
 - `node`는 host application과 transport 또는 ordered delivery를 연결한다.
 - `consensus`에는 commonware Simplex-backed orderer가 있다.
 - `lifecycle`은 node module set에 등록된 module code registry다. module wasm
@@ -49,7 +49,7 @@ audience: human
 - `cargo test --workspace`는 Rust workspace를 검증한다.
 - `cargo run -p demo`는 in-process multi-module walkthrough를 실행한다.
 - `cargo test -p demo --test network_joiner_full`은 joiner가 state-sync wire
-  protocol만으로 모든 module을 rebuild하고 source app-hash와 match함을 증명한다.
+  protocol만으로 모든 module을 rebuild하고 source root-hash와 match함을 증명한다.
 - `bin/node/examples/demo-invite.sh`는 human-runnable onboarding ceremony를 real
   socket 위에서 구동한다. founder `init`, invite, friend `join`, founder `admit`,
   refreshed invite 이후 두 node가 하나의 network로 boot하고 RPC-submitted directory

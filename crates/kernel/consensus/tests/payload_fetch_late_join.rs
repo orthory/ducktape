@@ -175,12 +175,12 @@ async fn run_late_join(mut context: deterministic::Context) {
         nodes.push(OrderedNode::new(host, orderer));
     }
 
-    let genesis = nodes[0].app_hash();
+    let genesis = nodes[0].root_hash();
     for n in &nodes {
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             genesis,
-            "identical genesis -> identical app-hash"
+            "identical genesis -> identical root-hash"
         );
     }
 
@@ -221,11 +221,11 @@ async fn run_late_join(mut context: deterministic::Context) {
 
     // ---- convergence: identical CORRECT state on every validator, incl. the
     // starved one that reached its ops purely through the resolver fetch path ----
-    let converged = nodes[0].app_hash();
+    let converged = nodes[0].root_hash();
     let converged_kv = nodes[0].host().module_root("kv").unwrap();
     assert_ne!(
         converged, genesis,
-        "the finalized ops moved the app-hash off genesis"
+        "the finalized ops moved the root-hash off genesis"
     );
     for (i, n) in nodes.iter().enumerate() {
         assert_eq!(
@@ -233,9 +233,9 @@ async fn run_late_join(mut context: deterministic::Context) {
             "validator {i} applied EXACTLY the finalized ops"
         );
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             converged,
-            "validator {i} converges on the identical app-hash"
+            "validator {i} converges on the identical root-hash"
         );
         assert_eq!(
             n.host().module_root("kv").unwrap(),

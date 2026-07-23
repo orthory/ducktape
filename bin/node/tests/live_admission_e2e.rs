@@ -34,7 +34,7 @@ fn network_shape_joiner_parks_until_promote() {
         "init should print the founded chain id"
     );
     cluster.spawn(0);
-    // network-shape nodes never print the dev-demo `converged app_hash=`; the
+    // network-shape nodes never print the dev-demo `converged root_hash=`; the
     // founder is up and finalizing once its rpc surface is listening (genesis
     // is already crossed by then), which is all `invite`/`promote` need.
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
@@ -76,7 +76,7 @@ fn network_shape_joiner_parks_until_promote() {
     // leg below.)
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
-    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(1, "synced root_hash=", CONVERGE);
     cluster.wait_marker(1, "shipped index staged", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 }
@@ -184,7 +184,7 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
 // staged chunk-object file, and a pin), a fresh node joins through the real
 // `join`/`promote` ceremony, and its `sync_all_modules` pass loops GetObjects to
 // FULL object possession over the p2p statesync lane before the joiner reads a
-// file back BYTE-IDENTICAL. (`synced app_hash=` latches only after the resolver
+// file back BYTE-IDENTICAL. (`synced root_hash=` latches only after the resolver
 // reports `possession_complete`, so the promoted read is proof bytes crossed.)
 
 fn df_put_inline(path: &str, bytes: &[u8]) -> Change {
@@ -363,11 +363,11 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
 
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
-    // `synced app_hash=` latches only AFTER `sync_all_modules` -> the duckfs
+    // `synced root_hash=` latches only AFTER `sync_all_modules` -> the duckfs
     // resolver reaches FULL object possession over the real p2p statesync lane
     // (it loops GetObjects until `possession_complete`). this marker alone is the
     // production proof that every duckfs object crossed the wire.
-    cluster.wait_marker(1, "synced app_hash=", CONVERGE);
+    cluster.wait_marker(1, "synced root_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 
     // ---- THE property: the promoted joiner reads the founder's files back
@@ -577,7 +577,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     }));
     //     …and the DERIVED tier follows the boundary too: the explorer
     //     records the followed boundary (an honest boundary row — verified
-    //     height + app-hash, frame-derived fields empty)…
+    //     height + root-hash, frame-derived fields empty)…
     poll("the resident explorer to record a followed boundary", Box::new(|| {
         let (status, body) = common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
         status == 200

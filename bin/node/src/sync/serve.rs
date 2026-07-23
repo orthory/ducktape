@@ -28,10 +28,10 @@ pub(crate) fn assert_floor_binds_view(
 }
 
 pub(crate) fn reopen_preflight_synced_host(host: &Host, expected: StateRoot) -> Result<(), String> {
-    let live = host.app_hash();
+    let live = host.root_hash();
     if live != expected {
         return Err(format!(
-            "preflight app_hash {} != boundary {}",
+            "preflight root_hash {} != boundary {}",
             hex(&live),
             hex(&expected)
         ));
@@ -106,7 +106,7 @@ pub(crate) async fn reopen_recovery(
 }
 
 /// a backfilled height's served seal, held for the post-fold cross-check:
-/// `(disposition, app_hash, per-module roots)` as the quorum sealed them.
+/// `(disposition, root_hash, per-module roots)` as the quorum sealed them.
 pub(crate) type ServedSeal = (
     node::Disposition,
     StateRoot,
@@ -168,7 +168,7 @@ where
             f.height,
             (
                 to_node_disposition(f.disposition),
-                f.app_hash,
+                f.root_hash,
                 f.roots.clone(),
             ),
         );
@@ -249,7 +249,7 @@ where
         target: "ducktape::statesync",
         tag = %diag_tag,
         checkpoint_height = boundary.height,
-        checkpoint_hash = %hex(&host.app_hash()),
+        checkpoint_hash = %hex(&host.root_hash()),
         floor_height = %floor_height,
         floor_present = floor.is_some(),
         "checkpoint captured"
@@ -339,7 +339,7 @@ pub(crate) fn recovery_frame_to_sync(
         frame: frame.frame,
         disposition: to_sync_disposition(frame.disposition)?,
         roots: frame.roots,
-        app_hash: frame.app_hash,
+        root_hash: frame.root_hash,
     })
 }
 

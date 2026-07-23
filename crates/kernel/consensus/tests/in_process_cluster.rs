@@ -14,7 +14,7 @@
 //!
 //! Each validator submits ONE distinct directory op; simplex BFT-orders them and
 //! every validator applies on finalization. `directory` is order-INDEPENDENT, so
-//! the three writes converge on a BYTE-IDENTICAL app-hash under any interleaving —
+//! the three writes converge on a BYTE-IDENTICAL root-hash under any interleaving —
 //! isolating the property under test (multi-validator consensus over the swapped
 //! carrier) from op ordering.
 //!
@@ -157,10 +157,10 @@ async fn converge(mut context: deterministic::Context) {
         nodes.push(OrderedNode::new(genesis_host(), orderer));
     }
 
-    // identical genesis module set -> identical genesis app-hash.
-    let genesis = nodes[0].app_hash();
+    // identical genesis module set -> identical genesis root-hash.
+    let genesis = nodes[0].root_hash();
     for n in &nodes {
-        assert_eq!(n.app_hash(), genesis, "identical genesis -> identical app-hash");
+        assert_eq!(n.root_hash(), genesis, "identical genesis -> identical root-hash");
     }
 
     // distribute the op-set ONE PER VALIDATOR: each digest lands in exactly one
@@ -177,9 +177,9 @@ async fn converge(mut context: deterministic::Context) {
     // node is still at genesis.
     for n in &nodes {
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             genesis,
-            "no optimistic echo: submit does not advance app-hash"
+            "no optimistic echo: submit does not advance root-hash"
         );
     }
 
@@ -196,16 +196,16 @@ async fn converge(mut context: deterministic::Context) {
         }
     }
 
-    // THE MILESTONE: byte-identical app-hash on every validator, moved off genesis,
+    // THE MILESTONE: byte-identical root-hash on every validator, moved off genesis,
     // reached with no OS-process mesh — only the swapped in-process carrier.
-    let converged = nodes[0].app_hash();
-    assert_ne!(converged, genesis, "the finalized ops moved the app-hash off genesis");
+    let converged = nodes[0].root_hash();
+    assert_ne!(converged, genesis, "the finalized ops moved the root-hash off genesis");
     for (i, n) in nodes.iter().enumerate() {
         assert_eq!(applied[i], target, "validator {i} applied EXACTLY the op-set");
         assert_eq!(
-            n.app_hash(),
+            n.root_hash(),
             converged,
-            "validator {i} converges on the identical app-hash"
+            "validator {i} converges on the identical root-hash"
         );
     }
 }

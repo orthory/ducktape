@@ -8,7 +8,7 @@
 //! wrapper's [`StateRoot`], commit/abort, and sync boundary. in facade mode, the
 //! storage implementation is an explicitly registered backing module and durable
 //! state belongs to that backing module's root. the host composes each module's
-//! [`StateRoot`] into the global app-hash (see `host::global_root`); how a module
+//! [`StateRoot`] into the global root-hash (see `host::global_root`); how a module
 //! *computes* that root — a qmdb merkle root, a git HEAD oid — is private to the
 //! module. the host only ever sees `root() -> StateRoot`.
 //!
@@ -459,7 +459,7 @@ pub trait Module {
     }
 
     /// the module's current authenticated root. called by the host to fold into
-    /// the global app-hash after a block applies.
+    /// the global root-hash after a block applies.
     fn root(&self) -> StateRoot;
 
     /// self-contained committed-state snapshot bytes, for the in-memory
@@ -585,7 +585,7 @@ pub trait Module {
     /// decide whether a boundary swap is needed — a cheap hash compare, so it
     /// re-instantiates a component only on an actual change, never every block.
     /// NEVER a consensus input: code is invisible to `root()` (state, not code,
-    /// composes the app-hash), so this is per-node realization bookkeeping only.
+    /// composes the root-hash), so this is per-node realization bookkeeping only.
     fn code_hash(&self) -> Option<Vec<u8>> {
         None
     }
@@ -594,7 +594,7 @@ pub trait Module {
     /// state — the live-update primitive. the host calls this at a code-registry
     /// activation boundary AFTER it has fetched the out-of-band component bytes
     /// and verified `sha256(bytes)` equals the consensus-committed hash; because
-    /// durable state is untouched, `root()` is unchanged and the app-hash stays
+    /// durable state is untouched, `root()` is unchanged and the root-hash stays
     /// continuous across the swap. the default is unsupported — only the wasm
     /// runtime module overrides it (a native module cannot swap its code).
     fn swap_code(&mut self, _component_bytes: &[u8]) -> Result<(), Error> {

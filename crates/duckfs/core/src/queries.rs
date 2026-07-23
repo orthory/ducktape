@@ -80,7 +80,7 @@ pub(crate) fn query<S: ObjectStore>(fs: &Fs<S>, q: FilesQuery) -> Result<FilesRe
 /// join/rejoin history), so a `true` sourced from raw odb presence would tell
 /// the client to skip staging a chunk that other nodes lack, and the commit
 /// referencing it would then be accepted on some validators and rejected on
-/// others — a split app-hash (finding #1). the answer is advisory: staging can
+/// others — a split root-hash (finding #1). the answer is advisory: staging can
 /// expire, so the commit re-validates — a stale `true` costs one clean
 /// rejection, a stale `false` one redundant (but consensus-safe) stage.
 ///

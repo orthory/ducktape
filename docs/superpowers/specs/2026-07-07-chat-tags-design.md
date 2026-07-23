@@ -18,7 +18,7 @@ Three approaches considered:
    modules (engagement), it is not a label store. Wrong shape. Rejected.
 3. **Hashtags parsed from message text, indexed in the existing derived chat
    search view** (`crates/apps/chat/src/index.rs`). The indexer layer is
-   documented as never part of any `root()`/app-hash → node-local, no
+   documented as never part of any `root()`/root-hash → node-local, no
    consensus impact, no upgrade gate. Message text already carries the tags,
    so history is retroactively taggable via the existing
    `rebuild_from_state` path. **Chosen.**

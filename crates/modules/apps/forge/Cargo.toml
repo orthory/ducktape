@@ -27,7 +27,7 @@ async-trait = { workspace = true }
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
 [dev-dependencies]
-# dev-only: prove forge's root composes into the global app-hash. not a
+# dev-only: prove forge's root composes into the global root-hash. not a
 # production dep — a module still depends on sdk + its interface only.
 host = { workspace = true }
 sdk-testkit = { workspace = true }

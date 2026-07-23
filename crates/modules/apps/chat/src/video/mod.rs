@@ -6,7 +6,7 @@
 //! (`CallJoin`/`CallLeave`) as the only piece that ever touches consensus.
 //!
 //! **Consensus never carries media.** This module is deliberately pure and
-//! synchronous: no async, no qmdb, no app-hash, nothing that touches chat's
+//! synchronous: no async, no qmdb, no root-hash, nothing that touches chat's
 //! consensus state. Every byte here is either an encoded video frame
 //! fragment or a call-control message (keyframe requests, presence beacons,
 //! rate hints) riding a data-plane flow — none of it is proposed, ordered,

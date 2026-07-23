@@ -29,10 +29,10 @@
 //!
 //! WHY root() rehashes the oids under sha256, not the oids verbatim:
 //!   a [`StateRoot`] is 32 bytes; a sha1 oid is only 20. rehashing the 20-byte
-//!   branch oids under sha256 makes forge's contribution to the global app-hash
+//!   branch oids under sha256 makes forge's contribution to the global root-hash
 //!   sha256-STRENGTH. the only residual sha1 surface is a *forge-object*
 //!   collision (two trees under one commit oid) — expensive and SHA-1DC-guarded —
-//!   while the app-hash's collision resistance at the STATE layer stays sha256.
+//!   while the root-hash's collision resistance at the STATE layer stays sha256.
 //!   (no committed branch and no tracker item anywhere -> StateRoot::ZERO.)
 //!
 //! WHAT DOES NOT CHANGE:
@@ -349,7 +349,7 @@ impl Forge {
 
         // re-adopt the persisted tracker. a corrupt file is FAIL-STOP (like a
         // corrupt repo): booting with a silently-empty tracker would compose a
-        // wrong root and fork this node at its first app-hash check anyway.
+        // wrong root and fork this node at its first root-hash check anyway.
         let tracker_path = base.join(TRACKER_FILE);
         let tracker = if tracker_path.exists() {
             let bytes = std::fs::read(&tracker_path)
@@ -1441,7 +1441,7 @@ mod tests {
         let before = host::global_root(&[&forge as &dyn Module]);
         push_head(&mut forge, "", None, oid('a'));
         let after = host::global_root(&[&forge as &dyn Module]);
-        assert_ne!(before, after, "forge's root must move the global app-hash");
+        assert_ne!(before, after, "forge's root must move the global root-hash");
         let _ = std::fs::remove_dir_all(&base);
     }
 

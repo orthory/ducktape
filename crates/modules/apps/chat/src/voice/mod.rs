@@ -1,7 +1,7 @@
 //! The voice media engine: Opus over the data plane's datagram class.
 //!
 //! A submodule of the chat module but deliberately self-contained: it touches
-//! no qmdb, no app-hash, and none of chat's consensus state. The coupling is
+//! no qmdb, no root-hash, and none of chat's consensus state. The coupling is
 //! one-directional and future — chat's channel membership will drive this
 //! engine's `AdmissionPolicy` and the channel→flow derivation; the media
 //! pipeline here knows nothing of channels.

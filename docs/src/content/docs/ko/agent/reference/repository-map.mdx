@@ -13,13 +13,13 @@ import { WorkspaceMap } from '../../../../../components/diagram/WorkspaceMap.cli
 - `crates/kernel/sdk`: module contract, deterministic system API, 공유
   snapshot codec(`sdk::codec`).
 - `crates/kernel/host`: registry, dispatch, follow-up drain, commit/abort,
-  global app-hash composition, worker seam(`host::worker`).
+  global root-hash composition, worker seam(`host::worker`).
 - `crates/kernel/node`: loopback 및 ordered node seam.
 - `crates/kernel/consensus`: Simplex orderer, content store, relay, inbox,
   resolver fetch, scheme boundary.
 - `crates/kernel/statesync`: state-sync wire protocol과 p2p binding.
 - `crates/kernel/recovery`: op journal, checkpoint, boot-time replay.
-- `crates/kernel/indexer`: 파생 node-local read index. app-hash에 포함되지
+- `crates/kernel/indexer`: 파생 node-local read index. root-hash에 포함되지
   않는다.
 - `crates/system/capability-host`: machine-local executor provider.
 

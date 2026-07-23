@@ -193,7 +193,7 @@ again: the permanent-abort loop. The rules, as implemented:
 
 - `AgentRecord{agent_id, owner (origin), display_name, capability,
   prompt_hash, allowed_actions, status}` — registration is an ordered op, so
-  *which capability and prompt an agent runs is part of the app-hash* and
+  *which capability and prompt an agent runs is part of the root-hash* and
   auditable. `capability` names WHAT a run needs (an open-set registry tag);
   HOW it executes — binary, flags, model — is host policy in each provider's
   spec, invisible to consensus. Prompt CONTENT is content-addressed in the

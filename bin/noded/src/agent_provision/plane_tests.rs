@@ -137,7 +137,7 @@ fn spawn_session_actor(
 pub(super) fn committed_block() -> crate::BlockSummary {
     crate::BlockSummary {
         height: 1,
-        app_hash: "ab".repeat(32),
+        root_hash: "ab".repeat(32),
     }
 }
 

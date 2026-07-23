@@ -8,7 +8,7 @@
 //! scannable index fed block-by-block from the ops consensus applied. it is
 //! DERIVED BY CONSTRUCTION:
 //!
-//! - never part of any `root()` or the app-hash — a wiped index changes no
+//! - never part of any `root()` or the root-hash — a wiped index changes no
 //!   consensus-visible byte;
 //! - node-local — no cross-node determinism claim is made for its contents;
 //! - rebuildable — the crash story is "delete the module's index directory

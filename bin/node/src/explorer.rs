@@ -70,22 +70,22 @@ pub(crate) fn sealed_frame_block_row(
     Some(noded::block_row(&noded::BlockRecord {
         height: block.height,
         hash: noded::hex_bytes(&node::frame_id(block.frame)),
-        commit_hash: hex(&block.app_hash),
+        commit_hash: hex(&block.root_hash),
         ops,
     }))
 }
 
 /// the resident's explorer row: a followed BOUNDARY, not a sealed frame. the
 /// populated fields are verified truth — the boundary height and the
-/// app-hash the manifest check passed — and every frame-derived field stays
+/// root-hash the manifest check passed — and every frame-derived field stays
 /// honestly empty, because a resident never sees the frames between
 /// boundaries (the same degradation rule that keeps the frameless daemon
 /// lane's `hash` empty rather than fabricated).
-pub(crate) fn boundary_block_row(height: u64, app_hash: &StateRoot) -> Vec<u8> {
+pub(crate) fn boundary_block_row(height: u64, root_hash: &StateRoot) -> Vec<u8> {
     noded::block_row(&noded::BlockRecord {
         height,
         hash: String::new(),
-        commit_hash: hex(app_hash),
+        commit_hash: hex(root_hash),
         // a resident follows boundaries, not frames: no member ops to show.
         ops: Vec::new(),
     })
@@ -170,7 +170,7 @@ impl recovery::ReplaySink for IndexFold<'_> {
 }
 
 /// stamp every index module whose watermark trails `boundary` as backfilled
-/// (every boot caller sits after a root/app-hash check; history below the
+/// (every boot caller sits after a root/root-hash check; history below the
 /// boundary re-enters only by replaying blocks through the feed). failures
 /// poison the store and log; the node boots regardless.
 pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str) {

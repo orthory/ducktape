@@ -13,7 +13,7 @@
 - Branch `client-acl`, worktree `.worktree/client-acl` (forked post-campaign dev). PR against `dev`. Commit after every task (0-commit worktrees get swept).
 - Build via `ops/build-with.sh cargo ...`; `ulimit -s unlimited` before cargo fixes the rustc SIGSEGVs. Packages: the new `clients` crate, `governance`, `node-bin`, `simnode`.
 - Gates per touched crate: `cargo clippy -p <crate> --tests --no-deps`. **`-p simnode` compile+test is a standing gate** (this touches the redeem/valset-adjacent plane — #545 broke simnode by skipping it). files wasm gate must stay green.
-- NO backward compatibility. This adds a genesis module → the genesis app-hash changes → **flag day, all nodes rebuild genesis together**.
+- NO backward compatibility. This adds a genesis module → the genesis root-hash changes → **flag day, all nodes rebuild genesis together**.
 - **CRITICAL — state-schema preflight (the "night it broke every workspace", #447):** two hardcoded arrays in `bin/node/src/constants.rs` enumerate the genesis module set and MUST both gain `clients`:
   - `MODULE_IDS: [&str; 25]` (`constants.rs:135-161`) → `[&str; 26]`, add `"clients"`.
   - `MODULE_STATE_SCHEMAS: [(&str, u32); 25]` (`constants.rs:168-194`) → `[(&str, u32); 26]`, add `("clients", 1)` in ALPHABETICAL order (right after `"chat"`).
@@ -53,7 +53,7 @@ pub struct Clients; impl Module for Clients { /* id, root, execute, query, commi
 
 **Files:** `bin/node/src/host_state.rs` (all 3 `ProductionModules`-style builders — add `clients: Clients::new("clients")` beside valset), `Governance::new(...)` gains a `clients` module id arg (or a `.with_clients("clients")` builder like `.with_invite_binding`), the module registry vec each builder returns. Plus the **state-schema preflight const** (see Global Constraints — add `clients` + bump revision).
 
-**Steps:** (1) add the module to genesis + governance's known ids. (2) update the preflight schema const. (3) `cargo build -p node-bin` + the genesis/app-hash test if one exists (`grep -rn "app_hash\|genesis" bin/node/tests | grep -i hash`) — expect the genesis hash to CHANGE (that's the flag day; update any golden). (4) commit.
+**Steps:** (1) add the module to genesis + governance's known ids. (2) update the preflight schema const. (3) `cargo build -p node-bin` + the genesis/root-hash test if one exists (`grep -rn "root_hash\|genesis" bin/node/tests | grep -i hash`) — expect the genesis hash to CHANGE (that's the flag day; update any golden). (4) commit.
 
 ### Task 3: `handle_redeem` grants client standing
 
@@ -81,6 +81,6 @@ pub struct Clients; impl Module for Clients { /* id, root, execute, query, commi
 - client-mode noded (no-consensus proxy node), the tunnel bring-up reuse, `/v1/*` proxying, the app "remote workspace" UX. Those are PR9+. This PR ends at: a Client invite grants a committed client-ACL entry, and a client-signed submit is authorized at the door. Everything testable via the governance rig + simnode, no tunnel/app.
 
 ## Risks
-- **Genesis flag day**: the new module changes the app-hash — every node rebuilds genesis, and the preflight const MUST include `clients` or boot raw-decode fails on every workspace (the #447 "broke every workspace" trap). This is the highest-risk item; verify the preflight update with a fresh-seed boot.
+- **Genesis flag day**: the new module changes the root-hash — every node rebuilds genesis, and the preflight const MUST include `clients` or boot raw-decode fails on every workspace (the #447 "broke every workspace" trap). This is the highest-risk item; verify the preflight update with a fresh-seed boot.
 - **Single-use set sharing**: Client and Resident redeems share the `redeemed` nonce set — confirm a nonce is single-use across BOTH (a Client invite's nonce can't later be reused as a Resident invite; they're different tokens with different nonces anyway, but the set is shared and that's correct).
 - **Door correctness**: extending `verify_relay_submit` must not accidentally admit a client to anything beyond submit — confirm the door is ONLY the submit-authorization gate, not reused for statesync/quorum (PR6's statesync door reads valset, not this — verify no shared helper conflates them).

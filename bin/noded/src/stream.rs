@@ -127,7 +127,7 @@ pub enum ServerFrame {
     },
     Heartbeat {
         height: u64,
-        app_hash: String,
+        root_hash: String,
         time_ms: u64,
         interval_ms: u64,
     },
@@ -237,7 +237,7 @@ pub enum RunStream {
 #[derive(Clone)]
 pub struct StreamHub {
     /// block wakeups: subscribers re-scan on any commit and push the fresh
-    /// tip (height/app-hash) as a heartbeat frame — `publish_block` primes
+    /// tip (height/root-hash) as a heartbeat frame — `publish_block` primes
     /// `tip` before broadcasting, so the wake always reads its own block.
     blocks: broadcast::Sender<()>,
     tip: Arc<RwLock<Option<(u64, String)>>>,
@@ -271,13 +271,13 @@ impl StreamHub {
         }
     }
 
-    pub fn publish_block(&self, height: u64, app_hash: impl Into<String>) {
-        self.prime(height, app_hash);
+    pub fn publish_block(&self, height: u64, root_hash: impl Into<String>) {
+        self.prime(height, root_hash);
         let _ = self.blocks.send(());
     }
 
-    pub fn prime(&self, height: u64, app_hash: impl Into<String>) {
-        *self.tip.write().expect("stream tip lock poisoned") = Some((height, app_hash.into()));
+    pub fn prime(&self, height: u64, root_hash: impl Into<String>) {
+        *self.tip.write().expect("stream tip lock poisoned") = Some((height, root_hash.into()));
     }
 
     pub fn log_ring(&self) -> LogRing {
@@ -1529,10 +1529,10 @@ async fn send_frame(socket: &mut WebSocket, frame: ServerFrame) -> bool {
 }
 
 fn heartbeat_frame(hub: &StreamHub) -> ServerFrame {
-    let (height, app_hash) = hub.tip().unwrap_or_else(|| (0, String::new()));
+    let (height, root_hash) = hub.tip().unwrap_or_else(|| (0, String::new()));
     ServerFrame::Heartbeat {
         height,
-        app_hash,
+        root_hash,
         time_ms: unix_millis(),
         interval_ms: HEARTBEAT_INTERVAL_MS,
     }
@@ -1801,12 +1801,12 @@ mod tests {
         match heartbeat_frame(&hub) {
             ServerFrame::Heartbeat {
                 height,
-                app_hash,
+                root_hash,
                 interval_ms,
                 ..
             } => {
                 assert_eq!(height, 7);
-                assert_eq!(app_hash, "abc");
+                assert_eq!(root_hash, "abc");
                 assert_eq!(interval_ms, HEARTBEAT_INTERVAL_MS);
             }
             other => panic!("expected heartbeat, got {other:?}"),

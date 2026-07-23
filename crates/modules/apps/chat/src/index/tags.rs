@@ -1,6 +1,6 @@
 //! hashtag tags on the derived chat view — extraction, postings, catalog,
 //! and the tag queries. node-local like everything in this index: no key
-//! written here is ever part of any `root()`/app-hash.
+//! written here is ever part of any `root()`/root-hash.
 //!
 //! key spaces (inside chat's per-module index database, next to `tok/`):
 //! - `tag/{label}/{channel}/{rseq}` — one posting per (tag, message), value =
