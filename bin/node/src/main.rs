@@ -60,6 +60,7 @@ mod cli_args;
 mod config;
 mod constants;
 mod cred_cli;
+mod cred_resolve;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
@@ -330,6 +331,7 @@ fn run_node(
         code_stage_requests,
         blobs,
         agent_provisioner,
+        cred_resolver,
         gateway_requests,
         gateway_commands,
         terminals,
@@ -553,6 +555,7 @@ fn run_node(
                 voice_requests,
                 blobs,
                 &agent_provisioner,
+                &cred_resolver,
                 &agent_dirs,
                 overlay_slot,
                 bulk_pacer.clone(),
@@ -609,6 +612,7 @@ fn run_node(
             code_stage_requests,
             blobs,
             agent_provisioner,
+            cred_resolver,
             agent_dirs,
             overlay_slot,
             bulk_pacer,

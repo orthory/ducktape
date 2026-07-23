@@ -30,7 +30,7 @@ use dispatch::{AdmissionPolicy, WorkSpec, decode_work_spec};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Event, Msg};
 
-mod envelope;
+pub mod envelope;
 mod ledger;
 mod pool;
 mod provision;
@@ -38,7 +38,8 @@ mod soul;
 mod workspace_source;
 pub use ledger::{ReservationGuard, ResourceLedger};
 pub use pool::{
-    AttemptControl, DeliverFn, DispatchPool, SpawnFn, SpawnKind, max_concurrent_runs_from_env,
+    AttemptControl, CredentialResolver, DeliverFn, DispatchPool, Resolved, SharedCredentialResolver,
+    SpawnFn, SpawnKind, max_concurrent_runs_from_env,
 };
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,

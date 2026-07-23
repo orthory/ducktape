@@ -1244,7 +1244,7 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
 }
 
 /// Where the airlock gateway lives.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AirlockGateway {
     /// Same machine (Credential Provider == Computation Provider): a loopback URL.
     Local { url: String },
@@ -1282,7 +1282,7 @@ pub struct ResolvedCredential {
 /// reads the seal_pk out of the attested REPORTDATA; `PinnedSealPk` is the
 /// self-host anchor: the seal_pk published on consensus, pinned directly, with
 /// no quote to verify.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AirlockTrust {
     Attested { measurement: String, attest: String },
     PinnedSealPk([u8; 32]),
@@ -1293,7 +1293,7 @@ pub enum AirlockTrust {
 /// consensus-resolved credential ([`self_host`], which pins the on-chain
 /// seal_pk). Absent on the default broker path (a host-held Anthropic credential
 /// → api.anthropic.com), which is unchanged.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AirlockConfig {
     gateway: AirlockGateway,
     trust: AirlockTrust,

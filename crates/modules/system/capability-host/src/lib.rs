@@ -281,12 +281,22 @@ pub struct RunContext {
     /// stdin prompt. `None` (no assembled context) means neither door does
     /// anything.
     pub context_doc: Option<String>,
-    /// the per-run credential source — a consensus-resolved self-host gateway.
-    /// `Some` makes the interactive spawn's broker resolve the upstream to THIS
-    /// config instead of `AirlockConfig::from_env()`, so a peer-attached session
+    /// the per-run credential SOURCE the broker draws on: a self-host airlock
+    /// config the executing node resolved either from a committed gateway
+    /// credential record (`ducktape agent sched --cred`) or for a peer-attached
+    /// interactive session. `Some` makes the spawn's broker resolve the upstream
+    /// to THIS config instead of `AirlockConfig::from_env()`, so the session
     /// draws on the guest's credential rather than the host's boundary env.
-    /// `None` (the default) keeps the env/host-credential path unchanged.
+    /// `None` (the default) keeps the env/host-credential path unchanged. Never
+    /// consensus data; the resolver builds it host-side from committed state
+    /// before the provider spawns.
     pub airlock: Option<broker::AirlockConfig>,
+    /// the ACCOUNT this run acts on behalf of — the credential-grant subject
+    /// (the submitting node's account, read from committed saga origin). Carried
+    /// beside `airlock` so the broker's gateway session can name whom the
+    /// traffic is attributed to. `None` (the default) = a host-credential run
+    /// acting for no distinct account.
+    pub on_behalf: Option<Vec<u8>>,
 }
 
 /// which child stream produced one live output line.
@@ -3552,9 +3562,10 @@ impl CliProvider {
         let _context = self.deliver_context(&workdir, config_home.as_deref(), ctx)?;
         let prompt_buf = self.prompt_with_context(prompt, ctx);
         let prompt = prompt_buf.as_str();
-        // the per-run credential source rides `ctx.airlock` (unifies both spawn
-        // paths); `None` for every existing headless run, so the env/host-
-        // credential path is unchanged.
+        // the per-run credential source rides `ctx.airlock` (unifies the
+        // headless `sched --cred` and peer-attached spawn paths); `None` for
+        // every existing headless run, so the env/host-credential path is
+        // unchanged. A present config takes precedence over env.
         let broker = self.start_broker(ctx.airlock.as_ref()).await?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
@@ -6160,6 +6171,7 @@ printf '%s\n' "$PATH"
             portable: true,
             context_doc: None,
             airlock: None,
+            on_behalf: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();

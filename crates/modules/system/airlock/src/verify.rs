@@ -59,7 +59,7 @@ impl std::str::FromStr for SnpProduct {
 
 /// Where the per-chip VCEK leaf certificate comes from. Transport, not trust:
 /// whatever this yields must still chain to the pinned ARK/ASK.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VcekSource {
     /// Fetch from the AMD Key Distribution Service by chip id + reported TCB.
     Kds,
