@@ -85,10 +85,10 @@ component PageCommentThreadButton(thread:PageCommentThread)
     pressed bg=white/10 text=fg border=white/12
 
 component PageCommentCard(comment:PageComment)
-  container width=fill padding=7.0 bg=white/3 border=white/6 border-w=1.0 r=7.0
+  container width=fill padding=7.0 bg=transparent border=transparent border-w=1.0 r=7.0
     col width=fill spacing=3.0
       row width=fill spacing=7.0 align=center
-        text comment.author width=fill size=11.0 wrapping=none font=medium @text-fg
+        text comment.author width=fill size=13.0 wrapping=none font=medium @text-fg
         text comment.meta size=11.0 wrapping=none @text-muted
       text comment.text width=fill size=13.0 wrapping=word @text-fg
 
@@ -147,7 +147,7 @@ component BlockContents(block:PageBlock)
 component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:bool)
   mouse enter=block_entered(block.id) exit=block_exited(block.id)
     stack width=fill
-      container width=fill padding-left=36.0
+      container width=fill padding-left=56.0
         row width=fill align=start
           if !empty(block.prefix)
             text block.prefix size=14.0 wrapping=none font=mono
@@ -157,13 +157,17 @@ component DocumentBlock(block:PageBlock, selected:bool, hovered:bool, disabled:b
           row width=fill align=center
             if !empty(block.prefix)
               text block.prefix size=14.0 wrapping=none font=mono
-            container width=36.0 bg=popover border=white/11 border-w=1.0 r=6.0 shadow=black/12 shadow-y=1.0 shadow-blur=5.0
+            container width=56.0 height=28.0 bg=popover border=white/11 border-w=1.0 r=7.0 shadow=black/12 shadow-y=1.0 shadow-blur=5.0
               row width=fill spacing=0.0 align=center
-                button "+" label="Insert block below" disabled=disabled width=18.0 height=26.0 padding=2.0 -> open_block_insert(block.key, block.id)
+                button label="Insert block below" disabled=disabled width=28.0 height=28.0 padding=0.0 -> open_block_insert(block.key, block.id)
+                  container width=fill height=fill align-x=center align-y=center
+                    text "+" size=14.0 font=medium
                   active bg=transparent text=muted r=5.0
                   hovered bg=white/8 text=fg
                   pressed bg=white/12 text=fg
-                button "⋮⋮" label="Block actions" disabled=disabled width=18.0 height=26.0 padding=1.0 -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
+                button label="Block actions" disabled=disabled width=28.0 height=28.0 padding=0.0 -> select_block(block.key, block.id, block.kind, block.text, block.checked, true)
+                  container width=fill height=fill align-x=center align-y=center
+                    text "⋮⋮" size=13.0 font=medium
                   active bg=transparent text=muted r=5.0
                   hovered bg=white/8 text=fg
                   pressed bg=white/12 text=fg
@@ -225,7 +229,7 @@ component BlockActionsMenu(block_id:str, kind:str, disabled:bool, delete_armed:b
 
 component InlineBlockInsert(kind:str, kinds:[str], disabled:bool, prefix:str)
   stack width=fill
-    container width=fill padding-left=36.0 padding-right=118.0
+    container width=fill padding-left=56.0 padding-right=118.0
       row width=fill
         if !empty(prefix)
           text prefix size=14.0 wrapping=none font=mono

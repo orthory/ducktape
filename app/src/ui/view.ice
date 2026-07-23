@@ -1,7 +1,7 @@
 view
   WorkspaceTabs status=status loading=(loading || mutation_phase != "idle") #workspace-tabs
     connection:
-      container width=fill padding=6.0 bg=white/5 border=white/11 border-w=1.0 r=10.0
+      container width=fill padding=6.0 bg=transparent border=white/11 border-w=1.0 r=10.0
         col width=fill spacing=5.0
           input "" #rpc label="RPC endpoint" <-> rpc hint="Node URL" disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering")) submit=reconnect width=fill padding=6.2 text-size=13.0 line-height=1.2
             active bg=surface border=white/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
@@ -24,13 +24,17 @@ view
           text "CHANNELS" width=fill size=11.0 font=medium @text-muted
           text len(channels) size=11.0 @text-muted
           if !channel_create_open
-            button "+" label="New channel" disabled=(loading || mutation_phase != "idle" || !connected) width=28.0 height=28.0 padding=5.0 -> toggle_channel_create
+            button label="New channel" disabled=(loading || mutation_phase != "idle" || !connected) width=28.0 height=28.0 padding=0.0 -> toggle_channel_create
+              container width=fill height=fill align-x=center align-y=center
+                text "+" size=14.0
               active bg=transparent text=muted r=8.0
               hovered bg=white/10 text=fg
               pressed bg=selection
               disabled text=muted
           if channel_create_open
-            button "×" label="Close new channel" disabled=(loading || mutation_phase != "idle") width=28.0 height=28.0 padding=5.0 -> toggle_channel_create
+            button label="Close new channel" disabled=(loading || mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> toggle_channel_create
+              container width=fill height=fill align-x=center align-y=center
+                text "×" size=14.0
               active bg=transparent text=muted r=8.0
               hovered bg=white/10 text=fg
               pressed bg=selection
@@ -41,7 +45,9 @@ view
               hovered bg=elevated border=white/21
               focused bg=elevated border=fg/45 border-w=1.0
               disabled bg=surface/54 value=muted
-            button "+" label="Create channel" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(channel_draft))) width=28.0 height=28.0 padding=5.0 -> create_channel_submit
+            button label="Create channel" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(channel_draft))) width=28.0 height=28.0 padding=0.0 -> create_channel_submit
+              container width=fill height=fill align-x=center align-y=center
+                text "+" size=14.0
               active bg=white/13 text=fg border=white/18 border-w=1.0 r=8.0
               hovered bg=white/19
               pressed bg=selection
@@ -56,13 +62,17 @@ view
           text "PAGES" width=fill size=11.0 font=medium @text-muted
           text len(pages) size=11.0 @text-muted
           if !page_create_open
-            button "+" label="New page" disabled=(loading || mutation_phase != "idle" || !connected) width=28.0 height=28.0 padding=5.0 -> toggle_page_create
+            button label="New page" disabled=(loading || mutation_phase != "idle" || !connected) width=28.0 height=28.0 padding=0.0 -> toggle_page_create
+              container width=fill height=fill align-x=center align-y=center
+                text "+" size=14.0
               active bg=transparent text=muted r=8.0
               hovered bg=white/10 text=fg
               pressed bg=selection
               disabled text=muted
           if page_create_open
-            button "×" label="Close new page" disabled=(loading || mutation_phase != "idle") width=28.0 height=28.0 padding=5.0 -> toggle_page_create
+            button label="Close new page" disabled=(loading || mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> toggle_page_create
+              container width=fill height=fill align-x=center align-y=center
+                text "×" size=14.0
               active bg=transparent text=muted r=8.0
               hovered bg=white/10 text=fg
               pressed bg=selection
@@ -73,7 +83,9 @@ view
               hovered bg=elevated border=white/21
               focused bg=elevated border=fg/45 border-w=1.0
               disabled bg=surface/54 value=muted
-            button "+" label="Create page" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(page_draft))) width=28.0 height=28.0 padding=5.0 -> create_page_submit
+            button label="Create page" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(page_draft))) width=28.0 height=28.0 padding=0.0 -> create_page_submit
+              container width=fill height=fill align-x=center align-y=center
+                text "+" size=14.0
               active bg=white/13 text=fg border=white/18 border-w=1.0 r=8.0
               hovered bg=white/19
               pressed bg=selection
@@ -117,16 +129,20 @@ view
                   focused bg=white/7 border=fg/40
                   disabled bg=transparent value=muted
                 if !empty(chat_search_hits)
-                  button "×" label="Clear message search" width=28.0 height=28.0 padding=4.0 -> clear_chat_search
+                  button label="Clear message search" width=28.0 height=28.0 padding=0.0 -> clear_chat_search
+                    container width=fill height=fill align-x=center align-y=center
+                      text "×" size=14.0
                     active bg=transparent text=muted r=7.0
                     hovered bg=white/10 text=fg
                     pressed bg=white/15
-                button "•••" label="Channel details" width=28.0 height=28.0 padding=4.0 -> toggle_channel_settings
+                button label="Channel details" width=28.0 height=28.0 padding=0.0 -> toggle_channel_settings
+                  container width=fill height=fill align-x=center align-y=center
+                    text "•••" size=13.0
                   active bg=transparent text=muted r=7.0
                   hovered bg=white/10 text=fg
                   pressed bg=white/15
             if !empty(chat_search_hits)
-              container width=fill height=148.0 padding=6.0 bg=white/6 border=white/10 border-w=1.0 r=10.0
+              container width=fill height=148.0 padding=6.0 bg=elevated border=white/10 border-w=1.0 r=10.0
                 scroll direction=vertical width=fill height=fill
                   col width=fill spacing=1.0
                     for hit in chat_search_hits
@@ -217,7 +233,9 @@ view
                                 active bg=white/11 text=fg border=white/13 border-w=1.0 r=7.0
                                 hovered bg=white/16
                                 pressed bg=white/20
-                              button "×" label="Cancel message edit" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=5.0 -> clear_message_selection
+                              button label="Cancel message edit" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> clear_message_selection
+                                container width=fill height=fill align-x=center align-y=center
+                                  text "×" size=14.0
                                 active bg=transparent text=muted r=7.0
                                 hovered bg=white/10 text=fg
                                 pressed bg=white/15
@@ -244,7 +262,9 @@ view
                   active bg=white/9 text=fg border=white/11 border-w=1.0 r=7.0
                   hovered bg=white/14
                   pressed bg=white/18
-                button "×" label="Dismiss unsent message" width=28.0 height=28.0 padding=5.0 -> dismiss_failed_message
+                button label="Dismiss unsent message" width=28.0 height=28.0 padding=0.0 -> dismiss_failed_message
+                  container width=fill height=fill align-x=center align-y=center
+                    text "×" size=14.0
                   active bg=transparent text=muted r=7.0
                   hovered bg=white/10 text=fg
                   pressed bg=white/15
@@ -267,7 +287,9 @@ view
               col width=fill height=fill spacing=8.0
                 row width=fill height=28.0 spacing=6.0 align=center
                   text "Channel details" width=fill size=13.0 font=medium @text-fg
-                  button "×" label="Close channel details" width=28.0 height=28.0 padding=4.0 -> toggle_channel_settings
+                  button label="Close channel details" width=28.0 height=28.0 padding=0.0 -> toggle_channel_settings
+                    container width=fill height=fill align-x=center align-y=center
+                      text "×" size=14.0
                     active bg=transparent text=muted r=7.0
                     hovered bg=white/10 text=fg
                     pressed bg=white/15
@@ -320,7 +342,7 @@ view
                     col width=fill spacing=2.0
                       for member in channel_members
                         ChatMemberRow member=member disabled=(mutation_phase != "idle")
-          if active_thread_seq > 0
+          if active_thread_seq > 0 && !channel_settings_open
             container width=1.0 height=fill bg=separator
               text ""
             container width=286.0 height=fill padding=10.0 bg=surface
@@ -331,7 +353,9 @@ view
                   if thread_target_seq > 0
                     text "Thread result" width=fill size=13.0 font=medium @text-fg
                   text len(thread_messages) size=11.0 @text-muted
-                  button "×" label="Close thread" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=4.0 -> close_thread
+                  button label="Close thread" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> close_thread
+                    container width=fill height=fill align-x=center align-y=center
+                      text "×" size=14.0
                     active bg=transparent text=muted r=7.0
                     hovered bg=white/11 text=fg
                     pressed bg=selection
@@ -357,7 +381,7 @@ view
                       active bg=transparent text=muted r=7.0
                       hovered bg=white/10 text=fg
                       pressed bg=white/15
-                container width=fill padding=5.0 bg=white/7 border=white/12 border-w=1.0 r=7.0
+                container width=fill padding=5.0 bg=transparent border=white/12 border-w=1.0 r=7.0
                   row width=fill spacing=5.0 align=center
                     input "" #reply label="Thread reply" <-> reply_draft hint="Reply…" disabled=(thread_loading || active_channel_archived) submit=send_reply_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
                       active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=0.0 r=8.0
@@ -393,12 +417,16 @@ view
                       focused bg=white/7 border=white/12
                       disabled value=muted
                     if !empty(page_search_hits)
-                      button "×" label="Clear page search" width=26.0 height=26.0 padding=4.0 -> clear_page_search
+                      button label="Clear page search" width=28.0 height=28.0 padding=0.0 -> clear_page_search
+                        container width=fill height=fill align-x=center align-y=center
+                          text "×" size=14.0
                         active bg=transparent text=muted r=7.0
                         hovered bg=white/10 text=fg
                         pressed bg=white/15
                     if !page_delete_armed
-                      button "•••" label="Page menu" disabled=(mutation_phase != "idle") width=28.0 height=26.0 padding=4.0 -> arm_page_delete
+                      button label="Page menu" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> arm_page_delete
+                        container width=fill height=fill align-x=center align-y=center
+                          text "•••" size=13.0
                         active bg=transparent text=muted r=7.0
                         hovered bg=white/10 text=fg
                         pressed bg=white/15
@@ -407,16 +435,16 @@ view
                         active bg=white/11 text=fg border=white/13 border-w=1.0 r=7.0
                         hovered bg=white/16
                         pressed bg=white/20
-                  container width=fill padding-left=36.0
+                  container width=fill padding-left=56.0
                     PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
                   if !empty(page_search_hits)
-                    container width=fill height=148.0 padding=5.0 bg=white/4 border=white/8 border-w=1.0 r=9.0
+                    container width=fill height=148.0 padding=5.0 bg=elevated border=white/8 border-w=1.0 r=9.0
                       scroll direction=vertical width=fill height=fill
                         col width=fill spacing=1.0
                           for hit in page_search_hits
                             PageSearchResult hit=hit
                   if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
-                    container width=fill padding=7.0 bg=white/4 border=white/9 border-w=1.0 r=9.0
+                    container width=fill padding=7.0 bg=elevated border=white/9 border-w=1.0 r=9.0
                       col width=fill spacing=5.0
                         text "Recovered drafts" size=11.0 font=medium @text-fg
                         for recovered_block in orphaned_block_drafts
@@ -442,7 +470,7 @@ view
                               hovered bg=white/9 text=fg
                               pressed bg=white/14
                   if empty(blocks) && !block_insert_open
-                    container width=fill padding-left=36.0
+                    container width=fill padding-left=56.0
                       button "Write something…" label="Start writing" disabled=loading width=fill padding=6.0 -> open_root_block_insert
                         active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                         hovered bg=white/4 text=fg border=white/7
@@ -468,13 +496,19 @@ view
                           if block.pending
                             container width=fill padding=5.0 bg=white/3 r=6.0
                               BlockContents block=block
-                          if !block.pending && block.id != selected_block_id
+                          if !block.pending && block.kind == "Page"
+                            button label=block.kind description=block.text width=fill padding=5.0 -> choose_page(block.id)
+                              BlockContents block=block
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                              hovered bg=white/3 text=fg border=transparent
+                              pressed bg=white/6 text=fg
+                          if !block.pending && block.kind != "Page" && block.id != selected_block_id
                             button label=block.kind description=block.text width=fill padding=5.0 -> select_block(block.key, block.id, block.kind, block.text, block.checked, false)
                               BlockContents block=block
                               active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                               hovered bg=white/3 text=fg border=transparent
                               pressed bg=white/6 text=fg
-                          if !block.pending && block.id == selected_block_id
+                          if !block.pending && block.kind != "Page" && block.id == selected_block_id
                             BlockLine block=block
                               col width=fill
                                 if block.kind == "Divider"
@@ -544,12 +578,12 @@ view
                             hovered bg=white/9 text=fg
                             pressed bg=white/14
                   row width=fill spacing=5.0 align=center
-                    input "" #block-comment(scope_key(connected_rpc, selected_block_id)) label="New block comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=create_block_thread_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                    input "" #block-comment(scope_key(connected_rpc, selected_block_id)) label="New block comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=post_block_comment_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
                       active bg=transparent border=white/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                       hovered bg=white/4 border=white/11
                       focused bg=white/6 border=white/13
                       disabled value=muted
-                    button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) height=26.0 padding=5.0 -> create_block_thread_submit
+                    button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) height=28.0 padding=5.0 -> post_block_comment_submit
                       active bg=fg/88 text=bg border=white/5 border-w=1.0 r=8.0
                       hovered bg=fg/78 text=bg
                       pressed bg=fg text=bg

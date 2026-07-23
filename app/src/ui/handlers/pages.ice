@@ -415,7 +415,7 @@ on close_block_comment_thread
   block_thread_comments_has_more = false
   block_thread_comments_loading = false
 
-on create_block_thread_submit
+on post_block_comment_submit
   return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || block_comments_target != selected_block_id || empty(trim(block_comment_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -426,9 +426,9 @@ on create_block_thread_submit
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
-  run create_block_thread(connected_rpc, password, block_comments_target, pending_block_comment, block_comments_generation) -> block_thread_created _ | block_thread_create_failed _
+  run post_block_comment(connected_rpc, password, block_comments_target, active_block_comment_thread, pending_block_comment, block_comments_generation) -> block_comment_posted _ | block_comment_post_failed _
 
-on block_thread_created(next)
+on block_comment_posted(next)
   return if next.generation != block_comments_generation || next.target != block_comments_target || next.target != selected_block_id || !block_comments_open
   active_block_comment_thread = next.thread_id
   block_thread_comments = next.comments
@@ -442,7 +442,7 @@ on block_thread_created(next)
   block_comment_threads_loading = true
   run load_block_threads(connected_rpc, block_comments_target, 0, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
-on block_thread_create_failed(cause)
+on block_comment_post_failed(cause)
   block_comment_draft = restore_draft(block_comment_draft, pending_block_comment, cause.committed)
   pending_block_comment = ""
   mutation_phase = mutation_failure_phase(cause.committed)

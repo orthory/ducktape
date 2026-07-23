@@ -803,6 +803,11 @@ mod tests {
         for label in ["Open thread", "Manage reactions", "More message actions"] {
             assert!(toolbar.contains(&format!("label=\"{label}\"")));
         }
+        assert!(
+            components.contains(
+                "button label=\"Open thread\" padding=4.0 -> open_thread_for(message.seq)"
+            )
+        );
 
         let view = include_str!("ui/view.ice");
         let chat = view
@@ -1056,6 +1061,15 @@ mod tests {
         let (app, _) = Ducktape::__boot();
         assert!(app.block_kinds.iter().any(|kind| kind == "Page"));
         assert!(!app.editable_block_kinds.iter().any(|kind| kind == "Page"));
+
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains("if !block.pending && block.kind == \"Page\""));
+        assert!(view.contains(
+            "button label=block.kind description=block.text width=fill padding=5.0 -> choose_page(block.id)"
+        ));
+        assert!(view.contains(
+            "if !block.pending && block.kind != \"Page\" && block.id == selected_block_id"
+        ));
     }
 
     #[test]
@@ -1082,7 +1096,7 @@ mod tests {
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
         assert!(view.contains(
-            "container width=fill padding-left=36.0\n                    PageTitleEditor"
+            "container width=fill padding-left=56.0\n                    PageTitleEditor"
         ));
     }
 
@@ -1127,6 +1141,11 @@ mod tests {
         assert!(shell.contains(
             "container width=240.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar"
         ));
+
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains("container width=fill padding=6.0 bg=transparent border=white/11"));
+        assert!(view.contains("if active_thread_seq > 0 && !channel_settings_open"));
+        assert!(view.contains("container width=fill padding=5.0 bg=transparent border=white/12"));
     }
 
     #[test]
@@ -1136,6 +1155,17 @@ mod tests {
         assert!(view.contains("padding=6.6 text-size=14.0 line-height=1.2"));
         assert!(view.contains("button \"Send\" disabled="));
         assert!(view.contains("height=30.0 padding=7.0 -> send_message_submit"));
+        assert!(
+            view.matches("container width=fill height=fill align-x=center align-y=center")
+                .count()
+                >= 10
+        );
+        for line in view
+            .lines()
+            .filter(|line| line.trim_start().starts_with("input "))
+        {
+            assert!(!line.contains(" height="), "{line}");
+        }
 
         let components = concat!(
             include_str!("ui/components/shell.ice"),
@@ -1143,6 +1173,9 @@ mod tests {
             include_str!("ui/components/pages.ice"),
         );
         assert!(components.contains("row width=fill height=fill spacing=9.0 align=center"));
+        assert!(components.contains(
+            "button label=\"Insert block below\" disabled=disabled width=28.0 height=28.0 padding=0.0"
+        ));
         for line in view.lines().chain(components.lines()).filter(|line| {
             [
                 "button \"+\" label",
@@ -1181,6 +1214,12 @@ mod tests {
         let components = include_str!("ui/components/pages.ice");
         assert!(components.contains("label=\"Comments\""));
         assert!(components.contains("-> open_block_comments"));
+
+        let handlers = include_str!("ui/handlers/pages.ice");
+        assert!(handlers.contains("on post_block_comment_submit"));
+        assert!(handlers.contains(
+            "run post_block_comment(connected_rpc, password, block_comments_target, active_block_comment_thread"
+        ));
     }
 
     #[test]

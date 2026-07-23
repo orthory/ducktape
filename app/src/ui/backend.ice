@@ -100,7 +100,7 @@ extern crate::backend
   load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
   refresh_block_comments(rpc:str, target:str, thread_id:str, generation:i64) -> BlockCommentsRefreshData ! HydrationError
-  create_block_thread(rpc:str, password:str, target:str, text:str, generation:i64) -> BlockCommentData ! AppError
+  post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
   autosave_page_title(rpc:str, password:str, page_id:str, title:str) -> bool ! AppError
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError

@@ -50,12 +50,15 @@ component MessageContents(message:ChatMessage)
       if message.reply_count > 0 || !empty(message.reactions)
         row width=fill spacing=5.0 align=center
           if message.reply_count > 0
-            container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/5 border=white/9 border-w=1.0 r=7.0
+            button label="Open thread" padding=4.0 -> open_thread_for(message.seq)
               row spacing=4.0 align=center
-                text "Thread" size=11.0 font=medium @text-muted
-                text message.reply_count size=11.0 @text-muted
+                text "Thread" size=11.0 font=medium
+                text message.reply_count size=11.0
+              active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+              hovered bg=white/6 text=fg border=white/8
+              pressed bg=white/10 text=fg border=white/12
           for reaction in message.reactions
-            container padding=4.0 padding-left=7.0 padding-right=7.0 bg=white/5 border=white/9 border-w=1.0 r=7.0
+            container padding=4.0 padding-left=7.0 padding-right=7.0 bg=transparent border=transparent border-w=1.0 r=7.0
               row spacing=4.0 align=center
                 text reaction.emoji size=11.0 @text-fg
                 text reaction.count size=11.0 @text-muted

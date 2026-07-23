@@ -1802,17 +1802,18 @@ pub async fn refresh_block_comments(
     })
 }
 
-pub async fn create_block_thread(
+pub async fn post_block_comment(
     rpc: String,
     password: String,
     target: String,
+    thread_id: String,
     text: String,
     generation: i64,
 ) -> Result<BlockCommentData, AppError> {
     async {
         let target = required_id(target, "block")?;
         let text = bounded_text(text, "comment", 16 * 1024)?;
-        let thread_id = fresh_id("thread");
+        let thread_id = comment_thread_id(thread_id)?;
         let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
@@ -1835,6 +1836,14 @@ pub async fn create_block_thread(
             .map_err(committed_error)
     }
     .await
+}
+
+fn comment_thread_id(thread_id: String) -> Result<String, String> {
+    if thread_id.is_empty() {
+        Ok(fresh_id("thread"))
+    } else {
+        required_id(thread_id, "comment thread")
+    }
 }
 
 pub async fn create_page(
@@ -3622,6 +3631,17 @@ mod tests {
         assert_eq!(thread_offset_after_reply(3, false, false), 3);
         assert_eq!(thread_offset_after_reply(256, true, true), 256);
         assert_eq!(thread_offset_after_reply(-1, false, true), -1);
+    }
+
+    #[test]
+    fn block_comment_posts_reuse_the_selected_thread() {
+        assert_eq!(comment_thread_id("thread-a".into()).unwrap(), "thread-a");
+        assert!(
+            comment_thread_id(String::new())
+                .unwrap()
+                .starts_with("thread-")
+        );
+        assert!(comment_thread_id(" ".into()).is_err());
     }
 
     #[test]
