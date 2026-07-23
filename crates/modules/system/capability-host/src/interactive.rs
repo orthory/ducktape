@@ -234,9 +234,11 @@ impl CliProvider {
         let workdir = self.ensure_writable_workdir(ctx)?;
         let workdir = canonical_mount_path(&workdir, "sandbox workdir")?;
         let config_home = self.prepare_config_home(&workdir, ctx)?;
-        // no per-run airlock resolution is wired into interactive sessions yet;
-        // the env/host-credential path is unchanged.
-        let broker = self.start_broker(None).await?;
+        // the per-run credential source: a peer-attached session carries a
+        // consensus-resolved self-host gateway on `ctx.airlock`, so the broker
+        // resolves the upstream to it instead of the boundary env; a local
+        // session leaves it `None` and the env/host-credential path is unchanged.
+        let broker = self.start_broker(ctx.airlock.as_ref()).await?;
         let auth = RunAuth {
             config_home: config_home.as_deref(),
             broker: broker.as_ref().map(|b| &b.endpoint),

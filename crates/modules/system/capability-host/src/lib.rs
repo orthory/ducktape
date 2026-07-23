@@ -234,7 +234,7 @@ impl Eq for RunCancellation {}
 /// [`RunContext::default`]. NEVER consensus
 /// data — providers only use it to pick a workspace dir and a session slot
 /// on this machine.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct RunContext {
     pub agent_id: Option<String>,
     pub thread_key: Option<String>,
@@ -281,6 +281,12 @@ pub struct RunContext {
     /// stdin prompt. `None` (no assembled context) means neither door does
     /// anything.
     pub context_doc: Option<String>,
+    /// the per-run credential source — a consensus-resolved self-host gateway.
+    /// `Some` makes the interactive spawn's broker resolve the upstream to THIS
+    /// config instead of `AirlockConfig::from_env()`, so a peer-attached session
+    /// draws on the guest's credential rather than the host's boundary env.
+    /// `None` (the default) keeps the env/host-credential path unchanged.
+    pub airlock: Option<broker::AirlockConfig>,
 }
 
 /// which child stream produced one live output line.
@@ -1041,8 +1047,9 @@ impl CliProvider {
     /// `None` keeps the env/host-credential path unchanged.
     async fn start_broker(
         &self,
-        airlock: Option<broker::AirlockConfig>,
+        airlock: Option<&broker::AirlockConfig>,
     ) -> Result<Option<broker::RunBroker>, String> {
+        let airlock = airlock.cloned();
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
@@ -3545,9 +3552,10 @@ impl CliProvider {
         let _context = self.deliver_context(&workdir, config_home.as_deref(), ctx)?;
         let prompt_buf = self.prompt_with_context(prompt, ctx);
         let prompt = prompt_buf.as_str();
-        // no per-run airlock resolution is wired here yet (that arrives with the
-        // consensus-record lookup); the env/host-credential path is unchanged.
-        let broker = self.start_broker(None).await?;
+        // the per-run credential source rides `ctx.airlock` (unifies both spawn
+        // paths); `None` for every existing headless run, so the env/host-
+        // credential path is unchanged.
+        let broker = self.start_broker(ctx.airlock.as_ref()).await?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
@@ -6151,6 +6159,7 @@ printf '%s\n' "$PATH"
             limits: BTreeMap::new(),
             portable: true,
             context_doc: None,
+            airlock: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();
