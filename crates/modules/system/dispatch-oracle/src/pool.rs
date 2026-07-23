@@ -543,6 +543,9 @@ async fn execute(
         input,
         mut ctx,
         workspace: plan,
+        // the credential name was consumed by the pool's resolver seam (it set
+        // `ctx.airlock`/`ctx.on_behalf`) before this executor ran.
+        credential: _,
     } = prepared;
     // the REQUESTED sink (Chain when the envelope carried none) — echoed on
     // the assembled RunnerResult below so runs' delivery can route it.
