@@ -104,6 +104,7 @@ pub(super) async fn park(
     metrics: noded::NodeMetrics,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &dispatch_oracle::SharedProvisioner,
+    cred_resolver: &dispatch_oracle::SharedCredentialResolver,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -551,6 +552,7 @@ pub(super) async fn park(
         // the announced capacity IS the pool's ledger (one source), same as
         // the validator path.
         sandbox_capacity,
+        Some(cred_resolver.clone()),
     );
     let mut resident_dispatch = resident_dispatch::ResidentDispatch::new(
         resident_pool,

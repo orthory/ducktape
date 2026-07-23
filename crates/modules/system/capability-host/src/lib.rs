@@ -281,6 +281,19 @@ pub struct RunContext {
     /// stdin prompt. `None` (no assembled context) means neither door does
     /// anything.
     pub context_doc: Option<String>,
+    /// the per-run credential SOURCE the broker draws on: a self-host airlock
+    /// config the executing node resolved from a committed gateway credential
+    /// record (`ducktape agent sched --cred`). `None` (the default) keeps
+    /// today's behavior — the `DUCKTAPE_AIRLOCK_*` env boundary, then a
+    /// host-held credential. Never consensus data; the resolver builds it
+    /// host-side from committed state before the provider spawns.
+    pub airlock: Option<broker::AirlockConfig>,
+    /// the ACCOUNT this run acts on behalf of — the credential-grant subject
+    /// (the submitting node's account, read from committed saga origin). Carried
+    /// beside `airlock` so the broker's gateway session can name whom the
+    /// traffic is attributed to. `None` (the default) = a host-credential run
+    /// acting for no distinct account.
+    pub on_behalf: Option<Vec<u8>>,
 }
 
 /// which child stream produced one live output line.
@@ -3545,9 +3558,12 @@ impl CliProvider {
         let _context = self.deliver_context(&workdir, config_home.as_deref(), ctx)?;
         let prompt_buf = self.prompt_with_context(prompt, ctx);
         let prompt = prompt_buf.as_str();
-        // no per-run airlock resolution is wired here yet (that arrives with the
-        // consensus-record lookup); the env/host-credential path is unchanged.
-        let broker = self.start_broker(None).await?;
+        // the run's credential source: a self-host airlock config the executing
+        // node resolved from a committed gateway record (`sched --cred`), or
+        // `None` — in which case `resolve_anthropic_upstream` falls back to the
+        // env boundary then a host-held credential (today's behavior). A present
+        // config takes precedence over env, so the self-host path is env-free.
+        let broker = self.start_broker(ctx.airlock.clone()).await?;
 
         let Some((session, store)) = self.session_store(ctx)? else {
             // no session plumbing for this run: one cold invocation.
@@ -6151,6 +6167,8 @@ printf '%s\n' "$PATH"
             limits: BTreeMap::new(),
             portable: true,
             context_doc: None,
+            airlock: None,
+            on_behalf: None,
         };
 
         let output = p.run("q", &ctx).await.unwrap();

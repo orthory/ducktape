@@ -13,6 +13,7 @@ pub(crate) struct Surfaces {
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
     pub(crate) agent_provisioner: dispatch_oracle::SharedProvisioner,
+    pub(crate) cred_resolver: dispatch_oracle::SharedCredentialResolver,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
 }
@@ -239,6 +240,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             http_listen.as_deref().filter(|_| !sync_only),
         )),
     );
+    // the executing-node credential resolver, built from the SAME committed-query
+    // lane the provisioner uses (before the serve/drop match consumes the
+    // handle). A `sched --cred` run's named credential resolves through this into
+    // a self-host airlock source, gated on the run's committed saga origin.
+    let cred_resolver: dispatch_oracle::SharedCredentialResolver =
+        std::sync::Arc::new(crate::cred_resolve::NodeCredentialResolver::new(&http_handle));
     // the node-local, off-chain interactive terminal-session plane (lives on the
     // http handle like the stream hub — never consensus). Wired only where the
     // app surface is actually served for a real member: not sync-only, not a
@@ -364,6 +371,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         code_stage_requests,
         blobs,
         agent_provisioner,
+        cred_resolver,
         gateway_requests: gateway_enabled.then_some(gateway_requests),
         gateway_commands,
     })
