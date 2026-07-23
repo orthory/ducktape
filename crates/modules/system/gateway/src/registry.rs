@@ -4,18 +4,22 @@ use sdk::codec::{Cursor, push_bytes, push_opt_str};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    MAX_ROUTE_LABEL_BYTES, MAX_ROUTE_STATEMENT_JSON_BYTES, MAX_ROUTES_PER_ACCOUNT, RouteName,
-    RouteRecord, RouteSummary, validate_account_id, validate_authorization,
-    validate_route_statement,
+    CredentialRecord, MAX_CREDENTIAL_GRANTS, MAX_ROUTE_LABEL_BYTES, MAX_ROUTE_STATEMENT_JSON_BYTES,
+    MAX_ROUTES_PER_ACCOUNT, RouteName, RouteRecord, RouteSummary, validate_account_id,
+    validate_authorization, validate_credential_name, validate_route_statement,
 };
 
 const MAX_RECORD_BYTES: usize = MAX_ROUTE_STATEMENT_JSON_BYTES + 1024;
+/// A credential record is scalar metadata plus a bounded grant set; each grant
+/// is at most [`crate::MAX_ACCOUNT_ID_BYTES`]. This caps its JSON on decode.
+const MAX_CREDENTIAL_RECORD_BYTES: usize = 8 * 1024;
 
 type RouteKey = (Vec<u8>, RouteName);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct State {
     routes: BTreeMap<RouteKey, RouteRecord>,
+    credentials: BTreeMap<String, CredentialRecord>,
 }
 
 pub struct Registry {
@@ -122,6 +126,95 @@ impl Registry {
         Ok(())
     }
 
+    pub fn credential(&self, name: &str) -> Result<Option<CredentialRecord>, String> {
+        validate_credential_name(name)?;
+        Ok(self.effective().credentials.get(name).cloned())
+    }
+
+    pub fn credentials(&self) -> Vec<CredentialRecord> {
+        self.effective().credentials.values().cloned().collect()
+    }
+
+    /// Register or replace a credential record. First registration in consensus
+    /// order wins the name: a record whose owner differs from the committed one
+    /// is refused. Grants MUST arrive empty here (managed by grant/revoke).
+    pub fn set_credential(&mut self, record: CredentialRecord) -> Result<(), String> {
+        validate_credential_name(&record.name)?;
+        validate_account_id(&record.owner_account)?;
+        if !record.grants.is_empty() {
+            return Err("gateway: credential registration carries no grants".into());
+        }
+        let taken_by_other = self
+            .effective()
+            .credentials
+            .get(&record.name)
+            .is_some_and(|existing| existing.owner_account != record.owner_account);
+        if taken_by_other {
+            return Err("gateway: credential name already registered".into());
+        }
+        self.pending_mut()
+            .credentials
+            .insert(record.name.clone(), record);
+        Ok(())
+    }
+
+    /// Load an owner's record for a grant/revoke/remove mutation, refusing when
+    /// the name is unknown or owned by a different account.
+    fn owned_credential(
+        &self,
+        name: &str,
+        owner_account: &[u8],
+    ) -> Result<CredentialRecord, String> {
+        let record = self
+            .credential(name)?
+            .ok_or_else(|| "gateway: credential is not registered".to_string())?;
+        if record.owner_account != owner_account {
+            return Err("gateway: credential is owned by another account".into());
+        }
+        Ok(record)
+    }
+
+    pub fn remove_credential(&mut self, name: &str, owner_account: &[u8]) -> Result<(), String> {
+        self.owned_credential(name, owner_account)?;
+        self.pending_mut().credentials.remove(name);
+        Ok(())
+    }
+
+    pub fn grant_credential(
+        &mut self,
+        name: &str,
+        owner_account: &[u8],
+        account: Vec<u8>,
+    ) -> Result<(), String> {
+        validate_account_id(&account)?;
+        let mut record = self.owned_credential(name, owner_account)?;
+        let is_new_grant = record.grants.insert(account);
+        let over_cap = is_new_grant && record.grants.len() > MAX_CREDENTIAL_GRANTS;
+        if over_cap {
+            return Err(format!(
+                "gateway: credential grant count exceeds {MAX_CREDENTIAL_GRANTS}"
+            ));
+        }
+        self.pending_mut()
+            .credentials
+            .insert(name.to_string(), record);
+        Ok(())
+    }
+
+    pub fn revoke_credential(
+        &mut self,
+        name: &str,
+        owner_account: &[u8],
+        account: &[u8],
+    ) -> Result<(), String> {
+        let mut record = self.owned_credential(name, owner_account)?;
+        record.grants.remove(account);
+        self.pending_mut()
+            .credentials
+            .insert(name.to_string(), record);
+        Ok(())
+    }
+
     pub fn commit(&mut self) {
         if let Some(next) = self.pending.take() {
             self.committed = next;
@@ -178,6 +271,14 @@ fn encode_state(state: &State) -> Vec<u8> {
             &serde_json::to_vec(record).expect("route record serializes"),
         );
     }
+    out.extend_from_slice(&(state.credentials.len() as u64).to_le_bytes());
+    for (name, record) in &state.credentials {
+        push_bytes(&mut out, name.as_bytes());
+        push_bytes(
+            &mut out,
+            &serde_json::to_vec(record).expect("credential record serializes"),
+        );
+    }
     out
 }
 
@@ -232,8 +333,55 @@ fn decode_state(bytes: &[u8]) -> Result<State, String> {
         previous = Some(key.clone());
         routes.insert(key, record);
     }
+    let credentials = decode_credentials(&mut reader)?;
     reader.finish("snapshot").map_err(codec_err)?;
-    Ok(State { routes })
+    Ok(State {
+        routes,
+        credentials,
+    })
+}
+
+fn decode_credentials(reader: &mut Cursor) -> Result<BTreeMap<String, CredentialRecord>, String> {
+    let count = reader.u64("snapshot credential count").map_err(codec_err)?;
+    // Each entry carries at least a name length + one name byte and a record
+    // length: 10 bytes.
+    reader
+        .bound(count, 10, "snapshot credential count")
+        .map_err(codec_err)?;
+    let mut credentials = BTreeMap::new();
+    let mut previous: Option<String> = None;
+    for _ in 0..count {
+        let name = reader
+            .string("snapshot credential name")
+            .map_err(codec_err)?;
+        validate_credential_name(&name)?;
+        if previous.as_ref().is_some_and(|old| old >= &name) {
+            return Err("gateway: snapshot credential names are not strictly increasing".into());
+        }
+        let record_bytes = reader
+            .bytes("snapshot credential record")
+            .map_err(codec_err)?;
+        if record_bytes.len() > MAX_CREDENTIAL_RECORD_BYTES {
+            return Err(format!(
+                "gateway: snapshot credential record exceeds {MAX_CREDENTIAL_RECORD_BYTES} bytes"
+            ));
+        }
+        let record: CredentialRecord = serde_json::from_slice(record_bytes)
+            .map_err(|error| format!("gateway: credential record: {error}"))?;
+        if record.name != name {
+            return Err("gateway: snapshot credential key does not match its record".into());
+        }
+        validate_credential_name(&record.name)?;
+        validate_account_id(&record.owner_account)?;
+        if record.grants.len() > MAX_CREDENTIAL_GRANTS {
+            return Err(format!(
+                "gateway: snapshot credential exceeds {MAX_CREDENTIAL_GRANTS} grants"
+            ));
+        }
+        previous = Some(name.clone());
+        credentials.insert(name, record);
+    }
+    Ok(credentials)
 }
 
 /// [`Cursor`] reports through [`sdk::Error`]; this crate speaks `String`.
