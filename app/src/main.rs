@@ -1176,8 +1176,10 @@ mod tests {
 
         let shell = include_str!("ui/components/shell.ice");
         assert!(shell.contains(
-            "container width=240.0 height=fill padding=12.0 padding-top=38.0 bg=sidebar"
+            "container width=sidebar_width height=fill padding=12.0 padding-top=38.0 bg=sidebar"
         ));
+        // the rail width is drag-resizable via the divider resize-handle.
+        assert!(shell.contains("resize-handle drag=sidebar_dragged cursor=resize-horizontal"));
 
         let view = include_str!("ui/view.ice");
         assert!(view.contains("container width=fill padding=6.0 bg=transparent border=white/11"));
