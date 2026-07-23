@@ -513,6 +513,28 @@ on remove_reaction_submit(emoji)
   error = ""
   run remove_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> chat_mutated _ | mutation_failed _
 
+on add_reaction_at(seq, emoji)
+  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived || seq <= 0
+  selected_message_seq = seq
+  live_thread_generation = live_thread_generation + 1
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "reaction"
+  error = ""
+  run add_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_mutated _ | mutation_failed _
+
+on remove_reaction_at(seq, emoji)
+  return if loading || mutation_phase != "idle" || active_channel_archived || seq <= 0
+  selected_message_seq = seq
+  live_thread_generation = live_thread_generation + 1
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  sync_phase = "idle"
+  mutation_phase = "reaction"
+  error = ""
+  run remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> chat_mutated _ | mutation_failed _
+
 on send_reply_submit
   return if loading || thread_loading || empty(active_channel) || active_channel_archived || active_thread_seq <= 0 || empty(trim(reply_draft))
   live_thread_generation = live_thread_generation + 1

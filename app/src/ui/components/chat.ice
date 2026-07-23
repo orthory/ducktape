@@ -102,10 +102,24 @@ component MessageContents(message:ChatMessage)
               hovered bg=primary/22 text=fg border=primary/34
               pressed bg=primary/30 text=fg border=primary/40
           for reaction in message.reactions
-            container padding=3.0 padding-left=8.0 padding-right=8.0 bg=white/6 border=white/13 border-w=1.0 r=9.0
-              row spacing=5.0 align=center
-                text reaction.emoji size=13.0 @text-fg
-                text reaction.count size=11.0 font=medium @text-muted
+            if reaction.reacted_by_me
+              button label="Remove reaction" description=reaction.emoji padding=0.0 -> remove_reaction_at(message.seq, reaction.emoji)
+                container padding=3.0 padding-left=8.0 padding-right=8.0
+                  row spacing=5.0 align=center
+                    text reaction.emoji size=13.0 @text-fg
+                    text reaction.count size=11.0 font=medium @text-primaryhi
+                active bg=primary/18 text=fg border=primary/36 border-w=1.0 r=9.0
+                hovered bg=primary/26 text=fg border=primary/46
+                pressed bg=primary/32 text=fg
+            if !reaction.reacted_by_me
+              button label="Add reaction" description=reaction.emoji padding=0.0 -> add_reaction_at(message.seq, reaction.emoji)
+                container padding=3.0 padding-left=8.0 padding-right=8.0
+                  row spacing=5.0 align=center
+                    text reaction.emoji size=13.0 @text-fg
+                    text reaction.count size=11.0 font=medium @text-muted
+                active bg=white/6 text=fg border=white/13 border-w=1.0 r=9.0
+                hovered bg=white/12 text=fg border=white/18
+                pressed bg=white/16 text=fg
 
 component MessageCard(message:ChatMessage, selected:bool, hovered:bool, disabled:bool)
   mouse enter=message_entered(message.seq) exit=message_exited(message.seq)
@@ -158,10 +172,24 @@ component ThreadMessageBody(message:ChatMessage)
       if !empty(message.reactions)
         row width=fill spacing=5.0 align=center
           for reaction in message.reactions
-            container padding=3.0 padding-left=8.0 padding-right=8.0 bg=white/6 border=white/13 border-w=1.0 r=9.0
-              row spacing=5.0 align=center
-                text reaction.emoji size=13.0 @text-fg
-                text reaction.count size=11.0 font=medium @text-muted
+            if reaction.reacted_by_me
+              button label="Remove reaction" description=reaction.emoji padding=0.0 -> remove_reaction_at(message.seq, reaction.emoji)
+                container padding=3.0 padding-left=8.0 padding-right=8.0
+                  row spacing=5.0 align=center
+                    text reaction.emoji size=13.0 @text-fg
+                    text reaction.count size=11.0 font=medium @text-primaryhi
+                active bg=primary/18 text=fg border=primary/36 border-w=1.0 r=9.0
+                hovered bg=primary/26 text=fg border=primary/46
+                pressed bg=primary/32 text=fg
+            if !reaction.reacted_by_me
+              button label="Add reaction" description=reaction.emoji padding=0.0 -> add_reaction_at(message.seq, reaction.emoji)
+                container padding=3.0 padding-left=8.0 padding-right=8.0
+                  row spacing=5.0 align=center
+                    text reaction.emoji size=13.0 @text-fg
+                    text reaction.count size=11.0 font=medium @text-muted
+                active bg=white/6 text=fg border=white/13 border-w=1.0 r=9.0
+                hovered bg=white/12 text=fg border=white/18
+                pressed bg=white/16 text=fg
 
 component ThreadMessageCard(message:ChatMessage, selected:bool)
   stack width=fill
