@@ -358,3 +358,41 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
         "the host reaps the closed session {session_id}: {ended:?}"
     );
 }
+
+/// The terminal plane must exist on a PARKED joiner — the credential-lending
+/// guest shape is a resident laptop directing a pty to a compute host, so the
+/// plane cannot be validator-gated. Boots the product join flow (founder +
+/// parked joiner, no promotion), then asserts the joiner's node wired the
+/// plane: the boot marker fires, and a local create refuses for the RIGHT
+/// reason (no sandbox configured) — never the plane-missing "terminal sessions
+/// are not enabled" 503 that a joiner used to answer.
+#[test]
+fn a_parked_joiner_serves_the_terminal_plane() {
+    let _serial = serial();
+    let mut cluster = common::NetworkShapeCluster::new();
+    let chain_id = cluster.init_founder("term-parked-joiner");
+    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", READY);
+
+    let invite = cluster.invite();
+    let friend_key_hex = cluster.join_friend(&invite);
+    assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
+    cluster.spawn(1);
+    // the regression: pre-fix, a joiner never wired the plane, so this marker
+    // never appeared and every create answered the plane-missing 503.
+    cluster.wait_marker(1, "terminal_plane_ready", READY);
+
+    let (status, body) = common::http_request(
+        cluster.http_ports[1],
+        "POST",
+        "/v1/term/sessions",
+        Some(&json!({ "agent": "echo" })),
+    );
+    assert_eq!(status, 503, "no sandbox is configured, so the create refuses: {body}");
+    assert_eq!(
+        body["error"].as_str().unwrap_or_default(),
+        "interactive sessions require a configured podman sandbox image",
+        "the refusal must be the no-sandbox one — the plane itself is present: {body}"
+    );
+}
