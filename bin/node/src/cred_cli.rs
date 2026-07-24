@@ -348,7 +348,13 @@ fn cmd_add(
             std::fs::copy(&src, dir.join(provider.artifact()))
                 .map_err(|e| format!("reuse artifact {src}: {e}"))?;
         }
-        _ => run_vendor_login(provider, &dir)?,
+        _ => {
+            // Start clean so the login-completion watch (the artifact appearing)
+            // is unambiguous — a stale file from a prior attempt would otherwise
+            // read as instant success.
+            let _ = std::fs::remove_file(dir.join(provider.artifact()));
+            run_vendor_login(provider, &dir)?
+        }
     }
 
     let artifact = dir.join(provider.artifact());
@@ -480,11 +486,12 @@ fn run_vendor_login(provider: ProviderArg, dir: &Path) -> CredResult {
     let mut command = tokio::process::Command::new(provider.binary());
     command.args(provider.login_args());
     command.env(provider.config_env(), dir);
+    let artifact = dir.join(provider.artifact());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("login runtime: {e}"))?;
-    rt.block_on(pump_login(command))?;
+    rt.block_on(pump_login(command, &artifact))?;
     Ok(())
 }
 
@@ -493,8 +500,10 @@ fn run_vendor_login(provider: ProviderArg, dir: &Path) -> CredResult {
 const CTRL_C: u8 = 0x03;
 
 /// Pump the pty: child output → stdout (mirrored), this process's stdin → child.
-/// Returns when the child exits or the pty closes; Ctrl-C cancels.
-async fn pump_login(command: tokio::process::Command) -> CredResult {
+/// Returns when the login artifact is written, the child exits, or the pty
+/// closes; Ctrl-C cancels. `artifact` is the credential file the vendor login
+/// writes — its appearance IS success.
+async fn pump_login(command: tokio::process::Command, artifact: &Path) -> CredResult {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncReadExt as _;
@@ -553,15 +562,32 @@ async fn pump_login(command: tokio::process::Command) -> CredResult {
         }
     };
 
-    // End on whichever comes first: the pty EOF (mirror returns) OR the child
-    // process itself exiting. `claude setup-token` prints its success and exits
-    // but leaves a lingering helper holding the pty slave, so the master never
-    // EOFs — waiting on `read` alone hangs the whole `cred add` before it can
-    // register the credential. Racing the child's exit unblocks that; `close`
-    // then terminates the process group, reaping the helper and freeing the pty.
+    // The vendor login has written the credential once this file is present and
+    // its size has stopped growing — that IS success, and it is the signal we
+    // trust: `claude setup-token` (a single process, no forked helper) prints
+    // "created successfully" and then does NOT exit — it sits waiting on the tty
+    // — so neither pty EOF nor child-exit ever fires and `cred add` would hang
+    // forever before registering. Watching the artifact ends the login the moment
+    // the token lands; `close` below kills the still-running child.
+    let watch = async {
+        let mut last = 0u64;
+        loop {
+            let size = std::fs::metadata(artifact).map(|m| m.len()).unwrap_or(0);
+            if size > 0 && size == last {
+                return;
+            }
+            last = size;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    };
+
+    // End on whichever comes first: the credential written (`watch`), the child
+    // exiting (some vendors do), or the pty closing (`mirror`). `close` then
+    // terminates the process group, reaping any child still holding the tty.
     tokio::select! {
         result = mirror => result?,
         () = session.wait_child_exit() => {}
+        () = watch => {}
     }
     input.abort();
     session.close().await;
@@ -717,6 +743,38 @@ pub(crate) fn query_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The login pump must return the moment the credential artifact lands, even
+    /// when the vendor login process NEVER exits (the `claude setup-token` shape:
+    /// it writes the token, prints success, then sits on the tty). A never-exiting
+    /// `sleep` stands in; the artifact is written mid-flight from another task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pump_login_returns_when_the_artifact_lands_even_if_the_child_never_exits() {
+        let dir = std::env::temp_dir().join(format!("ducktape-cred-pump-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let artifact = dir.join("cred.json");
+        let _ = std::fs::remove_file(&artifact);
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("300");
+
+        let art = artifact.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            std::fs::write(&art, b"{\"token\":\"x\"}").unwrap();
+        });
+
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(10), pump_login(cmd, &artifact))
+                .await;
+
+        writer.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "pump_login should return Ok once the artifact lands; got {outcome:?}"
+        );
+    }
 
     #[test]
     fn default_name_is_display_provider_counter() {
