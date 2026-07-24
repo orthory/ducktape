@@ -104,23 +104,22 @@ pub mod testkit;
 
 use std::collections::BTreeMap;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// accounts retained over the network's life (an account is never deleted --
 /// an unbind can empty its node set, but the record and its roster entry
 /// persist). founding past this refuses loudly at execute.
 pub const MAX_ACCOUNTS: usize = 1024;
-/// serialized roster-record byte bound, enforced at founding. the count cap
-/// alone does not bound the roster's SERIALIZED form: account ids are keys of
-/// up to 65 bytes ([`KeyKind::pubkey_wellformed`]) rendered as JSON byte
-/// arrays, so the byte gate keeps the committed record far under the qmdb
-/// value-decode ceiling (the poison-value lesson).
+/// serialized roster-record byte bound, enforced at founding — the backstop
+/// on top of the count cap that keeps the committed record far under the
+/// qmdb value-decode ceiling (the poison-value lesson). generous: borsh
+/// renders the worst-case roster (1024 ids of 65 bytes) in ~71 KiB.
 pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
 /// serialized account-record ceiling, enforced on EVERY staged account write.
 /// unlike governance's ballots there is no growth path that bypasses the
@@ -171,9 +170,9 @@ const ACCOUNT_ROSTER_KEY: &[u8] = b"accounts";
 /// the client set's whole key. absent = no client holds standing.
 const CLIENTS_KEY: &[u8] = b"clients";
 
-/// per-member metadata; the public key is the pair key, so it is not
-/// repeated. serialized verbatim inside [`AccountStored`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// per-member metadata; the public key is the map key, so it is not
+/// repeated. serialized verbatim inside [`AccountRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct MemberMeta {
     kind: KeyKind,
     label: Option<String>,
@@ -187,7 +186,7 @@ struct MemberMeta {
 /// per-node metadata; the node key is the map key, so it is not repeated. the
 /// label is the human name a bound device set (`SetNodeLabel`) and is dropped
 /// with the node on unbind.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, BorshSerialize, BorshDeserialize)]
 struct NodeMeta {
     label: Option<String>,
 }
@@ -195,8 +194,10 @@ struct NodeMeta {
 /// one account: display name, avatar ref + bio (the account's global profile,
 /// propagated per-network by the app), shared replay nonce, the member-key
 /// set, the labeled bound-node map, and the last-write block timestamp.
-/// `account_id` is the record key, so it is not repeated here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `account_id` is the record key, so it is not repeated here. stored
+/// verbatim — borsh writes the `BTreeMap`s length-prefixed in key order, so
+/// one record set has exactly one encoding.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct AccountRecord {
     display_name: Option<String>,
     /// duckfs path the app resolves the avatar image against (`None` unset).
@@ -207,60 +208,6 @@ struct AccountRecord {
     member_keys: BTreeMap<Vec<u8>, MemberMeta>,
     nodes: BTreeMap<Vec<u8>, NodeMeta>,
     updated_at: u64,
-}
-
-/// the stored form of an [`AccountRecord`]: maps flatten to sorted pair lists
-/// because the record codec (JSON) cannot key an object by raw bytes.
-/// `BTreeMap` iteration writes them sorted; `collect` rebuilds the maps.
-#[derive(Serialize, Deserialize)]
-struct AccountStored {
-    display_name: Option<String>,
-    avatar: Option<String>,
-    bio: Option<String>,
-    nonce: u64,
-    member_keys: Vec<(Vec<u8>, MemberMeta)>,
-    nodes: Vec<(Vec<u8>, Option<String>)>,
-    updated_at: u64,
-}
-
-impl From<&AccountRecord> for AccountStored {
-    fn from(r: &AccountRecord) -> Self {
-        Self {
-            display_name: r.display_name.clone(),
-            avatar: r.avatar.clone(),
-            bio: r.bio.clone(),
-            nonce: r.nonce,
-            member_keys: r
-                .member_keys
-                .iter()
-                .map(|(k, meta)| (k.clone(), meta.clone()))
-                .collect(),
-            nodes: r
-                .nodes
-                .iter()
-                .map(|(k, meta)| (k.clone(), meta.label.clone()))
-                .collect(),
-            updated_at: r.updated_at,
-        }
-    }
-}
-
-impl From<AccountStored> for AccountRecord {
-    fn from(s: AccountStored) -> Self {
-        Self {
-            display_name: s.display_name,
-            avatar: s.avatar,
-            bio: s.bio,
-            nonce: s.nonce,
-            member_keys: s.member_keys.into_iter().collect(),
-            nodes: s
-                .nodes
-                .into_iter()
-                .map(|(k, label)| (k, NodeMeta { label }))
-                .collect(),
-            updated_at: s.updated_at,
-        }
-    }
 }
 
 pub struct Identity {
@@ -298,11 +245,11 @@ impl Identity {
 
     async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
     where
-        T: DeserializeOwned,
+        T: BorshDeserialize,
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -314,11 +261,11 @@ impl Identity {
     /// [`Self::store_bounded`].
     fn store<T>(&mut self, key: Vec<u8>, value: &T)
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
         self.staged.stage(
             key,
-            serde_json::to_vec(value).expect("identity value is serializable"),
+            borsh::to_vec(value).expect("identity value is serializable"),
         );
     }
 
@@ -332,9 +279,9 @@ impl Identity {
         what: &str,
     ) -> Result<(), Error>
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
-        let bytes = serde_json::to_vec(value).expect("identity value is serializable");
+        let bytes = borsh::to_vec(value).expect("identity value is serializable");
         if bytes.len() > cap {
             return Err(Error::Module(format!(
                 "{what} record too large: {} > {cap} bytes",
@@ -346,10 +293,7 @@ impl Identity {
     }
 
     async fn account(&self, account_id: &[u8]) -> Result<Option<AccountRecord>, Error> {
-        Ok(self
-            .load::<AccountStored>(&acct_key(account_id))
-            .await?
-            .map(AccountRecord::from))
+        self.load(&acct_key(account_id)).await
     }
 
     /// an account a roster entry or ownership index points at. a reference key
@@ -387,7 +331,7 @@ impl Identity {
     fn store_account(&mut self, account_id: &[u8], record: &AccountRecord) -> Result<(), Error> {
         self.store_bounded(
             acct_key(account_id),
-            &AccountStored::from(record),
+            record,
             MAX_ACCOUNT_RECORD_BYTES,
             "account",
         )

@@ -54,7 +54,23 @@ use sha2::{Digest, Sha256};
 /// PR: hand-rolling a curve's signing-preimage format inside a consensus
 /// module is a correctness footgun, so we ship the kinds commonware already
 /// covers uniformly, plus the inherently-bespoke WebAuthn envelope.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// borsh rides along for the qmdb record codec (identity's stored member
+// meta); serde stays the wire form. borsh numbers variants by declaration
+// order, which matches [`KeyKind::tag`] — appending new kinds keeps both.
+#[derive(
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    borsh::BorshSerialize,
+    borsh::BorshDeserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyKind {
     /// ed25519 -- the founding/desktop seed key, and the only kind a v1
