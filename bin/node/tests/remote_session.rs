@@ -9,7 +9,7 @@
 //! Every wait is on the system's own events — a committed-state query, a log
 //! marker, or the next ws frame — never a fixed sleep.
 //!
-//! Requires a working Podman (the interactive plane refuses the Direct backend):
+//! Requires a working Podman (the interactive plane exists only on a sandboxed node):
 //! the test SKIPS loudly when podman is absent, exactly like the crate's other
 //! live-podman integration tests. The credential/airlock swap is proven by the
 //! airlock e2e; the echo provider declares no broker, so the seeded credential
@@ -228,7 +228,15 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // Podman terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.extra_toml = vec!["sandbox = \"podman\"".into()];
+    // the [sandbox] table LAST in the generated toml (extra_toml appends at
+    // the end; nothing may follow a toml table header).
+    cluster.extra_toml = vec![
+        "[sandbox]".into(),
+        "runtime = \"podman\"".into(),
+        "image = \"docker.io/library/node:22-slim\"".into(),
+        "cores = 0".into(),
+        "mem_gb = 0".into(),
+    ];
     cluster.env[1] = vec![(
         "DUCKTAPE_CAPABILITY_DIR".into(),
         spec_dir.path().display().to_string(),

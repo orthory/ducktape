@@ -318,12 +318,22 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
-    // `--compute` founds a workstation node: agent sessions run in a sandbox
-    // (podman on Linux, tart on macOS — chosen for the platform init runs on)
-    // and this host announces its provider capabilities. A plain consensus node
-    // leaves both off (the `direct` default).
+    // `--compute` founds a workstation node: a [sandbox] table (podman on
+    // Linux, tart on macOS — chosen for the platform init runs on) and the
+    // capability announce. A plain consensus node has no [sandbox] table and
+    // no compute plane at all.
     if args.compute {
-        plumbing.sandbox = if cfg!(target_os = "macos") { "tart" } else { "podman" }.into();
+        let (runtime, image) = if cfg!(target_os = "macos") {
+            ("tart", config::DEFAULT_TART_IMAGE)
+        } else {
+            ("podman", config::DEFAULT_PODMAN_IMAGE)
+        };
+        plumbing.sandbox = Some(config::SandboxToml {
+            runtime: runtime.into(),
+            image: image.into(),
+            cores: 0,
+            mem_gb: 0,
+        });
         plumbing.announce_capabilities = true;
     }
 

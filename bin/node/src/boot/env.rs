@@ -55,12 +55,13 @@ pub(crate) struct BootEnv {
     pub(crate) dev_demo: bool,
     pub(crate) sync_index: bool,
     pub(crate) announce_capabilities: bool,
-    /// how provider runs are spawned (`node.toml sandbox`) — threaded to both
-    /// `capability_host::discover` call sites (validator + resident).
-    pub(crate) sandbox: SandboxBackend,
-    /// the capacity a sandboxed node announces AND enforces: the single source
+    /// the compute plane (`node.toml [sandbox]`) — threaded to both
+    /// `capability_host::discover` call sites (validator + resident). `None`
+    /// = consensus-only: no discovery, no announce, no oracle pool.
+    pub(crate) sandbox: Option<SandboxBackend>,
+    /// the capacity a compute node announces AND enforces: the single source
     /// for both the dispatch pool's ledger and the capability announce's
-    /// resources. EMPTY for a direct-spawn node.
+    /// resources. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
     pub(crate) promoted: bool,
     pub(crate) joiner: bool,

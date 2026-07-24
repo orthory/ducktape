@@ -128,9 +128,8 @@ pub struct CapabilitySpec {
     /// (e.g. `~/.claude`, `~/.codex`) that must cross into a Podman sandbox
     /// read-write so the BYO CLI can authenticate. HOME-RELATIVE ONLY
     /// (validated at parse: absolute paths and `..` are rejected loudly);
-    /// expanded against the real `$HOME` at spawn. empty for the historical
-    /// posture — under the Direct backend it is inert (the child inherits
-    /// HOME whole), under Podman these are the ONLY paths under HOME mounted.
+    /// expanded against the real `$HOME` at spawn. under Podman these are
+    /// the ONLY paths under HOME mounted.
     /// the WEAK auth path: the credential DOES enter the child. mutually
     /// exclusive with `isolation.broker` (see this module's doc).
     pub rw_dirs: Vec<String>,

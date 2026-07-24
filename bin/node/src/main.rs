@@ -321,6 +321,19 @@ fn run_node(
         joiner,
     } = boot::env::derive(resolved, sync_only);
 
+    // the compute-plane gate: a configured sandbox must actually be runnable
+    // on THIS host before anything is discovered, announced, or spawned — a
+    // missing runtime binary is a boot error, never a bare fallback.
+    if let Some(backend) = &sandbox {
+        let runtime = backend.probe().map_err(|error| format!("sandbox: {error}"))?;
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            runtime = %runtime.display(),
+            "sandbox runtime probed"
+        );
+    }
+
     let gateway_enabled = gateway_can_start(
         sync_only,
         gateway_listen.as_deref(),

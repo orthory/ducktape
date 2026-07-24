@@ -366,7 +366,7 @@ fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max
         kind: dispatch::WORK_SPEC_KIND.into(),
         dispatch_id: saga_id.rsplit('\u{1f}').next().unwrap().into(),
         capability: TAG.into(),
-        payload: dispatch_oracle::envelope::compose_headless(saga_id, "PING", Some(CRED_NAME))
+        payload: dispatch_host::envelope::compose_headless(saga_id, "PING", Some(CRED_NAME))
             .into_bytes(),
         demands: BTreeMap::new(),
         admission: dispatch::AdmissionPolicy::Queue,

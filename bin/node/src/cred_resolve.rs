@@ -21,7 +21,7 @@
 //! consensus committed.
 
 use capability_host::{AirlockConfig, CredentialKind, ResolvedCredential};
-use dispatch_oracle::{CredentialResolver, Resolved};
+use dispatch_host::{CredentialResolver, Resolved};
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};
 use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration, credential_use_allowed};

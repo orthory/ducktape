@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use dispatch_oracle::{
+use dispatch_host::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};

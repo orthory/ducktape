@@ -10,7 +10,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 
 use super::identity::load_identity;
-use super::node_toml::{DevSeedToml, NodeToml};
+use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
 use super::{
     Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
     StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap,
@@ -128,69 +128,67 @@ pub struct Resolved {
     /// joiner's gate phase can persist a `coord.cap` delivered over its
     /// sealed `IntroReply::Admitted` ack via `save_coord_cap`.
     pub workspace: PathBuf,
-    /// how provider runs are spawned (`NodeToml::sandbox`). `Direct` (the
-    /// default) is the plain host spawn; `Podman` sandboxes every run AND
-    /// makes this node announce `sandbox_capacity`.
-    pub sandbox: SandboxBackend,
-    /// the numeric capacity a sandboxed node announces alongside its tags
-    /// (probed host totals, per-key overrides winning). EMPTY for a `Direct`
-    /// node — a direct spawn makes no capacity promise. This one value is both
+    /// the compute plane (`NodeToml::sandbox`): `Some` = provider runs spawn
+    /// inside this backend and the node announces `sandbox_capacity`;
+    /// `None` = consensus-only — no provider discovery, no announce, no
+    /// oracle pool, no terminal plane. a bare host spawn is unrepresentable.
+    pub sandbox: Option<SandboxBackend>,
+    /// the numeric capacity a compute node announces alongside its tags
+    /// (probed host totals, per-key overrides winning). EMPTY for a
+    /// consensus-only node. This one value is both
     /// the dispatch pool's ledger and the capability announce's resources.
     pub sandbox_capacity: BTreeMap<String, u64>,
 }
 
-/// the podman provider image default — also what generation prints into a
-/// fresh node.toml's `sandbox_image`.
+/// the podman provider image default — what `--compute` generation writes
+/// into a fresh `[sandbox] image`, and the commented example's value.
 pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/node:22-slim";
-/// the tart provider image default (used when `sandbox = "tart"` and the
-/// operator kept the podman default in `sandbox_image` untouched is NOT a
-/// case we guess about — tart configs set their image).
+/// the tart provider image default — what `--compute` generation writes on
+/// macOS. resolution never guesses an image: the table always carries one.
 pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:latest";
 
-/// resolve the operator's sandbox choice into a spawn backend plus the numeric
-/// capacity a sandboxed node announces. absent/`"direct"` → `Direct` (no
-/// capacity — a direct spawn makes no promise); `"podman"` → `Podman` with the
-/// probed host totals, per-key overrides winning; `"tart"` → `Tart` (ephemeral
-/// macOS VMs, same capacity model); anything else is a loud config error.
+/// resolve the operator's `[sandbox]` table into the compute plane: `None`
+/// (no table) = consensus-only node, no backend and no capacity; `"podman"`
+/// → `Podman` with the probed host totals, per-key overrides winning;
+/// `"tart"` → `Tart` (ephemeral macOS VMs, same capacity model); any other
+/// runtime — "direct" included, there is no bare spawn — is a loud config
+/// error naming the audited adapters.
 fn resolve_sandbox(
-    sandbox: Option<&str>,
-    sandbox_image: Option<&str>,
-    sandbox_cores: Option<u64>,
-    sandbox_mem_gb: Option<u64>,
-) -> Result<(SandboxBackend, BTreeMap<String, u64>), String> {
+    sandbox: Option<&SandboxToml>,
+) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
+    let Some(sandbox) = sandbox else {
+        return Ok((None, BTreeMap::new()));
+    };
     // podman and tart share the capacity derivation: probed totals with the
-    // operator's per-key overrides winning. the map is validated through THE
-    // consensus rule (capability::validate_resources) before it leaves this
-    // boundary: a zero override would otherwise pass boot, get announced,
-    // and be rejected by the module — wedging the announcer's in-flight
-    // latch with a false success log instead of erroring here, loudly.
+    // operator's per-key overrides (`0` = probe) winning. the map is validated
+    // through THE consensus rule (capability::validate_resources) before it
+    // leaves this boundary: a zero override would otherwise pass boot, get
+    // announced, and be rejected by the module — wedging the announcer's
+    // in-flight latch with a false success log instead of erroring here,
+    // loudly.
     let probed = || -> Result<BTreeMap<String, u64>, String> {
         let mut capacity = crate::host_resources::probe();
-        if let Some(cores) = sandbox_cores {
-            capacity.insert("cores".into(), cores);
+        if sandbox.cores != 0 {
+            capacity.insert("cores".into(), sandbox.cores);
         }
-        if let Some(mem_gb) = sandbox_mem_gb {
-            capacity.insert("mem_gb".into(), mem_gb);
+        if sandbox.mem_gb != 0 {
+            capacity.insert("mem_gb".into(), sandbox.mem_gb);
         }
         capability::validate_resources(&capacity)
             .map_err(|e| format!("sandbox capacity: {e}"))?;
         for dimension in ["cores", "mem_gb"] {
             if !capacity.contains_key(dimension) {
                 return Err(format!(
-                    "sandbox capacity: could not determine {dimension}; set sandbox_{dimension} explicitly"
+                    "sandbox capacity: could not determine {dimension}; set [sandbox] {dimension} explicitly"
                 ));
             }
         }
         Ok(capacity)
     };
-    match sandbox {
-        None | Some("direct") => Ok((SandboxBackend::Direct, BTreeMap::new())),
-        Some("podman") => {
-            let image = sandbox_image.unwrap_or(DEFAULT_PODMAN_IMAGE).to_string();
-            Ok((SandboxBackend::Podman { image }, probed()?))
-        }
-        Some("tart") => {
-            let image = sandbox_image.unwrap_or(DEFAULT_TART_IMAGE).to_string();
+    let image = sandbox.image.clone();
+    match sandbox.runtime.as_str() {
+        "podman" => Ok((Some(SandboxBackend::Podman { image }), probed()?)),
+        "tart" => {
             let capacity = probed()?;
             if capacity.get("cores").copied().unwrap_or(0) < capability_host::TART_MIN_CORES {
                 return Err(format!(
@@ -198,10 +196,11 @@ fn resolve_sandbox(
                     capability_host::TART_MIN_CORES
                 ));
             }
-            Ok((SandboxBackend::Tart { image }, capacity))
+            Ok((Some(SandboxBackend::Tart { image }), capacity))
         }
-        Some(other) => Err(format!(
-            "sandbox: {other:?} is not \"direct\", \"podman\", or \"tart\""
+        other => Err(format!(
+            "sandbox runtime: {other:?} is not \"podman\" or \"tart\" \
+             (provider runs never execute bare on the host)"
         )),
     }
 }
@@ -304,12 +303,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_listen,
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
-    let (sandbox, sandbox_capacity) = resolve_sandbox(
-        Some(&raw.sandbox),
-        Some(&raw.sandbox_image),
-        (raw.sandbox_cores != 0).then_some(raw.sandbox_cores),
-        (raw.sandbox_mem_gb != 0).then_some(raw.sandbox_mem_gb),
-    )?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -518,12 +512,7 @@ fn resolve_advertised(
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // resolved before any field of `raw` is moved out below (they borrow the
     // whole struct).
-    let (sandbox, sandbox_capacity) = resolve_sandbox(
-        raw.sandbox.as_deref(),
-        raw.sandbox_image.as_deref(),
-        raw.sandbox_cores,
-        raw.sandbox_mem_gb,
-    )?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let invite_listen = resolved_intro_listener(
         raw.advertised.as_deref(),
@@ -1022,43 +1011,52 @@ mod tests {
         );
     }
 
+    /// one `[sandbox]` line-set for the dev-seed harness shape, appended
+    /// LAST (everything after a toml table header belongs to the table).
+    fn sandbox_table(runtime: &str, image: &str, cores: u64, mem_gb: u64) -> String {
+        format!(
+            "[sandbox]\nruntime = \"{runtime}\"\nimage = \"{image}\"\ncores = {cores}\nmem_gb = {mem_gb}\n"
+        )
+    }
+
     #[test]
-    fn sandbox_parses_and_defaults_direct() {
+    fn sandbox_table_selects_the_compute_plane() {
         let dir = tmp("sandbox");
         let base = "id = 0\nlisten = \"127.0.0.1:52222\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
 
-        // absent ⇒ Direct, and a direct node announces no capacity.
+        // no [sandbox] table ⇒ consensus-only: no backend, no capacity.
         std::fs::write(dir.join("node.toml"), base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
-        assert_eq!(resolved.sandbox, SandboxBackend::Direct);
+        assert_eq!(resolved.sandbox, None);
         assert!(
             resolved.sandbox_capacity.is_empty(),
-            "a direct spawn makes no capacity promise"
+            "a consensus-only node makes no capacity promise"
         );
 
-        // "direct" is the explicit spelling of the default.
+        // the retired flat `sandbox = "direct"` spelling fails loudly — there
+        // is no bare spawn to fall back to.
         std::fs::write(
             dir.join("node.toml"),
             format!("{base}sandbox = \"direct\"\n"),
         )
         .expect("write");
-        assert_eq!(
-            resolve(&dir.join("node.toml")).expect("resolve").sandbox,
-            SandboxBackend::Direct
-        );
+        resolve(&dir.join("node.toml")).expect_err("flat sandbox key refused");
 
-        // "podman" ⇒ Podman with the default image + probed capacity.
+        // podman ⇒ Podman with the table's image + probed capacity (0 = probe).
         std::fs::write(
             dir.join("node.toml"),
-            format!("{base}sandbox = \"podman\"\n"),
+            format!(
+                "{base}{}",
+                sandbox_table("podman", "docker.io/library/node:22-slim", 0, 0)
+            ),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve podman");
         assert_eq!(
             resolved.sandbox,
-            SandboxBackend::Podman {
+            Some(SandboxBackend::Podman {
                 image: "docker.io/library/node:22-slim".into()
-            }
+            })
         );
         assert!(
             resolved.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
@@ -1069,30 +1067,37 @@ mod tests {
         std::fs::write(
             dir.join("node.toml"),
             format!(
-                "{base}sandbox = \"podman\"\nsandbox_image = \"docker.io/library/rust:1\"\n\
-                 sandbox_cores = 99\nsandbox_mem_gb = 128\n"
+                "{base}{}",
+                sandbox_table("podman", "docker.io/library/rust:1", 99, 128)
             ),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
         assert_eq!(
             resolved.sandbox,
-            SandboxBackend::Podman {
+            Some(SandboxBackend::Podman {
                 image: "docker.io/library/rust:1".into()
-            }
+            })
         );
         assert_eq!(resolved.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.sandbox_capacity.get("mem_gb"), Some(&128));
 
-        // "tart" resolves to the Tart backend with the default macOS image and
-        // probed capacity (overrides win, same as podman).
-        std::fs::write(dir.join("node.toml"), format!("{base}sandbox = \"tart\"\n")).expect("write");
+        // tart ⇒ the Tart backend, probed capacity, and the minimum-cores
+        // rule enforced at this boundary.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "{base}{}",
+                sandbox_table("tart", "ghcr.io/cirruslabs/macos-sonoma-base:latest", 0, 0)
+            ),
+        )
+        .expect("write");
         let tart = resolve(&dir.join("node.toml")).expect("tart accepted");
         assert_eq!(
             tart.sandbox,
-            SandboxBackend::Tart {
+            Some(SandboxBackend::Tart {
                 image: "ghcr.io/cirruslabs/macos-sonoma-base:latest".into()
-            }
+            })
         );
         assert!(
             ["cores", "mem_gb"]
@@ -1102,30 +1107,26 @@ mod tests {
         );
         std::fs::write(
             dir.join("node.toml"),
-            format!("{base}sandbox = \"tart\"\nsandbox_cores = 1\n"),
+            format!(
+                "{base}{}",
+                sandbox_table("tart", "ghcr.io/cirruslabs/macos-sonoma-base:latest", 1, 0)
+            ),
         )
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("undersized Tart capacity refused");
         assert!(err.contains("requires at least 2 cores"), "{err}");
 
-        // a zero capacity override is a loud BOOT error, not an announce-time
-        // module reject: the consensus rule (validate_resources) runs at this
-        // trust boundary too, so the announcer can never latch an unannouncable
-        // set (the silent-wedge failure the review found).
-        for zero in ["sandbox_cores = 0", "sandbox_mem_gb = 0"] {
+        // any other runtime — "direct" included — is a loud config error
+        // naming the audited adapters.
+        for runtime in ["gvisor", "direct"] {
             std::fs::write(
                 dir.join("node.toml"),
-                format!("{base}sandbox = \"podman\"\n{zero}\n"),
+                format!("{base}{}", sandbox_table(runtime, "img", 0, 0)),
             )
             .expect("write");
-            let err = resolve(&dir.join("node.toml")).expect_err("zero capacity refused");
-            assert!(err.contains("sandbox capacity"), "{err}");
+            let err = resolve(&dir.join("node.toml")).expect_err("unknown runtime refused");
+            assert!(err.contains("podman"), "{err}");
         }
-
-        // any other value is a loud config error.
-        std::fs::write(dir.join("node.toml"), format!("{base}sandbox = \"gvisor\"\n")).expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("unknown sandbox refused");
-        assert!(err.contains("sandbox"), "{err}");
     }
 
     /// `primary_coordinator` (change 1, issue #331): the key ABSENT resolves
@@ -1277,10 +1278,6 @@ mod tests {
             ("checkpoint_blocks", "32"),
             ("sync_index", "false"),
             ("announce_capabilities", "false"),
-            ("sandbox", "\"direct\""),
-            ("sandbox_image", "\"docker.io/library/node:22-slim\""),
-            ("sandbox_cores", "0"),
-            ("sandbox_mem_gb", "0"),
         ];
         defaults
             .iter()

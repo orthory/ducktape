@@ -472,7 +472,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     );
     // GAP 2, end to end: the agent HAS the library read cap, so the document
     // tells it the library exists and names the tools that open it. an agent
-    // without the cap is never told (proved in dispatch_oracle::soul).
+    // without the cap is never told (proved in dispatch_host::soul).
     assert!(
         prompt.contains("## The shared skill library"),
         "a library-granted agent is told the library is there: {prompt}"

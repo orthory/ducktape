@@ -195,8 +195,9 @@ pub enum CapabilityMsg {
     /// re-derive and re-announce freely (restart, rediscovery).
     Announce {
         capabilities: Vec<String>,
-        /// announced numeric capacity (e.g. "cores", "mem_gb"). EMPTY for a
-        /// direct-spawn node: tags-only, never matches a demands-carrying job.
+        /// announced numeric capacity (e.g. "cores", "mem_gb"). OPTIONAL by
+        /// design — a claim is a claim: a tags-only announce stays valid, it
+        /// just never matches a demands-carrying job.
         resources: BTreeMap<String, u64>,
     },
     /// claim a capability CLASS for the submitting MODULE — the claimant is

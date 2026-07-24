@@ -15,7 +15,7 @@
 //!
 //! this lives in the noded LIB crate — the only place `duckfs-client` (the
 //! checkout/commit engine), the actor-lane `NodeApi`, and the node handle's
-//! forge repo base are all reachable, the reachability wall dispatch-oracle
+//! forge repo base are all reachable, the reachability wall dispatch-host
 //! cannot cross.
 //!
 //! whichever lane materializes it, every run is handed the same TOOL PLANE
@@ -35,7 +35,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dispatch_oracle::{
+use dispatch_host::{
     ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
     assemble_context_doc, parse_skill_md,
 };
@@ -279,8 +279,8 @@ const SKILL_DOC: &str = "SKILL.md";
 ///
 /// the two jobs live together because this is the only place that has both
 /// halves: the committed curation (`mounts`: names, order, load modes) and the
-/// materialized bodies. dispatch-oracle owns the pure assembly
-/// ([`dispatch_oracle::assemble_context_doc`]) but cannot cross the reachability
+/// materialized bodies. dispatch-host owns the pure assembly
+/// ([`dispatch_host::assemble_context_doc`]) but cannot cross the reachability
 /// wall to read a duckfs checkout; the binary can read files but must not decide
 /// the document's shape. so: read here, assemble there.
 ///

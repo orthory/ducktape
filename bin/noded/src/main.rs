@@ -130,20 +130,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_handle = handle.clone();
 
     // the node-local, off-chain interactive terminal-session plane (lives in the
-    // daemon like the stream hub — never consensus). Podman-only: interactive
-    // spawn refuses the Direct backend, so this is available ONLY when the
-    // operator configured a sandbox image (DUCKTAPE_SANDBOX_IMAGE); with none,
-    // create returns a clear error rather than a Direct spawn. The identity +
+    // daemon like the stream hub — never consensus). Available ONLY when the
+    // operator configured a sandbox (DUCKTAPE_SANDBOX_IMAGE); with none there
+    // is no compute plane and create returns a clear error — a bare spawn is
+    // unrepresentable. The identity +
     // agent dirs mirror the oracle pool's (ORACLE_ORIGIN, AgentDirs under
     // <storage>). The manager shares the StreamHub's terminal ring so its pump
     // appends where the ws catch-up reads.
     let term_ring = handle.stream_hub().terminals();
     let term_cmd_ring = handle.stream_hub().term_commands();
-    let interactive = noded::term::discover_interactive(
-        ORACLE_ORIGIN,
-        capability_host::AgentDirs::under(&storage),
-        noded::term::backend_from_env(),
-    );
+    let interactive = noded::term::backend_from_env().and_then(|backend| {
+        noded::term::discover_interactive(
+            ORACLE_ORIGIN,
+            capability_host::AgentDirs::under(&storage),
+            backend,
+        )
+    });
     tracing::info!(
         target: "ducktape::term",
         enabled = interactive.is_some(),

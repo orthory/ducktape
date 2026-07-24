@@ -15,13 +15,13 @@ pub(crate) struct Surfaces {
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
-    pub(crate) agent_provisioner: dispatch_oracle::SharedProvisioner,
-    pub(crate) cred_resolver: dispatch_oracle::SharedCredentialResolver,
+    pub(crate) agent_provisioner: dispatch_host::SharedProvisioner,
+    pub(crate) cred_resolver: dispatch_host::SharedCredentialResolver,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     /// the host-side session manager (a clone of the one on the http handle), so
     /// the term plane's control handler can spawn peer-attached sessions. `None`
-    /// on a node that hosts no terminal plane (Direct / sync-only / joiner).
+    /// on a node that hosts no terminal plane (no sandbox / sync-only / joiner).
     pub(crate) terminals: Option<noded::TerminalSessions>,
     /// the guest-side remote-session lane the term plane's client half drains.
     pub(crate) session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
@@ -54,10 +54,10 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) node_key: Vec<u8>,
     /// how the owner-gated admin namespace is exposed (ADR A2/A4).
     pub(crate) admin_exposure: noded::AdminExposure,
-    /// how provider runs are spawned (`node.toml sandbox`): Direct, or a
-    /// Podman/Tart image. The interactive terminal plane requires Podman/Tart,
-    /// so a Direct node hosts no terminal plane.
-    pub(crate) sandbox: capability_host::SandboxBackend,
+    /// the compute plane (`node.toml [sandbox]`): a Podman/Tart backend, or
+    /// `None` for a consensus-only node — which hosts no terminal plane and
+    /// starts no auto airlock gateway.
+    pub(crate) sandbox: Option<capability_host::SandboxBackend>,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -120,9 +120,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // the browser gateway; served on the app-surface thread below. Only when the
     // gateway plane is up to serve it; route PUBLICATION stays a one-time signed
     // operator step.
-    // A compute/workstation node (sandbox != Direct) starts its airlock gateway
-    // even with an empty store, so `cred add` takes effect without a restart.
-    let compute_node = !matches!(sandbox, capability_host::SandboxBackend::Direct);
+    // A compute/workstation node (a configured [sandbox]) starts its airlock
+    // gateway even with an empty store, so `cred add` takes effect without a
+    // restart.
+    let compute_node = sandbox.is_some();
     let airlock_bits = match crate::airlock_serve::AirlockServe::resolve(storage, compute_node) {
         None => None,
         Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
@@ -260,7 +261,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // unconditionally, so the runs composer emits v3 (the de-versioned
     // activation — no flag day, pre-production re-genesis). a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: dispatch_oracle::SharedProvisioner = std::sync::Arc::new(
+    let agent_provisioner: dispatch_host::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(storage)
@@ -292,27 +293,29 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // lane the provisioner uses (before the serve/drop match consumes the
     // handle). A `sched --cred` run's named credential resolves through this into
     // a self-host airlock source, gated on the run's committed saga origin.
-    let cred_resolver: dispatch_oracle::SharedCredentialResolver =
+    let cred_resolver: dispatch_host::SharedCredentialResolver =
         std::sync::Arc::new(crate::cred_resolve::NodeCredentialResolver::new(&http_handle));
     // the node-local, off-chain interactive terminal-session plane (lives on the
     // http handle like the stream hub — never consensus). Wired only where the
     // app surface is actually served for a real member: not sync-only, not a
     // parked joiner, and only when an http address was configured. Sourced from
-    // the node's OWN config — the resolved `node.toml sandbox` backend and this
-    // node's signer identity (`node_key`) — so `discover_interactive` refuses
-    // the Direct backend (no terminal plane) and Podman container reaping scopes
+    // the node's OWN config — the resolved `node.toml [sandbox]` backend and
+    // this node's signer identity (`node_key`) — so a consensus-only node has
+    // no terminal plane by construction, and Podman container reaping scopes
     // to the SAME execution id as the node's real agent runs (validator/run.rs
     // discovers its provider set under the same identity). Mirrors bin/noded's
-    // wiring; a Podman node's create returns a session (or a clear spawn error),
-    // a Direct node's a "requires a configured podman sandbox image" 503 — never
-    // the "terminal sessions are not enabled" 503 that meant the plane was
-    // missing entirely (this bug).
+    // wiring; a sandboxed node's create returns a session (or a clear spawn
+    // error), an unsandboxed node's a "requires a configured sandbox" 503 —
+    // never the "terminal sessions are not enabled" 503 that meant the plane
+    // was missing entirely (this bug).
     let terminals = if !sync_only && !joiner && http_listen.is_some() {
-        let interactive = noded::term::discover_interactive(
-            &node_key,
-            capability_host::AgentDirs::under(storage),
-            sandbox,
-        );
+        let interactive = sandbox.and_then(|backend| {
+            noded::term::discover_interactive(
+                &node_key,
+                capability_host::AgentDirs::under(storage),
+                backend,
+            )
+        });
         tracing::info!(
             target: "ducktape::term",
             enabled = interactive.is_some(),
