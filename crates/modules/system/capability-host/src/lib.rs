@@ -157,6 +157,13 @@ pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential
 // are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
 #[cfg(unix)]
 mod interactive;
+// the libpod socket client: the sandbox drives podman over its rootless unix
+// socket, never the CLI binary. unix-only (unix-socket transport). the egress
+// ruleset generator the node's __egress-hook calls is re-exported.
+#[cfg(unix)]
+mod podman_api;
+#[cfg(unix)]
+pub use podman_api::egress_nftables;
 mod sandbox;
 mod session;
 mod spec;

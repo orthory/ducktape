@@ -1,172 +1,132 @@
-# Sandbox path anonymization + egress allowlist
+# Sandbox hardening: socket-driven podman, neutral paths, egress allowlist
 
-Date: 2026-07-24
-Crate: `crates/modules/system/capability-host`
-Status: design approved, ready for planning
+Date: 2026-07-24 (revised 2026-07-25 for the socket pivot)
+Crate: `crates/modules/system/capability-host` (+ `bin/node`)
+Status: foundation landed + unit-tested; integration UNVERIFIED (no live podman here)
 
 ## Problem
 
-A remote account that enters a lent-credential Claude Code PTY session on this
-node sees real host paths inside the container: the cwd is
-`/home/eddy/.ducktape/provider-runs/<run>/workspace`, PATH entries and the
-skills tree are mounted at their identical host paths, and `$HOME` points at a
-host directory layout. This leaks the operator's username, directory
-structure, and node layout to an untrusted guest.
+A remote account in a lent-credential Claude Code PTY session on this node
+sees real host paths — cwd `/home/eddy/.ducktape/provider-runs/<run>/workspace`,
+PATH/skills mounted at their identical host paths, `$HOME` a host layout —
+leaking the operator's username, directory structure, and node layout. And the
+container's `--network=slirp4netns` NAT reaches every routable destination the
+host can: the host's LAN, the tailnet (`100.64.0.0/10`), link-local, any host
+service on a routable interface.
 
-Second hole: the container runs with `--network=slirp4netns`, whose NAT reaches
-every routable destination the host can. `host.containers.internal` resolves to
-the host's real routable IP (that is how the child reaches its broker + node
-RPC), so the guest can equally reach the host's LAN, the tailnet
-(`100.64.0.0/10`), link-local, and any service the host exposes on a routable
-interface. A private netns is not isolation as long as its NAT is unfiltered.
+Both were reported together as "make the sandbox more sandboxed."
 
-Both holes live behind one seam: `CliProvider::podman_command` /
-`sandbox::wrap_podman_managed` in `capability-host`, used by BOTH headless runs
-and interactive PTY sessions (`interactive.rs` calls the same
-`podman_command`). One fix covers both.
+## Decision: drive podman over its rootless socket, not the CLI
 
-Scope note (No-Legacy doctrine): there are zero live networks. The current
-"identical container paths" contract is replaced outright — no dual path, no
-compat flag. Session identity keyed on the workspace path moves to the new
-fixed path in the same change.
+Beyond the two leaks, the sandbox is moved OFF the `podman` CLI subprocess and
+onto the libpod REST API over a **node-owned rootless podman socket**. No
+`Command::new("podman")` anywhere in the run path.
 
-## Part A — Neutral container paths
+- **The node owns a rootless podman service.** It supervises
+  `podman system service --time=0 --hooks-dir <datadir>/podman-hooks unix://<sock>`
+  and talks to `<sock>`. Starting the service with `--hooks-dir` is how the
+  egress hook is delivered — the socket API has no per-run `--hooks-dir`.
+- **Rootless user service only.** Containers stay in the node user's
+  namespaces, so the egress hook's `nsenter -U --net` into the container pid
+  works and the node never talks to a root daemon.
+- **A minimal in-tree libpod client** (`podman_api.rs`), hand-rolled over
+  `tokio::net::UnixStream` — no new dependency. Endpoints: create, start,
+  attach (raw hijacked stream), wait, resize, kill, remove.
 
-Drop the "mount every path at its identical host path" rule for the Podman
-backend. Mount at fixed, host-blind guest paths and translate env values + argv
-the same way the Tart backend already does (`translate_value`, mount tags).
+No-Legacy doctrine: the CLI-argv path is deleted outright, not kept behind a
+flag. There are zero live networks; nothing needs the old mechanism.
+
+## Part A — neutral container paths (`podman_api::plan_mounts` + `translate`)
+
+Every host path maps to a NEUTRAL `/ducktape/*` guest path in the
+`SpecGenerator`, and every env value / argv entry is translated to match.
 
 | host path | container path | mode |
 |---|---|---|
-| run workdir (`.../provider-runs/<run>/workspace`) | `/ducktape/workspace` | rw, `-w` |
-| executor bin | `/ducktape/bin/<filename>` | ro |
-| each `ro_paths` entry (PATH dirs, skills tree) | `/ducktape/ro<i>` (skills: `/ducktape/skills`) | ro |
-| each `rw_dirs` entry (CLI auth/state under `~/`) | `/ducktape/home/<rel-to-HOME>` | rw |
-| workspace-parent context doc (outside workdir) | `/ducktape/<filename>` (one level above `/ducktape/workspace`) | ro |
-| `HOME` env | `/ducktape/home` | — |
+| run workdir | `/ducktape/workspace` | rw, `work_dir` |
+| executor bin | `/ducktape/bin/<name>` | ro |
+| each `rw_dir` (CLI auth/state under HOME) | `/ducktape/home/<rel>` | rw |
+| workspace-parent context doc (a file in ro_paths) | `/ducktape/<name>` | ro |
+| other ro_paths (PATH dirs, skills) | `/ducktape/ro<i>` | ro |
+| `HOME` | `/ducktape/home` | — |
 
-Translation rules (mirroring Tart, hoisted to shared code so both backends use
-one implementation):
+`translate` does longest-host-prefix-first substring replacement over the mount
+table plus a synthetic `HOME → /ducktape/home`, covering the codex
+`projects."<workdir>"` TOML key and any stray `$HOME`-prefixed value. The bind
+mount's `source` (host side) still carries the real path — that is invisible to
+the guest, which only sees `destination`.
 
-- Build an ordered host→guest mount table. Env values and argv strings get
-  longest-host-prefix-first string replacement. This covers the codex
-  `projects.<workdir>` TOML key inside `-c` args and `DUCKTAPE_RUN_SKILLS`.
-- `PATH` is split on `:`, each entry translated, rejoined.
-- `HOME` is emitted as `/ducktape/home` (not translated per-mount).
-- The run-action URL rewrite (`127.0.0.1` → `host.containers.internal`) is
-  unchanged — it is a URL, not a mount.
+Session identity that keyed on the workspace path now uses the stable
+`/ducktape/workspace`; run uniqueness is carried by the container id + labels,
+not the guest path.
 
-Result: the guest's cwd is `/ducktape/workspace`; `env`, `pwd`, and every tool
-path show `/ducktape/...`. No operator username, no `.ducktape` layout, no
-node data-dir hints.
+## Part B — egress allowlist in the container netns
 
-The host-only cidfile (`~/.ducktape/provider-runs/podman/...`) is already never
-mounted and is asserted so; unchanged.
+`SpecGenerator`:
+- `netns = {nsmode: "slirp4netns"}` + `network_options.slirp4netns =
+  ["allow_host_loopback=false", "enable_ipv6=false"]`.
+- `cap_drop = ["NET_ADMIN", "NET_RAW"]` — the workload cannot alter the
+  firewall or open raw sockets.
+- annotations `io.ducktape.egress=1`, `io.ducktape.egress.host=<ip>`,
+  `io.ducktape.egress.ports=<broker>,<node>`.
 
-Session/run identity: any key derived from the workspace path (e.g. codex
-resume `projects.<key>`, `io.ducktape.run` label) uses the stable
-`/ducktape/workspace`. Because every run mounts its own distinct host workdir at
-that same guest path, the guest-side key is constant across runs by design; run
-uniqueness is already carried by the host-side cidfile/labels, not the guest
-path. No live network depends on the old value.
+**The firewall is an OCI `createRuntime` hook (fails closed).** Podman runs it
+after the netns exists but before the workload execs; a hook failure aborts the
+container, so a firewall that fails to install means the run never starts. The
+hook is the node binary's hidden `__egress-hook` subcommand: it reads the OCI
+state JSON on stdin (pid + bundle), reads the run's annotations, generates the
+ruleset with `capability_host::egress_nftables`, and runs
+`nsenter -U --net -t <pid> -- nft -f -`.
 
-## Part B — Egress allowlist in the container netns
-
-Keep `--network=slirp4netns` but make its flags explicit and add a firewall
-that runs inside the container's netns before the workload starts.
-
-### Netns flags (tighten the knobs)
-
+`egress_nftables(host_ip, ports)` ruleset, order load-bearing:
 ```
---network=slirp4netns:allow_host_loopback=false,enable_ipv6=false
---cap-drop=net_admin --cap-drop=net_raw
+oifname "lo" accept
+ip daddr <host_ip> tcp dport { <broker>, <node> } accept   # broker + node RPC
+udp/tcp dport 53 accept                                    # DNS (slirp resolver)
+ip daddr { 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, 127/8 } drop
+# public internet falls through to policy accept
 ```
+The broker/node accept precedes the private-range drop so the two allowed
+host:port pairs survive even though `host_ip` is in a dropped range.
+`host_ip` is what `host.containers.internal` resolves to (host default-route
+source IP, computed host-side via a UDP-connect probe).
 
-- `allow_host_loopback=false`: removes the `10.0.2.2 → host 127.0.0.1`
-  shortcut. The broker/node are reached via the host's routable IP through
-  `host.containers.internal`, not this shortcut, so this only closes an extra
-  door.
-- `enable_ipv6=false`: eliminate the v6 path rather than firewall it twice.
-- `--cap-drop=net_admin,net_raw`: the workload cannot alter the nft rules or
-  open raw sockets. The rules are installed by a host-side hook (below), which
-  needs no in-container capability.
+`nft` + `nsenter` (found via `/usr/sbin` too, off a non-root PATH) become boot
+probes alongside `slirp4netns`.
 
-### The firewall — an OCI `createRuntime` hook (fails closed)
+## Client (`podman_api.rs`) — landed + unit-tested
 
-Podman runs `createRuntime` hooks after the container's netns exists but
-BEFORE the workload's exec. A non-zero hook aborts the container — so a firewall
-that fails to install means the run never starts. That is the fail-closed
-property a post-`podman run` `nsenter` cannot guarantee (workload could send
-before rules land).
+Hand-rolled HTTP/1.1 over `UnixStream`. `request` uses `Connection: close`
+(read-to-EOF) with a `Content-Length`/chunked body parser; `attach` sends the
+`Upgrade` request, reads only the response head, and hands back the hijacked
+`UnixStream` split into read/write halves. Headless reads demux the 8-byte
+Docker mux header (`[stream,0,0,0,len_be]`); a tty session reads raw. Resize is
+a `POST .../resize?w=&h=` call (the SIGWINCH relay).
 
-- Add `--hooks-dir <ducktape-owned-dir>` and
-  `--annotation io.ducktape.egress=1` to the podman argv. The hook JSON in that
-  dir has `when.annotations = { "io.ducktape.egress": "1" }` and
-  `stages = ["createRuntime"]`, so it fires only for our containers and does not
-  touch any other podman usage on the host.
-- The hook command is a hidden `ducktape` subcommand (no new binary). Podman
-  pipes the OCI container state JSON to it on stdin: `{ pid, bundle, ... }`.
-  The subcommand reads `pid`, reads `<bundle>/config.json` for the run's
-  annotations (allowed ports + host IP), then:
-  `nsenter --preserve-credentials -U --net -t <pid> -- nft -f -` with the
-  generated ruleset. Running on the host (only the netns is entered), it needs
-  no container capabilities.
-- Ports/host-IP are passed as annotations set on the podman argv:
-  `io.ducktape.egress.host=<ip>`, `io.ducktape.egress.ports=<broker>,<node>`.
-  The broker port comes from the broker endpoint `base_url`; the node RPC port
-  from the run-action URL; the host IP is what `host.containers.internal`
-  resolves to (host default-route source address, computed host-side).
+Unit tests (pass, no podman needed): HTTP content-length + chunked parsing,
+error-body surfacing, attach frame demux, `plan_mounts` neutrality, `translate`
+of a codex arg + `$HOME` sanitization, `SpecGenerator` JSON shape, egress
+ruleset ordering.
 
-### Ruleset (nft, applied in the container netns, in order)
+## Integration (UNVERIFIED — needs real-node QA)
 
-```
-table inet ducktape {
-  chain output {
-    type filter hook output priority 0; policy accept;
-    oifname "lo" accept
-    ip daddr <host-ip> tcp dport { <broker>, <node> } accept   # broker + node RPC
-    udp dport 53 accept                                        # DNS (slirp resolver)
-    tcp dport 53 accept
-    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16, 127.0.0.0/8 } drop
-    # everything else (public internet) falls through to policy accept
-  }
-}
-```
+- `SandboxBackend::Podman { image, socket }` carries the node's socket path.
+- `podman_command`/`invoke` → build spec, create, start, attach; headless
+  demuxes stdout/stderr and `wait`s the exit code; kill/remove on
+  timeout/cancel. The cidfile lifecycle is deleted (the container id replaces
+  it); reaping lists containers by label over the socket.
+- `interactive.rs`: `InteractiveSession` becomes a transport enum — a socket
+  attach stream (Podman) or the existing local pty (Tart ssh / vendor login).
+  Resize calls the socket; close kills+removes.
+- `bin/node`: `__egress-hook` subcommand; supervise the rootless podman
+  service with `--hooks-dir`; write the hook JSON (path = current_exe).
 
-Order is load-bearing: the broker/node accept precedes the private-range drop,
-so the two allowed host:port pairs survive even though the host IP is itself in
-a dropped range. `100.64.0.0/10` is the tailnet/CGNAT block. Public egress is
-allowed per the chosen policy (package installs keep working); the broker still
-mediates all provider-API traffic regardless.
+## Live QA (real node — this dev box has no working podman)
 
-### Boot probe
-
-`SandboxBackend::probe()` gains `nft` and `nsenter` to its executable-on-PATH
-checks, alongside the existing `slirp4netns` requirement — a missing firewall
-tool is a loud boot error, never a silent unfirewalled run.
-
-## What this is NOT
-
-- Tart (macOS guest) already gets neutral paths via its mount tags; a Tart-side
-  egress equivalent is a different mechanism (VM NAT, not netns nft) and is out
-  of scope here. Noted as deferred.
-- No default-deny of public internet (chosen policy: public-only egress).
-- No IP-address pinning of the broker beyond host-IP + port; the per-run
-  random broker port and the opaque run bearer already gate it.
-
-## Testing
-
-- Pure unit tests (no podman): `wrap_podman_managed` emits `/ducktape/...`
-  mount targets, `/ducktape/workspace` as `-w`, translated env/argv, the
-  `--network=slirp4netns:allow_host_loopback=false,enable_ipv6=false` flag,
-  `--cap-drop` pair, `--hooks-dir`, and the three annotations. A dedicated test
-  asserts no host-username path (`/home/`, `.ducktape/provider-runs`) survives
-  into any mount/env/arg.
-- Pure unit test of the nft ruleset generator: given ports + host IP, the
-  emitted ruleset accepts the two host:port pairs and DNS, drops each private
-  range including `100.64.0.0/10`, in the required order.
-- Live QA on a real node: enter a session, confirm `pwd` = `/ducktape/workspace`
-  and `env | grep -i home` shows `/ducktape/home`; `curl` to a tailnet IP and a
-  LAN IP both fail; the provider round-trip (broker PONG) still works; a public
+- `pwd` = `/ducktape/workspace`; `env` shows `HOME=/ducktape/home`; no host
+  path visible.
+- `curl` to a tailnet IP and a LAN IP both fail; broker PONG works; a public
   `curl`/`npm` fetch succeeds.
-```
+- Interactive TUI renders and drives over the attach stream; resize works.
+- Hook failure aborts the container (fail-closed): break the ruleset, confirm
+  the run refuses to start.
