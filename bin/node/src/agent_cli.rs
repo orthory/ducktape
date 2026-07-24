@@ -216,7 +216,7 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // raw mode for the whole attach; the guard restores on drop (normal + panic).
-    let _raw = RawGuard::enter();
+    let _raw = crate::tty::RawGuard::enter();
     let stdin_fd = libc::STDIN_FILENO;
 
     // one outbound lane: subscribe (the entitlement gate) must reach the node
@@ -288,47 +288,6 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
     Ok(())
 }
 
-/// RAII: restore the saved `termios` on drop (covers normal return AND a panic
-/// unwinding through the attach future), so the tty is never left raw.
-struct RawGuard {
-    fd: i32,
-    saved: libc::termios,
-}
-
-impl RawGuard {
-    /// Put stdin into raw mode, returning the restore guard. `None` when stdin
-    /// is not a tty (piped) — nothing to restore, and the stream still runs.
-    fn enter() -> Option<Self> {
-        let fd = libc::STDIN_FILENO;
-        // SAFETY: fd is a valid descriptor; termios is fully written by tcgetattr
-        // before any read, and cfmakeraw/tcsetattr take valid pointers.
-        unsafe {
-            if libc::isatty(fd) != 1 {
-                return None;
-            }
-            let mut saved: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut saved) != 0 {
-                return None;
-            }
-            let mut raw = saved;
-            libc::cfmakeraw(&mut raw);
-            if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-                return None;
-            }
-            Some(Self { fd, saved })
-        }
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        // SAFETY: fd stayed valid for the guard's life; `saved` is the termios
-        // tcgetattr filled in enter().
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
-        }
-    }
-}
 
 /// the tty window size (cols, rows), or an 80x24 fallback when the ioctl fails.
 fn window_size(fd: i32) -> (u16, u16) {
