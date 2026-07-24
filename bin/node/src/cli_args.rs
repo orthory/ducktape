@@ -179,8 +179,9 @@ pub struct InitArgs {
     pub dir: Option<PathBuf>,
     /// workstation node: run agent sessions in a sandbox and announce this
     /// host's provider capabilities (writes a [sandbox] table, podman/tart by
-    /// platform, + announce). A plain consensus node omits this and has no
-    /// compute plane at all.
+    /// platform, + announce). Without it a fresh workspace still writes the
+    /// table when the platform runtime is on PATH — announce stays off; delete
+    /// the [sandbox] table for a consensus-only node.
     #[arg(long)]
     pub compute: bool,
     #[command(flatten)]
