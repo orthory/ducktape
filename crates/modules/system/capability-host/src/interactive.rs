@@ -30,43 +30,59 @@ use std::process::Stdio;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 
+use tokio::io::AsyncWriteExt as _;
+use tokio::net::unix::OwnedWriteHalf;
+
 use crate::broker::RunBroker;
 use crate::sandbox::{self, SandboxBackend};
 use crate::{
-    BrokerKind, CliProvider, LiveChild, PodmanRun, RunAuth, RunContext, TartGuard,
-    broker_provider_overrides, canonical_mount_path, configure_process_group,
+    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, TartGuard, broker_provider_overrides,
+    canonical_mount_path, configure_process_group, podman_api,
 };
 
-/// a live interactive session: the child process on one end of a pty, the host
-/// holding the master. Every method takes `&self` (the read and write halves are
-/// separate dups of the master), so the owner can wrap it in an `Arc` and pump
-/// bytes in one task while feeding input from another without splitting it.
+/// how a live interactive session carries the terminal. A Tart guest (ssh) or
+/// the operator's local vendor-login run uses a real pty the host holds the
+/// master of; a Podman run uses the hijacked attach stream over the node-private
+/// socket (podman allocates the container pty, the attach stream carries it
+/// raw). Both present the same read/write/resize/close surface.
+enum Transport {
+    Pty {
+        /// the master's read half (a dup of the pty master, non-blocking).
+        reader: AsyncFd<OwnedFd>,
+        /// the master's write half (a second dup of the same master).
+        writer: AsyncFd<OwnedFd>,
+        /// the child, behind a lock so `close` can tear it down through `&self`.
+        live: Mutex<LiveChild>,
+    },
+    Socket {
+        /// the attach stream's read half (raw tty bytes).
+        reader: Mutex<podman_api::AttachReader>,
+        /// the attach stream's write half (container stdin / keystrokes).
+        writer: Mutex<OwnedWriteHalf>,
+        client: podman_api::Podman,
+        id: String,
+    },
+}
+
+/// a live interactive session. Every method takes `&self`, so the owner can wrap
+/// it in an `Arc` and pump output in one task while feeding input from another.
 pub struct InteractiveSession {
-    /// the master's read half (a dup of the pty master, non-blocking).
-    reader: AsyncFd<OwnedFd>,
-    /// the master's write half (a second dup of the same master).
-    writer: AsyncFd<OwnedFd>,
-    /// the child + its Podman lifecycle, behind a lock so `close` can tear it
-    /// down through `&self`. `kill_on_drop` is the final safety net.
-    live: Mutex<LiveChild>,
-    /// the Tart VM guard, when the backend is Tart. Declared AFTER `live` so the
-    /// ssh child dies before this guard's Drop (synchronously) stops/deletes the
-    /// VM. `None` under Podman (where `live` carries the container lifecycle).
+    transport: Transport,
+    /// the Tart VM guard, when the backend is Tart. Declared AFTER `transport`
+    /// so the ssh child dies before this guard's Drop stops/deletes the VM.
     _tart: Option<TartGuard>,
-    /// held for the session's lifetime: dropping the broker tears its loopback
-    /// endpoint down, and the config home must outlive the child that reads it.
+    /// held for the session's lifetime: dropping the broker tears its endpoint
+    /// down, and the config home must outlive the child that reads it.
     _broker: Option<RunBroker>,
     _config_home: Option<PathBuf>,
 }
 
 impl InteractiveSession {
     /// spawn `command` with its stdio wired to a fresh pty and keep the master.
-    /// `podman`/`broker`/`config_home` are the session's owned lifecycle handles.
-    /// Backend-agnostic on purpose — [`CliProvider::spawn_interactive_session`]
-    /// hands it a `podman run -it …` command; a test hands it a plain `cat`.
+    /// The pty transport backs a Tart ssh session and the operator's local
+    /// vendor-login run; a Podman session uses [`Self::from_attach`] instead.
     fn spawn_on_pty(
         mut command: tokio::process::Command,
-        podman: Option<PodmanRun>,
         tart: Option<TartGuard>,
         broker: Option<RunBroker>,
         config_home: Option<PathBuf>,
@@ -91,45 +107,73 @@ impl InteractiveSession {
         let child = command
             .spawn()
             .map_err(|e| format!("spawn interactive session: {e}"))?;
-        let live = LiveChild::new(child, podman);
+        let live = LiveChild::new(child);
         let reader = AsyncFd::new(master).map_err(|e| format!("register pty master: {e}"))?;
         let writer = AsyncFd::new(writer_fd).map_err(|e| format!("register pty master: {e}"))?;
         Ok(Self {
-            reader,
-            writer,
-            live: Mutex::new(live),
+            transport: Transport::Pty {
+                reader,
+                writer,
+                live: Mutex::new(live),
+            },
             _tart: tart,
             _broker: broker,
             _config_home: config_home,
         })
     }
 
-    /// spawn `command` on a pty with NO sandbox, broker, or fresh config home —
-    /// the host runs it directly on this box. The ONLY intended caller is the
-    /// operator's own `ducktape user cred add` vendor-login wrap: it runs the
-    /// vendor's login CLI (`claude setup-token`, `codex login`) on the operator's
-    /// OWN machine to capture the operator's OWN credential, so there is nothing
-    /// to isolate — no foreign code, no lent credential, no shared filesystem to
-    /// fence. Every OTHER interactive session (a lent agent run) MUST go through
-    /// [`CliProvider::spawn_interactive_session`], which
-    /// keeps the broker/config-home/sandbox isolation.
-    pub fn spawn_local(command: tokio::process::Command) -> Result<Self, String> {
-        Self::spawn_on_pty(command, None, None, None, None)
+    /// build a session from a Podman attach stream (a `terminal = true` run over
+    /// the node-private socket). The container is killed + removed on `close`.
+    fn from_attach(
+        attach: podman_api::AttachStream,
+        client: podman_api::Podman,
+        id: String,
+        broker: Option<RunBroker>,
+        config_home: Option<PathBuf>,
+    ) -> Self {
+        let (writer, reader) = attach.into_split();
+        Self {
+            transport: Transport::Socket {
+                reader: Mutex::new(reader),
+                writer: Mutex::new(writer),
+                client,
+                id,
+            },
+            _tart: None,
+            _broker: broker,
+            _config_home: config_home,
+        }
     }
 
-    /// read the next chunk of terminal output. `Ok(0)` means end of session: on
-    /// Linux the master read returns EIO once the last slave (the child) is
-    /// gone, which we map to EOF.
+    /// spawn `command` on a pty with NO sandbox, broker, or fresh config home —
+    /// the host runs it directly on this box. The ONLY intended caller is the
+    /// operator's own `ducktape user cred add` vendor-login wrap (there is
+    /// nothing to isolate — the operator's own credential on the operator's own
+    /// machine). Every lent agent session goes through
+    /// [`CliProvider::spawn_interactive_session`], which keeps isolation.
+    pub fn spawn_local(command: tokio::process::Command) -> Result<Self, String> {
+        Self::spawn_on_pty(command, None, None, None)
+    }
+
+    /// read the next chunk of terminal output. `Ok(0)` means end of session.
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match &self.transport {
+            Transport::Pty { reader, .. } => Self::pty_read(reader, buf).await,
+            Transport::Socket { reader, .. } => reader.lock().await.read_raw(buf).await,
+        }
+    }
+
+    /// the pty read path: on Linux the master read returns EIO once the last
+    /// slave (the child) is gone, which we map to EOF.
+    async fn pty_read(reader: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            let mut guard = self.reader.readable().await?;
+            let mut guard = reader.readable().await?;
             let res = guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
                 // SAFETY: fd is our live master pty; buf is valid for `buf.len()`.
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n < 0 {
                     let e = std::io::Error::last_os_error();
-                    // the master EIOs when every slave has closed → treat as EOF.
                     if e.raw_os_error() == Some(libc::EIO) {
                         return Ok(0);
                     }
@@ -146,9 +190,16 @@ impl InteractiveSession {
     }
 
     /// write input (keystrokes) to the terminal, in full.
-    pub async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+    pub async fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
+        match &self.transport {
+            Transport::Pty { writer, .. } => Self::pty_write(writer, data).await,
+            Transport::Socket { writer, .. } => writer.lock().await.write_all(data).await,
+        }
+    }
+
+    async fn pty_write(writer: &AsyncFd<OwnedFd>, mut data: &[u8]) -> std::io::Result<()> {
         while !data.is_empty() {
-            let mut guard = self.writer.writable().await?;
+            let mut guard = writer.writable().await?;
             let res = guard.try_io(|inner| {
                 let fd = inner.get_ref().as_raw_fd();
                 // SAFETY: fd is our live master pty; data is valid for `data.len()`.
@@ -168,52 +219,78 @@ impl InteractiveSession {
         Ok(())
     }
 
-    /// resize the terminal. Setting the master's window size makes the kernel
-    /// SIGWINCH the slave's foreground group; under Podman that is the container
-    /// process, which relays the new size to the CLI's own tty.
+    /// resize the terminal. For a pty, setting the master window size SIGWINCHes
+    /// the container process. For a socket session, the resize is a libpod call;
+    /// it is best-effort (a fire-and-forget task) so this stays sync for the
+    /// terminal plane's synchronous resize handler.
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
-        let ws = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let fd = self.reader.get_ref().as_raw_fd();
-        // SAFETY: fd is our live master pty; &ws is a valid winsize for the ioctl.
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
-        if rc != 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
+        match &self.transport {
+            Transport::Pty { reader, .. } => {
+                let ws = libc::winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                let fd = reader.get_ref().as_raw_fd();
+                // SAFETY: fd is our live master pty; &ws is a valid winsize.
+                let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+            Transport::Socket { client, id, .. } => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let (client, id) = (client.clone(), id.clone());
+                    handle.spawn(async move {
+                        let _ = client.resize(&id, cols, rows).await;
+                    });
+                }
+                Ok(())
+            }
         }
     }
 
-    /// Resolve once the CHILD LEADER process has exited, without reaping it (the
-    /// reap stays with [`Self::close`]). Distinct from [`Self::read`] returning
-    /// EOF: the pty master only EOFs once EVERY slave fd is closed, so a child
-    /// that exits while a lingering grandchild still holds the slave (a browser
-    /// helper a vendor login forks, say) would never EOF. A caller that needs to
-    /// proceed the moment the child itself is done races this against `read`.
-    /// Never resolves if the leader pid is unknown (nothing to observe).
+    /// Resolve once the run has exited, without tearing it down (the teardown
+    /// stays with [`Self::close`]). For a pty, this observes the child leader's
+    /// exit even while a lingering grandchild holds the slave (so it does not
+    /// hang the way read-until-EOF would); for a socket, it waits the container.
     pub async fn wait_child_exit(&self) {
-        let Some(pid) = self.live.lock().await.leader_pid() else {
-            std::future::pending::<()>().await;
-            unreachable!()
-        };
-        crate::wait_leader_exit_unreaped(pid, "interactive session").await;
+        match &self.transport {
+            Transport::Pty { live, .. } => {
+                let Some(pid) = live.lock().await.leader_pid() else {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                };
+                crate::wait_leader_exit_unreaped(pid, "interactive session").await;
+            }
+            Transport::Socket { client, id, .. } => {
+                let _ = client.wait(id).await;
+            }
+        }
     }
 
-    /// end the session: terminate the child's process group and clean up the
-    /// Podman container. Idempotent-ish — safe to call once on session teardown.
+    /// end the session: terminate the child / kill + remove the container.
+    /// Idempotent-ish — safe to call once on session teardown.
     pub async fn close(&self) {
-        self.live.lock().await.terminate().await;
+        match &self.transport {
+            Transport::Pty { live, .. } => live.lock().await.terminate().await,
+            Transport::Socket { client, id, .. } => {
+                let _ = client.kill(id, "SIGKILL").await;
+                let _ = client.remove(id).await;
+            }
+        }
     }
 
     #[cfg(test)]
     fn window_size(&self) -> (u16, u16) {
+        let Transport::Pty { reader, .. } = &self.transport else {
+            panic!("window_size is only meaningful for a pty transport");
+        };
         // SAFETY: zeroed winsize is valid; ioctl fills it from the master pty.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let fd = self.reader.get_ref().as_raw_fd();
+        let fd = reader.get_ref().as_raw_fd();
         let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
         assert_eq!(
             rc,
@@ -277,12 +354,24 @@ impl CliProvider {
         let args = interactive_argv(base, &auth, &workdir, self.spec.isolation.broker);
 
         match &self.backend {
-            SandboxBackend::Podman { image } => {
-                let (mut command, run) =
-                    self.podman_command(image, &args, &workdir, ctx, &auth, true)?;
-                run.prepare_cidfile()?;
-                command.current_dir(&workdir);
-                InteractiveSession::spawn_on_pty(command, Some(run), None, broker, config_home)
+            SandboxBackend::Podman { .. } => {
+                // create + start the container with a container-side pty
+                // (terminal = true), then attach: the hijacked stream carries
+                // the raw tty both ways. `args` is already the interactive argv,
+                // so podman_create_and_start does not re-apply broker_argv.
+                let (client, id) = self
+                    .podman_create_and_start(&args, &workdir, ctx, &auth, true)
+                    .await?;
+                let attach = client.attach(&id, true).await.map_err(|e| {
+                    format!("{}: attach interactive container: {e}", self.spec.tag)
+                })?;
+                Ok(InteractiveSession::from_attach(
+                    attach,
+                    client,
+                    id,
+                    broker,
+                    config_home,
+                ))
             }
             SandboxBackend::Tart { .. } => {
                 // build the interactive guest plan (its script `exec`s the TUI,
@@ -297,7 +386,7 @@ impl CliProvider {
                 let mut command = tokio::process::Command::new("sshpass");
                 command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, true));
                 command.current_dir(&workdir);
-                InteractiveSession::spawn_on_pty(command, None, Some(guard), broker, config_home)
+                InteractiveSession::spawn_on_pty(command, Some(guard), broker, config_home)
             }
             #[cfg(test)]
             SandboxBackend::Bare => {
@@ -435,7 +524,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .expect("spawn cat on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
@@ -473,7 +561,7 @@ mod tests {
     async fn wait_child_exit_returns_while_a_grandchild_holds_the_pty() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", "sleep 30 & echo ready"]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None)
             .expect("spawn sh on a pty");
 
         // The child leader (sh) exits right after `echo ready`; the backgrounded
@@ -510,7 +598,6 @@ mod tests {
     async fn resize_sets_the_window_size() {
         let session = InteractiveSession::spawn_on_pty(
             tokio::process::Command::new("cat"),
-            None,
             None,
             None,
             None,
@@ -611,7 +698,7 @@ mod tests {
             "docker.io/library/debian:13-slim",
             "cat",
         ]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None)
             .expect("spawn podman on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
         let seen = read_until(&session, b"ping", 60).await;
@@ -644,7 +731,12 @@ mod tests {
             b"verify-node-000000000000000000000",
             dirs,
             None,
-            crate::SandboxBackend::Podman { image },
+            crate::SandboxBackend::Podman {
+                image,
+                socket: std::path::PathBuf::from(
+                    std::env::var("DUCKTAPE_PODMAN_SOCKET").unwrap_or_default(),
+                ),
+            },
         )
         .expect("discover codex on Podman");
         let provider = set.resolve("codex").expect("codex provider present");
@@ -688,7 +780,12 @@ mod tests {
                 b"verify-node-000000000000000000000",
                 crate::AgentDirs::under(std::path::Path::new("/tmp/ducktape-live-verify")),
                 None,
-                crate::SandboxBackend::Podman { image },
+                crate::SandboxBackend::Podman {
+                image,
+                socket: std::path::PathBuf::from(
+                    std::env::var("DUCKTAPE_PODMAN_SOCKET").unwrap_or_default(),
+                ),
+            },
             )
             .expect("discover on Podman"),
         )
@@ -929,7 +1026,7 @@ mod tests {
             "-c",
             "test -t 0 && printf ISATTY; sleep 1",
         ]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None)
             .expect("spawn podman on a pty");
         let seen = read_until(&session, b"ISATTY", 60).await;
         session.close().await;

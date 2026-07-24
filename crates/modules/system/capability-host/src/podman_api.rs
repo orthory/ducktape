@@ -331,8 +331,9 @@ fn install_nft_in_netns(pid: i32, ruleset: &str) -> Result<(), String> {
 }
 
 /// resolve a system tool by PATH, then the standard sbin/bin dirs a non-root
-/// PATH usually omits — `nft` ships in `/usr/sbin`.
-fn find_system_tool(bin: &str) -> Option<PathBuf> {
+/// PATH usually omits — `nft` ships in `/usr/sbin`. Shared with the sandbox boot
+/// probe ([`crate::SandboxBackend::probe`]).
+pub(crate) fn find_system_tool(bin: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let cand = dir.join(bin);
@@ -462,8 +463,8 @@ impl SpecGenerator {
         let memory = inputs.limits.get("mem_gb").map(|gb| MemoryLimit {
             limit: (*gb as i64) * 1024 * 1024 * 1024,
         });
-        let resource_limits = (cpu.is_some() || memory.is_some())
-            .then(|| ResourceLimits { cpu, memory });
+        let resource_limits =
+            (cpu.is_some() || memory.is_some()).then_some(ResourceLimits { cpu, memory });
 
         let labels = inputs
             .labels
@@ -635,6 +636,26 @@ impl Podman {
             .ok()
     }
 
+    /// container ids (running or not) carrying `label` — the boot reaper's query
+    /// for this node's orphaned sandbox containers. `label` is a bare key or
+    /// `key=value`; libpod wants it JSON-encoded in the `filters` query.
+    pub(crate) async fn list_by_label(&self, label: &str) -> Result<Vec<String>, String> {
+        let filters = format!("{{\"label\":[{:?}]}}", label);
+        let query = crate::podman_api::urlencode(&filters);
+        let resp = self
+            .request("GET", &format!("{API}/containers/json?all=true&filters={query}"), None)
+            .await?;
+        resp.ok()?;
+        #[derive(serde::Deserialize)]
+        struct Listed {
+            #[serde(rename = "Id")]
+            id: String,
+        }
+        let listed: Vec<Listed> =
+            serde_json::from_slice(&resp.body).map_err(|e| format!("decode container list: {e}"))?;
+        Ok(listed.into_iter().map(|c| c.id).collect())
+    }
+
     /// attach stdin+stdout+stderr to a running container. The HTTP connection is
     /// hijacked: after the response headers, the socket carries raw bytes (tty)
     /// or Docker-multiplexed frames (non-tty). Returns the split stream.
@@ -708,8 +729,10 @@ impl Podman {
     }
 }
 
-/// a hijacked attach stream. `write_all` feeds container stdin; reads come back
-/// raw for a tty session or demuxed for a headless run.
+/// a hijacked attach stream, freshly connected. Both the headless loop and an
+/// interactive session need to WRITE stdin while READING output concurrently,
+/// so the only thing you do with one is [`AttachStream::into_split`] it into an
+/// independently-owned write half (container stdin) and read half.
 pub(crate) struct AttachStream {
     read: OwnedReadHalf,
     write: OwnedWriteHalf,
@@ -719,16 +742,30 @@ pub(crate) struct AttachStream {
 }
 
 impl AttachStream {
-    /// write to container stdin.
-    pub(crate) async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
-        self.write.write_all(data).await
+    /// split into the container-stdin write half (an `OwnedWriteHalf`, already
+    /// `AsyncWrite`) and the output read half. The two halves are moved into
+    /// separate tasks (input feed vs output pump).
+    pub(crate) fn into_split(self) -> (OwnedWriteHalf, AttachReader) {
+        (
+            self.write,
+            AttachReader {
+                read: self.read,
+                leftover: self.leftover,
+                tty: self.tty,
+            },
+        )
     }
+}
 
-    /// close the write half (EOF on container stdin).
-    pub(crate) async fn shutdown(&mut self) -> std::io::Result<()> {
-        self.write.shutdown().await
-    }
+/// the read half of an attach stream: raw for a tty session, Docker-multiplexed
+/// frames for a headless run.
+pub(crate) struct AttachReader {
+    read: OwnedReadHalf,
+    leftover: Vec<u8>,
+    tty: bool,
+}
 
+impl AttachReader {
     /// read the next raw chunk (tty session). Drains any leftover first, then
     /// the socket. `Ok(0)` is EOF (container exited / stream closed).
     pub(crate) async fn read_raw(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -791,6 +828,58 @@ impl AttachStream {
             filled += n;
         }
         Ok(true)
+    }
+}
+
+/// the headless run's stdio, adapted from an attach stream so the existing
+/// output loop sees ordinary `AsyncRead`/`AsyncWrite` streams: `stdin` feeds
+/// container stdin, `stdout`/`stderr` are the demuxed halves. A background pump
+/// task reads attach frames and forwards each to the matching duplex; it ends
+/// (closing both, so the readers see EOF) when the attach stream EOFs.
+pub(crate) struct HeadlessIo {
+    pub(crate) stdin: OwnedWriteHalf,
+    pub(crate) stdout: tokio::io::DuplexStream,
+    pub(crate) stderr: tokio::io::DuplexStream,
+    pub(crate) pump: tokio::task::JoinHandle<()>,
+}
+
+/// adapt an attach stream into [`HeadlessIo`] (see its doc).
+pub(crate) fn headless_io(attach: AttachStream) -> HeadlessIo {
+    let (stdin, reader) = attach.into_split();
+    // 64 KiB matches the invoke loop's read buffer granularity; the pump never
+    // blocks long because the loop drains continuously.
+    let (out_w, out_r) = tokio::io::duplex(64 * 1024);
+    let (err_w, err_r) = tokio::io::duplex(64 * 1024);
+    let pump = tokio::spawn(pump_frames(reader, out_w, err_w));
+    HeadlessIo {
+        stdin,
+        stdout: out_r,
+        stderr: err_r,
+        pump,
+    }
+}
+
+async fn pump_frames(
+    mut reader: AttachReader,
+    mut out: tokio::io::DuplexStream,
+    mut err: tokio::io::DuplexStream,
+) {
+    loop {
+        match reader.read_frame().await {
+            Ok(Some((FrameStream::Stdout, payload))) => {
+                if out.write_all(&payload).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Some((FrameStream::Stderr, payload))) => {
+                if err.write_all(&payload).await.is_err() {
+                    break;
+                }
+            }
+            // clean EOF or a stream error both end the run's output; dropping
+            // `out`/`err` here closes the duplexes so the loop reads EOF.
+            Ok(None) | Err(_) => break,
+        }
     }
 }
 
@@ -903,6 +992,154 @@ fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, String> {
         body = &body[size + 2..]; // skip the chunk's trailing CRLF
     }
     Ok(out)
+}
+
+/// percent-encode a query-parameter value (the libpod `filters` JSON). Encodes
+/// everything that is not an unreserved character — enough for the JSON blobs
+/// the list filter needs.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 3);
+    for b in value.bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// PodmanService — the node-private rootless podman the sandbox drives
+// ---------------------------------------------------------------------------
+
+/// the node's OWN rootless podman: a dedicated socket, storage root, and OCI
+/// hooks dir, supervised as a child `podman system service`. This is what keeps
+/// the sandbox from colliding with any other podman on the host — the operator's
+/// own `podman`, another ducktape node, a system service. Nothing here is
+/// shared:
+/// - a private **socket** (`<data>/podman.sock`), never the default user socket;
+/// - a private **storage root** (`--root <data>/storage`), so this node's
+///   containers/images are a separate world an operator `podman system prune`
+///   cannot touch, and two nodes never fight over one store;
+/// - a private **hooks dir** carrying only the egress hook, passed on THIS
+///   service's argv — so the firewall applies solely to containers created
+///   through this socket and never alters the operator's other podman use.
+///
+/// Dropping the handle stops the service child (its containers die with it via
+/// each run's own teardown; the boot reaper sweeps any that outlive a crash).
+pub struct PodmanService {
+    socket: PathBuf,
+    child: tokio::process::Child,
+}
+
+impl PodmanService {
+    /// the node-private socket path under `data_dir` — deterministic, so the
+    /// config layer can name the [`SandboxBackend::Podman`] socket the boot
+    /// layer will serve on, with no handshake between them.
+    pub fn socket_path(data_dir: &Path) -> PathBuf {
+        data_dir.join("podman").join("podman.sock")
+    }
+
+    /// start the node-private service under `data_dir`, writing the egress hook
+    /// JSON that points back at `self_exe __egress-hook`. Idempotent per node:
+    /// a stale socket file is removed first. `podman_bin` is the resolved
+    /// runtime (from [`SandboxBackend::probe`]).
+    pub async fn start(
+        data_dir: &Path,
+        podman_bin: &Path,
+        self_exe: &Path,
+    ) -> Result<Self, String> {
+        let root = data_dir.join("podman");
+        let storage = root.join("storage");
+        let runroot = root.join("run");
+        let hooks_dir = root.join("hooks");
+        let socket = root.join("podman.sock");
+        for dir in [&storage, &runroot, &hooks_dir] {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("podman service: create {}: {e}", dir.display()))?;
+        }
+        // the hook fires only for our containers (annotation match) and only on
+        // THIS service (its own --hooks-dir), so it never touches other podman.
+        let hook_json = format!(
+            r#"{{"version":"1.0.0","hook":{{"path":{exe:?},"args":["ducktape","__egress-hook"]}},"when":{{"annotations":{{"io.ducktape.egress":"1"}}}},"stages":["createRuntime"]}}"#,
+            exe = self_exe.display().to_string(),
+        );
+        std::fs::write(hooks_dir.join("ducktape-egress.json"), hook_json)
+            .map_err(|e| format!("podman service: write egress hook: {e}"))?;
+        // a leftover socket from a previous boot would make `service` fail to bind.
+        let _ = std::fs::remove_file(&socket);
+
+        let child = tokio::process::Command::new(podman_bin)
+            .arg("--root")
+            .arg(&storage)
+            .arg("--runroot")
+            .arg(&runroot)
+            .arg("--hooks-dir")
+            .arg(&hooks_dir)
+            .arg("system")
+            .arg("service")
+            .arg("--time=0") // never idle-exit; the node owns its lifetime
+            .arg(format!("unix://{}", socket.display()))
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("podman service: spawn `{} system service`: {e}", podman_bin.display()))?;
+
+        let service = Self { socket, child };
+        service.await_socket().await?;
+        Ok(service)
+    }
+
+    /// the node-private socket path — what [`SandboxBackend::Podman`] carries.
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// a client bound to this service's socket.
+    pub(crate) fn client(&self) -> Podman {
+        Podman::new(self.socket.clone())
+    }
+
+    /// remove any of this node's containers left over from a previous crash —
+    /// they carry the managed label. Best-effort: a reap failure is logged by
+    /// the caller, never fatal (a fresh node has none).
+    pub async fn reap_orphans(&self, label: &str) -> Result<usize, String> {
+        let client = self.client();
+        let ids = client.list_by_label(label).await?;
+        let mut removed = 0;
+        for id in &ids {
+            if client.remove(id).await.is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// wait until the service is answering on its socket (bounded). The service
+    /// child creates the socket asynchronously after spawn; poll a cheap `_ping`
+    /// until it responds rather than sleeping a fixed time.
+    async fn await_socket(&self) -> Result<(), String> {
+        let client = self.client();
+        for _ in 0..100 {
+            if UnixStream::connect(&self.socket).await.is_ok()
+                && client.request("GET", "/_ping", None).await.is_ok()
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Err(format!(
+            "podman service did not answer on {} within 5s",
+            self.socket.display()
+        ))
+    }
+
+    /// stop the service child (best-effort; `kill_on_drop` is the backstop).
+    pub async fn shutdown(mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
 }
 
 #[cfg(test)]
@@ -1069,12 +1306,12 @@ mod tests {
         // a real UnixStream pair: writer pushes Docker-mux frames, reader demuxes.
         let (c1, c2) = UnixStream::pair().unwrap();
         let (r, w) = c1.into_split();
-        let mut att = AttachStream {
+        let mut att = AttachReader {
             read: r,
-            write: w,
             leftover: Vec::new(),
             tty: false,
         };
+        let _keep_write = w;
         // writer side pushes two frames then closes.
         let (_r2, mut w2) = c2.into_split();
         let mut wire = Vec::new();

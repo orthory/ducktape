@@ -77,15 +77,9 @@ const PODMAN_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PODMAN_RETRY_MIN: Duration = Duration::from_millis(250);
 const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
-const PODMAN_EMPTY_MIN_OBSERVATIONS: usize = 3;
 #[cfg(any(target_os = "linux", test))]
-const PODMAN_REAP_MAX: usize = 64;
 const PODMAN_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
 const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
-const PODMAN_OWNER_BOOT_LABEL: &str = "io.ducktape.owner.boot";
-const PODMAN_OWNER_PID_LABEL: &str = "io.ducktape.owner.pid";
-const PODMAN_OWNER_START_LABEL: &str = "io.ducktape.owner.starttime";
-const PODMAN_INSTANCE_LABEL: &str = "io.ducktape.instance";
 const TART_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
 const TART_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -163,7 +157,7 @@ mod interactive;
 #[cfg(unix)]
 mod podman_api;
 #[cfg(unix)]
-pub use podman_api::{egress_nftables, run_egress_hook};
+pub use podman_api::{PodmanService, egress_nftables, run_egress_hook};
 mod sandbox;
 mod session;
 mod spec;
@@ -599,6 +593,9 @@ impl CliProvider {
             .map(|prepared| prepared.command)
     }
 
+    // in a non-test build only the two error arms remain, so the inputs the Bare
+    // arm consumes are unused — expected, not a defect.
+    #[cfg_attr(not(test), allow(unused_variables))]
     fn prepared_command(
         &self,
         args: &[String],
@@ -606,38 +603,30 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
     ) -> Result<PreparedCommand, String> {
-        // a broker rewrites the argv BEFORE the backend sees it, so all three
-        // backends aim the CLI at the loopback endpoint identically.
-        let args = self.broker_argv(args, workdir, auth);
-        // the backend picks HOW the child is spawned; the stdio/kill/cwd
-        // handling below is identical either way. args are passed verbatim to
-        // exec — never shell-interpreted (the resume path's {session_id} slot
-        // was substituted host-side with an executor-minted id, never job
-        // content) — so nothing in a job can inject flags or commands.
-        let (mut command, podman) = match &self.backend {
-            SandboxBackend::Podman { image } => {
-                let (command, run) =
-                    self.podman_command(image, &args, workdir, ctx, auth, false)?;
-                (command, Some(run))
+        // Only the Bare test harness reaches here now: Podman is driven over its
+        // socket and Tart via its ssh lifecycle, both in [`Self::invoke`] before
+        // this seam. (`args`/`ctx`/`auth` are consumed only by the Bare arm, so
+        // in a non-test build they are legitimately unused.)
+        match &self.backend {
+            SandboxBackend::Podman { .. } => {
+                Err("internal error: Podman is driven over its socket, not a command".into())
             }
-            // Tart has a multi-process lifecycle (clone/set/boot, then SSH), so
-            // [`Self::invoke`] constructs it before reaching this single-child
-            // command seam.
             SandboxBackend::Tart { .. } => {
-                return Err("internal error: Tart command bypassed its VM lifecycle".into());
+                Err("internal error: Tart command bypassed its VM lifecycle".into())
             }
             #[cfg(test)]
-            SandboxBackend::Bare => (self.bare_command(&args, ctx, auth)?, None),
-        };
-        command
-            .current_dir(workdir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // final panic/drop safety; cancellation and timeouts take the
-            // explicit process-group + Podman cleanup path in invoke().
-            .kill_on_drop(true);
-        Ok(PreparedCommand { command, podman })
+            SandboxBackend::Bare => {
+                let args = self.broker_argv(args, workdir, auth);
+                let mut command = self.bare_command(&args, ctx, auth)?;
+                command
+                    .current_dir(workdir)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                Ok(PreparedCommand { command })
+            }
+        }
     }
 
     /// the test-harness spawn ([`SandboxBackend::Bare`]): the spec's binary
@@ -678,26 +667,36 @@ impl CliProvider {
         Ok(cmd)
     }
 
-    /// wrap the same invocation in `podman run`: identical container paths, the
-    /// run's numeric limits enforced, and ONLY the spec's `[sandbox] rw_dirs`
-    /// (the CLI's auth/state) crossing under HOME. HOME is set (so the CLI
-    /// finds its dotfiles at their identical mounted paths) but not itself
-    /// mounted — the node's data dir and user key stay outside (D7).
+    /// build this run's neutral-path `SpecGenerator`, create the container over
+    /// the node-private podman socket, and start it — returning the client + the
+    /// container id. Shared by the headless [`Self::invoke`] and the interactive
+    /// session (which passes `tty = true`).
     ///
-    /// The container runs in a private netns, so the node's own RPC is not on
-    /// its loopback: the run-action URL is rewritten to the
-    /// `host.containers.internal` gateway podman maps back to this host (the
-    /// broker's own base_url already names that gateway — see
-    /// [`broker::Reachability`]).
-    fn podman_command(
+    /// Every host path is mounted at a NEUTRAL `/ducktape/*` guest path and every
+    /// env value / argv entry that names a host path is translated to match, so
+    /// the guest never sees the operator's real paths. Only the spec's
+    /// `[sandbox] rw_dirs` (the CLI's auth/state) cross the boundary, under
+    /// `/ducktape/home`; the node's data dir + user key stay outside (D7). The
+    /// egress firewall (broker + node RPC + public only) is installed by the
+    /// createRuntime hook keyed on the annotations [`set_egress`] adds.
+    ///
+    /// The run-action URL is rewritten to `host.containers.internal` (the
+    /// private netns reaches the node's RPC only through that gateway); the
+    /// broker's own base_url already names it (see [`broker::Reachability`]).
+    /// `args` are the FINAL executor argv (the caller has already applied
+    /// [`Self::broker_argv`] for a headless run or `interactive_argv` for a TUI);
+    /// this method only translates their paths to the neutral guest layout.
+    async fn podman_create_and_start(
         &self,
-        image: &str,
         args: &[String],
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
         tty: bool,
-    ) -> Result<(tokio::process::Command, PodmanRun), String> {
+    ) -> Result<(podman_api::Podman, String), String> {
+        let SandboxBackend::Podman { image, socket } = &self.backend else {
+            return Err("internal error: podman spawn on a non-Podman backend".into());
+        };
         let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
         for (key, value) in &mut envs {
             if key == RUN_ACTION_URL_ENV {
@@ -711,24 +710,69 @@ impl CliProvider {
         let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
         let workdir = canonical_mount_path(workdir, "Podman workdir")?;
         let bin_path = canonical_mount_path(&self.bin, "Podman executor")?;
-        let run = PodmanRun::new(ctx, &workdir, &bin_path, &ro_paths, &rw_dirs)?;
-        let (bin, argv) = sandbox::wrap_podman_managed(
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "Podman run needs $HOME set to place the neutral home mount".to_string())?;
+        let home = canonical_mount_path(&home, "Podman HOME")?;
+
+        let plan = podman_api::plan_mounts(&workdir, &bin_path, &ro_paths, &rw_dirs, &home);
+        // translate env values + argv to the neutral guest paths (HOME is set
+        // directly to the guest home; every other value is prefix-translated).
+        let translated_env: Vec<(String, String)> = envs
+            .iter()
+            .map(|(key, value)| {
+                let value = if key == "HOME" {
+                    plan.guest_home.display().to_string()
+                } else {
+                    podman_api::translate(value, &plan.mounts, &home, &plan.guest_home)
+                };
+                (key.clone(), value)
+            })
+            .collect();
+        let translated_args: Vec<String> = args
+            .iter()
+            .map(|arg| podman_api::translate(arg, &plan.mounts, &home, &plan.guest_home))
+            .collect();
+
+        // egress-allowed host ports: this run's broker + the node RPC. The nft
+        // hook allows exactly these on the host IP; every other host port is
+        // dropped with the rest of the private ranges.
+        let mut ports = Vec::new();
+        if let Some(broker) = auth.broker {
+            ports.extend(url_port(&broker.base_url));
+        }
+        if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
+            ports.extend(url_port(run_action));
+        }
+        let host_ip = podman_api::host_routable_ip();
+
+        let executing_node = ctx.executing_node.as_deref().unwrap_or("unknown");
+        let labels = vec![
+            PODMAN_MANAGED_LABEL.to_string(),
+            format!("{PODMAN_NODE_LABEL}={executing_node}"),
+        ];
+
+        let mut spec = podman_api::SpecGenerator::build(podman_api::SpecInputs {
             image,
-            &bin_path,
-            args,
-            &workdir,
-            &envs,
-            &ro_paths,
-            &rw_dirs,
-            &ctx.limits,
-            &run.cidfile,
-            &run.labels,
-            tty,
-        );
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.args(argv)
-            .envs(envs.iter().map(|(key, value)| (key, value)));
-        Ok((cmd, run))
+            guest_bin: &plan.guest_bin,
+            guest_workdir: &plan.guest_workdir,
+            args: &translated_args,
+            env: &translated_env,
+            mounts: &plan.mounts,
+            limits: &ctx.limits,
+            labels: &labels,
+            terminal: tty,
+        });
+        spec.set_egress(&host_ip, podman_api::SLIRP_DNS, &ports);
+
+        let client = podman_api::Podman::new(socket.clone());
+        let id = client.create(&spec).await?;
+        if let Err(error) = client.start(&id).await {
+            // a container that never started must not linger in the node store.
+            let _ = client.remove(&id).await;
+            return Err(format!("start {} container: {error}", self.bin.display()));
+        }
+        Ok((client, id))
     }
 
     /// Assemble the real Tart VM boot + guest execution plan. Writable auth
@@ -1539,22 +1583,6 @@ fn canonical_mount_path(path: &Path, purpose: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("resolve {purpose} {}: {error}", path.display()))
 }
 
-fn ensure_podman_control_hidden<'a>(
-    root: &Path,
-    mounts: impl IntoIterator<Item = &'a Path>,
-) -> Result<(), String> {
-    for mount in mounts {
-        let mount = canonical_mount_path(mount, "Podman host mount")?;
-        if root.starts_with(&mount) {
-            return Err(format!(
-                "refusing Podman run: host-only cidfile root {} would be exposed by mount {}",
-                root.display(),
-                mount.display()
-            ));
-        }
-    }
-    Ok(())
-}
 
 /// removes a run's context document on drop — every exit path (success, error,
 /// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
@@ -1579,608 +1607,32 @@ impl Drop for ContextGuard {
 /// stop the exact container if this invocation is cancelled.
 struct PreparedCommand {
     command: tokio::process::Command,
-    podman: Option<PodmanRun>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PodmanOwner {
-    boot_id: String,
-    pid: u32,
-    starttime: u64,
+/// the TCP port in an `http://host:port/...` URL, if any — the egress firewall
+/// needs the broker + node-RPC ports as bare numbers.
+fn url_port(url: &str) -> Option<u16> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    authority.rsplit(':').next()?.parse().ok()
 }
 
-impl PodmanOwner {
-    #[cfg(target_os = "linux")]
-    fn current() -> Result<Self, String> {
-        let pid = std::process::id();
-        Ok(Self {
-            boot_id: linux_boot_id()?,
-            pid,
-            starttime: linux_process_starttime(pid)?.ok_or_else(|| {
-                format!("current process {pid} disappeared while building Podman ownership")
-            })?,
-        })
-    }
 
-    #[cfg(not(target_os = "linux"))]
-    fn current() -> Result<Self, String> {
-        // Non-Linux hosts still use exact cidfile/label cancellation. Startup
-        // reaping is disabled there; these labels are diagnostic only.
-        let pid = std::process::id();
-        Ok(Self {
-            boot_id: format!("{pid:08x}"),
-            pid,
-            starttime: 1,
-        })
-    }
 
-    #[cfg(any(target_os = "linux", test))]
-    fn from_inspect(output: &str) -> Option<Self> {
-        let mut fields = output.trim().split('\t');
-        let boot_id = fields.next()?.to_string();
-        let pid = fields.next()?.parse().ok()?;
-        let starttime = fields.next()?.parse().ok()?;
-        (fields.next().is_none() && valid_boot_id(&boot_id) && pid != 0 && starttime != 0)
-            .then_some(Self {
-                boot_id,
-                pid,
-                starttime,
-            })
-    }
-}
 
-/// Host-owned Podman lifecycle state. The cidfile deliberately lives below
-/// `$HOME/.ducktape/provider-runs`, which the Podman sandbox does not mount;
-/// we also reject any spec/run mount that would expose it.
-struct PodmanRun {
-    cidfile: PathBuf,
-    labels: Vec<String>,
-}
 
-impl PodmanRun {
-    fn new(
-        ctx: &RunContext,
-        workdir: &Path,
-        bin: &Path,
-        ro_paths: &[PathBuf],
-        rw_dirs: &[PathBuf],
-    ) -> Result<Self, String> {
-        static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-            "Podman lifecycle isolation needs $HOME set for its host-only cidfile".to_string()
-        })?;
-        let home = canonical_mount_path(&home, "Podman HOME")?;
-        let root = home.join(".ducktape").join("provider-runs").join("podman");
-        create_private_dir(&root)?;
-        let root = canonical_mount_path(&root, "Podman cidfile root")?;
-        let owner = PodmanOwner::current()?;
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| format!("Podman run clock is before Unix epoch: {error}"))?
-            .as_nanos();
-        let instance = format!(
-            "{}-{}-{}-{created}-{}",
-            owner.boot_id,
-            owner.pid,
-            owner.starttime,
-            NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let cidfile = root.join(format!("{instance}.cid"));
-        let executing_node = ctx.executing_node.as_deref().ok_or_else(|| {
-            "Podman provider run is missing its canonical executing-node id".to_string()
-        })?;
-        if !valid_execution_node_id(executing_node) {
-            return Err(format!(
-                "Podman provider run has invalid executing-node id {executing_node:?}"
-            ));
-        }
 
-        let exposed = std::iter::once(workdir)
-            .chain(std::iter::once(bin))
-            .chain(ro_paths.iter().map(PathBuf::as_path))
-            .chain(rw_dirs.iter().map(PathBuf::as_path));
-        ensure_podman_control_hidden(&root, exposed)?;
 
-        Ok(Self {
-            cidfile,
-            labels: vec![
-                PODMAN_MANAGED_LABEL.into(),
-                format!("{PODMAN_NODE_LABEL}={executing_node}"),
-                format!("{PODMAN_OWNER_BOOT_LABEL}={}", owner.boot_id),
-                format!("{PODMAN_OWNER_PID_LABEL}={}", owner.pid),
-                format!("{PODMAN_OWNER_START_LABEL}={}", owner.starttime),
-                format!("io.ducktape.run={}", runtime_slot(ctx, workdir)),
-                format!("{PODMAN_INSTANCE_LABEL}={instance}"),
-            ],
-        })
-    }
 
-    fn prepare_cidfile(&self) -> Result<(), String> {
-        let root = self
-            .cidfile
-            .parent()
-            .expect("a Podman cidfile always has its managed root");
-        create_private_dir(root)?;
-        self.remove_cidfile();
-        Ok(())
-    }
 
-    fn container_id(&self) -> Option<String> {
-        let id = std::fs::read_to_string(&self.cidfile).ok()?;
-        let id = id.trim();
-        valid_container_id(id).then(|| id.to_string())
-    }
 
-    async fn wait_container_id_until(&self, deadline: tokio::time::Instant) -> Option<String> {
-        loop {
-            if let Some(cid) = self.container_id() {
-                return Some(cid);
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return None;
-            }
-            tokio::time::sleep_until((now + PODMAN_CID_POLL_INTERVAL).min(deadline)).await;
-        }
-    }
 
-    fn stop_argv(cid: &str) -> Vec<String> {
-        vec![
-            "stop".into(),
-            "--ignore".into(),
-            "--time".into(),
-            TERMINATION_GRACE.as_secs().to_string(),
-            cid.into(),
-        ]
-    }
 
-    fn wait_argv(cid: &str) -> Vec<String> {
-        vec!["wait".into(), cid.into()]
-    }
 
-    fn remove_argv(cid: &str) -> Vec<String> {
-        vec!["rm".into(), "--force".into(), "--ignore".into(), cid.into()]
-    }
 
-    async fn control(&self, args: &[String]) -> Result<String, String> {
-        let args = args.to_vec();
-        tokio::task::spawn_blocking(move || {
-            run_command_bounded(Path::new("podman"), &args, PODMAN_CONTROL_TIMEOUT)
-        })
-        .await
-        .map_err(|error| format!("join bounded Podman control command: {error}"))?
-    }
 
-    fn control_blocking(&self, args: &[String]) -> Result<String, String> {
-        run_command_bounded(Path::new("podman"), args, PODMAN_CONTROL_TIMEOUT)
-    }
 
-    fn exact_query_argv(&self) -> Vec<String> {
-        let mut argv = vec![
-            "ps".into(),
-            "--all".into(),
-            "--quiet".into(),
-            "--no-trunc".into(),
-        ];
-        for label in &self.labels {
-            argv.extend(["--filter".into(), format!("label={label}")]);
-        }
-        argv
-    }
-
-    /// Prove this exact run's container is stopped or absent. `stop --ignore`
-    /// success is the proof for a known CID. Before a CID exists, only the full
-    /// unique label set may locate it; a stable sequence of successful exact
-    /// empty queries after the `podman run` process is reaped proves absence.
-    /// Any Podman error retries forever, deliberately retaining the caller's
-    /// resource reservation rather than declaring an unproven stop.
-    async fn stop_until_confirmed(&self, mut cid: Option<String>) -> Option<String> {
-        let mut empty_since = None;
-        let mut empty_observations = 0usize;
-        let mut failures = 0u64;
-        let mut retry_delay = PODMAN_RETRY_MIN;
-        loop {
-            if cid.is_none() {
-                cid = self.container_id();
-            }
-            if let Some(id) = cid.as_deref() {
-                match self.control(&Self::stop_argv(id)).await {
-                    Ok(_) => return Some(id.to_string()),
-                    Err(error) => {
-                        failures += 1;
-                        if failures == 1 || failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] exact Podman stop for {id} not yet proven \
-                                 (attempt {failures}): {error}"
-                            );
-                        }
-                    }
-                }
-            } else {
-                match self
-                    .control(&self.exact_query_argv())
-                    .await
-                    .and_then(|output| parse_container_ids(&output))
-                {
-                    Ok(ids) if ids.is_empty() => {
-                        let since = empty_since.get_or_insert_with(tokio::time::Instant::now);
-                        empty_observations += 1;
-                        if empty_observations >= PODMAN_EMPTY_MIN_OBSERVATIONS
-                            && since.elapsed() >= PODMAN_CONTROL_TIMEOUT
-                        {
-                            return None;
-                        }
-                    }
-                    Ok(mut ids) if ids.len() == 1 => {
-                        cid = ids.pop();
-                        empty_since = None;
-                        empty_observations = 0;
-                    }
-                    Ok(ids) => {
-                        empty_since = None;
-                        empty_observations = 0;
-                        failures += 1;
-                        if failures == 1 || failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] exact Podman identity matched {} containers; \
-                                 refusing broad cleanup (attempt {failures})",
-                                ids.len()
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        empty_since = None;
-                        empty_observations = 0;
-                        failures += 1;
-                        if failures == 1 || failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] exact Podman absence query failed \
-                                 (attempt {failures}): {error}"
-                            );
-                        }
-                    }
-                }
-            }
-            tokio::time::sleep(retry_delay).await;
-            retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
-        }
-    }
-
-    async fn cleanup_stopped(&self, cid: &str) {
-        if let Err(error) = self.control(&Self::wait_argv(cid)).await {
-            eprintln!("[capability-host] wait for stopped Podman container {cid}: {error}");
-        }
-        let mut failures = 0u64;
-        let mut retry_delay = PODMAN_RETRY_MIN;
-        loop {
-            match self.control(&Self::remove_argv(cid)).await {
-                Ok(_) => return,
-                Err(error) => {
-                    failures += 1;
-                    if failures == 1 || failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] remove stopped Podman container {cid} \
-                             failed (attempt {failures}): {error}"
-                        );
-                    }
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
-                }
-            }
-        }
-    }
-
-    /// Synchronous twin used only from a dropped invoke future. Drop cannot
-    /// await, and returning would release the dispatch reservation, so an
-    /// unavailable Podman daemon deliberately keeps retrying fail-closed.
-    fn cleanup_blocking(&self) {
-        let mut cid = self.container_id();
-        let mut empty_since = None;
-        let mut empty_observations = 0usize;
-        let mut failures = 0u64;
-        let mut retry_delay = PODMAN_RETRY_MIN;
-        loop {
-            if cid.is_none() {
-                cid = self.container_id();
-            }
-            if let Some(id) = cid.as_deref() {
-                match self.control_blocking(&Self::stop_argv(id)) {
-                    Ok(_) => break,
-                    Err(error) => {
-                        failures += 1;
-                        if failures == 1 || failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] dropped-run Podman stop for {id} \
-                                 not yet proven (attempt {failures}): {error}"
-                            );
-                        }
-                    }
-                }
-            } else {
-                match self
-                    .control_blocking(&self.exact_query_argv())
-                    .and_then(|output| parse_container_ids(&output))
-                {
-                    Ok(ids) if ids.is_empty() => {
-                        let since = empty_since.get_or_insert_with(std::time::Instant::now);
-                        empty_observations += 1;
-                        if empty_observations >= PODMAN_EMPTY_MIN_OBSERVATIONS
-                            && since.elapsed() >= PODMAN_CONTROL_TIMEOUT
-                        {
-                            self.remove_cidfile();
-                            return;
-                        }
-                    }
-                    Ok(mut ids) if ids.len() == 1 => {
-                        cid = ids.pop();
-                        empty_since = None;
-                        empty_observations = 0;
-                    }
-                    Ok(ids) => {
-                        empty_since = None;
-                        empty_observations = 0;
-                        failures += 1;
-                        if failures == 1 || failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] dropped-run identity matched {} containers; \
-                                 refusing broad cleanup (attempt {failures})",
-                                ids.len()
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        empty_since = None;
-                        empty_observations = 0;
-                        failures += 1;
-                        if failures == 1 || failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] dropped-run Podman absence query failed \
-                                 (attempt {failures}): {error}"
-                            );
-                        }
-                    }
-                }
-            }
-            std::thread::sleep(retry_delay);
-            retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
-        }
-
-        let cid = cid.expect("a successful exact stop has a container id");
-        let _ = self.control_blocking(&Self::wait_argv(&cid));
-        let mut retry_delay = PODMAN_RETRY_MIN;
-        loop {
-            match self.control_blocking(&Self::remove_argv(&cid)) {
-                Ok(_) => break,
-                Err(error) => {
-                    failures += 1;
-                    if failures == 1 || failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] dropped-run Podman remove for {cid} failed \
-                             (attempt {failures}): {error}"
-                        );
-                    }
-                    std::thread::sleep(retry_delay);
-                    retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
-                }
-            }
-        }
-        self.remove_cidfile();
-    }
-
-    fn remove_cidfile(&self) {
-        if let Err(error) = std::fs::remove_file(&self.cidfile)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!(
-                "[capability-host] removing Podman cidfile {} failed: {error}",
-                self.cidfile.display()
-            );
-        }
-    }
-}
-
-fn valid_container_id(id: &str) -> bool {
-    id.len() >= 12 && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn valid_execution_node_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len().is_multiple_of(2)
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn valid_boot_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-}
-
-#[cfg(target_os = "linux")]
-fn linux_boot_id() -> Result<String, String> {
-    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map_err(|error| format!("read Linux boot id for Podman ownership: {error}"))?;
-    let boot_id = boot_id.trim().to_ascii_lowercase();
-    valid_boot_id(&boot_id)
-        .then_some(boot_id)
-        .ok_or_else(|| "Linux returned an invalid boot id for Podman ownership".into())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_starttime(pid: u32) -> Result<Option<u64>, String> {
-    let path = format!("/proc/{pid}/stat");
-    let stat = match std::fs::read_to_string(&path) {
-        Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("read {path} for Podman ownership: {error}")),
-    };
-    // `comm` is parenthesized and may itself contain spaces or `)`, so fields
-    // after it start at the final `)`. starttime is proc stat field 22: index
-    // 19 in the field-3-and-later suffix.
-    let suffix = stat
-        .rsplit_once(')')
-        .map(|(_, suffix)| suffix)
-        .ok_or_else(|| format!("{path} has no parenthesized command field"))?;
-    let starttime = suffix
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| format!("{path} has no starttime field"))?
-        .parse::<u64>()
-        .map_err(|error| format!("parse {path} starttime: {error}"))?;
-    Ok(Some(starttime))
-}
-
-fn parse_container_ids(output: &str) -> Result<Vec<String>, String> {
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| {
-            valid_container_id(id)
-                .then(|| id.to_string())
-                .ok_or_else(|| format!("Podman returned an invalid container id: {id:?}"))
-        })
-        .collect()
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn podman_reap_query_argv(executing_node: &str) -> Vec<String> {
-    vec![
-        "ps".into(),
-        "--all".into(),
-        "--quiet".into(),
-        "--no-trunc".into(),
-        "--filter".into(),
-        format!("label={PODMAN_MANAGED_LABEL}"),
-        "--filter".into(),
-        format!("label={PODMAN_NODE_LABEL}={executing_node}"),
-    ]
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn podman_owner_inspect_argv(cid: &str) -> Vec<String> {
-    vec![
-        "inspect".into(),
-        "--type".into(),
-        "container".into(),
-        "--format".into(),
-        format!(
-            "{{{{ index .Config.Labels \"{PODMAN_OWNER_BOOT_LABEL}\" }}}}\t\
-             {{{{ index .Config.Labels \"{PODMAN_OWNER_PID_LABEL}\" }}}}\t\
-             {{{{ index .Config.Labels \"{PODMAN_OWNER_START_LABEL}\" }}}}"
-        ),
-        cid.into(),
-    ]
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OwnerLiveness {
-    Alive,
-    Dead,
-    Unknown,
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn owner_liveness_with(
-    owner: &PodmanOwner,
-    current_boot_id: &str,
-    process_starttime: &mut impl FnMut(u32) -> Result<Option<u64>, String>,
-) -> OwnerLiveness {
-    if owner.boot_id != current_boot_id {
-        return OwnerLiveness::Dead;
-    }
-    match process_starttime(owner.pid) {
-        Ok(Some(starttime)) if starttime == owner.starttime => OwnerLiveness::Alive,
-        Ok(Some(_)) | Ok(None) => OwnerLiveness::Dead,
-        Err(_) => OwnerLiveness::Unknown,
-    }
-}
-
-/// Reap only a bounded set of containers whose Linux owner identity is proven
-/// dead. A same-node live owner, a missing label, failed inspect, or unreadable
-/// `/proc` record is preserved: node identity alone is never kill authority.
-#[cfg(any(target_os = "linux", test))]
-fn reap_podman_orphans_with(
-    executing_node: &str,
-    current_boot_id: &str,
-    podman_present: bool,
-    mut process_starttime: impl FnMut(u32) -> Result<Option<u64>, String>,
-    mut run: impl FnMut(&[String]) -> Result<String, String>,
-) -> Result<(), String> {
-    // No podman binary means no managed containers can exist — the boot reaper
-    // has nothing to reap and MUST NOT fail the node. A node configured for a
-    // podman sandbox but without podman installed still boots (consensus and
-    // networking need no sandbox); the missing binary surfaces later, with a
-    // clear error, only when an agent session actually tries to spawn one.
-    if !podman_present {
-        return Ok(());
-    }
-    if !valid_execution_node_id(executing_node) {
-        return Err(format!(
-            "refusing Podman reaper with invalid executing-node id {executing_node:?}"
-        ));
-    }
-    if !valid_boot_id(current_boot_id) {
-        return Err("refusing Podman reaper without a valid current boot id".into());
-    }
-    let query = podman_reap_query_argv(executing_node);
-    let listed = run(&query)?;
-    let ids = parse_container_ids(&listed)?;
-    if ids.len() > PODMAN_REAP_MAX {
-        return Err(format!(
-            "refusing to inspect {} Podman containers; bounded reaper limit is {PODMAN_REAP_MAX}",
-            ids.len()
-        ));
-    }
-    for cid in ids {
-        let owner = match run(&podman_owner_inspect_argv(&cid))
-            .ok()
-            .and_then(|output| PodmanOwner::from_inspect(&output))
-        {
-            Some(owner) => owner,
-            None => continue,
-        };
-        if owner_liveness_with(&owner, current_boot_id, &mut process_starttime)
-            != OwnerLiveness::Dead
-        {
-            continue;
-        }
-        // `stop --ignore` success proves this exact CID stopped or absent.
-        // The managed run uses --rm, so it may auto-remove before `wait`; that
-        // cleanup observation is deliberately non-fatal. `rm --ignore` then
-        // proves no stopped metadata remains.
-        run(&PodmanRun::stop_argv(&cid))?;
-        let _ = run(&PodmanRun::wait_argv(&cid));
-        run(&PodmanRun::remove_argv(&cid))?;
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn run_podman_bounded(args: &[String]) -> Result<String, String> {
-    run_command_bounded(Path::new("podman"), args, PODMAN_CONTROL_TIMEOUT)
-}
-
-/// Whether the `podman` binary is resolvable on this process's PATH. Only a
-/// genuinely absent binary (spawn `NotFound`) reads as unavailable; any other
-/// spawn outcome is treated as present so a transient failure never suppresses
-/// the reaper.
-#[cfg(target_os = "linux")]
-fn podman_available() -> bool {
-    let status = std::process::Command::new("podman")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    !matches!(status, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-}
 
 fn kill_std_child_fail_closed(
     child: &mut std::process::Child,
@@ -2330,41 +1782,7 @@ fn run_command_bounded(
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
-#[cfg(target_os = "linux")]
-fn reap_podman_orphans_once(executing_node: &str) -> Result<(), String> {
-    struct Reap {
-        executing_node: String,
-        result: Result<(), String>,
-    }
-    static REAP: std::sync::OnceLock<Reap> = std::sync::OnceLock::new();
-    let reap = REAP.get_or_init(|| Reap {
-        executing_node: executing_node.to_string(),
-        result: PodmanOwner::current().and_then(|owner| {
-            reap_podman_orphans_with(
-                executing_node,
-                &owner.boot_id,
-                podman_available(),
-                linux_process_starttime,
-                run_podman_bounded,
-            )
-        }),
-    });
-    if reap.executing_node != executing_node {
-        return Err(format!(
-            "Podman reaper already ran for node {}, refusing a second node {executing_node} in the same process",
-            reap.executing_node
-        ));
-    }
-    reap.result.clone()
-}
 
-#[cfg(not(target_os = "linux"))]
-fn reap_podman_orphans_once(_executing_node: &str) -> Result<(), String> {
-    // There is no /proc boot-id + starttime identity with which to distinguish
-    // a live owner from PID reuse. Exact per-run cancellation still works, but
-    // startup reaping is disabled fail-safe rather than guessing from PID.
-    Ok(())
-}
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut tokio::process::Command) {
@@ -2576,15 +1994,14 @@ async fn wait_owned_child_complete(
 /// Gracefully terminate the child tree, then forcibly reap anything that
 /// ignored TERM. A SIGKILLed leader is always waited before return: a zombie is
 /// therefore reaped, while an uninterruptible D-state leader intentionally
-/// keeps this future (and its resource reservation) pending fail-closed.
-/// Podman cleanup targets the exact CID/full unique run labels, never a node or
-/// process-name match, and likewise does not return before stopped/absent proof.
+/// keeps this future (and its resource reservation) pending fail-closed. This is
+/// the local-child (Tart ssh / Bare) path; a Podman run is killed + removed over
+/// its socket (see [`RunControl::terminate`]), never here.
 async fn terminate_child(
     child: &mut tokio::process::Child,
     process_group: Option<u32>,
-    podman: Option<&PodmanRun>,
     leader_reaped: &mut bool,
-) -> Option<String> {
+) {
     let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
     #[cfg(unix)]
     if let Some(group) = process_group
@@ -2593,13 +2010,6 @@ async fn terminate_child(
         eprintln!("[capability-host] SIGTERM provider process group {group}: {error}");
     }
 
-    // `podman run` may have created the container but not written --cidfile at
-    // the instant cancellation wins. Poll within the same TERM grace window;
-    // killing the CLI after one read can otherwise strand that exact race.
-    let cid = match podman {
-        Some(podman) => podman.wait_container_id_until(deadline).await,
-        None => None,
-    };
     #[cfg(unix)]
     {
         if let Some(group) = process_group {
@@ -2651,8 +2061,6 @@ async fn terminate_child(
         let _ = wait_tokio_child_fail_closed(child, "killed provider child").await;
         *leader_reaped = true;
     }
-
-    cid
 }
 
 async fn cancellation_requested(cancellation: Option<&RunCancellation>) {
@@ -2838,12 +2246,11 @@ impl Drop for GroupChild {
 /// could still consume it.
 struct LiveChild {
     process: GroupChild,
-    podman: Option<PodmanRun>,
     cleaned: bool,
 }
 
 impl LiveChild {
-    fn new(child: tokio::process::Child, podman: Option<PodmanRun>) -> Self {
+    fn new(child: tokio::process::Child) -> Self {
         let process_group = child.id();
         Self {
             process: GroupChild {
@@ -2852,7 +2259,6 @@ impl LiveChild {
                 leader_reaped: false,
                 cleaned: false,
             },
-            podman,
             cleaned: false,
         }
     }
@@ -2872,40 +2278,23 @@ impl LiveChild {
 
     async fn terminate(&mut self) {
         let process_group = self.process.process_group;
-        let cid = if self.process.cleaned {
-            self.podman.as_ref().and_then(PodmanRun::container_id)
+        if self.process.cleaned {
+            // already cleaned
         } else if self.process.leader_reaped {
             #[cfg(unix)]
             if let Some(group) = process_group {
                 wait_process_group_gone(group, "provider").await;
             }
             self.process.cleaned = true;
-            self.podman.as_ref().and_then(PodmanRun::container_id)
         } else {
-            let podman = self.podman.as_ref();
             let child = self
                 .process
                 .child
                 .as_mut()
                 .expect("a live invocation owns its child");
-            terminate_child(
-                child,
-                process_group,
-                podman,
-                &mut self.process.leader_reaped,
-            )
-            .await
-        };
-        // terminate_child has reaped the leader and proved the group gone.
-        // Mark that boundary before awaiting Podman, so aborting cleanup falls
-        // through to this owner's exact synchronous container cleanup only.
-        self.process.cleaned = true;
-        if let Some(podman) = &self.podman {
-            if let Some(cid) = podman.stop_until_confirmed(cid).await {
-                podman.cleanup_stopped(&cid).await;
-            }
-            podman.remove_cidfile();
+            terminate_child(child, process_group, &mut self.process.leader_reaped).await;
         }
+        self.process.cleaned = true;
         self.cleaned = true;
     }
 
@@ -2918,17 +2307,8 @@ impl LiveChild {
             .expect("a live invocation owns its child");
         let status =
             wait_owned_child_complete(child, process_group, label, &mut self.process.leader_reaped)
-        .await?;
+                .await?;
         self.process.cleaned = true;
-        // A successful Podman CLI exit is not by itself cleanup proof. Target
-        // its exact CID/full label identity even on normal provider completion.
-        if let Some(podman) = &self.podman {
-            let cid = podman.stop_until_confirmed(podman.container_id()).await;
-            if let Some(cid) = cid {
-                podman.cleanup_stopped(&cid).await;
-            }
-            podman.remove_cidfile();
-        }
         self.cleaned = true;
         Ok(status)
     }
@@ -2940,10 +2320,67 @@ impl Drop for LiveChild {
             return;
         }
         self.process.kill_and_wait_blocking();
-        if let Some(podman) = &self.podman {
-            podman.cleanup_blocking();
-        }
         self.cleaned = true;
+    }
+}
+
+/// how [`CliProvider::invoke`] waits for and tears down a run, unifying the two
+/// backends: a `Local` child (Tart ssh / the Bare test harness), reaped through
+/// its process group; or a `Container` driven over the podman socket, waited and
+/// removed through the libpod API. The output loop drives whichever one this is
+/// identically.
+enum RunControl {
+    Local(LiveChild),
+    Container(PodmanHandle),
+}
+
+/// a running sandbox container: the socket client, the container id, and the
+/// background frame-demux pump. Waiting reaps it (a stopped container is always
+/// removed); terminate kills then removes it.
+struct PodmanHandle {
+    client: podman_api::Podman,
+    id: String,
+    pump: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RunControl {
+    /// kill (if still running) and remove the run, on every error/cancel/timeout
+    /// path. Idempotent enough to call once at teardown.
+    async fn terminate(&mut self) {
+        match self {
+            RunControl::Local(live) => live.terminate().await,
+            RunControl::Container(handle) => {
+                let _ = handle.client.kill(&handle.id, "SIGKILL").await;
+                let _ = handle.client.remove(&handle.id).await;
+                if let Some(pump) = handle.pump.take() {
+                    pump.abort();
+                }
+            }
+        }
+    }
+
+    /// wait for exit; returns `(success, exit_description)`. A container that has
+    /// exited is removed here (its output is already drained), so the success
+    /// path needs no separate cleanup.
+    async fn wait_success(&mut self, label: &str) -> std::io::Result<(bool, String)> {
+        match self {
+            RunControl::Local(live) => {
+                let status = live.wait_complete(label).await?;
+                Ok((status.success(), status.to_string()))
+            }
+            RunControl::Container(handle) => {
+                let code = handle
+                    .client
+                    .wait(&handle.id)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let _ = handle.client.remove(&handle.id).await;
+                if let Some(pump) = handle.pump.take() {
+                    pump.abort();
+                }
+                Ok((code == 0, format!("exit code {code}")))
+            }
+        }
     }
 }
 
@@ -3044,13 +2481,7 @@ impl TartGuard {
                     wait_process_group_gone(group, program).await;
                 }
             } else if let Some(child) = process.child.as_mut() {
-                let _ = terminate_child(
-                    child,
-                    process.process_group,
-                    None,
-                    &mut process.leader_reaped,
-                )
-                .await;
+                terminate_child(child, process.process_group, &mut process.leader_reaped).await;
             }
             process.cleaned = true;
         }
@@ -3288,49 +2719,82 @@ impl CliProvider {
         // Declared before the SSH child so VM stop/delete runs after the child
         // is dropped on success, error, or timeout.
         let tart_guard = self.tart_setup(tart_plan.as_ref(), ctx).await?;
-        let (mut command, podman) = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
-            let mut command = tokio::process::Command::new("sshpass");
-            command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, false));
-            (command, None)
-        } else {
-            let PreparedCommand { command, podman } =
-                self.prepared_command(args, workdir, ctx, &auth)?;
-            (command, podman)
-        };
-        if let Some(podman) = &podman {
-            podman.prepare_cidfile()?;
-        }
-        command
-            .current_dir(workdir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        configure_process_group(&mut command);
         let idle = self.timeout;
         let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
         if let Some(invocation) = &broker_invocation {
             invocation.arm(hard);
         }
-        let child = command
-            .spawn()
-            .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
-        let mut live = LiveChild::new(child, podman);
-        let mut stdin = live
-            .child_mut()
-            .stdin
-            .take()
-            .ok_or_else(|| "child stdin was not piped".to_string())?;
-        let mut stdout_pipe = live
-            .child_mut()
-            .stdout
-            .take()
-            .ok_or_else(|| "child stdout was not piped".to_string())?;
-        let mut stderr_pipe = live
-            .child_mut()
-            .stderr
-            .take()
-            .ok_or_else(|| "child stderr was not piped".to_string())?;
+        // backend split. Podman drives a container over its socket; Tart/Bare
+        // spawn a local child. Both expose the run's stdio as boxed streams so
+        // the refreshable-timeout output loop below is byte-identical, and both
+        // yield a `RunControl` that knows how to wait for exit and terminate.
+        type BoxRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+        type BoxWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+        let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control): (
+            BoxWrite,
+            BoxRead,
+            BoxRead,
+            RunControl,
+        ) = if matches!(self.backend, SandboxBackend::Podman { .. }) {
+            let final_args = self.broker_argv(args, workdir, &auth);
+            let (client, id) = self
+                .podman_create_and_start(&final_args, workdir, ctx, &auth, false)
+                .await?;
+            let attach = client.attach(&id, false).await.map_err(|e| {
+                format!("attach {} container {}: {e}", self.bin.display(), &id[..12.min(id.len())])
+            })?;
+            let io = podman_api::headless_io(attach);
+            (
+                Box::new(io.stdin),
+                Box::new(io.stdout),
+                Box::new(io.stderr),
+                RunControl::Container(PodmanHandle {
+                    client,
+                    id,
+                    pump: Some(io.pump),
+                }),
+            )
+        } else {
+            let mut command = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
+                let mut command = tokio::process::Command::new("sshpass");
+                command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, false));
+                command
+            } else {
+                self.prepared_command(args, workdir, ctx, &auth)?.command
+            };
+            command
+                .current_dir(workdir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            configure_process_group(&mut command);
+            let child = command
+                .spawn()
+                .map_err(|e| format!("spawn {} failed: {e}", self.bin.display()))?;
+            let mut live = LiveChild::new(child);
+            let stdin = live
+                .child_mut()
+                .stdin
+                .take()
+                .ok_or_else(|| "child stdin was not piped".to_string())?;
+            let stdout = live
+                .child_mut()
+                .stdout
+                .take()
+                .ok_or_else(|| "child stdout was not piped".to_string())?;
+            let stderr = live
+                .child_mut()
+                .stderr
+                .take()
+                .ok_or_else(|| "child stderr was not piped".to_string())?;
+            (
+                Box::new(stdin),
+                Box::new(stdout),
+                Box::new(stderr),
+                RunControl::Local(live),
+            )
+        };
 
         // feed the prompt CONCURRENTLY with collecting output: a prompt larger
         // than the pipe buffer would deadlock a sequential write-then-wait if
@@ -3390,7 +2854,7 @@ impl CliProvider {
                         if let Some(invocation) = &broker_invocation {
                             invocation.revoke();
                         }
-                        live.terminate().await;
+                        control.terminate().await;
                         return Err(format!(
                             "reading {} stdout failed: {e}",
                             self.bin.display()
@@ -3411,7 +2875,7 @@ impl CliProvider {
                         if let Some(invocation) = &broker_invocation {
                             invocation.revoke();
                         }
-                        live.terminate().await;
+                        control.terminate().await;
                         return Err(format!(
                             "reading {} stderr failed: {e}",
                             self.bin.display()
@@ -3422,7 +2886,7 @@ impl CliProvider {
                     if let Some(invocation) = &broker_invocation {
                         invocation.revoke();
                     }
-                    live.terminate().await;
+                    control.terminate().await;
                     return Err(format!(
                         "{} cancelled (child terminated)",
                         self.bin.display()
@@ -3447,7 +2911,7 @@ impl CliProvider {
                         if let Some(invocation) = &broker_invocation {
                             invocation.revoke();
                         }
-                        live.terminate().await;
+                        control.terminate().await;
                         return Err(format!(
                             "{} cancelled (child terminated)",
                             self.bin.display()
@@ -3481,7 +2945,7 @@ impl CliProvider {
                     if should_continue {
                         continue;
                     }
-                    live.terminate().await;
+                    control.terminate().await;
                     return Err(if now >= hard {
                         format!(
                             "{} timed out: still running at the hard cap of {:?} \
@@ -3506,31 +2970,31 @@ impl CliProvider {
             invocation.revoke();
         }
         enum WaitOutcome {
-            Exited(std::io::Result<std::process::ExitStatus>),
+            Exited(std::io::Result<(bool, String)>),
             Cancelled,
             TimedOut,
         }
         let label = self.bin.display().to_string();
-        let status = match tokio::select! {
-            status = live.wait_complete(&label) => {
-                WaitOutcome::Exited(status)
+        let (success, exit_desc) = match tokio::select! {
+            outcome = control.wait_success(&label) => {
+                WaitOutcome::Exited(outcome)
             },
             _ = cancellation_requested(ctx.cancellation.as_ref()) => WaitOutcome::Cancelled,
             _ = tokio::time::sleep(idle) => WaitOutcome::TimedOut,
         } {
-            WaitOutcome::Exited(Ok(status)) => status,
+            WaitOutcome::Exited(Ok(pair)) => pair,
             WaitOutcome::Exited(Err(error)) => {
                 if let Some(invocation) = &broker_invocation {
                     invocation.revoke();
                 }
-                live.terminate().await;
+                control.terminate().await;
                 return Err(format!("waiting on {} failed: {error}", self.bin.display()));
             }
             WaitOutcome::Cancelled => {
                 if let Some(invocation) = &broker_invocation {
                     invocation.revoke();
                 }
-                live.terminate().await;
+                control.terminate().await;
                 return Err(format!(
                     "{} cancelled (child terminated)",
                     self.bin.display()
@@ -3540,7 +3004,7 @@ impl CliProvider {
                 if let Some(invocation) = &broker_invocation {
                     invocation.revoke();
                 }
-                live.terminate().await;
+                control.terminate().await;
                 return Err(format!(
                     "{} closed its output but did not exit within {idle:?} (child killed)",
                     self.bin.display()
@@ -3551,13 +3015,12 @@ impl CliProvider {
         // draining stdin — the exit status below is the primary diagnostic.
         let fed = fed.unwrap_or(Ok(()));
 
-        if !status.success() {
+        if !success {
             // a failed exit is the primary diagnostic — it subsumes any
             // stdin write error (an early-exiting child EPIPEs the feed).
             return Err(format!(
-                "{} exited with {}: {}",
+                "{} exited with {exit_desc}: {}",
                 self.bin.display(),
-                status,
                 excerpt(&String::from_utf8_lossy(&err_bytes))
             ));
         }
@@ -3895,8 +3358,9 @@ fn excerpt(s: &str) -> String {
 /// sessions stay off beyond env overrides). `DUCKTAPE_AGENT_WORKSPACES` /
 /// `DUCKTAPE_AGENT_SESSIONS` override the wired roots. `output_sink`
 /// installs a live tail on every discovered CLI provider.
-/// `node_identity` is the verified local signer/origin bytes; Podman uses its
-/// canonical [`execution_node_id`] to scope crash reaping to this node only.
+/// `node_identity` is the verified local signer/origin bytes, kept for the run
+/// labels. Crash-orphan cleanup is the node's [`PodmanService::reap_orphans`]
+/// (its podman store is node-private), not this discovery path.
 pub fn discover(
     node_identity: &[u8],
     dirs: AgentDirs,
@@ -3904,11 +3368,7 @@ pub fn discover(
     backend: SandboxBackend,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
-    let executing_node = execution_node_id(node_identity);
-    if matches!(&backend, SandboxBackend::Podman { .. }) {
-        reap_podman_orphans_once(&executing_node)
-            .map_err(|error| format!("Podman crash-orphan cleanup failed: {error}"))?;
-    }
+    let _executing_node = execution_node_id(node_identity);
     let timeout = std::env::var("DUCKTAPE_PROVIDER_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -4124,579 +3584,6 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
-    fn podman_ctx() -> RunContext {
-        RunContext {
-            executing_node: Some(execution_node_id(b"test-node")),
-            ..RunContext::default()
-        }
-    }
-
-    #[test]
-    fn execution_node_identity_is_canonical_lower_hex() {
-        assert_eq!(execution_node_id(&[0, 0x0f, 0xa5, 0xff]), "000fa5ff");
-    }
-
-    #[tokio::test]
-    async fn cancellation_is_clone_visible_and_sticky() {
-        let cancellation = RunCancellation::new();
-        let waiter = cancellation.clone();
-        let waiting = tokio::spawn(async move { waiter.cancelled().await });
-        assert!(!cancellation.is_cancelled());
-
-        cancellation.cancel();
-        tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("an active waiter is woken")
-            .expect("waiter task does not panic");
-        assert!(cancellation.is_cancelled());
-        tokio::time::timeout(Duration::from_millis(50), cancellation.cancelled())
-            .await
-            .expect("a late waiter observes the cancelled state");
-    }
-
-    // ---- podman backend glue ------------------------------------------------
-
-    #[test]
-    fn podman_cleanup_commands_target_one_container_id() {
-        let cid = "0123456789abcdef";
-        assert_eq!(
-            PodmanRun::stop_argv(cid),
-            vec!["stop", "--ignore", "--time", "2", cid]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            PodmanRun::wait_argv(cid),
-            vec!["wait".to_string(), cid.to_string()]
-        );
-        assert_eq!(
-            PodmanRun::remove_argv(cid),
-            vec!["rm", "--force", "--ignore", cid]
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn podman_late_cid_query_uses_the_full_unique_run_identity() {
-        let labels = vec![
-            PODMAN_MANAGED_LABEL.into(),
-            format!("{PODMAN_NODE_LABEL}=node"),
-            format!("{PODMAN_OWNER_BOOT_LABEL}=boot"),
-            format!("{PODMAN_OWNER_PID_LABEL}=7"),
-            format!("{PODMAN_OWNER_START_LABEL}=11"),
-            format!("{PODMAN_INSTANCE_LABEL}=7-1"),
-        ];
-        let run = PodmanRun {
-            cidfile: scratch("podman-exact-query").join("run.cid"),
-            labels: labels.clone(),
-        };
-        let query = run.exact_query_argv();
-        assert_eq!(query[..4].join(" "), "ps --all --quiet --no-trunc");
-        assert_eq!(
-            query.iter().filter(|arg| *arg == "--filter").count(),
-            labels.len()
-        );
-        for label in labels {
-            assert!(query.contains(&format!("label={label}")), "{query:?}");
-        }
-        assert!(
-            query
-                .iter()
-                .all(|arg| !arg.contains("name=") && !arg.contains("pkill"))
-        );
-    }
-
-    #[test]
-    fn podman_reaper_absent_binary_is_a_noop_not_a_failure() {
-        // A node configured for a podman sandbox but without podman installed
-        // must still boot: the reaper skips (nothing to reap) rather than
-        // failing, and never shells out.
-        let executing_node = execution_node_id(b"node-a");
-        let outcome = reap_podman_orphans_with(
-            &executing_node,
-            "11111111-2222-3333-4444-555555555555",
-            false, // podman absent
-            |_| panic!("must not touch /proc when podman is absent"),
-            |_| panic!("must not spawn podman when it is absent"),
-        );
-        assert_eq!(outcome, Ok(()));
-    }
-
-    #[test]
-    fn podman_process_reaper_preserves_live_owner_and_reaps_only_dead_owner() {
-        let live_cid = "0123456789abcdef";
-        let dead_cid = "fedcba9876543210";
-        let executing_node = execution_node_id(b"node-a");
-        let query = podman_reap_query_argv(&executing_node);
-        let boot_id = "11111111-2222-3333-4444-555555555555";
-        let mut calls = Vec::new();
-        reap_podman_orphans_with(
-            &executing_node,
-            boot_id,
-            true,
-            |pid| match pid {
-                101 => Ok(Some(1001)),
-                // PID 202 exists but starttime differs: it was reused and is
-                // not the process that created this container.
-                202 => Ok(Some(9999)),
-                _ => Err("unexpected pid".into()),
-            },
-            |args| {
-                calls.push(args.to_vec());
-                if args == query.as_slice() {
-                    return Ok(format!("{live_cid}\n{dead_cid}\n"));
-                }
-                if args == podman_owner_inspect_argv(live_cid).as_slice() {
-                    return Ok(format!("{boot_id}\t101\t1001\n"));
-                }
-                if args == podman_owner_inspect_argv(dead_cid).as_slice() {
-                    return Ok(format!("{boot_id}\t202\t2002\n"));
-                }
-                if args == PodmanRun::wait_argv(dead_cid).as_slice() {
-                    return Err("container auto-removed after stop".into());
-                }
-                Ok(String::new())
-            },
-        )
-        .expect("fake managed container is reaped");
-
-        assert_eq!(
-            calls,
-            vec![
-                query.clone(),
-                podman_owner_inspect_argv(live_cid),
-                podman_owner_inspect_argv(dead_cid),
-                PodmanRun::stop_argv(dead_cid),
-                PodmanRun::wait_argv(dead_cid),
-                PodmanRun::remove_argv(dead_cid),
-            ]
-        );
-        assert!(calls.iter().all(|args| {
-            !args.iter().any(|arg| arg.contains("pkill"))
-                && (args.first().map(String::as_str) != Some("ps")
-                    || (args
-                        .iter()
-                        .any(|arg| arg == "label=io.ducktape.managed=capability-host")
-                        && args
-                            .iter()
-                            .any(|arg| arg == &format!("label=io.ducktape.node={executing_node}"))))
-        }));
-        assert!(parse_container_ids("not-a-container-id\n").is_err());
-    }
-
-    #[test]
-    fn podman_process_reaper_preserves_missing_or_unverifiable_owner() {
-        let missing = "0123456789abcdef";
-        let unreadable = "fedcba9876543210";
-        let executing_node = execution_node_id(b"node-a");
-        let query = podman_reap_query_argv(&executing_node);
-        let boot_id = "11111111-2222-3333-4444-555555555555";
-        let mut calls = Vec::new();
-        reap_podman_orphans_with(
-            &executing_node,
-            boot_id,
-            true,
-            |_| Err("/proc denied".into()),
-            |args| {
-                calls.push(args.to_vec());
-                if args == query.as_slice() {
-                    return Ok(format!("{missing}\n{unreadable}\n"));
-                }
-                if args == podman_owner_inspect_argv(missing).as_slice() {
-                    return Ok("<no value>\t<no value>\t<no value>\n".into());
-                }
-                if args == podman_owner_inspect_argv(unreadable).as_slice() {
-                    return Ok(format!("{boot_id}\t303\t3003\n"));
-                }
-                panic!("preserved containers must not receive cleanup: {args:?}");
-            },
-        )
-        .expect("unknown owners are preserved safely");
-        assert_eq!(calls.len(), 3, "one query and two exact inspections");
-    }
-
-    #[test]
-    fn podman_process_reaper_has_a_hard_inspection_bound() {
-        let executing_node = execution_node_id(b"node-a");
-        let query = podman_reap_query_argv(&executing_node);
-        let listed = (1..=PODMAN_REAP_MAX + 1)
-            .map(|id| format!("{id:016x}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let error = reap_podman_orphans_with(
-            &executing_node,
-            "11111111-2222-3333-4444-555555555555",
-            true,
-            |_| panic!("limit is checked before /proc"),
-            |args| {
-                assert_eq!(args, query.as_slice());
-                Ok(listed.clone())
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("bounded reaper limit"), "got: {error}");
-    }
-
-    #[test]
-    fn bounded_command_drains_large_stdout_and_stderr_while_waiting() {
-        let dir = scratch("podman-large-control-output");
-        let script = fake_cli(
-            &dir,
-            "large-output",
-            "i=0\n\
-             while [ \"$i\" -lt 4096 ]; do printf '%064d\\n' 0; i=$((i + 1)); done\n\
-             i=0\n\
-             while [ \"$i\" -lt 4096 ]; do printf '%064d\\n' 1 >&2; i=$((i + 1)); done",
-        );
-        let stdout = run_command_bounded(
-            Path::new("/bin/sh"),
-            &[script.display().to_string()],
-            Duration::from_secs(10),
-        )
-        .expect("both streams are drained before their pipe buffers fill");
-        assert!(stdout.len() > 64 * 1024, "stdout crossed a pipe buffer");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bounded_command_removes_a_helper_that_keeps_its_pipes_open() {
-        let dir = scratch("bounded-command-residual-helper");
-        let pidfile = dir.join("helper.pid");
-        let script = fake_cli(
-            &dir,
-            "residual-helper",
-            &format!("sleep 30 &\necho $! > {}\nexit 0", pidfile.display()),
-        );
-        let started = std::time::Instant::now();
-        run_command_bounded(
-            Path::new("/bin/sh"),
-            &[script.display().to_string()],
-            Duration::from_secs(2),
-        )
-        .expect("the exited leader's residual group is removed before pipe join");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "a background helper must not hold pipe readers until timeout"
-        );
-        let helper = std::fs::read_to_string(pidfile)
-            .unwrap()
-            .trim()
-            .parse::<libc::pid_t>()
-            .unwrap();
-        #[cfg(target_os = "linux")]
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{helper}/stat")) {
-            let (state, _) = linux_process_state_and_group(&stat).expect("helper proc stat");
-            assert!(
-                matches!(state, 'Z' | 'X' | 'x'),
-                "helper still computes: {stat}"
-            );
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert_eq!(unsafe { libc::kill(helper, 0) }, -1);
-            assert_eq!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ESRCH)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn podman_cancellation_collects_a_delayed_cid_before_exact_cleanup() {
-        let dir = scratch("podman-delayed-cid");
-        let cidfile = dir.join("run.cid");
-        let run = PodmanRun {
-            cidfile: cidfile.clone(),
-            labels: Vec::new(),
-        };
-        let cid = "0123456789abcdef";
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            std::fs::write(cidfile, format!("{cid}\n")).unwrap();
-        });
-        let collected = run
-            .wait_container_id_until(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await
-            .expect("the cidfile creation race is collected");
-        writer.await.unwrap();
-        assert_eq!(collected, cid);
-        assert_eq!(
-            PodmanRun::stop_argv(&collected).last().map(String::as_str),
-            Some(cid)
-        );
-        assert_eq!(
-            PodmanRun::wait_argv(&collected).last().map(String::as_str),
-            Some(cid)
-        );
-        assert_eq!(
-            PodmanRun::remove_argv(&collected)
-                .last()
-                .map(String::as_str),
-            Some(cid)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn podman_mount_checks_resolve_symlinks_and_reject_relative_paths() {
-        use std::os::unix::fs::symlink;
-
-        let dir = scratch("podman-canonical-mounts");
-        let home = dir.join("real-home");
-        let control = home.join(".ducktape/provider-runs/podman");
-        std::fs::create_dir_all(&control).unwrap();
-        let home_alias = dir.join("home-alias");
-        symlink(&home, &home_alias).unwrap();
-        assert_eq!(
-            canonical_mount_path(&home_alias, "test HOME").unwrap(),
-            std::fs::canonicalize(&home).unwrap()
-        );
-
-        let exposed_alias = dir.join("exposed-alias");
-        symlink(&control, &exposed_alias).unwrap();
-        let error = ensure_podman_control_hidden(
-            &std::fs::canonicalize(&control).unwrap(),
-            [exposed_alias.as_path()],
-        )
-        .unwrap_err();
-        assert!(error.contains("would be exposed"), "got: {error}");
-        assert!(canonical_mount_path(Path::new("relative/home"), "test HOME").is_err());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn setup_kill_does_not_return_before_the_child_is_reaped() {
-        let args = vec!["-c".into(), "sleep 30".into()];
-        let mut process = GroupChild::spawn("/bin/sh", &args, false).expect("spawn setup process");
-        process.kill_and_wait_blocking();
-        assert!(matches!(
-            process.child.as_mut().unwrap().try_wait(),
-            Ok(Some(_))
-        ));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn proc_stat_parser_handles_parentheses_and_distinguishes_zombies() {
-        assert_eq!(
-            linux_process_state_and_group("42 (agent (worker)) S 7 19 19 0"),
-            Some(('S', 19))
-        );
-        assert_eq!(
-            linux_process_state_and_group("43 (sleep) Z 1 19 19 0"),
-            Some(('Z', 19))
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_a_setup_process_reaps_its_whole_process_group() {
-        let dir = scratch("tart-setup-drop");
-        let pidfile = dir.join("setup.pid");
-        let args = vec![
-            "-c".into(),
-            format!(
-                "trap '' TERM; echo $$ > {}; sleep 30 & wait",
-                pidfile.display()
-            ),
-        ];
-        let process = GroupChild::spawn("/bin/sh", &args, false).expect("spawn setup process");
-        let group = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pidfile)
-                    && let Ok(pid) = pid.trim().parse::<u32>()
-                {
-                    break pid;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("setup process reports its group");
-        drop(process);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while process_group_alive(group) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("dropping setup leaves no descendant behind");
-    }
-
-    #[test]
-    fn a_finished_podman_run_removes_its_host_cidfile() {
-        let dir = scratch("podman-cidfile-cleanup");
-        let cidfile = dir.join("run.cid");
-        std::fs::write(&cidfile, b"0123456789abcdef\n").unwrap();
-        let run = PodmanRun {
-            cidfile: cidfile.clone(),
-            labels: Vec::new(),
-        };
-        run.remove_cidfile();
-        assert!(!cidfile.exists());
-    }
-
-    #[test]
-    fn podman_refuses_a_run_without_its_executing_node_scope() {
-        let root = scratch("podman-missing-node-scope");
-        let bin = root.join("pod");
-        let workdir = root.join("wd");
-        std::fs::write(&bin, b"pod").unwrap();
-        std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(
-            sandbox_spec("pod"),
-            bin,
-            SandboxBackend::Podman {
-                image: "img".into(),
-            },
-        );
-        let error = match provider.command(
-            &[],
-            &workdir,
-            &RunContext::default(),
-            &RunAuth::default(),
-        ) {
-            Ok(_) => panic!("an unscoped Podman run could be reaped by the wrong node"),
-            Err(error) => error,
-        };
-        assert!(error.contains("executing-node"), "got: {error}");
-    }
-
-    #[test]
-    fn podman_backend_wraps_command_with_identical_paths_and_rw_mounts() {
-        // the command() glue that assembles HOME, expands the spec's `~/`
-        // rw_dirs against it, and hands identical container paths to
-        // wrap_podman — asserted through the real command() the same way a run
-        // would build it. wrap_podman's own translation is covered in sandbox.rs.
-        let spec = CapabilitySpec::parse(
-            r#"
-spec = 1
-[capability]
-tag = "pod"
-[detect]
-bin = "pod"
-[invoke]
-args = []
-prompt = "stdin"
-[output]
-format = "text"
-[sandbox]
-rw_dirs = ["~/.claude"]
-"#,
-            "test",
-        )
-        .unwrap();
-        let root = scratch("podman-command-paths");
-        let bin = root.join("pod");
-        let workdir = root.join("wd");
-        std::fs::write(&bin, b"pod").unwrap();
-        std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(
-            spec,
-            bin.clone(),
-            SandboxBackend::Podman {
-                image: "img".into(),
-            },
-        );
-        let ctx = RunContext {
-            env: BTreeMap::from([
-                ("RUN_SECRET".to_string(), "not-in-argv".to_string()),
-                (
-                    RUN_ACTION_URL_ENV.to_string(),
-                    "http://127.0.0.1:4321/v1/run-action".to_string(),
-                ),
-            ]),
-            limits: BTreeMap::from([("cores".to_string(), 2u64)]),
-            ..podman_ctx()
-        };
-        let cmd = provider
-            .command(&["--go".into()], &workdir, &ctx, &RunAuth::default())
-            .expect("podman command builds");
-        let std = cmd.as_std();
-        assert_eq!(std.get_program(), std::ffi::OsStr::new("podman"));
-        let argv: Vec<String> = std
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let joined = argv.join(" ");
-        let home = canonical_mount_path(
-            &PathBuf::from(std::env::var_os("HOME").expect("HOME set in test env")),
-            "test HOME",
-        )
-        .unwrap();
-        // the spec's `~/.claude` expands against the real HOME and mounts rw at
-        // its IDENTICAL container path; the bin mounts ro; limits become flags.
-        assert!(
-            joined.contains(&format!(
-                "-v {home}/.claude:{home}/.claude",
-                home = home.display()
-            )),
-            "rw mount at identical path: {joined}"
-        );
-        assert!(
-            joined.contains(&format!("-v {bin}:{bin}:ro", bin = bin.display())),
-            "{joined}"
-        );
-        assert!(joined.contains("-e HOME"), "{joined}");
-        assert!(joined.contains("-e RUN_SECRET"), "{joined}");
-        assert!(joined.contains("--network=slirp4netns"), "{joined}");
-        assert!(
-            !joined.contains("not-in-argv"),
-            "secret value leaked in argv: {joined}"
-        );
-        assert_eq!(
-            std.get_envs()
-                .find(|(key, _)| *key == std::ffi::OsStr::new("RUN_SECRET"))
-                .and_then(|(_, value)| value),
-            Some(std::ffi::OsStr::new("not-in-argv"))
-        );
-        assert_eq!(
-            std.get_envs()
-                .find(|(key, _)| *key == std::ffi::OsStr::new("HOME"))
-                .and_then(|(_, value)| value),
-            Some(std::ffi::OsStr::new(&home))
-        );
-        assert_eq!(
-            std.get_envs()
-                .find(|(key, _)| *key == std::ffi::OsStr::new(RUN_ACTION_URL_ENV))
-                .and_then(|(_, value)| value),
-            Some(std::ffi::OsStr::new(
-                "http://host.containers.internal:4321/v1/run-action"
-            ))
-        );
-        assert!(joined.contains("--cpus 2"), "{joined}");
-        assert!(
-            joined.contains("--cidfile")
-                && joined.contains("--label io.ducktape.managed=capability-host")
-                && joined.contains(&format!(
-                    "--label io.ducktape.node={}",
-                    execution_node_id(b"test-node")
-                ))
-                && joined.contains("--label io.ducktape.owner.boot=")
-                && joined.contains("--label io.ducktape.owner.pid=")
-                && joined.contains("--label io.ducktape.owner.starttime=")
-                && joined.contains("--label io.ducktape.run=")
-                && joined.contains("--label io.ducktape.instance="),
-            "managed lifecycle identity: {joined}"
-        );
-        let cidfile = joined
-            .split_whitespace()
-            .skip_while(|arg| *arg != "--cidfile")
-            .nth(1)
-            .expect("cidfile value");
-        assert!(
-            !joined.contains(&format!("-v {cidfile}:"))
-                && !joined.contains(&format!("-e {cidfile}")),
-            "host cidfile is not visible inside the container: {joined}"
-        );
-        assert!(
-            joined.ends_with(&format!("img {} --go", bin.display())),
-            "{joined}"
-        );
-    }
 
     #[test]
     fn tart_backend_builds_a_boot_then_ssh_plan() {
@@ -4815,7 +3702,11 @@ printf 'sandbox-ok:%s' "$prompt""#,
     async fn macos_podman_hardware_smoke() {
         let image = std::env::var("DUCKTAPE_MACOS_PODMAN_IMAGE")
             .unwrap_or_else(|_| "docker.io/library/node:22-slim".into());
-        hardware_sandbox_smoke("macos-podman-hardware", SandboxBackend::Podman { image }).await;
+        hardware_sandbox_smoke(
+            "macos-podman-hardware",
+            SandboxBackend::Podman { image, socket: std::path::PathBuf::from(std::env::var("DUCKTAPE_PODMAN_SOCKET").unwrap_or_default()) },
+        )
+        .await;
     }
 
     /// Real Tart gate for Apple Silicon hardware. The provider owns the full
@@ -4832,70 +3723,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
         hardware_sandbox_smoke("macos-tart-hardware", SandboxBackend::Tart { image }).await;
     }
 
-    #[test]
-    fn a_sandboxed_run_mounts_its_skills_tree_read_only_when_it_has_one() {
-        // W6 skills live at a SIBLING of the rw checkout (outside the workdir, so
-        // `commit` never scans them), and the provisioner tells the child where
-        // via DUCKTAPE_RUN_SKILLS. under the bare test harness the env alone works — the path is
-        // on the host. under a sandbox, only what we mount exists, so without the
-        // mount the agent would find its own skills dir simply MISSING.
-        let root = scratch("podman-skills-mount");
-        let bin = root.join("pod");
-        let workdir = root.join("wd");
-        let skills = root.join("agent-7-ro");
-        std::fs::write(&bin, b"pod").unwrap();
-        std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::create_dir_all(&skills).unwrap();
-        let provider = CliProvider::from_spec(
-            sandbox_spec("pod"),
-            bin,
-            SandboxBackend::Podman {
-                image: "img".into(),
-            },
-        );
-        let ctx = RunContext {
-            env: BTreeMap::from([(SKILLS_ROOT_ENV.to_string(), skills.display().to_string())]),
-            ..podman_ctx()
-        };
-        let cmd = provider
-            .command(&[], &workdir, &ctx, &RunAuth::default())
-            .expect("podman command builds");
-        let joined = argv_of(&cmd);
-        // READ-ONLY, at the identical path the env names: the agent may read its
-        // skills, never rewrite them.
-        assert!(
-            joined.contains(&format!("-v {s}:{s}:ro", s = skills.display())),
-            "the skills root mounts ro at its identical path: {joined}"
-        );
-        assert!(
-            joined.contains(&format!("-e {SKILLS_ROOT_ENV}")),
-            "and the env still points at it: {joined}"
-        );
-    }
 
-    #[test]
-    fn a_run_with_no_skills_mounts_none() {
-        // no skills on the run = no mount. (the provisioner omits the env entirely
-        // when the agent has no skill records — see agent_provision's plane tests.)
-        let root = scratch("podman-no-skills-mount");
-        let bin = root.join("pod");
-        let workdir = root.join("wd");
-        std::fs::write(&bin, b"pod").unwrap();
-        std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(
-            sandbox_spec("pod"),
-            bin,
-            SandboxBackend::Podman {
-                image: "img".into(),
-            },
-        );
-        let cmd = provider
-            .command(&[], &workdir, &podman_ctx(), &RunAuth::default())
-            .expect("podman command builds");
-        let joined = argv_of(&cmd);
-        assert!(!joined.contains(SKILLS_ROOT_ENV), "{joined}");
-        assert!(!joined.contains("-ro:"), "no ro sibling mount: {joined}");
-    }
 
     // ---- the assembled context document (the agent's "soul") ----------------
 
@@ -5024,66 +3852,6 @@ format = "text"
         assert_eq!(out, "PROMPT", "no doc, no prepend");
     }
 
-    #[test]
-    fn a_sandbox_binds_a_workspace_parent_soul_read_only_and_needs_no_bind_for_a_config_home_one() {
-        let root = scratch("podman-context-mount");
-        let workdir = root.join("wd");
-        let bin = root.join("pod");
-        let soul = root.join("CLAUDE.md");
-        std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::write(&bin, b"pod").unwrap();
-        std::fs::write(&soul, SOUL).unwrap();
-        let ctx = RunContext {
-            context_doc: Some(SOUL.to_string()),
-            ..podman_ctx()
-        };
-
-        // OUTSIDE the workdir mount: without this bind the file would exist on the
-        // host and simply not be there for the child — a silently unsouled agent.
-        let provider = CliProvider::from_spec(
-            spec_with("pod", "[context]\npath = \"workspace-parent:CLAUDE.md\"\n"),
-            bin.clone(),
-            SandboxBackend::Podman {
-                image: "img".into(),
-            },
-        );
-        let cmd = provider
-            .command(&[], &workdir, &ctx, &RunAuth::default())
-            .expect("podman command builds");
-        let joined = argv_of(&cmd);
-        assert!(
-            joined.contains(&format!("-v {s}:{s}:ro", s = soul.display())),
-            "the soul binds ro at its identical path: {joined}"
-        );
-
-        // INSIDE it: a config-home doc lives under the workdir, which every backend
-        // already mounts — no second bind, and none wanted.
-        let provider = CliProvider::from_spec(
-            spec_with(
-                "pod",
-                "[isolation]\nconfig_home_env = \"H\"\n\n\
-                 [context]\npath = \"config-home:AGENTS.md\"\n",
-            ),
-            bin,
-            SandboxBackend::Podman {
-                image: "img".into(),
-            },
-        );
-        let config_home = workdir.join(".ducktape-run/slot/provider-config");
-        std::fs::create_dir_all(&config_home).unwrap();
-        let auth = RunAuth {
-            config_home: Some(&config_home),
-            broker: None,
-        };
-        let cmd = provider
-            .command(&[], &workdir, &ctx, &auth)
-            .expect("podman command builds");
-        let joined = argv_of(&cmd);
-        assert!(
-            !joined.contains("AGENTS.md"),
-            "a doc under the workdir crosses for free: {joined}"
-        );
-    }
 
     // ---- the credential broker ----------------------------------------------
 
@@ -5154,6 +3922,7 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
             SandboxBackend::Podman {
                 image: "img".into(),
+                socket: std::path::PathBuf::new(),
             },
             SandboxBackend::Tart {
                 image: "ghcr.io/example/macos-base:latest".into(),

@@ -1,18 +1,12 @@
 //! the sandbox backend seam: how a provider child is spawned. every backend
 //! is an audited in-tree adapter — a run NEVER executes bare on the host, so
-//! the seam has no unsandboxed variant a config could select. Podman wraps
-//! the argv in a rootless container that enforces the run's numeric limits.
-//! paths are mounted at identical
-//! container paths so workdir/session/skill logic upstream stays path-blind.
-//! HOME is NOT mounted: only the spec's [sandbox] rw_dirs (CLI auth/state)
-//! cross the boundary, so the node's data dir and user key stay outside —
-//! this is the D7 filesystem-isolation boundary for sandboxed providers.
-//! Every Podman run gets a PRIVATE netns (`--network=slirp4netns`), never the
-//! host's: it reaches only its own broker + this node's RPC via the
-//! `host.containers.internal` gateway, never other runs' brokers or the node's
-//! loopback control plane — that is the D-network isolation boundary.
-//! ponytail: a private netns still NATs outbound; an egress allowlist (broker +
-//! node only) is the next hardening — see the `--network=slirp4netns` site below.
+//! the seam has no unsandboxed variant a config could select.
+//!
+//! This module owns the [`SandboxBackend`] enum + its boot probe, and the Tart
+//! (macOS) backend. The Podman backend's execution — building each run's
+//! neutral-path `SpecGenerator`, driving create/start/attach/wait over the
+//! node-private libpod socket, and the egress firewall — lives in
+//! [`crate::podman_api`]; there is no `podman` CLI path any more.
 //!
 //! Tart (Apple Silicon, Virtualization.framework) is the macOS-guest backend:
 //! a run APFS-COW-clones a base image, configures and boots it, executes through
@@ -32,6 +26,11 @@ use std::path::{Path, PathBuf};
 pub enum SandboxBackend {
     Podman {
         image: String,
+        /// the node-private rootless podman socket this backend drives (libpod
+        /// REST over a unix socket — never the `podman` CLI). Owned by the
+        /// node's [`crate::PodmanService`], isolated from any other podman on
+        /// the host.
+        socket: std::path::PathBuf,
     },
     /// macOS / Apple Silicon: each run APFS-COW-clones `image`, runs the guest
     /// under a process-wide concurrency cap of 2 ([`TART_MAX_CONCURRENT`]), and
@@ -75,17 +74,25 @@ impl SandboxBackend {
     /// verify this host can actually run the chosen adapter: the runtime
     /// binary must be executable somewhere on `PATH`. a config naming an
     /// unusable runtime is a loud boot error — there is no bare fallback.
-    /// Podman additionally requires `slirp4netns`, the backend for the private
-    /// container netns every run gets (see [`wrap_podman_inner`]) — a hard
-    /// dependency, so missing it fails at boot, not per-run.
+    /// Podman additionally requires `nft` + `nsenter` (the egress firewall the
+    /// createRuntime hook installs in each run's netns) — hard dependencies, so
+    /// a missing one fails at boot, never as a silently unfirewalled run. The
+    /// netns backend (slirp4netns / pasta) is podman's own default and is not
+    /// probed here — `nsmode = "private"` uses whichever the host provides.
     pub fn probe(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
         let found = find_on_path(bin).ok_or_else(|| {
             format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
         })?;
-        let podman_needs_slirp = matches!(self, SandboxBackend::Podman { .. });
-        if podman_needs_slirp && find_on_path("slirp4netns").is_none() {
-            return Err("slirp4netns is not executable on PATH; the Podman sandbox requires it for the private container netns — install it".into());
+        if matches!(self, SandboxBackend::Podman { .. }) {
+            for dep in ["nft", "nsenter"] {
+                if crate::podman_api::find_system_tool(dep).is_none() {
+                    return Err(format!(
+                        "{dep} is not executable on PATH or a standard sbin dir; the Podman \
+                         sandbox requires it to install each run's egress firewall — install it"
+                    ));
+                }
+            }
         }
         Ok(found)
     }
@@ -99,140 +106,6 @@ fn find_on_path(bin: &str) -> Option<PathBuf> {
         .find(|candidate| crate::is_executable(candidate))
 }
 
-/// translate a provider invocation into a `podman run` argv — PURE, no I/O, so
-/// it unit-tests without podman installed. mounts every path at its IDENTICAL
-/// container path (nothing upstream translates paths): the workdir rw, the
-/// executor bin ro, each `ro_paths` entry ro (the run's PATH-entry dirs and its
-/// W6 skills tree — see `CliProvider::sandbox_ro_paths`), each `rw_dirs`
-/// entry rw (the spec's CLI auth/state dirs). Environment values live on the
-/// Podman process and argv carries names only. Only the limit dimensions this
-/// backend knows how to enforce (`cores` → `--cpus`, `mem_gb` → `--memory` and
-/// `--memory-swap` with the same value) become flags; an unknown dimension
-/// (e.g. `gpu`) is silently ignored — the scheduler already matched it, the
-/// backend enforces only what it can.
-// one flat argument per translation input keeps this a PURE, dependency-free
-// function (no context struct to build in tests); the alternative bundle would
-// exist only to appease the lint.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn wrap_podman(
-    image: &str,
-    bin: &Path,
-    args: &[String],
-    workdir: &Path,
-    envs: &[(String, String)],
-    ro_paths: &[PathBuf],
-    rw_dirs: &[PathBuf],
-    limits: &BTreeMap<String, u64>,
-) -> (PathBuf, Vec<String>) {
-    wrap_podman_inner(
-        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false,
-    )
-}
-
-/// The production wrapper adds host-owned lifecycle identity without exposing
-/// the cidfile inside the container. Kept crate-private so the public pure
-/// translation API does not grow a host-lifecycle concern.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn wrap_podman_managed(
-    image: &str,
-    bin: &Path,
-    args: &[String],
-    workdir: &Path,
-    envs: &[(String, String)],
-    ro_paths: &[PathBuf],
-    rw_dirs: &[PathBuf],
-    limits: &BTreeMap<String, u64>,
-    cidfile: &Path,
-    labels: &[String],
-    tty: bool,
-) -> (PathBuf, Vec<String>) {
-    wrap_podman_inner(
-        image,
-        workdir,
-        bin,
-        args,
-        envs,
-        ro_paths,
-        rw_dirs,
-        limits,
-        Some((cidfile, labels)),
-        tty,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn wrap_podman_inner(
-    image: &str,
-    workdir: &Path,
-    bin: &Path,
-    args: &[String],
-    envs: &[(String, String)],
-    ro_paths: &[PathBuf],
-    rw_dirs: &[PathBuf],
-    limits: &BTreeMap<String, u64>,
-    control: Option<(&Path, &[String])>,
-    tty: bool,
-) -> (PathBuf, Vec<String>) {
-    let mut argv: Vec<String> = vec!["run".into(), "--rm".into()];
-    // A PRIVATE netns via slirp4netns: the container gets its OWN loopback, so it
-    // can no longer scan the host's — closing the lateral reach `--network=host`
-    // gave, where a member could hit other runs' brokers / the node's loopback
-    // control plane. slirp4netns auto-adds `host.containers.internal` (→ the
-    // host's routable IP), which is how the child reaches this run's broker (bound
-    // to a routable interface; base_url = host.containers.internal — see
-    // `broker::Reachability`) and this node's RPC (the run-action URL is rewritten
-    // to the same gateway — see `podman_command`).
-    //
-    // slirp4netns is named EXPLICITLY, not left to podman's default: the default
-    // is pasta, which a host may not have installed (verified: a box with only
-    // slirp4netns fails `podman run` with the default). slirp4netns is the
-    // widely-available backend and `probe()` makes its absence a boot error.
-    //
-    // STILL DEFERRED (needs more podman-host work): a full OUTBOUND egress
-    // allowlist (block the internet, allow only the broker + node RPC) — a
-    // private netns alone still NATs outbound.
-    argv.push("--network=slirp4netns".into());
-    // -i keeps stdin open (the prompt is fed on the child's stdin). -t adds a
-    // container-side pty for an interactive session — the host attaches podman's
-    // stdio to a pty master and podman relays terminal size/SIGWINCH into it.
-    argv.push("-i".into());
-    if tty {
-        argv.push("-t".into());
-    }
-    if let Some((cidfile, labels)) = control {
-        argv.extend(["--cidfile".into(), cidfile.display().to_string()]);
-        for label in labels {
-            argv.extend(["--label".into(), label.clone()]);
-        }
-    }
-    if let Some(cores) = limits.get("cores") {
-        argv.extend(["--cpus".into(), cores.to_string()]);
-    }
-    if let Some(mem) = limits.get("mem_gb") {
-        let mem = format!("{mem}g");
-        argv.extend(["--memory".into(), mem.clone()]);
-        argv.extend(["--memory-swap".into(), mem]);
-    }
-    argv.extend(["-v".into(), format!("{d}:{d}", d = workdir.display())]);
-    argv.extend(["-w".into(), workdir.display().to_string()]);
-    argv.extend(["-v".into(), format!("{b}:{b}:ro", b = bin.display())]);
-    for p in ro_paths {
-        argv.extend(["-v".into(), format!("{p}:{p}:ro", p = p.display())]);
-    }
-    for d in rw_dirs {
-        argv.extend(["-v".into(), format!("{d}:{d}", d = d.display())]);
-    }
-    for (k, _) in envs {
-        // Podman reads the value from its own environment. Keep run-scoped
-        // values out of argv, where process listings and error logs expose them.
-        argv.extend(["-e".into(), k.clone()]);
-    }
-    argv.push(image.to_string());
-    argv.push(bin.display().to_string());
-    argv.extend(args.iter().cloned());
-    (PathBuf::from("podman"), argv)
-}
 
 // ---- tart (macOS / Apple Silicon) ------------------------------------------
 
@@ -582,198 +455,6 @@ pub(crate) fn tart_set_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn podman_wrap_translates_limits_mounts_and_env() {
-        let (bin, argv) = wrap_podman(
-            "docker.io/library/node:22-slim",
-            Path::new("/usr/bin/claude"),
-            &["--print".into()],
-            Path::new("/tmp/work"),
-            &[("FOO".into(), "bar".into())],
-            &[PathBuf::from("/opt/skills")],
-            &[PathBuf::from("/home/u/.claude")],
-            &[("cores".into(), 4u64), ("mem_gb".into(), 8u64)]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(bin, PathBuf::from("podman"));
-        let s = argv.join(" ");
-        assert!(s.starts_with("run --rm --network=slirp4netns"), "got: {s}");
-        assert!(
-            s.contains("--cpus 4") && s.contains("--memory 8g") && s.contains("--memory-swap 8g"),
-            "got: {s}"
-        );
-        assert!(
-            s.contains("-v /tmp/work:/tmp/work") && s.contains("-w /tmp/work"),
-            "got: {s}"
-        );
-        assert!(
-            s.contains("-v /usr/bin/claude:/usr/bin/claude:ro"),
-            "got: {s}"
-        );
-        assert!(s.contains("-v /opt/skills:/opt/skills:ro"), "got: {s}");
-        assert!(
-            s.contains("-v /home/u/.claude:/home/u/.claude"),
-            "auth state rw, got: {s}"
-        );
-        assert!(s.contains("-e FOO"), "got: {s}");
-        assert!(!s.contains("bar"), "environment values stay out of argv: {s}");
-        assert!(
-            s.ends_with("docker.io/library/node:22-slim /usr/bin/claude --print"),
-            "got: {s}"
-        );
-    }
-
-    #[test]
-    fn managed_podman_identity_stays_in_host_only_flags() {
-        let cidfile = Path::new("/host/ducktape/provider-runs/7.cid");
-        let labels = vec![
-            "io.ducktape.managed=capability-host".to_string(),
-            "io.ducktape.node=6e6f64652d61".to_string(),
-            "io.ducktape.instance=7".to_string(),
-        ];
-        let (_bin, argv) = wrap_podman_managed(
-            "img",
-            Path::new("/bin/x"),
-            &[],
-            Path::new("/work"),
-            &[],
-            &[],
-            &[],
-            &BTreeMap::new(),
-            cidfile,
-            &labels,
-            false,
-        );
-        let s = argv.join(" ");
-        assert!(
-            s.contains("--cidfile /host/ducktape/provider-runs/7.cid"),
-            "got: {s}"
-        );
-        assert!(
-            s.contains("--label io.ducktape.managed=capability-host")
-                && s.contains("--label io.ducktape.node=6e6f64652d61")
-                && s.contains("--label io.ducktape.instance=7"),
-            "got: {s}"
-        );
-        assert!(
-            !s.contains("-v /host/ducktape")
-                && !s.contains("-e /host/ducktape")
-                && !s.contains("/host/ducktape/provider-runs/7.cid:"),
-            "cidfile must never be mounted or exported: {s}"
-        );
-    }
-
-    #[test]
-    fn tty_flag_is_added_only_for_interactive_sessions() {
-        let cidfile = Path::new("/host/x.cid");
-        let labels: Vec<String> = vec![];
-        let build = |tty: bool| {
-            wrap_podman_managed(
-                "img",
-                Path::new("/bin/x"),
-                &[],
-                Path::new("/work"),
-                &[],
-                &[],
-                &[],
-                &BTreeMap::new(),
-                cidfile,
-                &labels,
-                tty,
-            )
-            .1
-            .join(" ")
-        };
-        let headless = build(false);
-        let interactive = build(true);
-        assert!(
-            headless.split(' ').any(|a| a == "-i"),
-            "headless keeps -i: {headless}"
-        );
-        assert!(
-            !headless.split(' ').any(|a| a == "-t"),
-            "headless has no -t: {headless}"
-        );
-        assert!(
-            interactive.split(' ').any(|a| a == "-t"),
-            "interactive adds -t: {interactive}"
-        );
-    }
-
-    #[test]
-    fn podman_always_gets_a_private_slirp4netns_never_the_host_netns() {
-        let cidfile = Path::new("/host/x.cid");
-        let labels: Vec<String> = vec![];
-        let (_bin, argv) = wrap_podman_managed(
-            "img",
-            Path::new("/bin/x"),
-            &[],
-            Path::new("/work"),
-            &[],
-            &[],
-            &[],
-            &BTreeMap::new(),
-            cidfile,
-            &labels,
-            false,
-        );
-        let s = argv.join(" ");
-        // Every run gets its OWN netns (reachable via host.containers.internal),
-        // never the host's — a member can no longer scan host loopback for other
-        // runs' brokers or the node's control plane.
-        assert!(s.contains("--network=slirp4netns"), "private netns: {s}");
-        assert!(!s.contains("--network=host"), "never host netns: {s}");
-    }
-
-    #[test]
-    fn dimensions_without_a_podman_flag_are_ignored_not_errors() {
-        // {"gpu": 1} produces no flag — scheduling already matched it; the
-        // backend enforces only what it knows how to enforce.
-        let (_bin, argv) = wrap_podman(
-            "img",
-            Path::new("/bin/x"),
-            &[],
-            Path::new("/w"),
-            &[],
-            &[],
-            &[],
-            &[("gpu".into(), 1u64)].into_iter().collect(),
-        );
-        let s = argv.join(" ");
-        assert!(
-            !s.contains("--cpus") && !s.contains("--memory") && !s.contains("--memory-swap"),
-            "got: {s}"
-        );
-        assert!(
-            !s.contains("gpu"),
-            "an unknown dimension is not a flag: {s}"
-        );
-    }
-
-    #[test]
-    fn always_wraps_even_with_no_limits() {
-        // a sandboxed node sandboxes everything: a demandless run still wraps,
-        // just without any limit flags.
-        let (_bin, argv) = wrap_podman(
-            "img",
-            Path::new("/bin/x"),
-            &[],
-            Path::new("/w"),
-            &[],
-            &[],
-            &[],
-            &BTreeMap::new(),
-        );
-        let s = argv.join(" ");
-        assert!(s.starts_with("run --rm --network=slirp4netns"), "got: {s}");
-        assert!(
-            !s.contains("--memory") && !s.contains("--memory-swap"),
-            "got: {s}"
-        );
-        assert!(s.ends_with("img /bin/x"), "got: {s}");
-    }
 
     // ---- tart backend -------------------------------------------------------
 
