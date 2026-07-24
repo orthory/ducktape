@@ -25,6 +25,8 @@ on clear_page_search
 
 on open_page_search_hit(page_id, block_id)
   return if loading || mutation_phase != "idle"
+  palette_open = false
+  shell_tab = "pages"
   page_search_generation = page_search_generation + 1
   page_searching = false
   orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)

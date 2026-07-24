@@ -66,6 +66,7 @@ extern crate::backend
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
   sync connection_degraded(status:str) -> bool
+  sync palette_key_action(physical:physical-key, modifiers:key-modifiers, open:bool) -> str
   sync slash_kind_matches(draft:str, kinds:[str]) -> [str]
   sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
   sync doc_tabs_without(tabs:[str], page_id:str) -> [str]

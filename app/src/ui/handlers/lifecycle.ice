@@ -264,8 +264,62 @@ on live_block_comments_failed(cause)
   block_thread_comments_loading = false
   error = cause.message
 
+on select_shell_tab(next)
+  shell_tab = next
+
+on toggle_palette
+  return if !connected
+  palette_open = !palette_open
+  palette_draft = ""
+  palette_chat_hits = []
+  palette_page_hits = []
+  palette_generation = palette_generation + 1
+  palette_searching = false
+  return if !palette_open
+  task widget focus #workspace-tabs/palette-input
+
+on close_palette
+  palette_open = false
+
+on global_key_pressed(event)
+  palette_key = palette_key_action(event.physical_key, event.modifiers, palette_open)
+  return if palette_key == "none" || !connected
+  palette_open = palette_key == "open"
+  palette_key = ""
+  palette_draft = ""
+  palette_chat_hits = []
+  palette_page_hits = []
+  palette_generation = palette_generation + 1
+  palette_searching = false
+  return if !palette_open
+  task widget focus #workspace-tabs/palette-input
+
+on palette_changed(next)
+  palette_draft = next
+  palette_generation = palette_generation + 1
+  palette_searching = !empty(trim(palette_draft))
+  return if empty(trim(palette_draft))
+  parallel
+    run search_chat(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_chat_loaded _ | palette_search_failed _
+    run search_pages(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_page_loaded _ | palette_search_failed _
+
+on palette_chat_loaded(next)
+  return if next.generation != palette_generation
+  palette_chat_hits = next.hits
+  palette_searching = false
+
+on palette_page_loaded(next)
+  return if next.generation != palette_generation
+  palette_page_hits = next.hits
+  palette_searching = false
+
+on palette_search_failed(cause)
+  return if cause.generation != palette_generation
+  palette_searching = false
+
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
+  keyboard press when connected -> global_key_pressed _
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)

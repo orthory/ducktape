@@ -980,6 +980,27 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+/// The global-key router for the command palette: platform-Command+K
+/// toggles, Escape closes an open palette; anything else is `none`.
+pub fn palette_key_action(
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+    open: bool,
+) -> String {
+    use iced::keyboard::key::{Code, Physical};
+    let is_toggle = modifiers.command() && physical == Physical::Code(Code::KeyK);
+    if is_toggle {
+        return match open {
+            true => "close".into(),
+            false => "open".into(),
+        };
+    }
+    if open && physical == Physical::Code(Code::Escape) {
+        return "close".into();
+    }
+    "none".into()
+}
+
 /// The slash menu: a draft starting with `/` filters the insertable block
 /// kinds by case-insensitive prefix (`/h` -> the headings). Empty when the
 /// draft is not a slash command.

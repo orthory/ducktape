@@ -1,5 +1,5 @@
 view
-  WorkspaceTabs status=status loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) #workspace-tabs
+  WorkspaceTabs status=status loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab #workspace-tabs
     connection:
       container width=fill padding=6.0 bg=transparent border=fg/11 border-w=1.0 r=10.0
         col width=fill spacing=5.0
@@ -802,3 +802,42 @@ view
               layer
                 float x=(block_menu_x + 10.0) y=block_menu_y
                   BlockActionsMenu block_id=selected_block_id kind=selected_block_kind disabled=(loading || mutation_phase != "idle") delete_armed=block_delete_armed editable_kinds=editable_block_kinds
+    palette:
+      stack width=fill height=fill
+        if palette_open
+          container width=fill height=fill align-x=center padding-top=72.0 bg=shadow/45
+            container width=540.0 padding=10.0 bg=popover border=fg/14 border-w=1.0 r=12.0 shadow=shadow shadow-y=8.0 shadow-blur=24.0
+              col width=fill spacing=8.0
+                input "" #palette-input label="Search everything" <-> palette_draft change=palette_changed hint="Search messages and pages… (Esc closes)" submit=close_palette width=fill padding=8.0 text-size=14.0 line-height=1.2
+                  active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
+                  hovered bg=elevated border=fg/21
+                  focused bg=elevated border=fg/45 border-w=1.0
+                if palette_searching
+                  text "Searching…" size=11.0 @text-muted
+                if !empty(palette_chat_hits) || !empty(palette_page_hits)
+                  scroll direction=vertical width=fill height=380.0
+                    col width=fill spacing=4.0
+                      if !empty(palette_chat_hits)
+                        container width=fill padding-left=4.0
+                          text "MESSAGES" size=11.0 font=medium @text-muted
+                        col width=fill spacing=1.0
+                          for hit in palette_chat_hits
+                            button label="Open message" width=fill padding=6.0 -> open_chat_search_hit(hit.channel_id, hit.root_seq, hit.seq)
+                              col width=fill spacing=1.0
+                                text hit.text size=13.0 wrapping=none @text-fg
+                                text hit.meta size=11.0 wrapping=none font=mono @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                              hovered bg=primary/12 text=fg
+                              pressed bg=primary/18
+                      if !empty(palette_page_hits)
+                        container width=fill padding-left=4.0
+                          text "PAGES" size=11.0 font=medium @text-muted
+                        col width=fill spacing=1.0
+                          for hit in palette_page_hits
+                            button label="Open page" width=fill padding=6.0 -> open_page_search_hit(hit.page_id, hit.block_id)
+                              col width=fill spacing=1.0
+                                text hit.text size=13.0 wrapping=none @text-fg
+                                text hit.kind size=11.0 wrapping=none font=mono @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                              hovered bg=primary/12 text=fg
+                              pressed bg=primary/18

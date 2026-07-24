@@ -72,6 +72,14 @@ state
   chat_searching = false
   chat_search_generation:i64 = 0
   history_view = false
+  shell_tab = "chat"
+  palette_open = false
+  palette_draft = ""
+  palette_key = ""
+  palette_generation:i64 = 0
+  palette_searching = false
+  palette_chat_hits:[ChatSearchHit] = []
+  palette_page_hits:[PageSearchHit] = []
   pages:[PageItem] = []
   doc_tabs:[str] = []
   closing_doc_tab = ""

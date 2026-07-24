@@ -110,22 +110,24 @@ mod tests {
     }
 
     #[test]
-    fn tab_selection_stays_in_the_component_scope() {
+    fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
         let (mut app, _) = Ducktape::__boot();
-        let _ = app.__update(__DucktapeMessage::__WorkspaceTabsHandleSelectTab(
-            "workspace-tabs".into(),
-            "pages".into(),
-        ));
+        assert_eq!(app.shell_tab, "chat");
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+        assert_eq!(app.shell_tab, "pages");
 
-        assert_eq!(
-            app.__ice_component_workspacetabs["workspace-tabs"].tab,
-            "pages"
-        );
-
-        let _ = app.__update(__DucktapeMessage::__WorkspaceTabsHandleToggleConnection(
-            "workspace-tabs".into(),
+        // a palette chat hit closes the palette and lands on the chat pane
+        app.loading = false;
+        app.mutation_phase = "idle".into();
+        app.connected_rpc = "http://node".into();
+        app.palette_open = true;
+        let _ = app.__update(__DucktapeMessage::OpenChatSearchHit(
+            "general".into(),
+            7,
+            7,
         ));
-        assert!(app.__ice_component_workspacetabs["workspace-tabs"].connection_open);
+        assert!(!app.palette_open);
+        assert_eq!(app.shell_tab, "chat");
     }
 
     #[test]
@@ -1232,7 +1234,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         // the shell is titlebar + optional degradation banner over the panes.
         assert!(shell.contains("component TitleBar(status:str, loading:bool)"));
         assert!(shell.contains("component ConnectionBanner(status:str)"));
-        assert!(shell.contains("if degraded\n        ConnectionBanner status=status"));
+        assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
         assert!(shell.contains(
             "container width=sidebar_width height=fill padding=12.0 bg=sidebar"
         ));

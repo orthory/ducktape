@@ -25,6 +25,8 @@ on clear_chat_search
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   return if loading || mutation_phase != "idle"
+  palette_open = false
+  shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
