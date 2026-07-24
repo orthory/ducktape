@@ -512,6 +512,19 @@ async fn proxy(
     }
 }
 
+/// Map the caller's request path onto the vendor upstream. Anthropic serves the
+/// `/v1/...` shape the caller sends, so it passes through. The ChatGPT Codex
+/// backend serves `/responses` under `/backend-api/codex` (no `/v1`), but codex
+/// posts to its `.../v1` broker base so the path arrives as `/v1/responses` —
+/// stripping the `/v1` prefix lands it on `.../codex/responses` instead of a
+/// 404'd `.../codex/v1/responses`.
+fn upstream_path(kind: CredentialKind, caller_path: &str) -> &str {
+    match kind {
+        CredentialKind::Claude => caller_path,
+        CredentialKind::Codex => caller_path.strip_prefix("/v1").unwrap_or(caller_path),
+    }
+}
+
 async fn proxy_inner(
     st: &AppState,
     method: Method,
@@ -632,12 +645,17 @@ async fn proxy_inner(
         o.access_token.clone()
     };
 
-    // Upstream base is chosen by the credential's vendor kind.
+    // Upstream base is the credential's vendor endpoint; the caller's path maps
+    // onto it per vendor (see `upstream_path`).
     let upstream_base = match entry.kind {
         CredentialKind::Claude => &st.cfg.anthropic_base,
         CredentialKind::Codex => &st.cfg.openai_base,
     };
-    let url = format!("{}{}", upstream_base.trim_end_matches('/'), path_and_query);
+    let url = format!(
+        "{}{}",
+        upstream_base.trim_end_matches('/'),
+        upstream_path(entry.kind, path_and_query)
+    );
     let mut rb = st.http.request(method, &url).body(body.to_vec());
     // Forward the caller's headers verbatim, minus ones we own or that would
     // break the relay. bearer_auth then plants the real credential.
@@ -749,4 +767,24 @@ async fn refresh_now(cfg: &Config, http: &reqwest::Client, entry: &CredEntry) ->
     }
     o.expires_at = now + expires_in.saturating_sub(60);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_upstream_path_strips_v1_but_claude_passes_through() {
+        // Codex: `.../backend-api/codex` + this path must be `/responses`, not
+        // `/v1/responses` (the 404 the ChatGPT backend returns otherwise).
+        assert_eq!(upstream_path(CredentialKind::Codex, "/v1/responses"), "/responses");
+        assert_eq!(
+            upstream_path(CredentialKind::Codex, "/v1/responses?stream=true"),
+            "/responses?stream=true"
+        );
+        // Claude: `api.anthropic.com` + `/v1/messages` is correct — pass through.
+        assert_eq!(upstream_path(CredentialKind::Claude, "/v1/messages"), "/v1/messages");
+        // A codex path already without `/v1` is left alone.
+        assert_eq!(upstream_path(CredentialKind::Codex, "/responses"), "/responses");
+    }
 }
