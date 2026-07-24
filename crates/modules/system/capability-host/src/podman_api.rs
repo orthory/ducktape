@@ -5,12 +5,16 @@
 //! `tokio::net::UnixStream` so it pulls no HTTP client dependency and the
 //! response parser + attach demux are unit-testable without a running podman.
 //!
-//! UNVERIFIED against a live podman: this dev box has no working podman (no
-//! conmon), so every real round-trip here is covered only by pure unit tests
-//! (the HTTP parser, the chunked decoder, the attach frame demux, the
-//! `SpecGenerator` JSON, the egress ruleset). The libpod field/endpoint shapes
-//! follow podman's documented `SpecGenerator`; the slirp4netns option plumbing
-//! and the attach framing need a real-node QA pass before this is trusted.
+//! LIVE-VALIDATED against real rootless podman (5.4.2 on the dev box, 6.0.1 on
+//! macmini-duke): create+inspect confirms every `SpecGenerator` field takes
+//! effect (work_dir, mounts+RW, netns=private→slirp4netns/pasta, dropped
+//! NET_ADMIN/NET_RAW in `.BoundingCaps`, cpu/mem limits, annotations); attach
+//! returns `101 UPGRADED` and the raw-stdin/framed-stdout demux round-trips; the
+//! egress ruleset, installed via `nsenter -U --net` + `nft` into the container
+//! netns, blocks the LAN + tailnet (incl. tailnet DNS) while the broker port,
+//! the scoped resolver, and the public internet stay reachable. Pure logic is
+//! also unit-tested (HTTP parse, chunked decode, attach demux, spec JSON,
+//! ruleset order) so it stays green without podman.
 //!
 //! Path hiding lives here too: [`plan_mounts`] maps every host path to a
 //! NEUTRAL `/ducktape/...` guest path and [`translate`] rewrites env/argv to
@@ -166,18 +170,26 @@ pub(crate) fn translate(value: &str, mounts: &[Mount], home: &Path, guest_home: 
 
 /// the nftables ruleset installed inside a run's container netns by the node
 /// binary's `__egress-hook` — PURE, so its ordering is unit-tested without
-/// podman. ORDER is load-bearing: the broker/node accept precedes the
-/// private-range drop, so the two allowed host:port pairs survive even though
-/// `host_ip` is itself in a dropped range. `100.64.0.0/10` is the tailnet/CGNAT
+/// podman. ORDER is load-bearing: the broker/node + DNS accepts precede the
+/// private-range drop, so those specific host:port pairs survive even though
+/// their IPs sit inside dropped ranges. `100.64.0.0/10` is the tailnet/CGNAT
 /// block; `fc00::/7` covers IPv6 ULA + tailnet-v6. Everything else (the public
 /// internet, v4 and v6) falls through to `policy accept` — the broker still
 /// mediates all provider-API traffic regardless.
 ///
 /// `host_ip` is what `host.containers.internal` resolves to INSIDE the
-/// container (a fixed pasta address like `192.168.127.254`, NOT the host's
-/// routable IP) — the hook reads it from the container's `/etc/hosts`, so it is
-/// correct regardless of the network backend.
-pub fn egress_nftables(host_ip: &str, ports: &[u16]) -> String {
+/// container (slirp: the host's routable LAN IP; pasta: a fixed `192.168.127.x`)
+/// — the hook reads it from the container's `/etc/hosts`, correct for any
+/// backend. `resolver_ip` is the container's PRIMARY nameserver (the slirp/pasta
+/// local forwarder). DNS is scoped to THAT IP only, NOT `dport 53` universally:
+/// the container inherits the host's resolv.conf, which on a tailnet box lists
+/// the Tailscale MagicDNS resolvers (100.100.100.100 / fd7a::53) — a blanket
+/// `dport 53 accept` would let the run reach those tailnet services and any
+/// LAN box on :53. Scoping to the local forwarder keeps name resolution working
+/// (it forwards upstream) while the tailnet/LAN resolvers stay dropped.
+/// (Live-verified on podman 5.4.2: LAN + tailnet DNS blocked, github.com still
+/// resolves through the forwarder.)
+pub fn egress_nftables(host_ip: &str, resolver_ip: &str, ports: &[u16]) -> String {
     let mut lines = vec![
         "table inet ducktape {".to_string(),
         "  chain output {".to_string(),
@@ -192,8 +204,9 @@ pub fn egress_nftables(host_ip: &str, ports: &[u16]) -> String {
             .join(", ");
         lines.push(format!("    ip daddr {host_ip} tcp dport {{ {allowed} }} accept"));
     }
-    lines.push("    udp dport 53 accept".to_string());
-    lines.push("    tcp dport 53 accept".to_string());
+    // DNS ONLY to the container's own forwarder — never a blanket :53 (see doc).
+    lines.push(format!("    ip daddr {resolver_ip} udp dport 53 accept"));
+    lines.push(format!("    ip daddr {resolver_ip} tcp dport 53 accept"));
     lines.push(
         "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, \
          169.254.0.0/16, 127.0.0.0/8 } drop"
@@ -221,9 +234,13 @@ pub(crate) struct OciMount {
     pub options: Vec<String>,
 }
 
-/// a libpod `Namespace` — `nsmode` is `"pasta"` for our private, host-isolated
-/// netns. (podman 6 REMOVED slirp4netns; pasta is the rootless default and is
-/// more host-isolated by default. The egress nft hook is the real enforcement.)
+/// a libpod `Namespace` — `nsmode` is `"private"`: a NEW netns (never the
+/// host's) populated by whatever the host's default rootless network cmd is.
+/// This is version-agnostic ON PURPOSE — `"slirp4netns"` fails on podman 6
+/// (removed) and `"pasta"` fails on podman 5.4 (not shipped); `"private"`
+/// resolves to slirp4netns on 5.4 and pasta on 6. Both give a private netns
+/// reachable via `host.containers.internal`; the egress nft hook is the real
+/// enforcement on top.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct Namespace {
     pub nsmode: String,
@@ -335,7 +352,7 @@ impl SpecGenerator {
             annotations: BTreeMap::new(),
             mounts,
             netns: Namespace {
-                nsmode: "pasta".to_string(),
+                nsmode: "private".to_string(),
             },
             cap_drop: vec!["NET_ADMIN".to_string(), "NET_RAW".to_string()],
             resource_limits,
@@ -781,11 +798,19 @@ mod tests {
 
     #[test]
     fn egress_ruleset_orders_allow_before_private_drop() {
-        let rs = egress_nftables("192.168.1.50", &[45001, 8080]);
+        let rs = egress_nftables("192.168.1.50", "10.0.2.3", &[45001, 8080]);
         let allow = rs.find("dport { 45001, 8080 } accept").expect("allow line");
+        let dns = rs.find("10.0.2.3 udp dport 53 accept").expect("scoped dns line");
         let drop = rs.find("100.64.0.0/10").expect("tailnet drop line");
-        assert!(allow < drop, "allow must precede the private-range drop:\n{rs}");
+        assert!(allow < drop, "broker allow must precede the private-range drop:\n{rs}");
+        assert!(dns < drop, "scoped DNS must precede the private-range drop:\n{rs}");
         assert!(rs.contains("192.168.1.50"), "host ip pinned");
+        // DNS is scoped to the resolver, NOT a blanket dport 53 — a bare
+        // `dport 53 accept` (no daddr) would reach LAN/tailnet resolvers.
+        assert!(
+            !rs.lines().any(|l| l.trim() == "udp dport 53 accept"),
+            "DNS must be scoped to the resolver, never universal:\n{rs}"
+        );
         assert!(rs.contains("100.64.0.0/10"), "tailnet v4 blocked");
         assert!(rs.contains("ip6 daddr { fc00::/7"), "tailnet/ULA v6 blocked");
         assert!(rs.contains("oifname \"lo\" accept"));
@@ -793,8 +818,9 @@ mod tests {
 
     #[test]
     fn egress_ruleset_with_no_ports_still_valid() {
-        let rs = egress_nftables("10.0.0.5", &[]);
+        let rs = egress_nftables("10.0.0.5", "10.0.2.3", &[]);
         assert!(!rs.contains("dport {"), "no port allow-list when no ports:\n{rs}");
+        assert!(rs.contains("10.0.2.3 udp dport 53 accept"), "dns still scoped:\n{rs}");
         assert!(rs.contains("drop"));
     }
 
@@ -823,7 +849,7 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"work_dir\":\"/ducktape/workspace\""), "{json}");
         assert!(json.contains("/ducktape/bin/claude"), "{json}");
-        assert!(json.contains("\"nsmode\":\"pasta\""), "{json}");
+        assert!(json.contains("\"nsmode\":\"private\""), "{json}");
         assert!(json.contains("NET_ADMIN") && json.contains("NET_RAW"), "{json}");
         assert!(json.contains("\"remove\":false"), "own removal, no auto-remove: {json}");
         assert!(json.contains("\"quota\":400000"), "cpu quota: {json}");
