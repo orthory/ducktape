@@ -23,7 +23,16 @@ use crate::{lobby, relay};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
+    /// one drain turn: the pass over delivered finalizations, then the
+    /// `/v1/status` publish — the boundary a pass settles must be visible on
+    /// the cell the moment the turn ends, and `publish_status` owns the
+    /// (throttled) operations refresh, so the pass itself stays free of it.
     pub(super) async fn on_drain(&mut self) {
+        self.drain_pass().await;
+        self.publish_status().await;
+    }
+
+    async fn drain_pass(&mut self) {
 
         let Self {
             context,

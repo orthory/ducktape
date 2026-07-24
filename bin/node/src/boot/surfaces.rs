@@ -7,6 +7,9 @@ use crate::constants::MODULE_IDS;
 pub(crate) struct Surfaces {
     pub(crate) rpc_listener: Option<std::net::TcpListener>,
     pub(crate) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
+    /// the `/v1/status` snapshot cell shared with the http surface: the role
+    /// loop that owns the host publishes into it at every boundary it settles.
+    pub(crate) status: noded::StatusCell,
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
@@ -244,6 +247,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     };
     let blobs = http_handle.blob_handle();
     let gateway_commands = http_handle.command_sender();
+    // the /v1/status snapshot cell, captured BEFORE the serve/drop match
+    // consumes the handle: the role loop publishes into it, the http route
+    // reads it without crossing the command lane.
+    let status = http_handle.status_cell();
     // the REAL portable-agent-run provisioner, built from a clone of the http
     // handle BEFORE the serve/drop match consumes it. portable (v3) runs
     // materialize a per-run duckfs checkout under a root VALIDATED to be
@@ -415,6 +422,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     Ok(Surfaces {
         rpc_listener,
         http_cmds,
+        status,
         stream_hub,
         index,
         voice_requests,

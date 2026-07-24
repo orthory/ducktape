@@ -8,7 +8,7 @@ use sdk::Msg;
 
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
-use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
+use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{
     read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
 };
@@ -39,6 +39,24 @@ impl ValidatorRuntime<'_> {
                     self.index.applied_height(module).unwrap_or_default(),
                 )
             }),
+        );
+    }
+
+    /// the ONE `/v1/status` publish seam: refresh the pricier operations
+    /// sections (throttled to `OPS_REFRESH_INTERVAL`), then publish this
+    /// node's boundary snapshot into the shared cell. called at startup and
+    /// at the end of every drain turn.
+    pub(super) async fn publish_status(&mut self) {
+        if self.context.current() >= self.next_ops_refresh {
+            let exposition = self.context.encode();
+            self.refresh_operations(&exposition).await;
+            self.next_ops_refresh = self.context.current() + OPS_REFRESH_INTERVAL;
+        }
+        super::publish_boundary_status(
+            &self.status,
+            &self.node,
+            &self.metrics,
+            &self.status_public_key,
         );
     }
 
@@ -578,31 +596,6 @@ impl ValidatorRuntime<'_> {
                     .await
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
-            }
-            noded::NodeCommand::Status { reply } => {
-                let exposition = self.context.encode();
-                self.refresh_operations(&exposition).await;
-                let modules = MODULE_IDS
-                    .iter()
-                    .map(|m| noded::ModuleStatus {
-                        id: (*m).into(),
-                        root: self
-                            .node
-                            .host()
-                            .module_root(m)
-                            .map(|r| hex(&r))
-                            .unwrap_or_default(),
-                        category: noded::ModuleCategory::of(m),
-                    })
-                    .collect();
-                let _ = reply.send(noded::NodeStatus {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    root_hash: hex(&self.node.root_hash()),
-                    height: self.node.finalized().map(|f| f.height).unwrap_or(0),
-                    modules,
-                    public_key: self.status_public_key.clone(),
-                    operations: self.metrics.operational_status(),
-                });
             }
             noded::NodeCommand::Peers { reply } => {
                 let _ = reply.send(self.peers_sample().await);

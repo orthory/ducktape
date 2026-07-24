@@ -69,7 +69,7 @@ mod git_http;
 pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
-pub use handle::{NodeCommand, NodeHandle};
+pub use handle::{NodeCommand, NodeHandle, StatusCell};
 
 mod module_code;
 pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
@@ -266,8 +266,10 @@ pub fn block_row(record: &BlockRecord) -> Vec<u8> {
 }
 
 /// the status projection: daemon build version, global root-hash, and each
-/// registered module's root.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// registered module's root. `Default` is the pre-first-publish snapshot in
+/// [`StatusCell`] — zeroed boundary facts are the honest answer before any
+/// boundary is served.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub version: String,
     pub root_hash: String,
@@ -790,15 +792,12 @@ async fn query(State(handle): State<NodeHandle>, Json(req): Json<QueryRequest>) 
     }
 }
 
+/// GET /v1/status — the last boundary snapshot the owning actor published,
+/// with live operations overlaid, straight off the handle's [`StatusCell`].
+/// deliberately NEVER crosses the command lane: a sync/catch-up stage keeps
+/// the pump busy for whole stages, and status must answer through that.
 async fn status(State(handle): State<NodeHandle>) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle.send(NodeCommand::Status { reply }).await {
-        return resp;
-    }
-    match rx.await {
-        Ok(status) => Json(status).into_response(),
-        Err(_) => actor_gone(),
-    }
+    Json(handle.status_cell().current()).into_response()
 }
 
 /// GET /v1/peers — the direct-peer sample (see [`peers::PeersView`]): who the

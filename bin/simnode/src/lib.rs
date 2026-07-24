@@ -884,6 +884,9 @@ fn run_sim(
             fatal,
         };
 
+        // the boot snapshot: /v1/status answers from the cell before the
+        // first command, exactly like the real daemons.
+        sim.publish_status();
         loop {
             select! {
                 cmd = control.next() => match cmd {
@@ -944,9 +947,6 @@ fn run_sim(
                             sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);
                     }
-                    Some(NodeCommand::Status { reply }) => {
-                        let _ = reply.send(sim.status());
-                    }
                     Some(NodeCommand::Peers { reply }) => {
                         // the sim has no mesh: its exposition carries no peer
                         // families, so this parses to the honest empty sample
@@ -969,6 +969,10 @@ fn run_sim(
                     None => break,
                 },
             }
+            // one publish per pump turn: any arm may have committed a block
+            // (submit, a control step, a released hold), and the sim is a
+            // test twin — unconditional is simpler than tracking which.
+            sim.publish_status();
         }
     });
 }
@@ -1333,6 +1337,12 @@ impl Sim {
             target: op.target.clone(),
             kind,
         })
+    }
+
+    /// publish the current committed snapshot into the shared `/v1/status`
+    /// cell — the http route reads the cell, never the command lane.
+    fn publish_status(&self) {
+        self.handle.status_cell().publish(self.status());
     }
 
     fn status(&self) -> NodeStatus {

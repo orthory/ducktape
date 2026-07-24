@@ -25,6 +25,7 @@ pub(crate) async fn run_validator(
     oracle: discovery::Oracle<ed25519::PublicKey>,
     quota: Quota,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     sync_source: Option<ed25519::PublicKey>,
     advertised_reach: Ingress,
     status_public_key: String,
@@ -361,6 +362,7 @@ pub(crate) async fn run_validator(
         cred_resolver,
         agent_dirs,
         metrics,
+        status,
         status_public_key,
         coordination,
     })

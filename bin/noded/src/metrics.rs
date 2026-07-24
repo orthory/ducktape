@@ -275,6 +275,12 @@ impl NodeMetrics {
             .clone()
     }
 
+    /// the shared operations projection itself, for the status cell's live
+    /// overlay ([`crate::StatusCell::wire_metrics`]).
+    pub(crate) fn operations_handle(&self) -> Arc<RwLock<OperationalStatus>> {
+        Arc::clone(&self.operations)
+    }
+
     pub fn update_consensus(
         &self,
         epoch: u64,

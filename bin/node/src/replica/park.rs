@@ -76,6 +76,54 @@ async fn peers_sample(
         .with_roles(&validators, &residents)
 }
 
+/// assemble + publish the replica's `/v1/status` snapshot into the shared
+/// cell: the served boundary when one exists, the zeroed answer otherwise —
+/// pre-first-sync the surface still answers (the app's liveness heartbeat),
+/// and a zeroed status is honest: no boundary is served yet. the storage
+/// section rides along so index watermarks stay current with the boundary.
+fn publish_replica_status(
+    status: &noded::StatusCell,
+    metrics: &noded::NodeMetrics,
+    index: &indexer::IndexStore,
+    ckpt_height: Option<u64>,
+    status_public_key: &str,
+    serving: Option<(u64, &host::Host)>,
+) {
+    metrics.update_storage(
+        ckpt_height.unwrap_or_default(),
+        index.is_poisoned(),
+        MODULE_IDS.iter().map(|module| {
+            (
+                (*module).to_string(),
+                index.applied_height(module).unwrap_or_default(),
+            )
+        }),
+    );
+    let (height, root_hash, modules) = match serving {
+        Some((height, host)) => (
+            height,
+            hex(&host.root_hash()),
+            MODULE_IDS
+                .iter()
+                .map(|m| noded::ModuleStatus {
+                    id: (*m).into(),
+                    root: host.module_root(m).map(|r| hex(&r)).unwrap_or_default(),
+                    category: noded::ModuleCategory::of(m),
+                })
+                .collect(),
+        ),
+        None => (0, String::new(), Vec::new()),
+    };
+    status.publish(noded::NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash,
+        height,
+        modules,
+        public_key: status_public_key.into(),
+        operations: metrics.operational_status(),
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn park(
     channels: ReplicaChannels,
@@ -105,6 +153,7 @@ pub(super) async fn park(
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     blobs: noded::blobs::BlobHandle,
     agent_provisioner: &dispatch_oracle::SharedProvisioner,
     cred_resolver: &dispatch_oracle::SharedCredentialResolver,
@@ -475,6 +524,14 @@ pub(super) async fn park(
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+        publish_replica_status(
+            &status,
+            &metrics,
+            &index,
+            replica_prev_ckpt.0,
+            &status_public_key,
+            serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
+        );
         tracing::info!(
             event = "node_phase_transition",
             role = "resident",
@@ -809,48 +866,6 @@ pub(super) async fn park(
                                 };
                                 let _ = reply.send(result);
                             }
-                            noded::NodeCommand::Status { reply } => {
-                                metrics.update_storage(
-                                    replica_prev_ckpt.0.unwrap_or_default(),
-                                    index.is_poisoned(),
-                                    MODULE_IDS.iter().map(|module| {
-                                        (
-                                            (*module).to_string(),
-                                            index.applied_height(module).unwrap_or_default(),
-                                        )
-                                    }),
-                                );
-                                // pre-first-sync the surface still answers (the
-                                // app's liveness heartbeat): a zeroed status is
-                                // honest — no boundary is served yet.
-                                let (height, root_hash, modules) = match &serving {
-                                    Some((height, node_r)) => (
-                                        *height,
-                                        hex(&node_r.host().root_hash()),
-                                        MODULE_IDS
-                                            .iter()
-                                            .map(|m| noded::ModuleStatus {
-                                                id: (*m).into(),
-                                                root: node_r
-                                                    .host()
-                                                    .module_root(m)
-                                                    .map(|r| hex(&r))
-                                                    .unwrap_or_default(),
-                                                category: noded::ModuleCategory::of(m),
-                                            })
-                                            .collect(),
-                                    ),
-                                    None => (0, String::new(), Vec::new()),
-                                };
-                                let _ = reply.send(noded::NodeStatus {
-                                    version: env!("CARGO_PKG_VERSION").into(),
-                                    root_hash,
-                                    height,
-                                    modules,
-                                    public_key: status_public_key.clone(),
-                                    operations: metrics.operational_status(),
-                                });
-                            }
                             noded::NodeCommand::Peers { reply } => {
                                 let _ = reply.send(
                                     peers_sample(
@@ -1008,6 +1023,14 @@ pub(super) async fn park(
                                         "replica backfill pruned; re-syncing at a fresh boundary"
                                     );
                                     serving = None;
+                                    publish_replica_status(
+                                        &status,
+                                        &metrics,
+                                        &index,
+                                        replica_prev_ckpt.0,
+                                        &status_public_key,
+                                        None,
+                                    );
                                     metrics.record_sync_failure(e.detail.clone());
                                     replica_scheme = None;
                                     replica_orchestrator = None;
@@ -1089,6 +1112,14 @@ pub(super) async fn park(
                                              fresh boundary"
                                         );
                                         serving = None;
+                                        publish_replica_status(
+                                            &status,
+                                            &metrics,
+                                            &index,
+                                            replica_prev_ckpt.0,
+                                            &status_public_key,
+                                            None,
+                                        );
                                         metrics.record_sync_failure(e.detail.clone());
                                         metrics.set_role_phase(
                                             noded::NodeRole::Resident,
@@ -1233,6 +1264,17 @@ pub(super) async fn park(
             {
                 metrics.record_sync_progress(*served_height);
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+            }
+            // the boundary this pass folded is visible NOW on /v1/status.
+            if !drained.is_empty() {
+                publish_replica_status(
+                    &status,
+                    &metrics,
+                    &index,
+                    replica_prev_ckpt.0,
+                    &status_public_key,
+                    Some((*served_height, node_r.host())),
+                );
             }
             // ---- valset orchestration (the replica mirror) --------
             //
@@ -1578,6 +1620,14 @@ pub(super) async fn park(
                     "replica epoch cutover; re-ascending"
                 );
                 serving = None;
+                publish_replica_status(
+                    &status,
+                    &metrics,
+                    &index,
+                    replica_prev_ckpt.0,
+                    &status_public_key,
+                    None,
+                );
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
                 replica_scheme = None;
                 replica_orchestrator = None;
@@ -1831,6 +1881,14 @@ pub(super) async fn park(
                             metrics.set_role_phase(
                                 noded::NodeRole::Resident,
                                 noded::NodePhase::Serving,
+                            );
+                            publish_replica_status(
+                                &status,
+                                &metrics,
+                                &index,
+                                replica_prev_ckpt.0,
+                                &status_public_key,
+                                serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
                             );
                             tracing::info!(
                                 event = "node_phase_transition",

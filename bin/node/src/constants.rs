@@ -88,6 +88,11 @@ pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TI
 /// for block handling, not a pacer: finalized blocks drain (and pending ops
 /// flush) event-driven the moment they land.
 pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
+/// the pace of `refresh_operations` (the /metrics exposition parse feeding
+/// status' consensus/storage sections): the status cell publishes boundary
+/// facts per drain pass, but the exposition parse is the pricey part and one
+/// per second bounds its cost — and the staleness — at once.
+pub(crate) const OPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and

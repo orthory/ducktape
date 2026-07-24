@@ -14,8 +14,9 @@ use futures::channel::{mpsc, oneshot};
 use crate::call::CallLane;
 use crate::gateway_http::{BrowserGateway, GatewayLane};
 use crate::gateway_ws_token::WsTokenStore;
+use crate::metrics::NodeMetrics;
 use crate::stream::{LogRing, StreamHub};
-use crate::{BlockSummary, NodeStatus, error_response};
+use crate::{BlockSummary, NodeStatus, OperationalStatus, error_response};
 
 /// inbound command backlog before submit/query callers see backpressure.
 pub(crate) const COMMAND_BUFFER: usize = 64;
@@ -48,9 +49,6 @@ pub enum NodeCommand {
         req: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
     },
-    Status {
-        reply: oneshot::Sender<NodeStatus>,
-    },
     /// sample the direct-peer projection (`GET /v1/peers`): the actor owns
     /// the metrics registry the sample is parsed from, so this read crosses
     /// the command lane like every other.
@@ -66,12 +64,77 @@ pub enum NodeCommand {
     },
 }
 
+/// the `/v1/status` snapshot cell: the actor that owns the host PUBLISHES a
+/// complete [`NodeStatus`] at each boundary it settles, and the http handler
+/// reads the last one published without ever crossing the command lane. that
+/// read-side independence is the point: a sync/catch-up stage keeps the pump
+/// away from its command queue for whole stages, and status is the one
+/// surface that must keep answering through that (it IS the liveness probe).
+#[derive(Clone, Default)]
+pub struct StatusCell {
+    inner: Arc<StatusCellInner>,
+}
+
+#[derive(Default)]
+struct StatusCellInner {
+    /// the last-published snapshot. publish swaps the WHOLE struct under one
+    /// write, so a read reflects exactly one boundary — never a torn one.
+    snapshot: std::sync::RwLock<NodeStatus>,
+    /// the live operations source — the metrics' shared projection, wired
+    /// once at boot by daemons that register [`NodeMetrics`]. a read overlays
+    /// it so phase and sync progress stay live BETWEEN boundary publishes
+    /// (they move mid-stage, exactly when no boundary publish can happen).
+    /// unwired (simnode), the published operations serve as-is.
+    operations: std::sync::OnceLock<Arc<std::sync::RwLock<OperationalStatus>>>,
+}
+
+impl StatusCell {
+    /// publish a complete snapshot — one whole-struct swap.
+    pub fn publish(&self, status: NodeStatus) {
+        *self
+            .inner
+            .snapshot
+            .write()
+            .expect("status snapshot lock poisoned") = status;
+    }
+
+    /// wire the live operations overlay to the metrics' shared projection.
+    /// once per process; a second wiring is a programming error.
+    pub fn wire_metrics(&self, metrics: &NodeMetrics) {
+        self.inner
+            .operations
+            .set(metrics.operations_handle())
+            .expect("status cell operations source wired twice");
+    }
+
+    /// the current status: the last-published boundary facts, with live
+    /// operations overlaid when a metrics source is wired.
+    pub fn current(&self) -> NodeStatus {
+        let mut status = self
+            .inner
+            .snapshot
+            .read()
+            .expect("status snapshot lock poisoned")
+            .clone();
+        if let Some(operations) = self.inner.operations.get() {
+            status.operations = operations
+                .read()
+                .expect("operations lock poisoned")
+                .clone();
+        }
+        status
+    }
+}
+
 /// the router's shared state: a command lane into the node actor, the
 /// stream hub for websocket subscribers, the shutdown signal, and the
 /// node-local blob store the files module shares.
 #[derive(Clone)]
 pub struct NodeHandle {
     pub(crate) cmds: mpsc::Sender<NodeCommand>,
+    /// the `/v1/status` snapshot the owning actor publishes into; the status
+    /// route reads it directly (the one read that never crosses `cmds`).
+    pub(crate) status: StatusCell,
     pub(crate) hub: StreamHub,
     pub(crate) shutdown: tokio::sync::watch::Sender<bool>,
     /// the files blob lane. NOT a command into the actor: chunk bytes stay
@@ -145,6 +208,7 @@ impl NodeHandle {
         let hub = StreamHub::with_log_ring(EVENT_BUFFER, logs);
         let handle = Self {
             cmds: cmd_tx,
+            status: StatusCell::default(),
             hub: hub.clone(),
             shutdown: tokio::sync::watch::channel(false).0,
             blobs: crate::blobs::BlobHandle::default(),
@@ -296,6 +360,12 @@ impl NodeHandle {
 
     pub fn command_sender(&self) -> mpsc::Sender<NodeCommand> {
         self.cmds.clone()
+    }
+
+    /// the `/v1/status` snapshot cell — the owning actor keeps a clone and
+    /// publishes into it at every boundary it settles.
+    pub fn status_cell(&self) -> StatusCell {
+        self.status.clone()
     }
 
     /// the multiplexed stream hub backing `/v1/ws`.

@@ -74,25 +74,6 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         serde_json::to_vec(&serde_json::json!({ "tasks": [] })).unwrap()
                     ));
                 }
-                NodeCommand::Status { reply } => {
-                    let _ = reply.send(NodeStatus {
-                        version: "9.9.9".into(),
-                        root_hash: "cd".repeat(32),
-                        height: 3,
-                        modules: vec![ModuleStatus {
-                            id: "chat".into(),
-                            root: "ef".repeat(32),
-                            category: ModuleCategory::of("chat"),
-                        }],
-                        public_key: "ab".repeat(32),
-                        operations: noded::OperationalStatus {
-                            role: noded::NodeRole::Validator,
-                            phase: noded::NodePhase::Validating,
-                            phase_since: 1_720_000_000,
-                            ..Default::default()
-                        },
-                    });
-                }
                 NodeCommand::Peers { reply } => {
                     // answered as the real lanes answer it: a sample parsed
                     // from an exposition — here one connected peer — stamped
@@ -372,8 +353,28 @@ async fn query_returns_the_decoded_module_reply() {
 
 #[tokio::test]
 async fn status_reports_root_hash_height_and_module_roots() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+    // deliberately NO actor: /v1/status serves the last-published snapshot
+    // straight off the handle's cell, so it must answer even when nothing
+    // drains the command lane — the wedged-behind-sync regression this cell
+    // exists to prevent.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    handle.status_cell().publish(NodeStatus {
+        version: "9.9.9".into(),
+        root_hash: "cd".repeat(32),
+        height: 3,
+        modules: vec![ModuleStatus {
+            id: "chat".into(),
+            root: "ef".repeat(32),
+            category: ModuleCategory::of("chat"),
+        }],
+        public_key: "ab".repeat(32),
+        operations: noded::OperationalStatus {
+            role: noded::NodeRole::Validator,
+            phase: noded::NodePhase::Validating,
+            phase_since: 1_720_000_000,
+            ..Default::default()
+        },
+    });
 
     let response = noded::router(handle)
         .oneshot(

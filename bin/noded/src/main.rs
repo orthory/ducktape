@@ -319,6 +319,12 @@ fn run_node(
         let metrics = NodeMetrics::register(&context);
         metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
 
+        // the /v1/status snapshot cell: this single-writer loop is the ONE
+        // publisher; the http route reads the cell without crossing the
+        // command lane, with live operations overlaid from the metrics.
+        let status = node_handle.status_cell();
+        status.wire_metrics(&metrics);
+
         // OFF-LOOP execution: the pool gates effects inline but runs the
         // provider CLI on spawned tasks; a completed run re-enters as a
         // Submit command on `oracle_cmds`, so this serial command loop
@@ -373,6 +379,9 @@ fn run_node(
                 );
             }
         }
+        // the boot snapshot: resumed (or genesis) state serves immediately —
+        // /v1/status answers before the first command, never behind it.
+        publish_status(&status, &metrics, &index, &host, height);
         while let Some(cmd) = cmds.next().await {
             match cmd {
                 NodeCommand::Submit {
@@ -393,6 +402,7 @@ fn run_node(
                         Msg { target, payload },
                     )
                     .await;
+                    publish_status(&status, &metrics, &index, &host, height);
                     let _ = reply.send(result); // caller may have hung up
                 }
                 NodeCommand::SubmitFrame { frame, reply } => {
@@ -432,6 +442,7 @@ fn run_node(
                         // embedder-side producer on the command lane.
                         Err(err) => Err(err.to_string()),
                     };
+                    publish_status(&status, &metrics, &index, &host, height);
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
@@ -440,36 +451,6 @@ fn run_node(
                         .await
                         .map_err(|err| err.to_string());
                     let _ = reply.send(result);
-                }
-                NodeCommand::Status { reply } => {
-                    metrics.update_storage(
-                        0,
-                        index.is_poisoned(),
-                        MODULE_IDS.iter().map(|id| {
-                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
-                        }),
-                    );
-                    let modules = MODULE_IDS
-                        .iter()
-                        .map(|id| ModuleStatus {
-                            id: (*id).into(),
-                            root: host
-                                .module_root(id)
-                                .map(|root| hex_root(&root))
-                                .unwrap_or_default(),
-                            category: ModuleCategory::of(id),
-                        })
-                        .collect();
-                    let _ = reply.send(NodeStatus {
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        root_hash: hex_root(&host.root_hash()),
-                        height,
-                        modules,
-                        // the embedded daemon has no mesh identity — clients
-                        // treat an empty key as "no peer-routed features here".
-                        public_key: String::new(),
-                        operations: metrics.operational_status(),
-                    });
                 }
                 NodeCommand::Peers { reply } => {
                     // the embedded daemon has no mesh, so the exposition
@@ -610,6 +591,46 @@ impl host::worker::Lane for OracleLane<'_> {
     async fn pending(&self) -> bool {
         self.host.has_pending_deliveries().await
     }
+}
+
+/// assemble and publish the `/v1/status` snapshot for this single-writer
+/// lane: at boot, then after every command that can move state. the storage
+/// section rides along so index watermarks stay current with the boundary.
+fn publish_status(
+    status: &noded::StatusCell,
+    metrics: &NodeMetrics,
+    index: &IndexStore,
+    host: &Host,
+    height: u64,
+) {
+    metrics.update_storage(
+        0,
+        index.is_poisoned(),
+        MODULE_IDS.iter().map(|id| {
+            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+        }),
+    );
+    let modules = MODULE_IDS
+        .iter()
+        .map(|id| ModuleStatus {
+            id: (*id).into(),
+            root: host
+                .module_root(id)
+                .map(|root| hex_root(&root))
+                .unwrap_or_default(),
+            category: ModuleCategory::of(id),
+        })
+        .collect();
+    status.publish(NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash: hex_root(&host.root_hash()),
+        height,
+        modules,
+        // the embedded daemon has no mesh identity — clients treat an empty
+        // key as "no peer-routed features here".
+        public_key: String::new(),
+        operations: metrics.operational_status(),
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
