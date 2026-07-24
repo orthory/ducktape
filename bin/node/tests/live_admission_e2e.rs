@@ -698,7 +698,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
     assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
-    cluster.wait_marker(1, "admitted at epoch", CONVERGE);
+    // no `admitted at epoch` marker here: that line is the COLD path's
+    // manifest fetch, and a warm seat deliberately fetches nothing — its
+    // own fold carries it straight to `promoted:`.
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let residents = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
