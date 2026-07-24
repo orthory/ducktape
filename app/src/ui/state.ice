@@ -85,6 +85,13 @@ state
   gov_rows:[ProposalRow] = []
   gov_generation:i64 = 0
   gov_voting = ""
+  settings_endpoint = ""
+  settings_node_key = ""
+  settings_height:i64 = 0
+  settings_key_path = ""
+  settings_key_state = ""
+  settings_open_tabs:i64 = 0
+  settings_generation:i64 = 0
   fs_path = "/shared"
   fs_entries:[FsEntry] = []
   fs_generation:i64 = 0

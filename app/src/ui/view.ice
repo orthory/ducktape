@@ -1009,6 +1009,45 @@ view
                           active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
                           hovered bg=fg/10 text=fg
                           pressed bg=fg/14
+    settings:
+      scroll direction=vertical width=fill height=fill
+        container width=fill max-width=640.0 margin-x=auto padding=20.0
+          col width=fill spacing=12.0
+            text "Settings" size=15.0 font=display @text-fg
+            container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
+              col width=fill spacing=6.0
+                text "CONNECTION" size=11.0 font=medium @text-muted
+                row width=fill spacing=8.0 align=center
+                  text "Endpoint" width=120.0 size=13.0 @text-muted
+                  text settings_endpoint width=fill size=13.0 wrapping=none font=mono @text-fg
+                row width=fill spacing=8.0 align=center
+                  text "Node key" width=120.0 size=13.0 @text-muted
+                  text settings_node_key width=fill size=13.0 wrapping=none font=mono @text-fg
+                row width=fill spacing=8.0 align=center
+                  text "Block height" width=120.0 size=13.0 @text-muted
+                  text settings_height width=fill size=13.0 wrapping=none font=mono @text-fg
+                text "Change the endpoint from the sidebar's Connection panel." size=11.0 @text-muted
+            container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
+              col width=fill spacing=6.0
+                text "IDENTITY" size=11.0 font=medium @text-muted
+                row width=fill spacing=8.0 align=center
+                  text "User key" width=120.0 size=13.0 @text-muted
+                  text settings_key_state width=fill size=13.0 wrapping=none font=mono @text-primary
+                row width=fill spacing=8.0 align=center
+                  text "Key path" width=120.0 size=13.0 @text-muted
+                  text settings_key_path width=fill size=11.0 wrapping=none font=mono @text-muted
+            container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
+              col width=fill spacing=6.0
+                text "THIS DEVICE" size=11.0 font=medium @text-muted
+                row width=fill spacing=8.0 align=center
+                  text "Open page tabs" width=120.0 size=13.0 @text-muted
+                  text settings_open_tabs size=13.0 wrapping=none font=mono @text-fg
+                  space width=fill
+                  button "Forget tabs" height=24.0 padding=5.0 -> settings_clear_tabs
+                    active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+                    hovered bg=fg/10 text=fg
+                    pressed bg=fg/14
+                text "Preferences persist per endpoint in app-prefs.json beside the user key." size=11.0 @text-muted
     explorer:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

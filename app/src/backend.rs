@@ -1590,6 +1590,62 @@ pub async fn governance_execute(
     Ok(true)
 }
 
+/// The settings pane's facts: where this app points and what identity it
+/// holds locally.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct SettingsFacts {
+    pub generation: i64,
+    pub endpoint: String,
+    pub node_key: String,
+    pub height: i64,
+    pub key_path: String,
+    pub key_state: String,
+    pub open_tabs: i64,
+}
+
+/// Load the settings facts: node identity from /v1/status, the local user
+/// key's location and state, and the persisted tab count.
+pub async fn load_settings_facts(
+    rpc: String,
+    generation: i64,
+) -> Result<SettingsFacts, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status().await?;
+        let (key_path, key_state) = match user_key_path() {
+            Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
+            Ok(path) => {
+                let state = match std::fs::read(&path) {
+                    Err(_) => "absent",
+                    Ok(bytes) if bytes.starts_with(ENCRYPTED_KEY_PREFIX.as_bytes()) => "encrypted",
+                    Ok(_) => "PLAINTEXT — secure it",
+                };
+                (path.display().to_string(), state.to_string())
+            }
+        };
+        let tabs = load_doc_tabs(rpc.clone()).await;
+        Ok(SettingsFacts {
+            generation,
+            endpoint: rpc,
+            node_key: short_label(&status.public_key),
+            height: i64::try_from(status.height).unwrap_or(i64::MAX),
+            key_path,
+            key_state,
+            open_tabs: count_i64(tabs.len()),
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Forget this endpoint's persisted doc tabs.
+pub async fn clear_doc_tabs(rpc: String) -> bool {
+    save_doc_tabs(rpc, Vec::new()).await
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -1609,6 +1665,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
         ("members", "Members", "◎"),
         ("governance", "Governance", "⚖"),
         ("explorer", "Explorer", "⛓"),
+        ("settings", "Settings", "⚙"),
     ]
     .into_iter()
     .map(|(id, title, icon)| NavItem {

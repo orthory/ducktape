@@ -117,6 +117,12 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_c
                       text "GOVERNANCE" size=11.0 font=medium @text-muted
                     container width=fill padding-left=8.0
                       text "Proposals freeze their electorate when opened; anyone may settle past the deadline." size=11.0 @text-muted
+                "settings"
+                  col width=fill height=fill spacing=6.0
+                    container width=fill padding-left=8.0
+                      text "SETTINGS" size=11.0 font=medium @text-muted
+                    container width=fill padding-left=8.0
+                      text "Connection, identity, and this device's preferences." size=11.0 @text-muted
                 _
                   col width=fill height=fill spacing=6.0
                     container width=fill padding-left=8.0
@@ -157,6 +163,8 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_c
                 slot members
               "governance"
                 slot governance
+              "settings"
+                slot settings
               _
                 slot explorer
 

@@ -277,6 +277,7 @@ on select_shell_tab(next)
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
+  settings_generation = settings_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
   parallel
@@ -285,6 +286,23 @@ on select_shell_tab(next)
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+    run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
+
+on settings_loaded(next)
+  return if next.generation != settings_generation
+  settings_endpoint = next.endpoint
+  settings_node_key = next.node_key
+  settings_height = next.height
+  settings_key_path = next.key_path
+  settings_key_state = next.key_state
+  settings_open_tabs = next.open_tabs
+
+on settings_failed(cause)
+  return if cause.generation != settings_generation
+
+on settings_clear_tabs
+  doc_tabs = []
+  run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
 
 on governance_loaded(next)
   return if next.generation != gov_generation
