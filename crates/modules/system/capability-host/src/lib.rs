@@ -163,7 +163,7 @@ mod interactive;
 #[cfg(unix)]
 mod podman_api;
 #[cfg(unix)]
-pub use podman_api::egress_nftables;
+pub use podman_api::{egress_nftables, run_egress_hook};
 mod sandbox;
 mod session;
 mod spec;

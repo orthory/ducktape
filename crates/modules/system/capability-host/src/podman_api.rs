@@ -221,6 +221,132 @@ pub fn egress_nftables(host_ip: &str, resolver_ip: &str, ports: &[u16]) -> Strin
 }
 
 // ---------------------------------------------------------------------------
+// the OCI createRuntime hook (installs the egress firewall in the netns)
+// ---------------------------------------------------------------------------
+
+/// the OCI container state podman pipes to a hook on stdin. Only the fields the
+/// egress hook needs are decoded; libpod sends many more.
+#[derive(serde::Deserialize)]
+struct OciState {
+    pid: i32,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
+}
+
+/// run the egress `createRuntime` hook: read the OCI state on stdin, and if this
+/// run carries the `io.ducktape.egress=1` annotation, install the nft allowlist
+/// inside the container's netns via `nsenter -n` + `nft`. Called by the node
+/// binary's hidden `__egress-hook` subcommand.
+///
+/// FAILS CLOSED: any error returns `Err`, the subcommand exits non-zero, and
+/// podman aborts the container — a run whose firewall could not be installed
+/// never starts. (Verified live: a failing hook makes `containers/{id}/start`
+/// return HTTP 500 and the container does not run.)
+///
+/// Namespace note (verified live on rootless podman 5.4.2): at `createRuntime`
+/// the hook already runs INSIDE podman's rootless user namespace — the same one
+/// that owns the container netns — so it enters the NET namespace ONLY
+/// (`nsenter -n`, never `-U`, which fails with EINVAL here) and still has the
+/// caps to load nft. The container itself runs with `NET_ADMIN`/`NET_RAW`
+/// dropped, so it cannot undo the rules.
+pub fn run_egress_hook() -> Result<(), String> {
+    use std::io::Read as _;
+    let mut raw = String::new();
+    std::io::stdin()
+        .read_to_string(&mut raw)
+        .map_err(|e| format!("egress hook: read OCI state from stdin: {e}"))?;
+    let state: OciState =
+        serde_json::from_str(&raw).map_err(|e| format!("egress hook: parse OCI state: {e}"))?;
+
+    // no marker → this is not one of our runs; nothing to do.
+    if state.annotations.get("io.ducktape.egress").map(String::as_str) != Some("1") {
+        return Ok(());
+    }
+    let host_ip = state
+        .annotations
+        .get("io.ducktape.egress.host")
+        .ok_or("egress hook: missing io.ducktape.egress.host annotation")?;
+    let resolver_ip = state
+        .annotations
+        .get("io.ducktape.egress.resolver")
+        .ok_or("egress hook: missing io.ducktape.egress.resolver annotation")?;
+    let ports = state
+        .annotations
+        .get("io.ducktape.egress.ports")
+        .map(|s| {
+            s.split(',')
+                .filter(|p| !p.is_empty())
+                .map(|p| p.parse::<u16>().map_err(|e| format!("bad egress port {p:?}: {e}")))
+                .collect::<Result<Vec<u16>, String>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let ruleset = egress_nftables(host_ip, resolver_ip, &ports);
+    install_nft_in_netns(state.pid, &ruleset)
+}
+
+/// pipe `ruleset` to `nft -f -` running inside pid's network namespace via
+/// `nsenter -n`. The hook's own userns already owns that netns (see
+/// [`run_egress_hook`]), so no `-U`.
+fn install_nft_in_netns(pid: i32, ruleset: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let nsenter = find_system_tool("nsenter").ok_or("egress hook: nsenter not found")?;
+    let nft = find_system_tool("nft").ok_or("egress hook: nft not found")?;
+    let mut child = Command::new(nsenter)
+        .args([
+            "--preserve-credentials",
+            "-n",
+            "-t",
+            &pid.to_string(),
+            "--",
+        ])
+        .arg(&nft)
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("egress hook: spawn nsenter/nft: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("egress hook: nft stdin missing")?
+        .write_all(ruleset.as_bytes())
+        .map_err(|e| format!("egress hook: write ruleset to nft: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("egress hook: wait for nft: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "egress hook: nft rejected the ruleset ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// resolve a system tool by PATH, then the standard sbin/bin dirs a non-root
+/// PATH usually omits — `nft` ships in `/usr/sbin`.
+fn find_system_tool(bin: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join(bin);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join(bin))
+        .find(|cand| cand.is_file())
+}
+
+// ---------------------------------------------------------------------------
 // SpecGenerator (the libpod container-create body)
 // ---------------------------------------------------------------------------
 
@@ -364,11 +490,19 @@ impl SpecGenerator {
     }
 
     /// attach the egress-hook annotations: the marker the `--hooks-dir` hook
-    /// matches, plus the allowed ports (this run's broker + node RPC). The host
-    /// IP is NOT passed — the hook resolves `host.containers.internal` from the
-    /// container's own `/etc/hosts`, which is correct regardless of the network
-    /// backend. Host-side only — none of this reaches the guest.
-    pub(crate) fn set_egress(&mut self, ports: &[u16]) {
+    /// matches, plus the three values it builds the ruleset from — the host IP
+    /// (`host.containers.internal`), the container's DNS forwarder, and the
+    /// allowed ports (this run's broker + node RPC).
+    ///
+    /// These are passed as ANNOTATIONS, not left for the hook to read from the
+    /// container's files, because at the `createRuntime` stage podman has not
+    /// yet written the container's `/etc/hosts` / `/etc/resolv.conf` (verified:
+    /// they are empty then, and podman blocks on the hook so a retry deadlocks).
+    /// The node computes both host-side (host_ip = its own routable IP, which
+    /// matches what podman writes; resolver = the slirp DNS forwarder) and the
+    /// hook reads them straight from the OCI state JSON. Host-side only — none
+    /// of this reaches the guest.
+    pub(crate) fn set_egress(&mut self, host_ip: &str, resolver_ip: &str, ports: &[u16]) {
         let ports = ports
             .iter()
             .map(u16::to_string)
@@ -377,8 +511,37 @@ impl SpecGenerator {
         self.annotations
             .insert("io.ducktape.egress".to_string(), "1".to_string());
         self.annotations
+            .insert("io.ducktape.egress.host".to_string(), host_ip.to_string());
+        self.annotations
+            .insert("io.ducktape.egress.resolver".to_string(), resolver_ip.to_string());
+        self.annotations
             .insert("io.ducktape.egress.ports".to_string(), ports);
     }
+}
+
+/// the slirp4netns default DNS forwarder — `.3` of its default `10.0.2.0/24`
+/// cidr. The node passes this as the run's egress resolver so the nft hook can
+/// scope DNS to it. A constant because the sandbox always runs slirp with the
+/// default cidr; if that ever changes this must move with it. (Verified live:
+/// the container's primary nameserver is `10.0.2.3` and name resolution works
+/// through it under the egress firewall.)
+pub(crate) const SLIRP_DNS: &str = "10.0.2.3";
+
+/// the host's own routable IPv4 address — what podman sets
+/// `host.containers.internal` to for a slirp4netns run, so the egress rule that
+/// allows the broker + node ports must target exactly this. Found by opening a
+/// UDP socket toward a public address and reading back the kernel-chosen source
+/// IP (no packet is sent); falls back to `127.0.0.1` only if that fails, which
+/// would make the run reach nothing but localhost — a safe, obvious failure.
+/// (Verified live: this matches podman's `host.containers.internal` value.)
+pub(crate) fn host_routable_ip() -> String {
+    use std::net::UdpSocket;
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            sock.connect("8.8.8.8:53")?;
+            Ok(sock.local_addr()?.ip().to_string())
+        })
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -845,7 +1008,7 @@ mod tests {
             labels: &["io.ducktape.run=abc".to_string()],
             terminal: false,
         });
-        spec.set_egress(&[45001, 8080]);
+        spec.set_egress("192.168.1.50", SLIRP_DNS, &[45001, 8080]);
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"work_dir\":\"/ducktape/workspace\""), "{json}");
         assert!(json.contains("/ducktape/bin/claude"), "{json}");
@@ -853,7 +1016,10 @@ mod tests {
         assert!(json.contains("NET_ADMIN") && json.contains("NET_RAW"), "{json}");
         assert!(json.contains("\"remove\":false"), "own removal, no auto-remove: {json}");
         assert!(json.contains("\"quota\":400000"), "cpu quota: {json}");
-        assert!(json.contains("io.ducktape.egress"), "egress annotation: {json}");
+        assert!(json.contains("io.ducktape.egress"), "egress marker annotation: {json}");
+        assert!(json.contains("io.ducktape.egress.host"), "host annotation: {json}");
+        assert!(json.contains("io.ducktape.egress.resolver"), "resolver annotation: {json}");
+        assert!(json.contains("io.ducktape.egress.ports"), "ports annotation: {json}");
         // the GUEST-visible fields (command, work_dir, env, mount destinations)
         // are neutral. bind-mount `source` fields legitimately carry the host
         // path — that is the host side of the mount, never seen inside the
