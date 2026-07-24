@@ -331,6 +331,7 @@ struct HostData {
     object_puts: BTreeMap<Vec<u8>, Vec<u8>>,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
+    out_assigned: Vec<u8>,
 }
 
 impl host::Host for HostData {
@@ -428,6 +429,9 @@ impl host::Host for HostData {
     }
     fn emit_event(&mut self, source: String, payload: Vec<u8>) {
         self.out_events.push((source, payload));
+    }
+    fn set_assigned(&mut self, stamp: Vec<u8>) {
+        self.out_assigned = stamp;
     }
 }
 
@@ -758,6 +762,7 @@ impl WasmModule {
             object_puts: BTreeMap::new(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
+            out_assigned: Vec::new(),
         };
         let mut store = Store::new(&self.engine, data);
         let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(self.fuel) {
@@ -1045,6 +1050,7 @@ impl Module for WasmModule {
                 object_puts: staged_objects0.clone(),
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
+                out_assigned: Vec::new(),
             };
             let mut store = Store::new(&self.engine, data);
 
@@ -1105,6 +1111,9 @@ impl Module for WasmModule {
                     }
                     for (source, payload) in data.out_events {
                         ctx.emit_event(Event { source, payload });
+                    }
+                    if !data.out_assigned.is_empty() {
+                        ctx.set_assigned(data.out_assigned);
                     }
                     Ok(())
                 }

@@ -42,18 +42,59 @@ impl From<Error> for String {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A live module event from the node's resumable `/v1/ws` stream.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ModuleEvent {
     /// The requested topics are active. Cursors are suitable for reconnect.
     Ready { cursors: BTreeMap<String, String> },
-    /// One committed operation changed a module.
+    /// One committed operation applied to a module — the full feed row, so a
+    /// follower folds the delta instead of refetching a snapshot.
     Changed {
         module: String,
         cursor: String,
-        height: u64,
+        op: StreamOp,
     },
     /// Replay history was unavailable; hydrate a fresh snapshot at this cursor.
     Lagged { module: String, cursor: String },
+}
+
+/// One applied-op feed row as the stream serves it: the block coordinates,
+/// the dispatch origin, the op payload verbatim (`payload` when it is JSON,
+/// `payload_hex` otherwise), and the module-assigned stamp the module
+/// declared while applying it (chat's message seq, an edit's rev) — absent
+/// when the op assigned nothing.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct StreamOp {
+    pub height: u64,
+    /// the block-wide dispatch index.
+    pub seq: u32,
+    /// the block's consensus time.
+    pub time: u64,
+    pub origin: StreamOrigin,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub payload_hex: Option<String>,
+    #[serde(default)]
+    pub assigned: Option<serde_json::Value>,
+    #[serde(default)]
+    pub assigned_hex: Option<String>,
+}
+
+/// The dispatch origin of one applied op. External ids arrive rendered as
+/// user handles.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct StreamOrigin {
+    pub kind: StreamOriginKind,
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamOriginKind {
+    External,
+    Module,
+    System,
 }
 
 /// One connected module-event session. Reconnect policy belongs to the caller.
@@ -107,11 +148,6 @@ enum StreamFrame {
         topic: String,
         detail: String,
     },
-}
-
-#[derive(Deserialize)]
-struct StreamOp {
-    height: u64,
 }
 
 impl Client {
@@ -322,13 +358,9 @@ fn decode_stream_message(
                 .collect();
             Some(Ok(ModuleEvent::Ready { cursors }))
         }
-        StreamFrame::Event { topic, cursor, op } => Some(module_name(&topic, expected).map(
-            |module| ModuleEvent::Changed {
-                module,
-                cursor,
-                height: op.height,
-            },
-        )),
+        StreamFrame::Event { topic, cursor, op } => Some(
+            module_name(&topic, expected).map(|module| ModuleEvent::Changed { module, cursor, op }),
+        ),
         StreamFrame::Lagged { topic, cursor } => {
             Some(module_name(&topic, expected).map(|module| ModuleEvent::Lagged { module, cursor }))
         }

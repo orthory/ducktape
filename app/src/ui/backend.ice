@@ -7,7 +7,10 @@ extern crate::backend
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_r:f64, avatar_g:f64, avatar_b:f64, reactions:[ChatReaction])
   ChatData(channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
-  ChatSendResult(data:ChatData, operation_id:str, channel_id:str)
+  SendReceipt(operation_id:str, channel_id:str)
+  ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
+  PagesDelta(kind:str, comments:bool)
+  LiveRefresh(generation:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   LiveThreadData(generation:i64, channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
@@ -27,7 +30,7 @@ extern crate::backend
   PageSearchData(generation:i64, hits:[PageSearchHit])
   AutosaveResult(generation:i64, written:bool)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
-  LiveUpdate(kind:str, status:str, height:i64)
+  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta)
   ComposerCmd()
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
@@ -36,8 +39,8 @@ extern crate::backend
   editor-binding composer_keys() -> ComposerCmd
   connect(rpc:str) -> WorkspaceData ! AppError
   stream live_events(rpc:str) -> LiveUpdate
-  refresh(rpc:str, channel_id:str, page_id:str, generation:i64) -> WorkspaceData ! HydrationError
-  retry_refresh(rpc:str, channel_id:str, page_id:str, generation:i64, attempt:i64) -> WorkspaceData ! HydrationError
+  sync resync_planes(load_chat:bool, load_pages:bool) -> str
+  live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, attempt:i64) -> LiveRefresh ! HydrationError
   load_older_messages(rpc:str, channel_id:str, before_seq:i64, generation:i64) -> HistoryPageData ! HydrationError
   sync fresh_operation_id(prefix:str) -> str
   sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
@@ -74,6 +77,23 @@ extern crate::backend
   sync channel_head_seq(channels:[ChatChannel], channel:str) -> i64
   sync mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
   sync channel_is_unread(reads:[ChannelRead], channel:str, head_seq:i64) -> bool
+  sync apply_chat_channels(channels:[ChatChannel], delta:ChatDelta) -> [ChatChannel]
+  sync apply_chat_messages(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> [ChatMessage]
+  sync apply_chat_thread(thread:[ChatMessage], delta:ChatDelta, active_channel:str, root:i64) -> [ChatMessage]
+  sync apply_chat_members(members:[ChatMember], delta:ChatDelta, active_channel:str) -> [ChatMember]
+  sync thread_offset_after_live(offset:i64, has_more:bool, delta:ChatDelta, active_channel:str, root:i64) -> i64
+  sync channel_display_name(channels:[ChatChannel], channel:str, current:str) -> str
+  sync channel_flag_archived(channels:[ChatChannel], channel:str, current:bool) -> bool
+  sync channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
+  sync channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64
+  sync keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
+  sync keep_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage]) -> [ChatMessage]
+  sync keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
+  sync keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
+  sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
+  sync keep_str(loaded:bool, next:str, current:str) -> str
+  sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
+  sync keep_i64(loaded:bool, next:i64, current:i64) -> i64
   sync initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
   sync frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
   sync first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
@@ -97,22 +117,22 @@ extern crate::backend
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
   create_channel(rpc:str, password:str, name:str) -> ChatData ! AppError
-  rename_channel(rpc:str, password:str, channel_id:str, name:str) -> ChatData ! AppError
-  archive_channel(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
-  unarchive_channel(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
-  add_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> ChatData ! AppError
-  remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> ChatData ! AppError
-  join_huddle(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
-  leave_huddle(rpc:str, password:str, channel_id:str) -> ChatData ! AppError
-  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> ChatSendResult ! OptimisticMutationError
+  rename_channel(rpc:str, password:str, channel_id:str, name:str) -> bool ! AppError
+  archive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
+  unarchive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
+  add_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
+  remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
+  join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
+  leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
+  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
   refresh_live_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> LiveThreadData ! HydrationError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> ChatMessage ! OptimisticMutationError
-  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> ChatData ! AppError
-  delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> ChatData ! AppError
-  add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
-  remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> ChatData ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
+  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> bool ! AppError
+  delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
+  add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
+  remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
   load_page(rpc:str, page_id:str, selected_block_id:str) -> PagesData ! AppError
   load_block_threads(rpc:str, target:str, from:i64, generation:i64) -> BlockThreadListData ! HydrationError

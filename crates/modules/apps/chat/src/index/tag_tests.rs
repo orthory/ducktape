@@ -6,19 +6,40 @@
 
 use std::collections::BTreeMap;
 
-use super::{ChatViewReply, MsgRow, TagRow, fold_op, serve_view, tags};
-use crate::{Block, ChatMsg, Span, encode_msg};
+use super::{ChatViewReply, MsgRow, TagRow, fold_op, msg_key, read_row, read_u64, seq_key,
+    serve_view, tags};
+use crate::{Block, ChatAssigned, ChatMsg, Span, encode_assigned, encode_msg};
 use index_guest::{OpRow, OriginTag, apply_to_map};
 
 type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 
-fn op(height: u64, msg: &ChatMsg) -> OpRow {
+/// the test twin of the module's in-state assignment — see `index.rs`'s
+/// `assigned_for` (the harness duplication is deliberate, per the module doc).
+fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
+    match msg {
+        ChatMsg::PostMessage { channel_id, .. } => encode_assigned(&ChatAssigned::Posted {
+            seq: read_u64(map, &seq_key(channel_id)) + 1,
+        }),
+        ChatMsg::EditMessage {
+            channel_id, seq, ..
+        } => {
+            let row = read_row(map, &msg_key(channel_id, *seq))
+                .expect("row reads")
+                .expect("edited row exists");
+            encode_assigned(&ChatAssigned::Edited { rev: row.rev + 1 })
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn op(map: &Map, height: u64, msg: &ChatMsg) -> OpRow {
     OpRow {
         height,
         seq: 0,
         time: 1_000 + height,
         origin: OriginTag::external("jess"),
         payload: encode_msg(msg),
+        assigned: assigned_for(map, msg),
     }
 }
 
@@ -49,7 +70,7 @@ fn delete(channel: &str, seq: u64) -> ChatMsg {
 }
 
 fn fold(map: &mut Map, height: u64, msg: &ChatMsg) {
-    let writes = fold_op(&op(height, msg), map).expect("fold");
+    let writes = fold_op(&op(map, height, msg), map).expect("fold");
     apply_to_map(map, writes);
 }
 

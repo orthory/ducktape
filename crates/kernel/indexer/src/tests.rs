@@ -43,6 +43,7 @@ fn chat_op(payload: &[u8]) -> AppliedOp {
         module: "chat".into(),
         origin: OriginTag::external("jess"),
         payload: payload.to_vec(),
+        assigned: Vec::new(),
     }
 }
 
@@ -51,6 +52,7 @@ fn tasks_op() -> AppliedOp {
         module: "tasks".into(),
         origin: OriginTag::module("chat"),
         payload: br#"{"create":"t"}"#.to_vec(),
+        assigned: Vec::new(),
     }
 }
 
@@ -202,6 +204,7 @@ fn unknown_module_is_refused_and_poisons() {
             module: "ghost".into(),
             origin: OriginTag::system(),
             payload: b"{}".to_vec(),
+            assigned: Vec::new(),
         }],
     );
     assert!(matches!(
@@ -577,6 +580,7 @@ fn checkpoint_files_sweeps_its_stale_archive_and_refuses_poisoned() {
                 module: "ghost".into(),
                 origin: OriginTag::system(),
                 payload: vec![],
+                assigned: Vec::new(),
             }],
         ))
         .unwrap_err();

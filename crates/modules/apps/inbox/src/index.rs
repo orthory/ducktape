@@ -12,8 +12,10 @@
 //!   opaque strings that may contain `/`, which would otherwise bleed one
 //!   member's scan into another's.
 //! - `nseq/{hex(member)}`    — mirror of the member's last assigned seq,
-//!   faithful by construction (a failed Deliver aborts its block and never
-//!   reaches the feed).
+//!   written from each applied `Deliver`'s assigned stamp
+//!   ([`crate::InboxAssigned::Delivered`] on the feed row) — the module's
+//!   exact in-state assignment, never a counted derivation, so the mirror
+//!   cannot desync across a boundary stamp.
 //! - `ncnt/{hex(member)}`    — the member's live item count (u64 BE), the
 //!   overflow mirror: a Deliver past [`MAX_ITEMS_PER_MEMBER`] drops the
 //!   member's oldest row, exactly like the module.
@@ -27,7 +29,7 @@
 use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
-use crate::{InboxMsg, MAX_ITEMS_PER_MEMBER, decode_msg};
+use crate::{InboxAssigned, InboxMsg, MAX_ITEMS_PER_MEMBER, decode_assigned, decode_msg};
 
 /// default and max page size for notification listing.
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -40,6 +42,9 @@ const FAIL_OP_DECODE: i32 = 2;
 const FAIL_ROW_DECODE: i32 = 3;
 /// [`Fail`] code: a view request this mapper does not speak.
 const FAIL_BAD_REQUEST: i32 = 4;
+/// [`Fail`] code: an applied `Deliver` carried a missing or undecodable
+/// assigned stamp — the same interface-drift class as [`FAIL_OP_DECODE`].
+const FAIL_ASSIGNED_DECODE: i32 = 5;
 
 /// one delivered notification, as the list view returns it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -174,7 +179,8 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     let mut out = Writes::new();
     match msg {
         InboxMsg::Deliver { member, kind, body } => {
-            let seq = read_u64(read, &seq_key(&member)) + 1;
+            let InboxAssigned::Delivered { seq } =
+                decode_assigned(&op.assigned).map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?;
             put_u64(&mut out, seq_key(&member), seq);
             let mut count = read_u64(read, &count_key(&member)) + 1;
             let mut unread = read_u64(read, &unread_key(&member)) + 1;
@@ -287,24 +293,36 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode_msg;
+    use crate::{encode_assigned, encode_msg};
     use index_guest::apply_to_map;
     use std::collections::BTreeMap;
 
     type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 
-    fn op(height: u64, origin: OriginTag, msg: &InboxMsg) -> OpRow {
+    /// the test twin of the module's in-state assignment (`stage_deliver`):
+    /// a Deliver takes the member's next sequence; nothing else assigns.
+    fn assigned_for(map: &Map, msg: &InboxMsg) -> Vec<u8> {
+        match msg {
+            InboxMsg::Deliver { member, .. } => encode_assigned(&InboxAssigned::Delivered {
+                seq: read_u64(map, &seq_key(member)) + 1,
+            }),
+            InboxMsg::MarkRead { .. } | InboxMsg::Clear { .. } => Vec::new(),
+        }
+    }
+
+    fn op(map: &Map, height: u64, origin: OriginTag, msg: &InboxMsg) -> OpRow {
         OpRow {
             height,
             seq: 0,
             time: 1_000 + height,
             origin,
             payload: encode_msg(msg),
+            assigned: assigned_for(map, msg),
         }
     }
 
     fn fold(map: &mut Map, height: u64, msg: &InboxMsg) {
-        let writes = fold_op(&op(height, OriginTag::module("chat"), msg), map).expect("fold");
+        let writes = fold_op(&op(map, height, OriginTag::module("chat"), msg), map).expect("fold");
         apply_to_map(map, writes);
     }
 

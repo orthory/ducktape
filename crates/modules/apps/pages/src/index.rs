@@ -715,6 +715,7 @@ mod tests {
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_msg(msg),
+            assigned: Vec::new(),
         }
     }
 

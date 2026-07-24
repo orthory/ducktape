@@ -181,6 +181,12 @@ pub struct OpRow {
     pub origin: OriginTag,
     /// the dispatch payload, verbatim.
     pub payload: Vec<u8>,
+    /// the module-assigned stamp of this dispatch, verbatim (module-encoded;
+    /// e.g. chat's assigned message sequence). empty when the op assigned
+    /// nothing. folds consume this instead of re-deriving assignments by
+    /// counting — a counted mirror desyncs across a boundary stamp, a carried
+    /// stamp cannot.
+    pub assigned: Vec<u8>,
 }
 
 // ============================================================================
@@ -367,6 +373,7 @@ mod tests {
             time: 7,
             origin: OriginTag::external("jess"),
             payload: b"{\"post\":1}".to_vec(),
+            assigned: b"{\"seq\":9}".to_vec(),
         };
         let bytes = borsh::to_vec(&row).expect("op rows always encode");
         assert_eq!(borsh::from_slice::<OpRow>(&bytes).expect("round trip"), row);

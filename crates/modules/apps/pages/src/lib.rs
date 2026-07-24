@@ -60,6 +60,10 @@ pub use interface::*;
 // database is `index_guest` below.
 pub mod index;
 
+// the CLIENT view model: applied-op classification for feed followers —
+// module-owned beside the index fold, pure, ui.wasm-portable.
+pub mod client;
+
 // the wasm index-mapper shell: wires the pure core into the fluent31 engine.
 // compiled only by `guest-builder --index`'s synthesized wasm32 workspace
 // (feature `index-guest`), never by the native build.

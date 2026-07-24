@@ -82,6 +82,7 @@ mod tests {
             time: 1,
             origin: index_guest::OriginTag::external("jess"),
             payload: b"p".to_vec(),
+            assigned: Vec::new(),
         };
         let writes = fold_op(&op(1, 0), &map).unwrap();
         index_guest::apply_to_map(&mut map, writes);

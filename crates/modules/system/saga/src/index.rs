@@ -298,6 +298,7 @@ mod tests {
             time: height,
             origin,
             payload: encode_msg(msg),
+            assigned: Vec::new(),
         }
     }
 
@@ -469,6 +470,7 @@ mod tests {
                 time: 1,
                 origin: OriginTag::external("aa11"),
                 payload: b"not json".to_vec(),
+                assigned: Vec::new(),
             },
         );
         // a result with a non-External origin cannot be attributed.

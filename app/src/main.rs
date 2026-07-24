@@ -45,18 +45,16 @@ mod tests {
         app.reply_editor.text().trim().to_string()
     }
 
-    fn workspace(
+    fn live_refresh(
         generation: i64,
         active_channel: &str,
         messages: Vec<backend::ChatMessage>,
         active_page: &str,
         blocks: Vec<backend::PageBlock>,
-    ) -> backend::WorkspaceData {
-        backend::WorkspaceData {
+    ) -> backend::LiveRefresh {
+        backend::LiveRefresh {
             generation,
-            rpc: "http://node".into(),
-            status: "Live".into(),
-            height: 1,
+            chat_loaded: true,
             channels: Vec::new(),
             messages,
             active_channel: active_channel.into(),
@@ -65,11 +63,28 @@ mod tests {
             active_channel_members_only: false,
             active_channel_huddle_count: 0,
             channel_members: Vec::new(),
+            pages_loaded: true,
             pages: Vec::new(),
             blocks,
             active_page: active_page.into(),
             active_page_title: active_page.into(),
             active_page_parent: String::new(),
+        }
+    }
+
+    fn posted_delta(channel: &str, row: backend::ChatMessage) -> backend::LiveUpdate {
+        backend::LiveUpdate {
+            kind: "chat".into(),
+            status: "Live".into(),
+            height: row.seq.max(1),
+            chat: backend::ChatDelta {
+                kind: "posted".into(),
+                channel_id: channel.into(),
+                seq: row.seq,
+                message: row,
+                ..backend::ChatDelta::default()
+            },
+            ..backend::LiveUpdate::default()
         }
     }
 
@@ -124,7 +139,7 @@ mod tests {
         assert!(!view.contains("button \"Refresh\""));
 
         let refresh = lifecycle
-            .split_once("on workspace_refreshed(next)\n")
+            .split_once("on live_resynced(next)\n")
             .unwrap()
             .1
             .split_once("\non ")
@@ -152,17 +167,20 @@ mod tests {
             "reply_draft",
         ] {
             assert!(refresh.contains(&format!(
-                "{scoped} = retain_for_endpoint({scoped}, active_channel, next.active_channel)"
+                "{scoped} = retain_for_endpoint({scoped}, active_channel, \
+keep_str(next.chat_loaded, next.active_channel, active_channel))"
             )));
         }
         assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
         assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
         assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
         assert!(!lifecycle.contains("every 1s"));
-        assert!(lifecycle.contains("run refresh(connected_rpc"));
+        assert!(lifecycle.contains("run live_resync_load(connected_rpc"));
         assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
         assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
-        assert!(lifecycle.contains("active_page_title = next.active_page_title"));
+        assert!(lifecycle.contains(
+            "active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)"
+        ));
         assert!(lifecycle.contains("block_edit_draft = refreshed_block_draft("));
         assert!(lifecycle.contains(
             "block_comment_draft = retain_selected_string(block_comment_draft, selected_block_id)"
@@ -171,10 +189,10 @@ mod tests {
             .split_once("on live_block_comments_refreshed(next)\n")
             .unwrap()
             .1
-            .split_once("\non refresh_failed(cause)")
+            .split_once("\nsubscribe")
             .unwrap()
             .0;
-        assert!(!live_comment_callbacks.contains("run refresh("));
+        assert!(!live_comment_callbacks.contains("run live_resync_load("));
     }
 
     #[test]
@@ -203,151 +221,76 @@ mod tests {
     }
 
     #[test]
-    fn stale_refresh_is_ignored_after_user_action() {
+    fn stale_resyncs_are_ignored_and_deltas_fold_without_reloads() {
         let (mut app, _) = Ducktape::__boot();
         app.status = "current".into();
-        app.sync_phase = "refreshing".into();
         app.hydration_generation = 3;
         app.loading = false;
 
+        // a channel switch invalidates any in-flight resync
         let _ = app.__update(__DucktapeMessage::ChooseChannel("next".into()));
-        assert_eq!(app.sync_phase, "idle");
         assert_eq!(app.hydration_generation, 4);
 
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "changed".into(),
-            status: "Live".into(),
-            height: 99,
-        }));
-        assert!(app.live_dirty);
+        // a chat delta folds straight into state — no reload cycle
+        app.loading = false;
+        app.active_channel = "next".into();
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+            "next",
+            message(1, "hello from the feed", false),
+        )));
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].body, "hello from the feed");
 
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: 3,
-                rpc: "http://stale".into(),
-                status: "stale".into(),
-                height: 99,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: Vec::new(),
-                active_page: String::new(),
-                active_page_title: String::new(),
-                active_page_parent: String::new(),
-            },
-        ));
-        assert_eq!(app.status, "Live");
-        assert_eq!(app.sync_phase, "idle");
+        // a resync from a superseded generation is dropped whole
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+            3,
+            "stale",
+            vec![message(9, "stale", false)],
+            "stale-page",
+            Vec::new(),
+        )));
+        assert_eq!(app.active_channel, "next");
+        assert_eq!(app.messages[0].body, "hello from the feed");
 
-        app.sync_phase = "refreshing".into();
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: 4,
-                rpc: "http://current".into(),
-                status: "fresh".into(),
-                height: 100,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: Vec::new(),
-                active_page: "page".into(),
-                active_page_title: "Remote title".into(),
-                active_page_parent: String::new(),
-            },
-        ));
-        assert_eq!(app.active_page_title, "Remote title");
+        // the current generation applies
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+            4,
+            "next",
+            vec![message(1, "hello from the feed", false)],
+            "page",
+            Vec::new(),
+        )));
+        assert_eq!(app.active_page_title, "page");
     }
 
     #[test]
-    fn a_new_live_event_replaces_an_inflight_workspace_refresh() {
+    fn consecutive_deltas_fold_in_place_and_keep_the_freshest_status() {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;
         app.hydration_generation = 10;
+        app.active_channel = "general".into();
 
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "changed".into(),
-            status: "first".into(),
-            height: 1,
-        }));
-        assert_eq!(app.hydration_generation, 11);
-        assert_eq!(app.sync_phase, "refreshing");
-        assert!(!app.live_dirty);
-
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "changed".into(),
-            status: "second".into(),
-            height: 2,
-        }));
-        assert_eq!(app.hydration_generation, 12);
-        assert_eq!(app.status, "second");
-        assert!(!app.live_dirty);
-
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: 11,
-                rpc: "http://node".into(),
-                status: "stale".into(),
-                height: 1,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: Vec::new(),
-                active_page: String::new(),
-                active_page_title: String::new(),
-                active_page_parent: String::new(),
-            },
-        ));
-        assert_eq!(app.status, "second");
-        assert_eq!(app.sync_phase, "refreshing");
-
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: 12,
-                rpc: "http://node".into(),
-                status: "fresh".into(),
-                height: 2,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: Vec::new(),
-                active_page: String::new(),
-                active_page_title: String::new(),
-                active_page_parent: String::new(),
-            },
-        ));
-        assert_eq!(app.status, "fresh");
-        assert_eq!(app.sync_phase, "idle");
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+            "general",
+            message(1, "first", false),
+        )));
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+            "general",
+            message(2, "second", false),
+        )));
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[1].body, "second");
+        assert_eq!(
+            app.hydration_generation, 10,
+            "chat deltas never start a reload cycle"
+        );
     }
 
     #[test]
-    fn workspace_refresh_cannot_retarget_drafts_to_fallback_contexts() {
+    fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
         let (mut app, _) = Ducktape::__boot();
         app.connected_rpc = "http://node".into();
-        app.sync_phase = "refreshing".into();
+        app.loading = false;
         app.hydration_generation = 7;
         app.active_channel = "deleted-channel".into();
         app.message_draft = "channel draft".into();
@@ -373,7 +316,7 @@ mod tests {
         app.block_insert_after_id = "deleted-block".into();
         app.block_draft = "new block draft".into();
 
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
             7,
             "fallback-channel",
             vec![message(7, "same sequence, other channel", false)],
@@ -400,27 +343,13 @@ mod tests {
         assert!(app.reply_draft.is_empty());
         assert!(app.pending_reply.is_empty());
         assert!(app.message_draft.is_empty());
-        assert_eq!(app.failed_message_draft, "channel draft\nmessage edit");
-        assert_eq!(app.failed_reply_draft, "thread reply");
         assert_eq!(app.active_page, "fallback-page");
         assert!(!app.block_insert_open);
         assert!(app.block_insert_after_id.is_empty());
-        assert_eq!(app.block_draft, "new block draft");
-
-        let _ = app.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
-            generation: 4,
-            root_seq: 7,
-            target_seq: 7,
-            messages: vec![message(7, "stale fallback collision", false)],
-            next_reply_offset: 1,
-            has_more: true,
-        }));
-        assert_eq!(app.active_thread_seq, 0);
-        assert!(app.thread_messages.is_empty());
     }
 
     #[test]
-    fn unrelated_chat_mutation_preserves_open_editors_and_thread_state() {
+    fn mutation_acks_preserve_open_editors_and_thread_state() {
         let (mut app, _) = Ducktape::__boot();
         app.active_channel = "general".into();
         app.selected_message_seq = 7;
@@ -434,30 +363,11 @@ mod tests {
         app.thread_has_more = true;
         app.reply_editor = compose("reply in progress");
         app.message_editor = compose("next message");
-        app.mutation_phase = "message".into();
+        app.mutation_phase = "reaction".into();
         app.pending_message = "sent message".into();
 
-        let _ = app.__update(__DucktapeMessage::ChatMutated(backend::ChatData {
-            channels: Vec::new(),
-            messages: vec![
-                message(7, "message being edited", false),
-                message(9, "thread root", false),
-            ],
-            active_channel: "general".into(),
-            active_channel_name: "General".into(),
-            active_channel_archived: false,
-            active_channel_members_only: false,
-            active_channel_huddle_count: 0,
-            channel_members: Vec::new(),
-            selected_message_seq: 0,
-            selected_message_rev: 0,
-            selected_message_body: String::new(),
-            active_thread_seq: 0,
-            thread_target_seq: 0,
-            thread_messages: Vec::new(),
-            thread_next_reply_offset: 0,
-            thread_has_more: false,
-        }));
+        // an unrelated mutation's ack carries no snapshot — nothing to stomp
+        let _ = app.__update(__DucktapeMessage::ChatAcked(true));
 
         assert_eq!(app.selected_message_seq, 7);
         assert_eq!(app.message_action, "editing");
@@ -473,44 +383,42 @@ mod tests {
     }
 
     #[test]
-    fn tombstoned_thread_root_closes_every_thread_bound_state() {
+    fn a_tombstoned_thread_root_renders_deleted_in_place() {
         let (mut app, _) = Ducktape::__boot();
         app.connected_rpc = "http://node".into();
-        app.sync_phase = "refreshing".into();
-        app.hydration_generation = 3;
+        app.loading = false;
         app.active_channel = "general".into();
+        app.messages = vec![message(9, "thread root", false)];
         app.active_thread_seq = 9;
-        app.thread_generation = 11;
         app.thread_target_seq = 10;
         app.thread_messages = vec![message(9, "thread root", false)];
-        app.thread_next_reply_offset = 4;
-        app.thread_has_more = true;
-        app.thread_loading = true;
         app.reply_draft = "unsent reply".into();
-        app.pending_reply = "pending reply".into();
 
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
-            3,
-            "general",
-            vec![message(9, "thread root", true)],
-            "",
-            Vec::new(),
-        )));
+        // the root's delete arrives as a delta: both lists tombstone the row
+        // in place; the open thread stays open showing the tombstone (the
+        // module allows replying to a tombstoned root).
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "chat".into(),
+            status: "Live".into(),
+            height: 5,
+            chat: backend::ChatDelta {
+                kind: "deleted".into(),
+                channel_id: "general".into(),
+                seq: 9,
+                ..backend::ChatDelta::default()
+            },
+            ..backend::LiveUpdate::default()
+        }));
 
-        assert_eq!(app.active_thread_seq, 0);
-        assert_eq!(app.thread_generation, 12);
-        assert_eq!(app.thread_target_seq, 0);
-        assert!(app.thread_messages.is_empty());
-        assert_eq!(app.thread_next_reply_offset, 0);
-        assert!(!app.thread_has_more);
-        assert!(!app.thread_loading);
-        assert!(app.reply_draft.is_empty());
-        assert!(app.pending_reply.is_empty());
-        assert_eq!(app.failed_reply_draft, "unsent reply");
+        assert!(app.messages[0].deleted);
+        assert!(app.thread_messages[0].deleted);
+        assert_eq!(app.thread_messages[0].body, "Message deleted");
+        assert_eq!(app.active_thread_seq, 9, "the panel stays open");
+        assert_eq!(app.reply_draft, "unsent reply");
     }
 
     #[test]
-    fn unrelated_hydration_keeps_an_initial_thread_load_alive() {
+    fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
         let (mut refresh, _) = Ducktape::__boot();
         refresh.connected_rpc = "http://node".into();
         refresh.active_channel = "general".into();
@@ -521,10 +429,10 @@ mod tests {
         assert_eq!(refresh.active_thread_seq, 7);
         assert_eq!(refresh.thread_generation, 7);
         assert!(refresh.thread_loading);
-        refresh.sync_phase = "refreshing".into();
         refresh.hydration_generation = 5;
 
-        let _ = refresh.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
+        // an unrelated resync leaves the in-flight thread load untouched
+        let _ = refresh.__update(__DucktapeMessage::LiveResynced(live_refresh(
             5,
             "general",
             vec![message(7, "root", false)],
@@ -534,63 +442,17 @@ mod tests {
         assert_eq!(refresh.active_thread_seq, 7);
         assert_eq!(refresh.thread_generation, 7);
         assert!(refresh.thread_loading);
-
-        refresh.sync_phase = "refreshing".into();
-        refresh.hydration_generation = 6;
-        let _ = refresh.__update(__DucktapeMessage::WorkspaceRefreshed(workspace(
-            6,
-            "general",
-            vec![message(7, "root", true)],
-            "",
-            Vec::new(),
-        )));
-        assert_eq!(refresh.active_thread_seq, 0);
-        assert_eq!(refresh.thread_generation, 8);
-        assert!(!refresh.thread_loading);
         let _ = refresh.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
             generation: 7,
             root_seq: 7,
             target_seq: 7,
-            messages: vec![message(7, "stale deleted root", false)],
+            messages: vec![message(7, "root", false)],
             next_reply_offset: 1,
             has_more: true,
         }));
-        assert_eq!(refresh.active_thread_seq, 0);
-        assert!(refresh.thread_messages.is_empty());
-
-        let (mut mutation, _) = Ducktape::__boot();
-        mutation.active_channel = "general".into();
-        mutation.loading = false;
-        mutation.mutation_phase = "idle".into();
-        mutation.thread_generation = 8;
-        let _ = mutation.__update(__DucktapeMessage::OpenThreadFor(7));
-        mutation.mutation_phase = "message".into();
-        let _ = mutation.__update(__DucktapeMessage::ChatMutated(chat_data(
-            "general",
-            vec![message(7, "root", false)],
-        )));
-        assert_eq!(mutation.active_thread_seq, 7);
-        assert_eq!(mutation.thread_generation, 9);
-        assert!(mutation.thread_loading);
-
-        mutation.mutation_phase = "channel".into();
-        let _ = mutation.__update(__DucktapeMessage::ChatMutated(chat_data(
-            "fallback",
-            vec![message(7, "same sequence, other channel", false)],
-        )));
-        assert_eq!(mutation.thread_generation, 10);
-        assert!(!mutation.thread_loading);
-
-        let _ = mutation.__update(__DucktapeMessage::ThreadLoaded(backend::ThreadLoadData {
-            generation: 9,
-            root_seq: 7,
-            target_seq: 7,
-            messages: vec![message(7, "stale load", false)],
-            next_reply_offset: 1,
-            has_more: true,
-        }));
-        assert_eq!(mutation.active_thread_seq, 0);
-        assert!(mutation.thread_messages.is_empty());
+        assert_eq!(refresh.active_thread_seq, 7);
+        assert_eq!(refresh.thread_messages.len(), 1);
+        assert!(!refresh.thread_loading);
     }
 
     #[test]
@@ -681,15 +543,21 @@ mod tests {
 
         let (mut live, _) = Ducktape::__boot();
         live.loading = false;
+        live.block_height = 41;
         live.hydration_generation = 2;
         let _ = live.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
             kind: "ready".into(),
             status: "Live".into(),
             height: -1,
+            load_chat: true,
+            load_pages: true,
+            ..backend::LiveUpdate::default()
         }));
-        assert_eq!(live.hydration_generation, 2);
-        assert_eq!(live.sync_phase, "idle");
-        assert!(!live.live_dirty);
+        assert_eq!(
+            live.hydration_generation, 3,
+            "ready starts the subscribe-then-hydrate catch-up resync"
+        );
+        assert_eq!(live.block_height, 41, "a heightless event keeps the tip");
     }
 
     #[test]
@@ -716,50 +584,24 @@ mod tests {
         assert!(app.messages.iter().all(|message| message.pending));
 
         app.message_editor = compose("third");
-        let _ = app.__update(__DucktapeMessage::MessageSent(backend::ChatSendResult {
+        // the submit receipt itself never touches the list…
+        let _ = app.__update(__DucktapeMessage::MessageSent(backend::SendReceipt {
             operation_id: first_id.clone(),
             channel_id: "general".into(),
-            data: backend::ChatData {
-                channels: Vec::new(),
-                messages: vec![backend::ChatMessage {
-                    id: first_id,
-                    seq: 1,
-                    author: "you".into(),
-                    meta: "#1".into(),
-                    body: "first".into(),
-                    blocks: backend::paragraph_blocks("first"),
-                    pending: false,
-                    rev: 0,
-                    edited: false,
-                    deleted: false,
-                    reply_count: 0,
-                    thread_seq: 0,
-                    show_author: true,
-                    initial: "U".into(),
-                    avatar_r: 0.4,
-                    avatar_g: 0.4,
-                    avatar_b: 0.9,
-                    reactions: Vec::new(),
-                }],
-                active_channel: "general".into(),
-                active_channel_name: "general".into(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                selected_message_seq: 0,
-                selected_message_rev: 0,
-                selected_message_body: String::new(),
-                active_thread_seq: 0,
-                thread_target_seq: 0,
-                thread_messages: Vec::new(),
-                thread_next_reply_offset: 0,
-                thread_has_more: false,
-            },
         }));
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.messages.iter().all(|message| message.pending));
+
+        // …the committed row arrives as a delta and settles ONLY its pending
+        let mut committed = message(1, "first", false);
+        committed.id = first_id;
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+            "general", committed,
+        )));
         assert_eq!(composer(&app), "third");
         assert_eq!(app.mutation_phase, "idle");
         assert!(!app.messages[0].pending);
+        assert_eq!(app.messages[0].seq, 1);
         assert_eq!(app.messages[1].id, second_id);
         assert!(app.messages[1].pending);
 
@@ -1524,7 +1366,6 @@ mod tests {
         app.connected = true;
         app.loading = false;
         app.mutation_phase = "idle".into();
-        app.sync_phase = "idle".into();
         app.selected_block_id = "block-1".into();
         app.block_comments_open = true;
         app.block_comments_target = "block-1".into();
@@ -1539,17 +1380,25 @@ mod tests {
             text: "stale".into(),
         }];
 
+        // a pages comment op arrives: the delta starts the debounced reload
         let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "changed".into(),
+            kind: "pages".into(),
             status: "Live".into(),
             height: 8,
+            load_pages: true,
+            debounce: true,
+            pages: backend::PagesDelta {
+                kind: "touched".into(),
+                comments: true,
+            },
+            ..backend::LiveUpdate::default()
         }));
-        let workspace_generation = app.hydration_generation;
+        let resync_generation = app.hydration_generation;
         let stale_generation = app.block_comments_generation;
-        assert_eq!(app.sync_phase, "refreshing");
         let _ = app.__update(__DucktapeMessage::LoadMoreBlockThreads);
         assert_ne!(app.block_comments_generation, stale_generation);
 
+        // a comment refresh from a superseded generation is dropped whole
         let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
             backend::BlockCommentsRefreshData {
                 generation: stale_generation,
@@ -1564,41 +1413,27 @@ mod tests {
                 comments_has_more: false,
             },
         ));
-        assert_eq!(app.sync_phase, "refreshing");
+        assert_eq!(app.block_comment_draft, "draft stays");
 
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: workspace_generation,
-                rpc: "http://node".into(),
-                status: "Live".into(),
-                height: 8,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: vec![backend::PageBlock {
-                    key: 0,
-                    id: "block-1".into(),
-                    parent: "page".into(),
-                    kind: "Text".into(),
-                    text: "block".into(),
-                    pending: false,
-                    checked: false,
-                    prefix: String::new(),
-                    child_count: 0,
-                    mark_count: 0,
-                }],
-                active_page: "page".into(),
-                active_page_title: "Page".into(),
-                active_page_parent: String::new(),
-            },
-        ));
-        assert_eq!(app.sync_phase, "idle");
+        // the scoped reload lands and re-arms the comment refresh
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+            resync_generation,
+            "",
+            Vec::new(),
+            "page",
+            vec![backend::PageBlock {
+                key: 0,
+                id: "block-1".into(),
+                parent: "page".into(),
+                kind: "Text".into(),
+                text: "block".into(),
+                pending: false,
+                checked: false,
+                prefix: String::new(),
+                child_count: 0,
+                mark_count: 0,
+            }],
+        )));
         let generation = app.block_comments_generation;
 
         let _ = app.__update(__DucktapeMessage::LiveBlockCommentsRefreshed(
@@ -1630,23 +1465,29 @@ mod tests {
     }
 
     #[test]
-    fn a_live_event_waits_for_thread_pagination_then_refreshes() {
+    fn deltas_fold_during_thread_pagination_without_disturbing_it() {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;
         app.active_channel = "general".into();
+        app.messages = vec![message(7, "root", false)];
         app.active_thread_seq = 7;
         app.thread_generation = 4;
         app.thread_loading = true;
         app.hydration_generation = 9;
 
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "changed".into(),
-            status: "Live".into(),
-            height: 10,
-        }));
-        assert!(app.live_dirty);
-        assert_eq!(app.hydration_generation, 9);
+        // a delta folds immediately — pagination in flight is not a gate
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+            "general",
+            message(8, "landed mid-pagination", false),
+        )));
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(
+            app.hydration_generation, 9,
+            "a folded delta starts no reload"
+        );
+        assert!(app.thread_loading);
 
+        // the pending thread page still lands on its own generation
         let _ = app.__update(__DucktapeMessage::ThreadPageLoaded(
             backend::ThreadPageData {
                 generation: 4,
@@ -1655,10 +1496,8 @@ mod tests {
                 has_more: false,
             },
         ));
-        assert!(!app.live_dirty);
         assert!(!app.thread_loading);
-        assert_eq!(app.hydration_generation, 10);
-        assert_eq!(app.sync_phase, "refreshing");
+        assert_eq!(app.hydration_generation, 9);
     }
 
     #[test]
@@ -1716,12 +1555,11 @@ mod tests {
             written: true,
         }));
         assert_eq!(app.hydration_generation, navigation_generation);
-        assert_eq!(app.sync_phase, "idle");
         assert!(app.loading);
     }
 
     #[test]
-    fn block_edits_invalidate_an_older_workspace_refresh() {
+    fn block_edits_invalidate_an_older_resync() {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;
         app.connected_rpc = "http://node".into();
@@ -1729,57 +1567,29 @@ mod tests {
         app.selected_block_kind = "Text".into();
         app.block_edit_draft = "old".into();
         app.hydration_generation = 3;
-        app.sync_phase = "refreshing".into();
 
         let _ = app.__update(__DucktapeMessage::BlockTextChanged("new".into()));
         assert_eq!(app.hydration_generation, 4);
-        assert_eq!(app.sync_phase, "idle");
 
-        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "changed".into(),
-            status: "Live".into(),
-            height: 1,
-        }));
-        assert_eq!(app.hydration_generation, 5);
-        assert_eq!(app.sync_phase, "refreshing");
-        let _ = app.__update(__DucktapeMessage::BlockTextSaved(backend::AutosaveResult {
-            generation: app.block_autosave_generation,
-            written: true,
-        }));
-        assert_eq!(app.hydration_generation, 6);
-
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: 5,
-                rpc: "http://node".into(),
-                status: "stale".into(),
-                height: 1,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: vec![backend::PageBlock {
-                    key: 0,
-                    id: "block-1".into(),
-                    parent: "page".into(),
-                    kind: "Text".into(),
-                    text: "old".into(),
-                    pending: false,
-                    checked: false,
-                    prefix: String::new(),
-                    child_count: 0,
-                    mark_count: 0,
-                }],
-                active_page: "page".into(),
-                active_page_title: "Page".into(),
-                active_page_parent: String::new(),
-            },
-        ));
+        // a stale resync from before the edit cannot roll the draft back
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+            3,
+            "",
+            Vec::new(),
+            "page",
+            vec![backend::PageBlock {
+                key: 0,
+                id: "block-1".into(),
+                parent: "page".into(),
+                kind: "Text".into(),
+                text: "old".into(),
+                pending: false,
+                checked: false,
+                prefix: String::new(),
+                child_count: 0,
+                mark_count: 0,
+            }],
+        )));
         assert_eq!(app.block_edit_draft, "new");
     }
 
@@ -1789,7 +1599,6 @@ mod tests {
         app.loading = false;
         app.connected_rpc = "http://node".into();
         app.hydration_generation = 4;
-        app.sync_phase = "refreshing".into();
         app.selected_block_id = "deleted".into();
         app.selected_block_kind = "Text".into();
         app.block_edit_draft = "unfinished block".into();
@@ -1802,27 +1611,13 @@ mod tests {
         app.page_delete_armed = true;
         app.page_title_selected = true;
 
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(
-            backend::WorkspaceData {
-                generation: 4,
-                rpc: "http://node".into(),
-                status: "Live".into(),
-                height: 9,
-                channels: Vec::new(),
-                messages: Vec::new(),
-                active_channel: String::new(),
-                active_channel_name: String::new(),
-                active_channel_archived: false,
-                active_channel_members_only: false,
-                active_channel_huddle_count: 0,
-                channel_members: Vec::new(),
-                pages: Vec::new(),
-                blocks: Vec::new(),
-                active_page: "page".into(),
-                active_page_title: "Page".into(),
-                active_page_parent: String::new(),
-            },
-        ));
+        let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+            4,
+            "",
+            Vec::new(),
+            "page",
+            Vec::new(),
+        )));
 
         assert_eq!(app.orphaned_block_drafts, ["unfinished block"]);
         assert_eq!(app.orphaned_comment_drafts, ["unfinished comment"]);
@@ -2045,7 +1840,6 @@ mod tests {
         assert_eq!(app.messages.len(), 1);
         assert!(app.messages[0].pending);
         assert_eq!(app.mutation_phase, "idle");
-        assert_eq!(app.sync_phase, "refreshing");
 
         app.message_editor = compose("still available");
         let _ = app.__update(__DucktapeMessage::SendMessageSubmit);
@@ -2101,7 +1895,20 @@ mod tests {
         let mut second = message(3, "second", false);
         second.id = second_id.clone();
         second.thread_seq = 1;
-        let _ = app.__update(__DucktapeMessage::ThreadReplySent(second));
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "chat".into(),
+            status: "Live".into(),
+            height: 3,
+            chat: backend::ChatDelta {
+                kind: "reply".into(),
+                channel_id: "general".into(),
+                seq: 3,
+                root_seq: 1,
+                message: second,
+                ..backend::ChatDelta::default()
+            },
+            ..backend::LiveUpdate::default()
+        }));
         assert_eq!(app.thread_messages.len(), 2);
         assert!(
             app.thread_messages
@@ -2117,7 +1924,20 @@ mod tests {
         let mut first = message(2, "first", false);
         first.id = first_id.clone();
         first.thread_seq = 1;
-        let _ = app.__update(__DucktapeMessage::ThreadReplySent(first));
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: "chat".into(),
+            status: "Live".into(),
+            height: 4,
+            chat: backend::ChatDelta {
+                kind: "reply".into(),
+                channel_id: "general".into(),
+                seq: 2,
+                root_seq: 1,
+                message: first,
+                ..backend::ChatDelta::default()
+            },
+            ..backend::LiveUpdate::default()
+        }));
         assert_eq!(app.thread_messages.len(), 2);
         assert!(app.thread_messages.iter().all(|message| !message.pending));
         assert_eq!(app.thread_messages[0].body, "first");
@@ -2193,7 +2013,6 @@ mod tests {
         assert!(app.failed_reply_draft.is_empty());
         assert_eq!(app.mutation_phase, "idle");
         assert!(!app.thread_loading);
-        assert_eq!(app.sync_phase, "refreshing");
 
         app.reply_editor = compose("still available");
         let _ = app.__update(__DucktapeMessage::SendReplySubmit);
@@ -2277,26 +2096,15 @@ mod tests {
             50
         ));
 
-        // A same-channel live refresh that brings a NEW message must NOT move
+        // A same-channel live delta that brings a NEW message must NOT move
         // the frozen boundary — the divider would jump as you read.
-        app.sync_phase = "refreshing".into();
-        let generation = app.hydration_generation;
-        let mut refreshed = workspace(
-            generation,
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
             "random",
-            vec![
-                message(31, "a", false),
-                message(40, "b", false),
-                message(50, "c", false),
-                message(60, "d", false),
-            ],
-            "",
-            Vec::new(),
-        );
-        refreshed.channels = vec![channel("random", 60)];
-        let _ = app.__update(__DucktapeMessage::WorkspaceRefreshed(refreshed));
+            message(60, "d", false),
+        )));
         assert_eq!(app.active_channel, "random");
         assert_eq!(app.unread_boundary, 30);
+        assert_eq!(app.messages.len(), 4);
 
         // Arriving at a caught-up channel shows no divider (boundary 0).
         app.channel_reads =
@@ -2347,15 +2155,21 @@ mod tests {
             lifecycle
                 .contains("channel_reads = initial_channel_reads(next.channels, channel_reads)")
         );
+        // navigation loads freeze on the real channel change (chat.ice);
+        // the resync path freezes against the possibly-unchanged channel.
         let chat = include_str!("ui/handlers/chat.ice");
-        for handler in [chat, lifecycle] {
-            assert!(handler.contains(
-                "unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)"
-            ));
-            assert!(handler.contains(
-                "channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))"
-            ));
-        }
+        assert!(chat.contains(
+            "unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)"
+        ));
+        assert!(chat.contains(
+            "channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))"
+        ));
+        assert!(lifecycle.contains(
+            "unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)"
+        ));
+        assert!(lifecycle.contains(
+            "channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))"
+        ));
 
         // Client-local only: no wire read-cursor leaked into the module surface.
         let backend_ice = include_str!("ui/backend.ice");
