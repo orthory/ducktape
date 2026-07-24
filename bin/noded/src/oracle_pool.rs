@@ -66,8 +66,6 @@ where
         agent_dirs,
         Some(run_output.output_sink()),
         backend,
-        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-        false,
     )
     // BYO: run whatever executor CLIs the capability specs describe and
     // this host has installed — no credential handling here (see

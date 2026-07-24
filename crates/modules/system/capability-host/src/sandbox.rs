@@ -7,8 +7,12 @@
 //! HOME is NOT mounted: only the spec's [sandbox] rw_dirs (CLI auth/state)
 //! cross the boundary, so the node's data dir and user key stay outside —
 //! this is the D7 filesystem-isolation boundary for sandboxed providers.
-//! ponytail: --network=host keeps loopback MCP reachable; a private netns
-//! with a gateway route is the upgrade path if network isolation matters.
+//! Every Podman run gets a PRIVATE netns (`--network=slirp4netns`), never the
+//! host's: it reaches only its own broker + this node's RPC via the
+//! `host.containers.internal` gateway, never other runs' brokers or the node's
+//! loopback control plane — that is the D-network isolation boundary.
+//! ponytail: a private netns still NATs outbound; an egress allowlist (broker +
+//! node only) is the next hardening — see the `--network=slirp4netns` site below.
 //!
 //! Tart (Apple Silicon, Virtualization.framework) is the macOS-guest backend:
 //! a run APFS-COW-clones a base image, configures and boots it, executes through
@@ -71,17 +75,28 @@ impl SandboxBackend {
     /// verify this host can actually run the chosen adapter: the runtime
     /// binary must be executable somewhere on `PATH`. a config naming an
     /// unusable runtime is a loud boot error — there is no bare fallback.
+    /// Podman additionally requires `slirp4netns`, the backend for the private
+    /// container netns every run gets (see [`wrap_podman_inner`]) — a hard
+    /// dependency, so missing it fails at boot, not per-run.
     pub fn probe(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
-        let path = std::env::var_os("PATH")
-            .ok_or_else(|| format!("sandbox runtime {bin:?}: PATH is unset"))?;
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(bin))
-            .find(|candidate| crate::is_executable(candidate))
-            .ok_or_else(|| {
-                format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
-            })
+        let found = find_on_path(bin).ok_or_else(|| {
+            format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
+        })?;
+        let podman_needs_slirp = matches!(self, SandboxBackend::Podman { .. });
+        if podman_needs_slirp && find_on_path("slirp4netns").is_none() {
+            return Err("slirp4netns is not executable on PATH; the Podman sandbox requires it for the private container netns — install it".into());
+        }
+        Ok(found)
     }
+}
+
+/// first executable named `bin` on `PATH`, if any.
+fn find_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(bin))
+        .find(|candidate| crate::is_executable(candidate))
 }
 
 /// translate a provider invocation into a `podman run` argv — PURE, no I/O, so
@@ -111,7 +126,7 @@ fn wrap_podman(
     limits: &BTreeMap<String, u64>,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
-        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false, false,
+        image, workdir, bin, args, envs, ro_paths, rw_dirs, limits, None, false,
     )
 }
 
@@ -131,7 +146,6 @@ pub(crate) fn wrap_podman_managed(
     cidfile: &Path,
     labels: &[String],
     tty: bool,
-    private_net: bool,
 ) -> (PathBuf, Vec<String>) {
     wrap_podman_inner(
         image,
@@ -144,7 +158,6 @@ pub(crate) fn wrap_podman_managed(
         limits,
         Some((cidfile, labels)),
         tty,
-        private_net,
     )
 }
 
@@ -160,33 +173,26 @@ fn wrap_podman_inner(
     limits: &BTreeMap<String, u64>,
     control: Option<(&Path, &[String])>,
     tty: bool,
-    private_net: bool,
 ) -> (PathBuf, Vec<String>) {
     let mut argv: Vec<String> = vec!["run".into(), "--rm".into()];
-    if private_net {
-        // A PRIVATE netns via slirp4netns: the container gets its OWN loopback,
-        // so it can no longer scan the host's — the lateral reach `--network=host`
-        // gave, letting a member hit other runs' brokers / the node RPC. slirp4netns
-        // auto-adds `host.containers.internal` (→ the host's routable IP), which is
-        // how the child reaches this run's broker (bound to a routable interface;
-        // base_url = host.containers.internal — see `broker::Reachability`).
-        //
-        // slirp4netns is named EXPLICITLY, not left to podman's default: the
-        // default is pasta, which a host may not have installed (verified: a box
-        // with only slirp4netns fails `podman run` with the default). slirp4netns
-        // is the widely-available backend and reachability is verified with it.
-        //
-        // STILL DEFERRED (needs more podman-host work): a full OUTBOUND egress
-        // allowlist (block the internet, allow only the broker + node RPC) — a
-        // private netns alone still NATs outbound. Off by default (enabled per node
-        // by DUCKTAPE_SANDBOX_PRIVATE_NET) so nothing regresses meanwhile.
-        argv.push("--network=slirp4netns".into());
-    } else {
-        // `--network=host`: the container shares the host netns, so the broker /
-        // MCP on 127.0.0.1 are reachable at the address the argv names. The
-        // historical default; kept until private_net is validated on a podman host.
-        argv.push("--network=host".into());
-    }
+    // A PRIVATE netns via slirp4netns: the container gets its OWN loopback, so it
+    // can no longer scan the host's — closing the lateral reach `--network=host`
+    // gave, where a member could hit other runs' brokers / the node's loopback
+    // control plane. slirp4netns auto-adds `host.containers.internal` (→ the
+    // host's routable IP), which is how the child reaches this run's broker (bound
+    // to a routable interface; base_url = host.containers.internal — see
+    // `broker::Reachability`) and this node's RPC (the run-action URL is rewritten
+    // to the same gateway — see `podman_command`).
+    //
+    // slirp4netns is named EXPLICITLY, not left to podman's default: the default
+    // is pasta, which a host may not have installed (verified: a box with only
+    // slirp4netns fails `podman run` with the default). slirp4netns is the
+    // widely-available backend and `probe()` makes its absence a boot error.
+    //
+    // STILL DEFERRED (needs more podman-host work): a full OUTBOUND egress
+    // allowlist (block the internet, allow only the broker + node RPC) — a
+    // private netns alone still NATs outbound.
+    argv.push("--network=slirp4netns".into());
     // -i keeps stdin open (the prompt is fed on the child's stdin). -t adds a
     // container-side pty for an interactive session — the host attaches podman's
     // stdio to a pty master and podman relays terminal size/SIGWINCH into it.
@@ -593,7 +599,7 @@ mod tests {
         );
         assert_eq!(bin, PathBuf::from("podman"));
         let s = argv.join(" ");
-        assert!(s.starts_with("run --rm --network=host"), "got: {s}");
+        assert!(s.starts_with("run --rm --network=slirp4netns"), "got: {s}");
         assert!(
             s.contains("--cpus 4") && s.contains("--memory 8g") && s.contains("--memory-swap 8g"),
             "got: {s}"
@@ -639,7 +645,6 @@ mod tests {
             cidfile,
             &labels,
             false,
-            false,
         );
         let s = argv.join(" ");
         assert!(
@@ -677,7 +682,6 @@ mod tests {
                 cidfile,
                 &labels,
                 tty,
-                false,
             )
             .1
             .join(" ")
@@ -699,38 +703,28 @@ mod tests {
     }
 
     #[test]
-    fn private_net_swaps_host_netns_for_a_gateway_mapped_private_one() {
+    fn podman_always_gets_a_private_slirp4netns_never_the_host_netns() {
         let cidfile = Path::new("/host/x.cid");
         let labels: Vec<String> = vec![];
-        let build = |private_net: bool| {
-            wrap_podman_managed(
-                "img",
-                Path::new("/bin/x"),
-                &[],
-                Path::new("/work"),
-                &[],
-                &[],
-                &[],
-                &BTreeMap::new(),
-                cidfile,
-                &labels,
-                false,
-                private_net,
-            )
-            .1
-            .join(" ")
-        };
-        let host = build(false);
-        let private = build(true);
-        // default: shared host netns.
-        assert!(host.contains("--network=host"), "host mode: {host}");
-        // private: a slirp4netns netns instead (verified reachable via
-        // host.containers.internal), never the host netns.
-        assert!(!private.contains("--network=host"), "private: {private}");
-        assert!(
-            private.contains("--network=slirp4netns"),
-            "private: {private}"
+        let (_bin, argv) = wrap_podman_managed(
+            "img",
+            Path::new("/bin/x"),
+            &[],
+            Path::new("/work"),
+            &[],
+            &[],
+            &[],
+            &BTreeMap::new(),
+            cidfile,
+            &labels,
+            false,
         );
+        let s = argv.join(" ");
+        // Every run gets its OWN netns (reachable via host.containers.internal),
+        // never the host's — a member can no longer scan host loopback for other
+        // runs' brokers or the node's control plane.
+        assert!(s.contains("--network=slirp4netns"), "private netns: {s}");
+        assert!(!s.contains("--network=host"), "never host netns: {s}");
     }
 
     #[test]
@@ -773,7 +767,7 @@ mod tests {
             &BTreeMap::new(),
         );
         let s = argv.join(" ");
-        assert!(s.starts_with("run --rm --network=host"), "got: {s}");
+        assert!(s.starts_with("run --rm --network=slirp4netns"), "got: {s}");
         assert!(
             !s.contains("--memory") && !s.contains("--memory-swap"),
             "got: {s}"

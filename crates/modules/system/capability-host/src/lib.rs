@@ -534,13 +534,6 @@ pub(crate) struct CliProvider {
     /// how the child is spawned: rootless `Podman` or an ephemeral
     /// Tart VM. set once at discovery for the whole provider set.
     backend: SandboxBackend,
-    /// (Podman only) give the container a PRIVATE netns instead of `--network=host`,
-    /// so it cannot scan the host's loopback for other runs' brokers / the node
-    /// RPC. Off by default (`--network=host` unchanged); enabled per-node by
-    /// `DUCKTAPE_SANDBOX_PRIVATE_NET` while the gateway/egress specifics are
-    /// validated on a real podman host. When on, the broker is reachable via
-    /// `host.containers.internal` (see [`broker::Reachability`]).
-    private_net: bool,
 }
 
 impl CliProvider {
@@ -563,19 +556,12 @@ impl CliProvider {
             dirs: AgentDirs::default(),
             output_sink: None,
             backend,
-            private_net: false,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_workdir(mut self, workdir: PathBuf) -> Self {
         self.workdir = workdir;
-        self
-    }
-
-    /// (Podman only) opt into a private netns instead of `--network=host`.
-    pub fn with_private_net(mut self, private_net: bool) -> Self {
-        self.private_net = private_net;
         self
     }
 
@@ -691,9 +677,11 @@ impl CliProvider {
     /// finds its dotfiles at their identical mounted paths) but not itself
     /// mounted — the node's data dir and user key stay outside (D7).
     ///
-    /// Host endpoints compose with both network modes: host networking keeps
-    /// loopback intact, while a private netns uses Podman's
-    /// `host.containers.internal` gateway.
+    /// The container runs in a private netns, so the node's own RPC is not on
+    /// its loopback: the run-action URL is rewritten to the
+    /// `host.containers.internal` gateway podman maps back to this host (the
+    /// broker's own base_url already names that gateway — see
+    /// [`broker::Reachability`]).
     fn podman_command(
         &self,
         image: &str,
@@ -704,12 +692,13 @@ impl CliProvider {
         tty: bool,
     ) -> Result<(tokio::process::Command, PodmanRun), String> {
         let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
-        if self.private_net {
-            for (key, value) in &mut envs {
-                if key == RUN_ACTION_URL_ENV {
-                    *value =
-                        value.replacen("http://127.0.0.1:", "http://host.containers.internal:", 1);
-                }
+        for (key, value) in &mut envs {
+            if key == RUN_ACTION_URL_ENV {
+                *value = value.replacen(
+                    "http://127.0.0.1:",
+                    "http://host.containers.internal:",
+                    1,
+                );
             }
         }
         let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
@@ -728,7 +717,6 @@ impl CliProvider {
             &run.cidfile,
             &run.labels,
             tty,
-            self.private_net,
         );
         let mut cmd = tokio::process::Command::new(bin);
         cmd.args(argv)
@@ -1044,15 +1032,15 @@ impl CliProvider {
             return Ok(None);
         };
         let tart = matches!(self.backend, SandboxBackend::Tart { .. });
-        // a private-netns Podman child can't reach a loopback-bound broker at
-        // 127.0.0.1; it dials `host.containers.internal` instead.
-        let podman_private =
-            self.private_net && matches!(self.backend, SandboxBackend::Podman { .. });
+        // every Podman run is in a private netns, so it can't reach a
+        // loopback-bound broker at 127.0.0.1; it dials `host.containers.internal`.
+        // the remaining `else` (a loopback broker) is only the test-only Bare host.
+        let podman = matches!(self.backend, SandboxBackend::Podman { .. });
         match kind {
             BrokerKind::CodexResponses => {
                 if tart {
                     broker::RunBroker::start_for_tart(airlock).await.map(Some)
-                } else if podman_private {
+                } else if podman {
                     broker::RunBroker::start_for_podman_private(airlock).await.map(Some)
                 } else {
                     broker::RunBroker::start(airlock).await.map(Some)
@@ -1061,7 +1049,7 @@ impl CliProvider {
             BrokerKind::AnthropicMessages => {
                 if tart {
                     broker::RunBroker::start_anthropic_for_tart(airlock).await.map(Some)
-                } else if podman_private {
+                } else if podman {
                     broker::RunBroker::start_anthropic_for_podman_private(airlock)
                         .await
                         .map(Some)
@@ -3850,12 +3838,6 @@ pub fn discover(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
-    // force a private container netns regardless of the env knob. The interactive
-    // terminal plane passes `true` — its containers are driven by ADVERSARIAL
-    // members, so they must NOT share the host netns (where they could reach the
-    // node's own loopback /v1 control plane + other runs' brokers). Headless runs
-    // pass `false` and honor `DUCKTAPE_SANDBOX_PRIVATE_NET`.
-    force_private_net: bool,
 ) -> Result<ProviderSet, String> {
     let specs = SpecSet::load(operator_spec_dir().as_deref())?;
     let executing_node = execution_node_id(node_identity);
@@ -3867,13 +3849,6 @@ pub fn discover(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
-    // opt-in per node: a private container netns instead of --network=host (see
-    // CliProvider::private_net). Off unless explicitly enabled while its podman
-    // networking specifics are validated on a real podman host.
-    let private_net = force_private_net
-        || std::env::var("DUCKTAPE_SANDBOX_PRIVATE_NET")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
     Ok(discover_with_sink(
         specs,
         std::env::var_os("PATH"),
@@ -3882,7 +3857,6 @@ pub fn discover(
         dirs.resolved(&|k| std::env::var_os(k)),
         output_sink,
         backend,
-        private_net,
     ))
 }
 
@@ -3922,7 +3896,6 @@ fn discover_with(
         dirs,
         None,
         SandboxBackend::Bare,
-        false,
     )
 }
 
@@ -3935,7 +3908,6 @@ fn discover_with_sink(
     dirs: AgentDirs,
     output_sink: Option<OutputSink>,
     backend: SandboxBackend,
-    private_net: bool,
 ) -> ProviderSet {
     let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
@@ -3951,8 +3923,7 @@ fn discover_with_sink(
         };
         for spec in group {
             let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone(), backend.clone())
-                .with_agent_dirs(dirs.clone())
-                .with_private_net(private_net);
+                .with_agent_dirs(dirs.clone());
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }
@@ -4565,8 +4536,7 @@ rw_dirs = ["~/.claude"]
             SandboxBackend::Podman {
                 image: "img".into(),
             },
-        )
-        .with_private_net(true);
+        );
         let ctx = RunContext {
             env: BTreeMap::from([
                 ("RUN_SECRET".to_string(), "not-in-argv".to_string()),

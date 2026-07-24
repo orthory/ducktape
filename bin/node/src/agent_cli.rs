@@ -132,7 +132,14 @@ fn cmd_pty(args: PtyArgs, network: Option<&str>) -> AgentResult {
         .build()
         .map_err(|e| format!("attach runtime: {e}"))?;
     let outcome = runtime.block_on(attach(&base, &created.session_id, &created.topic));
-    drop(runtime);
+    // `shutdown_background`, NOT drop: the attach loop's stdin forwarder reads
+    // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. On a real
+    // tty that read never returns, and `abort()` cannot interrupt an OS-level
+    // blocking read — so a normal runtime drop WAITS for that thread forever,
+    // wedging `agent pty` AFTER the session already ended (the second half of the
+    // wedge; the first was the missing end signal). Detach instead: the stuck
+    // reader dies with the process.
+    runtime.shutdown_background();
 
     // Best-effort close (idempotent host-side; the 4 h wall-clock + kill-on-drop
     // are the backstops if it never lands).

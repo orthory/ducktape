@@ -210,21 +210,27 @@ impl TermRing {
     }
 
     /// flag a session's ring as ended (the pump reached EOF) and wake its ws
-    /// subscribers so the catch-up path can emit the terminal frame. A no-op for
-    /// a session already evicted from the ring — no subscriber can be waiting on
-    /// a ring that is gone. Bumps `version` so `term:<id>` `watch` fires exactly
-    /// as an append would.
+    /// subscribers so the catch-up path can emit the terminal frame. CREATES the
+    /// ring entry if absent: a session that dies before printing a single byte
+    /// (a fast crash, or a kill before the child renders) has no ring entry yet,
+    /// and its end MUST still reach the `agent pty` client waiting on the topic —
+    /// otherwise that no-output session is exactly the one that wedges. Bumps
+    /// `version` so `term:<id>` `watch` fires exactly as an append would.
     pub fn mark_ended(&self, session: &str) {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
-        let Some(ring) = inner.sessions.get_mut(session) else {
-            return;
-        };
-        if ring.ended {
-            return;
+        let touch = inner.touch + 1;
+        let version = inner.version + 1;
+        {
+            let ring = inner.sessions.entry(session.to_string()).or_default();
+            if ring.ended {
+                return; // already ended — the double-close race is a no-op
+            }
+            ring.ended = true;
+            ring.touched = touch; // not the instant LRU victim before the signal lands
         }
-        ring.ended = true;
-        inner.version += 1;
-        let version = inner.version;
+        inner.touch = touch;
+        inner.version = version;
+        drop(inner);
         let _ = self.watch.send(version);
     }
 
@@ -1052,9 +1058,7 @@ pub fn discover_interactive(
     dirs: AgentDirs,
     backend: SandboxBackend,
 ) -> Option<ProviderSet> {
-    // force_private_net = TRUE: terminal containers host adversarial members, so
-    // they must not share the host netns (see capability_host::discover).
-    match capability_host::discover(node_identity, dirs, None, backend, true) {
+    match capability_host::discover(node_identity, dirs, None, backend) {
         Ok(set) => Some(set),
         Err(err) => {
             tracing::error!(target: "ducktape::term", error = %err, "interactive_discovery_failed");
@@ -1346,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_marks_ended_idempotently_and_ignores_unknown_sessions() {
+    fn ring_marks_ended_idempotently_even_without_prior_output() {
         let ring = TermRing::default();
         ring.append("s", STANDARD.encode(b"hi"));
         assert!(!ring.is_ended("s"), "a live session is not ended");
@@ -1354,10 +1358,13 @@ mod tests {
         assert!(ring.is_ended("s"), "the pump's EOF marks the ring ended");
         ring.mark_ended("s"); // idempotent — the double-close race is a no-op
         assert!(ring.is_ended("s"));
-        // an unknown/evicted session is never ended and never panics.
-        assert!(!ring.is_ended("nope"));
-        ring.mark_ended("nope");
-        assert!(!ring.is_ended("nope"));
+
+        // THE WEDGE CASE: a session that produced NO output has no ring entry
+        // yet — mark_ended must still create it and flag it ended, so the
+        // `agent pty` client waiting on the topic learns the session is over.
+        assert!(!ring.is_ended("silent"), "no entry yet, so not ended");
+        ring.mark_ended("silent");
+        assert!(ring.is_ended("silent"), "a no-output session still signals end");
     }
 
     #[test]

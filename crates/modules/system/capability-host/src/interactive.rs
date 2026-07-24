@@ -645,8 +645,6 @@ mod tests {
             dirs,
             None,
             crate::SandboxBackend::Podman { image },
-            // match the terminal plane's forced private netns (L9).
-            true,
         )
         .expect("discover codex on Podman");
         let provider = set.resolve("codex").expect("codex provider present");
@@ -691,8 +689,6 @@ mod tests {
                 crate::AgentDirs::under(std::path::Path::new("/tmp/ducktape-live-verify")),
                 None,
                 crate::SandboxBackend::Podman { image },
-                // match the terminal plane's forced private netns (L9).
-                true,
             )
             .expect("discover on Podman"),
         )

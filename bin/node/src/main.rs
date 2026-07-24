@@ -314,7 +314,6 @@ fn run_node(
         sandbox,
         sandbox_capacity,
         promoted,
-        joiner,
     } = boot::env::derive(resolved, sync_only);
 
     // the compute-plane gate: a configured sandbox must actually be runnable
@@ -355,7 +354,6 @@ fn run_node(
         local_gateway_via,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
-        joiner,
         label: &label,
         storage: &storage,
         // the config dir where gateway-routes.json lives (= storage in the dev
