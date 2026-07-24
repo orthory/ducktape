@@ -101,10 +101,6 @@ pub(super) async fn restore(
                 forge_repo,
                 duckfs_dir,
                 &manifest,
-                NetworkBindings {
-                    invite: namespace,
-                    identity_chain_id,
-                },
                 blobs.clone(),
             )
             .await;
@@ -190,7 +186,6 @@ pub(super) async fn post_reboot_catchup<'a>(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
-    identity_chain_id: String,
     validators: Vec<ed25519::PublicKey>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
@@ -365,10 +360,6 @@ pub(super) async fn post_reboot_catchup<'a>(
                                 context,
                                 &client,
                                 &target,
-                                NetworkBindings {
-                                    invite: &namespace,
-                                    identity_chain_id: &identity_chain_id,
-                                },
                                 SyncSubstrates {
                                     forge_repo: &forge_repo,
                                     duckfs_dir: &duckfs_dir,

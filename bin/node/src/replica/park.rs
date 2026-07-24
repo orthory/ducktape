@@ -22,7 +22,7 @@ use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_index};
 use crate::host_reads::{joiner_epoch_mesh, read_valset_members, read_valset_residents};
-use crate::host_state::{NetworkBindings, SyncSubstrates, restore_host, sync_all_modules};
+use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
 use crate::oracle_pool;
 use crate::relay;
 use crate::relay_runtime;
@@ -214,7 +214,6 @@ pub(super) async fn park(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
-    identity_chain_id: String,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -514,10 +513,6 @@ pub(super) async fn park(
             &forge_repo,
             &duckfs_dir,
             ckpt,
-            NetworkBindings {
-                invite: &namespace,
-                identity_chain_id: &identity_chain_id,
-            },
             blobs.clone(),
         )
         .await;
@@ -1912,10 +1907,6 @@ pub(super) async fn park(
                         &context,
                         &client,
                         &m,
-                        NetworkBindings {
-                            invite: &namespace,
-                            identity_chain_id: &identity_chain_id,
-                        },
                         SyncSubstrates {
                             forge_repo: &forge_repo,
                             duckfs_dir: &duckfs_dir,
@@ -2292,10 +2283,6 @@ pub(super) async fn park(
             &context,
             &client,
             &m,
-            NetworkBindings {
-                invite: &namespace,
-                identity_chain_id: &identity_chain_id,
-            },
             SyncSubstrates {
                 forge_repo: &forge_repo,
                 duckfs_dir: &duckfs_dir,

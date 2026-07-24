@@ -114,14 +114,10 @@ const CAPABILITY_MODULE_ID: &str = "capability";
 const IDENTITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/identity/component.wasm");
 const IDENTITY_MODULE_ID: &str = "identity";
-/// gateway — an adapter-ported tenant whose native constructor takes a
-/// PER-NETWORK parameter (the chain id). a wasm component is fixed bytes, so
-/// the parameter travels as GENESIS CONFIG: the builder below installs an
-/// initial store carrying the reserved `__config` key (`sdk::genesis_config`)
-/// at construction, and the guest decodes it per dispatch. the config is
-/// consensus state — identical on every node, in the module root (hence the
-/// root-hash) from genesis, and carried by checkpoint snapshots like any
-/// other store key.
+/// gateway — a STORE-BACKED tenant with the governance/identity seam: its
+/// per-network chain id travels as GENESIS CONFIG seeded INTO the qmdb store
+/// ([`seed_store_config`]), an ordinary store record in the merkle root from
+/// genesis that rides state-sync like every other record.
 const GATEWAY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/gateway/component.wasm");
 const GATEWAY_MODULE_ID: &str = "gateway";
@@ -432,31 +428,6 @@ fn files_wasm(dir: std::path::PathBuf) -> Result<WasmModule, sdk::Error> {
     WasmModule::with_odb(FILES_MODULE_ID, FILES_WASM_COMPONENT, Box::new(backing))
 }
 
-/// a wasm tenant at its GENESIS code with a host-installed GENESIS-CONFIG
-/// store: the component loads, then adopts an initial snapshot whose one
-/// entry is the reserved `__config` key carrying the canonically-encoded
-/// per-network parameters. install is verify-then-adopt against the
-/// host-computed root, so the constructed module's root commits to the config
-/// from block zero (genesis roots honestly differ per network). the RESTORE /
-/// STATE-SYNC paths construct through the same builder and then install the
-/// checkpoint snapshot over it — the config rides in those bytes, so the
-/// interim config-only store is simply replaced by the same-config checkpoint.
-fn genesis_config_wasm(
-    module_id: &str,
-    component: &[u8],
-    params: &[(&str, &[u8])],
-    what: &str,
-) -> WasmModule {
-    let mut module = WasmModule::from_bytes(module_id, component)
-        .unwrap_or_else(|e| panic!("embedded {what} component loads: {e}"));
-    let config = sdk::genesis_config::encode_config(params);
-    let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module
-        .install(&bytes, root)
-        .unwrap_or_else(|e| panic!("{what} genesis config installs: {e}"));
-    module
-}
-
 /// identity at its GENESIS code over the host-constructed store (same three
 /// store lifecycles as [`pages_wasm`]). the per-network chain id every signed
 /// certificate preimage folds in is a `__config` STORE RECORD, seeded at
@@ -467,15 +438,13 @@ fn identity_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
         .expect("embedded identity component loads")
 }
 
-/// gateway at its GENESIS code + config. It owns the `.duck` handle and route
-/// planes; both are chain-scoped, so the per-network chain id rides `__config`.
-fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
-    genesis_config_wasm(
-        GATEWAY_MODULE_ID,
-        GATEWAY_WASM_COMPONENT,
-        &[("chain_id", bindings.identity_chain_id.as_bytes())],
-        "gateway",
-    )
+/// gateway at its GENESIS code over the host-constructed store (same three
+/// store lifecycles as [`pages_wasm`]). It owns the `.duck` handle and route
+/// planes; both are chain-scoped, so the per-network chain id rides the
+/// store-seeded `__config` record ([`seed_store_config`]).
+fn gateway_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(GATEWAY_MODULE_ID, GATEWAY_WASM_COMPONENT, store)
+        .expect("embedded gateway component loads")
 }
 
 /// governance at its GENESIS code over the host-constructed store (same
@@ -630,6 +599,16 @@ pub(super) async fn genesis_host(
     let capability = capability_wasm(Box::new(
         QmdbStore::init(context.child("capability"), "capability").await,
     ));
+    let gateway = {
+        let mut store = QmdbStore::init(context.child("gateway"), "gateway").await;
+        seed_store_config(
+            &mut store,
+            &[("chain_id", bindings.identity_chain_id.as_bytes())],
+            "gateway",
+        )
+        .await;
+        gateway_wasm(Box::new(store))
+    };
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -693,9 +672,9 @@ pub(super) async fn genesis_host(
         // the MERGED gateway: the whole `.duck` name → AccountId → route
         // pipeline in ONE module — the route plane PLUS the optional human-name
         // handle plane absorbed from the retired `duckdns` module. Files owns
-        // DuckFS bytes, loopback ports stay local. adapter-ported; the chain id
-        // rides its GENESIS CONFIG.
-        gateway: genesis_gateway_wasm(bindings),
+        // DuckFS bytes, loopback ports stay local. store-backed; the chain id
+        // rides the store-seeded GENESIS CONFIG.
+        gateway,
         // per-member notification queues; other modules deliver via follow-up
         // ops so a notification commits atomically with the causing event (P2).
         inbox: genesis_inbox_wasm(),
@@ -736,7 +715,6 @@ pub(super) async fn restore_host(
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
     manifest: &Manifest,
-    bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
     // store-backed wasm tenants restore like the other qmdb modules: the
@@ -765,6 +743,9 @@ pub(super) async fn restore_host(
     ));
     let capability = capability_wasm(Box::new(
         QmdbStore::init(context.child("capability"), "capability").await,
+    ));
+    let gateway = gateway_wasm(Box::new(
+        QmdbStore::init(context.child("gateway"), "gateway").await,
     ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
@@ -828,12 +809,6 @@ pub(super) async fn restore_host(
     tasks
         .install(bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
-
-    let mut gateway = genesis_gateway_wasm(bindings);
-    let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID)?;
-    gateway
-        .install(bytes, root)
-        .map_err(|e| format!("gateway install: {e}"))?;
 
     let mut inbox = genesis_inbox_wasm();
     let (bytes, root) = snapshot_of(INBOX_MODULE_ID)?;
@@ -945,7 +920,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     context: &commonware_runtime::tokio::Context,
     client: &C,
     manifest: &statesync::Manifest,
-    bindings: NetworkBindings<'_>,
     substrates: SyncSubstrates<'_>,
     attempt: usize,
 ) -> Result<Host, String> {
@@ -1077,6 +1051,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    let (target, resolver) = fetch_target("gateway").await?;
+    let gateway = gateway_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("gateway")),
+            "gateway",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1144,12 +1129,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     tasks
         .install(&bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID).await?;
-    let mut gateway = genesis_gateway_wasm(bindings);
-    gateway
-        .install(&bytes, root)
-        .map_err(|e| format!("gateway install: {e}"))?;
 
     let (bytes, root) = snapshot_of(INBOX_MODULE_ID).await?;
     let mut inbox = genesis_inbox_wasm();

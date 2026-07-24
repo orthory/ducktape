@@ -9,7 +9,7 @@ use statesync::fetch_manifest;
 use statesync::p2p::P2pSyncClient;
 
 use crate::constants::*;
-use crate::host_state::{NetworkBindings, SyncSubstrates, sync_all_modules};
+use crate::host_state::{SyncSubstrates, sync_all_modules};
 use crate::util::hex;
 
 /// `run_node`'s terminal `--sync-only` branch (phase P4): registers every
@@ -34,7 +34,6 @@ pub(crate) async fn run(
     metrics: noded::NodeMetrics,
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
-    identity_chain_id: String,
     blobs: noded::blobs::BlobHandle,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
@@ -168,10 +167,6 @@ pub(crate) async fn run(
         &context,
         &client,
         &manifest,
-        NetworkBindings {
-            invite: &namespace,
-            identity_chain_id: &identity_chain_id,
-        },
         SyncSubstrates {
             forge_repo: &forge_repo,
             duckfs_dir: &duckfs_dir,

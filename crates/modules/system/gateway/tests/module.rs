@@ -143,6 +143,7 @@ fn fixture(seed: u64) -> (Vec<u8>, ed25519::PrivateKey, AccountView, TestCtx, Ga
     };
     let module = Gateway::new(
         "gateway",
+        Box::new(sdk_testkit::MemStore::new()),
         "identity",
         Some("valset".into()),
         "test#12345678",
@@ -500,7 +501,13 @@ fn first_registration_wins_and_owner_gates_mutations() {
             (node_b.clone(), account_b.clone()),
         ]),
     };
-    let mut module = Gateway::new("gateway", "identity", Some("valset".into()), CHAIN_ID);
+    let mut module = Gateway::new(
+        "gateway",
+        Box::new(sdk_testkit::MemStore::new()),
+        "identity",
+        Some("valset".into()),
+        CHAIN_ID,
+    );
 
     let as_a = |context: &mut TestCtx| context.env.origin = Origin::External(node_a.clone());
     let as_b = |context: &mut TestCtx| context.env.origin = Origin::External(node_b.clone());

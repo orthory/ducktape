@@ -552,7 +552,13 @@ async fn demo_genesis(
         None,
         "demo".into(),
     );
-    let gateway = Gateway::new("gateway", "identity", None, "demo");
+    let gateway = Gateway::new(
+        "gateway",
+        Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
+        "identity",
+        None,
+        "demo",
+    );
     let inbox = Inbox::new("inbox");
     let files = Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open");
     let agent = AgentModule::new(

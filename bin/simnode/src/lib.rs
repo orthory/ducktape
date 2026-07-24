@@ -813,7 +813,13 @@ fn run_sim(
             None,
             String::new(),
         );
-        let gateway = Gateway::new("gateway", "identity", None, "local");
+        let gateway = Gateway::new(
+            "gateway",
+            Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
+            "identity",
+            None,
+            "local",
+        );
         let mut modules: Vec<Box<dyn Module>> = vec![
             Box::new(chat),
             Box::new(saga),

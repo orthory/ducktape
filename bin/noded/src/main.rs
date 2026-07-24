@@ -309,7 +309,13 @@ fn run_node(
         // the MERGED gateway owns both the `.duck` handle plane and the route
         // plane; the single-node daemon carries no valset (ungated) and a
         // dev-only chain id.
-        let gateway = Gateway::new("gateway", "identity", None, "local");
+        let gateway = Gateway::new(
+            "gateway",
+            Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
+            "identity",
+            None,
+            "local",
+        );
         let mut host = Host::genesis(vec![
             Box::new(chat),
             Box::new(saga),
