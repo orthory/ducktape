@@ -1,4 +1,4 @@
-//! deterministic ACCOUNT registry: an umbrella over a person's keys and nodes.
+//! qmdb-backed ACCOUNT registry: an umbrella over a person's keys and nodes.
 //!
 //! an ACCOUNT is keyed by its FOUNDING key (`account_id` = the first member
 //! key). it collects many MEMBER KEYS of different schemes (an ed25519 seed
@@ -24,26 +24,57 @@
 //!   way (a bound node labels its account's own devices; the label is a
 //!   per-network on-chain fact visible to the user's other devices).
 //!
-//! state model mirrors capability's host-lent staging seam: `execute`
-//! STAGES into a `pending` overlay (committed state untouched); `query` reads
-//! pending-over-committed (read-your-writes) via the `merged_*` helpers;
-//! `commit_block` folds pending into committed state AND rebuilds the derived
-//! `node_index` + `member_index`; `abort_block` drops pending; `root()`
-//! reflects COMMITTED `accounts` only (both indexes are derived, so excluded).
+//! ## State model
 //!
-//! `BindNode` is additionally member-gated when constructed with a valset id:
-//! the submitting node must be a current validator OR resident (queried live
-//! via [`Ctx::query`]). the member-key and unbind ops carry NO valset gate
-//! beyond "external origin": their authority is the member signature.
+//! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
+//! the concrete store (qmdb today -- `statesync::qmdb::QmdbStore`) and hands
+//! it to [`Identity::new`], so this crate never names a storage crate. one
+//! logical record per account (`acct\0{account_id}`), plus the two OWNERSHIP
+//! INDEXES as write-path-maintained point records -- `node\0{node_key}` and
+//! `member\0{member_key}`, each valued by the owning account id -- and two
+//! aggregate records:
 //!
-//! state-sync: a joiner rebuilds this module from a peer via
-//! [`Identity::snapshot`]/[`Identity::install`]. the snapshot is the exact
-//! preimage of `root()`, so `install` needs no trust in the serving peer -- it
-//! recomputes the root of whatever bytes arrived and adopts them only on a
-//! match, rebuilding both indexes from the adopted map and clearing `pending`.
-//! an account with an EMPTY node set is a legal encoding (an unbind can leave a
-//! record with no nodes but surviving members/name/nonce); an account with an
-//! EMPTY member set is NOT (every live account keeps at least one key).
+//! - the account ROSTER (the sorted account-id list, bounded by
+//!   [`MAX_ACCOUNTS`]) -- the ONE enumeration read. it stays canonical
+//!   because identity's reads are consumed in-consensus (governance resolves
+//!   actors/shares through them at execute time) and by the operator CLIs;
+//!   the id-length bound is structural ([`KeyKind::pubkey_wellformed`] admits
+//!   nothing past a 65-byte SEC1 point);
+//! - the CLIENT set (the submit-door ACL, bounded by [`MAX_CLIENTS`]) -- the
+//!   node's submit door consumes it whole between drains, and governance's
+//!   redeem dedup reads it, so it lives as one sorted aggregate of fixed
+//!   32-byte ed25519 keys. an empty set deletes the record, so a fully
+//!   revoked plane is byte-identical to one that never granted.
+//!
+//! `OfNode`/`OfMember` are canonical POINT READS over the index records
+//! (dispatch-consumed: the join/settle paths resolve node standing through
+//! them), so no derived read model exists to rebuild -- the execute paths
+//! maintain the indexes as they stage.
+//!
+//! writes are staged during a block and flushed to the store in one batch at
+//! `commit_block`; the module root IS the store's merkle root. sync belongs
+//! to the store, not this module: a joiner rebuilds the concrete store from a
+//! peer (`QmdbStore::sync_from`) and wraps a fresh `Identity` around it.
+//!
+//! oversized values never reach the store (the poison-value lesson -- the
+//! qmdb wire codec bounds a value at decode, so an over-cap committed value
+//! would wedge every syncing peer): EVERY path that grows an account record
+//! (bind, add-member, the profile setters) restages the whole record through
+//! the [`MAX_ACCOUNT_RECORD_BYTES`] gate, so no growth can bypass it and no
+//! half-cap headroom is needed; the roster is byte-gated at
+//! [`MAX_ROSTER_RECORD_BYTES`] on top of its count cap; the client set is
+//! bounded by construction (fixed 32-byte keys under [`MAX_CLIENTS`]).
+//!
+//! ## Genesis config (the chain id)
+//!
+//! the per-network chain id reaches the NATIVE module through
+//! [`Identity::new`]. the wasm tenant is fixed bytes, so there the id rides
+//! GENESIS CONFIG: the host seeds the reserved `__config` entry
+//! ([`sdk::genesis_config`]) into this module's store at genesis construction
+//! -- under [`sdk::store_key`], the same logical→store mapping every record
+//! here uses -- and the guest decodes it per dispatch. the config is
+//! consensus state in the store's merkle root from genesis and rides
+//! state-sync like any other record. this module never writes that key.
 //!
 //! ## client standing (the submit-door ACL, a facet of the account plane)
 //!
@@ -52,10 +83,9 @@
 //! no mesh, no statesync (the sync/mesh planes read valset, never this set, so
 //! a client can never leak into standing). governance's `role=Client` invite
 //! redemption emits [`IdentityMsg::GrantClient`] as a MODULE-origin follow-up;
-//! [`IdentityMsg::RevokeClient`] drops a key. it stages through its own
-//! `clients_pending` overlay and folds into `clients` on commit, and it is part
-//! of identity's ONE root/snapshot (encoded after the accounts), so a joiner
-//! restores it with the rest of the account plane.
+//! [`IdentityMsg::RevokeClient`] drops a key. the set is one store record in
+//! identity's ONE root, so a joiner restores it with the rest of the account
+//! plane.
 //!
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -72,22 +102,84 @@ pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_challenge, web
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519::PublicKey;
-use sdk::codec::{Cursor, push_bytes, push_opt_str};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use sha2::{Digest, Sha256};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-/// per-member metadata; the public key is the map key, so it is not repeated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// accounts retained over the network's life (an account is never deleted --
+/// an unbind can empty its node set, but the record and its roster entry
+/// persist). founding past this refuses loudly at execute.
+pub const MAX_ACCOUNTS: usize = 1024;
+/// serialized roster-record byte bound, enforced at founding. the count cap
+/// alone does not bound the roster's SERIALIZED form: account ids are keys of
+/// up to 65 bytes ([`KeyKind::pubkey_wellformed`]) rendered as JSON byte
+/// arrays, so the byte gate keeps the committed record far under the qmdb
+/// value-decode ceiling (the poison-value lesson).
+pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
+/// serialized account-record ceiling, enforced on EVERY staged account write.
+/// unlike governance's ballots there is no growth path that bypasses the
+/// gate -- bind/add-member/profile ops all restage the whole record through
+/// it -- so an op that would push a record past the cap is refused loudly and
+/// deterministically instead of poisoning the sync wire.
+pub const MAX_ACCOUNT_RECORD_BYTES: usize = 512 * 1024;
+/// client-ACL count cap. clients enter one governance-redeemed invite at a
+/// time and every key is a fixed 32 bytes, so the record stays bounded by
+/// construction under this count.
+pub const MAX_CLIENTS: usize = 1024;
+
+/// per-account record key: prefix + 0 + account id (the single-component
+/// shape chat uses). safe because every key literal below is fixed and none
+/// is another followed by a 0 byte.
+fn acct_key(account_id: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 1 + account_id.len());
+    key.extend_from_slice(b"acct");
+    key.push(0);
+    key.extend_from_slice(account_id);
+    key
+}
+
+/// node-ownership index key: prefix + 0 + node key. valued by the owning
+/// account id; maintained by the execute paths as they stage.
+fn node_owner_key(node: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 1 + node.len());
+    key.extend_from_slice(b"node");
+    key.push(0);
+    key.extend_from_slice(node);
+    key
+}
+
+/// member-ownership index key: prefix + 0 + member public key.
+fn member_owner_key(member: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(6 + 1 + member.len());
+    key.extend_from_slice(b"member");
+    key.push(0);
+    key.extend_from_slice(member);
+    key
+}
+
+/// the account roster's whole key. collides with no `acct\0...` /
+/// `node\0...` / `member\0...` key (nor the host-seeded `__config`
+/// genesis-config record).
+const ACCOUNT_ROSTER_KEY: &[u8] = b"accounts";
+
+/// the client set's whole key. absent = no client holds standing.
+const CLIENTS_KEY: &[u8] = b"clients";
+
+/// per-member metadata; the public key is the pair key, so it is not
+/// repeated. serialized verbatim inside [`AccountStored`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MemberMeta {
     kind: KeyKind,
     label: Option<String>,
     /// `SHA-256(rp_id)` a WebAuthn member's later assertions must carry in
     /// authenticatorData -- pins the passkey to the RP it enrolled under.
-    /// `Some` iff `kind == WebauthnP256`, enforced by the canonical codec.
+    /// `Some` iff `kind == WebauthnP256`.
     rp_id_hash: Option<[u8; 32]>,
     added_at: u64,
 }
@@ -100,10 +192,10 @@ struct NodeMeta {
     label: Option<String>,
 }
 
-/// one stored account: display name, avatar ref + bio (the account's global
-/// profile, propagated per-network by the app), shared replay nonce, the
-/// member-key set, the labeled bound-node map, and the last-write block
-/// timestamp. `account_id` is the map key, so it is not repeated here.
+/// one account: display name, avatar ref + bio (the account's global profile,
+/// propagated per-network by the app), shared replay nonce, the member-key
+/// set, the labeled bound-node map, and the last-write block timestamp.
+/// `account_id` is the record key, so it is not repeated here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AccountRecord {
     display_name: Option<String>,
@@ -117,9 +209,59 @@ struct AccountRecord {
     updated_at: u64,
 }
 
-/// the two committed halves a snapshot decodes into: the account registry and
-/// the trailing client-standing set (the submit-door ACL).
-type DecodedState = (BTreeMap<Vec<u8>, AccountRecord>, BTreeSet<Vec<u8>>);
+/// the stored form of an [`AccountRecord`]: maps flatten to sorted pair lists
+/// because the record codec (JSON) cannot key an object by raw bytes.
+/// `BTreeMap` iteration writes them sorted; `collect` rebuilds the maps.
+#[derive(Serialize, Deserialize)]
+struct AccountStored {
+    display_name: Option<String>,
+    avatar: Option<String>,
+    bio: Option<String>,
+    nonce: u64,
+    member_keys: Vec<(Vec<u8>, MemberMeta)>,
+    nodes: Vec<(Vec<u8>, Option<String>)>,
+    updated_at: u64,
+}
+
+impl From<&AccountRecord> for AccountStored {
+    fn from(r: &AccountRecord) -> Self {
+        Self {
+            display_name: r.display_name.clone(),
+            avatar: r.avatar.clone(),
+            bio: r.bio.clone(),
+            nonce: r.nonce,
+            member_keys: r
+                .member_keys
+                .iter()
+                .map(|(k, meta)| (k.clone(), meta.clone()))
+                .collect(),
+            nodes: r
+                .nodes
+                .iter()
+                .map(|(k, meta)| (k.clone(), meta.label.clone()))
+                .collect(),
+            updated_at: r.updated_at,
+        }
+    }
+}
+
+impl From<AccountStored> for AccountRecord {
+    fn from(s: AccountStored) -> Self {
+        Self {
+            display_name: s.display_name,
+            avatar: s.avatar,
+            bio: s.bio,
+            nonce: s.nonce,
+            member_keys: s.member_keys.into_iter().collect(),
+            nodes: s
+                .nodes
+                .into_iter()
+                .map(|(k, label)| (k, NodeMeta { label }))
+                .collect(),
+            updated_at: s.updated_at,
+        }
+    }
+}
 
 pub struct Identity {
     id: ModuleId,
@@ -130,40 +272,128 @@ pub struct Identity {
     /// this network's chain id -- folded into every signed preimage so a
     /// certificate minted for one network can never act on another.
     chain_id: String,
-    /// committed registry -- what `root()` commits to.
-    accounts: BTreeMap<Vec<u8>, AccountRecord>,
-    /// committed, DERIVED index: node key -> owning account id. rebuilt from
-    /// `accounts` at every `commit_block`; excluded from `root()`.
-    node_index: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// committed, DERIVED index: member public key -> owning account id.
-    /// rebuilt alongside `node_index`; excluded from `root()`.
-    member_index: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// this block's staged per-account upserts (`Some`) / clears (`None`).
-    /// read ahead of `accounts` (read-your-writes), merged in on `commit_block`.
-    pending: BTreeMap<Vec<u8>, Option<AccountRecord>>,
-    /// committed CLIENT standing — the submit-door ACL, folded into `root()`
-    /// after the accounts. governance grants/revokes keys here on `role=Client`
-    /// invite redemption; structurally distinct from membership (never valset).
-    clients: BTreeSet<Vec<u8>>,
-    /// this block's staged client changes: `true` == staged grant, `false` ==
-    /// staged revoke. read ahead of `clients`, merged in on `commit_block`.
-    clients_pending: BTreeMap<Vec<u8>, bool>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Identity {
-    pub fn new(id: impl Into<ModuleId>, valset_id: Option<ModuleId>, chain_id: String) -> Self {
+    /// wrap the host-constructed store under module identity `id`.
+    pub fn new(
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+        valset_id: Option<ModuleId>,
+        chain_id: String,
+    ) -> Self {
         Self {
             id: id.into(),
             valset_id,
             chain_id,
-            accounts: BTreeMap::new(),
-            node_index: BTreeMap::new(),
-            member_index: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            clients: BTreeSet::new(),
-            clients_pending: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
+
+    // ---- staged-over-committed reads ----------------------------------------
+
+    async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: DeserializeOwned,
+    {
+        match self.staged.get(key).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// stage a value whose serialized size is bounded by construction (an
+    /// ownership index entry, the client set) -- see the module doc's
+    /// poison-value paragraph. account records and the roster go through
+    /// [`Self::store_bounded`].
+    fn store<T>(&mut self, key: Vec<u8>, value: &T)
+    where
+        T: Serialize,
+    {
+        self.staged.stage(
+            key,
+            serde_json::to_vec(value).expect("identity value is serializable"),
+        );
+    }
+
+    /// stage a value only if its serialized size fits `cap` -- the write-time
+    /// guard against poison values (the qmdb codec cap is decode-only).
+    fn store_bounded<T>(
+        &mut self,
+        key: Vec<u8>,
+        value: &T,
+        cap: usize,
+        what: &str,
+    ) -> Result<(), Error>
+    where
+        T: Serialize,
+    {
+        let bytes = serde_json::to_vec(value).expect("identity value is serializable");
+        if bytes.len() > cap {
+            return Err(Error::Module(format!(
+                "{what} record too large: {} > {cap} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(key, bytes);
+        Ok(())
+    }
+
+    async fn account(&self, account_id: &[u8]) -> Result<Option<AccountRecord>, Error> {
+        Ok(self
+            .load::<AccountStored>(&acct_key(account_id))
+            .await?
+            .map(AccountRecord::from))
+    }
+
+    /// an account a roster entry or ownership index points at. a reference key
+    /// without its record is a store bug -- loud, never skipped.
+    async fn stored_account(&self, account_id: &[u8]) -> Result<AccountRecord, Error> {
+        self.account(account_id)
+            .await?
+            .ok_or_else(|| Error::Module("missing account record".into()))
+    }
+
+    /// the account owning `node`, if bound -- the node-ownership index read.
+    async fn owner_of_node(&self, node: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.load(&node_owner_key(node)).await
+    }
+
+    /// the account `member` belongs to, if any -- the member-ownership index.
+    async fn owner_of_member(&self, member: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.load(&member_owner_key(member)).await
+    }
+
+    /// the account roster -- every account id, sorted. record, roster, and
+    /// index entries are staged (and commit or abort) together, so membership
+    /// in one is membership in all.
+    async fn roster(&self) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self.load(ACCOUNT_ROSTER_KEY).await?.unwrap_or_default())
+    }
+
+    /// the client set, sorted. absent record = empty set.
+    async fn client_set(&self) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self.load(CLIENTS_KEY).await?.unwrap_or_default())
+    }
+
+    /// stage an updated account record under the byte cap -- the ONE write
+    /// every account mutation funnels through (see [`MAX_ACCOUNT_RECORD_BYTES`]).
+    fn store_account(&mut self, account_id: &[u8], record: &AccountRecord) -> Result<(), Error> {
+        self.store_bounded(
+            acct_key(account_id),
+            &AccountStored::from(record),
+            MAX_ACCOUNT_RECORD_BYTES,
+            "account",
+        )
+    }
+
+    // ---- gates ---------------------------------------------------------------
 
     /// validate that `key` is a well-formed 32-byte ed25519 public key — the
     /// explicit length guard keeps the 32-byte invariant independent of decode's
@@ -178,20 +408,6 @@ impl Identity {
         PublicKey::decode(key)
             .map_err(|e| Error::Module(format!("invalid ed25519 client key: {e}")))?;
         Ok(())
-    }
-
-    /// the committed client set with this block's staged changes applied,
-    /// sorted (order-independent) — read-your-writes over `clients_pending`.
-    fn effective_clients(&self) -> Vec<Vec<u8>> {
-        let mut set = self.clients.clone();
-        for (k, present) in &self.clients_pending {
-            if *present {
-                set.insert(k.clone());
-            } else {
-                set.remove(k);
-            }
-        }
-        set.into_iter().collect()
     }
 
     /// the AUTHENTICATED submitter key -- a non-empty external origin, or a
@@ -241,39 +457,16 @@ impl Identity {
         Ok(())
     }
 
-    // ---- merged (pending-over-committed) view -------------------------------
-
-    /// committed accounts with this block's staged changes applied.
-    fn merged_accounts(&self) -> BTreeMap<Vec<u8>, AccountRecord> {
-        let mut merged = self.accounts.clone();
-        for (key, change) in &self.pending {
-            match change {
-                Some(record) => {
-                    merged.insert(key.clone(), record.clone());
-                }
-                None => {
-                    merged.remove(key);
-                }
-            }
+    /// client standing changes only via governance: a module origin (its redeem
+    /// follow-up) or a system origin (genesis). part of the deterministic Env,
+    /// enforced identically on every node.
+    fn require_module_origin(ctx: &dyn Ctx) -> Result<(), Error> {
+        match &ctx.env().origin {
+            Origin::Module(_) | Origin::System => Ok(()),
+            Origin::External(_) => Err(Error::Module(
+                "client standing changes only via governance".into(),
+            )),
         }
-        merged
-    }
-
-    /// read one account through the staged overlay (read-your-writes).
-    fn merged_record(&self, account_id: &[u8]) -> Option<AccountRecord> {
-        match self.pending.get(account_id) {
-            Some(change) => change.clone(),
-            None => self.accounts.get(account_id).cloned(),
-        }
-    }
-
-    /// node -> account and member -> account indexes derived from the merged
-    /// view, so a staged bind/unbind/add/remove is visible before commit.
-    fn merged_node_index(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        Self::node_index_of(&self.merged_accounts())
-    }
-    fn merged_member_index(&self) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        Self::member_index_of(&self.merged_accounts())
     }
 
     fn account_view(account_id: &[u8], record: &AccountRecord) -> AccountView {
@@ -304,286 +497,6 @@ impl Identity {
             updated_at: record.updated_at,
         }
     }
-
-    // ---- canonical state bytes (root() preimage / snapshot) -----------------
-
-    /// canonical bytes of `accounts`: `u64-le` account count, then per sorted
-    /// account -- `len+account_id`, name (flag `u8` + `len+name` if set),
-    /// avatar (flag `u8` + `len+avatar` if set), bio (flag `u8` + `len+bio` if
-    /// set), `u64-le` nonce, `u64-le` member count then per sorted member
-    /// (`len+pubkey`, kind tag `u8`, label flag + `len+label` if set,
-    /// rp-hash flag + 32 bytes if set, `u64-le added_at`), `u64-le` node count
-    /// then per sorted node (`len+node`, label flag `u8` + `len+label` if set),
-    /// and `u64-le updated_at`. both indexes are derived and excluded. a CLIENT
-    /// TAIL follows the accounts: `u64-le` client count then each sorted client
-    /// key (`len+key`) — the submit-door ACL, folded into the one root.
-    fn encode_state(
-        accounts: &BTreeMap<Vec<u8>, AccountRecord>,
-        clients: &BTreeSet<Vec<u8>>,
-    ) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&(accounts.len() as u64).to_le_bytes());
-        for (account_id, record) in accounts {
-            push_bytes(&mut out, account_id);
-            push_opt_str(&mut out, record.display_name.as_deref());
-            push_opt_str(&mut out, record.avatar.as_deref());
-            push_opt_str(&mut out, record.bio.as_deref());
-            out.extend_from_slice(&record.nonce.to_le_bytes());
-
-            out.extend_from_slice(&(record.member_keys.len() as u64).to_le_bytes());
-            for (pubkey, meta) in &record.member_keys {
-                push_bytes(&mut out, pubkey);
-                out.push(meta.kind.tag());
-                push_opt_str(&mut out, meta.label.as_deref());
-                match &meta.rp_id_hash {
-                    Some(hash) => {
-                        out.push(1u8);
-                        out.extend_from_slice(hash);
-                    }
-                    None => out.push(0u8),
-                }
-                out.extend_from_slice(&meta.added_at.to_le_bytes());
-            }
-
-            out.extend_from_slice(&(record.nodes.len() as u64).to_le_bytes());
-            for (node, meta) in &record.nodes {
-                push_bytes(&mut out, node);
-                push_opt_str(&mut out, meta.label.as_deref());
-            }
-            out.extend_from_slice(&record.updated_at.to_le_bytes());
-        }
-        out.extend_from_slice(&(clients.len() as u64).to_le_bytes());
-        for key in clients {
-            push_bytes(&mut out, key);
-        }
-        out
-    }
-
-    /// the state-based commitment: `ZERO` when the account plane is entirely
-    /// empty (no accounts AND no clients), else sha256 over exactly the bytes
-    /// `encode_state` emits.
-    fn root_of(
-        accounts: &BTreeMap<Vec<u8>, AccountRecord>,
-        clients: &BTreeSet<Vec<u8>>,
-    ) -> StateRoot {
-        if accounts.is_empty() && clients.is_empty() {
-            return StateRoot::ZERO;
-        }
-        StateRoot(Sha256::digest(Self::encode_state(accounts, clients)).into())
-    }
-
-    fn node_index_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        let mut index = BTreeMap::new();
-        for (account_id, record) in accounts {
-            for node in record.nodes.keys() {
-                index.insert(node.clone(), account_id.clone());
-            }
-        }
-        index
-    }
-
-    fn member_index_of(accounts: &BTreeMap<Vec<u8>, AccountRecord>) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        let mut index = BTreeMap::new();
-        for (account_id, record) in accounts {
-            for member in record.member_keys.keys() {
-                index.insert(member.clone(), account_id.clone());
-            }
-        }
-        index
-    }
-
-    // ---- state-sync (snapshot / install) -----------------------------------
-
-    /// canonical bytes of the COMMITTED registry -- exactly what `root()`
-    /// hashes. pending is deliberately excluded.
-    pub fn snapshot(&self) -> Vec<u8> {
-        Self::encode_state(&self.accounts, &self.clients)
-    }
-
-    /// replace committed state with a decoded snapshot iff its recomputed root
-    /// equals `expected`. decode/verify land in temporaries, so on any `Err`
-    /// committed state, both indexes, and the client set are byte-identical to
-    /// before.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (accounts, clients) = Self::decode_snapshot(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&accounts, &clients), expected)?;
-        self.node_index = Self::node_index_of(&accounts);
-        self.member_index = Self::member_index_of(&accounts);
-        self.accounts = accounts;
-        self.clients = clients;
-        self.pending.clear();
-        self.clients_pending.clear();
-        Ok(())
-    }
-
-    /// strict decode of UNTRUSTED snapshot bytes (a byzantine peer serves them):
-    /// every count/length is checked against the remaining buffer before any
-    /// allocation; truncation and trailing bytes both reject; account ids,
-    /// member keys (within an account) and node keys (within an account) must
-    /// each arrive strictly increasing; the kind tag must be known; the rp-hash
-    /// flag must be present exactly for WebAuthn members; every account carries
-    /// at least one member; no node or member key may appear in two accounts
-    /// (states the execute path can never commit); and the trailing CLIENT set's
-    /// keys must arrive strictly increasing too.
-    fn decode_snapshot(bytes: &[u8]) -> Result<DecodedState, Error> {
-        let mut cur = Cursor::new(bytes);
-        let count = cur.u64("snapshot account count")?;
-        // per-account minimum: id-len(8) + name flag(1) + avatar flag(1) + bio
-        // flag(1) + nonce(8) + member count(8) + node count(8) + updated_at(8)
-        // = 43 bytes.
-        const MIN_ACCOUNT_BYTES: u64 = 43;
-        cur.bound(count, MIN_ACCOUNT_BYTES, "snapshot account")?;
-
-        let mut accounts = BTreeMap::new();
-        let mut prev_account: Option<Vec<u8>> = None;
-        for _ in 0..count {
-            let account_id = cur.bytes("snapshot account id")?.to_vec();
-            if prev_account
-                .as_deref()
-                .is_some_and(|p| p >= account_id.as_slice())
-            {
-                return Err(Error::Module(
-                    "snapshot account ids must be strictly increasing".into(),
-                ));
-            }
-            prev_account = Some(account_id.clone());
-
-            let display_name = cur.opt_str(MAX_NAME_LEN, "snapshot account name")?;
-            let avatar = cur.opt_str(MAX_AVATAR_REF_LEN, "snapshot account avatar")?;
-            let bio = cur.opt_str(MAX_BIO_LEN, "snapshot account bio")?;
-            let nonce = cur.u64("snapshot account nonce")?;
-
-            let member_keys = Self::decode_members(&mut cur)?;
-            let nodes = Self::decode_nodes(&mut cur)?;
-            let updated_at = cur.u64("snapshot account updated_at")?;
-
-            accounts.insert(
-                account_id,
-                AccountRecord {
-                    display_name,
-                    avatar,
-                    bio,
-                    nonce,
-                    member_keys,
-                    nodes,
-                    updated_at,
-                },
-            );
-        }
-
-        // the trailing client set (the submit-door ACL): count-bounded before
-        // allocation, keys strictly increasing, decoded BEFORE the finish so
-        // trailing garbage past it still rejects.
-        let client_count = cur.u64("snapshot client count")?;
-        cur.bound(client_count, 8, "snapshot client")?;
-        let mut clients = BTreeSet::new();
-        let mut prev_client: Option<Vec<u8>> = None;
-        for _ in 0..client_count {
-            let key = cur.bytes("snapshot client key")?.to_vec();
-            if prev_client.as_deref().is_some_and(|p| p >= key.as_slice()) {
-                return Err(Error::Module(
-                    "snapshot client keys must be strictly increasing".into(),
-                ));
-            }
-            prev_client = Some(key.clone());
-            clients.insert(key);
-        }
-        cur.finish("snapshot")?;
-
-        // no node and no member key may be claimed by two accounts: the execute
-        // path enforces single-ownership, so a snapshot claiming otherwise is a
-        // forgery.
-        let mut seen_nodes = BTreeSet::new();
-        let mut seen_members = BTreeSet::new();
-        for record in accounts.values() {
-            for node in record.nodes.keys() {
-                if !seen_nodes.insert(node.clone()) {
-                    return Err(Error::Module("node bound twice in snapshot".into()));
-                }
-            }
-            for member in record.member_keys.keys() {
-                if !seen_members.insert(member.clone()) {
-                    return Err(Error::Module("member key claimed twice in snapshot".into()));
-                }
-            }
-        }
-
-        Ok((accounts, clients))
-    }
-
-    fn decode_members(cur: &mut Cursor) -> Result<BTreeMap<Vec<u8>, MemberMeta>, Error> {
-        let count = cur.u64("snapshot member count")?;
-        // per-member minimum: pubkey-len(8) + kind(1) + label flag(1) + rp
-        // flag(1) + added_at(8) = 19 bytes.
-        const MIN_MEMBER_BYTES: u64 = 19;
-        cur.bound(count, MIN_MEMBER_BYTES, "snapshot member")?;
-        if count == 0 {
-            return Err(Error::Module(
-                "snapshot account has no member keys (every live account keeps one)".into(),
-            ));
-        }
-        let mut members = BTreeMap::new();
-        let mut prev: Option<Vec<u8>> = None;
-        for _ in 0..count {
-            let pubkey = cur.bytes("snapshot member key")?.to_vec();
-            if prev.as_deref().is_some_and(|p| p >= pubkey.as_slice()) {
-                return Err(Error::Module(
-                    "snapshot member keys must be strictly increasing within an account".into(),
-                ));
-            }
-            prev = Some(pubkey.clone());
-
-            let kind = KeyKind::from_tag(cur.byte("snapshot member kind")?)
-                .ok_or_else(|| Error::Module("snapshot member has an unknown key kind".into()))?;
-            let label = cur.opt_str(MAX_LABEL_LEN, "snapshot member label")?;
-            let rp_id_hash = match cur.byte("snapshot rp-hash flag")? {
-                0 => None,
-                1 => Some(cur.array::<32>("snapshot rp-hash")?),
-                other => {
-                    return Err(Error::Module(format!(
-                        "snapshot rp-hash flag must be 0 or 1, got {other}"
-                    )));
-                }
-            };
-            // the rp-hash pin is present exactly for WebAuthn members.
-            if rp_id_hash.is_some() != kind.expects_rp_id_hash() {
-                return Err(Error::Module(
-                    "snapshot rp-hash presence does not match the member kind".into(),
-                ));
-            }
-            let added_at = cur.u64("snapshot member added_at")?;
-            members.insert(
-                pubkey,
-                MemberMeta {
-                    kind,
-                    label,
-                    rp_id_hash,
-                    added_at,
-                },
-            );
-        }
-        Ok(members)
-    }
-
-    fn decode_nodes(cur: &mut Cursor) -> Result<BTreeMap<Vec<u8>, NodeMeta>, Error> {
-        let count = cur.u64("snapshot node count")?;
-        // per-node minimum: key-len(8) + label flag(1) = 9 bytes.
-        cur.bound(count, 9, "snapshot node")?;
-        let mut nodes = BTreeMap::new();
-        let mut prev: Option<Vec<u8>> = None;
-        for _ in 0..count {
-            let node = cur.bytes("snapshot node key")?.to_vec();
-            if prev.as_deref().is_some_and(|p| p >= node.as_slice()) {
-                return Err(Error::Module(
-                    "snapshot node keys must be strictly increasing within an account".into(),
-                ));
-            }
-            let label = cur.opt_str(MAX_LABEL_LEN, "snapshot node label")?;
-            prev = Some(node.clone());
-            nodes.insert(node, NodeMeta { label });
-        }
-        Ok(nodes)
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -592,12 +505,25 @@ impl Module for Identity {
         self.id.clone()
     }
 
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.accounts, &self.clients)
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -606,110 +532,89 @@ impl Module for Identity {
             IdentityMsg::UnbindNode {
                 node_key,
                 authorizer,
-            } => self.unbind_node(ctx, node_key, authorizer),
+            } => self.unbind_node(ctx, node_key, authorizer).await,
             IdentityMsg::AddMemberKey {
                 new_key,
                 new_kind,
                 new_label,
                 possession,
                 authorizer,
-            } => self.add_member_key(ctx, new_key, new_kind, new_label, possession, authorizer),
+            } => {
+                self.add_member_key(ctx, new_key, new_kind, new_label, possession, authorizer)
+                    .await
+            }
             IdentityMsg::RemoveMemberKey {
                 target_key,
                 authorizer,
-            } => self.remove_member_key(ctx, target_key, authorizer),
+            } => self.remove_member_key(ctx, target_key, authorizer).await,
             IdentityMsg::SetAccountName { display_name } => {
-                self.set_account_name(ctx, display_name)
+                self.set_account_name(ctx, display_name).await
             }
-            IdentityMsg::SetProfile { avatar, bio } => self.set_profile(ctx, avatar, bio),
+            IdentityMsg::SetProfile { avatar, bio } => self.set_profile(ctx, avatar, bio).await,
             IdentityMsg::SetNodeLabel { node_key, label } => {
-                self.set_node_label(ctx, node_key, label)
+                self.set_node_label(ctx, node_key, label).await
             }
-            IdentityMsg::GrantClient { key } => self.grant_client(ctx, key),
-            IdentityMsg::RevokeClient { key } => self.revoke_client(ctx, key),
+            IdentityMsg::GrantClient { key } => self.grant_client(ctx, key).await,
+            IdentityMsg::RevokeClient { key } => self.revoke_client(ctx, key).await,
         }
     }
 
+    /// read projection — committed plus this block's staged changes (the
+    /// staged-over-committed store view).
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             IdentityQuery::All { from, limit } => {
-                let merged = self.merged_accounts();
+                // walk the roster window by derived key (≤ MAX_QUERY_LIMIT
+                // point reads).
+                let roster = self.roster().await?;
                 let limit = limit.min(MAX_QUERY_LIMIT) as usize;
                 let from = usize::try_from(from).unwrap_or(usize::MAX);
-                let accounts = merged
-                    .iter()
-                    .skip(from)
-                    .take(limit)
-                    .map(|(id, record)| Self::account_view(id, record))
-                    .collect();
+                let mut accounts = Vec::new();
+                for account_id in roster.iter().skip(from).take(limit) {
+                    let record = self.stored_account(account_id).await?;
+                    accounts.push(Self::account_view(account_id, &record));
+                }
                 Ok(encode_reply(&IdentityReply::Accounts(accounts)))
             }
             IdentityQuery::Get { account_id } => Ok(encode_reply(&IdentityReply::Account(
-                self.merged_record(&account_id)
+                self.account(&account_id)
+                    .await?
                     .map(|record| Self::account_view(&account_id, &record)),
             ))),
             IdentityQuery::OfNode { node_key } => {
-                let account = self
-                    .merged_node_index()
-                    .get(&node_key)
-                    .cloned()
-                    .and_then(|id| {
-                        self.merged_record(&id)
-                            .map(|record| Self::account_view(&id, &record))
-                    });
+                let account = match self.owner_of_node(&node_key).await? {
+                    Some(account_id) => Some(Self::account_view(
+                        &account_id,
+                        &self.stored_account(&account_id).await?,
+                    )),
+                    None => None,
+                };
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
             IdentityQuery::OfMember { member_key } => {
-                let account = self
-                    .merged_member_index()
-                    .get(&member_key)
-                    .cloned()
-                    .and_then(|id| {
-                        self.merged_record(&id)
-                            .map(|record| Self::account_view(&id, &record))
-                    });
+                let account = match self.owner_of_member(&member_key).await? {
+                    Some(account_id) => Some(Self::account_view(
+                        &account_id,
+                        &self.stored_account(&account_id).await?,
+                    )),
+                    None => None,
+                };
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
             IdentityQuery::Clients => Ok(encode_reply(&IdentityReply::Clients(
-                self.effective_clients(),
+                self.client_set().await?,
             ))),
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (key, present) in std::mem::take(&mut self.clients_pending) {
-            if present {
-                self.clients.insert(key);
-            } else {
-                self.clients.remove(&key);
-            }
-        }
-        for (account_id, change) in std::mem::take(&mut self.pending) {
-            // drop every index entry currently pointing at this account; the
-            // new sets (if any) are reinserted below.
-            self.node_index.retain(|_, owner| owner != &account_id);
-            self.member_index.retain(|_, owner| owner != &account_id);
-            match change {
-                Some(record) => {
-                    for node in record.nodes.keys() {
-                        self.node_index.insert(node.clone(), account_id.clone());
-                    }
-                    for member in record.member_keys.keys() {
-                        self.member_index.insert(member.clone(), account_id.clone());
-                    }
-                    self.accounts.insert(account_id, record);
-                }
-                None => {
-                    self.accounts.remove(&account_id);
-                }
-            }
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending.clear();
-        self.clients_pending.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -732,58 +637,57 @@ impl Identity {
 
         // which account does this authorizer speak for -- an existing
         // membership, or a brand-new account it founds?
-        let (account_id, mut record) =
-            match self.merged_member_index().get(&authorizer.key).cloned() {
-                Some(account_id) => {
-                    let record = self
-                        .merged_record(&account_id)
-                        .expect("member_index only ever points at an existing record");
-                    (account_id, record)
+        let resolved = self.owner_of_member(&authorizer.key).await?;
+        let founding = resolved.is_none();
+        let (account_id, mut record) = match resolved {
+            Some(account_id) => {
+                let record = self.stored_account(&account_id).await?;
+                (account_id, record)
+            }
+            None => {
+                if !authorizer.kind.pubkey_wellformed(&authorizer.key) {
+                    return Err(Error::Module(
+                        "founding key is malformed for its kind".into(),
+                    ));
                 }
-                None => {
-                    if !authorizer.kind.pubkey_wellformed(&authorizer.key) {
-                        return Err(Error::Module(
-                            "founding key is malformed for its kind".into(),
-                        ));
-                    }
-                    if self.merged_record(&authorizer.key).is_some() {
-                        return Err(Error::Module(
-                            "account id already exists but its founding key is not a member".into(),
-                        ));
-                    }
-                    let rp_id_hash = if authorizer.kind.expects_rp_id_hash() {
-                        webauthn_rp_id_hash(&authorizer.proof)
-                    } else {
-                        None
-                    };
-                    let mut member_keys = BTreeMap::new();
-                    member_keys.insert(
-                        authorizer.key.clone(),
-                        MemberMeta {
-                            kind: authorizer.kind,
-                            label: None,
-                            rp_id_hash,
-                            added_at: ctx.env().consensus_time,
-                        },
-                    );
-                    let record = AccountRecord {
-                        display_name: None,
-                        avatar: None,
-                        bio: None,
-                        nonce: 0,
-                        member_keys,
-                        nodes: BTreeMap::new(),
-                        updated_at: 0,
-                    };
-                    (authorizer.key.clone(), record)
+                if self.account(&authorizer.key).await?.is_some() {
+                    return Err(Error::Module(
+                        "account id already exists but its founding key is not a member".into(),
+                    ));
                 }
-            };
+                let rp_id_hash = if authorizer.kind.expects_rp_id_hash() {
+                    webauthn_rp_id_hash(&authorizer.proof)
+                } else {
+                    None
+                };
+                let mut member_keys = BTreeMap::new();
+                member_keys.insert(
+                    authorizer.key.clone(),
+                    MemberMeta {
+                        kind: authorizer.kind,
+                        label: None,
+                        rp_id_hash,
+                        added_at: ctx.env().consensus_time,
+                    },
+                );
+                let record = AccountRecord {
+                    display_name: None,
+                    avatar: None,
+                    bio: None,
+                    nonce: 0,
+                    member_keys,
+                    nodes: BTreeMap::new(),
+                    updated_at: 0,
+                };
+                (authorizer.key.clone(), record)
+            }
+        };
 
         // idempotent re-bind: node already bound to THIS account -> no-op, no
-        // nonce bump. the proof is deliberately left unverified here (no state
-        // change, and origin is already consensus-authenticated).
-        if let Some(bound_to) = self.merged_node_index().get(&origin) {
-            if *bound_to == account_id {
+        // nonce bump, nothing staged. the proof is deliberately left unverified
+        // here (no state change, and origin is already consensus-authenticated).
+        if let Some(bound_to) = self.owner_of_node(&origin).await? {
+            if bound_to == account_id {
                 return Ok(());
             }
             return Err(Error::Module(
@@ -795,15 +699,42 @@ impl Identity {
         let preimage = bind_preimage(&self.chain_id, &origin, record.nonce);
         Self::authorize(&record, IDENTITY_BIND_NS, &preimage, &authorizer)?;
 
-        record.nodes.insert(origin, NodeMeta::default());
+        // a founding bind also claims a roster slot and the founder's
+        // member-index entry.
+        if founding {
+            let mut roster = self.roster().await?;
+            let position = match roster.binary_search(&account_id) {
+                Ok(_) => {
+                    return Err(Error::Module(
+                        "account roster carries an id with no record".into(),
+                    ));
+                }
+                Err(position) => position,
+            };
+            if roster.len() >= MAX_ACCOUNTS {
+                return Err(Error::Module(format!("account cap reached ({MAX_ACCOUNTS})")));
+            }
+            roster.insert(position, account_id.clone());
+            self.store_bounded(
+                ACCOUNT_ROSTER_KEY.to_vec(),
+                &roster,
+                MAX_ROSTER_RECORD_BYTES,
+                "account roster",
+            )?;
+            // bounded by construction: the account id is a well-formed key.
+            self.store(member_owner_key(&authorizer.key), &account_id);
+        }
+
+        record.nodes.insert(origin.clone(), NodeMeta::default());
         record.nonce += 1;
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
+        self.store_account(&account_id, &record)?;
+        self.store(node_owner_key(&origin), &account_id);
         Ok(())
     }
 
     /// evict `node_key`, authorized by any member of its account.
-    fn unbind_node(
+    async fn unbind_node(
         &mut self,
         ctx: &mut dyn Ctx,
         node_key: Vec<u8>,
@@ -812,13 +743,10 @@ impl Identity {
         Self::origin_key(ctx)?;
 
         let account_id = self
-            .merged_node_index()
-            .get(&node_key)
-            .cloned()
+            .owner_of_node(&node_key)
+            .await?
             .ok_or_else(|| Error::Module("node is not bound".into()))?;
-        let mut record = self
-            .merged_record(&account_id)
-            .expect("node_index only ever points at an existing record");
+        let mut record = self.stored_account(&account_id).await?;
 
         let preimage = unbind_preimage(&self.chain_id, &node_key, record.nonce);
         Self::authorize(&record, IDENTITY_UNBIND_NS, &preimage, &authorizer)?;
@@ -828,13 +756,14 @@ impl Identity {
         record.nodes.remove(&node_key);
         record.nonce += 1;
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
+        self.store_account(&account_id, &record)?;
+        self.staged.delete(node_owner_key(&node_key));
         Ok(())
     }
 
     /// admit `new_key` to the authorizer's account: an existing member consents
     /// and the new key proves possession, both over the same add-preimage.
-    fn add_member_key(
+    async fn add_member_key(
         &mut self,
         ctx: &mut dyn Ctx,
         new_key: Vec<u8>,
@@ -846,13 +775,10 @@ impl Identity {
         Self::origin_key(ctx)?;
 
         let account_id = self
-            .merged_member_index()
-            .get(&authorizer.key)
-            .cloned()
+            .owner_of_member(&authorizer.key)
+            .await?
             .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
-        let mut record = self
-            .merged_record(&account_id)
-            .expect("member_index only ever points at an existing record");
+        let mut record = self.stored_account(&account_id).await?;
 
         if !new_kind.pubkey_wellformed(&new_key) {
             return Err(Error::Module(
@@ -864,7 +790,7 @@ impl Identity {
                 "key is already a member of this account".into(),
             ));
         }
-        if self.merged_member_index().contains_key(&new_key) {
+        if self.owner_of_member(&new_key).await?.is_some() {
             return Err(Error::Module(
                 "key already belongs to another account".into(),
             ));
@@ -901,7 +827,7 @@ impl Identity {
         };
 
         record.member_keys.insert(
-            new_key,
+            new_key.clone(),
             MemberMeta {
                 kind: new_kind,
                 label,
@@ -911,13 +837,14 @@ impl Identity {
         );
         record.nonce += 1;
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
+        self.store_account(&account_id, &record)?;
+        self.store(member_owner_key(&new_key), &account_id);
         Ok(())
     }
 
     /// drop `target_key` from the authorizer's account. any member may drop any
     /// member (including itself), except the last remaining one.
-    fn remove_member_key(
+    async fn remove_member_key(
         &mut self,
         ctx: &mut dyn Ctx,
         target_key: Vec<u8>,
@@ -926,13 +853,10 @@ impl Identity {
         Self::origin_key(ctx)?;
 
         let account_id = self
-            .merged_member_index()
-            .get(&authorizer.key)
-            .cloned()
+            .owner_of_member(&authorizer.key)
+            .await?
             .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
-        let mut record = self
-            .merged_record(&account_id)
-            .expect("member_index only ever points at an existing record");
+        let mut record = self.stored_account(&account_id).await?;
 
         if !record.member_keys.contains_key(&target_key) {
             return Err(Error::Module(
@@ -952,21 +876,23 @@ impl Identity {
         record.member_keys.remove(&target_key);
         record.nonce += 1;
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
+        self.store_account(&account_id, &record)?;
+        self.staged.delete(member_owner_key(&target_key));
         Ok(())
     }
 
     /// set the display name of the account the origin node is bound to.
-    fn set_account_name(&mut self, ctx: &mut dyn Ctx, display_name: String) -> Result<(), Error> {
+    async fn set_account_name(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        display_name: String,
+    ) -> Result<(), Error> {
         let origin = Self::origin_key(ctx)?;
         let account_id = self
-            .merged_node_index()
-            .get(&origin)
-            .cloned()
+            .owner_of_node(&origin)
+            .await?
             .ok_or_else(|| Error::Module("origin node is not bound to an account".into()))?;
-        let mut record = self
-            .merged_record(&account_id)
-            .expect("node_index only ever points at an existing record");
+        let mut record = self.stored_account(&account_id).await?;
 
         let trimmed = display_name.trim();
         if trimmed.is_empty() {
@@ -980,14 +906,13 @@ impl Identity {
         }
         // no signature is consumed here: the nonce is NOT bumped.
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
-        Ok(())
+        self.store_account(&account_id, &record)
     }
 
     /// set the avatar ref and/or bio of the account the origin node is bound
     /// to. origin-gated exactly like `set_account_name`; each field empty-trims
     /// to cleared, over its byte cap rejects. no signature, no nonce bump.
-    fn set_profile(
+    async fn set_profile(
         &mut self,
         ctx: &mut dyn Ctx,
         avatar: Option<String>,
@@ -995,19 +920,15 @@ impl Identity {
     ) -> Result<(), Error> {
         let origin = Self::origin_key(ctx)?;
         let account_id = self
-            .merged_node_index()
-            .get(&origin)
-            .cloned()
+            .owner_of_node(&origin)
+            .await?
             .ok_or_else(|| Error::Module("origin node is not bound to an account".into()))?;
-        let mut record = self
-            .merged_record(&account_id)
-            .expect("node_index only ever points at an existing record");
+        let mut record = self.stored_account(&account_id).await?;
 
         record.avatar = clean_field(avatar, MAX_AVATAR_REF_LEN, "avatar reference")?;
         record.bio = clean_field(bio, MAX_BIO_LEN, "bio")?;
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
-        Ok(())
+        self.store_account(&account_id, &record)
     }
 
     /// set (or clear) the label of `node_key`. origin-gated exactly like
@@ -1015,69 +936,74 @@ impl Identity {
     /// `node_key` must be bound to that SAME account (you label your own
     /// devices). a device label is cosmetic display metadata, so it rides the
     /// bound-node origin gate with no member signature and no nonce bump.
-    fn set_node_label(
+    async fn set_node_label(
         &mut self,
         ctx: &mut dyn Ctx,
         node_key: Vec<u8>,
         label: Option<String>,
     ) -> Result<(), Error> {
         let origin = Self::origin_key(ctx)?;
-        let index = self.merged_node_index();
-        let account_id = index
-            .get(&origin)
-            .cloned()
+        let account_id = self
+            .owner_of_node(&origin)
+            .await?
             .ok_or_else(|| Error::Module("origin node is not bound to an account".into()))?;
         // the target must be bound to the SAME account -- a bound node labels
         // only its own account's devices, never another account's node.
-        if index.get(&node_key) != Some(&account_id) {
+        if self.owner_of_node(&node_key).await? != Some(account_id.clone()) {
             return Err(Error::Module(
                 "target node is not bound to the origin's account".into(),
             ));
         }
-        let mut record = self
-            .merged_record(&account_id)
-            .expect("node_index only ever points at an existing record");
+        let mut record = self.stored_account(&account_id).await?;
 
         let meta = record
             .nodes
             .get_mut(&node_key)
-            .expect("target was just found in this account's node index");
+            .ok_or_else(|| Error::Module("node index disagrees with its account record".into()))?;
         meta.label = clean_label(label)?;
         // no signature is consumed here: the nonce is NOT bumped.
         record.updated_at = ctx.env().consensus_time;
-        self.pending.insert(account_id, Some(record));
-        Ok(())
+        self.store_account(&account_id, &record)
     }
 
     /// grant CLIENT (submit-door) standing to `key`. GOVERNANCE-GATED exactly
     /// like valset membership: only a module origin (governance's redeem
     /// follow-up) or a system origin (genesis) may stage it — an external key
-    /// cannot self-grant. staged into `clients_pending`, folded on commit.
-    fn grant_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
+    /// cannot self-grant. a key that already holds standing is a no-op that
+    /// stages nothing (no root movement).
+    async fn grant_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
         Self::require_module_origin(ctx)?;
         Self::validate_client_key(&key)?;
-        self.clients_pending.insert(key, true);
-        Ok(())
-    }
-
-    /// revoke client standing by `key`; a no-op if the key holds none. same
-    /// governance origin gate as [`Identity::grant_client`].
-    fn revoke_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
-        Self::require_module_origin(ctx)?;
-        self.clients_pending.insert(key, false);
-        Ok(())
-    }
-
-    /// client standing changes only via governance: a module origin (its redeem
-    /// follow-up) or a system origin (genesis). part of the deterministic Env,
-    /// enforced identically on every node.
-    fn require_module_origin(ctx: &dyn Ctx) -> Result<(), Error> {
-        match &ctx.env().origin {
-            Origin::Module(_) | Origin::System => Ok(()),
-            Origin::External(_) => Err(Error::Module(
-                "client standing changes only via governance".into(),
-            )),
+        let mut clients = self.client_set().await?;
+        let Err(position) = clients.binary_search(&key) else {
+            return Ok(());
+        };
+        if clients.len() >= MAX_CLIENTS {
+            return Err(Error::Module(format!("client cap reached ({MAX_CLIENTS})")));
         }
+        clients.insert(position, key);
+        // bounded by construction: ≤ MAX_CLIENTS fixed 32-byte keys.
+        self.store(CLIENTS_KEY.to_vec(), &clients);
+        Ok(())
+    }
+
+    /// revoke client standing by `key`; a no-op (nothing staged) if the key
+    /// holds none. same governance origin gate as [`Identity::grant_client`].
+    /// revoking the last client deletes the record, so the store returns to
+    /// its never-granted shape.
+    async fn revoke_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
+        Self::require_module_origin(ctx)?;
+        let mut clients = self.client_set().await?;
+        let Ok(position) = clients.binary_search(&key) else {
+            return Ok(());
+        };
+        clients.remove(position);
+        if clients.is_empty() {
+            self.staged.delete(CLIENTS_KEY.to_vec());
+        } else {
+            self.store(CLIENTS_KEY.to_vec(), &clients);
+        }
+        Ok(())
     }
 }
 
@@ -1138,8 +1064,9 @@ fn clean_label(label: Option<String>) -> Result<Option<String>, Error> {
 #[cfg(test)]
 mod tests;
 
-// the wasm-guest port: the dispatch shell that adapts this module to the
-// ducktape:module world. compiled only by the guest-builder's synthesized
-// wasm32 cdylib workspace (feature `guest`), never by the native build.
+// the wasm-guest port: the store-backed dispatch shell that adapts this module
+// to the ducktape:module world. compiled only by the guest-builder's
+// synthesized wasm32 cdylib workspace (feature `guest`), never by the native
+// build.
 #[cfg(feature = "guest")]
 mod guest;

@@ -103,8 +103,16 @@ fn native_governance(store: Box<dyn sdk::MerkleStore>) -> Governance {
         .with_code_registry("lifecycle")
 }
 
+/// the native identity SIBLING over a MemStore double — the store backend is
+/// irrelevant here (both hosts carry the same-shaped native sibling; only
+/// same-backend cross-host equality is asserted).
 fn native_identity() -> Identity {
-    Identity::new("identity", Some("valset".into()), CHAIN_ID.to_string())
+    Identity::new(
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+        Some("valset".into()),
+        CHAIN_ID.to_string(),
+    )
 }
 
 fn seeded_valset(validators: &[Vec<u8>]) -> Valset {

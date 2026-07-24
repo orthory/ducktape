@@ -805,8 +805,14 @@ fn run_sim(
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
         // the deterministic user->nodes binding registry — no valset, no chain
         // (the simulator has neither), matching noded's daemon wiring. It is
-        // also the canonical account display-name registry.
-        let identity = Identity::new("identity", None, String::new());
+        // also the canonical account display-name registry. store-backed like
+        // chat/pages.
+        let identity = Identity::new(
+            "identity",
+            Box::new(QmdbStore::init(context.child("identity"), "identity").await),
+            None,
+            String::new(),
+        );
         let gateway = Gateway::new("gateway", "identity", None, "local");
         let mut modules: Vec<Box<dyn Module>> = vec![
             Box::new(chat),

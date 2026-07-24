@@ -545,7 +545,13 @@ async fn demo_genesis(
     let tasks = Tasks::new("tasks");
     // the deterministic user->nodes binding registry: no valset gating and
     // a fixed demo chain id (the demo has no real network descriptor).
-    let identity = Identity::new("identity", None, "demo".into());
+    // store-backed like chat/pages.
+    let identity = Identity::new(
+        "identity",
+        Box::new(QmdbStore::init(context.child("identity"), "identity").await),
+        None,
+        "demo".into(),
+    );
     let gateway = Gateway::new("gateway", "identity", None, "demo");
     let inbox = Inbox::new("inbox");
     let files = Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open");

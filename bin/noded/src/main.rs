@@ -299,8 +299,13 @@ fn run_node(
         // the deterministic user->nodes binding registry. the single-node
         // daemon carries no valset (ungated binds) and no chain (dev-only,
         // chain-unscoped certs are an acceptable surface here). It also owns
-        // the canonical account display name.
-        let identity = Identity::new("identity", None, String::new());
+        // the canonical account display name. store-backed like chat/pages.
+        let identity = Identity::new(
+            "identity",
+            Box::new(QmdbStore::init(context.child("identity"), "identity").await),
+            None,
+            String::new(),
+        );
         // the MERGED gateway owns both the `.duck` handle plane and the route
         // plane; the single-node daemon carries no valset (ungated) and a
         // dev-only chain id.

@@ -4036,6 +4036,7 @@ dependencies = [
  "runs",
  "saga",
  "sdk",
+ "sdk-testkit",
  "serde_json",
  "sha2",
  "statesync",
@@ -4432,6 +4433,7 @@ dependencies = [
  "base64 0.22.1",
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-runtime",
  "commonware-utils",
  "futures",
  "guest-adapter",
@@ -4441,6 +4443,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "valset",
 ]
 
