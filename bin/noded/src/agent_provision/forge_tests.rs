@@ -11,7 +11,7 @@ use super::super::plane_tests::{
     SKILL_BODY, SKILL_FILE, skill_mount, skill_tree, spawn_files_actor,
 };
 use super::*;
-use dispatch_oracle::WorkspaceProvisioner as _;
+use dispatch_host::WorkspaceProvisioner as _;
 
 const REPO: &str = "app";
 const BRANCH: &str = "agent/item-7";

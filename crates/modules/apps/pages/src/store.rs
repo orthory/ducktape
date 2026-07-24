@@ -1,9 +1,8 @@
 use super::{
     BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_MOVE_SUBTREE_READS, MAX_PAGE_DEPTH,
     MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_TRAVERSAL_WORK, MerkleStore, ModuleId,
-    PAGE_INDEX_KEY, PageBlockPage, PageError, PageList, PageMeta, Pages, StagedStore, to_page_err,
+    PAGE_INDEX_KEY, PageBlockPage, PageError, Pages, StagedStore, to_page_err,
 };
-use std::ops::Bound::{Excluded, Unbounded};
 
 impl Pages {
     /// wrap the host-constructed store under module identity `id`. sync — the
@@ -298,51 +297,6 @@ impl Pages {
             );
         }
         Ok(())
-    }
-
-    /// Read one bounded page of the sorted page index. The cursor is a lexical
-    /// boundary, so deletion of the previously returned page cannot strand a
-    /// client between pages.
-    pub(super) async fn list_page_page(
-        &self,
-        after: Option<String>,
-        limit: u16,
-    ) -> Result<PageList, Error> {
-        let index = self.load_index().await?;
-        let start = after.map_or(Unbounded, Excluded);
-        let mut entries = index.range((start, Unbounded));
-        let limit = page_query_limit(limit);
-        let mut pages = Vec::with_capacity(limit);
-        let mut spent = 0_usize;
-        for _ in 0..limit {
-            let Some((id, parent)) = entries.next() else {
-                break;
-            };
-            let root = self
-                .load_block(id)
-                .await?
-                .filter(|block| block.kind == BlockKind::Page)
-                .ok_or_else(corrupt)?;
-            let page = PageMeta {
-                id: id.clone(),
-                title: root.text,
-                parent: parent.clone(),
-            };
-            let cost = encoded_len(&page);
-            if cost > MAX_PAGE_QUERY_BYTES {
-                return Err(corrupt());
-            }
-            if spent.saturating_add(cost) > MAX_PAGE_QUERY_BYTES {
-                let next_after = pages.last().map(|page: &PageMeta| page.id.clone());
-                return Ok(PageList { pages, next_after });
-            }
-            spent += cost;
-            pages.push(page);
-        }
-        let next_after = entries
-            .next()
-            .and_then(|_| pages.last().map(|page| page.id.clone()));
-        Ok(PageList { pages, next_after })
     }
 
     /// Read one bounded slice of a page's PREORDER traversal through the

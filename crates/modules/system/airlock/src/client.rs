@@ -15,7 +15,8 @@ use base64::Engine as _;
 use crate::handshake;
 use crate::seal;
 use crate::wire::{
-    AttestationResponse, CredentialPayload, CredentialUpload, SessionRequest, SessionResponse,
+    AttestationResponse, CredentialKind, CredentialPayload, CredentialUpload, SessionRequest,
+    SessionResponse,
 };
 
 /// Topology-agnostic handle to a gateway.
@@ -73,7 +74,21 @@ impl Gateway {
     /// return the scoped session token. ECDHs the attested key, so the token can
     /// only be opened by this client — a relaying node cannot read it.
     pub async fn open_session(&self, seal_pk: &[u8; 32], sub: &str) -> Result<String> {
-        let (token, _keys) = self.open_session_with(seal_pk, sub, false).await?;
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false, None).await?;
+        Ok(token)
+    }
+
+    /// Open a session that CLAIMS to act on behalf of `account` — the grant
+    /// subject a co-hosted lending gateway checks against its on-chain credential
+    /// record. Refused (`credential_not_granted`) if the account is neither the
+    /// owner nor a grantee.
+    pub async fn open_session_as(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+        account: &[u8],
+    ) -> Result<String> {
+        let (token, _keys) = self.open_session_with(seal_pk, sub, false, Some(account)).await?;
         Ok(token)
     }
 
@@ -84,7 +99,22 @@ impl Gateway {
         seal_pk: &[u8; 32],
         sub: &str,
     ) -> Result<(String, handshake::SessionKeys)> {
-        self.open_session_with(seal_pk, sub, true).await
+        self.open_session_with(seal_pk, sub, true, None).await
+    }
+
+    /// Sealed-body session that ALSO claims to act on behalf of `account` — the
+    /// grant subject a co-hosted lending gateway checks against its on-chain
+    /// credential record (see [`Self::open_session_as`]), but body-sealed. The
+    /// production broker uses this on the self-host path so the owner's gateway
+    /// learns which account is drawing on the credential; refused
+    /// (`credential_not_granted`) if the account is neither owner nor grantee.
+    pub async fn open_session_sealed_as(
+        &self,
+        seal_pk: &[u8; 32],
+        sub: &str,
+        account: &[u8],
+    ) -> Result<(String, handshake::SessionKeys)> {
+        self.open_session_with(seal_pk, sub, true, Some(account)).await
     }
 
     async fn open_session_with(
@@ -92,6 +122,7 @@ impl Gateway {
         seal_pk: &[u8; 32],
         sub: &str,
         body_seal: bool,
+        account: Option<&[u8]>,
     ) -> Result<(String, handshake::SessionKeys)> {
         let (client_eph_pk, keys) = handshake::client_handshake(seal_pk);
         let resp: SessionResponse = self
@@ -100,6 +131,7 @@ impl Gateway {
                 sub: sub.to_string(),
                 client_eph_pk_b64: BASE64.encode(client_eph_pk),
                 body_seal,
+                account_b64: account.map(|a| BASE64.encode(a)),
             })
             .send()
             .await?
@@ -114,17 +146,24 @@ impl Gateway {
     }
 
     /// Seal `payload` (a refresh token or a static bearer) to the ALREADY-VERIFIED
-    /// `seal_pk` and upload it. The gateway never sees it in the clear.
+    /// `seal_pk` and upload it under the credential `name`/`kind`. The gateway
+    /// never sees the secret in the clear; the name/kind are cleartext routing.
     pub async fn upload_sealed_credential(
         &self,
         seal_pk: &[u8; 32],
+        name: &str,
+        kind: CredentialKind,
         payload: &CredentialPayload,
     ) -> Result<()> {
         let payload = serde_json::to_vec(payload)?;
         let sealed = seal::seal(seal_pk, &payload);
         let status = self
             .route(self.http.post(self.url("/credential")))
-            .json(&CredentialUpload { sealed_b64: BASE64.encode(sealed) })
+            .json(&CredentialUpload {
+                name: name.to_string(),
+                kind,
+                sealed_b64: BASE64.encode(sealed),
+            })
             .send()
             .await?
             .status();

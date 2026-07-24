@@ -110,8 +110,9 @@ fn sees(cluster: &NetworkShapeCluster, idx: usize, message_id: &str) -> Option<(
     let raw = cluster.query(
         idx,
         "chat",
-        &encode_query(&ChatQuery::MessagesLatest {
+        &encode_query(&ChatQuery::MessagesRange {
             channel_id: "general".into(),
+            from_seq: 1,
             limit: 16,
         }),
     )?;

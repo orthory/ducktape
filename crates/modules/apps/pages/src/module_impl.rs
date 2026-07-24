@@ -130,31 +130,12 @@ impl Module for Pages {
                 };
                 Ok(encode_reply(&PageReply::Block(block)))
             }
-            PageQuery::ListPages { after, limit } => {
-                let page = self.list_page_page(after, limit).await?;
-                Ok(encode_reply(&PageReply::PageList(page)))
-            }
-            PageQuery::ThreadsForTarget {
-                target,
-                from,
-                limit,
-            } => {
-                let page = self
-                    .target_thread_page(&target, from, limit)
+            PageQuery::CommentThread { thread_id } => {
+                let view = self
+                    .thread_view(&thread_id)
                     .await
                     .map_err(|error| Error::Module(error.to_string()))?;
-                Ok(encode_reply(&PageReply::ThreadPage(page)))
-            }
-            PageQuery::CommentsForThread {
-                thread_id,
-                from,
-                limit,
-            } => {
-                let page = self
-                    .comment_page(&thread_id, from, limit)
-                    .await
-                    .map_err(|error| Error::Module(error.to_string()))?;
-                Ok(encode_reply(&PageReply::CommentPage(page)))
+                Ok(encode_reply(&PageReply::CommentThread(view)))
             }
             PageQuery::GetComment { comment_id } => {
                 let comment = self
@@ -162,6 +143,13 @@ impl Module for Pages {
                     .await
                     .map_err(|e| Error::Module(e.to_string()))?;
                 Ok(encode_reply(&PageReply::Comment(comment)))
+            }
+            PageQuery::TargetThreadCount { target } => {
+                let ids = self
+                    .load_target_index(&target)
+                    .await
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                Ok(encode_reply(&PageReply::TargetThreadCount(ids.len() as u64)))
             }
         }
     }

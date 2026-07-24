@@ -376,7 +376,6 @@ async fn job_view(host: &Host, job_id: &str) -> Option<Job> {
         .unwrap();
     match jobs_decode_reply(&reply).unwrap() {
         JobsReply::Job(job) => job,
-        other => panic!("unexpected reply: {other:?}"),
     }
 }
 

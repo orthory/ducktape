@@ -8,7 +8,7 @@ use sdk::Msg;
 
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
-use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, SUBMIT_HOLD};
+use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{
     read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
 };
@@ -39,6 +39,35 @@ impl ValidatorRuntime<'_> {
                     self.index.applied_height(module).unwrap_or_default(),
                 )
             }),
+        );
+    }
+
+    /// the ONE observability publish seam: refresh the pricier sections
+    /// (throttled to `OPS_REFRESH_INTERVAL` — the exposition parse AND the
+    /// valset standing reads ride the same pace), then publish this node's
+    /// boundary snapshot into the shared cell. called at startup and at the
+    /// end of every drain turn.
+    pub(super) async fn publish_status(&mut self) {
+        if self.context.current() >= self.next_ops_refresh {
+            let exposition = self.context.encode();
+            self.refresh_operations(&exposition).await;
+            // the peers standing: committed valset roles + chain position for
+            // the off-lane /v1/peers composition. roles move only on valset
+            // change, so the 1/s pace bounds staleness far below block rate.
+            let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
+            self.status.publish_peers(noded::PeersStanding {
+                validators: hex_set(read_valset_members(self.node.host()).await),
+                residents: hex_set(read_valset_residents(self.node.host()).await),
+                height: self.node.finalized().map(|f| f.height).unwrap_or(0),
+                epoch: Some(self.orchestrator.epoch()),
+            });
+            self.next_ops_refresh = self.context.current() + OPS_REFRESH_INTERVAL;
+        }
+        super::publish_boundary_status(
+            &self.status,
+            &self.node,
+            &self.metrics,
+            &self.status_public_key,
         );
     }
 
@@ -397,6 +426,16 @@ impl ValidatorRuntime<'_> {
     }
 
     pub(super) async fn on_relay(&mut self, peer: ed25519::PublicKey, bytes: Vec<u8>) {
+        let Ok(msg) = relay::decode_msg(&bytes) else {
+            return;
+        };
+        // the leader nudge is not part of the relay submit protocol — it
+        // carries no frame, needs no standing read, and touches no relay
+        // state — so it dispatches BEFORE the protocol machine.
+        if matches!(msg, relay::RelayMsg::Nudge) {
+            self.on_leader_nudge(&peer).await;
+            return;
+        }
         let Self {
             context,
             node,
@@ -408,9 +447,6 @@ impl ValidatorRuntime<'_> {
         } = self;
         let now = context.current();
 
-        let Ok(msg) = relay::decode_msg(&bytes) else {
-            return;
-        };
         let needs_standing = matches!(
             msg,
             relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
@@ -571,41 +607,6 @@ impl ValidatorRuntime<'_> {
                     .await
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
-            }
-            noded::NodeCommand::Status { reply } => {
-                let exposition = self.context.encode();
-                self.refresh_operations(&exposition).await;
-                let modules = MODULE_IDS
-                    .iter()
-                    .map(|m| noded::ModuleStatus {
-                        id: (*m).into(),
-                        root: self
-                            .node
-                            .host()
-                            .module_root(m)
-                            .map(|r| hex(&r))
-                            .unwrap_or_default(),
-                        category: noded::ModuleCategory::of(m),
-                    })
-                    .collect();
-                let _ = reply.send(noded::NodeStatus {
-                    version: env!("CARGO_PKG_VERSION").into(),
-                    root_hash: hex(&self.node.root_hash()),
-                    height: self.node.finalized().map(|f| f.height).unwrap_or(0),
-                    modules,
-                    public_key: self.status_public_key.clone(),
-                    operations: self.metrics.operational_status(),
-                });
-            }
-            noded::NodeCommand::Peers { reply } => {
-                let _ = reply.send(self.peers_sample().await);
-            }
-            noded::NodeCommand::Metrics { reply } => {
-                // one registry: commonware's runtime series plus the
-                // `ducktape_*` block series the drain loop records.
-                let exposition = self.context.encode();
-                self.refresh_operations(&exposition).await;
-                let _ = reply.send(self.context.encode());
             }
         }
     }

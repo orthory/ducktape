@@ -32,8 +32,8 @@ use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAut
 
 use airlock::attest::{self, Measurement};
 use airlock::client::Gateway as AirlockClient;
-use airlock::server::{self, GatewayConfig};
-use airlock::wire::CredentialPayload;
+use airlock::server::{self, AttestMode, GatewayConfig};
+use airlock::wire::{CredentialKind, CredentialPayload};
 
 use axum::extract::State;
 use axum::routing::post;
@@ -238,8 +238,12 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
 
     let (app, vendor) = server::build_with_quoter(
         GatewayConfig {
-            attest: "snp".into(),
+            // build_with_quoter takes the vendor as an explicit arg; the config's
+            // attest field is unused on this path (Tsm carries the TEE vendor).
+            attest: AttestMode::Tsm("snp".into()),
+            seal_keypair: None,
             anthropic_base: upstream.clone(),
+            openai_base: String::new(),
             oauth_token_url: format!("{upstream}/oauth/token"),
             oauth_client_id: "test-client".into(),
             session_ttl_secs: 3600,
@@ -247,7 +251,7 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
         },
         "snp",
         test_enclave().quoter(),
-        None,
+        Vec::new(),
     )
     .unwrap();
     assert_eq!(vendor, "snp");
@@ -286,7 +290,9 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
-            &CredentialPayload::Refresh { refresh_token: "seed".into() },
+            "compute-node",
+            CredentialKind::Claude,
+            &CredentialPayload::Refresh { refresh_token: "seed".into(), access_token: String::new(), expires_at: 0 },
         )
         .await
         .unwrap();
@@ -439,7 +445,9 @@ fn airlock_single_node_self_serves_its_own_route() {
         let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
-            &CredentialPayload::Refresh { refresh_token: "seed".into() },
+            "self",
+            CredentialKind::Claude,
+            &CredentialPayload::Refresh { refresh_token: "seed".into(), access_token: String::new(), expires_at: 0 },
         )
         .await
         .unwrap();
@@ -864,6 +872,8 @@ fn airlock_embedded_gateway_self_serves() {
     cluster.env[0] = vec![
         ("DUCKTAPE_AIRLOCK_SERVE".into(), "1".into()),
         ("DUCKTAPE_AIRLOCK_SERVE_ATTEST".into(), "auto".into()),
+        // name the seeded credential to match the session `sub` opened below.
+        ("DUCKTAPE_AIRLOCK_SERVE_NAME".into(), "self".into()),
         ("DUCKTAPE_AIRLOCK_SERVE_ANTHROPIC_BASE".into(), upstream.clone()),
         (
             "DUCKTAPE_AIRLOCK_SERVE_CREDENTIALS".into(),

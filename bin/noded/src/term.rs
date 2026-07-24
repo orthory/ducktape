@@ -39,7 +39,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use capability_host::{AgentDirs, InteractiveSession, ProviderSet, RunContext, SandboxBackend};
+use capability_host::{
+    AgentDirs, AirlockConfig, InteractiveSession, ProviderSet, RunContext, SandboxBackend,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -163,6 +165,11 @@ struct SessionRing {
     bytes: usize,
     touched: u64,
     chunks: VecDeque<(u64, String)>,
+    /// the child (and its container) has exited — the pump reached EOF. A
+    /// `term:<id>` ws subscriber that has drained the ring learns the session
+    /// is over from this and closes, rather than blocking forever on a topic
+    /// that will never append again (the wedge that stranded `agent pty`).
+    ended: bool,
 }
 
 impl Default for TermRing {
@@ -200,6 +207,32 @@ impl TermRing {
     /// Only a Shared session (the huddle-style path) forwards.
     pub fn append_local_only(&self, session: &str, chunk_b64: String) {
         self.push(session, chunk_b64, false);
+    }
+
+    /// flag a session's ring as ended (the pump reached EOF) and wake its ws
+    /// subscribers so the catch-up path can emit the terminal frame. A no-op for
+    /// a session already evicted from the ring — no subscriber can be waiting on
+    /// a ring that is gone. Bumps `version` so `term:<id>` `watch` fires exactly
+    /// as an append would.
+    pub fn mark_ended(&self, session: &str) {
+        let mut inner = self.inner.lock().expect("term ring lock poisoned");
+        let Some(ring) = inner.sessions.get_mut(session) else {
+            return;
+        };
+        if ring.ended {
+            return;
+        }
+        ring.ended = true;
+        inner.version += 1;
+        let version = inner.version;
+        let _ = self.watch.send(version);
+    }
+
+    /// whether the session's pump has reached EOF. `false` for an unknown or
+    /// evicted session — a caller with no ring to drain has nothing to close on.
+    pub fn is_ended(&self, session: &str) -> bool {
+        let inner = self.inner.lock().expect("term ring lock poisoned");
+        inner.sessions.get(session).is_some_and(|ring| ring.ended)
     }
 
     fn push(&self, session: &str, chunk_b64: String, publish: bool) {
@@ -491,9 +524,10 @@ pub struct Command {
 /// (the consensus-ready path). The two are MUTUALLY EXCLUSIVE per session: a
 /// shared session refuses raw input (else a keystroke would bypass the total
 /// order), and a single session refuses commands (it has no lane/consumer).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionMode {
+    #[default]
     Single,
     Shared,
 }
@@ -501,6 +535,10 @@ pub enum SessionMode {
 struct Live {
     session: Arc<InteractiveSession>,
     mode: SessionMode,
+    /// the node that created this session, for the host-side input gate. `None`
+    /// for a local (non peer-attached) session — a forwarded input frame naming
+    /// a local session is refused, since no peer owns it.
+    creator_node: Option<[u8; 32]>,
     cmd_tx: mpsc::UnboundedSender<Command>,
     _reaper_cancel: oneshot::Sender<()>,
 }
@@ -533,8 +571,17 @@ struct Inner {
     active: AtomicUsize,
 }
 
+/// everything the host needs to spawn a session on behalf of a mesh peer: the
+/// creator node (the input gate), the guest's consensus-resolved credential as a
+/// self-host airlock config (the broker upstream), and the cpu/mem limits.
+pub struct PeerAttach {
+    pub creator_node: [u8; 32],
+    pub airlock: AirlockConfig,
+    pub limits: BTreeMap<String, u64>,
+}
+
 /// the create-session reply — the fixed wire shape the app client consumes.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CreatedSession {
     pub session_id: String,
     pub topic: String,
@@ -671,11 +718,17 @@ impl TerminalSessions {
                 Live {
                     session: session.clone(),
                     mode,
+                    // a local session has no creator peer — the input gate treats
+                    // a forwarded frame for it as "not an attached session".
+                    creator_node: None,
                     cmd_tx,
                     _reaper_cancel: cancel_tx,
                 },
             );
-        self.spawn_pump(id.clone(), session.clone(), mode);
+        // only a Shared session fans its output out to peers; a solo Single
+        // session stays node-local (rings + local ws only).
+        let forward = mode == SessionMode::Shared;
+        self.spawn_pump(id.clone(), session.clone(), forward);
         // the ordered command lane exists only for a Shared session; a Single
         // session drives the pty with raw keystrokes (no lane, no consumer).
         if mode == SessionMode::Shared {
@@ -689,14 +742,108 @@ impl TerminalSessions {
         })
     }
 
+    /// create a session on behalf of a mesh PEER (the host side of a directed
+    /// `ducktape agent pty --node <this>`): the FULL solo TUI (`restricted =
+    /// false`, raw keystrokes) but with output FORWARDING on — so `term_plane`
+    /// fans the pty out to the guest node — and the creator node recorded for the
+    /// host-side input gate. The credential rides `attach.airlock` onto the
+    /// interactive broker (the guest's self-host gateway); `attach.limits`
+    /// becomes the container's cpu/mem ceilings. Reserves a slot against the cap
+    /// exactly like [`Self::create`].
+    pub async fn create_for_peer(
+        &self,
+        provider: &str,
+        attach: PeerAttach,
+    ) -> Result<CreatedSession, TermError> {
+        let inner = &self.0;
+        let Some(providers) = inner.providers.as_ref() else {
+            tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "peer session create refused");
+            return Err(TermError::NoSandbox);
+        };
+        if inner.active.fetch_add(1, Ordering::SeqCst) + 1 > MAX_TERM_SESSIONS {
+            inner.active.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(target: "ducktape::term", reason = "at_capacity", cap = MAX_TERM_SESSIONS, "peer session create refused");
+            return Err(TermError::AtCapacity);
+        }
+        match self.spawn_for_peer(providers, provider, attach).await {
+            Ok(created) => Ok(created),
+            Err(err) => {
+                inner.active.fetch_sub(1, Ordering::SeqCst);
+                Err(err)
+            }
+        }
+    }
+
+    /// resolve the provider, build the peer-attached run context (limits +
+    /// airlock, portable), spawn the solo TUI, and register it forwarding. The
+    /// reservation is held by [`Self::create_for_peer`].
+    async fn spawn_for_peer(
+        &self,
+        providers: &ProviderSet,
+        provider: &str,
+        attach: PeerAttach,
+    ) -> Result<CreatedSession, TermError> {
+        let resolved = providers.resolve(provider).map_err(|detail| {
+            tracing::warn!(target: "ducktape::term", reason = "unknown_provider", provider, "peer session create refused");
+            TermError::Resolve(detail)
+        })?;
+        let id = format!("{:016x}", rand::random::<u64>());
+        let ctx = RunContext {
+            agent_id: Some(provider.to_string()),
+            executing_node: Some(self.0.executing_node.clone()),
+            workdir_override: Some(self.0.workdir_root.join(&id)),
+            portable: true,
+            limits: attach.limits,
+            airlock: Some(attach.airlock),
+            ..Default::default()
+        };
+        // a peer-attached session is the solo TUI (raw keystrokes), never the
+        // restricted command-lane argv.
+        let session = resolved
+            .spawn_interactive(&ctx, false)
+            .await
+            .map_err(|detail| {
+                tracing::warn!(target: "ducktape::term", reason = "spawn_failed", provider, "peer interactive spawn failed");
+                TermError::Spawn(detail)
+            })?;
+        let session = Arc::new(session);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        // a Single session drives the pty with raw keystrokes: the lane has no
+        // consumer, but the field must hold a sender.
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        self.0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .insert(
+                id.clone(),
+                Live {
+                    session: session.clone(),
+                    mode: SessionMode::Single,
+                    creator_node: Some(attach.creator_node),
+                    cmd_tx,
+                    _reaper_cancel: cancel_tx,
+                },
+            );
+        // a peer-attached session ALWAYS forwards its output — that is how the
+        // guest node streams it (the security-critical INPUT direction is
+        // creator-gated host-side, not here).
+        self.spawn_pump(id.clone(), session, true);
+        self.spawn_reaper(id.clone(), cancel_rx);
+        tracing::info!(target: "ducktape::term", session = %id, provider, "session_created");
+        Ok(CreatedSession {
+            topic: topic(&id),
+            session_id: id,
+        })
+    }
+
     /// the pump: copy pty output into the ring + broadcast until EOF, then
-    /// clean the session up. One task per session.
-    fn spawn_pump(&self, id: String, session: Arc<InteractiveSession>, mode: SessionMode) {
+    /// clean the session up. One task per session. `forward` (decided by the
+    /// caller as a named predicate) fans output out to peers: true for a Shared
+    /// local session AND a peer-attached one, false for a solo local session.
+    fn spawn_pump(&self, id: String, session: Arc<InteractiveSession>, forward: bool) {
         let manager = self.clone();
         let ring = self.0.ring.clone();
-        // only a Shared session fans its output out to peers; a Single session
-        // stays node-local (rings + local ws only).
-        let forward = mode == SessionMode::Shared;
         tokio::spawn(async move {
             let mut buf = vec![0u8; TERM_READ_BUF];
             loop {
@@ -719,8 +866,13 @@ impl TerminalSessions {
                     }
                 }
             }
-            // whoever removes the entry owns teardown + the lifecycle log, so an
-            // explicit close() racing the EOF here never double-terminates.
+            // mark the ring ended FIRST, so the terminal frame reaches every
+            // `term:<id>` ws subscriber (an `agent pty` client blocks on this
+            // topic and only unblocks when it sees the session is over). Then
+            // finish() removes the entry: whoever removes it owns teardown + the
+            // lifecycle log, so an explicit close() racing the EOF here never
+            // double-terminates.
+            ring.mark_ended(&id);
             if let Some(session) = manager.finish(&id) {
                 session.close().await;
                 tracing::info!(target: "ducktape::term", session = %id, "session_ended");
@@ -823,6 +975,12 @@ impl TerminalSessions {
         let _ = tx.send(Command { origin, text });
     }
 
+    /// whether a sandbox provider set is configured — the host-side admission's
+    /// `no_sandbox` gate. False when the node has no compute plane.
+    pub fn has_sandbox(&self) -> bool {
+        self.0.providers.is_some()
+    }
+
     /// the mode a session was created with (for the ws input gates), if live.
     pub fn mode(&self, id: &str) -> Option<SessionMode> {
         self.0
@@ -831,6 +989,18 @@ impl TerminalSessions {
             .expect("term sessions lock poisoned")
             .get(id)
             .map(|live| live.mode)
+    }
+
+    /// the node that created a peer-attached session — the host-side input gate.
+    /// `None` for a local session (no creator peer) or an unknown id, so a
+    /// forwarded input frame for either is refused.
+    pub fn creator_node(&self, id: &str) -> Option<[u8; 32]> {
+        self.0
+            .sessions
+            .lock()
+            .expect("term sessions lock poisoned")
+            .get(id)
+            .and_then(|live| live.creator_node)
     }
 
     /// the live session for `id`, if any (for `TermInput`/`TermResize`).
@@ -872,19 +1042,16 @@ async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool
     }
 }
 
-/// build the sandbox-backed interactive provider set for `backend`. `None` for
-/// `Direct` (interactive requires Podman/Tart — a Direct node simply has no
-/// terminal plane, no fallback); a discovery error is logged and also disables
-/// it. The caller owns backend selection: `bin/node` passes its resolved
-/// `node.toml` backend, `bin/noded` passes [`backend_from_env`].
+/// build the sandbox-backed interactive provider set for `backend`. the
+/// caller owns backend selection — and calls this only when a sandbox is
+/// actually configured: `bin/node` passes its resolved `node.toml` backend,
+/// `bin/noded` passes [`backend_from_env`]'s `Some`. a discovery error is
+/// logged and disables the terminal plane.
 pub fn discover_interactive(
     node_identity: &[u8],
     dirs: AgentDirs,
     backend: SandboxBackend,
 ) -> Option<ProviderSet> {
-    if matches!(backend, SandboxBackend::Direct) {
-        return None;
-    }
     // force_private_net = TRUE: terminal containers host adversarial members, so
     // they must not share the host netns (see capability_host::discover).
     match capability_host::discover(node_identity, dirs, None, backend, true) {
@@ -896,29 +1063,29 @@ pub fn discover_interactive(
     }
 }
 
-/// derive the interactive sandbox backend from the daemon's env vars
-/// (`DUCKTAPE_SANDBOX_IMAGE` / `DUCKTAPE_SANDBOX_BACKEND`). `Direct` (no
-/// terminal plane) when no image is configured, or the backend name is unknown.
-/// `bin/noded` uses this because it parses no toml; `bin/node` resolves its
-/// backend from `node.toml` instead and passes it to [`discover_interactive`].
-pub fn backend_from_env() -> SandboxBackend {
+/// derive the daemon's sandbox backend from its env vars
+/// (`DUCKTAPE_SANDBOX_IMAGE` / `DUCKTAPE_SANDBOX_BACKEND`). `None` — no
+/// compute plane, no terminal plane — when no image is configured or the
+/// backend name is unknown. `bin/noded` uses this because it parses no toml;
+/// `bin/node` resolves its backend from `node.toml` instead.
+pub fn backend_from_env() -> Option<SandboxBackend> {
     let Ok(image) = std::env::var(SANDBOX_IMAGE_ENV) else {
-        return SandboxBackend::Direct;
+        return None;
     };
     let image = image.trim().to_string();
     if image.is_empty() {
-        return SandboxBackend::Direct;
+        return None;
     }
     match std::env::var(SANDBOX_BACKEND_ENV)
         .ok()
         .as_deref()
         .map(str::trim)
     {
-        None | Some("") | Some("podman") => SandboxBackend::Podman { image },
-        Some("tart") => SandboxBackend::Tart { image },
+        None | Some("") | Some("podman") => Some(SandboxBackend::Podman { image }),
+        Some("tart") => Some(SandboxBackend::Tart { image }),
         Some(other) => {
-            tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; interactive disabled");
-            SandboxBackend::Direct
+            tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; compute plane disabled");
+            None
         }
     }
 }
@@ -938,22 +1105,112 @@ pub fn backend_from_env() -> SandboxBackend {
 // way the run/dispatch path (`/v1/submit`) is, per the design (authorization
 // rides the existing trusted-local surface, no new ACL).
 
-/// the `POST /v1/term/sessions` body.
+/// the `POST /v1/term/sessions` body. The `{agent, mode}` local path is
+/// unchanged when the cross-node fields are absent; a `node` (or a bare `cred`
+/// on this node) routes the create over the mesh to a host peer.
 #[derive(Deserialize)]
 pub struct CreateSessionBody {
+    /// provider tag (`claude`|`codex`|a test provider); required.
     pub agent: String,
-    /// `"single"` = raw-keystroke solo terminal;
-    /// `"shared"` = ordered `TermCommand` lane.
+    /// `"single"` (default) = raw-keystroke solo terminal; `"shared"` = ordered
+    /// `TermCommand` lane.
+    #[serde(default)]
     pub mode: SessionMode,
+    /// hex host node key; `None` = this node (the local path).
+    #[serde(default)]
+    pub node: Option<String>,
+    /// credential name; required when `node` is set.
+    #[serde(default)]
+    pub cred: Option<String>,
+    #[serde(default)]
+    pub cpu: Option<u64>,
+    #[serde(default)]
+    pub mem_gb: Option<u64>,
+}
+
+/// where a create is served: on this node (today's local path) or directed to a
+/// host peer over the mesh (the guest lane, loopback-short-circuited when the
+/// host is this node itself).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CreateRoute {
+    Local,
+    Remote { host: [u8; 32] },
+}
+
+/// decode a 64-hex node key to its 32 bytes.
+fn decode_node_key(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        let text = std::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// the pure create-routing decision. `own_node` is this node's key (for the bare-
+/// cred own-node attach). A cross-node create requires a credential; a set `node`
+/// must be a 32-byte hex key.
+fn create_route(
+    node: Option<&str>,
+    cred: Option<&str>,
+    own_node: Option<[u8; 32]>,
+) -> Result<CreateRoute, (StatusCode, &'static str)> {
+    match node {
+        // no node: a bare `cred` runs on THIS node with that credential (the
+        // own-node attach, looped back through the session lane); no cred is the
+        // unchanged local path.
+        None => match cred {
+            None => Ok(CreateRoute::Local),
+            Some(_) => match own_node {
+                Some(host) => Ok(CreateRoute::Remote { host }),
+                None => Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "terminal sessions are not enabled on this node",
+                )),
+            },
+        },
+        // a named host: a credential is mandatory, and the key must be 32-byte hex.
+        Some(node) => {
+            if cred.is_none() {
+                return Err((StatusCode::BAD_REQUEST, "a cross-node session requires --cred"));
+            }
+            let host = decode_node_key(node)
+                .ok_or((StatusCode::BAD_REQUEST, "node must be a 32-byte hex node key"))?;
+            Ok(CreateRoute::Remote { host })
+        }
+    }
 }
 
 /// POST /v1/term/sessions — create an interactive session and return its id +
-/// ws topic. Over the concurrency cap, missing sandbox, or an unknown agent
-/// each return a clear error (never a panic, never a Direct spawn).
+/// ws topic. A local create spawns here; a directed (`node`/`cred`) create rides
+/// the guest lane to the host. Over the cap, missing sandbox, unknown agent, or a
+/// host refusal each return a clear error (never a panic, never a Direct spawn).
 pub async fn create_session(
     State(handle): State<NodeHandle>,
     Json(body): Json<CreateSessionBody>,
 ) -> Response {
+    let own_node = handle
+        .admin
+        .node_key
+        .as_deref()
+        .and_then(|key| <[u8; 32]>::try_from(key).ok());
+    let route = match create_route(body.node.as_deref(), body.cred.as_deref(), own_node) {
+        Ok(route) => route,
+        Err((status, msg)) => {
+            return (status, Json(serde_json::json!({ "error": msg }))).into_response();
+        }
+    };
+    match route {
+        CreateRoute::Local => create_local(&handle, body).await,
+        CreateRoute::Remote { host } => create_remote(&handle, host, body).await,
+    }
+}
+
+/// the unchanged local create path (today's `{agent, mode}`).
+async fn create_local(handle: &NodeHandle, body: CreateSessionBody) -> Response {
     let Some(terminals) = handle.terminals() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -975,7 +1232,7 @@ pub async fn create_session(
     // just without the consensus lane — so it warns and continues.
     if body.mode == SessionMode::Shared {
         let channel = crate::term_consensus::session_channel(&created.session_id);
-        match crate::term_consensus::ensure_channel(&handle, &channel).await {
+        match crate::term_consensus::ensure_channel(handle, &channel).await {
             Ok(()) => {
                 crate::term_consensus::spawn_projector(handle.clone(), created.session_id.clone());
             }
@@ -987,9 +1244,79 @@ pub async fn create_session(
     (StatusCode::OK, Json(created)).into_response()
 }
 
+/// the directed create path: hand a `SessionJob::Create` to the guest lane and
+/// await the host's reply. On success remember the session→host binding so the
+/// ws input/resize handlers forward to that host.
+async fn create_remote(handle: &NodeHandle, host: [u8; 32], body: CreateSessionBody) -> Response {
+    let Some(lane) = handle.session_lane() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "terminal sessions are not enabled on this node" })),
+        )
+            .into_response();
+    };
+    let cred = body.cred.expect("create_route guarantees a cred on the remote path");
+    let (reply, rx) = oneshot::channel();
+    let job = crate::term_remote::SessionJob::Create {
+        host,
+        provider: body.agent,
+        cred,
+        cpu: body.cpu,
+        mem_gb: body.mem_gb,
+        reply,
+    };
+    if lane.send(job).await.is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "terminal sessions are not enabled on this node" })),
+        )
+            .into_response();
+    }
+    let created = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(created))) => created,
+        Ok(Ok(Err(msg))) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("host refused: {msg}") })),
+            )
+                .into_response();
+        }
+        Ok(Err(_)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "the session lane dropped the request" })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({ "error": "the host did not respond" })),
+            )
+                .into_response();
+        }
+    };
+    handle
+        .remote_sessions()
+        .remember(created.session_id.clone(), host);
+    (StatusCode::OK, Json(created)).into_response()
+}
+
 /// POST /v1/term/sessions/{id}/close — end a session. Idempotent: a closed or
-/// unknown id is a 204 no-op.
+/// unknown id is a 204 no-op. A remote session's close is forwarded to its host.
 pub async fn close_session(State(handle): State<NodeHandle>, Path(id): Path<String>) -> Response {
+    if let Some(host) = handle.remote_sessions().host_of(&id) {
+        if let Some(lane) = handle.session_lane() {
+            let _ = lane
+                .send(crate::term_remote::SessionJob::Close {
+                    host,
+                    session: id.clone(),
+                })
+                .await;
+        }
+        handle.remote_sessions().forget(&id);
+        return StatusCode::NO_CONTENT.into_response();
+    }
     if let Some(terminals) = handle.terminals() {
         terminals.close(&id).await;
     }
@@ -1016,6 +1343,21 @@ mod tests {
         assert!(none.is_empty());
         // an unknown session is empty, never a panic.
         assert!(ring.read_after("nope", 0, 64).0.is_empty());
+    }
+
+    #[test]
+    fn ring_marks_ended_idempotently_and_ignores_unknown_sessions() {
+        let ring = TermRing::default();
+        ring.append("s", STANDARD.encode(b"hi"));
+        assert!(!ring.is_ended("s"), "a live session is not ended");
+        ring.mark_ended("s");
+        assert!(ring.is_ended("s"), "the pump's EOF marks the ring ended");
+        ring.mark_ended("s"); // idempotent — the double-close race is a no-op
+        assert!(ring.is_ended("s"));
+        // an unknown/evicted session is never ended and never panics.
+        assert!(!ring.is_ended("nope"));
+        ring.mark_ended("nope");
+        assert!(!ring.is_ended("nope"));
     }
 
     #[test]
@@ -1178,6 +1520,52 @@ mod tests {
             .0
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn create_body_routes_local_when_node_absent_and_remote_when_present() {
+        let host_hex = "aa".repeat(32);
+        let host = [0xaau8; 32];
+        let me = [0x11u8; 32];
+        // no node, no cred → local.
+        assert_eq!(
+            create_route(None, None, Some(me)).unwrap(),
+            CreateRoute::Local
+        );
+        // a named host + cred → remote to that host.
+        assert_eq!(
+            create_route(Some(&host_hex), Some("c"), Some(me)).unwrap(),
+            CreateRoute::Remote { host }
+        );
+        // no node but a bare cred → own-node attach (looped back).
+        assert_eq!(
+            create_route(None, Some("c"), Some(me)).unwrap(),
+            CreateRoute::Remote { host: me }
+        );
+        // a named host without a cred → 400 requires --cred.
+        let (status, msg) = create_route(Some(&host_hex), None, Some(me)).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "a cross-node session requires --cred");
+        // a malformed node key → 400 32-byte hex.
+        let (status, msg) = create_route(Some("zz"), Some("c"), Some(me)).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "node must be a 32-byte hex node key");
+    }
+
+    #[test]
+    fn creator_node_is_absent_for_a_local_or_unknown_session() {
+        // a manager with no providers can't spawn, but the input-gate accessor is
+        // pure: an unknown id (and, by construction, any local session) has no
+        // creator node — so a forwarded input frame naming it is refused. The
+        // live peer-attach spawn is covered by the two-node e2e (real pty).
+        let terminals = TerminalSessions::new(
+            None,
+            "node".into(),
+            PathBuf::from("term-sessions"),
+            TermRing::default(),
+            TermCommandRing::default(),
+        );
+        assert!(terminals.creator_node("nope").is_none());
     }
 
     #[test]

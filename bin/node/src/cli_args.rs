@@ -177,6 +177,12 @@ pub struct InitArgs {
     /// found the network here instead of the registry default
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+    /// workstation node: run agent sessions in a sandbox and announce this
+    /// host's provider capabilities (writes a [sandbox] table, podman/tart by
+    /// platform, + announce). A plain consensus node omits this and has no
+    /// compute plane at all.
+    #[arg(long)]
+    pub compute: bool,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }

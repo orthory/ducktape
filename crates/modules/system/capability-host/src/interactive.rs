@@ -10,10 +10,11 @@
 //! `[interactive]` TUI argv (not `[invoke]`'s headless one), and the child's
 //! stdio is a pty the host holds the master of, not pipes.
 //!
-//! **Podman only.** The `Direct` backend has no mount namespace and no fresh
-//! HOME, so an interactive session on it would expose the operator's whole home
-//! to whoever is typing — the exact thing the sandbox exists to prevent. So
-//! [`CliProvider::spawn_interactive_session`] refuses anything but Podman; the
+//! **Sandboxed only.** A bare spawn would have no mount namespace and no fresh
+//! HOME, so an interactive session outside the sandbox would expose the
+//! operator's whole home
+//! to whoever is typing — the exact thing the sandbox exists to prevent, and
+//! exactly why [`crate::SandboxBackend`] cannot express one; the
 //! pty primitive underneath ([`InteractiveSession::spawn_on_pty`]) is backend
 //! agnostic only so its behavior can be unit-tested against a plain local child.
 //!
@@ -75,8 +76,12 @@ impl InteractiveSession {
         let writer_fd = master
             .try_clone()
             .map_err(|e| format!("dup pty master: {e}"))?;
-        let stdin = slave.try_clone().map_err(|e| format!("dup pty slave: {e}"))?;
-        let stdout = slave.try_clone().map_err(|e| format!("dup pty slave: {e}"))?;
+        let stdin = slave
+            .try_clone()
+            .map_err(|e| format!("dup pty slave: {e}"))?;
+        let stdout = slave
+            .try_clone()
+            .map_err(|e| format!("dup pty slave: {e}"))?;
         command
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
@@ -97,6 +102,19 @@ impl InteractiveSession {
             _broker: broker,
             _config_home: config_home,
         })
+    }
+
+    /// spawn `command` on a pty with NO sandbox, broker, or fresh config home —
+    /// the host runs it directly on this box. The ONLY intended caller is the
+    /// operator's own `ducktape user cred add` vendor-login wrap: it runs the
+    /// vendor's login CLI (`claude setup-token`, `codex login`) on the operator's
+    /// OWN machine to capture the operator's OWN credential, so there is nothing
+    /// to isolate — no foreign code, no lent credential, no shared filesystem to
+    /// fence. Every OTHER interactive session (a lent agent run) MUST go through
+    /// [`CliProvider::spawn_interactive_session`], which
+    /// keeps the broker/config-home/sandbox isolation.
+    pub fn spawn_local(command: tokio::process::Command) -> Result<Self, String> {
+        Self::spawn_on_pty(command, None, None, None, None)
     }
 
     /// read the next chunk of terminal output. `Ok(0)` means end of session: on
@@ -170,6 +188,21 @@ impl InteractiveSession {
         }
     }
 
+    /// Resolve once the CHILD LEADER process has exited, without reaping it (the
+    /// reap stays with [`Self::close`]). Distinct from [`Self::read`] returning
+    /// EOF: the pty master only EOFs once EVERY slave fd is closed, so a child
+    /// that exits while a lingering grandchild still holds the slave (a browser
+    /// helper a vendor login forks, say) would never EOF. A caller that needs to
+    /// proceed the moment the child itself is done races this against `read`.
+    /// Never resolves if the leader pid is unknown (nothing to observe).
+    pub async fn wait_child_exit(&self) {
+        let Some(pid) = self.live.lock().await.leader_pid() else {
+            std::future::pending::<()>().await;
+            unreachable!()
+        };
+        crate::wait_leader_exit_unreaped(pid, "interactive session").await;
+    }
+
     /// end the session: terminate the child's process group and clean up the
     /// Podman container. Idempotent-ish — safe to call once on session teardown.
     pub async fn close(&self) {
@@ -182,15 +215,20 @@ impl InteractiveSession {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         let fd = self.reader.get_ref().as_raw_fd();
         let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
-        assert_eq!(rc, 0, "TIOCGWINSZ failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "TIOCGWINSZ failed: {}",
+            std::io::Error::last_os_error()
+        );
         (ws.ws_col, ws.ws_row)
     }
 }
 
 impl CliProvider {
-    /// spawn this capability's interactive TUI on a pty. Requires a SANDBOX
-    /// backend (Podman or Tart) — `Direct` has no mount namespace / fresh HOME
-    /// and is refused — and a spec with an `[interactive]` argv. The isolation is
+    /// spawn this capability's interactive TUI on a pty, inside the provider's
+    /// sandbox backend (Podman or Tart), from a spec with an `[interactive]`
+    /// argv. The isolation is
     /// the headless path's (a broker holding the credential, a fresh config home,
     /// the container/VM fence); only the argv and the stdio (pty, not pipes)
     /// differ. Podman keeps the container lifecycle on the pty child itself; Tart
@@ -201,13 +239,6 @@ impl CliProvider {
         ctx: &RunContext,
         restricted: bool,
     ) -> Result<InteractiveSession, String> {
-        if matches!(self.backend, SandboxBackend::Direct) {
-            return Err(format!(
-                "{}: interactive sessions require a sandbox backend (Podman or Tart); \
-                 this node runs Direct",
-                self.spec.tag
-            ));
-        }
         let Some(interactive) = self.spec.interactive.clone() else {
             return Err(format!(
                 "{}: this capability declares no [interactive] argv",
@@ -234,7 +265,11 @@ impl CliProvider {
         let workdir = self.ensure_writable_workdir(ctx)?;
         let workdir = canonical_mount_path(&workdir, "sandbox workdir")?;
         let config_home = self.prepare_config_home(&workdir, ctx)?;
-        let broker = self.start_broker().await?;
+        // the per-run credential source: a peer-attached session carries a
+        // consensus-resolved self-host gateway on `ctx.airlock`, so the broker
+        // resolves the upstream to it instead of the boundary env; a local
+        // session leaves it `None` and the env/host-credential path is unchanged.
+        let broker = self.start_broker(ctx.airlock.as_ref()).await?;
         let auth = RunAuth {
             config_home: config_home.as_deref(),
             broker: broker.as_ref().map(|b| &b.endpoint),
@@ -264,7 +299,10 @@ impl CliProvider {
                 command.current_dir(&workdir);
                 InteractiveSession::spawn_on_pty(command, None, Some(guard), broker, config_home)
             }
-            SandboxBackend::Direct => unreachable!("Direct is refused above"),
+            #[cfg(test)]
+            SandboxBackend::Bare => {
+                unreachable!("interactive sessions never run under the bare test harness")
+            }
         }
     }
 }
@@ -313,7 +351,10 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
     // SAFETY: `name` is NUL-terminated by the platform slave-name lookup.
     let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
     if slave < 0 {
-        return Err(format!("open pty slave: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "open pty slave: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: `slave` is a fresh fd we now own.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
@@ -364,11 +405,17 @@ fn set_nonblocking(fd: &OwnedFd) -> Result<(), String> {
     // SAFETY: raw is a live fd we own.
     let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
     if flags < 0 {
-        return Err(format!("fcntl F_GETFL: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "fcntl F_GETFL: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     // SAFETY: raw is a live fd we own; setting O_NONBLOCK on its status flags.
     if unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(format!("fcntl F_SETFL: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "fcntl F_SETFL: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -383,15 +430,14 @@ mod tests {
     /// line-discipline echo, so the payload is guaranteed to come back.)
     #[tokio::test]
     async fn pty_round_trips_bytes_through_a_child() {
-        let session =
-            InteractiveSession::spawn_on_pty(
-                tokio::process::Command::new("cat"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("spawn cat on a pty");
+        let session = InteractiveSession::spawn_on_pty(
+            tokio::process::Command::new("cat"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("spawn cat on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
 
         let mut seen = Vec::new();
@@ -416,6 +462,46 @@ mod tests {
             "expected the pty to echo 'ping', got {:?}",
             String::from_utf8_lossy(&seen)
         );
+    }
+
+    /// `wait_child_exit` resolves when the child LEADER exits even though a
+    /// lingering grandchild still holds the pty slave open — the exact shape that
+    /// hangs a plain `read`-until-EOF wrap (a vendor login that forks a helper
+    /// and exits). `sh` backgrounds a long `sleep` (which inherits the slave),
+    /// prints, then exits: the master never EOFs, but `wait_child_exit` returns.
+    #[tokio::test]
+    async fn wait_child_exit_returns_while_a_grandchild_holds_the_pty() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo ready"]);
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+            .expect("spawn sh on a pty");
+
+        // The child leader (sh) exits right after `echo ready`; the backgrounded
+        // sleep keeps the slave open, so this must still complete promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(10), session.wait_child_exit())
+            .await
+            .expect("wait_child_exit hung while a grandchild held the pty");
+
+        // Drain any buffered output; the pty must reach a BLOCK (no more data),
+        // never EOF — the sleep still holds a slave, so a read-until-EOF wrap
+        // would hang here even though wait_child_exit already returned.
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                session.read(&mut buf),
+            )
+            .await
+            {
+                Err(_) => break, // read blocked: pty open, no EOF — the point.
+                Ok(Ok(0)) => panic!("pty EOF'd — the grandchild did not hold it open"),
+                Ok(Ok(_)) => continue, // drained a chunk (e.g. "ready"), keep going.
+                Ok(Err(e)) => panic!("read errored: {e}"),
+            }
+        }
+
+        // close() terminates the process group, reaping the sleep and freeing it.
+        session.close().await;
     }
 
     /// resize sets the master's window size; the kernel reflects it back through
@@ -495,11 +581,8 @@ mod tests {
         let mut seen = Vec::new();
         let mut buf = [0u8; 4096];
         for _ in 0..rounds {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                session.read(&mut buf),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_secs(20), session.read(&mut buf))
+                .await
             {
                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                 Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
@@ -520,8 +603,13 @@ mod tests {
         }
         let mut cmd = tokio::process::Command::new("podman");
         cmd.args([
-            "run", "--rm", "-i", "-t", "--network=host",
-            "docker.io/library/debian:13-slim", "cat",
+            "run",
+            "--rm",
+            "-i",
+            "-t",
+            "--network=host",
+            "docker.io/library/debian:13-slim",
+            "cat",
         ]);
         let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
             .expect("spawn podman on a pty");
@@ -578,7 +666,10 @@ mod tests {
         let seen = read_until(&session, b"\x1b[", 40).await; // any ANSI = a TUI drew
         session.close().await;
         let text = String::from_utf8_lossy(&seen);
-        eprintln!("--- codex TUI output ({} bytes) ---\n{text}\n--- end ---", seen.len());
+        eprintln!(
+            "--- codex TUI output ({} bytes) ---\n{text}\n--- end ---",
+            seen.len()
+        );
         assert!(
             !seen.is_empty(),
             "codex produced no output in the container — TUI did not launch"
@@ -617,7 +708,9 @@ mod tests {
         }
         RunContext {
             agent_id: Some(agent.into()),
-            executing_node: Some(crate::execution_node_id(b"verify-node-000000000000000000000")),
+            executing_node: Some(crate::execution_node_id(
+                b"verify-node-000000000000000000000",
+            )),
             env: pairs.into_iter().collect(),
             ..Default::default()
         }
@@ -745,7 +838,8 @@ mod tests {
     // The prompt asks the model to TRANSFORM a word to uppercase, so the reply
     // (ZEPHYR) is distinguishable from the prompt's own echo (zephyr).
     #[cfg(test)]
-    const TURN_PROMPT: &str = "Reply with ONLY the uppercase form of the word zephyr and nothing else.";
+    const TURN_PROMPT: &str =
+        "Reply with ONLY the uppercase form of the word zephyr and nothing else.";
     #[cfg(test)]
     const TURN_REPLY: &str = "ZEPHYR";
 
@@ -762,7 +856,10 @@ mod tests {
             .expect("spawn codex TUI");
         let raw = drive_tui(&session, TURN_PROMPT).await;
         session.close().await;
-        eprintln!("=== codex TUI transcript (deansi) ===\n{}\n=== end ===", deansi(&raw));
+        eprintln!(
+            "=== codex TUI transcript (deansi) ===\n{}\n=== end ===",
+            deansi(&raw)
+        );
         assert!(
             letters_contains(&raw, TURN_REPLY),
             "codex TUI never rendered the model reply ({TURN_REPLY})"
@@ -781,7 +878,10 @@ mod tests {
             .expect("spawn claude TUI");
         let raw = drive_tui(&session, TURN_PROMPT).await;
         session.close().await;
-        eprintln!("=== claude TUI transcript (deansi) ===\n{}\n=== end ===", deansi(&raw));
+        eprintln!(
+            "=== claude TUI transcript (deansi) ===\n{}\n=== end ===",
+            deansi(&raw)
+        );
         assert!(
             letters_contains(&raw, TURN_REPLY),
             "claude TUI never rendered the model reply ({TURN_REPLY})"
@@ -803,7 +903,10 @@ mod tests {
             .expect("spawn restricted codex TUI");
         let raw = drive_tui(&session, TURN_PROMPT).await;
         session.close().await;
-        eprintln!("=== codex RESTRICTED TUI transcript (deansi) ===\n{}\n=== end ===", deansi(&raw));
+        eprintln!(
+            "=== codex RESTRICTED TUI transcript (deansi) ===\n{}\n=== end ===",
+            deansi(&raw)
+        );
         assert!(
             letters_contains(&raw, TURN_REPLY),
             "restricted codex TUI never rendered the model reply ({TURN_REPLY})"
@@ -820,9 +923,15 @@ mod tests {
         }
         let mut cmd = tokio::process::Command::new("podman");
         cmd.args([
-            "run", "--rm", "-i", "-t", "--network=host",
+            "run",
+            "--rm",
+            "-i",
+            "-t",
+            "--network=host",
             "docker.io/library/debian:13-slim",
-            "sh", "-c", "test -t 0 && printf ISATTY; sleep 1",
+            "sh",
+            "-c",
+            "test -t 0 && printf ISATTY; sleep 1",
         ]);
         let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
             .expect("spawn podman on a pty");

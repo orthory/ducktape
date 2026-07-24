@@ -48,6 +48,31 @@ pub(crate) enum UserCmd {
     WebauthnChallenge(EnrollArgs),
     /// print the hex bytes a software P256 key must ECDSA-sign to join
     P256Payload(EnrollArgs),
+    /// named, grantable API credentials co-hosted through this node's gateway
+    Cred(crate::cred_cli::CredArgs),
+    /// bind this user key to an account on the local node and name it — one
+    /// command for the bind + display name + `.duck` handle a fresh operator
+    /// otherwise had to submit by hand
+    AccountInit(AccountInitArgs),
+}
+
+/// `user account-init --name <name> [-n <chain-id> | --node <url>]` — the
+/// one-shot account setup for an operator running their own node.
+#[derive(Debug, clap::Args)]
+pub(crate) struct AccountInitArgs {
+    /// the account's human-readable display name (also the default `.duck` handle)
+    #[arg(long, value_name = "NAME")]
+    name: String,
+    /// the local node's http base (e.g. `http://host:port`)
+    #[arg(long, value_name = "URL")]
+    node: Option<String>,
+    /// resolve the node through a registered workspace's chain id
+    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
+    network: Option<String>,
+    /// path to the user key file (defaults to the network workspace's
+    /// `user.key`, minting it there if absent — the canonical per-network key)
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
 }
 
 /// `user key` lifecycle subcommands.
@@ -258,7 +283,66 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
         UserCmd::RedeemInvite(args) => cmd_user_redeem_invite(args, &mut stdin),
         UserCmd::WebauthnChallenge(args) => cmd_user_webauthn_challenge(args),
         UserCmd::P256Payload(args) => cmd_user_p256_payload(args),
+        UserCmd::Cred(args) => crate::cred_cli::run(args, &mut stdin),
+        UserCmd::AccountInit(args) => cmd_user_account_init(args, &mut stdin),
     }
+}
+
+/// `user account-init` — bind the user key to an account on the local node,
+/// set its display name, and register its `.duck` handle, in one command.
+/// Idempotent: a key already bound to an account skips the bind and only
+/// (re)asserts name + handle. Replaces the hand-built `sign-bind` + two raw
+/// `/v1/submit` calls a fresh operator used to run.
+fn cmd_user_account_init(
+    args: AccountInitArgs,
+    stdin: &mut impl std::io::BufRead,
+) -> CommandResult {
+    use identity::{IdentityMsg, IdentityQuery, IdentityReply};
+
+    let base = redeem_node(args.node.as_deref(), args.network.as_deref())?;
+    let needle = args
+        .network
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .ok_or("account-init needs -n/--network to locate the node's workspace")?;
+    let (dir, _http) = config::resolve_network(needle)?;
+    let resolved = config::resolve(&dir.join("node.toml"))?;
+    // default the key to the network's canonical `<workspace>/user.key`, so a
+    // later `cred add -n <net>` (no `--key`) finds the very key this bind used.
+    let key_path = args.key.unwrap_or_else(|| dir.join("user.key"));
+    let user = load_user_signer(&key_path, stdin)?;
+    let user_pub = user.public_key();
+
+    // Already bound? then the bind is a no-op — just (re)assert name + handle.
+    let query = IdentityQuery::OfMember { member_key: user_pub.as_ref().to_vec() };
+    let reply: IdentityReply = serde_json::from_value(crate::cred_cli::query_node(
+        &base,
+        "identity",
+        serde_json::to_value(&query)?,
+    )?)?;
+    let already_bound = matches!(reply, IdentityReply::Account(Some(_)));
+
+    if !already_bound {
+        let node_pub = resolved.signer.public_key();
+        let authorizer = config::ed25519_member_auth(
+            &user,
+            identity::IDENTITY_BIND_NS,
+            &identity::bind_preimage(&resolved.chain_id, node_pub.as_ref(), 0),
+        );
+        let msg = IdentityMsg::BindNode { authorizer };
+        let height = crate::node_http::submit(&base, "identity", &serde_json::to_value(&msg)?)?;
+        println!("bound account at height {height}");
+    }
+
+    let name_msg = IdentityMsg::SetAccountName { display_name: args.name.clone() };
+    crate::node_http::submit(&base, "identity", &serde_json::to_value(&name_msg)?)?;
+
+    let handle = args.name.to_lowercase();
+    let handle_msg = serde_json::json!({ "set_handle": { "handle": handle } });
+    crate::node_http::submit(&base, "gateway", &handle_msg)?;
+
+    println!("account {} ready (handle {}.duck)", args.name, handle);
+    Ok(())
 }
 
 // ============================================================================
@@ -396,11 +480,11 @@ fn read_key_line(path: &std::path::Path) -> Result<String, String> {
 
 /// Resolve the user signer from an encrypted key. Password is stdin's first
 /// line for every signing verb.
-fn load_user_signer(
+pub(crate) fn load_user_signer(
     key_path: &std::path::Path,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
-        let password = prompt_stdin_line(stdin, "password")?;
+    let password = prompt_stdin_line(stdin, "password")?;
     let line = read_key_line(key_path)?;
     Ok(userkey::open_user_key(&line, &password)?)
 }
@@ -671,7 +755,7 @@ fn cmd_user_sign_frame(args: FrameArgs, stdin: &mut impl std::io::BufRead) -> Co
 /// `--node <url>` wins, else `-n/--network <id>` resolves through the registry
 /// to the workspace node.toml's `http_listen`. a set-but-broken `--network`
 /// (unknown/ambiguous workspace, or one with no http listen) is a loud error.
-fn redeem_node(
+pub(crate) fn redeem_node(
     node: Option<&str>,
     network: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {

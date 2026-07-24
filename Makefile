@@ -115,7 +115,7 @@ BUILDER_MODULES := \
 # indexer crate's test fixture and rides the same sweep.
 INDEX_MODULES := \
   crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
-  crates/modules/system/saga \
+  crates/modules/apps/inbox crates/modules/system/saga \
   crates/kernel/index-guest/testmap
 
 wasm-modules:

@@ -59,8 +59,23 @@ async fn peers_sample(
     announce_targets: &[ed25519::PublicKey],
     height: u64,
 ) -> noded::peers::PeersView {
-    use std::collections::BTreeSet;
-    let (validators, residents): (BTreeSet<String>, BTreeSet<String>) = match host {
+    let (validators, residents) = replica_roles(host, announce_targets).await;
+    noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms(), height, None)
+        .with_roles(&validators, &residents)
+}
+
+/// the replica's valset standing, hex-keyed: the serving host's committed
+/// valset when one exists, else the announce-target member set alone (a
+/// parked joiner has no queryable valset yet, but it knows who the members
+/// are — and can attest no residents).
+async fn replica_roles(
+    host: Option<&host::Host>,
+    announce_targets: &[ed25519::PublicKey],
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    match host {
         Some(host) => (
             read_valset_members(host)
                 .await
@@ -74,15 +89,71 @@ async fn peers_sample(
                 .collect(),
         ),
         None => (
-            announce_targets
-                .iter()
-                .map(|k| hex_bytes(k.as_ref()))
-                .collect(),
-            BTreeSet::new(),
+            announce_targets.iter().map(|k| hex_bytes(k.as_ref())).collect(),
+            std::collections::BTreeSet::new(),
         ),
+    }
+}
+
+/// assemble + publish the replica's `/v1/status` snapshot into the shared
+/// cell: the served boundary when one exists, the zeroed answer otherwise —
+/// pre-first-sync the surface still answers (the app's liveness heartbeat),
+/// and a zeroed status is honest: no boundary is served yet. the storage
+/// section rides along so index watermarks stay current with the boundary,
+/// and the peers standing rides too (the off-lane /v1/peers composition
+/// reads it beside the live exposition).
+async fn publish_replica_status(
+    status: &noded::StatusCell,
+    metrics: &noded::NodeMetrics,
+    index: &indexer::IndexStore,
+    ckpt_height: Option<u64>,
+    status_public_key: &str,
+    announce_targets: &[ed25519::PublicKey],
+    serving: Option<(u64, &host::Host)>,
+) {
+    metrics.update_storage(
+        ckpt_height.unwrap_or_default(),
+        index.is_poisoned(),
+        MODULE_IDS.iter().map(|module| {
+            (
+                (*module).to_string(),
+                index.applied_height(module).unwrap_or_default(),
+            )
+        }),
+    );
+    let (height, root_hash, modules) = match serving {
+        Some((height, host)) => (
+            height,
+            hex(&host.root_hash()),
+            MODULE_IDS
+                .iter()
+                .map(|m| noded::ModuleStatus {
+                    id: (*m).into(),
+                    root: host.module_root(m).map(|r| hex(&r)).unwrap_or_default(),
+                    category: noded::ModuleCategory::of(m),
+                })
+                .collect(),
+        ),
+        None => (0, String::new(), Vec::new()),
     };
-    noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms(), height, None)
-        .with_roles(&validators, &residents)
+    status.publish(noded::NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash,
+        height,
+        modules,
+        public_key: status_public_key.into(),
+        operations: metrics.operational_status(),
+    });
+    // the same standing the retired per-request sample attested; the epoch
+    // stays absent — the replica lane runs no consensus.
+    let (validators, residents) =
+        replica_roles(serving.map(|(_, host)| host), announce_targets).await;
+    status.publish_peers(noded::PeersStanding {
+        validators,
+        residents,
+        height,
+        epoch: None,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -99,7 +170,7 @@ pub(super) async fn park(
     checkpoint_blocks: u64,
     sync_index: bool,
     announce_capabilities: bool,
-    sandbox: capability_host::SandboxBackend,
+    sandbox: Option<capability_host::SandboxBackend>,
     sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
@@ -108,11 +179,16 @@ pub(super) async fn park(
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
+    session_manager: Option<noded::TerminalSessions>,
+    session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    local_gateway_via: String,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &dispatch_oracle::SharedProvisioner,
+    agent_provisioner: &dispatch_host::SharedProvisioner,
+    cred_resolver: &dispatch_host::SharedCredentialResolver,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -173,7 +249,9 @@ pub(super) async fn park(
             stream_hub.run_output(),
         );
         // the terminal-session plane: forwards a session's output ring and
-        // ordered command log to peers, so a member on another node streams it.
+        // ordered command log to peers, hosts the directed create/close +
+        // creator-gated input control lanes, and drains the guest-side session
+        // lane (the client half).
         crate::term_plane::spawn(
             label.clone(),
             crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
@@ -183,6 +261,10 @@ pub(super) async fn park(
             planes.clone(),
             stream_hub.terminals(),
             stream_hub.term_commands(),
+            session_manager,
+            gateway_commands.clone(),
+            local_gateway_via,
+            session_requests,
         );
         Some(tracked)
     } else {
@@ -471,6 +553,15 @@ pub(super) async fn park(
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+        publish_replica_status(
+            &status,
+            &metrics,
+            &index,
+            replica_prev_ckpt.0,
+            &status_public_key,
+            &announce_targets,
+            serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
+        ).await;
         tracing::info!(
             event = "node_phase_transition",
             role = "resident",
@@ -532,17 +623,22 @@ pub(super) async fn park(
     // drained by the park loop's pump pass, so a minutes-long run
     // never stalls the serve window, boundary follow, or promotion
     // detection.
-    let resident_provider_set = capability_host::discover(
-        &me_bytes,
-        agent_dirs.clone(),
-        Some(stream_hub.run_output().output_sink()),
-        // the operator's `node.toml sandbox` choice (Direct or Podman), same
-        // as the validator boot — a resident sandboxes its runs identically.
-        sandbox,
-        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-        false,
-    )
-    .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+    // no `node.toml [sandbox]` = no compute plane, same as the validator
+    // boot: nothing discovered, nothing announced, nothing spawnable.
+    let resident_provider_set = match sandbox {
+        Some(backend) => capability_host::discover(
+            &me_bytes,
+            agent_dirs.clone(),
+            Some(stream_hub.run_output().output_sink()),
+            // the operator's `node.toml [sandbox]` runtime, same as the
+            // validator boot — a resident sandboxes its runs identically.
+            backend,
+            // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+            false,
+        )
+        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+        None => capability_host::ProviderSet::empty(),
+    };
     let resident_capabilities = resident_provider_set.capabilities();
     let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
         me_bytes.clone(),
@@ -557,6 +653,7 @@ pub(super) async fn park(
         // the announced capacity IS the pool's ledger (one source), same as
         // the validator path.
         sandbox_capacity,
+        Some(cred_resolver.clone()),
     );
     let mut resident_dispatch =
         resident_dispatch::ResidentDispatch::new(resident_pool, resident_control, me_bytes.clone());
@@ -804,73 +901,6 @@ pub(super) async fn park(
                                 };
                                 let _ = reply.send(result);
                             }
-                            noded::NodeCommand::Status { reply } => {
-                                metrics.update_storage(
-                                    replica_prev_ckpt.0.unwrap_or_default(),
-                                    index.is_poisoned(),
-                                    MODULE_IDS.iter().map(|module| {
-                                        (
-                                            (*module).to_string(),
-                                            index.applied_height(module).unwrap_or_default(),
-                                        )
-                                    }),
-                                );
-                                // pre-first-sync the surface still answers (the
-                                // app's liveness heartbeat): a zeroed status is
-                                // honest — no boundary is served yet.
-                                let (height, root_hash, modules) = match &serving {
-                                    Some((height, node_r)) => (
-                                        *height,
-                                        hex(&node_r.host().root_hash()),
-                                        MODULE_IDS
-                                            .iter()
-                                            .map(|m| noded::ModuleStatus {
-                                                id: (*m).into(),
-                                                root: node_r
-                                                    .host()
-                                                    .module_root(m)
-                                                    .map(|r| hex(&r))
-                                                    .unwrap_or_default(),
-                                                category: noded::ModuleCategory::of(m),
-                                            })
-                                            .collect(),
-                                    ),
-                                    None => (0, String::new(), Vec::new()),
-                                };
-                                let _ = reply.send(noded::NodeStatus {
-                                    version: env!("CARGO_PKG_VERSION").into(),
-                                    root_hash,
-                                    height,
-                                    modules,
-                                    public_key: status_public_key.clone(),
-                                    operations: metrics.operational_status(),
-                                });
-                            }
-                            noded::NodeCommand::Peers { reply } => {
-                                let _ = reply.send(
-                                    peers_sample(
-                                        context.encode(),
-                                        serving.as_ref().map(|(_, node_r)| node_r.host()),
-                                        &announce_targets,
-                                        serving.as_ref().map(|(h, _)| *h).unwrap_or(0),
-                                    )
-                                    .await,
-                                );
-                            }
-                            noded::NodeCommand::Metrics { reply } => {
-                                let checkpoint_height = replica_prev_ckpt.0.unwrap_or_default();
-                                metrics.update_storage(
-                                    checkpoint_height,
-                                    index.is_poisoned(),
-                                    MODULE_IDS.iter().map(|module| {
-                                        (
-                                            (*module).to_string(),
-                                            index.applied_height(module).unwrap_or_default(),
-                                        )
-                                    }),
-                                );
-                                let _ = reply.send(context.encode());
-                            }
                         }
                     }
                     // a validator's answer for a frame we relayed: match it
@@ -1003,6 +1033,15 @@ pub(super) async fn park(
                                         "replica backfill pruned; re-syncing at a fresh boundary"
                                     );
                                     serving = None;
+                                    publish_replica_status(
+                                        &status,
+                                        &metrics,
+                                        &index,
+                                        replica_prev_ckpt.0,
+                                        &status_public_key,
+                                        &announce_targets,
+                                        None,
+                                    ).await;
                                     metrics.record_sync_failure(e.detail.clone());
                                     replica_scheme = None;
                                     replica_orchestrator = None;
@@ -1084,6 +1123,15 @@ pub(super) async fn park(
                                              fresh boundary"
                                         );
                                         serving = None;
+                                        publish_replica_status(
+                                            &status,
+                                            &metrics,
+                                            &index,
+                                            replica_prev_ckpt.0,
+                                            &status_public_key,
+                                            &announce_targets,
+                                            None,
+                                        ).await;
                                         metrics.record_sync_failure(e.detail.clone());
                                         metrics.set_role_phase(
                                             noded::NodeRole::Resident,
@@ -1230,6 +1278,18 @@ pub(super) async fn park(
             {
                 metrics.record_sync_progress(*served_height);
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
+            }
+            // the boundary this pass folded is visible NOW on /v1/status.
+            if !drained.is_empty() {
+                publish_replica_status(
+                    &status,
+                    &metrics,
+                    &index,
+                    replica_prev_ckpt.0,
+                    &status_public_key,
+                    &announce_targets,
+                    Some((*served_height, node_r.host())),
+                ).await;
             }
             // ---- valset orchestration (the replica mirror) --------
             //
@@ -1570,6 +1630,15 @@ pub(super) async fn park(
                     "replica epoch cutover; re-ascending"
                 );
                 serving = None;
+                publish_replica_status(
+                    &status,
+                    &metrics,
+                    &index,
+                    replica_prev_ckpt.0,
+                    &status_public_key,
+                    &announce_targets,
+                    None,
+                ).await;
                 metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
                 replica_scheme = None;
                 replica_orchestrator = None;
@@ -1820,6 +1889,15 @@ pub(super) async fn park(
                                 noded::NodeRole::Resident,
                                 noded::NodePhase::Serving,
                             );
+                            publish_replica_status(
+                                &status,
+                                &metrics,
+                                &index,
+                                replica_prev_ckpt.0,
+                                &status_public_key,
+                                &announce_targets,
+                                serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
+                            ).await;
                             tracing::info!(
                                 event = "node_phase_transition",
                                 role = "resident",

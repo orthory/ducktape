@@ -40,7 +40,7 @@ capability-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
 tagging = { workspace = true }
-dispatch-oracle = { workspace = true }
+dispatch-host = { workspace = true }
 forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
@@ -100,7 +100,7 @@ indexer = { workspace = true }
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's
 # bounded mutex/timeout around the temporary statesync client; `signal` drives
 # the SIGTERM/SIGINT graceful-checkpoint arm of the run loop.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util"] }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }

@@ -171,26 +171,20 @@ impl Client {
         decode_json(response).await
     }
 
-    /// Query one module's derived materialized view, such as Chat/Pages search.
+    /// Submit one typed index-tier view request and decode its typed reply —
+    /// the read model behind every human-facing list, page, and search.
     pub async fn view<Q: Serialize, R: DeserializeOwned>(
         &self,
         module: &str,
         query: &Q,
     ) -> Result<R> {
-        let valid_module = !module.is_empty()
-            && module
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-        if !valid_module {
-            return Err(Error::new("view module id is invalid"));
-        }
         let response = self
             .http
             .post(self.url(&format!("v1/index/{module}/view"))?)
             .json(query)
             .send()
             .await
-            .map_err(|error| Error::new(format!("{module} view query failed: {error}")))?;
+            .map_err(|error| Error::new(format!("{module} view failed: {error}")))?;
         decode_json(response).await
     }
 

@@ -623,6 +623,17 @@ impl SimHandle {
     pub fn shutdown(mut self) {
         self.node.request_shutdown();
         self.join_threads();
+        // once both sim threads have exited, this handle's StatusCell
+        // exposition closure owns the LAST commonware-executor ref, and
+        // dropping the tokio runtime inside it panics on an async embedder
+        // thread (the app's current_thread tests) — hand the final drop to a
+        // scratch thread and wait for it.
+        let reaper = std::thread::Builder::new()
+            .name("sim-drop".into())
+            .spawn(move || drop(self));
+        if let Ok(reaper) = reaper {
+            let _ = reaper.join();
+        }
     }
 
     /// send one control command and block for its reply. a torn-down actor is
@@ -883,6 +894,17 @@ fn run_sim(
             fatal,
         };
 
+        // the boot snapshot: /v1/status answers from the cell before the
+        // first command, exactly like the real daemons. the exposition source
+        // feeds /metrics + /v1/peers off-lane (no mesh: the sample parses
+        // honestly empty, roles stay absent). `Context` has no Clone; a child
+        // shares the SAME registry, so its encode() serves the identical
+        // exposition.
+        let exposition_context = context.child("exposition");
+        sim.handle
+            .status_cell()
+            .wire_exposition(move || exposition_context.encode());
+        sim.publish_status();
         loop {
             select! {
                 cmd = control.next() => match cmd {
@@ -943,31 +965,13 @@ fn run_sim(
                             sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);
                     }
-                    Some(NodeCommand::Status { reply }) => {
-                        let _ = reply.send(sim.status());
-                    }
-                    Some(NodeCommand::Peers { reply }) => {
-                        // the sim has no mesh: its exposition carries no peer
-                        // families, so this parses to the honest empty sample
-                        // (same shape as the embedded daemon — logical clock,
-                        // no consensus, so no epoch either).
-                        let sampled_at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let _ = reply.send(noded::peers::peers_from_exposition(
-                            &context.encode(),
-                            sampled_at_ms,
-                            sim.height(),
-                            None,
-                        ));
-                    }
-                    Some(NodeCommand::Metrics { reply }) => {
-                        let _ = reply.send(context.encode());
-                    }
                     None => break,
                 },
             }
+            // one publish per pump turn: any arm may have committed a block
+            // (submit, a control step, a released hold), and the sim is a
+            // test twin — unconditional is simpler than tracking which.
+            sim.publish_status();
         }
     });
 }
@@ -1210,6 +1214,19 @@ impl Sim {
                     .publish_block(projection.height, hex_root(&root_hash));
             }
         }
+        // the deterministic lane's read barrier: fold triggers drain on a
+        // background runner, and a sim commit must imply the derived views
+        // answer the block (a client read — or the ws `changed` event that
+        // prompts one — must never race the fold). production daemons stay
+        // async by design; their clients re-read on the next event.
+        if let Err(err) = self.index.wait_folds_drained() {
+            tracing::error!(
+                target: "ducktape::consensus",
+                event = "node_index_poisoned",
+                error = %err,
+                "module index fold failed — the sim's views are now STALE"
+            );
+        }
         Ok((drained, self.node.take_events()))
     }
 
@@ -1332,6 +1349,18 @@ impl Sim {
             target: op.target.clone(),
             kind,
         })
+    }
+
+    /// publish the current committed snapshot into the shared `/v1/status`
+    /// cell — the http route reads the cell, never the command lane. the
+    /// peers standing rides along (no mesh: height only, no roles or epoch).
+    fn publish_status(&self) {
+        let cell = self.handle.status_cell();
+        cell.publish(self.status());
+        cell.publish_peers(noded::PeersStanding {
+            height: self.height(),
+            ..Default::default()
+        });
     }
 
     fn status(&self) -> NodeStatus {

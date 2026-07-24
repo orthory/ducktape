@@ -283,8 +283,9 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) ->
         let reply = cluster.query(
             idx,
             "chat",
-            &chat::encode_query(&ChatQuery::MessagesLatest {
+            &chat::encode_query(&ChatQuery::MessagesRange {
                 channel_id: channel.into(),
+                from_seq: 1,
                 limit: 64,
             }),
         )?;
@@ -427,6 +428,39 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // exactly one execution per run, each on the node that provides the tag.
     assert_eq!(text_provider.executions(), 1, "text provider ran once");
     assert_eq!(json_provider.executions(), 1, "json provider ran once");
+
+    // the READ-MODEL lane end to end: the same conversation through
+    // `/v1/index/chat/view` — the surface every human/agent list rides now.
+    // the fold applies block-by-block behind finalized state, so both view
+    // probes poll instead of racing the indexer.
+    poll_until("the channel list view to fold", FINALIZE, || {
+        let (status, body) = cluster.http(
+            0,
+            "POST",
+            "/v1/index/chat/view",
+            Some(&serde_json::json!({"channels": {}})),
+        );
+        (status == 200).then_some(())?;
+        // externally-tagged reply: {"channels": {"channels": [...], ...}}
+        let channels = body["channels"]["channels"].as_array()?;
+        channels
+            .iter()
+            .find(|c| c["id"] == "dispatch" && c["head_seq"].as_u64() >= Some(4))
+            .map(|_| ())
+    });
+    poll_until("the message page view to fold", FINALIZE, || {
+        let (status, body) = cluster.http(
+            0,
+            "POST",
+            "/v1/index/chat/view",
+            Some(&serde_json::json!({"messages_latest": {"channel_id": "dispatch", "limit": 16}})),
+        );
+        (status == 200).then_some(())?;
+        let rows = body["messages"].as_array()?;
+        rows.iter()
+            .find(|r| r["message_id"] == format!("agent/{run_text}"))
+            .map(|_| ())
+    });
 
     // the never-pop-stack rule, observed: the agent's reply post (the
     // delivery block's follow-up) landed STRICTLY ABOVE the oracle result

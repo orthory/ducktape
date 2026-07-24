@@ -2,11 +2,13 @@
 
 Status: shipped — the wasm index-guest architecture: host-written op feed,
 engine-folded read models (fluent31 changes-mode triggers), per-module view
-guests, boundary stamps, and index-archive shipping.
+guests, boundary stamps, and index-archive shipping. Since the read-model
+cutover, this tier IS the human-facing read surface: canonical module
+queries serve dispatch alone (§5).
 Code: `crates/kernel/indexer` (the host store: feed writer + guest converge),
 `crates/kernel/index-guest` (the contract + authoring SDK; `testmap` is the
-reference mapper), the chat/tasks/pages/saga modules' `src/index.rs` (pure
-decision cores) + `src/index_guest.rs` (wasm shells, packaged by
+reference mapper), the chat/tasks/pages/inbox/saga modules' `src/index.rs`
+(pure decision cores) + `src/index_guest.rs` (wasm shells, packaged by
 `guest-builder --index`), `bin/noded` (the feed, the HTTP lanes, the shared
 store construction with bundled guests), `bin/node` (the validator: live
 feed, replay feed, boundary stamps).
@@ -169,28 +171,46 @@ snapshots, like the blob and telemetry lanes.
 A module with no guest (or a guest with no `query` role) answers 404 on
 `view`.
 
-## 5. When NOT to index
+## 5. The substrate doctrine — where reads live
 
-Not every module earns a mapper. Skip one when:
+The split is a DOCTRINE, not a per-module judgment call:
 
-- **the substrate is already a read model.** forge's state *is* a git repo —
-  cloneable, greppable, log-walkable over the existing smart-HTTP lane. An
-  index would be a worse second copy.
-- **canonical queries already fit the read shape.** identity is a bounded
-  account→name/keys/nodes registry with direct typed queries. Listing
-  modules with nothing to scan or search gains nothing from the derived
-  tier.
-- **the data never leaves the node-local plane.** files' chunk bytes bypass
-  consensus entirely; there is no op stream to fold.
+- **canonical state is authenticated point-read state, nothing more.** qmdb
+  is used for what it is — hash-addressable records behind a merkle root.
+  A module's canonical `query` surface exists FOR dispatch: the point and
+  computed reads other modules' `execute()` paths (and the host) consume.
+  Consensus can never read the derived tier, so those reads stay canonical
+  by necessity — and they are the ONLY reads that do.
+- **no scan machinery in canonical state.** stored enumeration lists,
+  stand-in range-index records, and counter-driven pagination that exists
+  only to serve a human surface are defects: the engine on this tier
+  iterates natively, so that is where iteration lives. (a record dispatch
+  itself needs — pages' folder-parent map for cycle checks, chat's bounded
+  per-message emoji index for caps and tombstone cleanup — stays canonical:
+  it serves a consensus decision, not a scan.)
+- **everything a human lists, scrolls, or searches is a view here.** the
+  UI's read surface is `/v1/index/{module}/view`, uniformly — chat pages
+  and threads, the pages sidebar and comment panels, boards, feeds, search.
+- **modules hold no state in RAM.** the in-memory snapshot-bytes cohort is
+  a transitional shape scheduled for re-platforming onto qmdb + this tier
+  (phase 2+, in dependency order: small registries first, the hot
+  consensus-loop modules — valset, dispatch, saga, runs — last).
 
-The shipped mappers and why they exist:
+Exemptions are substrate facts, not preferences: forge's state *is* a git
+repo (cloneable, greppable — an index would be a worse second copy), and
+files' chunk bytes bypass consensus (no op stream to fold). A bounded
+typed registry whose canonical reads are all dispatch-consumed (identity,
+valset) simply has no read model to move.
 
-| module | view | why the canonical tier can't |
+The shipped mappers:
+
+| module | read model | dispatch reads kept canonical |
 | --- | --- | --- |
-| chat | `search` full-text + `tags`/`tag_search` | no scans over hashed keys; search is a read model |
-| pages | `search` — full-text over the block tree | same; subtree removal mirrored via child membership |
-| tasks | `by_status` pages + `task` lookup | canonical read is one unpaged `List` |
-| saga | `usage` — the executor billing ledger | canonical saga prunes terminal sagas; history is feed-only |
+| chat | channel list, message pages, threads, revisions, reactions, members, `search` + `tags` | `Channel`, `MessagesRange` (agent context windows), `Message` (id probes) |
+| pages | page list, per-target comment threads, `search` | `GetPage`/`GetBlock`, `CommentThread`/`GetComment`, `TargetThreadCount` (cap probe) |
+| tasks | task `by_status` pages, job pages + census | task `List` (unpaged, dispatch-consumed), `JobsQuery::Get` |
+| inbox | per-member notification pages, unread counts | none — nothing in consensus reads an inbox |
+| saga | `usage` — the executor billing ledger | `Get`, `NextExpiry`, `AssignedPending` (all host/dispatch-required) |
 
 ## 6. Rebuild and failure story
 
@@ -218,9 +238,11 @@ no second derivation with its own degradation matrix.
   the live drain (every SEALED frame — a rejected frame feeds empty, it
   still consumed its height), the journal replay, and post-reboot frame
   catch-up; whatever they cannot reproduce converges on the boundary stamp.
-- A serving RESIDENT never feeds — it observes state boundaries, not sealed
-  frames — so its modules re-stamp on every state-changing boundary and the
-  blocks database gains one honest boundary row
+- A standing RESIDENT feeds like a validator: the replica fold driver folds
+  finalized frames (unified-node phase 2) and applies the per-block index
+  fold from their dispatches. Boundary stamps fire only where state jumped
+  WITHOUT frames — the join bootstrap and backfilled heights — and the
+  blocks database gains one honest boundary row there
   (`IndexStore::apply_block_record`).
 - **Host-write failures poison** (writes refuse, reads keep serving,
   remedy = rebuild). **Guest-fold failures never poison** — they hold that
@@ -246,10 +268,12 @@ floor, AND the installed guest + its trigger/queue state, so a shipped index
 resumes folding mid-stream on the joiner.
 
 Contents are NOT root-verifiable (the derived tier has no root by design),
-so the lane trusts the serving node and stays optional — `sync_index = true`
-in node.toml (node-local operator policy, default off). A joiner that skips
-it boundary-stamps instead (§6): views begin at the boundary, exact and
-honest. Shipped watermarks land at the source's fold tip, so a module whose
+so the lane trusts the serving node — accepted, because the read model is
+how a node renders at all, and a joiner already trusted its sync source
+enough to join through it. The lane is ON by default (`sync_index` in
+node.toml, node-local operator policy); `sync_index = false` opts a node
+down to consensus-only — it boundary-stamps instead (§6): views begin at
+the boundary, exact and honest. Shipped watermarks land at the source's fold tip, so a module whose
 watermark reaches the joiner's boundary skips its stamp (warm), and
 anything stale, missing, or refused falls to `watermark < boundary` and
 stamps exactly as if nothing was shipped. The blocks database rides along

@@ -7,14 +7,27 @@ use crate::constants::MODULE_IDS;
 pub(crate) struct Surfaces {
     pub(crate) rpc_listener: Option<std::net::TcpListener>,
     pub(crate) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
+    /// the `/v1/status` snapshot cell shared with the http surface: the role
+    /// loop that owns the host publishes into it at every boundary it settles.
+    pub(crate) status: noded::StatusCell,
     pub(crate) stream_hub: noded::StreamHub,
     pub(crate) index: std::sync::Arc<indexer::IndexStore>,
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
-    pub(crate) agent_provisioner: dispatch_oracle::SharedProvisioner,
+    pub(crate) agent_provisioner: dispatch_host::SharedProvisioner,
+    pub(crate) cred_resolver: dispatch_host::SharedCredentialResolver,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
+    /// the host-side session manager (a clone of the one on the http handle), so
+    /// the term plane's control handler can spawn peer-attached sessions. `None`
+    /// on a node that hosts no terminal plane (no sandbox / sync-only / joiner).
+    pub(crate) terminals: Option<noded::TerminalSessions>,
+    /// the guest-side remote-session lane the term plane's client half drains.
+    pub(crate) session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    /// the host's own browser-gateway base URL — the `via` a resolved credential
+    /// routes through. Empty when no browser gateway is bound.
+    pub(crate) local_gateway_via: String,
 }
 
 pub(crate) struct BindConfig<'a> {
@@ -41,10 +54,10 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) node_key: Vec<u8>,
     /// how the owner-gated admin namespace is exposed (ADR A2/A4).
     pub(crate) admin_exposure: noded::AdminExposure,
-    /// how provider runs are spawned (`node.toml sandbox`): Direct, or a
-    /// Podman/Tart image. The interactive terminal plane requires Podman/Tart,
-    /// so a Direct node hosts no terminal plane.
-    pub(crate) sandbox: capability_host::SandboxBackend,
+    /// the compute plane (`node.toml [sandbox]`): a Podman/Tart backend, or
+    /// `None` for a consensus-only node — which hosts no terminal plane and
+    /// starts no auto airlock gateway.
+    pub(crate) sandbox: Option<capability_host::SandboxBackend>,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -99,13 +112,19 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         }
         _ => None,
     };
-    // An embedded airlock gateway (credential-provider node, DUCKTAPE_AIRLOCK_SERVE):
-    // run it in-process on loopback and register its port as the `airlock` gateway
-    // route, so a compute node can reach it over the overlay (airlock.<handle>.duck).
-    // Bound here (out of the runtime) like the browser gateway; served on the
-    // app-surface thread below. Only when the gateway plane is up to serve it; route
-    // PUBLICATION stays a one-time signed operator step.
-    let airlock_bits = match crate::airlock_serve::AirlockServe::from_env() {
+    // An embedded airlock gateway (credential-provider node): either the
+    // disk-backed self-host store (`user cred add`) or the TEE env path
+    // (DUCKTAPE_AIRLOCK_SERVE). Run it in-process on loopback and register its
+    // port as the `airlock` gateway route, so a compute node can reach it over
+    // the overlay (airlock.<handle>.duck). Bound here (out of the runtime) like
+    // the browser gateway; served on the app-surface thread below. Only when the
+    // gateway plane is up to serve it; route PUBLICATION stays a one-time signed
+    // operator step.
+    // A compute/workstation node (a configured [sandbox]) starts its airlock
+    // gateway even with an empty store, so `cred add` takes effect without a
+    // restart.
+    let compute_node = sandbox.is_some();
+    let airlock_bits = match crate::airlock_serve::AirlockServe::resolve(storage, compute_node) {
         None => None,
         Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
         Some(Ok(serve)) if !sync_only && gateway_enabled => {
@@ -115,11 +134,31 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             ))?;
             listener.set_nonblocking(true)?;
             let port = listener.local_addr()?.port();
+            // A lending gateway (the self-host store) enforces its own on-chain
+            // grants: a session claiming an account that is neither the owner nor a
+            // grantee is refused at the owner's gateway, not just at the compute
+            // node's broker. The gate reads THIS node's committed gateway record
+            // over the actor lane. The TEE path is not lent, so it leaves it off.
+            let grant_check = serve
+                .grant_gated
+                .then(|| crate::airlock_serve::committed_grant_check(http_handle.command_sender()));
             // Build — and thus ATTEST — BEFORE registering the route or claiming
             // to listen: a node that cannot attest must fail boot loudly here,
-            // never register a route to a gateway that will not come up.
-            let (router, vendor) = airlock::server::build_seeded(serve.cfg, serve.credential)
-                .map_err(|error| format!("airlock gateway: {error}"))?;
+            // never register a route to a gateway that will not come up. The
+            // self-host store path (grant_gated) wires the lazy loader so a
+            // credential added after boot is served without a restart; the TEE
+            // env path (one fixed enclave credential) has no store to reload.
+            let (router, vendor) = if serve.grant_gated {
+                airlock::server::build_self_host_reloadable(
+                    serve.cfg,
+                    serve.seeds,
+                    grant_check,
+                    crate::airlock_serve::reload_from_store(storage),
+                )
+            } else {
+                airlock::server::build_seeded_gated(serve.cfg, serve.seeds, grant_check)
+            }
+            .map_err(|error| format!("airlock gateway: {error}"))?;
             crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
                 .map_err(|error| format!("register airlock gateway route: {error}"))?;
             tracing::info!(
@@ -143,6 +182,15 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         }
     };
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
+    // the guest-side remote-session lane: /v1/term/sessions with a `node` hands a
+    // SessionJob here, drained by the term plane's client half (mirrors the
+    // gateway lane). The host's own browser-gateway base URL is the `via` a
+    // resolved credential routes through.
+    let (session_lane, session_requests) = tokio::sync::mpsc::channel::<noded::SessionJob>(32);
+    let local_gateway_via = gateway_listener
+        .as_ref()
+        .map(|(_, address)| format!("http://{address}"))
+        .unwrap_or_default();
     // the derived per-module index (noded's exact store, <storage>/index),
     // plus the blocks database the explorer reads: the pump folds sealed
     // blocks into it, boot heals it from verified state at sync/recovery
@@ -200,6 +248,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     };
     let blobs = http_handle.blob_handle();
     let gateway_commands = http_handle.command_sender();
+    // the /v1/status snapshot cell, captured BEFORE the serve/drop match
+    // consumes the handle: the role loop publishes into it, the http route
+    // reads it without crossing the command lane.
+    let status = http_handle.status_cell();
     // the REAL portable-agent-run provisioner, built from a clone of the http
     // handle BEFORE the serve/drop match consumes it. portable v1 runs
     // materialize a per-run duckfs checkout under a root VALIDATED to be
@@ -208,7 +260,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // LIVE for every agent run: this binary wires the files module
     // unconditionally, so the runs composer emits v1. a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: dispatch_oracle::SharedProvisioner = std::sync::Arc::new(
+    let agent_provisioner: dispatch_host::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(storage)
@@ -236,31 +288,39 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             http_listen.as_deref().filter(|_| !sync_only),
         )),
     );
+    // the executing-node credential resolver, built from the SAME committed-query
+    // lane the provisioner uses (before the serve/drop match consumes the
+    // handle). A `sched --cred` run's named credential resolves through this into
+    // a self-host airlock source, gated on the run's committed saga origin.
+    let cred_resolver: dispatch_host::SharedCredentialResolver =
+        std::sync::Arc::new(crate::cred_resolve::NodeCredentialResolver::new(&http_handle));
     // the node-local, off-chain interactive terminal-session plane (lives on the
     // http handle like the stream hub — never consensus). Wired only where the
     // app surface is actually served for a real member: not sync-only, not a
     // parked joiner, and only when an http address was configured. Sourced from
-    // the node's OWN config — the resolved `node.toml sandbox` backend and this
-    // node's signer identity (`node_key`) — so `discover_interactive` refuses
-    // the Direct backend (no terminal plane) and Podman container reaping scopes
+    // the node's OWN config — the resolved `node.toml [sandbox]` backend and
+    // this node's signer identity (`node_key`) — so a consensus-only node has
+    // no terminal plane by construction, and Podman container reaping scopes
     // to the SAME execution id as the node's real agent runs (validator/run.rs
     // discovers its provider set under the same identity). Mirrors bin/noded's
-    // wiring; a Podman node's create returns a session (or a clear spawn error),
-    // a Direct node's a "requires a configured podman sandbox image" 503 — never
-    // the "terminal sessions are not enabled" 503 that meant the plane was
-    // missing entirely (this bug).
-    let http_handle = if !sync_only && !joiner && http_listen.is_some() {
-        let interactive = noded::term::discover_interactive(
-            &node_key,
-            capability_host::AgentDirs::under(storage),
-            sandbox,
-        );
+    // wiring; a sandboxed node's create returns a session (or a clear spawn
+    // error), an unsandboxed node's a "requires a configured sandbox" 503 —
+    // never the "terminal sessions are not enabled" 503 that meant the plane
+    // was missing entirely (this bug).
+    let terminals = if !sync_only && !joiner && http_listen.is_some() {
+        let interactive = sandbox.and_then(|backend| {
+            noded::term::discover_interactive(
+                &node_key,
+                capability_host::AgentDirs::under(storage),
+                backend,
+            )
+        });
         tracing::info!(
             target: "ducktape::term",
             enabled = interactive.is_some(),
             "terminal_plane_ready"
         );
-        http_handle.with_terminals(noded::TerminalSessions::new(
+        Some(noded::TerminalSessions::new(
             interactive,
             capability_host::execution_node_id(&node_key),
             storage.join("term-sessions"),
@@ -268,7 +328,16 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             stream_hub.term_commands(),
         ))
     } else {
-        http_handle
+        None
+    };
+    // the term plane's host side (control handler) takes a clone of the same
+    // manager the http handle serves; the guest side drains the session lane.
+    let http_handle = match terminals.clone() {
+        Some(manager) => http_handle.with_terminals(manager).with_session_lane(session_lane),
+        None => {
+            drop(session_lane);
+            http_handle
+        }
     };
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
@@ -355,13 +424,18 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     Ok(Surfaces {
         rpc_listener,
         http_cmds,
+        status,
         stream_hub,
         index,
         voice_requests,
         code_stage_requests,
         blobs,
         agent_provisioner,
+        cred_resolver,
         gateway_requests: gateway_enabled.then_some(gateway_requests),
         gateway_commands,
+        terminals,
+        session_requests,
+        local_gateway_via,
     })
 }

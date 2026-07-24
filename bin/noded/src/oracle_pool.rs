@@ -1,5 +1,5 @@
 //! off-loop oracle execution for the embedded daemon: wires
-//! [`dispatch_oracle::DispatchPool`] into the actor's runtime context and
+//! [`dispatch_host::DispatchPool`] into the actor's runtime context and
 //! the daemon's own command lane.
 //!
 //! the pool's gate (lease check, decode, dedup) runs inline where
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind};
+use dispatch_host::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::{NodeCommand, ORACLE_ORIGIN};
@@ -47,6 +47,17 @@ where
             return vec![Box::new(EchoWorker)];
         }
     }
+    // the daemon's compute plane exists only when a sandbox is configured
+    // (DUCKTAPE_SANDBOX_IMAGE / _BACKEND — the same resolver its terminal
+    // plane uses). With none there is nothing to spawn providers in, so the
+    // daemon runs no oracle worker at all: a bare spawn is unrepresentable.
+    let Some(backend) = noded::term::backend_from_env() else {
+        tracing::info!(
+            target: "ducktape::node",
+            "no sandbox configured; oracle pool disabled (consensus/app-surface only)"
+        );
+        return Vec::new();
+    };
     // grab the live-output registry BEFORE the provisioner below consumes
     // the handle — the sink keys per-run rings by ctx.run_key.
     let run_output = node_handle.stream_hub().run_output();
@@ -54,10 +65,7 @@ where
         ORACLE_ORIGIN,
         agent_dirs,
         Some(run_output.output_sink()),
-        // the embedded daemon stays Direct this phase: it exposes no operator
-        // sandbox knobs, so `DispatchPool::new` below keeps the bare (empty
-        // capacity) ledger — the sandbox/capacity plane is bin/node only.
-        capability_host::SandboxBackend::Direct,
+        backend,
         // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
         false,
     )

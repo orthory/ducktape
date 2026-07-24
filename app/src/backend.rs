@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chat::{AuthorRef, ChatMsg, ChatQuery, ChatReply, PostPolicy};
+use chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
+use chat::{ChatMsg, PostPolicy};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::StreamExt as _;
+use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
 use tokio::io::AsyncWriteExt as _;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -21,6 +23,9 @@ const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 const ENCRYPTED_KEY_PREFIX: &str = "ducktape-user-key-v1:";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const CHAT_TIMELINE_ROOT_LIMIT: usize = 128;
+/// The chat view clamps one message page to 256 rows (default 50, max 256), so
+/// the timeline walk steps in 256-row pages.
+const CHAT_VIEW_PAGE_LIMIT: u64 = 256;
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatChannel {
@@ -1276,7 +1281,7 @@ pub async fn load_chat_hit(
             return Ok(chat);
         }
         let reply = load_message_at(&rpc, &channel_id, target_seq).await?;
-        if reply.head.thread != Some(root_seq) {
+        if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
         let current_user = local_user_key().await;
@@ -1608,21 +1613,27 @@ pub async fn load_thread_page(
         let root_seq = positive_sequence(root_seq)?;
         let from = u64::try_from(from).map_err(|_| "invalid thread offset".to_string())?;
         let rpc = rpc_client(&rpc)?;
-        let thread = query_thread_page(&rpc, &channel_id, root_seq, from).await?;
-        let reply_count = thread.replies.len() as u64;
-        let current_user = local_user_key().await;
-        let next_reply_offset = from.saturating_add(reply_count);
-        let page_is_full = reply_count == chat::MAX_QUERY_LIMIT;
+        let thread = query_thread_page(&rpc, &channel_id, root_seq).await?;
+        let total = thread.replies.len() as u64;
+        let start = from.min(total);
+        let page_len = CHAT_VIEW_PAGE_LIMIT.min(total - start);
+        let next_reply_offset = start + page_len;
+        let page_is_full = page_len == CHAT_VIEW_PAGE_LIMIT;
         let thread_cap_reached = next_reply_offset >= chat::MAX_THREAD_REPLIES as u64;
+        let has_more = page_is_full && !thread_cap_reached;
+        let current_user = local_user_key().await;
+        let messages = thread
+            .replies
+            .into_iter()
+            .skip(start as usize)
+            .take(page_len as usize)
+            .map(|row| chat_message(row, current_user.as_deref()))
+            .collect();
         Ok(ThreadPageData {
             generation,
-            messages: thread
-                .replies
-                .into_iter()
-                .map(|message| chat_message(message, current_user.as_deref()))
-                .collect(),
+            messages,
             next_reply_offset: number_i64(next_reply_offset),
-            has_more: page_is_full && !thread_cap_reached,
+            has_more,
         })
     }
     .await;
@@ -2374,7 +2385,9 @@ pub async fn search_pages(
                 }),
             )
             .await?;
-        let pages::index::PagesViewReply::Hits(hits) = reply;
+        let pages::index::PagesViewReply::Hits(hits) = reply else {
+            return Err("page search returned an invalid reply".into());
+        };
         Ok(PageSearchData {
             generation,
             hits: hits
@@ -2434,20 +2447,44 @@ fn tip_from_status(status: NodeStatus) -> Result<Tip, String> {
 }
 
 async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<ChatData, String> {
-    let reply: ChatReply = rpc.query("chat", &ChatQuery::Channels).await?;
-    let wire_channels = match reply {
-        ChatReply::Channels(channels) => channels,
-        _ => return Err("node returned an invalid channel list".into()),
-    };
+    let mut wire_channels = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::Channels {
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let ChatViewReply::Channels {
+            channels: page,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("node returned an invalid channel list".into());
+        };
+        wire_channels.extend(page);
+        if !has_more {
+            break;
+        }
+        after = next_after;
+        if after.is_none() {
+            break;
+        }
+    }
     let channels = wire_channels
         .iter()
-        .map(|channel| ChatChannel {
-            id: channel.id.clone(),
-            name: channel.name.clone(),
-            archived: channel.archived,
-            members_only: channel.post_policy == PostPolicy::MembersOnly,
-            huddle_count: count_i64(channel.huddle.len()),
-            head_seq: number_i64(channel.head_seq),
+        .map(|info| ChatChannel {
+            id: info.channel.id.clone(),
+            name: info.channel.name.clone(),
+            archived: info.channel.archived,
+            members_only: info.channel.post_policy == PostPolicy::MembersOnly,
+            huddle_count: count_i64(info.channel.huddle.len()),
+            head_seq: number_i64(info.head_seq),
         })
         .collect::<Vec<_>>();
     let active_channel = requested
@@ -2462,13 +2499,13 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
         .unwrap_or_default();
     let active_wire_channel = wire_channels
         .iter()
-        .find(|channel| channel.id == active_channel);
-    let active_channel_archived = active_wire_channel.is_some_and(|channel| channel.archived);
-    let active_channel_members_only =
-        active_wire_channel.is_some_and(|channel| channel.post_policy == PostPolicy::MembersOnly);
+        .find(|info| info.channel.id == active_channel);
+    let active_channel_archived = active_wire_channel.is_some_and(|info| info.channel.archived);
+    let active_channel_members_only = active_wire_channel
+        .is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
     let active_channel_huddle_count =
-        active_wire_channel.map_or(0, |channel| count_i64(channel.huddle.len()));
-    let active_channel_head_seq = active_wire_channel.map_or(0, |channel| channel.head_seq);
+        active_wire_channel.map_or(0, |info| count_i64(info.channel.huddle.len()));
+    let active_channel_head_seq = active_wire_channel.map_or(0, |info| info.head_seq);
     let channel_members = if active_channel.is_empty() {
         Vec::new()
     } else {
@@ -2503,25 +2540,52 @@ async fn load_channel_members(
     rpc: &RpcClient,
     channel_id: &str,
 ) -> Result<Vec<ChatMember>, String> {
-    let reply: ChatReply = rpc
-        .query(
-            "chat",
-            &ChatQuery::Members {
-                channel_id: channel_id.to_string(),
-            },
-        )
-        .await?;
-    let members = match reply {
-        ChatReply::Members(members) => members,
-        _ => return Err("node returned an invalid channel member list".into()),
-    };
+    let mut members = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::Members {
+                    channel_id: channel_id.to_string(),
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let ChatViewReply::Members {
+            members: page,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("node returned an invalid channel member list".into());
+        };
+        members.extend(page);
+        if !has_more {
+            break;
+        }
+        after = next_after;
+        if after.is_none() {
+            break;
+        }
+    }
     Ok(members
         .into_iter()
-        .map(|member| ChatMember {
-            label: short_hex(&member),
-            key: hex_encode(&member),
+        .map(|member| {
+            let id = member_id(&member.user);
+            ChatMember {
+                label: short_label(id),
+                key: id.to_string(),
+            }
         })
         .collect())
+}
+
+/// The member's key id: the part after `user:` in a rendered member handle,
+/// or the whole handle when it carries no such prefix.
+fn member_id(user: &str) -> &str {
+    user.strip_prefix("user:").unwrap_or(user)
 }
 
 async fn load_messages(
@@ -2532,39 +2596,34 @@ async fn load_messages(
     let mut cursor = head_seq;
     let mut roots = Vec::new();
     while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
-        let limit = chat::MAX_QUERY_LIMIT.min(cursor);
+        let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
         let from_seq = cursor - limit + 1;
-        let reply: ChatReply = rpc
-            .query(
+        let reply: ChatViewReply = rpc
+            .view(
                 "chat",
-                &ChatQuery::MessagesRange {
+                &ChatViewQuery::MessagesRange {
                     channel_id: channel_id.to_string(),
                     from_seq,
-                    limit,
+                    limit: Some(limit as usize),
                 },
             )
             .await?;
-        let messages = match reply {
-            ChatReply::Messages(messages) => messages,
-            _ => return Err("node returned an invalid message list".into()),
+        let ChatViewReply::Messages(rows) = reply else {
+            return Err("node returned an invalid message list".into());
         };
-        roots.extend(
-            messages
-                .into_iter()
-                .filter(|message| message.head.thread.is_none()),
-        );
+        roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
         if from_seq == 1 {
             break;
         }
         cursor = from_seq - 1;
     }
-    roots.sort_by_key(|message| message.seq);
+    roots.sort_by_key(|row| row.seq);
     let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
     roots.drain(..excess);
     let current_user = local_user_key().await;
     let mut messages: Vec<ChatMessage> = roots
         .into_iter()
-        .map(|message| chat_message(message, current_user.as_deref()))
+        .map(|row| chat_message(row, current_user.as_deref()))
         .collect();
     mark_message_groups(&mut messages);
     Ok(messages)
@@ -2635,39 +2694,34 @@ pub async fn load_older_messages(
         let mut cursor = before.saturating_sub(1);
         let mut roots = Vec::new();
         while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
-            let limit = chat::MAX_QUERY_LIMIT.min(cursor);
+            let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
             let from_seq = cursor - limit + 1;
-            let reply: ChatReply = rpc
-                .query(
+            let reply: ChatViewReply = rpc
+                .view(
                     "chat",
-                    &ChatQuery::MessagesRange {
+                    &ChatViewQuery::MessagesRange {
                         channel_id: channel_id.clone(),
                         from_seq,
-                        limit,
+                        limit: Some(limit as usize),
                     },
                 )
                 .await?;
-            let messages = match reply {
-                ChatReply::Messages(messages) => messages,
-                _ => return Err("node returned an invalid message list".to_string()),
+            let ChatViewReply::Messages(rows) = reply else {
+                return Err("node returned an invalid message list".to_string());
             };
-            roots.extend(
-                messages
-                    .into_iter()
-                    .filter(|message| message.head.thread.is_none()),
-            );
+            roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
             if from_seq == 1 {
                 break;
             }
             cursor = from_seq - 1;
         }
-        roots.sort_by_key(|message| message.seq);
+        roots.sort_by_key(|row| row.seq);
         let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
         roots.drain(..excess);
         let current_user = local_user_key().await;
         let messages: Vec<ChatMessage> = roots
             .into_iter()
-            .map(|message| chat_message(message, current_user.as_deref()))
+            .map(|row| chat_message(row, current_user.as_deref()))
             .collect();
         Ok(messages)
     }
@@ -2688,25 +2742,24 @@ async fn load_messages_around(
     channel_id: &str,
     seq: u64,
 ) -> Result<Vec<ChatMessage>, String> {
-    let reply: ChatReply = rpc
-        .query(
+    let reply: ChatViewReply = rpc
+        .view(
             "chat",
-            &ChatQuery::MessagesAround {
+            &ChatViewQuery::MessagesAround {
                 channel_id: channel_id.to_string(),
                 seq,
-                limit: chat::MAX_QUERY_LIMIT,
+                limit: Some(CHAT_VIEW_PAGE_LIMIT as usize),
             },
         )
         .await?;
-    let messages = match reply {
-        ChatReply::Messages(messages) => messages,
-        _ => return Err("node returned an invalid message window".into()),
+    let ChatViewReply::Messages(rows) = reply else {
+        return Err("node returned an invalid message window".into());
     };
     let current_user = local_user_key().await;
-    Ok(messages
+    Ok(rows
         .into_iter()
-        .filter(|message| message.head.thread.is_none())
-        .map(|message| chat_message(message, current_user.as_deref()))
+        .filter(|row| row.thread.is_none())
+        .map(|row| chat_message(row, current_user.as_deref()))
         .collect())
 }
 
@@ -2714,24 +2767,22 @@ async fn load_message_at(
     rpc: &RpcClient,
     channel_id: &str,
     seq: u64,
-) -> Result<chat::MessageView, String> {
-    let reply: ChatReply = rpc
-        .query(
+) -> Result<MsgRow, String> {
+    let reply: ChatViewReply = rpc
+        .view(
             "chat",
-            &ChatQuery::MessagesAround {
+            &ChatViewQuery::MessagesAround {
                 channel_id: channel_id.to_string(),
                 seq,
-                limit: 1,
+                limit: Some(1),
             },
         )
         .await?;
-    let messages = match reply {
-        ChatReply::Messages(messages) => messages,
-        _ => return Err("node returned an invalid message window".into()),
+    let ChatViewReply::Messages(rows) = reply else {
+        return Err("node returned an invalid message window".into());
     };
-    messages
-        .into_iter()
-        .find(|message| message.seq == seq)
+    rows.into_iter()
+        .find(|row| row.seq == seq)
         .ok_or_else(|| "message was not found".into())
 }
 
@@ -2740,48 +2791,78 @@ async fn load_reply_by_id(
     message_id: &str,
     channel_id: &str,
     root_seq: u64,
-) -> Result<chat::MessageView, String> {
-    let reply: ChatReply = rpc
-        .query(
+) -> Result<MsgRow, String> {
+    let reply: ChatViewReply = rpc
+        .view(
             "chat",
-            &ChatQuery::Message {
+            &ChatViewQuery::Message {
                 message_id: message_id.to_string(),
             },
         )
         .await?;
-    let message = match reply {
-        ChatReply::Message(Some(message)) => message,
-        _ => return Err("reply was not found".into()),
+    let ChatViewReply::Message(Some(row)) = reply else {
+        return Err("reply was not found".into());
     };
-    let is_expected_reply =
-        message.channel_id == channel_id && message.head.thread == Some(root_seq);
+    let is_expected_reply = row.channel_id == channel_id && row.thread == Some(root_seq);
     if !is_expected_reply {
         return Err("node returned an invalid thread reply".into());
     }
-    Ok(message)
+    Ok(row)
+}
+
+/// One thread's root plus its complete reply run, walked over the view's reply
+/// cursor to exhaustion.
+struct ThreadPage {
+    root: MsgRow,
+    replies: Vec<MsgRow>,
 }
 
 async fn query_thread_page(
     rpc: &RpcClient,
     channel_id: &str,
     root_seq: u64,
-    from: u64,
-) -> Result<chat::Thread, String> {
-    let reply: ChatReply = rpc
-        .query(
-            "chat",
-            &ChatQuery::Thread {
-                channel_id: channel_id.to_string(),
-                root_seq,
-                from,
-                limit: chat::MAX_QUERY_LIMIT,
-            },
-        )
-        .await?;
-    match reply {
-        ChatReply::Thread(Some(thread)) => Ok(thread),
-        _ => Err("thread was not found".into()),
+) -> Result<ThreadPage, String> {
+    let mut root = None;
+    let mut replies = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::Thread {
+                    channel_id: channel_id.to_string(),
+                    root_seq,
+                    after: after.clone(),
+                    limit: None,
+                },
+            )
+            .await?;
+        let ChatViewReply::Thread {
+            root: page_root,
+            replies: page_replies,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("thread was not found".into());
+        };
+        if root.is_none() {
+            let Some(page_root) = page_root else {
+                return Err("thread was not found".into());
+            };
+            root = Some(page_root);
+        }
+        replies.extend(page_replies);
+        if !has_more {
+            break;
+        }
+        after = next_after;
+        if after.is_none() {
+            break;
+        }
     }
+    let root = root.ok_or_else(|| "thread was not found".to_string())?;
+    Ok(ThreadPage { root, replies })
 }
 
 async fn load_sparse_thread_data(
@@ -2792,7 +2873,7 @@ async fn load_sparse_thread_data(
 ) -> Result<ThreadData, String> {
     let root = load_message_at(rpc, channel_id, root_seq).await?;
     let target = load_message_at(rpc, channel_id, target_seq).await?;
-    if target.head.thread != Some(root_seq) {
+    if target.thread != Some(root_seq) {
         return Err("search result does not belong to the selected thread".into());
     }
     let current_user = local_user_key().await;
@@ -2824,77 +2905,82 @@ async fn load_thread_data(
         });
     }
 
-    let mut root = None;
-    let mut replies = Vec::new();
-    let mut from = 0_u64;
-    let has_more = loop {
-        let thread = query_thread_page(rpc, channel_id, root_seq, from).await?;
-        if root.is_none() {
-            root = Some(thread.root);
-        }
-        let page_len = thread.replies.len() as u64;
-        replies.extend(thread.replies);
-        from = from.saturating_add(page_len);
-        let page_is_full = page_len == chat::MAX_QUERY_LIMIT;
-        let thread_cap_reached = from >= chat::MAX_THREAD_REPLIES as u64;
-        let has_more = page_is_full && !thread_cap_reached;
-        let first_page_is_enough = through_reply_offset == 0;
-        let requested_offset_is_loaded = from >= through_reply_offset;
-        if !has_more || first_page_is_enough || requested_offset_is_loaded {
-            break has_more;
-        }
-    };
-    let root = root.ok_or_else(|| "thread was not found".to_string())?;
+    // the view walks the reply cursor to exhaustion, so the whole thread (up to
+    // the module's reply cap) arrives in one call; re-page it into the UI's
+    // MAX_QUERY_LIMIT windows so the reducer's cursor contract is unchanged.
+    let thread = query_thread_page(rpc, channel_id, root_seq).await?;
+    let (loaded, has_more) = thread_page_bound(thread.replies.len() as u64, through_reply_offset);
     let current_user = local_user_key().await;
-    let messages = std::iter::once(root)
-        .chain(replies)
-        .map(|message| chat_message(message, current_user.as_deref()))
+    let messages = std::iter::once(thread.root)
+        .chain(thread.replies.into_iter().take(loaded as usize))
+        .map(|row| chat_message(row, current_user.as_deref()))
         .collect();
     Ok(ThreadData {
         root_seq: number_i64(root_seq),
         target_seq: 0,
         messages,
-        next_reply_offset: number_i64(from),
+        next_reply_offset: number_i64(loaded),
         has_more,
     })
 }
 
-fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> ChatMessage {
-    let edited = message.head.rev > 0;
+/// Re-page a fully-loaded thread into the branch's MAX_QUERY_LIMIT windows:
+/// how many replies to surface for `through_reply_offset`, and whether more
+/// remain. Mirrors the old page-walk (has_more keys on a full page, capped at
+/// MAX_THREAD_REPLIES).
+fn thread_page_bound(total: u64, through_reply_offset: u64) -> (u64, bool) {
+    let cap = chat::MAX_THREAD_REPLIES as u64;
+    let mut from = 0;
+    loop {
+        let page_len = CHAT_VIEW_PAGE_LIMIT.min(total - from);
+        from += page_len;
+        let page_is_full = page_len == CHAT_VIEW_PAGE_LIMIT;
+        let thread_cap_reached = from >= cap;
+        let has_more = page_is_full && !thread_cap_reached;
+        let first_page_is_enough = through_reply_offset == 0;
+        let requested_offset_is_loaded = from >= through_reply_offset;
+        if !has_more || first_page_is_enough || requested_offset_is_loaded {
+            return (from, has_more);
+        }
+    }
+}
+
+fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
+    let edited = row.rev > 0;
     let meta = if edited {
-        format!("#{} · edited", message.seq)
+        format!("#{} · edited", row.seq)
     } else {
-        format!("#{}", message.seq)
+        format!("#{}", row.seq)
     };
-    let (avatar_r, avatar_g, avatar_b) = avatar_rgb(&message.head.author);
-    let blocks = if message.head.deleted {
+    let (avatar_r, avatar_g, avatar_b) = avatar_rgb(&row.author);
+    let blocks = if row.deleted {
         vec![deleted_block()]
     } else {
-        blocks_view(&message.head.blocks)
+        blocks_view(&row.blocks)
     };
     ChatMessage {
-        id: message.head.message_id,
-        seq: number_i64(message.seq),
-        author: author_name(&message.head.author),
+        id: row.message_id,
+        seq: number_i64(row.seq),
+        author: author_name(&row.author),
         meta,
-        body: if message.head.deleted {
+        body: if row.deleted {
             "Message deleted".into()
         } else {
-            message_body(&message.head.blocks)
+            message_body(&row.blocks)
         },
         blocks,
         pending: false,
-        rev: i64::from(message.head.rev),
+        rev: i64::from(row.rev),
         edited,
-        deleted: message.head.deleted,
-        reply_count: number_i64(message.head.reply_count),
-        thread_seq: number_i64(message.head.thread.unwrap_or(0)),
+        deleted: row.deleted,
+        reply_count: number_i64(row.reply_count),
+        thread_seq: number_i64(row.thread.unwrap_or(0)),
         show_author: true,
-        initial: avatar_initial(&message.head.author),
+        initial: avatar_initial(&row.author),
         avatar_r,
         avatar_g,
         avatar_b,
-        reactions: message
+        reactions: row
             .reactions
             .into_iter()
             .map(|reaction| {
@@ -2909,11 +2995,12 @@ fn chat_message(message: chat::MessageView, current_user: Option<&[u8]>) -> Chat
     }
 }
 
-fn reacted_by_user(reactors: &BTreeSet<AuthorRef>, current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|current_user| {
-        reactors
-            .iter()
-            .any(|reactor| matches!(reactor, AuthorRef::User(key) if key == current_user))
+/// True when the local user's rendered author string (`user:{hex}`) is among a
+/// reaction's reactors.
+fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
+    current_user.is_some_and(|key| {
+        let handle = format!("user:{}", hex_encode(key));
+        reactors.contains(&handle)
     })
 }
 
@@ -2923,31 +3010,33 @@ async fn query_block_threads(
     from: u32,
     generation: i64,
 ) -> Result<BlockThreadListData, String> {
-    let reply: PageReply = rpc
-        .query(
+    let reply: PagesViewReply = rpc
+        .view(
             "pages",
-            &PageQuery::ThreadsForTarget {
-                target: target.to_string(),
-                from,
-                limit: 0,
+            &PagesViewQuery::ThreadsForTargets {
+                targets: vec![target.to_string()],
             },
         )
         .await?;
-    let PageReply::ThreadPage(page) = reply else {
+    let PagesViewReply::Threads(groups) = reply else {
         return Err("node returned an invalid comment thread page".into());
     };
-    if page.target != target {
-        return Err("node returned comment threads for another block".into());
-    }
-    let has_more = page.next_from.is_some();
+    // threads-per-target is consensus-capped, so the whole list arrives in one
+    // grouped reply — there is no offset paging to resume.
+    let threads = groups
+        .into_iter()
+        .find(|group| group.target == target)
+        .map(|group| group.threads)
+        .unwrap_or_default();
+    let total = count_i64(threads.len());
     Ok(BlockThreadListData {
         generation,
-        target: page.target,
+        target: target.to_string(),
         from: i64::from(from),
-        threads: page.threads.into_iter().map(page_comment_thread).collect(),
-        total: i64::from(page.total),
-        next_from: page.next_from.map_or(0, i64::from),
-        has_more,
+        threads: threads.into_iter().map(page_comment_thread).collect(),
+        total,
+        next_from: 0,
+        has_more: false,
     })
 }
 
@@ -2961,37 +3050,43 @@ async fn query_block_comment_page(
     let reply: PageReply = rpc
         .query(
             "pages",
-            &PageQuery::CommentsForThread {
+            &PageQuery::CommentThread {
                 thread_id: thread_id.to_string(),
-                from,
-                limit: 0,
             },
         )
         .await?;
-    let PageReply::CommentPage(page) = reply else {
+    let PageReply::CommentThread(thread) = reply else {
         return Err("node returned an invalid comment page".into());
     };
-    let Some(page) = page else {
+    let Some(view) = thread else {
         return Ok(None);
     };
-    let is_expected_thread = page.thread.id == thread_id && page.thread.target == target;
+    let is_expected_thread = view.thread.id == thread_id && view.thread.target == target;
     if !is_expected_thread {
         return Err("node returned comments for another block".into());
     }
-    let has_more = page.next_from.is_some();
+    // the committed read returns the whole live comment list; the UI's page
+    // ordinals are 1-based positions in it, sliced from `from`.
+    let comments = view
+        .comments
+        .into_iter()
+        .enumerate()
+        .skip(from as usize)
+        .map(|(index, comment)| page_comment(index + 1, comment))
+        .collect();
     Ok(Some(BlockCommentData {
         generation,
-        target: page.thread.target,
-        thread_id: page.thread.id,
+        target: view.thread.target,
+        thread_id: view.thread.id,
         from: i64::from(from),
-        comments: page.comments.into_iter().map(page_comment).collect(),
-        next_from: page.next_from.map_or(0, i64::from),
-        has_more,
+        comments,
+        next_from: 0,
+        has_more: false,
     }))
 }
 
-fn page_comment_thread(thread: pages::CommentThread) -> PageCommentThread {
-    let comment_count = i64::from(thread.comment_count);
+fn page_comment_thread(thread: ThreadRow) -> PageCommentThread {
+    let comment_count = count_i64(thread.comments.iter().filter(|c| !c.deleted).count());
     let count_label = if comment_count == 1 {
         "1 comment".to_string()
     } else {
@@ -2999,7 +3094,7 @@ fn page_comment_thread(thread: pages::CommentThread) -> PageCommentThread {
     };
     PageCommentThread {
         id: thread.id,
-        author: page_author_name(&thread.opener),
+        author: author_name(&thread.opener),
         meta: if thread.resolved {
             format!("{count_label} · resolved")
         } else {
@@ -3010,18 +3105,19 @@ fn page_comment_thread(thread: pages::CommentThread) -> PageCommentThread {
     }
 }
 
-fn page_comment(item: pages::CommentItem) -> PageComment {
-    let edited = item.comment.edited_at.is_some();
+fn page_comment(ordinal: usize, comment: pages::Comment) -> PageComment {
+    let edited = comment.edited_at.is_some();
+    let ordinal = count_i64(ordinal);
     PageComment {
-        id: item.comment.id,
-        ordinal: i64::from(item.ordinal),
-        author: page_author_name(&item.comment.author),
+        id: comment.id,
+        ordinal,
+        author: page_author_name(&comment.author),
         meta: if edited {
-            format!("#{} · edited", item.ordinal)
+            format!("#{ordinal} · edited")
         } else {
-            format!("#{}", item.ordinal)
+            format!("#{ordinal}")
         },
-        text: item.comment.text,
+        text: comment.text,
     }
 }
 
@@ -3178,25 +3274,32 @@ async fn load_page_blocks(rpc: &RpcClient, page_id: &str) -> Result<Vec<pages::B
     }
 }
 
-async fn load_page_index(rpc: &RpcClient) -> Result<Vec<pages::PageMeta>, String> {
+async fn load_page_index(rpc: &RpcClient) -> Result<Vec<PageRow>, String> {
     let mut pages = Vec::new();
-    let mut after = None;
+    let mut after: Option<String> = None;
     loop {
-        let reply: PageReply = rpc
-            .query(
+        let reply: PagesViewReply = rpc
+            .view(
                 "pages",
-                &PageQuery::ListPages {
+                &PagesViewQuery::ListPages {
                     after: after.clone(),
-                    limit: 0,
+                    limit: None,
                 },
             )
             .await?;
-        let page = match reply {
-            PageReply::PageList(page) => page,
-            _ => return Err("node returned an invalid page list".into()),
+        let PagesViewReply::Pages {
+            pages: page,
+            has_more,
+            next_after,
+        } = reply
+        else {
+            return Err("node returned an invalid page list".into());
         };
-        pages.extend(page.pages);
-        let Some(next) = page.next_after else {
+        pages.extend(page);
+        if !has_more {
+            return Ok(pages);
+        }
+        let Some(next) = next_after else {
             return Ok(pages);
         };
         if after.as_ref() == Some(&next) {
@@ -3206,7 +3309,7 @@ async fn load_page_index(rpc: &RpcClient) -> Result<Vec<pages::PageMeta>, String
     }
 }
 
-fn page_items(wire_pages: Vec<pages::PageMeta>) -> Vec<PageItem> {
+fn page_items(wire_pages: Vec<PageRow>) -> Vec<PageItem> {
     let known = wire_pages
         .iter()
         .map(|page| page.id.as_str())
@@ -3820,31 +3923,36 @@ fn word_spans(spans: &[chat::Span]) -> Vec<ChatSpan> {
     out
 }
 
-fn author_name(author: &AuthorRef) -> String {
-    match author {
-        AuthorRef::User(key) => format!("user {}", short_hex(key)),
-        AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
-        AuthorRef::Module(module) => module.clone(),
-        AuthorRef::System => "system".into(),
+/// The display name for a rendered author string (`user:{id}`,
+/// `agent:{module}/{agent}`, `module:{id}`, or `system`).
+fn author_name(author: &str) -> String {
+    match author.split_once(':') {
+        Some(("user", id)) => format!("user {}", short_label(id)),
+        Some(("agent", path)) => {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            format!("@{name}")
+        }
+        Some(("module", id)) => id.to_string(),
+        _ => "system".into(),
     }
 }
 
-/// The stable identity string an avatar is derived from: the hex fingerprint for
-/// a user, the id for an agent/module. Both the initial glyph and the tint hash
+/// The stable identity an avatar is derived from: the shortened id for a user,
+/// the agent/module name otherwise. Both the initial glyph and the tint hash
 /// off this so a given author always looks the same.
-fn avatar_source(author: &AuthorRef) -> String {
-    match author {
-        AuthorRef::User(key) => short_hex(key),
-        AuthorRef::Agent { agent_id, .. } => agent_id.clone(),
-        AuthorRef::Module(module) => module.clone(),
-        AuthorRef::System => "system".into(),
+fn avatar_source(author: &str) -> String {
+    match author.split_once(':') {
+        Some(("user", id)) => short_label(id),
+        Some(("agent", path)) => path.rsplit('/').next().unwrap_or(path).to_string(),
+        Some(("module", id)) => id.to_string(),
+        _ => "system".into(),
     }
 }
 
 /// The single-glyph avatar label for an author: the first alphanumeric character
 /// of its identity, uppercased. Falls back to a neutral dot when there is
 /// nothing to show.
-fn avatar_initial(author: &AuthorRef) -> String {
+fn avatar_initial(author: &str) -> String {
     initial_of(&avatar_source(author))
 }
 
@@ -3869,7 +3977,7 @@ const AVATAR_PALETTE: [(u8, u8, u8); 8] = [
 ];
 
 /// The avatar tint for an author as linear 0..1 RGB.
-pub fn avatar_rgb(author: &AuthorRef) -> (f64, f64, f64) {
+pub fn avatar_rgb(author: &str) -> (f64, f64, f64) {
     avatar_rgb_for(&avatar_source(author))
 }
 
@@ -3916,6 +4024,16 @@ fn short_hex(bytes: &[u8]) -> String {
         output.push('…');
     }
     output
+}
+
+/// A shortened display label for an id string: its first 8 characters, with an
+/// ellipsis when more follow.
+fn short_label(id: &str) -> String {
+    let mut label: String = id.chars().take(8).collect();
+    if id.chars().count() > 8 {
+        label.push('…');
+    }
+    label
 }
 
 const fn block_kind_name(kind: BlockKind) -> &'static str {
@@ -4210,7 +4328,10 @@ mod tests {
         );
         assert!(parse_user_key_status("absent\n").is_none());
         assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
-        let reactors = BTreeSet::from([AuthorRef::User(vec![0xab; 32]), AuthorRef::System]);
+        let reactors = vec![
+            format!("user:{}", hex_encode(&[0xab; 32])),
+            "system".to_string(),
+        ];
         assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
         assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
         assert!(!reacted_by_user(&reactors, None));
@@ -4629,6 +4750,7 @@ mod tests {
         let changed = live.next().await.unwrap();
         assert_eq!(changed.kind, "changed");
         assert!(changed.height > workspace.height);
+        let base_height = changed.height;
         submit_test(
             &rpc,
             &signer,
@@ -4669,6 +4791,7 @@ mod tests {
         )
         .await;
 
+        wait_for_block(&mut live, base_height + 3).await;
         let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
         assert_eq!(chat.active_channel_name, "General");
         assert_eq!(chat.messages[0].body, "hello, edited");
@@ -4748,6 +4871,7 @@ mod tests {
         )
         .await;
 
+        wait_for_block(&mut live, base_height + 7).await;
         let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
         assert_eq!(pages.pages[0].id, "welcome");
         assert_eq!(pages.pages[1].id, "child");
@@ -4772,6 +4896,7 @@ mod tests {
             }),
         )
         .await;
+        wait_for_block(&mut live, base_height + 8).await;
         let comments =
             refresh_block_comments(origin.clone(), "intro".into(), "thread-live".into(), 1)
                 .await
@@ -4787,6 +4912,7 @@ mod tests {
             }),
         )
         .await;
+        wait_for_block(&mut live, base_height + 9).await;
         let comments =
             refresh_block_comments(origin.clone(), "intro".into(), "thread-live".into(), 2)
                 .await
@@ -5253,6 +5379,20 @@ mod tests {
             frozen_unread_boundary(caught_up, channels, "general".into(), "random".into(), 999),
             0
         );
+    }
+
+    /// drain the live event stream until the index has folded the block at
+    /// `min_height` — the system's own commit signal, never a timed poll.
+    async fn wait_for_block(
+        live: &mut iced::futures::stream::BoxStream<'static, LiveUpdate>,
+        min_height: i64,
+    ) {
+        loop {
+            let update = live.next().await.expect("live stream ended");
+            if update.kind == "changed" && update.height >= min_height {
+                return;
+            }
+        }
     }
 
     async fn submit_test(

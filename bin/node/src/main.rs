@@ -47,8 +47,9 @@
 //! joiner's synced line equals the converged line.
 
 use commonware_cryptography::Signer;
-use commonware_runtime::{Runner, Supervisor};
+use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
+mod agent_cli;
 mod agent_plane;
 mod airlock_serve;
 mod blob_fetch;
@@ -58,6 +59,10 @@ mod cli_args;
 mod code_plane;
 mod config;
 mod constants;
+mod cred_cli;
+mod node_http;
+mod tty;
+mod cred_resolve;
 mod drain_actions;
 mod explorer;
 mod first_contact_join;
@@ -190,6 +195,8 @@ enum Family {
     /// the duckfs working-copy CLI
     #[command(subcommand)]
     Fs(fs_cli::FsCmd),
+    /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
+    Agent(agent_cli::AgentArgs),
     /// the stdio MCP server an agent runner spawns
     Mcp,
 }
@@ -211,6 +218,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
@@ -309,6 +317,19 @@ fn run_node(
         joiner,
     } = boot::env::derive(resolved, sync_only);
 
+    // the compute-plane gate: a configured sandbox must actually be runnable
+    // on THIS host before anything is discovered, announced, or spawned — a
+    // missing runtime binary is a boot error, never a bare fallback.
+    if let Some(backend) = &sandbox {
+        let runtime = backend.probe().map_err(|error| format!("sandbox: {error}"))?;
+        tracing::info!(
+            target: "ducktape::node",
+            node = %label,
+            runtime = %runtime.display(),
+            "sandbox runtime probed"
+        );
+    }
+
     let gateway_enabled = gateway_can_start(
         sync_only,
         gateway_listen.as_deref(),
@@ -319,14 +340,19 @@ fn run_node(
     let boot::surfaces::Surfaces {
         rpc_listener,
         http_cmds,
+        status,
         stream_hub,
         index,
         voice_requests,
         code_stage_requests,
         blobs,
         agent_provisioner,
+        cred_resolver,
         gateway_requests,
         gateway_commands,
+        terminals,
+        session_requests,
+        local_gateway_via,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
         joiner,
@@ -408,6 +434,22 @@ fn run_node(
             wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
+        // the observability cell: operations overlay live from the metrics
+        // the moment they exist; boundary facts stay zeroed (honest —
+        // nothing is served yet) until a role loop publishes its first
+        // boundary. the boot snapshot stamps the process constants so a
+        // pre-boundary read still carries version + mesh identity, and the
+        // exposition source feeds /metrics + /v1/peers off the command lane
+        // (`Context` has no Clone; a child shares the SAME registry, so its
+        // encode() serves the identical exposition).
+        status.wire_metrics(&metrics);
+        let exposition_context = context.child("exposition");
+        status.wire_exposition(move || exposition_context.encode());
+        status.publish(noded::NodeStatus {
+            version: env!("CARGO_PKG_VERSION").into(),
+            public_key: status_public_key.clone(),
+            ..Default::default()
+        });
         // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
@@ -533,12 +575,17 @@ fn run_node(
                 http_cmds,
                 gateway_requests,
                 gateway_commands.clone(),
+                terminals,
+                session_requests,
+                local_gateway_via,
                 &stream_hub,
                 index,
                 metrics.clone(),
+                status.clone(),
                 voice_requests,
                 blobs,
                 &agent_provisioner,
+                &cred_resolver,
                 &agent_dirs,
                 overlay_slot,
                 bulk_pacer.clone(),
@@ -557,6 +604,7 @@ fn run_node(
             oracle,
             quota,
             metrics,
+            status,
             sync_source,
             advertised_reach,
             status_public_key,
@@ -586,12 +634,16 @@ fn run_node(
             http_cmds,
             gateway_requests,
             gateway_commands,
+            terminals,
+            session_requests,
+            local_gateway_via,
             stream_hub,
             index,
             voice_requests,
             code_stage_requests,
             blobs,
             agent_provisioner,
+            cred_resolver,
             agent_dirs,
             overlay_slot,
             bulk_pacer,

@@ -167,29 +167,13 @@ pub enum JobsEvent {
     },
 }
 
-/// read projections over the job board.
+/// the job board's DISPATCH read — the by-id point lookup other modules'
+/// execute() paths consume. board enumeration (status lists, the census)
+/// is the index guest's job on the derived tier.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum JobsQuery {
-    Get {
-        job_id: String,
-    },
-    List {
-        status: Option<JobStatus>,
-        kind_prefix: String,
-        limit: u64,
-    },
-    Counts {},
-}
-
-/// a per-status census of the job board.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct BoardCounts {
-    pub pending: u64,
-    pub processing: u64,
-    pub done: u64,
-    pub failed: u64,
-    pub cancelled: u64,
+    Get { job_id: String },
 }
 
 /// replies to [`JobsQuery`].
@@ -197,8 +181,6 @@ pub struct BoardCounts {
 #[serde(rename_all = "snake_case")]
 pub enum JobsReply {
     Job(Option<Job>),
-    Jobs(Vec<Job>),
-    Counts(BoardCounts),
 }
 
 // ---- the unifying envelope ------------------------------------------------

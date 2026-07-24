@@ -27,8 +27,22 @@ impl SealKeypair {
         Self { secret, public }
     }
 
+    /// Reconstruct the keypair from a persisted 32-byte secret. The self-host
+    /// gateway loads its on-disk seal secret this way so the seal_pk it serves
+    /// matches the one published on-chain (the broker's pinned trust anchor).
+    pub fn from_secret_bytes(secret: [u8; 32]) -> Self {
+        let secret = StaticSecret::from(secret);
+        let public = PublicKey::from(&secret);
+        Self { secret, public }
+    }
+
     pub fn public_bytes(&self) -> [u8; 32] {
         self.public.to_bytes()
+    }
+
+    /// The raw 32-byte secret, so the node can persist it (0600) across boots.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// ECDH against a peer's X25519 public key, so this same static keypair also

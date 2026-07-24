@@ -18,7 +18,7 @@
 #                      valset, governance, identity, lifecycle, saga,
 #                      capability, dispatch, tagging, gateway + its
 #                      absorbed duckdns naming library) and their host-side
-#                      counterparts (blobstore, dispatch-oracle, capability-host)
+#                      counterparts (blobstore, dispatch-host, capability-host)
 #   crates/modules/apps/   — application modules, the product features (forge,
 #                      chat, pages, agent, runs, tasks, vaults, automations,
 #                      inbox, files, jobs)
@@ -75,7 +75,7 @@ members = [
     "crates/modules/system/capability-host",
     "crates/modules/system/blobstore",
     "crates/modules/system/dispatch",
-    "crates/modules/system/dispatch-oracle",
+    "crates/modules/system/dispatch/host",
     "crates/modules/system/tagging",
     "crates/modules/system/airlock",
     "crates/modules/system/duckdns",
@@ -244,7 +244,7 @@ saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 blobstore = { path = "crates/modules/system/blobstore" }
 dispatch = { path = "crates/modules/system/dispatch" }
-dispatch-oracle = { path = "crates/modules/system/dispatch-oracle" }
+dispatch-host = { path = "crates/modules/system/dispatch/host" }
 tagging = { path = "crates/modules/system/tagging" }
 duckdns = { path = "crates/modules/system/duckdns" }
 gateway = { path = "crates/modules/system/gateway" }

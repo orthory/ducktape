@@ -1,6 +1,8 @@
-//! the sandbox backend seam: how a provider child is spawned. Direct is the
-//! historical spawn; Podman wraps the identical argv in a rootless container
-//! that enforces the run's numeric limits. paths are mounted at identical
+//! the sandbox backend seam: how a provider child is spawned. every backend
+//! is an audited in-tree adapter — a run NEVER executes bare on the host, so
+//! the seam has no unsandboxed variant a config could select. Podman wraps
+//! the argv in a rootless container that enforces the run's numeric limits.
+//! paths are mounted at identical
 //! container paths so workdir/session/skill logic upstream stays path-blind.
 //! HOME is NOT mounted: only the spec's [sandbox] rw_dirs (CLI auth/state)
 //! cross the boundary, so the node's data dir and user key stay outside —
@@ -16,16 +18,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// how a provider child is spawned. `Direct` is the plain host spawn (the
-/// historical behavior); `Podman` wraps each run in a rootless container. a
-/// node whose provider set uses `Podman`
-/// sandboxes EVERY run it makes — demandless ones included — because a
+/// how a provider child is spawned — always inside an isolation adapter; a
+/// bare host spawn is unrepresentable here by design ("nothing ever runs
+/// directly on the node"). `Podman` wraps each run in a rootless container. a
+/// node sandboxes EVERY run it makes — demandless ones included — because a
 /// sandboxed node sandboxes everything; the numeric limit flags are added only
 /// for the dimensions actually present on the run.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxBackend {
-    #[default]
-    Direct,
     Podman {
         image: String,
     },
@@ -36,6 +36,52 @@ pub enum SandboxBackend {
     Tart {
         image: String,
     },
+    /// test-harness spawn: the bin exec'd directly, compiled ONLY into this
+    /// crate's unit tests so the run loop stays testable without a container
+    /// runtime on the test host. a shipped binary cannot express a bare
+    /// spawn — the variant does not exist outside `cfg(test)`.
+    #[cfg(test)]
+    Bare,
+}
+
+impl SandboxBackend {
+    /// the host runtime binary this adapter drives.
+    pub fn runtime_bin(&self) -> &'static str {
+        match self {
+            SandboxBackend::Podman { .. } => "podman",
+            SandboxBackend::Tart { .. } => "tart",
+            #[cfg(test)]
+            SandboxBackend::Bare => "sh",
+        }
+    }
+
+    /// whether this run spawns through the test-only bare harness (host paths,
+    /// no mount canonicalization). always false in shipped code.
+    pub(crate) fn is_bare_test(&self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, SandboxBackend::Bare)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// verify this host can actually run the chosen adapter: the runtime
+    /// binary must be executable somewhere on `PATH`. a config naming an
+    /// unusable runtime is a loud boot error — there is no bare fallback.
+    pub fn probe(&self) -> Result<PathBuf, String> {
+        let bin = self.runtime_bin();
+        let path = std::env::var_os("PATH")
+            .ok_or_else(|| format!("sandbox runtime {bin:?}: PATH is unset"))?;
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(bin))
+            .find(|candidate| crate::is_executable(candidate))
+            .ok_or_else(|| {
+                format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
+            })
+    }
 }
 
 /// translate a provider invocation into a `podman run` argv — PURE, no I/O, so

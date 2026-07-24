@@ -32,11 +32,14 @@ pub(crate) const PEER_SET: u64 = 0;
 // blocks, and this heartbeat must submit the same string — so the value lives in
 // `noded::projection` and both sides read it here.
 pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
-// block cadence is a single knob: `consensus::BLOCK_TIME` (1s). the idle
-// heartbeat beats one nop block per BLOCK_TIME so an idle chain still finalizes
-// (its height keeps ticking) and any pending cutover still crosses — paced to
-// the same interval the leader's idle-propose holds a view open, so the beat
-// never outpaces the intended block time.
+// block cadence: BUSY is event-driven with NO interval — the run loop flushes
+// pending ops the moment nothing of ours is in flight (`pump_eager_flush`),
+// so the network's own agreement speed paces blocks and ops aggregate behind
+// the one batch in flight. IDLE is the only timed cadence: the heartbeat
+// beats one nop block per `consensus::BLOCK_TIME` (1s) so an idle chain still
+// finalizes (its height keeps ticking) and any pending cutover still crosses
+// — paced to the same interval the leader's idle-propose holds a view open,
+// so the idle beat never outpaces the view hold.
 /// request timeout for the promoted-validator boot catch-up client. it is long
 /// enough to let discovery links warm, but bounded so boot cannot hang forever
 /// before the statesync server bridge is installed.
@@ -77,12 +80,19 @@ pub(crate) const MAX_BACKLOG: usize = 128;
 /// roamed / NAT-rebound laptop freezes for exactly this long before the
 /// dialer heals the mesh.
 pub(crate) const MESH_IO_TIMEOUT: Duration = overlay_net::userspace::seam::IO_TIMEOUT;
-/// pump drain cadence: how often the pump applies finalized frames (and runs
-/// everything that rides the drain arm — checkpoints, valset orchestration,
-/// the epoch cutover, the heartbeat). enforced as a FLOOR via an absolute
-/// deadline in the pump loop: ingress load can delay one drain by one
-/// request's service time, but can never starve the arm.
+/// pump drain cadence: how often the pump runs the drain arm — checkpoints,
+/// valset orchestration, the epoch cutover, the heartbeat — when no
+/// finalization delivery wake turned the loop first. enforced as a FLOOR via
+/// an absolute deadline in the pump loop: ingress load can delay one drain by
+/// one request's service time, but can never starve the arm. it is a BACKSTOP
+/// for block handling, not a pacer: finalized blocks drain (and pending ops
+/// flush) event-driven the moment they land.
 pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
+/// the pace of `refresh_operations` (the /metrics exposition parse feeding
+/// status' consensus/storage sections): the status cell publishes boundary
+/// facts per drain pass, but the exposition parse is the pricey part and one
+/// per second bounds its cost — and the staleness — at once.
+pub(crate) const OPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and

@@ -29,7 +29,7 @@
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
-use dispatch_oracle::WorkspaceSpec;
+use dispatch_host::WorkspaceSpec;
 use futures::channel::oneshot;
 use std::sync::Arc;
 

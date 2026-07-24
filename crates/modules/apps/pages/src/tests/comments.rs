@@ -62,14 +62,12 @@ fn exact_comment_anchor_rebases_with_target_text() {
             },
         )
         .await;
-        let moved_from = query_target_threads(&p, "b1", 0, 0).await;
-        let moved_to = query_target_threads(&p, "b2", 0, 0).await;
-        assert!(moved_from.threads.is_empty());
-        assert_eq!(moved_to.threads[0].target, "b2");
-        assert_eq!(
-            moved_to.threads[0].anchor,
-            Some(RelativeAnchor { start: 0, end: 2 })
-        );
+        let moved = query_thread(&p, "t1").await.unwrap();
+        assert_eq!(moved.thread.target, "b2");
+        assert_eq!(moved.thread.anchor, Some(RelativeAnchor { start: 0, end: 2 }));
+        // the per-target index re-homed with it.
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
     });
 }
 
@@ -355,7 +353,7 @@ fn as_agent_refines_a_module_origin_into_an_agent_author() {
         };
         assert_eq!(view.thread.opener, agent, "the opener is the agent");
         assert_eq!(
-            view.comments[0].comment.author, agent,
+            view.comments[0].author, agent,
             "the comment author too"
         );
     });
@@ -418,7 +416,7 @@ fn get_comment_serves_the_record_tombstones_included() {
 }
 
 #[test]
-fn comment_add_opens_then_appends_and_batches_by_target() {
+fn comment_add_opens_then_appends_and_counts_per_target() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
@@ -426,139 +424,21 @@ fn comment_add_opens_then_appends_and_batches_by_target() {
         apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
         apply_commit_as(&mut p, &add("t3", "m4", "b2", "elsewhere"), user("alice")).await;
 
-        let b1 = query_target_threads(&p, "b1", 0, 0).await;
-        let b2 = query_target_threads(&p, "b2", 0, 0).await;
-        assert_eq!(b1.threads.len(), 2);
-        let t1 = b1.threads.iter().find(|thread| thread.id == "t1").unwrap();
-        assert_eq!(t1.opener, AuthorRef::User(b"alice".to_vec()));
-        assert_eq!(t1.comment_count, 2);
-        let comments = query_thread(&p, "t1").await.unwrap();
+        let t1 = query_thread(&p, "t1").await.unwrap();
         assert_eq!(
-            comments
-                .comments
+            t1.comments
                 .iter()
-                .map(|item| item.comment.text.as_str())
+                .map(|c| c.text.as_str())
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
-        assert_eq!(
-            comments.comments[1].comment.author,
-            AuthorRef::User(b"bob".to_vec())
-        );
-        assert_eq!(b2.threads.len(), 1);
-    });
-}
-
-#[test]
-fn comment_queries_page_targets_and_skip_tombstones_with_stable_ordinals() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages");
-        for index in 0..=MAX_THREAD_PAGE_LIMIT {
-            let thread = format!("t{index:02}");
-            let comment = format!("c{index:02}");
-            apply_commit_as(
-                &mut p,
-                &add(&thread, &comment, "b1", &thread),
-                user("alice"),
-            )
-            .await;
-        }
-        for index in 1..=MAX_COMMENT_PAGE_LIMIT {
-            let comment = format!("m{index:02}");
-            apply_commit_as(&mut p, &add("t00", &comment, "b1", &comment), user("alice")).await;
-        }
-        apply_commit_as(
-            &mut p,
-            &PageMsg::DeleteComment {
-                comment_id: "m03".into(),
-            },
-            user("alice"),
-        )
-        .await;
-
-        let first_threads = query_target_threads(&p, "b1", 0, u16::MAX).await;
-        assert_eq!(first_threads.total, u32::from(MAX_THREAD_PAGE_LIMIT) + 1);
-        assert_eq!(
-            first_threads.threads.len(),
-            usize::from(MAX_THREAD_PAGE_LIMIT),
-            "the target limit clamps"
-        );
-        assert_eq!(first_threads.threads[0].id, "t00");
-        assert_eq!(
-            first_threads.threads[0].comment_count,
-            u32::from(MAX_COMMENT_PAGE_LIMIT) + 1
-        );
-        assert_eq!(
-            first_threads.next_from,
-            Some(u32::from(MAX_THREAD_PAGE_LIMIT))
-        );
-        let final_threads =
-            query_target_threads(&p, "b1", first_threads.next_from.unwrap(), u16::MAX).await;
-        assert_eq!(final_threads.threads.len(), 1);
-        assert_eq!(final_threads.threads[0].id, "t64");
-        assert_eq!(final_threads.next_from, None);
-
-        let first_comments = query_thread_comments(&p, "t00", 0, u16::MAX).await.unwrap();
-        assert_eq!(
-            first_comments
-                .comments
-                .iter()
-                .map(|item| item.ordinal)
-                .collect::<Vec<_>>(),
-            [1, 2, 3, 5, 6, 7, 8],
-            "the deleted middle comment stays a gap in stable ordinals"
-        );
-        assert_eq!(
-            first_comments.next_from,
-            Some(u32::from(MAX_COMMENT_PAGE_LIMIT)),
-            "the comment limit clamps by lifetime slots"
-        );
-        let final_comments =
-            query_thread_comments(&p, "t00", first_comments.next_from.unwrap(), u16::MAX)
-                .await
-                .unwrap();
-        assert_eq!(
-            final_comments
-                .comments
-                .iter()
-                .map(|item| item.ordinal)
-                .collect::<Vec<_>>(),
-            [9]
-        );
-        assert_eq!(final_comments.next_from, None);
-    });
-}
-
-#[test]
-fn comment_queries_reject_ids_that_cannot_exist() {
-    deterministic::Runner::default().start(|context| async move {
-        let p = pages_on!(context, "pages");
-        let target = "x".repeat(MAX_COMMENT_TARGET_BYTES + 1);
-        let target_query = PageQuery::ThreadsForTarget {
-            target,
-            from: 0,
-            limit: 0,
-        };
-        assert_eq!(
-            p.query(&encode_query(&target_query))
-                .await
-                .unwrap_err()
-                .to_string(),
-            "Module(comment id or target too large)"
-        );
-
-        let thread_query = PageQuery::CommentsForThread {
-            thread_id: "x".repeat(MAX_THREAD_ID_BYTES + 1),
-            from: 0,
-            limit: 0,
-        };
-        assert_eq!(
-            p.query(&encode_query(&thread_query))
-                .await
-                .unwrap_err()
-                .to_string(),
-            "Module(comment id or target too large)"
-        );
+        assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
+        assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
+        // the per-target index counts THREADS, not comments (per-target
+        // thread ENUMERATION is `index::tests`' now).
+        assert_eq!(target_thread_count(&p, "b1").await, 2);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
+        assert_eq!(target_thread_count(&p, "ghost").await, 0);
     });
 }
 
@@ -627,8 +507,8 @@ fn comment_edit_and_delete_are_author_only() {
         )
         .await;
         let v = query_thread(&p, "t1").await.unwrap();
-        assert_eq!(v.comments[0].comment.text, "edited");
-        assert_eq!(v.comments[0].comment.edited_at, Some(7));
+        assert_eq!(v.comments[0].text, "edited");
+        assert_eq!(v.comments[0].edited_at, Some(7));
     });
 }
 
@@ -650,7 +530,7 @@ fn comment_deleting_last_live_removes_the_thread() {
         assert_eq!(
             v.comments
                 .iter()
-                .map(|item| item.comment.text.as_str())
+                .map(|c| c.text.as_str())
                 .collect::<Vec<_>>(),
             ["b"]
         );
@@ -663,12 +543,7 @@ fn comment_deleting_last_live_removes_the_thread() {
         )
         .await;
         assert!(query_thread(&p, "t1").await.is_none());
-        assert!(
-            query_target_threads(&p, "b1", 0, 0)
-                .await
-                .threads
-                .is_empty()
-        );
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
     });
 }
 
@@ -736,6 +611,8 @@ fn comment_caps_and_reserved_ids_reject() {
             "reserved block id",
         )
         .await;
+        // the MAX_QUERY_TARGETS cap guards the index tier's grouped read now
+        // (`index::tests::threads_for_targets_rejects_over_cap_target_lists`).
     });
 }
 
@@ -754,7 +631,7 @@ fn comments_and_blocks_coexist_and_move_the_root() {
             ids(&get_page(&p, "p1").await.unwrap()),
             ["p1", "b1", "b2", "b3"]
         );
-        assert_eq!(query_target_threads(&p, "b1", 0, 0).await.threads.len(), 1);
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
     });
 }
 
@@ -767,7 +644,7 @@ fn deleting_a_block_purges_its_comment_threads() {
         seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
         apply_commit_as(&mut p, &add("t2", "m2", "p1", "on the page"), user("alice")).await;
-        assert_eq!(query_target_threads(&p, "b1", 0, 0).await.threads.len(), 1);
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
 
         // remove b1 → its thread t1 (+ comment m1 + target index) is gone.
         apply_commit(
@@ -777,12 +654,7 @@ fn deleting_a_block_purges_its_comment_threads() {
             },
         )
         .await;
-        assert!(
-            query_target_threads(&p, "b1", 0, 0)
-                .await
-                .threads
-                .is_empty()
-        );
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
         assert!(query_thread(&p, "t1").await.is_none());
 
         // delete the page → the page-anchored thread t2 is purged too.
@@ -802,11 +674,6 @@ fn deleting_a_block_purges_its_comment_threads() {
         )
         .await;
         assert!(query_thread(&p, "t2").await.is_none());
-        assert!(
-            query_target_threads(&p, "p1", 0, 0)
-                .await
-                .threads
-                .is_empty()
-        );
+        assert_eq!(target_thread_count(&p, "p1").await, 0);
     });
 }

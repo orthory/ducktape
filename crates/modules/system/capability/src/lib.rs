@@ -22,9 +22,11 @@
 //! capacity per open-set dimension ("cores" -> 8, "mem_gb" -> 32), riding the
 //! same declarative replace as tags. capacity with nothing to execute is
 //! meaningless, so resources without at least one tag is rejected; a
-//! tags-only node stays valid (direct-spawn mode) but never satisfies a
-//! demands-carrying query — absent is never infinite.
-//! [`CapabilityQuery::CapableProviders`] is the read future work
+//! tags-only node stays valid (capacity is optional — a claim is a claim)
+//! but never satisfies a
+//! demands-carrying query — absent is never infinite. this moved the
+//! snapshot/root byte encoding to v2 (FLAG DAY: a v1 stream no longer
+//! decodes). [`CapabilityQuery::CapableProviders`] is the read future work
 //! assignment filters on: providers of a capability whose announced
 //! resources cover every demanded dimension.
 //!
@@ -1310,8 +1312,11 @@ mod tests {
             )
             .await
             .unwrap();
-            // tags-only node (direct mode): never matches ANY demand.
-            c.execute(&mut ctx_external(&bare), &announce_with(&["codex"], &[]))
+            // tags-only node (no announced capacity): never matches ANY demand.
+            c.execute(
+                &mut ctx_external(&bare),
+                &announce_with(&["codex"], &[]),
+            )
             .await
             .unwrap();
             c.commit_block().await.unwrap();

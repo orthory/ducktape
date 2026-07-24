@@ -1,22 +1,28 @@
 //! the adapter-port equivalence proof for the inbox cutover: the `inbox` guest
 //! component (the NATIVE `inbox` crate compiled to wasm behind `guest-adapter`)
-//! and the native `Inbox` module answer the SAME op sequence with IDENTICAL
-//! query replies, and their roots move in lockstep (move on commit, hold on
-//! no-ops and abort). the roots THEMSELVES differ — the port persists the
-//! native canonical snapshot as one host-KV value, an intentional greenfield
-//! root break pinned by this proof.
+//! and the native `Inbox` module answer the SAME op sequence with the SAME
+//! committed state, and their roots move in lockstep (move on commit, hold on
+//! no-ops and abort). the module serves NO queries (its read surface is the
+//! index guest's job on the derived tier), so the equivalence claim is
+//! ROOT-SHAPED: the port persists the native canonical snapshot as one host-KV
+//! value (`__state`, with its 32-byte root under `__root`), which makes the
+//! wasm root a PURE FUNCTION of the native committed bytes — after every block
+//! the wasm root must equal that derivation recomputed from the native host's
+//! snapshot. the roots THEMSELVES differ — the host-KV wrapping is a declared
+//! state-schema break (revision 2) — and this proof pins that difference so it
+//! can never be mistaken for accidental compatibility.
 //!
 //! the inbox's primary writer is a SIBLING module's follow-up (`emit_msg`), so
 //! the op matrix includes a delivery emitted by a stub producer module — the
 //! cross-module path the native inbox tests exercise — asserting the wasm port
 //! derives the same Module-origin `source`.
 
-use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use inbox::{
-    Inbox, InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES,
-    MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
-};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use std::collections::BTreeMap;
+
+use host::{BlockContext, FinalizedBlock, Host, MemberOutcome, SubmitError};
+use inbox::{Inbox, InboxMsg, MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES, encode_msg};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sha2::{Digest, Sha256};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `inbox` module's guest port by
@@ -92,89 +98,94 @@ fn block(height: u64, origin: Origin) -> BlockContext {
     }
 }
 
-/// the read matrix: every query family, including the empty/zero shapes, a
-/// pagination window, and a limit above the clamp.
-async fn replies(h: &Host) -> Vec<Vec<u8>> {
-    let queries = [
-        encode_query(&InboxQuery::List {
-            member: "alice".into(),
-            from_seq: 0,
-            limit: MAX_QUERY_LIMIT,
-        }),
-        encode_query(&InboxQuery::List {
-            member: "alice".into(),
-            from_seq: 3,
-            limit: 2,
-        }),
-        encode_query(&InboxQuery::List {
-            member: "alice".into(),
-            from_seq: 0,
-            limit: MAX_QUERY_LIMIT + 1_000,
-        }),
-        encode_query(&InboxQuery::List {
-            member: "bob".into(),
-            from_seq: 0,
-            limit: MAX_QUERY_LIMIT,
-        }),
-        encode_query(&InboxQuery::List {
-            member: "absent".into(),
-            from_seq: 0,
-            limit: MAX_QUERY_LIMIT,
-        }),
-        encode_query(&InboxQuery::Unread {
-            member: "alice".into(),
-        }),
-        encode_query(&InboxQuery::Unread {
-            member: "absent".into(),
-        }),
-    ];
-    let mut out = Vec::new();
-    for q in &queries {
-        out.push(h.query("inbox", q).await.expect("query"));
-    }
-    out
-}
-
-async fn list(h: &Host, member: &str) -> Vec<Notification> {
-    let reply = h
-        .query(
-            "inbox",
-            &encode_query(&InboxQuery::List {
-                member: member.into(),
-                from_seq: 0,
-                limit: MAX_QUERY_LIMIT,
-            }),
-        )
-        .await
-        .expect("list query");
-    match decode_reply(&reply).expect("decode") {
-        InboxReply::Items(items) => items,
-        other => panic!("expected Items, got {other:?}"),
-    }
-}
-
-async fn unread(h: &Host, member: &str) -> u64 {
-    let reply = h
-        .query(
-            "inbox",
-            &encode_query(&InboxQuery::Unread {
-                member: member.into(),
-            }),
-        )
-        .await
-        .expect("unread query");
-    match decode_reply(&reply).expect("decode") {
-        InboxReply::UnreadCount(count) => count,
-        other => panic!("expected UnreadCount, got {other:?}"),
-    }
-}
-
 fn root_of(h: &Host) -> StateRoot {
     h.module_root("inbox").expect("inbox registered")
 }
 
+/// the NATIVE host's committed inbox snapshot bytes, captured through the
+/// finalized-checkpoint lane (committed state only, never a staged overlay).
+fn native_snapshot(h: &Host, height: u64) -> Vec<u8> {
+    let snap = h
+        .capture_finalized_snapshot(FinalizedBlock {
+            height,
+            root_hash: h.root_hash(),
+        })
+        .expect("capture finalized snapshot");
+    let module = snap.module("inbox").expect("inbox registered");
+    match &module.state_sync {
+        StateSyncHandle::SnapshotBytes(bytes) => bytes.clone(),
+        other => panic!("inbox must be snapshot-backed: {other:?}"),
+    }
+}
+
+/// the adapter port's root, recomputed from the native canonical state: the
+/// port persists the snapshot under `__state` with its 32-byte root under
+/// `__root`, and the wasm root is the host-KV hash over exactly those two
+/// pairs. equality against this value proves the wasm committed state is
+/// BYTE-IDENTICAL to the native committed state — the old query-matrix
+/// equivalence claim, root-shaped.
+fn ported_root(native_root: StateRoot, snapshot: &[u8]) -> StateRoot {
+    let committed = BTreeMap::from([
+        (b"__root".to_vec(), native_root.0.to_vec()),
+        (b"__state".to_vec(), snapshot.to_vec()),
+    ]);
+    StateRoot(Sha256::digest(sdk::hash::encode_pairs(&committed)).into())
+}
+
+/// the cross-runtime equivalence at a committed boundary: the wasm root must
+/// be the ported derivation of the native committed bytes.
+fn assert_state_parity(native: &Host, wasm: &Host, height: u64) {
+    let snapshot = native_snapshot(native, height);
+    assert_eq!(
+        root_of(wasm),
+        ported_root(root_of(native), &snapshot),
+        "wasm committed state diverged from the native canonical state at block {height}"
+    );
+}
+
+// ---- hand-encoded expected images ------------------------------------------
+//
+// the native module's canonical byte layout (the exact root preimage AND the
+// snapshot wire): member count, then per member (id, next_seq, item count,
+// items ascending by seq), length-prefixed strings and LE u64s throughout.
+// spot checks build the EXPECTED committed image and compare it against the
+// captured native snapshot — with `assert_state_parity` pinning the wasm side
+// to those same bytes, this replaces the old decoded query spot checks.
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_str(out: &mut Vec<u8>, value: &str) {
+    push_u64(out, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// one item as `(seq, kind, body, source, created_at, read)`.
+type ItemBytes<'a> = (u64, &'a str, &'a str, &'a str, u64, bool);
+
+/// the full canonical image for a committed state (members ascending by id).
+fn snapshot_bytes(members: &[(&str, u64, &[ItemBytes])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, members.len() as u64);
+    for (member, next_seq, items) in members {
+        push_str(&mut out, member);
+        push_u64(&mut out, *next_seq);
+        push_u64(&mut out, items.len() as u64);
+        for (seq, kind, body, source, created_at, read) in *items {
+            push_u64(&mut out, *seq);
+            push_str(&mut out, kind);
+            push_str(&mut out, body);
+            push_str(&mut out, source);
+            push_u64(&mut out, *created_at);
+            out.push(*read as u8);
+        }
+    }
+    out
+}
+
 #[test]
-fn same_ops_same_replies_roots_in_lockstep_schema_break_pinned() {
+fn same_ops_same_state_roots_in_lockstep_schema_break_pinned() {
     futures::executor::block_on(same_ops_inner());
 }
 
@@ -183,9 +194,6 @@ async fn same_ops_inner() {
     let mut wasm = wasm_host_();
     let (alice, bob) = (key(0xA1), key(0xB2));
 
-    // the schema break is visible from genesis: the native root hashes the
-    // (empty) canonical member map, the wasm root commits to the (empty)
-    // host-KV store.
     // at GENESIS the roots coincide: this module's native encoding of empty
     // state is the same empty canonical map the wasm host store hashes. the
     // declared schema break manifests on the FIRST WRITE (asserted per block
@@ -279,8 +287,10 @@ async fn same_ops_inner() {
         ),
     ];
 
+    let mut final_height = 0;
     for (height, (origin, msg, moves)) in ops.into_iter().enumerate() {
         let height = height as u64 + 1;
+        final_height = height;
         let (n_before, w_before) = (root_of(&native), root_of(&wasm));
         native
             .submit_at(block(height, origin.clone()), msg.clone())
@@ -290,12 +300,9 @@ async fn same_ops_inner() {
             .await
             .expect("wasm submit");
 
-        // replies identical after every block (the whole read matrix).
-        assert_eq!(
-            replies(&native).await,
-            replies(&wasm).await,
-            "replies diverge after block {height}"
-        );
+        // the equivalence claim after every block: the wasm committed store
+        // is exactly {__root, __state} of the native canonical state.
+        assert_state_parity(&native, &wasm, height);
         // roots move in LOCKSTEP: a state-changing op moves both commit
         // boundaries, a no-op holds both...
         if moves {
@@ -309,34 +316,54 @@ async fn same_ops_inner() {
         assert_ne!(root_of(&native), root_of(&wasm));
     }
 
-    // decoded spot check on the wasm side: seq 1 was cleared; seq 2 is read;
-    // the producer follow-up carries the EMITTING module as source and the
+    // byte-level spot check on the shared final state (parity above pins the
+    // wasm side to these same bytes): seq 1 was cleared; seq 2 is read; the
+    // producer follow-up carries the EMITTING module as source and the
     // causing block's consensus time; the anonymous external reads "ext:";
-    // the post-clear delivery took seq 5 (next_seq never rewinds).
-    let alice_items = list(&wasm, "alice").await;
-    let seqs: Vec<u64> = alice_items.iter().map(|n| n.seq).collect();
-    assert_eq!(seqs, [2, 3, 4, 5], "seq 1 cleared, next_seq preserved");
-    assert!(alice_items[0].read, "seq 2 was marked read");
-    assert_eq!(alice_items[0].source, "system");
-    assert_eq!(alice_items[1].source, "producer", "module-origin source");
-    assert_eq!(alice_items[1].created_at, 1_004, "the causing block's time");
-    assert!(!alice_items[1].read);
-    assert_eq!(alice_items[2].source, "ext:", "anonymous external source");
-    assert_eq!(alice_items[3].body, "after clear");
-    assert_eq!(unread(&wasm, "alice").await, 3, "seq 3,4,5 remain unread");
-    let bob_items = list(&wasm, "bob").await;
-    assert_eq!(bob_items.len(), 1);
+    // the post-clear delivery took seq 5 (next_seq never rewinds); bob's
+    // source is ext: + lowercase hex of the submitter key.
+    let bob_source = format!("ext:{}", "b2".repeat(32));
+    let expected = snapshot_bytes(&[
+        (
+            "alice",
+            6,
+            &[
+                (2, "reply", "yo", "system", 1_002, true),
+                (3, "event", "produced", "producer", 1_004, false),
+                (4, "note", "self-note", "ext:", 1_005, false),
+                (5, "followup", "after clear", "system", 1_011, false),
+            ],
+        ),
+        (
+            "bob",
+            2,
+            &[(1, "mention", "sup", bob_source.as_str(), 1_003, false)],
+        ),
+    ]);
     assert_eq!(
-        bob_items[0].source,
-        format!("ext:{}", "b2".repeat(32)),
-        "external source is ext: + lowercase hex of the submitter key"
+        native_snapshot(&native, final_height),
+        expected,
+        "the committed image diverged from the op sequence's expected state"
     );
 
-    // queries are read-only on the wasm side too: the root is STABLE across
-    // the whole read matrix.
-    let settled = root_of(&wasm);
-    let _ = replies(&wasm).await;
-    assert_eq!(root_of(&wasm), settled, "a query moved the wasm root");
+    // the read surface is GONE on both runtimes alike: the native module
+    // answers QueryUnsupported and the port refuses too (its wit rendering is
+    // its own business; the refusal is the parity claim) — and neither
+    // refusal moves a root.
+    let (n_settled, w_settled) = (root_of(&native), root_of(&wasm));
+    let n_err = native
+        .query("inbox", b"{}")
+        .await
+        .expect_err("the native inbox must refuse queries");
+    assert!(
+        matches!(n_err, Error::QueryUnsupported),
+        "native refusal shape: {n_err:?}"
+    );
+    wasm.query("inbox", b"{}")
+        .await
+        .expect_err("the wasm inbox must refuse queries");
+    assert_eq!(root_of(&native), n_settled, "a refused query moved the native root");
+    assert_eq!(root_of(&wasm), w_settled, "a refused query moved the wasm root");
 }
 
 #[test]
@@ -357,6 +384,7 @@ async fn rejections_inner() {
         .await
         .expect("seed deliver");
     }
+    assert_state_parity(&native, &wasm, 1);
 
     // the rejection matrix: every cap-violation family the native module
     // rejects at execute, plus a malformed payload (the decode seam). each
@@ -413,10 +441,11 @@ async fn rejections_inner() {
             "wasm reason must carry the native reason: {w_msg}"
         );
 
-        // abort leaves no trace: both roots byte-identical to pre-block.
+        // abort leaves no trace: both roots byte-identical to pre-block, and
+        // the wasm store still the ported derivation of the native bytes.
         assert_eq!(root_of(&native), n_before, "native root moved on reject");
         assert_eq!(root_of(&wasm), w_before, "wasm root moved on reject");
-        assert_eq!(replies(&native).await, replies(&wasm).await);
+        assert_state_parity(&native, &wasm, height);
     }
 }
 
@@ -429,6 +458,7 @@ async fn multi_dispatch_inner() {
     let mut native = native_host();
     let mut wasm = wasm_host_();
     let (alice, carol) = (key(0xA1), key(0xC3));
+    let alice_source = format!("ext:{}", "a1".repeat(32));
 
     // ONE block, three ops: the second delivery's seq assignment READS the
     // first op's staged write (next_seq only exists in this block's overlay),
@@ -469,15 +499,19 @@ async fn multi_dispatch_inner() {
             out.members
         );
     }
-    assert_eq!(replies(&native).await, replies(&wasm).await);
-    for host in [&native, &wasm] {
-        let items = list(host, "alice").await;
-        let seqs: Vec<u64> = items.iter().map(|n| n.seq).collect();
-        assert_eq!(seqs, [1, 2], "the second dispatch saw the staged next_seq");
-        assert!(items[0].read, "the third dispatch acked the staged item");
-        assert!(!items[1].read);
-        assert_eq!(unread(host, "alice").await, 1);
-    }
+    // the committed image pins the staged read-your-writes: the second
+    // dispatch saw the staged next_seq (seq 2, not a reused 1) and the third
+    // acked the item that only existed staged (seq 1 read) — identically on
+    // the wasm side via the ported-root derivation.
+    let alice_items: &[ItemBytes] = &[
+        (1, "k", "first", alice_source.as_str(), 1_001, true),
+        (2, "k", "second", alice_source.as_str(), 1_001, false),
+    ];
+    assert_eq!(
+        native_snapshot(&native, 1),
+        snapshot_bytes(&[("alice", 3, alice_items)])
+    );
+    assert_state_parity(&native, &wasm, 1);
 
     // ONE block where the SECOND member rejects: the runtime aborts the staged
     // overlay and replays the accepted member — committed state must equal the
@@ -502,13 +536,21 @@ async fn multi_dispatch_inner() {
         assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
         assert!(matches!(out.members[1], MemberOutcome::Rejected { .. }));
     }
-    // the accepted member landed (roots moved), the rejected one left nothing.
+    // the accepted member landed (roots moved), the rejected one left nothing:
+    // bob holds exactly the accepted "ok" delivery.
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
-    assert_eq!(replies(&native).await, replies(&wasm).await);
-    for host in [&native, &wasm] {
-        let items = list(host, "bob").await;
-        assert_eq!(items.len(), 1, "a rejected member must leave no trace");
-        assert_eq!(items[0].body, "ok");
-    }
+    assert_eq!(
+        native_snapshot(&native, 2),
+        snapshot_bytes(&[
+            ("alice", 3, alice_items),
+            (
+                "bob",
+                2,
+                &[(1, "k", "ok", alice_source.as_str(), 1_002, false)]
+            ),
+        ]),
+        "a rejected member must leave no trace"
+    );
+    assert_state_parity(&native, &wasm, 2);
 }

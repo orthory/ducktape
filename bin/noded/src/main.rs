@@ -130,20 +130,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let actor_handle = handle.clone();
 
     // the node-local, off-chain interactive terminal-session plane (lives in the
-    // daemon like the stream hub — never consensus). Podman-only: interactive
-    // spawn refuses the Direct backend, so this is available ONLY when the
-    // operator configured a sandbox image (DUCKTAPE_SANDBOX_IMAGE); with none,
-    // create returns a clear error rather than a Direct spawn. The identity +
+    // daemon like the stream hub — never consensus). Available ONLY when the
+    // operator configured a sandbox (DUCKTAPE_SANDBOX_IMAGE); with none there
+    // is no compute plane and create returns a clear error — a bare spawn is
+    // unrepresentable. The identity +
     // agent dirs mirror the oracle pool's (ORACLE_ORIGIN, AgentDirs under
     // <storage>). The manager shares the StreamHub's terminal ring so its pump
     // appends where the ws catch-up reads.
     let term_ring = handle.stream_hub().terminals();
     let term_cmd_ring = handle.stream_hub().term_commands();
-    let interactive = noded::term::discover_interactive(
-        ORACLE_ORIGIN,
-        capability_host::AgentDirs::under(&storage),
-        noded::term::backend_from_env(),
-    );
+    let interactive = noded::term::backend_from_env().and_then(|backend| {
+        noded::term::discover_interactive(
+            ORACLE_ORIGIN,
+            capability_host::AgentDirs::under(&storage),
+            backend,
+        )
+    });
     tracing::info!(
         target: "ducktape::term",
         enabled = interactive.is_some(),
@@ -322,6 +324,20 @@ fn run_node(
         let metrics = NodeMetrics::register(&context);
         metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
 
+        // the observability cell: this single-writer loop is the ONE
+        // publisher; the status/peers routes read the cell without crossing
+        // the command lane, operations overlay live from the metrics, and
+        // /metrics + the ws metrics topic encode the registry through the
+        // wired exposition source. no mesh identity here — the peers
+        // standing stays role-less, and the sample parses honestly empty.
+        let status = node_handle.status_cell();
+        status.wire_metrics(&metrics);
+        // `Context` has no Clone; a child shares the SAME registry (the
+        // label only prefixes new registrations), so its encode() serves
+        // the identical exposition.
+        let exposition_context = context.child("exposition");
+        status.wire_exposition(move || exposition_context.encode());
+
         // OFF-LOOP execution: the pool gates effects inline but runs the
         // provider CLI on spawned tasks; a completed run re-enters as a
         // Submit command on `oracle_cmds`, so this serial command loop
@@ -376,6 +392,9 @@ fn run_node(
                 );
             }
         }
+        // the boot snapshot: resumed (or genesis) state serves immediately —
+        // /v1/status answers before the first command, never behind it.
+        publish_status(&status, &metrics, &index, &host, height);
         while let Some(cmd) = cmds.next().await {
             match cmd {
                 NodeCommand::Submit {
@@ -396,6 +415,7 @@ fn run_node(
                         Msg { target, payload },
                     )
                     .await;
+                    publish_status(&status, &metrics, &index, &host, height);
                     let _ = reply.send(result); // caller may have hung up
                 }
                 NodeCommand::SubmitFrame { frame, reply } => {
@@ -435,6 +455,7 @@ fn run_node(
                         // embedder-side producer on the command lane.
                         Err(err) => Err(err.to_string()),
                     };
+                    publish_status(&status, &metrics, &index, &host, height);
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
@@ -443,64 +464,6 @@ fn run_node(
                         .await
                         .map_err(|err| err.to_string());
                     let _ = reply.send(result);
-                }
-                NodeCommand::Status { reply } => {
-                    metrics.update_storage(
-                        0,
-                        index.is_poisoned(),
-                        MODULE_IDS.iter().map(|id| {
-                            (
-                                (*id).to_string(),
-                                index.applied_height(id).unwrap_or_default(),
-                            )
-                        }),
-                    );
-                    let modules = MODULE_IDS
-                        .iter()
-                        .map(|id| ModuleStatus {
-                            id: (*id).into(),
-                            root: host
-                                .module_root(id)
-                                .map(|root| hex_root(&root))
-                                .unwrap_or_default(),
-                            category: ModuleCategory::of(id),
-                        })
-                        .collect();
-                    let _ = reply.send(NodeStatus {
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        root_hash: hex_root(&host.root_hash()),
-                        height,
-                        modules,
-                        // the embedded daemon has no mesh identity — clients
-                        // treat an empty key as "no peer-routed features here".
-                        public_key: String::new(),
-                        operations: metrics.operational_status(),
-                    });
-                }
-                NodeCommand::Peers { reply } => {
-                    // the embedded daemon has no mesh, so the exposition
-                    // carries no peer families and the honest sample is empty;
-                    // no consensus either, so the epoch stays absent.
-                    let _ = reply.send(noded::peers::peers_from_exposition(
-                        &context.encode(),
-                        unix_millis(),
-                        height,
-                        None,
-                    ));
-                }
-                NodeCommand::Metrics { reply } => {
-                    metrics.update_storage(
-                        0,
-                        index.is_poisoned(),
-                        MODULE_IDS.iter().map(|id| {
-                            (
-                                (*id).to_string(),
-                                index.applied_height(id).unwrap_or_default(),
-                            )
-                        }),
-                    );
-                    // the context owns the registry; encode it to OpenMetrics text.
-                    let _ = reply.send(context.encode());
                 }
             }
         }
@@ -618,6 +581,52 @@ impl host::worker::Lane for OracleLane<'_> {
     async fn pending(&self) -> bool {
         self.host.has_pending_deliveries().await
     }
+}
+
+/// assemble and publish the `/v1/status` snapshot for this single-writer
+/// lane: at boot, then after every command that can move state. the storage
+/// section rides along so index watermarks stay current with the boundary.
+fn publish_status(
+    status: &noded::StatusCell,
+    metrics: &NodeMetrics,
+    index: &IndexStore,
+    host: &Host,
+    height: u64,
+) {
+    metrics.update_storage(
+        0,
+        index.is_poisoned(),
+        MODULE_IDS.iter().map(|id| {
+            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+        }),
+    );
+    let modules = MODULE_IDS
+        .iter()
+        .map(|id| ModuleStatus {
+            id: (*id).into(),
+            root: host
+                .module_root(id)
+                .map(|root| hex_root(&root))
+                .unwrap_or_default(),
+            category: ModuleCategory::of(id),
+        })
+        .collect();
+    status.publish(NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash: hex_root(&host.root_hash()),
+        height,
+        modules,
+        // the embedded daemon has no mesh identity — clients treat an empty
+        // key as "no peer-routed features here".
+        public_key: String::new(),
+        operations: metrics.operational_status(),
+    });
+    // no mesh, no consensus: the standing carries only the height — the
+    // peers route parses an honestly empty sample with no roles or epoch.
+    status.publish_peers(noded::PeersStanding {
+        height,
+        ..Default::default()
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

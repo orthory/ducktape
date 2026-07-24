@@ -96,7 +96,7 @@ use sha2::Digest as _;
 // the shared host↔guest vocabulary: key conventions + the borsh op-row
 // envelope. re-exported so every host-side consumer names them through this
 // crate, exactly as before the wasm cutover.
-pub use index_guest::{META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key};
+pub use index_guest::{META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key, user_handle};
 
 /// key prefix of the per-block explorer rows in the internal blocks database.
 pub const BLOCK_PREFIX: &str = "blk/";
@@ -164,6 +164,10 @@ pub enum Error {
     /// a previous apply failed; the store refuses further writes until rebuilt.
     #[error("indexer: store is poisoned by an earlier apply failure — rebuild the index")]
     Poisoned,
+    /// a fold trigger reported a drain error with a backlog still pending —
+    /// the views cannot catch up to the feed without a rebuild.
+    #[error("indexer: fold stuck: {0}")]
+    FoldStuck(String),
     /// filesystem io in the shipping lane (fork archive reads, staged
     /// installs) — io this crate performs itself, outside the engine's own
     /// error surface.
@@ -184,25 +188,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 // outcome. deliberately NOT sdk/host types: the derived tier consumes an op
 // stream, it is not part of the consensus contract.
 // ============================================================================
-
-/// render an external submitter identity for display in a read model.
-///
-/// a `User` identity is a claimed display name on the embedded daemon (printable
-/// utf-8, e.g. `jess`) but a raw ed25519 public key on the networked node (32
-/// arbitrary bytes). printable utf-8 passes through as the name; anything else —
-/// control bytes, invalid utf-8, the common pubkey case — renders as lowercase
-/// hex, never the lossy `�` boxes `from_utf8_lossy` would leave. mirrors the
-/// client's `displayUserBytes`; the node layer renders EVERY external origin
-/// through this before it enters the feed, so guests never see raw key bytes.
-pub fn user_handle(bytes: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes)
-        && !text.is_empty()
-        && !text.chars().any(char::is_control)
-    {
-        return text.to_string();
-    }
-    hex(bytes)
-}
 
 /// one dispatch a finalized block applied: the target module, the trigger, and
 /// the op bytes. order within [`BlockOps::ops`] is drain order.
@@ -235,14 +220,6 @@ fn encode_row(height: u64, seq: u32, time: u64, op: &AppliedOp) -> Result<Vec<u8
         origin: op.origin.clone(),
         payload: op.payload.clone(),
     })?)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 /// the key of one block's explorer row, same fixed-width-hex ordering rule as
@@ -509,6 +486,41 @@ impl IndexStore {
             self.blocks.write(batch)?;
         }
         Ok(())
+    }
+
+    /// block until every folding module's trigger backlog is drained, so a
+    /// view read after this answers everything `apply_block` already fed.
+    /// the deterministic lanes' commit barrier: fluent31 drains folds on a
+    /// background runner, and a sim must not let a read (or the ws `changed`
+    /// event that prompts one) race it. mirrors fluent31's own
+    /// `wait_flushed` progress-wait idiom. `Err` = a fold failed with a
+    /// backlog still pending — the views cannot catch up.
+    pub fn wait_folds_drained(&self) -> Result<()> {
+        loop {
+            let mut pending = 0u64;
+            for (id, m) in &self.modules {
+                if !m.has_fold {
+                    continue;
+                }
+                let trigger = m
+                    .db
+                    .list_triggers()?
+                    .into_iter()
+                    .find(|t| t.name == FOLD_TRIGGER);
+                if let Some(t) = trigger
+                    && t.pending > 0
+                {
+                    if let Some(err) = t.last_error {
+                        return Err(Error::FoldStuck(format!("{id}: {err}")));
+                    }
+                    pending += t.pending;
+                }
+            }
+            if pending == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// store one explorer row at `height` WITHOUT a dispatch feed — the write

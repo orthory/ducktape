@@ -74,42 +74,6 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
                         serde_json::to_vec(&serde_json::json!({ "tasks": [] })).unwrap()
                     ));
                 }
-                NodeCommand::Status { reply } => {
-                    let _ = reply.send(NodeStatus {
-                        version: "9.9.9".into(),
-                        root_hash: "cd".repeat(32),
-                        height: 3,
-                        modules: vec![ModuleStatus {
-                            id: "chat".into(),
-                            root: "ef".repeat(32),
-                            category: ModuleCategory::of("chat"),
-                        }],
-                        public_key: "ab".repeat(32),
-                        operations: noded::OperationalStatus {
-                            role: noded::NodeRole::Validator,
-                            phase: noded::NodePhase::Validating,
-                            phase_since: 1_720_000_000,
-                            ..Default::default()
-                        },
-                    });
-                }
-                NodeCommand::Peers { reply } => {
-                    // answered as the real lanes answer it: a sample parsed
-                    // from an exposition — here one connected peer — stamped
-                    // with the fake's chain position.
-                    let _ = reply.send(noded::peers::peers_from_exposition(
-                        "network_tracker_directory_connected{peer=\"ab\"} 1000\n",
-                        2000,
-                        41,
-                        Some(7),
-                    ));
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(
-                        "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n"
-                            .to_string(),
-                    );
-                }
             }
         }
     });
@@ -372,8 +336,28 @@ async fn query_returns_the_decoded_module_reply() {
 
 #[tokio::test]
 async fn status_reports_root_hash_height_and_module_roots() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+    // deliberately NO actor: /v1/status serves the last-published snapshot
+    // straight off the handle's cell, so it must answer even when nothing
+    // drains the command lane — the wedged-behind-sync regression this cell
+    // exists to prevent.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    handle.status_cell().publish(NodeStatus {
+        version: "9.9.9".into(),
+        root_hash: "cd".repeat(32),
+        height: 3,
+        modules: vec![ModuleStatus {
+            id: "chat".into(),
+            root: "ef".repeat(32),
+            category: ModuleCategory::of("chat"),
+        }],
+        public_key: "ab".repeat(32),
+        operations: noded::OperationalStatus {
+            role: noded::NodeRole::Validator,
+            phase: noded::NodePhase::Validating,
+            phase_since: 1_720_000_000,
+            ..Default::default()
+        },
+    });
 
     let response = noded::router(handle)
         .oneshot(
@@ -401,8 +385,20 @@ async fn status_reports_root_hash_height_and_module_roots() {
 
 #[tokio::test]
 async fn peers_reports_the_direct_peer_sample() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+    // NO actor: the sample parses from the wired exposition source and the
+    // published standing — like status, peers must answer while a sync
+    // stage has the pump busy.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let cell = handle.status_cell();
+    cell.wire_exposition(|| {
+        "network_tracker_directory_connected{peer=\"ab\"} 1000\n".to_string()
+    });
+    cell.publish_peers(noded::PeersStanding {
+        validators: ["ab".to_string()].into(),
+        residents: Default::default(),
+        height: 41,
+        epoch: Some(7),
+    });
 
     let response = noded::router(handle)
         .oneshot(
@@ -416,18 +412,24 @@ async fn peers_reports_the_direct_peer_sample() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["sampled_at_ms"], 2000);
     assert_eq!(body["height"], 41);
     assert_eq!(body["epoch"], 7);
     assert_eq!(body["peers"][0]["peer"], "ab");
     assert_eq!(body["peers"][0]["connected"], true);
     assert_eq!(body["peers"][0]["connected_since_ms"], 1000);
+    assert_eq!(
+        body["peers"][0]["role"], "validator",
+        "the published standing stamps roles onto the live sample"
+    );
 }
 
 #[tokio::test]
 async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
-    spawn_fake_actor(cmd_rx, None);
+    // NO actor: the scrape reads the wired exposition source directly.
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    handle.status_cell().wire_exposition(|| {
+        "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n".to_string()
+    });
 
     let response = noded::router(handle)
         .oneshot(
@@ -454,7 +456,7 @@ async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
     let text = String::from_utf8(bytes.to_vec()).expect("metrics body is utf-8");
     assert!(
         text.contains("ducktape_blocks_total 3"),
-        "actor body passed through: {text:?}"
+        "the wired exposition passed through: {text:?}"
     );
 }
 

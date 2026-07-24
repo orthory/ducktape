@@ -21,8 +21,8 @@
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use pages::Pages;
 use pages::{
-    Block, BlockKind, NewBlock, PageMeta, PageMsg, PageQuery, PageReply, decode_reply, encode_msg,
-    encode_query,
+    Block, BlockKind, NewBlock, PageMsg, PageQuery, PageReply, ThreadView, decode_reply,
+    encode_msg, encode_query,
 };
 use sdk::{MerkleStore as _, Module, Msg, StateRoot};
 use sdk_testkit::TestCtx;
@@ -73,27 +73,15 @@ async fn get_page(p: &Pages, page_id: &str) -> Option<Vec<Block>> {
     }
 }
 
-async fn list_pages(p: &Pages) -> Vec<PageMeta> {
-    let mut pages = Vec::new();
-    let mut after = None;
-    loop {
-        let reply = p
-            .query(&encode_query(&PageQuery::ListPages {
-                after: after.clone(),
-                limit: 0,
-            }))
-            .await
-            .unwrap();
-        let page = match decode_reply(&reply).unwrap() {
-            PageReply::PageList(page) => page,
-            _ => panic!("expected PageList"),
-        };
-        pages.extend(page.pages);
-        let Some(next) = page.next_after else {
-            return pages;
-        };
-        assert_ne!(after.as_ref(), Some(&next), "page-list cursor must advance");
-        after = Some(next);
+/// the kept per-target cap probe — the dispatch read over the reserved
+/// target-index key (thread enumeration is index-tier now).
+async fn thread_count(p: &Pages, target: &str) -> u64 {
+    let q = PageQuery::TargetThreadCount {
+        target: target.into(),
+    };
+    match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
+        PageReply::TargetThreadCount(n) => n,
+        _ => panic!("expected TargetThreadCount"),
     }
 }
 
@@ -205,30 +193,30 @@ fn synced_store_reconstructs_source_root() {
         assert_eq!(page[1].text, "final");
 
         // the comment survived the sync too.
-        let page = match decode_reply(
+        let view = match decode_reply(
             &synced
-                .query(&encode_query(&PageQuery::CommentsForThread {
+                .query(&encode_query(&PageQuery::CommentThread {
                     thread_id: "th1".into(),
-                    from: 0,
-                    limit: 1,
                 }))
                 .await
                 .unwrap(),
         )
         .unwrap()
         {
-            PageReply::CommentPage(v) => v,
-            other => panic!("expected CommentPage, got {other:?}"),
+            PageReply::CommentThread(v) => v,
+            other => panic!("expected CommentThread, got {other:?}"),
         };
-        let page = page.expect("thread present after sync");
-        assert_eq!(page.comments.len(), 1);
-        assert_eq!(page.comments[0].comment.text, "review this");
+        let view: ThreadView = view.expect("thread present after sync");
+        assert_eq!(view.comments.len(), 1);
+        assert_eq!(view.comments[0].text, "review this");
+        // the reserved per-target thread index synced with it.
+        assert_eq!(thread_count(&synced, "b1").await, 1);
     });
 }
 
 // the enumeration INDEX is ordinary store state (a reserved sentinel key), so
-// it state-syncs like any block: a joiner that rebuilds a byte-identical root
-// reproduces the exact page set, titles included.
+// it state-syncs like any block: a joiner rebuilds a byte-identical root and
+// answers every kept query — each page's full tree — exactly like the source.
 #[test]
 fn synced_store_reproduces_the_page_index() {
     deterministic::Runner::default().start(|context| async move {
@@ -256,9 +244,9 @@ fn synced_store_reproduces_the_page_index() {
             },
         )
         .await;
-        let src_pages = list_pages(&src).await;
-        assert_eq!(src_pages.len(), 2);
-        assert_eq!(src_pages[0].id, "alpha");
+        // capture the source's answers to compare against the joiner's.
+        let src_alpha = get_page(&src, "alpha").await.expect("alpha exists");
+        let src_zebra = get_page(&src, "zebra").await.expect("zebra exists");
         let src_root = src.root();
 
         // reopen-as-raw handoff (see the header doc): target, then resolver.
@@ -272,13 +260,20 @@ fn synced_store_reproduces_the_page_index() {
             .expect("sync_from");
         let synced = Pages::new("dst", Box::new(store));
 
+        // the byte-identical root carries the sentinel page index with it, and
+        // the joiner answers the kept reads exactly like the source.
         assert_eq!(
-            list_pages(&synced).await,
-            src_pages,
-            "a synced store must reproduce the source's page index"
+            synced.root(),
+            src_root,
+            "synced store root must equal the source root"
         );
-        let page = get_page(&synced, "alpha").await.unwrap();
-        assert_eq!(page.len(), 2);
-        assert_eq!(page[1].id, "b1");
+        assert_eq!(
+            get_page(&synced, "alpha").await,
+            Some(src_alpha.clone()),
+            "a synced store must answer GetPage like the source"
+        );
+        assert_eq!(get_page(&synced, "zebra").await, Some(src_zebra));
+        assert_eq!(src_alpha.len(), 2);
+        assert_eq!(src_alpha[1].id, "b1");
     });
 }

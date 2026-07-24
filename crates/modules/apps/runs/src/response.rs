@@ -936,35 +936,31 @@ impl RunsModule {
         let reply = ctx
             .query(
                 pages,
-                &pages::encode_query(&pages::PageQuery::CommentsForThread {
+                &pages::encode_query(&pages::PageQuery::CommentThread {
                     thread_id: thread_id.to_string(),
-                    from: 0,
-                    limit: 1,
                 }),
             )
             .await
             .map_err(|e| format!("pages thread lookup failed: {e}"))?;
-        let page = match pages::decode_reply(&reply) {
-            Ok(pages::PageReply::CommentPage(Some(page))) => page,
+        let view = match pages::decode_reply(&reply) {
+            Ok(pages::PageReply::CommentThread(Some(view))) => view,
             _ => return Err(format!("pages thread is missing: {thread_id}")),
         };
-        let thread_cap_reached = usize::try_from(page.thread.comment_count)
-            .map_or(true, |count| count >= pages::MAX_COMMENTS_PER_THREAD);
-        if thread_cap_reached {
+        if view.thread.comment_ids.len() >= pages::MAX_COMMENTS_PER_THREAD {
             return Err(format!("pages comment thread is full: {thread_id}"));
         }
         let target_reply = ctx
             .query(
                 pages,
                 &pages::encode_query(&pages::PageQuery::GetBlock {
-                    block_id: page.thread.target.clone(),
+                    block_id: view.thread.target.clone(),
                 }),
             )
             .await
             .map_err(|e| format!("pages target lookup failed: {e}"))?;
         let target = match pages::decode_reply(&target_reply) {
             Ok(pages::PageReply::Block(Some(block))) => block,
-            _ => return Err(format!("pages target is missing: {}", page.thread.target)),
+            _ => return Err(format!("pages target is missing: {}", view.thread.target)),
         };
         let agent = self
             .agent_for_run(ctx, entry)
@@ -1004,7 +1000,7 @@ impl RunsModule {
             payload: pages::encode_msg(&pages::PageMsg::AddComment {
                 thread_id: thread_id.to_string(),
                 comment_id,
-                target: page.thread.target,
+                target: view.thread.target,
                 text,
                 anchor: None,
                 mentions: Vec::new(),

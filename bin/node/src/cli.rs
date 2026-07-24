@@ -305,7 +305,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // coordinator default `apply_primary_coordinator` bakes into the
     // descriptor, so the two never silently disagree (see `docs`:
     // coordinator is ambient, node-local).
-    let plumbing = config::merged_plumbing(
+    let mut plumbing = config::merged_plumbing(
         &dir,
         net.listen.as_deref(),
         net.advertised.as_deref(),
@@ -317,6 +317,24 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
+    // `--compute` founds a workstation node: a [sandbox] table (podman on
+    // Linux, tart on macOS — chosen for the platform init runs on) and the
+    // capability announce. A plain consensus node has no [sandbox] table and
+    // no compute plane at all.
+    if args.compute {
+        let (runtime, image) = if cfg!(target_os = "macos") {
+            ("tart", config::DEFAULT_TART_IMAGE)
+        } else {
+            ("podman", config::DEFAULT_PODMAN_IMAGE)
+        };
+        plumbing.sandbox = Some(config::SandboxToml {
+            runtime: runtime.into(),
+            image: image.into(),
+            cores: 0,
+            mem_gb: 0,
+        });
+        plumbing.announce_capabilities = true;
+    }
 
     let me = key.public_key();
     let mut descriptor = config::NetworkDescriptor {

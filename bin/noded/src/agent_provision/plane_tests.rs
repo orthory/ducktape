@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use dispatch_oracle::{RoMount, WorkspaceProvisioner as _, WorkspaceSource, WorkspaceSpec};
+use dispatch_host::{RoMount, WorkspaceProvisioner as _, WorkspaceSource, WorkspaceSpec};
 use duckfs_client::chunk::{chunk_ids, file_object_id};
 use duckfs_core::{
     EntryInfo, EntryKindWire, FilesQuery, FilesReply, RefsInfo, decode_query, encode_reply,
@@ -127,7 +127,6 @@ fn spawn_session_actor(
                     ));
                     let _ = reply.send(Ok(committed_block()));
                 }
-                _ => panic!("the stand-in session actor got an unexpected command"),
             }
         }
     });

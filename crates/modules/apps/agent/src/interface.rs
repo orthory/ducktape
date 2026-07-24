@@ -60,7 +60,7 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// line in the assembled context document, and an `Always` one costs its whole
 /// body. [`MAX_AGENT_RECORD_BYTES`] bounds the BYTES and usually bites first;
 /// this bounds the SHAPE, and it is the same number the host-side assembler
-/// checks (`dispatch_oracle::assemble_context_doc`) — one rule, not two that
+/// checks (`dispatch_host::assemble_context_doc`) — one rule, not two that
 /// could drift into a record consensus accepts but no run can load.
 ///
 /// deliberately generous, because curation is not the only door: an uncurated

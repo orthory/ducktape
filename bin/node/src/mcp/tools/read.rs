@@ -22,7 +22,6 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
 use agent::{AgentQuery, CapRequest};
-use chat::ChatQuery;
 use forge::ForgeQuery;
 use pages::PageQuery;
 use runs::RunsQuery;
@@ -247,18 +246,18 @@ fn runs_list(run: &Run, args: &Value) -> Result<Value> {
 }
 
 fn chat_channels(run: &Run, _args: &Value) -> Result<Value> {
-    run.node.query(TARGET_CHAT, encode(&ChatQuery::Channels)?)
+    run.node.view(TARGET_CHAT, json!({"channels": {}}))
 }
 
 fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
     let limit = opt_u64(args, "limit")
         .unwrap_or(DEFAULT_READ_LIMIT)
         .min(MAX_READ_LIMIT);
-    let query = ChatQuery::MessagesLatest {
-        channel_id: arg_str(args, "channel_id")?,
-        limit,
-    };
-    run.node.query(TARGET_CHAT, encode(&query)?)
+    let query = json!({"messages_latest": {
+        "channel_id": arg_str(args, "channel_id")?,
+        "limit": limit,
+    }});
+    run.node.view(TARGET_CHAT, query)
 }
 
 fn tasks_list(run: &Run, _args: &Value) -> Result<Value> {
@@ -267,11 +266,10 @@ fn tasks_list(run: &Run, _args: &Value) -> Result<Value> {
 }
 
 fn pages_list(run: &Run, args: &Value) -> Result<Value> {
-    let query = PageQuery::ListPages {
-        after: page_cursor(args)?,
-        limit: page_limit(args)?,
-    };
-    run.node.query(TARGET_PAGES, encode(&query)?)
+    run.node.view(
+        TARGET_PAGES,
+        json!({"list_pages": {"after": page_cursor(args)?, "limit": page_limit(args)?}}),
+    )
 }
 
 fn page_get(run: &Run, args: &Value) -> Result<Value> {
@@ -488,8 +486,14 @@ mod tests {
     fn queries_encode_to_the_modules_own_wire_shapes() {
         // the guard against this file drifting from the module interfaces: if
         // chat renames a variant, this fails here rather than in front of a
-        // model.
-        assert_eq!(encode(&ChatQuery::Channels).unwrap(), json!("channels"));
+        // model. chat's tools speak the index-tier view wire, so their json
+        // literals must DECODE as chat's own view enum.
+        serde_json::from_value::<chat::index::ChatViewQuery>(json!({"channels": {}}))
+            .expect("the channels view literal is chat's view wire");
+        serde_json::from_value::<chat::index::ChatViewQuery>(
+            json!({"messages_latest": {"channel_id": "c", "limit": 5}}),
+        )
+        .expect("the messages_latest view literal is chat's view wire");
         assert_eq!(encode(&AgentQuery::Agents).unwrap(), json!("agents"));
         assert_eq!(
             encode(&RunsQuery::PendingRuns).unwrap(),
@@ -498,14 +502,6 @@ mod tests {
         assert_eq!(
             encode(&RunsQuery::RecentRuns).unwrap(),
             json!("recent_runs")
-        );
-        assert_eq!(
-            encode(&ChatQuery::MessagesLatest {
-                channel_id: "c".into(),
-                limit: 5,
-            })
-            .unwrap(),
-            json!({"messages_latest": {"channel_id": "c", "limit": 5}})
         );
         assert_eq!(
             encode(&ForgeQuery::PrDiff {
@@ -519,23 +515,10 @@ mod tests {
             encode(&WorkQuery::Task(TaskQuery::List)).unwrap(),
             json!({"task": "list"})
         );
-        assert_eq!(
-            encode(&PageQuery::ListPages {
-                after: Some("page-8".into()),
-                limit: 8,
-            })
-            .unwrap(),
-            json!({"list_pages": {"after": "page-8", "limit": 8}})
-        );
-        assert_eq!(
-            encode(&PageQuery::GetPage {
-                page_id: "page-9".into(),
-                after: Some("block-8".into()),
-                limit: 8,
-            })
-            .unwrap(),
-            json!({"get_page": {"page_id": "page-9", "after": "block-8", "limit": 8}})
-        );
+        serde_json::from_value::<pages::index::PagesViewQuery>(
+            json!({"list_pages": {"after": "page-8", "limit": 8}}),
+        )
+        .expect("the list_pages view literal is pages' view wire");
         assert_eq!(
             encode(&ForgeQuery::GetItem {
                 repo: "app".into(),

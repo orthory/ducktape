@@ -1,6 +1,8 @@
 //! the inbox module's public wire surface — types only.
 //!
-//! writes go via [`InboxMsg`]; reads via [`InboxQuery`] -> [`InboxReply`]. the
+//! writes go via [`InboxMsg`]; the read surface (paged lists, unread counts)
+//! lives on the derived tier (`src/index.rs`), not here — the module serves no
+//! queries. the
 //! inbox holds per-member notification queues as consensus state: other modules
 //! deliver notifications as follow-up ops, so a notification commits atomically
 //! with the event that caused it (platform promise P2), and no external push
@@ -29,8 +31,6 @@ pub const MAX_ITEMS_PER_MEMBER: usize = 4096;
 /// distinct members bound; a delivery that would introduce a new member beyond
 /// this is rejected.
 pub const MAX_MEMBERS: usize = 65536;
-/// query page bound; larger limits are clamped down to this.
-pub const MAX_QUERY_LIMIT: u64 = 256;
 
 /// one delivered notification. `seq` is assigned per member, monotonic and
 /// gap-free within what was ever assigned (a `Clear` removes items but never
@@ -70,47 +70,10 @@ pub enum InboxMsg {
     Clear { member: String, up_to_seq: u64 },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum InboxQuery {
-    /// items for `member`, ascending by seq starting at `from_seq`, at most
-    /// `limit` (clamped to [`MAX_QUERY_LIMIT`]).
-    List {
-        member: String,
-        from_seq: u64,
-        limit: u64,
-    },
-    /// count of unread items for `member`.
-    Unread { member: String },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum InboxReply {
-    Items(Vec<Notification>),
-    UnreadCount(u64),
-}
-
 pub fn encode_msg(m: &InboxMsg) -> Vec<u8> {
     sdk::wire::encode(m)
 }
 
 pub fn decode_msg(b: &[u8]) -> Result<InboxMsg, String> {
-    sdk::wire::decode(b)
-}
-
-pub fn encode_query(q: &InboxQuery) -> Vec<u8> {
-    sdk::wire::encode(q)
-}
-
-pub fn decode_query(b: &[u8]) -> Result<InboxQuery, String> {
-    sdk::wire::decode(b)
-}
-
-pub fn encode_reply(r: &InboxReply) -> Vec<u8> {
-    sdk::wire::encode(r)
-}
-
-pub fn decode_reply(b: &[u8]) -> Result<InboxReply, String> {
     sdk::wire::decode(b)
 }

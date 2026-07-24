@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capability_host::{ProviderSet, RunCancellation};
+use capability_host::{AirlockConfig, ProviderSet, RunCancellation};
 use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
 use sdk::{Event, Msg};
@@ -75,6 +75,47 @@ pub fn max_concurrent_runs_from_env() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_CONCURRENT_RUNS)
+}
+
+/// Resolve a run's named gateway credential into a self-host broker source, on
+/// the node that will execute the run. Implemented by the node binary (the only
+/// place the committed-query lane and the overlay gateway are reachable); the
+/// pool holds it behind this seam so credential-less runs and unit tests need no
+/// node. A resolve `Err` (unknown credential, non-account origin, ungranted
+/// account) fails the attempt BEFORE any provider spawns — the paid call never
+/// happens for a refused credential.
+#[async_trait::async_trait]
+pub trait CredentialResolver: Send + Sync {
+    async fn resolve(&self, credential: &str, saga_id: &str) -> Result<Resolved, String>;
+}
+
+/// A resolved credential: the self-host airlock config the broker draws on. The
+/// grant subject (the account the run acts on behalf of) rides INSIDE the
+/// config, so the broker's sealed session names it to the owner's gateway.
+pub struct Resolved {
+    pub airlock: AirlockConfig,
+}
+
+pub type SharedCredentialResolver = Arc<dyn CredentialResolver>;
+
+/// Resolve the run's named credential (if any) into the run context's airlock,
+/// on the executing node. A credential with no resolver wired, or a resolver
+/// refusal, fails the attempt — the caller turns the `Err` into the saga's
+/// `OracleResult(Err)` for this attempt, with no provider spawn.
+async fn resolve_credential_into(
+    prepared: &mut crate::envelope::Prepared,
+    saga_id: &str,
+    resolver: &Option<SharedCredentialResolver>,
+) -> Result<(), String> {
+    let Some(name) = prepared.credential.take() else {
+        return Ok(());
+    };
+    let Some(resolver) = resolver else {
+        return Err("this node has no credential resolver".into());
+    };
+    let resolved = resolver.resolve(&name, saga_id).await?;
+    prepared.ctx.airlock = Some(resolved.airlock);
+    Ok(())
 }
 
 fn run_key_for(saga_id: &str) -> String {
@@ -187,6 +228,11 @@ pub struct DispatchPool {
     /// reserves before the semaphore acquire. `Arc`-wrapped so the spawned
     /// task can hold its own cheap clone alongside `providers`.
     ledger: Arc<ResourceLedger>,
+    /// resolves a run's named gateway credential into a self-host broker source
+    /// on THIS node. `None` on a node with no resolver wired (tests, an embedder
+    /// that never lends credentials) — a run carrying a credential name then
+    /// fails loudly rather than silently running on the host's own source.
+    credential_resolver: Option<SharedCredentialResolver>,
 }
 
 impl DispatchPool {
@@ -235,7 +281,17 @@ impl DispatchPool {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             provisioner,
             ledger: Arc::new(ResourceLedger::new(capacity)),
+            credential_resolver: None,
         }
+    }
+
+    /// Wire the node's credential resolver (chainable). Kept off the
+    /// constructors' positional lists so the many `with_limit`/`new` call sites
+    /// stay untouched; a node calls this once at build time. Absent = a run that
+    /// names a credential fails resolve (no host-source fallback).
+    pub fn with_credential_resolver(mut self, resolver: SharedCredentialResolver) -> Self {
+        self.credential_resolver = Some(resolver);
+        self
     }
 
     /// how many attempts are executing (or queued for the semaphore) right
@@ -261,6 +317,7 @@ impl DispatchPool {
         let inflight = self.inflight.clone();
         let ledger = self.ledger.clone();
         let provisioner = self.provisioner.clone();
+        let credential_resolver = self.credential_resolver.clone();
         let executing_node = capability_host::execution_node_id(&self.node_key);
         let owner_spawn = self.spawn.clone();
         let attempt_guard = AttemptTaskGuard {
@@ -403,17 +460,31 @@ impl DispatchPool {
                                             prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
                                                 prepared.ctx.executing_node = Some(executing_node);
                                                 prepared.ctx.limits = job.demands.clone();
-                                            prepared.ctx.cancellation = Some(cancellation.clone());
-                                                execute(
-                                                    &job,
-                                                    prepared,
-                                                    provider,
-                                                    &provisioner,
-                                                    &cancellation,
-                                                    permit,
+                                                prepared.ctx.cancellation =
+                                                    Some(cancellation.clone());
+                                                // resolve a named credential into
+                                                // ctx.airlock BEFORE the provider
+                                                // spawns: a refusal fails the
+                                                // attempt with no paid call.
+                                                match resolve_credential_into(
+                                                    &mut prepared,
+                                                    &job.saga_id,
+                                                    &credential_resolver,
                                                 )
                                                 .await
-                                                .map_err(clean_error)
+                                                {
+                                                    Ok(()) => execute(
+                                                        &job,
+                                                        prepared,
+                                                        provider,
+                                                        &provisioner,
+                                                        &cancellation,
+                                                        permit,
+                                                    )
+                                                    .await
+                                                    .map_err(clean_error),
+                                                    Err(error) => Err(clean_error(error)),
+                                                }
                                             }
                                             Err(error) => Err(clean_error(error)),
                                     },
@@ -539,6 +610,9 @@ async fn execute(
         input,
         mut ctx,
         workspace: plan,
+        // the credential name was consumed by the pool's resolver seam (it set
+        // `ctx.airlock`) before this executor ran.
+        credential: _,
     } = prepared;
     // the REQUESTED sink (Chain when the envelope carried none) — echoed on
     // the assembled RunnerResult below so runs' delivery can route it.
@@ -1124,6 +1198,134 @@ format = "text"
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// a canned resolver: either a fixed `Resolved` or a fixed error string.
+    /// Records whether it was consulted so a credential-less run can prove it was
+    /// never asked to resolve.
+    struct FixedResolver {
+        outcome: Result<AirlockConfig, String>,
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl FixedResolver {
+        fn ok(airlock: AirlockConfig) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let seen = Arc::new(AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    outcome: Ok(airlock),
+                    seen: seen.clone(),
+                }),
+                seen,
+            )
+        }
+
+        fn err(reason: &str) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let seen = Arc::new(AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    outcome: Err(reason.to_string()),
+                    seen: seen.clone(),
+                }),
+                seen,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialResolver for FixedResolver {
+        async fn resolve(&self, _credential: &str, _saga_id: &str) -> Result<Resolved, String> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone().map(|airlock| Resolved { airlock })
+        }
+    }
+
+    /// a self-host airlock config to hand a resolver in tests — its internals are
+    /// opaque here (private fields), so tests only assert that SOME config
+    /// reached the run context.
+    fn sample_airlock() -> AirlockConfig {
+        AirlockConfig::self_host(&capability_host::ResolvedCredential {
+            name: "jess-fable-1".into(),
+            kind: capability_host::CredentialKind::Claude,
+            authority: "airlock.owner.duck".into(),
+            via: "http://127.0.0.1:0".into(),
+            seal_pk: [7u8; 32],
+            account: b"acct".to_vec(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_credential_envelope_resolves_into_the_run_context() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (resolver, seen) = FixedResolver::ok(sample_airlock());
+        let (pool, mut rx) = pool_with(providers, 1);
+        let pool = pool.with_credential_resolver(resolver);
+        let payload = crate::envelope::compose_headless("sched\u{1f}d1", "hi", Some("jess-fable-1"))
+            .into_bytes();
+        pool.run(&effect_with_payload("s1", 0, Some(b"me"), &payload))
+            .await
+            .unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        outcome.expect("the resolved run completes");
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "the resolver was consulted");
+        let (_input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert!(ctx.airlock.is_some(), "the resolved airlock reached the run");
+    }
+
+    #[tokio::test]
+    async fn a_resolver_refusal_fails_the_run_without_spawning() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (resolver, _seen) = FixedResolver::err("credential_not_granted");
+        let (pool, mut rx) = pool_with(providers, 1);
+        let pool = pool.with_credential_resolver(resolver);
+        let payload =
+            crate::envelope::compose_headless("sched\u{1f}d2", "hi", Some("missing")).into_bytes();
+        pool.run(&effect_with_payload("s2", 0, Some(b"me"), &payload))
+            .await
+            .unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        assert!(
+            outcome.unwrap_err().contains("credential_not_granted"),
+            "the refusal is the attempt's result"
+        );
+        assert_eq!(
+            probes.executions.load(Ordering::SeqCst),
+            0,
+            "a refused credential never launches a provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_with_no_resolver_wired_fails_the_run() {
+        // a node that wired no resolver cannot honor a credential name; it must
+        // fail loudly rather than run the guest on the host's own source.
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (pool, mut rx) = pool_with(providers, 1);
+        let payload =
+            crate::envelope::compose_headless("sched\u{1f}d3", "hi", Some("jess")).into_bytes();
+        pool.run(&effect_with_payload("s3", 0, Some(b"me"), &payload))
+            .await
+            .unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        assert!(outcome.unwrap_err().contains("no credential resolver"));
+        assert_eq!(probes.executions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_credential_less_run_never_consults_the_resolver() {
+        let (providers, probes) = slow_providers(Duration::from_millis(5), false);
+        let (resolver, seen) = FixedResolver::ok(sample_airlock());
+        let (pool, mut rx) = pool_with(providers, 1);
+        let pool = pool.with_credential_resolver(resolver);
+        // an ordinary (credential-less) envelope.
+        pool.run(&effect_with_payload("s4", 0, Some(b"me"), &envelope_payload()))
+            .await
+            .unwrap();
+        let (_, _, outcome) = next_result(&mut rx).await;
+        outcome.expect("an ordinary run completes untouched");
+        assert_eq!(seen.load(Ordering::SeqCst), 0, "the resolver is not consulted");
+        let (_input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
+        assert!(ctx.airlock.is_none(), "no credential ⇒ no airlock override");
     }
 
     #[test]

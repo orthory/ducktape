@@ -284,17 +284,15 @@ impl RunsModule {
         let reply = ctx
             .query(
                 pages,
-                &pages_encode_query(&PageQuery::CommentsForThread {
+                &pages_encode_query(&PageQuery::CommentThread {
                     thread_id: thread_id.clone(),
-                    from: 0,
-                    limit: 1,
                 }),
             )
             .await
             .map_err(|e| format!("pages thread lookup failed: {e}"))?;
         match pages::decode_reply(&reply) {
-            Ok(PageReply::CommentPage(None)) => {}
-            Ok(PageReply::CommentPage(Some(_))) => {
+            Ok(PageReply::CommentThread(None)) => {}
+            Ok(PageReply::CommentThread(Some(_))) => {
                 return Err(format!("thread id already taken: {thread_id}"));
             }
             _ => return Err("unexpected pages reply for a thread lookup".into()),
@@ -322,19 +320,15 @@ impl RunsModule {
         let reply = ctx
             .query(
                 pages,
-                &pages_encode_query(&PageQuery::ThreadsForTarget {
+                &pages_encode_query(&PageQuery::TargetThreadCount {
                     target: target.to_string(),
-                    from: 0,
-                    limit: 1,
                 }),
             )
             .await
             .map_err(|e| format!("pages target lookup failed: {e}"))?;
         match pages::decode_reply(&reply) {
-            Ok(PageReply::ThreadPage(page)) => {
-                let taken = usize::try_from(page.total)
-                    .map_err(|_| "pages target thread count exceeds host usize")?
-                    + already_staged;
+            Ok(PageReply::TargetThreadCount(committed)) => {
+                let taken = committed as usize + already_staged;
                 if taken >= MAX_THREADS_PER_TARGET {
                     return Err(format!("target {target} already holds {taken} threads"));
                 }
