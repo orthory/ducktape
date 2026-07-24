@@ -107,6 +107,7 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "capability",
  "commonware-runtime",
  "duckdns",
@@ -757,6 +758,7 @@ name = "automations"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "chat",
  "commonware-runtime",
  "futures",
@@ -3664,6 +3666,7 @@ name = "governance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
@@ -3675,7 +3678,6 @@ dependencies = [
  "sdk",
  "sdk-testkit",
  "serde",
- "serde_json",
  "statesync",
  "valset",
 ]
@@ -7262,6 +7264,7 @@ name = "saga"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "capability",
  "futures",
  "guest-adapter",

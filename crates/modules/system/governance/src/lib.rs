@@ -83,6 +83,7 @@ pub mod invite;
 
 use std::collections::BTreeMap;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use identity::{
@@ -94,7 +95,6 @@ use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
@@ -117,12 +117,11 @@ pub const MAX_PROPOSAL_ID_BYTES: usize = 256;
 /// proposals retained over the network's life (settled proposals keep their
 /// ids forever). proposing past this is refused loudly at execute.
 pub const MAX_PROPOSALS: usize = 1024;
-/// serialized roster-record byte bound, enforced at propose. the id-length and
-/// count caps do not bound the roster's SERIALIZED form tightly enough on
-/// their own: [`MAX_PROPOSALS`] ids of [`MAX_PROPOSAL_ID_BYTES`] control
-/// characters JSON-escape past the qmdb wire codec's decode ceiling — a
-/// committed over-cap value would wedge every syncing peer (the poison-value
-/// lesson), so the propose op refuses loudly instead.
+/// serialized roster-record byte bound, enforced at propose — the backstop
+/// on top of the id-length and count caps that keeps the committed record
+/// far under the qmdb value-decode ceiling (the poison-value lesson: a
+/// committed over-cap value would wedge every syncing peer). generous: borsh
+/// renders the worst-case roster (1024 ids of 256 bytes) in ~260 KiB.
 pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
 /// serialized proposal-record ceiling. a NEW proposal is gated at HALF this
 /// value: ballots accrue only from principals inside the frozen electorate
@@ -162,7 +161,10 @@ const SHARES_KEY: &[u8] = b"shares";
 /// the share-mode flag's whole key. absent = validator ballots (the default).
 const SHARE_MODE_KEY: &[u8] = b"mode";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// one proposal, stored verbatim — borsh writes the ballot and electorate
+/// `BTreeMap`s length-prefixed in key order, so one proposal state has
+/// exactly one encoding.
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Proposal {
     action: GovAction,
     proposer: Vec<u8>,
@@ -175,66 +177,11 @@ struct Proposal {
     electorate: Electorate,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Electorate {
     voter_kind: VoterKind,
     powers: BTreeMap<Vec<u8>, u64>,
     rule: VotingRule,
-}
-
-/// the stored form of a [`Proposal`]: maps flatten to sorted pair lists
-/// because the record codec (JSON) cannot key an object by raw bytes.
-/// `BTreeMap` iteration writes them sorted; `collect` rebuilds the maps.
-#[derive(Serialize, Deserialize)]
-struct ProposalRecord {
-    action: GovAction,
-    proposer: Vec<u8>,
-    created_at: u64,
-    deadline: u64,
-    status: ProposalStatus,
-    votes: Vec<(Vec<u8>, bool)>,
-    voter_kind: VoterKind,
-    electorate: Vec<(Vec<u8>, u64)>,
-    rule: VotingRule,
-}
-
-impl From<&Proposal> for ProposalRecord {
-    fn from(p: &Proposal) -> Self {
-        Self {
-            action: p.action.clone(),
-            proposer: p.proposer.clone(),
-            created_at: p.created_at,
-            deadline: p.deadline,
-            status: p.status,
-            votes: p.votes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-            voter_kind: p.electorate.voter_kind,
-            electorate: p
-                .electorate
-                .powers
-                .iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect(),
-            rule: p.electorate.rule,
-        }
-    }
-}
-
-impl From<ProposalRecord> for Proposal {
-    fn from(r: ProposalRecord) -> Self {
-        Self {
-            action: r.action,
-            proposer: r.proposer,
-            created_at: r.created_at,
-            deadline: r.deadline,
-            status: r.status,
-            votes: r.votes.into_iter().collect(),
-            electorate: Electorate {
-                voter_kind: r.voter_kind,
-                powers: r.electorate.into_iter().collect(),
-                rule: r.rule,
-            },
-        }
-    }
 }
 
 /// who a verified frame origin speaks for (see [`Governance::resolve_actor`]).
@@ -272,7 +219,7 @@ impl Actor {
 
 /// one settled invite redemption — the single-use record plus the audit
 /// trail (who invited whom, when). the nonce is the record KEY, not a field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct Redemption {
     joiner: Vec<u8>,
     issuer: Vec<u8>,
@@ -344,11 +291,11 @@ impl Governance {
 
     async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
     where
-        T: DeserializeOwned,
+        T: BorshDeserialize,
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -360,11 +307,11 @@ impl Governance {
     /// [`Self::store_bounded`].
     fn store<T>(&mut self, key: Vec<u8>, value: &T)
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
         self.staged.stage(
             key,
-            serde_json::to_vec(value).expect("governance value is serializable"),
+            borsh::to_vec(value).expect("governance value is serializable"),
         );
     }
 
@@ -378,9 +325,9 @@ impl Governance {
         what: &str,
     ) -> Result<(), Error>
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
-        let bytes = serde_json::to_vec(value).expect("governance value is serializable");
+        let bytes = borsh::to_vec(value).expect("governance value is serializable");
         if bytes.len() > cap {
             return Err(Error::Module(format!(
                 "{what} record too large: {} > {cap} bytes",
@@ -392,10 +339,7 @@ impl Governance {
     }
 
     async fn proposal(&self, proposal_id: &str) -> Result<Option<Proposal>, Error> {
-        Ok(self
-            .load::<ProposalRecord>(&prop_key(proposal_id))
-            .await?
-            .map(Proposal::from))
+        self.load(&prop_key(proposal_id)).await
     }
 
     /// stage a settled/updated proposal record under the FULL byte cap — see
@@ -403,7 +347,7 @@ impl Governance {
     fn store_proposal(&mut self, proposal_id: &str, proposal: &Proposal) -> Result<(), Error> {
         self.store_bounded(
             prop_key(proposal_id),
-            &ProposalRecord::from(proposal),
+            proposal,
             MAX_PROPOSAL_RECORD_BYTES,
             "proposal",
         )
@@ -911,7 +855,7 @@ impl Governance {
         // settled record past the full cap.
         self.store_bounded(
             prop_key(&proposal_id),
-            &ProposalRecord::from(&proposal),
+            &proposal,
             MAX_PROPOSAL_RECORD_BYTES / 2,
             "proposal",
         )?;

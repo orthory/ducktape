@@ -20,6 +20,7 @@
 //! - [`AgentQuery`] -> [`AgentReply`] — reads over the registry.
 
 use saga::SagaOrigin;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 // ---- consensus constants ----------------------------------------------------
@@ -165,7 +166,7 @@ pub const KNOWN_ACTIONS: [&str; 7] = [
 /// identically. `secrets` are OPAQUE vault references (D6) — never a
 /// materialized value, never key material (D1). an empty `ResourceCaps` is the
 /// default and denies every request except a zero budget check.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResourceCaps {
     /// forge repos this agent may READ.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -220,7 +221,7 @@ pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
 /// reference material. it lives in consensus (rather than in the document's own
 /// frontmatter) so "what does this agent always load" is visible to the root-hash
 /// and to the UI.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadMode {
     /// inlined verbatim into the assembled context document — the persona.
@@ -240,7 +241,7 @@ pub enum LoadMode {
 ///
 /// deliberately a struct (not an enum): the phase-5 envelope composer reads
 /// every field straight through into a skill mount, so the same fields live here.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SkillRef {
     pub name: String,
     pub source_prefix: String,
@@ -281,7 +282,7 @@ pub enum CapRequest<'a> {
 
 /// whether an agent may engage new runs. a paused agent never engages — but
 /// pausing does not cancel work already dispatched.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Active,
@@ -290,7 +291,7 @@ pub enum AgentStatus {
 
 /// Owner-assigned semantic role. General is the default; a record that omits
 /// the role is an ordinary (General) agent.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     #[default]
@@ -311,7 +312,7 @@ pub enum AgentRole {
 /// unchanged in kind — consensus used to commit which prompt bytes ran (a
 /// hash), and now commits which skill snapshots ran (pins). both are content
 /// addresses; the skill one is also editable, diffable, and reviewable.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub agent_id: String,
     pub owner: SagaOrigin,
