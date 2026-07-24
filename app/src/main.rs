@@ -110,22 +110,24 @@ mod tests {
     }
 
     #[test]
-    fn tab_selection_stays_in_the_component_scope() {
+    fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
         let (mut app, _) = Ducktape::__boot();
-        let _ = app.__update(__DucktapeMessage::__WorkspaceTabsHandleSelectTab(
-            "workspace-tabs".into(),
-            "pages".into(),
-        ));
+        assert_eq!(app.shell_tab, "chat");
+        let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+        assert_eq!(app.shell_tab, "pages");
 
-        assert_eq!(
-            app.__ice_component_workspacetabs["workspace-tabs"].tab,
-            "pages"
-        );
-
-        let _ = app.__update(__DucktapeMessage::__WorkspaceTabsHandleToggleConnection(
-            "workspace-tabs".into(),
+        // a palette chat hit closes the palette and lands on the chat pane
+        app.loading = false;
+        app.mutation_phase = "idle".into();
+        app.connected_rpc = "http://node".into();
+        app.palette_open = true;
+        let _ = app.__update(__DucktapeMessage::OpenChatSearchHit(
+            "general".into(),
+            7,
+            7,
         ));
-        assert!(app.__ice_component_workspacetabs["workspace-tabs"].connection_open);
+        assert!(!app.palette_open);
+        assert_eq!(app.shell_tab, "chat");
     }
 
     #[test]
@@ -136,7 +138,11 @@ mod tests {
         assert!(!view.contains("sync_phase"));
         assert!(root.contains("use \"view.ice\""));
         assert!(!lifecycle.contains("on refresh_now"));
-        assert!(!view.contains("button \"Refresh\""));
+        // live surfaces (chat/pages) never need a manual refresh — the delta
+        // stream keeps them current. The explorer's recent-window reload is
+        // the one legitimate refresh affordance.
+        let before_explorer = view.split_once("    explorer:").map_or(view, |(head, _)| head);
+        assert!(!before_explorer.contains("button \"Refresh\""));
 
         let refresh = lifecycle
             .split_once("on live_resynced(next)\n")
@@ -611,6 +617,84 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     }
 
     #[test]
+    fn flow_typing_inserts_blocks_in_order() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_page = "welcome".into();
+        app.block_insert_open = true;
+        app.block_insert_after_id = String::new();
+
+        app.block_draft = "first".into();
+        let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
+        let first_id = app.blocks[0].id.clone();
+        let _ = app.__update(__DucktapeMessage::BlockAdded(backend::BlockInsertResult {
+            data: backend::PagesData {
+                pages: Vec::new(),
+                blocks: vec![backend::PageBlock {
+                    key: 1,
+                    id: first_id.clone(),
+                    parent: "welcome".into(),
+                    kind: "Text".into(),
+                    text: "first".into(),
+                    pending: false,
+                    checked: false,
+                    prefix: String::new(),
+                    child_count: 0,
+                    mark_count: 0,
+                }],
+                active_page: "welcome".into(),
+                active_page_title: "Welcome".into(),
+                active_page_parent: String::new(),
+                selected_block_id: String::new(),
+                selected_block_kind: String::new(),
+                selected_block_text: String::new(),
+                selected_block_checked: false,
+                page_title_selected: false,
+            },
+            operation_id: first_id.clone(),
+            page_id: "welcome".into(),
+        }));
+        assert_eq!(
+            app.block_insert_after_id, first_id,
+            "the insert anchor advances so Enter-typing appends in order"
+        );
+
+        // the next flow-typed block lands AFTER the first, not before it
+        app.block_draft = "second".into();
+        let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
+        assert_eq!(app.blocks.len(), 2);
+        assert_eq!(app.blocks[0].text, "first");
+        assert_eq!(app.blocks[1].text, "second");
+        assert!(app.blocks[1].pending);
+    }
+
+    #[test]
+    fn history_windows_offer_a_jump_back_to_latest() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.active_channel = "general".into();
+
+        // landing on a search hit enters history mode…
+        let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+            "general",
+            vec![message(7, "an old message", false)],
+        )));
+        assert!(app.history_view);
+
+        // …and a plain channel load (the Jump-to-latest path) leaves it
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
+            "general",
+            vec![message(50, "the latest", false)],
+        )));
+        assert!(!app.history_view);
+
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains("button \"Jump to latest\""));
+        assert!(view.contains("-> choose_channel(active_channel)"));
+    }
+
+    #[test]
     fn message_actions_require_explicit_intent() {
         let (mut app, _) = Ducktape::__boot();
         app.mutation_phase = "idle".into();
@@ -831,7 +915,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .unwrap()
             .0;
         assert!(edit.contains(
-            "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft))"
+            "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members)"
         ));
         let delete = handlers
             .split_once("on delete_thread_message_submit\n")
@@ -1101,12 +1185,12 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
         assert!(view.contains(
-            "container width=fill padding-left=56.0\n                    PageTitleEditor"
+            "container width=fill padding-left=56.0\n                      PageTitleEditor"
         ));
     }
 
     #[test]
-    fn macos_shell_uses_layered_system_materials() {
+    fn shell_uses_warm_opaque_materials() {
         let ui = concat!(
             include_str!("ui/app.ice"),
             include_str!("ui/backend.ice"),
@@ -1123,41 +1207,48 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         for gradient in ["linear(", "radial(", "conic("] {
             assert!(!ui.contains(gradient), "{gradient}");
         }
-
+        // fully opaque: no window transparency, no blur, no white-alpha glass
+        // overlays — light-theme chrome responds with ink (`fg/N`) and tokens.
         let app = include_str!("ui/app.ice");
-        assert!(app.contains("transparent true"));
+        assert!(!app.contains("\n    transparent true"));
+        assert!(!app.contains("\n    blur true"));
         assert!(app.contains("titlebar-transparent true"));
         assert!(app.contains("fullsize-content-view true"));
         assert!(app.contains("font \"../../assets/InterVariable.ttf\""));
+        assert!(!ui.contains("white/"));
 
         let theme = include_str!("ui/theme.ice");
         assert!(theme.contains("font ui family=\"Inter\" weight=normal"));
         for material in [
-            "bg #0b0b10ec",
-            "surface #17171fe8",
-            "popover #20202be8",
-            "sidebar #101016ef",
-            "elevated #262631e8",
+            "bg #fcfcfc",
+            "surface #f5f5f5",
+            "popover #ffffff",
+            "sidebar #f9f9f9",
+            "elevated #efefef",
+            "fg #2c2b27",
         ] {
             assert!(theme.contains(material), "{material}");
         }
-        // The redesign introduces an indigo accent for life (avatars, selection,
-        // primary actions) while staying a layered dark system material set.
-        for accent in ["primary #6f6cf6", "primaryhi #8a88ff"] {
+        // the terracotta accent is the single color voice of the warm palette.
+        for accent in ["primary #a05a3c", "primaryhi #8a4a2e"] {
             assert!(theme.contains(accent), "{accent}");
         }
 
         let shell = include_str!("ui/components/shell.ice");
+        // the shell is titlebar + optional degradation banner over the panes.
+        assert!(shell.contains("component TitleBar(status:str, loading:bool, bell_badge:i64)"));
+        assert!(shell.contains("component ConnectionBanner(status:str)"));
+        assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
         assert!(shell.contains(
-            "container width=sidebar_width height=fill padding=12.0 padding-top=38.0 bg=sidebar"
+            "container width=sidebar_width height=fill padding=12.0 bg=sidebar"
         ));
         // the rail width is drag-resizable via the divider resize-handle.
         assert!(shell.contains("resize-handle drag=sidebar_dragged cursor=resize-horizontal"));
 
         let view = include_str!("ui/view.ice");
-        assert!(view.contains("container width=fill padding=6.0 bg=transparent border=white/11"));
+        assert!(view.contains("container width=fill padding=6.0 bg=transparent border=fg/11"));
         assert!(view.contains("if active_thread_seq > 0 && !channel_settings_open"));
-        assert!(view.contains("container width=fill padding=5.0 bg=transparent border=white/12"));
+        assert!(view.contains("container width=fill padding=5.0 bg=transparent border=fg/12"));
     }
 
     #[test]
@@ -1245,7 +1336,13 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     #[test]
     fn block_comments_use_a_floating_side_panel() {
         let view = include_str!("ui/view.ice");
-        let pages = view.split_once("    pages:").unwrap().1;
+        let pages = view
+            .split_once("    pages:")
+            .unwrap()
+            .1
+            .split_once("    files:")
+            .unwrap()
+            .0;
         assert!(pages.contains("block_comments_open"));
         assert!(
             pages

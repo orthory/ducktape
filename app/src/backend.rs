@@ -24,8 +24,11 @@ pub use chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message,
     mark_message_groups, merge_message_send_result, merge_pending_messages,
-    merge_thread_reply, optimistic_message, paragraph_blocks, parse_message,
+    merge_thread_reply, optimistic_message, paragraph_blocks, parse_message_with_members,
     rollback_pending_message, short_label, thread_offset_after_reply,
+};
+pub use inbox::client::{
+    BellDelta, BellItem, apply_bell_items as fold_bell_items,
 };
 pub use pages::client::PagesDelta;
 
@@ -320,6 +323,7 @@ pub struct LiveUpdate {
     pub debounce: bool,
     pub chat: ChatDelta,
     pub pages: PagesDelta,
+    pub bell: BellDelta,
 }
 
 
@@ -980,6 +984,1451 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+/// One files-browser row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size: i64,
+}
+
+/// One committed duckfs snapshot.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsSnapshot {
+    pub id: String,
+    pub short_id: String,
+    pub author: String,
+    pub height: i64,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsListing {
+    pub generation: i64,
+    pub path: String,
+    pub entries: Vec<FsEntry>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsPreview {
+    pub generation: i64,
+    pub path: String,
+    pub text: String,
+    pub truncated: bool,
+    pub binary: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsHistory {
+    pub generation: i64,
+    pub snapshots: Vec<FsSnapshot>,
+}
+
+/// List one duckfs directory (committed head), name order.
+pub async fn files_ls(
+    rpc: String,
+    path: String,
+    generation: i64,
+) -> Result<FsListing, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.files_get("ls", &[("path", path.as_str())]).await?;
+        let entries = reply["entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                let entry_path = entry["path"].as_str().unwrap_or_default().to_string();
+                let name = entry_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(entry_path.as_str())
+                    .to_string();
+                FsEntry {
+                    name,
+                    kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+                    size: entry["size"].as_i64().unwrap_or(0),
+                    path: entry_path,
+                }
+            })
+            .collect();
+        Ok(FsListing {
+            generation,
+            path,
+            entries,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Read a file's head bytes for the preview pane (64 KiB window).
+pub async fn files_preview(
+    rpc: String,
+    path: String,
+    generation: i64,
+) -> Result<FsPreview, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc
+            .files_get("read", &[("path", path.as_str()), ("len", "65536")])
+            .await?;
+        let b64 = reply["b64"].as_str().unwrap_or_default();
+        let eof = reply["eof"].as_bool().unwrap_or(true);
+        let bytes = base64_decode(b64).unwrap_or_default();
+        let (text, binary) = match String::from_utf8(bytes.clone()) {
+            Ok(text) if !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') => {
+                (text, false)
+            }
+            _ => (format!("{} binary bytes", bytes.len()), true),
+        };
+        Ok(FsPreview {
+            generation,
+            path,
+            text,
+            truncated: !eof,
+            binary,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The committed snapshot window, newest first.
+pub async fn files_history(
+    rpc: String,
+    generation: i64,
+) -> Result<FsHistory, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.files_get("history", &[("limit", "50")]).await?;
+        let snapshots = reply["snapshots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|snapshot| {
+                let id = snapshot["id"].as_str().unwrap_or_default().to_string();
+                FsSnapshot {
+                    short_id: short_digest(&id),
+                    author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
+                    height: snapshot["height"].as_i64().unwrap_or(0),
+                    message: snapshot["message"].as_str().unwrap_or_default().to_string(),
+                    id,
+                }
+            })
+            .collect();
+        Ok(FsHistory {
+            generation,
+            snapshots,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The head snapshot id for commit CAS (empty when nothing is committed).
+async fn files_head(rpc: &RpcClient) -> Result<Option<String>, String> {
+    let refs = rpc.files_get("refs", &[]).await?;
+    Ok(refs["head"].as_str().map(str::to_string))
+}
+
+/// One files commit through the node's commit lane.
+async fn files_commit_one(
+    rpc: &RpcClient,
+    message: String,
+    change: serde_json::Value,
+) -> Result<(), String> {
+    let head = files_head(rpc).await?;
+    rpc.files_post(
+        "commit",
+        &serde_json::json!({
+            "base_snapshot": head,
+            "message": message,
+            "changes": [change],
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Create a directory.
+pub async fn files_mkdir(rpc: String, path: String) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        files_commit_one(
+            &rpc,
+            format!("mkdir {path}"),
+            serde_json::json!({ "mkdir": { "path": path } }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Remove a file or whole subtree.
+pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        files_commit_one(
+            &rpc,
+            format!("rm {path}"),
+            serde_json::json!({ "rm": { "path": path } }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Write a text file (create or replace) as inline content.
+pub async fn files_write_text(
+    rpc: String,
+    path: String,
+    text: String,
+) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        files_commit_one(
+            &rpc,
+            format!("write {path}"),
+            serde_json::json!({
+                "put": {
+                    "path": path,
+                    "exec": false,
+                    "meta": {},
+                    "content": { "inline": { "b64": base64_encode(text.as_bytes()) } },
+                }
+            }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Upload a local file dropped onto the window into the current directory:
+/// small files ride inline; larger ones stage 1 MiB chunks then commit a
+/// chunk list. The dropped path never leaves this device — only bytes do.
+pub async fn files_upload(
+    rpc: String,
+    dir: String,
+    dropped: String,
+) -> Result<bool, AppError> {
+    async {
+        let source = PathBuf::from(&dropped);
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "dropped path has no file name".to_string())?
+            .to_string();
+        let bytes =
+            std::fs::read(&source).map_err(|error| format!("cannot read {dropped}: {error}"))?;
+        let rpc = rpc_client(&rpc)?;
+        let target = fs_child(dir, name.clone());
+        let content = match bytes.len() as u64 <= 256 * 1024 {
+            true => serde_json::json!({ "inline": { "b64": base64_encode(&bytes) } }),
+            false => {
+                let mut chunks = Vec::new();
+                for chunk in bytes.chunks(1024 * 1024) {
+                    chunks.push(rpc.files_stage(chunk.to_vec()).await?);
+                }
+                serde_json::json!({ "chunks": { "size": bytes.len() as u64, "chunks": chunks } })
+            }
+        };
+        files_commit_one(
+            &rpc,
+            format!("upload {name}"),
+            serde_json::json!({
+                "put": { "path": target, "exec": false, "meta": {}, "content": content }
+            }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The Added/Removed/Modified leaves between a snapshot and the head.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsDiffEntry {
+    pub path: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsDiff {
+    pub generation: i64,
+    pub from: String,
+    pub entries: Vec<FsDiffEntry>,
+}
+
+/// Diff one committed snapshot against the current head.
+pub async fn files_diff(
+    rpc: String,
+    from: String,
+    generation: i64,
+) -> Result<FsDiff, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let head = files_head(&rpc)
+            .await?
+            .ok_or_else(|| "nothing committed yet".to_string())?;
+        let reply = rpc
+            .files_get("diff", &[("from", from.as_str()), ("to", head.as_str())])
+            .await?;
+        let entries = reply["entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| FsDiffEntry {
+                path: entry["path"].as_str().unwrap_or_default().to_string(),
+                kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        Ok(FsDiff {
+            generation,
+            from,
+            entries,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut acc = 0u32;
+        for (i, byte) in chunk.iter().enumerate() {
+            acc |= u32::from(*byte) << (16 - 8 * i);
+        }
+        for i in 0..4 {
+            let live = i * 6 < chunk.len() * 8 + 6 && i <= chunk.len();
+            match live {
+                true => out.push(TABLE[((acc >> (18 - 6 * i)) & 0x3f) as usize] as char),
+                false => out.push('='),
+            }
+        }
+    }
+    out
+}
+
+/// A child path under the current directory.
+pub fn fs_child(path: String, name: String) -> String {
+    let name = name.trim().trim_matches('/');
+    if path.is_empty() {
+        return format!("/{name}");
+    }
+    format!("{path}/{name}")
+}
+
+/// Minimal base64 (standard alphabet, padded) — the files read lane's wire.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let value = |c: u8| TABLE.iter().position(|t| *t == c).map(|i| i as u32);
+    let clean: Vec<u8> = input.bytes().filter(|b| !b" \n\r\t".contains(b)).collect();
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for byte in chunk {
+            if *byte == b'=' {
+                break;
+            }
+            acc = (acc << 6) | value(*byte)?;
+            bits += 6;
+        }
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The breadcrumb path one level up ("" at the root).
+pub fn fs_parent(path: String) -> String {
+    match path.rfind('/') {
+        Some(0) | None => String::new(),
+        Some(cut) => path[..cut].to_string(),
+    }
+}
+
+/// One member of the network: a validator (quorum seat) or resident
+/// (mesh + statesync standing).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct MemberRow {
+    pub key: String,
+    pub label: String,
+    pub role: String,
+    pub is_this_node: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct MembersData {
+    pub generation: i64,
+    pub validators: i64,
+    pub residents: i64,
+    pub members: Vec<MemberRow>,
+}
+
+/// Load the valset directory: validators then residents, this node marked.
+pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let node_key = rpc.status().await?.public_key;
+        let mut members = Vec::new();
+        let mut counts = (0i64, 0i64);
+        for (query, role) in [("validators", "validator"), ("residents", "resident")] {
+            let reply: serde_json::Value = rpc
+                .query("valset", &serde_json::json!(query))
+                .await?;
+            let keys = reply[query].as_array().cloned().unwrap_or_default();
+            match role {
+                "validator" => counts.0 = count_i64(keys.len()),
+                _ => counts.1 = count_i64(keys.len()),
+            }
+            for key in keys {
+                let bytes: Vec<u8> = key
+                    .as_array()
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let hex = hex_encode(&bytes);
+                members.push(MemberRow {
+                    label: short_label(&hex),
+                    is_this_node: hex == node_key,
+                    role: role.into(),
+                    key: hex,
+                });
+            }
+        }
+        Ok(MembersData {
+            generation,
+            validators: counts.0,
+            residents: counts.1,
+            members,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// One governance proposal, rendered.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ProposalRow {
+    pub id: String,
+    pub action: String,
+    pub proposer: String,
+    pub status: String,
+    pub deadline: i64,
+    pub approvals: i64,
+    pub rejections: i64,
+    pub electorate: i64,
+    pub open: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct GovernanceData {
+    pub generation: i64,
+    pub proposals: Vec<ProposalRow>,
+}
+
+/// Load the proposal register, open proposals first, newest first within.
+pub async fn load_governance(
+    rpc: String,
+    generation: i64,
+) -> Result<GovernanceData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc
+            .query("governance", &serde_json::json!("proposals"))
+            .await?;
+        let mut proposals: Vec<ProposalRow> = reply["proposals"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|view| {
+                let votes = view["votes"].as_array().cloned().unwrap_or_default();
+                let approvals = votes
+                    .iter()
+                    .filter(|vote| vote[1].as_bool().unwrap_or(false))
+                    .count();
+                let status = view["status"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        view["status"]
+                            .as_object()
+                            .and_then(|tagged| tagged.keys().next().cloned())
+                            .unwrap_or_default()
+                    });
+                let action = view["action"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        view["action"]
+                            .as_object()
+                            .and_then(|tagged| tagged.keys().next().cloned())
+                            .unwrap_or_default()
+                    });
+                let proposer_bytes: Vec<u8> = view["proposer"]
+                    .as_array()
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ProposalRow {
+                    id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
+                    open: status == "open",
+                    proposer: short_label(&hex_encode(&proposer_bytes)),
+                    deadline: view["deadline"].as_i64().unwrap_or(0),
+                    approvals: count_i64(approvals),
+                    rejections: count_i64(votes.len() - approvals),
+                    electorate: count_i64(
+                        view["electorate"].as_array().map_or(0, |members| members.len()),
+                    ),
+                    action,
+                    status,
+                }
+            })
+            .collect();
+        proposals.sort_by(|left, right| {
+            right
+                .open
+                .cmp(&left.open)
+                .then(right.deadline.cmp(&left.deadline))
+        });
+        Ok(GovernanceData {
+            generation,
+            proposals,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Cast (or change) this node's ballot.
+pub async fn governance_vote(
+    rpc: String,
+    password: String,
+    proposal_id: String,
+    approve: bool,
+) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "governance",
+            governance::encode_msg(&governance::GovMsg::Vote {
+                proposal_id,
+                approve,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Tally and settle a proposal past its deadline (anyone may trigger).
+pub async fn governance_execute(
+    rpc: String,
+    password: String,
+    proposal_id: String,
+) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "governance",
+            governance::encode_msg(&governance::GovMsg::Execute { proposal_id }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The settings pane's facts: where this app points and what identity it
+/// holds locally.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct SettingsFacts {
+    pub generation: i64,
+    pub endpoint: String,
+    pub node_key: String,
+    pub height: i64,
+    pub key_path: String,
+    pub key_state: String,
+    pub open_tabs: i64,
+}
+
+/// Load the settings facts: node identity from /v1/status, the local user
+/// key's location and state, and the persisted tab count.
+pub async fn load_settings_facts(
+    rpc: String,
+    generation: i64,
+) -> Result<SettingsFacts, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status().await?;
+        let (key_path, key_state) = match user_key_path() {
+            Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
+            Ok(path) => {
+                let state = match std::fs::read(&path) {
+                    Err(_) => "absent",
+                    Ok(bytes) if bytes.starts_with(ENCRYPTED_KEY_PREFIX.as_bytes()) => "encrypted",
+                    Ok(_) => "PLAINTEXT — secure it",
+                };
+                (path.display().to_string(), state.to_string())
+            }
+        };
+        let tabs = load_doc_tabs(rpc.clone()).await;
+        Ok(SettingsFacts {
+            generation,
+            endpoint: rpc,
+            node_key: short_label(&status.public_key),
+            height: i64::try_from(status.height).unwrap_or(i64::MAX),
+            key_path,
+            key_state,
+            open_tabs: count_i64(tabs.len()),
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Forget this endpoint's persisted doc tabs.
+pub async fn clear_doc_tabs(rpc: String) -> bool {
+    save_doc_tabs(rpc, Vec::new()).await
+}
+
+/// One log line for the operator pane.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct NodeLogLine {
+    pub cursor: String,
+    pub line: String,
+}
+
+/// The node's live log ring as an app stream — reconnects with backoff and
+/// resumes from the last cursor, exactly like the module stream.
+pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeLogLine> {
+    struct State {
+        rpc: String,
+        cursor: Option<String>,
+        stream: Option<iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<ducktape_rpc::LogLine>>>,
+        retry_attempt: u32,
+    }
+    iced::futures::stream::unfold(
+        State {
+            rpc,
+            cursor: None,
+            stream: None,
+            retry_attempt: 0,
+        },
+        |mut state| async move {
+            loop {
+                if state.stream.is_none() && state.retry_attempt > 0 {
+                    tokio::time::sleep(retry_delay(state.retry_attempt)).await;
+                }
+                if state.stream.is_none() {
+                    let Ok(rpc) = rpc_client(&state.rpc) else {
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                        continue;
+                    };
+                    match rpc.log_events(state.cursor.clone()).await {
+                        Ok(stream) => state.stream = Some(stream),
+                        Err(_) => {
+                            state.retry_attempt = state.retry_attempt.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
+                match state.stream.as_mut().expect("stream initialized").next().await {
+                    Some(Ok(line)) => {
+                        state.retry_attempt = 0;
+                        state.cursor = Some(line.cursor.clone());
+                        return Some((
+                            NodeLogLine {
+                                cursor: line.cursor,
+                                line: line.line,
+                            },
+                            state,
+                        ));
+                    }
+                    Some(Err(_)) | None => {
+                        state.stream = None;
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// Append a log line to the pane's bounded ring (newest last, 500 kept).
+pub fn push_log_line(mut lines: Vec<NodeLogLine>, line: NodeLogLine) -> Vec<NodeLogLine> {
+    let duplicate = lines.last().is_some_and(|last| last.cursor == line.cursor);
+    if duplicate {
+        return lines;
+    }
+    lines.push(line);
+    let excess = lines.len().saturating_sub(500);
+    lines.drain(..excess);
+    lines
+}
+
+/// The pane's visible window: substring-filtered, newest last.
+pub fn filter_log_lines(lines: Vec<NodeLogLine>, filter: String) -> Vec<NodeLogLine> {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .filter(|line| line.line.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// One peer row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PeerRow {
+    pub key: String,
+    pub height: i64,
+    pub live: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PeersData {
+    pub generation: i64,
+    pub peers: Vec<PeerRow>,
+}
+
+/// Load the peers standing view.
+pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.peers().await?;
+        let peers = reply["peers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peer| PeerRow {
+                key: short_label(peer["key"].as_str().unwrap_or_default()),
+                height: peer["height"].as_i64().unwrap_or(0),
+                live: peer["live"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        Ok(PeersData { generation, peers })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// One registered agent, rendered.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    pub capability: String,
+    pub status: String,
+    pub actions: String,
+    pub owner: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentsData {
+    pub generation: i64,
+    pub agents: Vec<AgentRow>,
+}
+
+/// Load the agent roster from the canonical registry.
+pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc.query("agent", &serde_json::json!("agents")).await?;
+        let agents = reply["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| {
+                let status = record["status"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        record["status"]
+                            .as_object()
+                            .and_then(|tagged| tagged.keys().next().cloned())
+                            .unwrap_or_default()
+                    });
+                let owner = record["owner"]
+                    .as_object()
+                    .and_then(|tagged| tagged.keys().next().cloned())
+                    .or_else(|| record["owner"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                AgentRow {
+                    id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                    name: record["display_name"].as_str().unwrap_or_default().to_string(),
+                    capability: record["capability"].as_str().unwrap_or_default().to_string(),
+                    actions: record["allowed_actions"]
+                        .as_array()
+                        .map(|actions| {
+                            actions
+                                .iter()
+                                .filter_map(|action| action.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default(),
+                    status,
+                    owner,
+                }
+            })
+            .collect();
+        Ok(AgentsData { generation, agents })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The local account picture: whether THIS NODE is bound, and the account's
+/// public face.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AccountData {
+    pub generation: i64,
+    pub bound: bool,
+    pub account_id: String,
+    pub display_name: String,
+    pub bio: String,
+    pub members: i64,
+    pub nodes: i64,
+}
+
+/// Load the account this node is bound to (via the canonical resolver).
+pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let node_key_hex = client.status().await?.public_key;
+        let node_key: Vec<u8> = (0..node_key_hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&node_key_hex[i..i + 2], 16).ok())
+            .collect();
+        let reply: serde_json::Value = client
+            .query(
+                "identity",
+                &serde_json::json!({ "of_node": { "node_key": node_key } }),
+            )
+            .await?;
+        let account = &reply["account"];
+        if account.is_null() {
+            return Ok(AccountData {
+                generation,
+                bound: false,
+                account_id: String::new(),
+                display_name: String::new(),
+                bio: String::new(),
+                members: 0,
+                nodes: 0,
+            });
+        }
+        let id_bytes: Vec<u8> = account["account_id"]
+            .as_array()
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(AccountData {
+            generation,
+            bound: true,
+            account_id: short_label(&hex_encode(&id_bytes)),
+            display_name: account["display_name"].as_str().unwrap_or_default().to_string(),
+            bio: account["bio"].as_str().unwrap_or_default().to_string(),
+            members: count_i64(account["members"].as_array().map_or(0, |m| m.len())),
+            nodes: count_i64(account["nodes"].as_array().map_or(0, |n| n.len())),
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Rename the account this node is bound to (origin-gated: the bound node
+/// itself is the authority).
+pub async fn set_account_name(
+    rpc: String,
+    password: String,
+    display_name: String,
+) -> Result<bool, AppError> {
+    async {
+        let display_name = bounded_text(display_name, "display name", 128)?;
+        let client = rpc_client(&rpc)?;
+        signed_write(
+            &client,
+            "identity",
+            identity::encode_msg(&identity::IdentityMsg::SetAccountName { display_name }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// One forge repo row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeRepo {
+    pub name: String,
+    pub head: String,
+}
+
+/// One tracker item row (issue or PR).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeItem {
+    pub number: i64,
+    pub kind: String,
+    pub title: String,
+    pub state: String,
+    pub author: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeData {
+    pub generation: i64,
+    pub repos: Vec<ForgeRepo>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeRepoData {
+    pub generation: i64,
+    pub repo: String,
+    pub branches: Vec<String>,
+    pub items: Vec<ForgeItem>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeItemData {
+    pub generation: i64,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+    pub kind: String,
+    pub body: String,
+    pub branches: String,
+    pub reviews: i64,
+    pub diff: String,
+}
+
+/// The repo namespace with committed heads.
+pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc.query("forge", &serde_json::json!("list_repos")).await?;
+        let repos = reply["repos"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|repo| ForgeRepo {
+                name: repo["name"].as_str().unwrap_or_default().to_string(),
+                head: short_digest(repo["head"].as_str().unwrap_or("(unborn)")),
+            })
+            .collect();
+        Ok(ForgeData { generation, repos })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// One repo's branches and tracker items.
+pub async fn load_forge_repo(
+    rpc: String,
+    repo: String,
+    generation: i64,
+) -> Result<ForgeRepoData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let refs: serde_json::Value = rpc
+            .query("forge", &serde_json::json!({ "list_refs": { "repo": repo } }))
+            .await?;
+        let items: serde_json::Value = rpc
+            .query("forge", &serde_json::json!({ "list_items": { "repo": repo } }))
+            .await?;
+        let branches = refs["refs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|branch| branch["name"].as_str().map(str::to_string))
+            .collect();
+        let mut rows: Vec<ForgeItem> = items["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| ForgeItem {
+                number: item["number"].as_i64().unwrap_or(0),
+                kind: tagged_name(&item["kind"]),
+                state: tagged_name(&item["state"]),
+                title: item["title"].as_str().unwrap_or_default().to_string(),
+                author: tagged_name(&item["author"]),
+            })
+            .collect();
+        rows.reverse();
+        Ok(ForgeRepoData {
+            generation,
+            repo,
+            branches,
+            items: rows,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// One item in full, with the PR patch when there is one.
+pub async fn load_forge_item(
+    rpc: String,
+    repo: String,
+    number: i64,
+    generation: i64,
+) -> Result<ForgeItemData, HydrationError> {
+    async {
+        let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc
+            .query(
+                "forge",
+                &serde_json::json!({ "get_item": { "repo": repo, "number": number } }),
+            )
+            .await?;
+        let item = &reply["item"];
+        if item.is_null() {
+            return Err("item was not found".to_string());
+        }
+        let is_pr = tagged_name(&item["kind"]) == "pull";
+        let diff = match is_pr {
+            false => String::new(),
+            true => rpc
+                .query::<_, serde_json::Value>(
+                    "forge",
+                    &serde_json::json!({ "pr_diff": { "repo": repo, "number": number } }),
+                )
+                .await
+                .map(|reply| {
+                    reply["pr_diff"]["patch"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .unwrap_or_default(),
+        };
+        let branches = match (
+            item["source_branch"].as_str(),
+            item["target_branch"].as_str(),
+        ) {
+            (Some(source), Some(target)) => format!("{source} → {target}"),
+            _ => String::new(),
+        };
+        Ok(ForgeItemData {
+            generation,
+            repo,
+            number: i64::try_from(number).unwrap_or(0),
+            title: item["title"].as_str().unwrap_or_default().to_string(),
+            state: tagged_name(&item["state"]),
+            kind: tagged_name(&item["kind"]),
+            body: item["body"].as_str().unwrap_or_default().to_string(),
+            reviews: count_i64(item["reviews"].as_array().map_or(0, |reviews| reviews.len())),
+            branches,
+            diff,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The name of an externally-tagged wire enum value (or the string itself).
+fn tagged_name(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .as_object()
+                .and_then(|tagged| tagged.keys().next().cloned())
+        })
+        .unwrap_or_default()
+}
+
+/// One shell navigation entry.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct NavItem {
+    pub id: String,
+    pub title: String,
+    pub icon: String,
+    pub active: bool,
+}
+
+/// The shell's module navigation, the active pane flagged. Modules join the
+/// shell by joining this list.
+pub fn shell_nav(tab: String) -> Vec<NavItem> {
+    [
+        ("chat", "Chat", "#"),
+        ("pages", "Pages", "▤"),
+        ("files", "Files", "▣"),
+        ("members", "Members", "◎"),
+        ("agents", "Agents", "🤖"),
+        ("forge", "Forge", "⌥"),
+        ("governance", "Governance", "⚖"),
+        ("explorer", "Explorer", "⛓"),
+        ("node", "Node", "⛭"),
+        ("settings", "Settings", "⚙"),
+    ]
+    .into_iter()
+    .map(|(id, title, icon)| NavItem {
+        id: id.into(),
+        title: title.into(),
+        icon: icon.into(),
+        active: id == tab,
+    })
+    .collect()
+}
+
+/// The local user's inbox member handle (`user:{hex}`), when a key exists.
+async fn local_member() -> Option<String> {
+    local_user_key()
+        .await
+        .map(|key| format!("user:{}", hex_encode(&key)))
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BellData {
+    pub generation: i64,
+    pub unread: i64,
+    pub items: Vec<BellItem>,
+}
+
+/// Load the bell: this member's notification page (newest first) + unread
+/// count from the inbox views. A device without a user key has no inbox.
+pub async fn load_bell(rpc: String, generation: i64) -> Result<BellData, HydrationError> {
+    async {
+        let Some(member) = local_member().await else {
+            return Ok(BellData {
+                generation,
+                unread: 0,
+                items: Vec::new(),
+            });
+        };
+        let rpc = rpc_client(&rpc)?;
+        let listed: serde_json::Value = rpc
+            .view(
+                "inbox",
+                &serde_json::json!({ "list": { "member": member, "from_seq": 0, "limit": 50 } }),
+            )
+            .await?;
+        let unread: serde_json::Value = rpc
+            .view("inbox", &serde_json::json!({ "unread": { "member": member } }))
+            .await?;
+        let mut items: Vec<BellItem> = listed["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| BellItem {
+                seq: row["seq"].as_i64().unwrap_or(0),
+                kind: row["kind"].as_str().unwrap_or_default().to_string(),
+                body: row["body"].as_str().unwrap_or_default().to_string(),
+                source: row["source"].as_str().unwrap_or_default().to_string(),
+                height: row["height"].as_i64().unwrap_or(0),
+                read: row["read"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        items.reverse();
+        Ok(BellData {
+            generation,
+            unread: unread["unread_count"].as_i64().unwrap_or(0),
+            items,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Mark everything at or below `up_to_seq` read (signed by the local user).
+pub async fn mark_bell_read(
+    rpc: String,
+    password: String,
+    up_to_seq: i64,
+) -> Result<bool, AppError> {
+    async {
+        if up_to_seq <= 0 {
+            return Ok(());
+        }
+        let member = local_member()
+            .await
+            .ok_or_else(|| "no local user key".to_string())?;
+        let up_to_seq = u64::try_from(up_to_seq).unwrap_or(0);
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "inbox",
+            inbox::encode_msg(&inbox::InboxMsg::MarkRead {
+                member,
+                up_to_seq,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The delta-fold splices, re-exported shapes the Ice layer applies.
+pub fn apply_bell(items: Vec<BellItem>, delta: BellDelta) -> Vec<BellItem> {
+    fold_bell_items(items, delta)
+}
+
+/// The unread count after one bell delta.
+pub fn bell_unread_after(unread: i64, items: Vec<BellItem>, delta: BellDelta) -> i64 {
+    inbox::client::apply_bell_unread(unread, &items, &delta)
+}
+
+/// The mark-read watermark of the current list.
+pub fn bell_head(items: Vec<BellItem>) -> i64 {
+    inbox::client::bell_head_seq(&items)
+}
+
+/// One explorer block row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerBlock {
+    pub height: i64,
+    pub hash: String,
+    pub commit: String,
+    pub op_count: i64,
+}
+
+/// One applied (or rejected) op inside an explorer block.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerOp {
+    pub height: i64,
+    pub proposer: String,
+    pub target: String,
+    pub disposition: String,
+    pub op_hash: String,
+    pub payload: String,
+    pub trace: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerData {
+    pub generation: i64,
+    pub blocks: Vec<ExplorerBlock>,
+    pub ops: Vec<ExplorerOp>,
+}
+
+/// Load the recent block window for the explorer pane, newest first.
+pub async fn load_explorer(rpc: String, generation: i64) -> Result<ExplorerData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let rows = rpc.blocks(100).await?;
+        let mut blocks = Vec::with_capacity(rows.len());
+        let mut ops = Vec::new();
+        for row in &rows {
+            let height = row["height"].as_i64().unwrap_or(0);
+            let row_ops = row["ops"].as_array().cloned().unwrap_or_default();
+            blocks.push(ExplorerBlock {
+                height,
+                hash: short_digest(row["hash"].as_str().unwrap_or_default()),
+                commit: short_digest(row["commit_hash"].as_str().unwrap_or_default()),
+                op_count: count_i64(row_ops.len()),
+            });
+            for op in row_ops {
+                ops.push(ExplorerOp {
+                    height,
+                    proposer: short_digest(op["proposer"].as_str().unwrap_or_default()),
+                    target: op["target"].as_str().unwrap_or_default().to_string(),
+                    disposition: op["disposition"].as_str().unwrap_or_default().to_string(),
+                    op_hash: short_digest(op["op_hash"].as_str().unwrap_or_default()),
+                    payload: explorer_payload(&op["payload"]),
+                    trace: explorer_trace(op["operations"].as_array()),
+                });
+            }
+        }
+        blocks.reverse();
+        ops.reverse();
+        Ok(ExplorerData {
+            generation,
+            blocks,
+            ops,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// First 12 hex chars of a digest — the explorer's display form.
+fn short_digest(digest: &str) -> String {
+    let mut short: String = digest.chars().take(12).collect();
+    if digest.chars().count() > 12 {
+        short.push('…');
+    }
+    short
+}
+
+/// The op payload preview: verbatim short strings, else a truncated render.
+fn explorer_payload(payload: &serde_json::Value) -> String {
+    let rendered = match payload.as_str() {
+        Some(text) => text.to_string(),
+        None => payload.to_string(),
+    };
+    let mut preview: String = rendered.chars().take(160).collect();
+    if rendered.chars().count() > 160 {
+        preview.push('…');
+    }
+    preview
+}
+
+/// The dispatch trace summary: `module(+msgs/+events)` per hop.
+fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
+    let Some(operations) = operations else {
+        return String::new();
+    };
+    operations
+        .iter()
+        .map(|op| {
+            let module = op["module"].as_str().unwrap_or("?");
+            let msgs = op["emitted_msgs"].as_i64().unwrap_or(0);
+            let events = op["emitted_events"].as_i64().unwrap_or(0);
+            format!("{module}(+{msgs}m/+{events}e)")
+        })
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+/// The ops of the selected block (0 selects nothing).
+pub fn explorer_ops_at(ops: Vec<ExplorerOp>, height: i64) -> Vec<ExplorerOp> {
+    ops.into_iter().filter(|op| op.height == height).collect()
+}
+
+/// The global-key router for the command palette: platform-Command+K
+/// toggles, Escape closes an open palette; anything else is `none`.
+pub fn palette_key_action(
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+    open: bool,
+) -> String {
+    use iced::keyboard::key::{Code, Physical};
+    let is_toggle = modifiers.command() && physical == Physical::Code(Code::KeyK);
+    if is_toggle {
+        return match open {
+            true => "close".into(),
+            false => "open".into(),
+        };
+    }
+    if open && physical == Physical::Code(Code::Escape) {
+        return "close".into();
+    }
+    "none".into()
+}
+
+/// The slash menu: a draft starting with `/` filters the insertable block
+/// kinds by case-insensitive prefix (`/h` -> the headings). Empty when the
+/// draft is not a slash command.
+pub fn slash_kind_matches(draft: String, kinds: Vec<String>) -> Vec<String> {
+    let Some(needle) = draft.strip_prefix('/') else {
+        return Vec::new();
+    };
+    let needle = needle.trim().to_ascii_lowercase();
+    kinds
+        .into_iter()
+        .filter(|kind| kind.to_ascii_lowercase().starts_with(&needle))
+        .collect()
+}
+
+/// True when the live connection is in a state the shell should banner:
+/// the stream is down, retrying, or a resync failed and is backing off.
+pub fn connection_degraded(status: String) -> bool {
+    status == "Offline"
+        || status == "Sync delayed"
+        || status == "Reconnecting…"
+        || status == "Live · resyncing"
+}
+
 pub fn canonical_endpoint(input: String) -> String {
     let configured = input.trim();
     rpc_client(configured)
@@ -1022,7 +2471,11 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                 let connected = async {
                     let rpc = rpc_client(&state.rpc)?;
                     rpc.module_events(
-                        vec!["chat".to_string(), "pages".to_string()],
+                        vec![
+                            "chat".to_string(),
+                            "pages".to_string(),
+                            "inbox".to_string(),
+                        ],
                         state.cursors.clone(),
                     )
                     .await
@@ -1052,7 +2505,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     }
                     Some(Ok(ModuleEvent::Changed { module, cursor, op })) => {
                         state.cursors.insert(format!("module:{module}"), cursor);
-                        match folded_update(&state.rpc, &module, op).await {
+                        match folded_update(&state.rpc, &module, *op).await {
                             Some(update) => update,
                             // invisible to the UI (hook registration) — keep
                             // draining without emitting.
@@ -1100,11 +2553,7 @@ async fn folded_update(
     match module {
         "chat" => {
             let current_user = local_user_key().await;
-            let origin_kind = match op.origin.kind {
-                ducktape_rpc::StreamOriginKind::External => "external",
-                ducktape_rpc::StreamOriginKind::Module => "module",
-                ducktape_rpc::StreamOriginKind::System => "system",
-            };
+            let origin_kind = stream_origin_kind(&op.origin.kind);
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
@@ -1138,7 +2587,36 @@ async fn folded_update(
                 debounce: false,
                 chat: delta,
                 pages: PagesDelta::default(),
+                bell: BellDelta::default(),
             })
+        }
+        "inbox" => {
+            let current_user = local_user_key().await?;
+            let member = format!("user:{}", hex_encode(&current_user));
+            let origin_kind = stream_origin_kind(&op.origin.kind);
+            let folded = inbox::client::delta_from_op(
+                &payload,
+                op.assigned.as_ref(),
+                origin_kind,
+                op.origin.id.as_deref(),
+                &member,
+            );
+            match folded {
+                Ok(Some(bell)) => Some(LiveUpdate {
+                    kind: "bell".into(),
+                    status: format!("Live · block {height}"),
+                    height,
+                    module: "inbox".into(),
+                    load_chat: false,
+                    load_pages: false,
+                    debounce: false,
+                    chat: ChatDelta::default(),
+                    pages: PagesDelta::default(),
+                    bell,
+                }),
+                Ok(None) => None,
+                Err(_) => None,
+            }
         }
         "pages" => match pages::client::delta_from_op(&payload) {
             Ok(delta) => Some(LiveUpdate {
@@ -1151,10 +2629,19 @@ async fn folded_update(
                 debounce: true,
                 chat: ChatDelta::default(),
                 pages: delta,
+                bell: BellDelta::default(),
             }),
             Err(_) => Some(live_resync("pages", height)),
         },
         _ => None,
+    }
+}
+
+fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
+    match kind {
+        ducktape_rpc::StreamOriginKind::External => "external",
+        ducktape_rpc::StreamOriginKind::Module => "module",
+        ducktape_rpc::StreamOriginKind::System => "system",
     }
 }
 
@@ -1390,6 +2877,7 @@ pub async fn create_channel(
     rpc: String,
     password: String,
     name: String,
+    members_only: bool,
 ) -> Result<ChatData, AppError> {
     async {
         let name = bounded_text(name, "channel name", 128)?;
@@ -1401,7 +2889,10 @@ pub async fn create_channel(
             chat::encode_msg(&ChatMsg::CreateChannel {
                 channel_id: channel_id.clone(),
                 name,
-                post_policy: PostPolicy::Open,
+                post_policy: match members_only {
+                    true => PostPolicy::MembersOnly,
+                    false => PostPolicy::Open,
+                },
             }),
             password,
         )
@@ -1589,6 +3080,7 @@ pub async fn send_message(
     channel_id: String,
     message_id: String,
     body: String,
+    members: Vec<ChatMember>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -1605,7 +3097,7 @@ pub async fn send_message(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: required_id(message_id, "message")?,
-                blocks: parse_message(&body),
+                blocks: parse_message_with_members(&body, &members),
                 thread: None,
                 as_agent: None,
             }),
@@ -1763,6 +3255,7 @@ pub async fn send_reply(
     root_seq: i64,
     message_id: String,
     body: String,
+    members: Vec<ChatMember>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -1778,7 +3271,7 @@ pub async fn send_reply(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: message_id.clone(),
-                blocks: parse_message(&body),
+                blocks: parse_message_with_members(&body, &members),
                 thread: Some(root_seq),
                 as_agent: None,
             }),
@@ -1809,6 +3302,7 @@ pub async fn edit_message(
     seq: i64,
     base_rev: i64,
     body: String,
+    members: Vec<ChatMember>,
 ) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
@@ -1822,7 +3316,7 @@ pub async fn edit_message(
             chat::encode_msg(&ChatMsg::EditMessage {
                 channel_id: channel_id.clone(),
                 seq,
-                blocks: parse_message(&body),
+                blocks: parse_message_with_members(&body, &members),
                 base_rev: Some(base_rev),
             }),
             password,
@@ -1920,18 +3414,25 @@ pub async fn search_chat(
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
-        let reply: chat::index::ChatViewReply = rpc
-            .view(
-                "chat",
-                &serde_json::json!({
-                    "search": {
-                        "text": text,
-                        "channel_id": (!channel_id.is_empty()).then_some(channel_id),
-                        "limit": 50
-                    }
-                }),
-            )
-            .await?;
+        // a `#tag` query filters by the exact hashtag (the index's tag
+        // postings); anything else is full-text search.
+        let query = match text.strip_prefix('#') {
+            Some(tag) if !tag.is_empty() => serde_json::json!({
+                "tag_search": {
+                    "tag": tag.to_lowercase(),
+                    "channel_id": (!channel_id.is_empty()).then_some(channel_id),
+                    "limit": 50
+                }
+            }),
+            _ => serde_json::json!({
+                "search": {
+                    "text": text,
+                    "channel_id": (!channel_id.is_empty()).then_some(channel_id),
+                    "limit": 50
+                }
+            }),
+        };
+        let reply: chat::index::ChatViewReply = rpc.view("chat", &query).await?;
         let chat::index::ChatViewReply::Hits(hits) = reply else {
             return Err("chat search returned an invalid reply".into());
         };
@@ -3475,6 +4976,116 @@ fn parse_user_key_status(status: &str) -> Option<Vec<u8>> {
     public_key(key, "local user key").ok()
 }
 
+/// The client-local UI prefs file (doc tabs, per-endpoint) — sibling to the
+/// user key: `$DUCKTAPE_HOME/app-prefs.json`, else `~/.ducktape/app-prefs.json`.
+/// Never wire state: purely this device's view preferences.
+fn prefs_path() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
+        return Some(PathBuf::from(root).join("app-prefs.json"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".ducktape/app-prefs.json"))
+}
+
+fn read_prefs() -> serde_json::Value {
+    let Some(path) = prefs_path() else {
+        return serde_json::json!({});
+    };
+    std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_prefs(prefs: &serde_json::Value) -> bool {
+    let Some(path) = prefs_path() else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(bytes) = serde_json::to_vec_pretty(prefs) else {
+        return false;
+    };
+    std::fs::write(&path, bytes).is_ok()
+}
+
+/// This endpoint's persisted doc tabs (open page ids, in open order).
+pub async fn load_doc_tabs(rpc: String) -> Vec<String> {
+    let prefs = read_prefs();
+    prefs["doc_tabs"][&rpc]
+        .as_array()
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| tab.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist this endpoint's doc tabs. Best-effort: a failed write only costs
+/// tab restoration on the next boot.
+pub async fn save_doc_tabs(rpc: String, tabs: Vec<String>) -> bool {
+    let mut prefs = read_prefs();
+    prefs["doc_tabs"][&rpc] = serde_json::json!(tabs);
+    write_prefs(&prefs)
+}
+
+/// Add a page to the doc-tab strip (idempotent, keeps open order).
+pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
+    if page_id.is_empty() || tabs.contains(&page_id) {
+        return tabs;
+    }
+    tabs.push(page_id);
+    tabs
+}
+
+/// Close one tab.
+pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
+    tabs.retain(|tab| *tab != page_id);
+    tabs
+}
+
+/// The tabs that still exist in the page list — deleted pages drop at render
+/// time and self-heal in the persisted list on the next save.
+pub fn retain_doc_tabs(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
+    tabs.into_iter()
+        .filter(|tab| pages.iter().any(|page| page.id == *tab))
+        .collect()
+}
+
+/// One rendered doc tab.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DocTab {
+    pub id: String,
+    pub title: String,
+    pub active: bool,
+}
+
+/// The rendered tab strip: open tabs that still exist, titled from the page
+/// list, the active one flagged.
+pub fn doc_tab_rows(tabs: Vec<String>, pages: Vec<PageItem>, active: String) -> Vec<DocTab> {
+    tabs.into_iter()
+        .filter_map(|tab| {
+            let page = pages.iter().find(|page| page.id == tab)?;
+            Some(DocTab {
+                title: page.title.clone(),
+                active: tab == active,
+                id: tab,
+            })
+        })
+        .collect()
+}
+
+/// The tab to activate after closing one: the last remaining tab, or empty.
+pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String {
+    if closed != active {
+        return active;
+    }
+    tabs.into_iter().rev().find(|tab| *tab != closed).unwrap_or_default()
+}
+
 fn user_key_path() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("DUCKTAPE_USER_KEY") {
         return Ok(path.into());
@@ -3595,6 +5206,7 @@ fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
         debounce: false,
         chat: ChatDelta::default(),
         pages: PagesDelta::default(),
+        bell: BellDelta::default(),
     }
 }
 
@@ -3917,6 +5529,22 @@ mod tests {
     use iced::futures::StreamExt as _;
 
     use super::*;
+
+    #[test]
+    fn files_base64_round_trips() {
+        for sample in [
+            b"".as_slice(),
+            b"a".as_slice(),
+            b"ab".as_slice(),
+            b"abc".as_slice(),
+            b"hello duckfs \xf0\x9f\xa6\x86".as_slice(),
+        ] {
+            let encoded = base64_encode(sample);
+            assert_eq!(base64_decode(&encoded).as_deref(), Some(sample), "{encoded}");
+        }
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+    }
 
     #[test]
     fn signer_requires_the_encrypted_v1_key_format() {

@@ -16,7 +16,7 @@
 use index_guest::{OriginTag, user_handle};
 
 use crate::index::{self, MsgRow};
-use crate::{Block, ChatAssigned, ChatMsg, Mark, PostPolicy, Span, decode_msg};
+use crate::{AuthorRef, Block, ChatAssigned, ChatMsg, Mark, PostPolicy, Span, decode_msg};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1045,6 +1045,15 @@ fn count_i64(value: usize) -> i64 {
 /// `__bold__`, `*italic*` / `_italic_`, and bare `http(s)` links. Everything the
 /// `chat` wire enums can round-trip — nothing client-only.
 pub fn parse_message(input: &str) -> Vec<Block> {
+    parse_message_with_members(input, &[])
+}
+
+/// [`parse_message`] with `@mention` resolution against the channel's member
+/// roster: `@` followed by four or more characters that case-insensitively
+/// prefix-match a member's key becomes a [`Mark::Mention`] span, which the
+/// module fans out to hooks (inbox notifications) on apply. Non-matching
+/// `@word`s stay plain text.
+pub fn parse_message_with_members(input: &str, members: &[ChatMember]) -> Vec<Block> {
     let lines: Vec<&str> = input.lines().collect();
     let mut blocks = Vec::new();
     let mut index = 0;
@@ -1061,11 +1070,11 @@ pub fn parse_message(input: &str) -> Vec<Block> {
             blocks.push(Block::Divider);
             index += 1;
         } else if is_quote {
-            index = push_quote_block(&lines, index, &mut blocks);
+            index = push_quote_block(&lines, index, members, &mut blocks);
         } else if is_blank {
             index += 1;
         } else {
-            index = push_paragraph_block(&lines, index, &mut blocks);
+            index = push_paragraph_block(&lines, index, members, &mut blocks);
         }
     }
     if blocks.is_empty() {
@@ -1090,7 +1099,12 @@ fn push_code_block(lines: &[&str], start: usize, opener: &str, blocks: &mut Vec<
     if closed { index + 1 } else { index }
 }
 
-fn push_quote_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+fn push_quote_block(
+    lines: &[&str],
+    start: usize,
+    members: &[ChatMember],
+    blocks: &mut Vec<Block>,
+) -> usize {
     let mut index = start;
     let mut quoted = Vec::new();
     while index < lines.len() && lines[index].trim().starts_with('>') {
@@ -1098,11 +1112,16 @@ fn push_quote_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> us
         quoted.push(stripped.to_string());
         index += 1;
     }
-    blocks.push(Block::Quote(inline_spans(&quoted.join(" "))));
+    blocks.push(Block::Quote(inline_spans(&quoted.join(" "), members)));
     index
 }
 
-fn push_paragraph_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -> usize {
+fn push_paragraph_block(
+    lines: &[&str],
+    start: usize,
+    members: &[ChatMember],
+    blocks: &mut Vec<Block>,
+) -> usize {
     let mut index = start;
     let mut paragraph = Vec::new();
     while index < lines.len() {
@@ -1118,14 +1137,14 @@ fn push_paragraph_block(lines: &[&str], start: usize, blocks: &mut Vec<Block>) -
         paragraph.push(trimmed);
         index += 1;
     }
-    blocks.push(Block::Paragraph(inline_spans(&paragraph.join(" "))));
+    blocks.push(Block::Paragraph(inline_spans(&paragraph.join(" "), members)));
     index
 }
 
 /// Scan a single line of text for inline marks, emitting marked `Span`s. Marks do
 /// not nest; the first matching delimiter wins. Bare `http(s)://` runs become
 /// `Link`s.
-fn inline_spans(text: &str) -> Vec<Span> {
+fn inline_spans(text: &str, members: &[ChatMember]) -> Vec<Span> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span> = Vec::new();
     let mut plain = String::new();
@@ -1134,7 +1153,15 @@ fn inline_spans(text: &str) -> Vec<Span> {
         let url = url_len(&chars, index);
         let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
         let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
-        if let Some(len) = url {
+        if let Some((member, len)) = mention_at(&chars, index, members) {
+            flush_plain(&mut plain, &mut spans);
+            let handle: String = chars[index..index + len].iter().collect();
+            spans.push(Span {
+                text: handle,
+                marks: vec![Mark::Mention(AuthorRef::User(member_key_bytes(&member)))],
+            });
+            index += len;
+        } else if let Some(len) = url {
             flush_plain(&mut plain, &mut spans);
             let target: String = chars[index..index + len].iter().collect();
             spans.push(Span {
@@ -1186,6 +1213,50 @@ fn url_len(chars: &[char], at: usize) -> Option<usize> {
         .take_while(|c| !c.is_whitespace())
         .count();
     (len > 0).then_some(len)
+}
+
+/// If `chars[at..]` opens an `@mention` of a channel member — `@` plus four
+/// or more word characters that case-insensitively prefix-match a member's
+/// key — the matched member and the consumed length (the `@` included).
+fn mention_at(chars: &[char], at: usize, members: &[ChatMember]) -> Option<(ChatMember, usize)> {
+    let opens = chars[at] == '@' && (at == 0 || chars[at - 1].is_whitespace());
+    if !opens || members.is_empty() {
+        return None;
+    }
+    let word: String = chars[at + 1..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if word.chars().count() < 4 {
+        return None;
+    }
+    let needle = word.to_ascii_lowercase();
+    let member = members
+        .iter()
+        .find(|member| member.key.to_ascii_lowercase().starts_with(&needle))?
+        .clone();
+    Some((member, 1 + word.chars().count()))
+}
+
+/// A member key back to `AuthorRef::User` bytes: keys are rendered by
+/// [`user_handle`] — printable identities pass through verbatim, raw key
+/// bytes arrive hex-encoded — so an even-length all-hex key decodes, and
+/// anything else is the identity's own bytes.
+fn member_key_bytes(member: &ChatMember) -> Vec<u8> {
+    let key = &member.key;
+    let looks_hex =
+        !key.is_empty() && key.len().is_multiple_of(2) && key.bytes().all(|b| b.is_ascii_hexdigit());
+    if looks_hex {
+        let decode = |range: &str| u8::from_str_radix(range, 16).ok();
+        let bytes: Option<Vec<u8>> = (0..key.len())
+            .step_by(2)
+            .map(|i| decode(&key[i..i + 2]))
+            .collect();
+        if let Some(bytes) = bytes {
+            return bytes;
+        }
+    }
+    key.as_bytes().to_vec()
 }
 
 /// If `chars[at..]` opens with `marker` and has a later closing `marker`, the
@@ -1273,6 +1344,63 @@ mod tests {
         assert_eq!(plain.len(), 1);
         assert!(!plain[0].rich);
         assert_eq!(plain[0].text, "just text here");
+    }
+
+    #[test]
+    fn mentions_resolve_against_the_member_roster() {
+        let members = vec![
+            ChatMember {
+                key: "a1b2c3d4e5f6".into(),
+                label: "a1b2c3d4…".into(),
+            },
+            ChatMember {
+                key: "zoe".into(),
+                label: "zoe".into(),
+            },
+        ];
+        let blocks = parse_message_with_members("ping @a1b2 about the deploy", &members);
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        let mention = spans
+            .iter()
+            .find(|span| span.marks.iter().any(|m| matches!(m, Mark::Mention(_))))
+            .expect("a mention span");
+        assert_eq!(mention.text, "@a1b2");
+        let Mark::Mention(AuthorRef::User(bytes)) = &mention.marks[0] else {
+            panic!("user mention expected");
+        };
+        assert_eq!(bytes, &vec![0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
+
+        // a printable (non-hex) identity keeps its own bytes
+        let blocks = parse_message_with_members("hey @zoe1 no — @zoea", &members);
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        // "@zoe1" prefix-matches nothing ("zoe" is shorter than the needle);
+        // four-char rule also keeps short "@zoe" plain.
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.marks.iter().all(|m| !matches!(m, Mark::Mention(_))))
+        );
+
+        // an unknown @word stays plain text
+        let blocks = parse_message_with_members("email @someone", &members);
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert!(spans.iter().all(|span| span.marks.is_empty()));
+
+        // rendered mentions highlight
+        let view = blocks_view(&parse_message_with_members("cc @a1b2c3", &members));
+        assert!(view[0].rich);
+        assert!(
+            view[0]
+                .spans
+                .iter()
+                .any(|span| span.highlight && span.text.starts_with("@a1b2c3"))
+        );
     }
 
     #[test]

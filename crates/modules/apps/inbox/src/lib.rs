@@ -41,6 +41,10 @@ pub use interface::*;
 // `index_guest` below.
 pub mod index;
 
+// the CLIENT view model: the rendered bell item + the member-scoped delta
+// fold a feed-following UI splices with. pure, ui.wasm-portable.
+pub mod client;
+
 // the wasm index-mapper shell: wires the pure core into the fluent31 engine.
 // compiled only by `guest-builder --index`'s synthesized wasm32 workspace
 // (feature `index-guest`), never by the native build.

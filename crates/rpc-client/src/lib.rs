@@ -51,7 +51,7 @@ pub enum ModuleEvent {
     Changed {
         module: String,
         cursor: String,
-        op: StreamOp,
+        op: Box<StreamOp>,
     },
     /// Replay history was unavailable; hydrate a fresh snapshot at this cursor.
     Lagged { module: String, cursor: String },
@@ -100,6 +100,13 @@ pub enum StreamOriginKind {
 /// One connected module-event session. Reconnect policy belongs to the caller.
 pub type ModuleEventStream = futures::stream::BoxStream<'static, Result<ModuleEvent>>;
 
+/// One log-ring line from the `logs` topic, with its resume cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogLine {
+    pub cursor: String,
+    pub line: String,
+}
+
 /// The stable portion of `GET /v1/status` needed by public clients.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct Status {
@@ -137,7 +144,7 @@ enum StreamFrame {
     Event {
         topic: String,
         cursor: String,
-        op: StreamOp,
+        op: Box<StreamOp>,
     },
     Lagged {
         topic: String,
@@ -222,6 +229,167 @@ impl Client {
             .await
             .map_err(|error| Error::new(format!("{module} view failed: {error}")))?;
         decode_json(response).await
+    }
+
+    /// Read the recent non-empty block rows (`GET /v1/blocks`), oldest-first
+    /// — the explorer surface. Rows are the node's own JSON projection.
+    pub async fn blocks(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut url = self.url("v1/blocks")?;
+        url.set_query(Some(&format!("limit={limit}")));
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC blocks failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Blocks {
+            blocks: Vec<serde_json::Value>,
+        }
+        let reply: Blocks = decode_json(response).await?;
+        Ok(reply.blocks)
+    }
+
+    /// One GET against a `/v1/files/*` read lane, query-string params, JSON
+    /// reply verbatim — the files browser's transport.
+    pub async fn files_get(
+        &self,
+        lane: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value> {
+        let mut url = self.url(&format!("v1/files/{lane}"))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(key, value);
+            }
+        }
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
+        decode_json(response).await
+    }
+
+    /// One POST against a `/v1/files/*` write lane with a JSON body — the
+    /// files browser's mutation transport (the node encodes + submits the
+    /// corresponding `FilesMsg`).
+    pub async fn files_post(
+        &self,
+        lane: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(self.url(&format!("v1/files/{lane}"))?)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
+        decode_json(response).await
+    }
+
+    /// Stage one duckfs chunk (`POST /v1/files/stage`, raw bytes ≤ 1 MiB) —
+    /// returns the staged chunk's digest.
+    pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {
+        let response = self
+            .http
+            .post(self.url("v1/files/stage")?)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC files stage failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Staged {
+            digest: String,
+        }
+        let reply: Staged = decode_json(response).await?;
+        Ok(reply.digest)
+    }
+
+    /// Read the peers standing (`GET /v1/peers`), the node's own JSON view.
+    pub async fn peers(&self) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .get(self.url("v1/peers")?)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC peers failed: {error}")))?;
+        decode_json(response).await
+    }
+
+    /// Subscribe the node's log ring (`logs` topic): each item is one log
+    /// line with its resume cursor. Reconnect policy belongs to the caller.
+    pub async fn log_events(
+        &self,
+        resume: Option<String>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<LogLine>>> {
+        let mut cursors = BTreeMap::new();
+        if let Some(cursor) = resume {
+            cursors.insert("logs".to_string(), cursor);
+        }
+        let subscribe = serde_json::to_string(&SubscribeRequest {
+            op: "subscribe",
+            topics: vec!["logs".to_string()],
+            resume: cursors,
+        })
+        .map_err(|error| Error::new(format!("could not encode log subscription: {error}")))?;
+        let url = self.stream_url()?;
+        let (mut socket, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(&url))
+            .await
+            .map_err(|_| Error::new("RPC stream connection timed out"))?
+            .map_err(|error| Error::new(format!("RPC stream connection failed: {error}")))?;
+        tokio::time::timeout(TIMEOUT, socket.send(Message::Text(subscribe)))
+            .await
+            .map_err(|_| Error::new("RPC stream subscription timed out"))?
+            .map_err(|error| Error::new(format!("RPC stream subscription failed: {error}")))?;
+        let stream = futures::stream::unfold(Some(socket), move |socket| async move {
+            let mut socket = socket?;
+            loop {
+                let message = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, socket.next()).await
+                {
+                    Ok(Some(message)) => message,
+                    Ok(None) => return Some((Err(Error::new("RPC stream closed")), None)),
+                    Err(_) => {
+                        return Some((Err(Error::new("RPC stream heartbeat timed out")), None));
+                    }
+                };
+                let Ok(Message::Text(text)) = message else {
+                    if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                        return Some((Err(Error::new("RPC stream closed")), None));
+                    }
+                    continue;
+                };
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all = "snake_case")]
+                enum LogFrame {
+                    Subscribed {},
+                    Tail {
+                        cursor: String,
+                        item: serde_json::Value,
+                    },
+                    Heartbeat,
+                    #[serde(other)]
+                    Other,
+                }
+                match serde_json::from_str::<LogFrame>(&text) {
+                    Ok(LogFrame::Tail { cursor, item }) => {
+                        let line = item["line"].as_str().unwrap_or_default().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        return Some((Ok(LogLine { cursor, line }), Some(socket)));
+                    }
+                    Ok(_) => continue,
+                    Err(_) => continue,
+                }
+            }
+        })
+        .boxed();
+        Ok(stream)
     }
 
     /// Submit an already-signed operation frame.

@@ -30,7 +30,15 @@ extern crate::backend
   PageSearchData(generation:i64, hits:[PageSearchHit])
   AutosaveResult(generation:i64, written:bool)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
-  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta)
+  BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
+  BellDelta(kind:str, item:BellItem, up_to_seq:i64)
+  BellData(generation:i64, unread:i64, items:[BellItem])
+  sync apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
+  sync bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
+  sync bell_head(items:[BellItem]) -> i64
+  load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
+  mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
+  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta, bell:BellDelta)
   ComposerCmd()
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
@@ -65,6 +73,73 @@ extern crate::backend
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
+  sync connection_degraded(status:str) -> bool
+  sync palette_key_action(physical:physical-key, modifiers:key-modifiers, open:bool) -> str
+  NavItem(id:str, title:str, icon:str, active:bool)
+  FsEntry(path:str, name:str, kind:str, size:i64)
+  FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
+  FsListing(generation:i64, path:str, entries:[FsEntry])
+  FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
+  FsHistory(generation:i64, snapshots:[FsSnapshot])
+  sync fs_parent(path:str) -> str
+  sync fs_child(path:str, name:str) -> str
+  files_mkdir(rpc:str, path:str) -> bool ! AppError
+  files_remove(rpc:str, path:str) -> bool ! AppError
+  files_write_text(rpc:str, path:str, text:str) -> bool ! AppError
+  files_upload(rpc:str, dir:str, dropped:str) -> bool ! AppError
+  FsDiffEntry(path:str, kind:str)
+  FsDiff(generation:i64, from:str, entries:[FsDiffEntry])
+  files_diff(rpc:str, from:str, generation:i64) -> FsDiff ! HydrationError
+  files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
+  files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
+  files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
+  sync shell_nav(tab:str) -> [NavItem]
+  NodeLogLine(cursor:str, line:str)
+  PeerRow(key:str, height:i64, live:bool)
+  PeersData(generation:i64, peers:[PeerRow])
+  sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
+  sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
+  stream node_logs(rpc:str) -> NodeLogLine
+  load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
+  AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
+  load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
+  set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
+  SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, open_tabs:i64)
+  load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
+  clear_doc_tabs(rpc:str) -> bool
+  ForgeRepo(name:str, head:str)
+  ForgeItem(number:i64, kind:str, title:str, state:str, author:str)
+  ForgeData(generation:i64, repos:[ForgeRepo])
+  ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
+  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, branches:str, reviews:i64, diff:str)
+  load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
+  load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
+  load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
+  AgentRow(id:str, name:str, capability:str, status:str, actions:str, owner:str)
+  AgentsData(generation:i64, agents:[AgentRow])
+  load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
+  ProposalRow(id:str, action:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, electorate:i64, open:bool)
+  GovernanceData(generation:i64, proposals:[ProposalRow])
+  load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
+  governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError
+  governance_execute(rpc:str, password:str, proposal_id:str) -> bool ! AppError
+  MemberRow(key:str, label:str, role:str, is_this_node:bool)
+  MembersData(generation:i64, validators:i64, residents:i64, members:[MemberRow])
+  load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
+  ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
+  ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
+  ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
+  sync explorer_ops_at(ops:[ExplorerOp], height:i64) -> [ExplorerOp]
+  load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
+  sync slash_kind_matches(draft:str, kinds:[str]) -> [str]
+  sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
+  sync doc_tabs_without(tabs:[str], page_id:str) -> [str]
+  DocTab(id:str, title:str, active:bool)
+  sync retain_doc_tabs(tabs:[str], pages:[PageItem]) -> [str]
+  sync doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
+  sync next_doc_tab(tabs:[str], closed:str, active:str) -> str
+  load_doc_tabs(rpc:str) -> [str]
+  save_doc_tabs(rpc:str, tabs:[str]) -> bool
   sync retain_for_endpoint(value:str, current:str, next:str) -> str
   sync mutation_failure_phase(committed:bool) -> str
   sync message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64
@@ -116,7 +191,7 @@ extern crate::backend
   sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
   load_chat(rpc:str, channel_id:str) -> ChatData ! AppError
   load_chat_hit(rpc:str, channel_id:str, root_seq:i64, target_seq:i64) -> ChatData ! AppError
-  create_channel(rpc:str, password:str, name:str) -> ChatData ! AppError
+  create_channel(rpc:str, password:str, name:str, members_only:bool) -> ChatData ! AppError
   rename_channel(rpc:str, password:str, channel_id:str, name:str) -> bool ! AppError
   archive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
   unarchive_channel(rpc:str, password:str, channel_id:str) -> bool ! AppError
@@ -124,12 +199,12 @@ extern crate::backend
   remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
   join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
-  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
+  send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
   refresh_live_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> LiveThreadData ! HydrationError
-  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str) -> SendReceipt ! OptimisticMutationError
-  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str) -> bool ! AppError
+  send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
+  edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str, members:[ChatMember]) -> bool ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError

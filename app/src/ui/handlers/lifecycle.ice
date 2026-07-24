@@ -61,6 +61,7 @@ on reconnect
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   pages = []
+  doc_tabs = []
   blocks = []
   active_page = ""
   active_page_title = ""
@@ -126,6 +127,10 @@ on workspace_connected(next)
   mutation_phase = "idle"
   hydration_retry_attempt = 0
   error = ""
+  bell_generation = bell_generation + 1
+  parallel
+    run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
+    run load_bell(connected_rpc, bell_generation) -> bell_loaded _ | bell_failed _
 
 on live_updated(next)
   status = next.status
@@ -141,6 +146,8 @@ on live_updated(next)
   active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
   active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
+  bell_items = apply_bell(bell_items, next.bell)
   return if !next.load_chat && !next.load_pages
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -262,8 +269,393 @@ on live_block_comments_failed(cause)
   block_thread_comments_loading = false
   error = cause.message
 
+on select_shell_tab(next)
+  shell_tab = next
+  return if !connected
+  return if shell_tab == "chat" || shell_tab == "pages"
+  explorer_generation = explorer_generation + 1
+  fs_generation = fs_generation + 1
+  members_generation = members_generation + 1
+  gov_generation = gov_generation + 1
+  agents_generation = agents_generation + 1
+  account_generation = account_generation + 1
+  forge_generation = forge_generation + 1
+  settings_generation = settings_generation + 1
+  node_peers_generation = node_peers_generation + 1
+  explorer_loading = shell_tab == "explorer"
+  fs_loading = shell_tab == "files"
+  parallel
+    run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
+    run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
+    run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+    run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
+    run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
+    run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
+    run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+    run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
+
+on forge_loaded(next)
+  return if next.generation != forge_generation
+  forge_repos = next.repos
+
+on forge_failed(cause)
+  return if cause.generation != forge_generation
+
+on forge_open_repo(name)
+  return if !connected
+  forge_repo = name
+  forge_item_number = 0
+  forge_item_diff = ""
+  forge_generation = forge_generation + 1
+  run load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
+
+on forge_repo_loaded(next)
+  return if next.generation != forge_generation
+  forge_repo = next.repo
+  forge_branches = next.branches
+  forge_items = next.items
+
+on forge_open_item(number)
+  return if !connected || empty(forge_repo)
+  forge_item_number = number
+  forge_generation = forge_generation + 1
+  run load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_failed _
+
+on forge_item_loaded(next)
+  return if next.generation != forge_generation
+  forge_item_number = next.number
+  forge_item_title = next.title
+  forge_item_state = next.state
+  forge_item_kind = next.kind
+  forge_item_body = next.body
+  forge_item_branches = next.branches
+  forge_item_reviews = next.reviews
+  forge_item_diff = next.diff
+
+on forge_close_item
+  forge_item_number = 0
+  forge_item_diff = ""
+
+on account_loaded(next)
+  return if next.generation != account_generation
+  account_bound = next.bound
+  account_id = next.account_id
+  account_name = next.display_name
+  account_bio = next.bio
+  account_members = next.members
+  account_nodes = next.nodes
+
+on account_failed(cause)
+  return if cause.generation != account_generation
+
+on account_name_draft_changed(next)
+  account_name_draft = next
+
+on account_rename_submit
+  return if !connected || !account_bound || account_renaming || empty(trim(account_name_draft))
+  account_renaming = true
+  error = ""
+  run set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
+
+on account_renamed(_)
+  account_renaming = false
+  account_name_draft = ""
+  account_generation = account_generation + 1
+  run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+
+on account_rename_failed(cause)
+  account_renaming = false
+  error = cause.message
+
+on agents_loaded(next)
+  return if next.generation != agents_generation
+  agents_rows = next.agents
+
+on agents_failed(cause)
+  return if cause.generation != agents_generation
+
+on node_log_line(line)
+  node_log_lines = push_log_line(node_log_lines, line)
+
+on node_log_filter_changed(next)
+  node_log_filter = next
+
+on peers_loaded(next)
+  return if next.generation != node_peers_generation
+  node_peers = next.peers
+
+on peers_failed(cause)
+  return if cause.generation != node_peers_generation
+
+on settings_loaded(next)
+  return if next.generation != settings_generation
+  settings_endpoint = next.endpoint
+  settings_node_key = next.node_key
+  settings_height = next.height
+  settings_key_path = next.key_path
+  settings_key_state = next.key_state
+  settings_open_tabs = next.open_tabs
+
+on settings_failed(cause)
+  return if cause.generation != settings_generation
+
+on settings_clear_tabs
+  doc_tabs = []
+  run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
+
+on governance_loaded(next)
+  return if next.generation != gov_generation
+  gov_rows = next.proposals
+
+on governance_failed(cause)
+  return if cause.generation != gov_generation
+
+on gov_vote(proposal_id, approve)
+  return if !connected || !empty(gov_voting)
+  gov_voting = proposal_id
+  run governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
+
+on gov_execute(proposal_id)
+  return if !connected || !empty(gov_voting)
+  gov_voting = proposal_id
+  run governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
+
+on gov_acted(_)
+  gov_voting = ""
+  gov_generation = gov_generation + 1
+  run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+
+on gov_act_failed(cause)
+  gov_voting = ""
+  error = cause.message
+
+on members_loaded(next)
+  return if next.generation != members_generation
+  members_rows = next.members
+  members_validators = next.validators
+  members_residents = next.residents
+
+on members_failed(cause)
+  return if cause.generation != members_generation
+
+on fs_open_dir(path)
+  return if fs_loading || !connected
+  fs_path = path
+  fs_generation = fs_generation + 1
+  fs_loading = true
+  fs_preview_path = ""
+  fs_preview_text = ""
+  run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+
+on fs_open_parent
+  return if fs_loading || !connected || empty(fs_path)
+  fs_path = fs_parent(fs_path)
+  fs_generation = fs_generation + 1
+  fs_loading = true
+  fs_preview_path = ""
+  fs_preview_text = ""
+  run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+
+on fs_open_file(path)
+  return if fs_loading || !connected
+  fs_preview_path = path
+  fs_generation = fs_generation + 1
+  run files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
+
+on fs_toggle_history
+  fs_history_open = !fs_history_open
+
+on fs_listed(next)
+  return if next.generation != fs_generation
+  fs_loading = false
+  fs_path = next.path
+  fs_entries = next.entries
+
+on fs_previewed(next)
+  return if next.generation != fs_generation
+  fs_preview_path = next.path
+  fs_preview_text = next.text
+  fs_preview_truncated = next.truncated
+  fs_preview_binary = next.binary
+
+on fs_history_loaded(next)
+  return if next.generation != fs_generation
+  fs_history = next.snapshots
+
+on fs_failed(cause)
+  return if cause.generation != fs_generation
+  fs_loading = false
+  error = cause.message
+
+on fs_new_name_changed(next)
+  fs_new_name = next
+
+on fs_mkdir_submit
+  return if fs_loading || !connected || empty(trim(fs_new_name))
+  fs_loading = true
+  error = ""
+  run files_mkdir(connected_rpc, fs_child(fs_path, trim(fs_new_name))) -> fs_wrote _ | fs_write_failed _
+
+on fs_new_file_submit
+  return if fs_loading || !connected || empty(trim(fs_new_name))
+  fs_loading = true
+  error = ""
+  run files_write_text(connected_rpc, fs_child(fs_path, trim(fs_new_name)), "") -> fs_wrote _ | fs_write_failed _
+
+on fs_arm_delete(path)
+  fs_delete_target = path
+
+on fs_delete_submit
+  return if fs_loading || !connected || empty(fs_delete_target)
+  fs_loading = true
+  error = ""
+  run files_remove(connected_rpc, fs_delete_target) -> fs_wrote _ | fs_write_failed _
+
+on fs_begin_edit
+  return if fs_preview_binary || empty(fs_preview_path)
+  fs_editing = true
+  fs_editor = editor(fs_preview_text)
+
+on fs_cancel_edit
+  fs_editing = false
+
+on fs_save_edit
+  return if fs_loading || !connected || !fs_editing || empty(fs_preview_path)
+  fs_loading = true
+  fs_editing = false
+  fs_preview_text = editor_text(fs_editor)
+  error = ""
+  run files_write_text(connected_rpc, fs_preview_path, editor_text(fs_editor)) -> fs_wrote _ | fs_write_failed _
+
+on fs_wrote(_)
+  fs_new_name = ""
+  fs_delete_target = ""
+  fs_generation = fs_generation + 1
+  fs_loading = true
+  parallel
+    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
+
+on fs_write_failed(cause)
+  fs_loading = false
+  error = cause.message
+
+on fs_file_dropped(path)
+  return if shell_tab != "files" || fs_loading || !connected
+  fs_loading = true
+  error = ""
+  run files_upload(connected_rpc, fs_path, path) -> fs_wrote _ | fs_write_failed _
+
+on fs_show_diff(from)
+  return if fs_loading || !connected
+  fs_diff_from = from
+  fs_generation = fs_generation + 1
+  run files_diff(connected_rpc, fs_diff_from, fs_generation) -> fs_diffed _ | fs_failed _
+
+on fs_close_diff
+  fs_diff_from = ""
+  fs_diff = []
+
+on fs_diffed(next)
+  return if next.generation != fs_generation
+  fs_diff = next.entries
+
+on refresh_explorer
+  return if !connected || explorer_loading
+  explorer_generation = explorer_generation + 1
+  explorer_loading = true
+  run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+
+on explorer_loaded(next)
+  return if next.generation != explorer_generation
+  explorer_loading = false
+  explorer_blocks = next.blocks
+  explorer_ops = next.ops
+
+on explorer_failed(cause)
+  return if cause.generation != explorer_generation
+  explorer_loading = false
+  error = cause.message
+
+on select_explorer_block(height)
+  explorer_selected = height
+
+on toggle_palette
+  return if !connected
+  palette_open = !palette_open
+  palette_draft = ""
+  palette_chat_hits = []
+  palette_page_hits = []
+  palette_generation = palette_generation + 1
+  palette_searching = false
+  return if !palette_open
+  task widget focus #workspace-tabs/palette-input
+
+on close_palette
+  palette_open = false
+
+on toggle_bell
+  bell_open = !bell_open
+  return if !bell_open || bell_unread <= 0
+  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
+
+on close_bell
+  bell_open = false
+
+on bell_loaded(next)
+  return if next.generation != bell_generation
+  bell_unread = next.unread
+  bell_items = next.items
+
+on bell_failed(cause)
+  return if cause.generation != bell_generation
+
+on bell_marked(_)
+  error = error
+
+on global_key_pressed(event)
+  palette_key = palette_key_action(event.physical_key, event.modifiers, palette_open)
+  return if palette_key == "none" || !connected
+  palette_open = palette_key == "open"
+  palette_key = ""
+  palette_draft = ""
+  palette_chat_hits = []
+  palette_page_hits = []
+  palette_generation = palette_generation + 1
+  palette_searching = false
+  return if !palette_open
+  task widget focus #workspace-tabs/palette-input
+
+on palette_changed(next)
+  palette_draft = next
+  palette_generation = palette_generation + 1
+  palette_searching = !empty(trim(palette_draft))
+  return if empty(trim(palette_draft))
+  parallel
+    run search_chat(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_chat_loaded _ | palette_search_failed _
+    run search_pages(connected_rpc, "", trim(palette_draft), palette_generation) -> palette_page_loaded _ | palette_search_failed _
+
+on palette_chat_loaded(next)
+  return if next.generation != palette_generation
+  palette_chat_hits = next.hits
+  palette_searching = false
+
+on palette_page_loaded(next)
+  return if next.generation != palette_generation
+  palette_page_hits = next.hits
+  palette_searching = false
+
+on palette_search_failed(cause)
+  return if cause.generation != palette_generation
+  palette_searching = false
+
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
+  keyboard press when connected -> global_key_pressed _
+  window file-dropped -> fs_file_dropped _
+  run node_logs(connected_rpc) when (connected && shell_tab == "node") -> node_log_line _
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)

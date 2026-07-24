@@ -25,6 +25,8 @@ on clear_chat_search
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   return if loading || mutation_phase != "idle"
+  palette_open = false
+  shell_tab = "chat"
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   hydration_generation = hydration_generation + 1
@@ -51,7 +53,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   reply_editor = editor("")
   pending_reply = ""
   error = ""
-  run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_updated _ | failed _
+  run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_hit_loaded _ | failed _
 
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
@@ -91,7 +93,10 @@ on create_channel_submit
   pending_channel = trim(channel_draft)
   channel_draft = ""
   error = ""
-  run create_channel(connected_rpc, password, pending_channel) -> channel_created _ | mutation_failed _
+  run create_channel(connected_rpc, password, pending_channel, channel_create_members_only) -> channel_created _ | mutation_failed _
+
+on toggle_channel_create_members_only
+  channel_create_members_only = !channel_create_members_only
 
 on toggle_channel_create
   channel_create_open = !channel_create_open
@@ -181,7 +186,7 @@ on send_message_submit
   message_editor = editor("")
   messages = optimistic_message(messages, pending_message, pending_message_id)
   error = ""
-  run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message) -> message_sent _ | message_send_failed _
+  run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -200,6 +205,34 @@ on message_send_failed(cause)
   run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on chat_updated(next)
+  history_view = false
+  channels = next.channels
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  active_channel = next.active_channel
+  active_channel_name = next.active_channel_name
+  active_channel_archived = next.active_channel_archived
+  active_channel_members_only = next.active_channel_members_only
+  active_channel_huddle_count = next.active_channel_huddle_count
+  channel_members = next.channel_members
+  selected_message_seq = next.selected_message_seq
+  selected_message_rev = next.selected_message_rev
+  message_action = "toolbar"
+  message_edit_draft = next.selected_message_body
+  active_thread_seq = next.active_thread_seq
+  thread_target_seq = next.thread_target_seq
+  thread_messages = next.thread_messages
+  thread_next_reply_offset = next.thread_next_reply_offset
+  thread_has_more = next.thread_has_more
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = false
+  loading = false
+  error = ""
+
+on chat_hit_loaded(next)
+  history_view = true
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
@@ -228,6 +261,7 @@ on chat_updated(next)
 on channel_created(next)
   pending_channel = ""
   channel_create_open = false
+  channel_create_members_only = false
   mutation_phase = "idle"
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
@@ -345,7 +379,7 @@ on edit_thread_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-edit"
   error = ""
-  run edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft)) -> chat_acked _ | mutation_failed _
+  run edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_thread_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != "delete"
@@ -522,7 +556,7 @@ on edit_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-edit"
   error = ""
-  run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft)) -> chat_acked _ | mutation_failed _
+  run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || message_action != "delete"
@@ -582,7 +616,7 @@ on send_reply_submit
   reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
-  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply) -> thread_reply_sent _ | thread_reply_send_failed _
+  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
 on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
