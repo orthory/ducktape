@@ -841,9 +841,16 @@ fn run_sim(
             }
             // a redeemed role=Client invite records a key in identity's client
             // ACL (governance emits an `IdentityMsg::GrantClient` follow-up);
-            // identity is already in the default module set above.
-            let governance = Governance::new("governance", "valset", "identity")
-                .with_invite_binding(invite_binding);
+            // identity is already in the default module set above. store-backed
+            // like bin/node; the sim wires the binding through the native
+            // builder (no wasm guest here, so no `__config` seeding).
+            let governance = Governance::new(
+                "governance",
+                Box::new(QmdbStore::init(context.child("governance"), "governance").await),
+                "valset",
+                "identity",
+            )
+            .with_invite_binding(invite_binding);
             let lifecycle = Lifecycle::new("lifecycle", "valset");
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));

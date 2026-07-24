@@ -17,7 +17,8 @@ use governance::{
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use sdk::{Error, Module as _, Msg, Origin};
+use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
 use valset::Valset;
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode,
@@ -42,6 +43,7 @@ fn gov_host() -> Host {
         Box::new(valset),
         Box::new(Governance::new(
             "governance",
+            Box::new(MemStore::new()),
             "valset",
             "identity",
         )),
@@ -464,6 +466,7 @@ fn a_single_member_ballot_is_a_deciding_majority() {
             Box::new(valset),
             Box::new(Governance::new(
                 "governance",
+                Box::new(MemStore::new()),
                 "valset",
                 "identity",
             )),
@@ -554,6 +557,7 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
             Box::new(valset),
             Box::new(Governance::new(
                 "governance",
+                Box::new(MemStore::new()),
                 "valset",
                 "identity",
             )),
@@ -837,78 +841,3 @@ fn votes_close_at_the_deadline_and_ballots_are_per_member() {
     });
 }
 
-#[test]
-fn snapshot_install_round_trips_and_rejects_tampering() {
-    block_on(async {
-        let mut host = gov_host();
-        let m1 = member_key(1);
-        submit_as(
-            &mut host,
-            &m1,
-            1,
-            "governance",
-            gov_encode(&GovMsg::Propose {
-                proposal_id: "p".into(),
-                action: GovAction::Signal {
-                    text: "snapshot me".into(),
-                },
-                voting_period: 50,
-            }),
-        )
-        .await
-        .expect("propose");
-        submit_as(
-            &mut host,
-            &m1,
-            2,
-            "governance",
-            gov_encode(&GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: true,
-            }),
-        )
-        .await
-        .expect("vote");
-
-        // rebuild a fresh instance from the snapshot, gated on the root.
-        let root = host.module_root("governance").expect("gov root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
-            // reach the handle through the host's finalized-snapshot surface.
-            let finalized = host::FinalizedBlock {
-                height: 2,
-                root_hash: host.root_hash(),
-            };
-            host.capture_finalized_snapshot(finalized)
-                .expect("capture")
-                .module("governance")
-                .expect("gov entry")
-                .state_sync
-                .clone()
-        }) else {
-            panic!("governance must advertise snapshot bytes");
-        };
-
-        let mut rebuilt = Governance::new("governance", "valset", "identity");
-        rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(
-            rebuilt.root(),
-            root,
-            "installed root equals the source root"
-        );
-
-        // a flipped bit must be refused without touching state.
-        let mut tampered = bytes.clone();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0x01;
-        let mut fresh = Governance::new("governance", "valset", "identity");
-        assert!(
-            fresh.install(&tampered, root).is_err(),
-            "tampered snapshot refused"
-        );
-        assert_eq!(
-            fresh.root(),
-            sdk::StateRoot::ZERO,
-            "refused install leaves no trace"
-        );
-    });
-}

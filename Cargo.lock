@@ -3666,15 +3666,17 @@ dependencies = [
  "async-trait",
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-runtime",
  "futures",
  "guest-adapter",
  "host",
  "identity",
  "lifecycle",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
- "sha2",
+ "statesync",
  "valset",
 ]
 

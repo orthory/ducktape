@@ -1,34 +1,58 @@
-//! the wasm port of this module, built the
-//! ADAPTER way: the NATIVE `governance` crate is compiled to wasm32 unmodified
-//! and adapted to the `ducktape:module` world through `guest-adapter`, so the
-//! module's logic is single-sourced (a behavior change in the native crate IS
-//! the wasm change).
+//! the wasm port of this module, built the ADAPTER way: the NATIVE
+//! `governance` crate is compiled to wasm32 unmodified and adapted to the
+//! `ducktape:module` world through `guest-adapter`, so the module's logic is
+//! single-sourced (a behavior change in the native crate IS the wasm change).
+//! the packaging cdylib around this port is synthesized by `guest-builder` —
+//! this module is the whole of the guest's hand-written surface.
+//!
+//! ## the STORE-BACKED dispatch model, and why it is equivalent
+//!
+//! governance is pure logic over a host-injected [`sdk::MerkleStore`] — so
+//! the port injects [`WitStore`], the adapter's `MerkleStore` over the wit
+//! `state-*` imports, and the REAL qmdb store stays host-side
+//! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store
+//! IS the state and the wasm root is the store's Merkle root. See the
+//! `pages` guest port for the staging-contract argument spelled out point by
+//! point — governance rides the identical seams:
+//!
+//! * the guest rebuilds the module FRESH per dispatch over the exact
+//!   production builder chain (`Governance::new` with the valset/identity
+//!   sibling ids below, plus the code registry); its inner `StagedStore`
+//!   overlay is per-dispatch, and cross-dispatch read-your-writes comes from
+//!   the host's outer staged overlay via `WitStore::get`
+//!   (staged-over-committed) — every decision in the execute paths reads
+//!   through it (the proposal roster and records, the redeemed-nonce set,
+//!   the share registry and mode flag), so a propose-then-vote cascade
+//!   inside one block decides byte-identically to native.
+//! * each successful `execute` flushes the inner staging with the inner
+//!   `commit_block` — `state-set`/`state-delete` OUTER staging the host
+//!   publishes into the real store in ONE `commit_batch` at the true block
+//!   boundary.
+//! * governance exercises every seam the runtime offers at once: sibling
+//!   reads (valset membership, identity account resolution) resolve through
+//!   the memoized replay, and a passing proposal EMITS follow-up msgs
+//!   (valset membership ops, lifecycle upgrade schedules + code swaps) that
+//!   the runtime republishes through the host ctx only after a clean run —
+//!   so a wasm governance still drives the code registry that live-updates
+//!   the other wasm tenants.
+//!
+//! ## the genesis-config invite binding
 //!
 //! governance's per-network parameter is the INVITE BINDING — the genesis
 //! namespace every invite token and join proof verify against. a wasm
 //! component is fixed bytes, so the binding arrives as GENESIS CONFIG: the
-//! host installs an `sdk::genesis_config`-encoded `__config` entry into this
-//! module's consensus store at genesis construction, and every dispatch
-//! decodes it and constructs the native module with it. the config is
-//! consensus state and rides checkpoint snapshots like any other store key.
-//! the valset / lifecycle / identity sibling ids are genesis-constant
-//! wiring (identical on every network), so they stay compiled in like every
-//! other port's sibling ids.
-//!
-//! governance exercises every seam the runtime offers at once: sibling reads
-//! (valset membership, identity account resolution) resolve through the
-//! memoized replay, and a passing proposal EMITS follow-up msgs (valset
-//! membership ops, lifecycle upgrade schedules + code swaps) that the runtime
-//! republishes through the host ctx only after a clean run — so a wasm
-//! governance still drives the code registry that live-updates the other wasm
-//! tenants. the whole-state dispatch model (load `__state`/`__root` through
-//! the host's staged overlay, run the native `execute`, commit the INNER
-//! module, save the canonical snapshot back as OUTER staged writes) is
-//! the `agent` guest port verbatim; see that crate for the
-//! equivalence argument. The canonical snapshot is stored as one host-KV value.
+//! host seeds an `sdk::genesis_config`-encoded `__config` record into this
+//! module's qmdb store at genesis construction — under [`sdk::store_key`],
+//! the store-backed twin of the host-KV `__config` entry — and every
+//! dispatch reads it back through [`load_store_config`] and constructs the
+//! native module with it. the config is consensus state in the store's
+//! merkle root from genesis, and it rides state-sync like any other record.
+//! the valset / lifecycle / identity sibling ids are genesis-constant wiring
+//! (identical on every network), so they stay compiled in like every other
+//! port's sibling ids.
 
 use crate::Governance;
-use guest_adapter::{host, load_config};
+use guest_adapter::{WitStore, host, load_store_config};
 use sdk::genesis_config;
 
 /// the genesis-constant id this module registers under (the native twin's id:
@@ -45,12 +69,12 @@ const IDENTITY_ID: &str = "identity";
 /// the genesis-config key carrying this network's invite binding.
 const INVITE_PARAM: &str = "invite";
 
-/// this network's invite binding, decoded from the host-installed genesis
+/// this network's invite binding, decoded from the host-seeded genesis
 /// config. a missing or malformed config is host wiring corruption surfaced
 /// as a deterministic rejection — never a guessed default (an unwired binding
 /// would refuse every `Redeem` its peers accept, which forks).
 fn invite_binding() -> Result<Vec<u8>, host::Error> {
-    let raw = load_config().ok_or_else(|| {
+    let raw = load_store_config().ok_or_else(|| {
         host::Error::Rejected("governance genesis config missing (__config)".into())
     })?;
     let params = genesis_config::decode_config(&raw)
@@ -62,16 +86,17 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
         })
 }
 
-// whole-state port; the per-network invite binding comes from genesis config
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// the per-network invite binding comes from the store-seeded genesis config
 // via the bespoke `invite_binding` above (a bytes param, not the chain_id
-// twin's string). the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+// twins' string); redeem-time client grants ride an `IdentityMsg::GrantClient`
+// follow-up into identity (already wired for account-share) — no separate
+// module.
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Governance,
-    new: Governance::new(MODULE_ID, VALSET_ID, IDENTITY_ID)
+    new: Governance::new(MODULE_ID, Box::new(WitStore), VALSET_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
-        // redeem-time client grants ride an `IdentityMsg::GrantClient` follow-up
-        // into identity (already wired for account-share). no separate module.
         .with_code_registry(LIFECYCLE_ID),
 }

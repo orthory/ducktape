@@ -29,6 +29,7 @@ use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode, encode_query as identity_query,
 };
 use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
 use valset::Valset;
 use valset::{
     ValsetQuery, ValsetReply, decode_reply as valset_decode, encode_query as valset_query,
@@ -100,7 +101,10 @@ fn gov_host() -> Host {
     Host::genesis(vec![
         Box::new(valset),
         Box::new(Identity::new("identity", None, "testnet".into())),
-        Box::new(Governance::new("governance", "valset", "identity").with_invite_binding(BINDING)),
+        Box::new(
+            Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
+                .with_invite_binding(BINDING),
+        ),
     ])
     .expect("genesis")
 }
@@ -148,14 +152,19 @@ async fn clients(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-async fn redemptions(host: &Host) -> Vec<governance::RedemptionView> {
+async fn redemption(host: &Host, nonce: &[u8]) -> Option<governance::RedemptionView> {
     let reply = host
-        .query("governance", &gov_query(&GovQuery::Redemptions))
+        .query(
+            "governance",
+            &gov_query(&GovQuery::Redemption {
+                nonce: nonce.to_vec(),
+            }),
+        )
         .await
         .expect("gov query");
     match gov_decode(&reply).expect("decode") {
-        GovReply::Redemptions(r) => r,
-        other => panic!("expected Redemptions, got {other:?}"),
+        GovReply::Redemption(r) => r,
+        other => panic!("expected Redemption, got {other:?}"),
     }
 }
 
@@ -180,16 +189,21 @@ fn a_valid_redemption_grants_full_node_standing_without_a_ballot() {
             vec![key_bytes(&joiner)],
             "the joiner holds resident standing in the same block"
         );
-        let audit = redemptions(&host).await;
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].joiner, key_bytes(&joiner));
-        assert_eq!(audit[0].issuer, key_bytes(&member));
-        assert_eq!(audit[0].height, 1);
+        let audit = redemption(&host, &token.nonce)
+            .await
+            .expect("the admission is recorded under its nonce");
+        assert_eq!(audit.joiner, key_bytes(&joiner));
+        assert_eq!(audit.issuer, key_bytes(&member));
+        assert_eq!(audit.height, 1);
+        assert!(
+            redemption(&host, &[0u8; 16]).await.is_none(),
+            "an unspent nonce reads as absent"
+        );
     });
 }
 
 #[test]
-fn a_token_is_single_use_and_survives_snapshot_round_trip() {
+fn a_token_is_single_use() {
     block_on(async {
         let mut host = gov_host();
         let (member, joiner) = (keypair(1), keypair(9));
@@ -220,29 +234,6 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
                 if m.contains("already redeemed") || m.contains("already holds resident standing")),
             "a replay must be refused as a double-admit, got {err:?}"
         );
-
-        // the redeemed set is state: it rides the snapshot, and a rebuilt
-        // instance reproduces the exact root.
-        use sdk::Module as _;
-        let expected_root = host.module_root("governance").expect("gov root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
-            let finalized = host::FinalizedBlock {
-                height: 2,
-                root_hash: host.root_hash(),
-            };
-            host.capture_finalized_snapshot(finalized)
-                .expect("capture")
-                .module("governance")
-                .expect("gov entry")
-                .state_sync
-                .clone()
-        }) else {
-            panic!("governance must advertise snapshot bytes");
-        };
-        let mut rebuilt =
-            Governance::new("governance", "valset", "identity").with_invite_binding(BINDING);
-        rebuilt.install(&bytes, expected_root).expect("install");
-        assert_eq!(rebuilt.root(), expected_root, "round-trip root");
     });
 }
 
@@ -304,7 +295,12 @@ fn a_network_without_a_binding_refuses_redemption() {
         let mut host = Host::genesis(vec![
             Box::new(valset),
             // no with_invite_binding — the dev-seed shape.
-            Box::new(Governance::new("governance", "valset", "identity")),
+            Box::new(Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )),
         ])
         .expect("genesis");
 
@@ -398,10 +394,11 @@ fn a_client_role_token_grants_client_standing_not_residency() {
             residents(&host).await.is_empty(),
             "a Client redeem grants NO resident standing — the tiers are distinct"
         );
-        // the admission is still audited in the shared redemption set.
-        let audit = redemptions(&host).await;
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].joiner, key_bytes(&client));
+        // the admission is still recorded in the shared redemption keyspace.
+        let audit = redemption(&host, &token.nonce)
+            .await
+            .expect("the admission is recorded under its nonce");
+        assert_eq!(audit.joiner, key_bytes(&client));
     });
 }
 
