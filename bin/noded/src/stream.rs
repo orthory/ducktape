@@ -8,12 +8,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use duckfs_core::{Change, FilesMsg};
 use futures::StreamExt as _;
-use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tracing_subscriber::fmt::MakeWriter;
 
-use crate::{NodeCommand, NodeHandle};
+use crate::NodeHandle;
 
 /// the TIMER beat: the liveness floor while no blocks commit, and (×2.5) the
 /// client watchdog's timeout basis. a heartbeat frame also rides every block
@@ -1490,11 +1489,11 @@ fn catch_up_term_command(
     CatchUpResult::keep(frames)
 }
 
-/// re-sample the node's OpenMetrics exposition through the SAME actor command
-/// GET /metrics answers (`NodeCommand::Metrics` — every embedder already
-/// handles it), so the stream needs no second registry encoder. one Tail
-/// frame per wakeup carrying the whole scrape text; a gone actor drops the
-/// topic with the same `unavailable` shape the http lane's 503 carries.
+/// re-sample the node's OpenMetrics exposition through the SAME wired source
+/// GET /metrics reads (the handle's status cell), so the stream needs no
+/// second registry encoder — and no actor round-trip. one Tail frame per
+/// wakeup carrying the whole scrape text; an unwired source drops the topic
+/// with the same `unavailable` shape the http lane's 503 carries.
 async fn catch_up_metrics(
     topic: &str,
     state: &mut TopicState,
@@ -1503,12 +1502,11 @@ async fn catch_up_metrics(
     let TopicState::Metrics { sampled_ms } = state else {
         return CatchUpResult::keep(Vec::new());
     };
-    let (reply, rx) = oneshot::channel();
-    if handle.send(NodeCommand::Metrics { reply }).await.is_err() {
-        return CatchUpResult::drop(vec![unavailable(topic, "node actor is gone")]);
-    }
-    let Ok(text) = rx.await else {
-        return CatchUpResult::drop(vec![unavailable(topic, "node actor dropped the reply")]);
+    let Some(text) = handle.status_cell().exposition() else {
+        return CatchUpResult::drop(vec![unavailable(
+            topic,
+            "no metrics exposition is wired on this daemon",
+        )]);
     };
     let time_ms = unix_millis();
     *sampled_ms = time_ms;
@@ -1588,7 +1586,7 @@ fn heartbeat_frame(hub: &StreamHub) -> ServerFrame {
     }
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is past the epoch")
@@ -2040,8 +2038,9 @@ mod tests {
 
     #[test]
     fn metrics_topic_subscribes_without_a_store_and_ignores_resume() {
-        // metrics rides the actor lane, not the index — a daemon with no index
-        // store still serves it, and a reconnect's stored cursor is harmless.
+        // metrics rides the exposition source, not the index — a daemon with
+        // no index store still serves it, and a reconnect's stored cursor is
+        // harmless.
         let (state, lagged) =
             prepare_topic("metrics", Some(&"1752000000000".to_string()), None).expect("topic");
         assert!(lagged.is_none());
@@ -2049,15 +2048,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_catch_up_samples_through_the_actor_lane() {
-        let (handle, mut cmds, _hub) = crate::NodeHandle::channel();
-        tokio::spawn(async move {
-            while let Some(cmd) = cmds.next().await {
-                if let NodeCommand::Metrics { reply } = cmd {
-                    let _ = reply.send("ducktape_blocks_total 5\n".to_string());
-                }
-            }
-        });
+    async fn metrics_catch_up_samples_through_the_wired_exposition() {
+        // NO actor: the topic samples the handle's wired exposition source
+        // directly, so it stays live while the pump is busy (or absent).
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        handle
+            .status_cell()
+            .wire_exposition(|| "ducktape_blocks_total 5\n".to_string());
         let (mut state, _) = prepare_topic("metrics", None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(!result.drop_topic);
@@ -2083,9 +2080,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_catch_up_drops_the_topic_when_the_actor_is_gone() {
-        let (handle, cmds, _hub) = crate::NodeHandle::channel();
-        drop(cmds); // the actor never ran (or exited) — the command lane is closed
+    async fn metrics_catch_up_drops_the_topic_when_no_exposition_is_wired() {
+        // no exposition source (an embedder that registers no metrics) — the
+        // topic drops with the same `unavailable` shape the http 503 carries.
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
         let (mut state, _) = prepare_topic("metrics", None, None).expect("topic");
         let result = catch_up_metrics("metrics", &mut state, &handle).await;
         assert!(result.drop_topic);

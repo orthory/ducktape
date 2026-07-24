@@ -49,27 +49,27 @@ pub enum NodeCommand {
         req: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
     },
-    /// sample the direct-peer projection (`GET /v1/peers`): the actor owns
-    /// the metrics registry the sample is parsed from, so this read crosses
-    /// the command lane like every other.
-    Peers {
-        reply: oneshot::Sender<crate::peers::PeersView>,
-    },
-    /// encode the runtime's Prometheus registry (commonware runtime metrics plus
-    /// the daemon's own `ducktape_*` series) to the OpenMetrics text exposition.
-    /// the actor owns the commonware context that holds the registry, so this,
-    /// like every other read, crosses the command lane.
-    Metrics {
-        reply: oneshot::Sender<String>,
-    },
 }
 
-/// the `/v1/status` snapshot cell: the actor that owns the host PUBLISHES a
-/// complete [`NodeStatus`] at each boundary it settles, and the http handler
-/// reads the last one published without ever crossing the command lane. that
-/// read-side independence is the point: a sync/catch-up stage keeps the pump
-/// away from its command queue for whole stages, and status is the one
-/// surface that must keep answering through that (it IS the liveness probe).
+/// the committed facts a `/v1/peers` sample needs from the actor: valset
+/// standing (hex key sets), the served height, and the epoch. published
+/// beside the status snapshot at the same boundaries; the peer/traffic
+/// counters themselves are parsed LIVE from the wired exposition source.
+#[derive(Clone, Default)]
+pub struct PeersStanding {
+    pub validators: std::collections::BTreeSet<String>,
+    pub residents: std::collections::BTreeSet<String>,
+    pub height: u64,
+    pub epoch: Option<u64>,
+}
+
+/// the observability snapshot cell: the actor that owns the host PUBLISHES
+/// its projections at each boundary it settles — the complete [`NodeStatus`]
+/// and the peers standing — and the http handlers read the last ones
+/// published without ever crossing the command lane. that read-side
+/// independence is the point: a sync/catch-up stage keeps the pump away from
+/// its command queue for whole stages, and the observability surface
+/// (status, peers, /metrics) must keep answering through exactly that state.
 #[derive(Clone, Default)]
 pub struct StatusCell {
     inner: Arc<StatusCellInner>,
@@ -80,12 +80,19 @@ struct StatusCellInner {
     /// the last-published snapshot. publish swaps the WHOLE struct under one
     /// write, so a read reflects exactly one boundary — never a torn one.
     snapshot: std::sync::RwLock<NodeStatus>,
+    /// the last-published peers standing (same whole-struct-swap contract).
+    standing: std::sync::RwLock<PeersStanding>,
     /// the live operations source — the metrics' shared projection, wired
     /// once at boot by daemons that register [`NodeMetrics`]. a read overlays
     /// it so phase and sync progress stay live BETWEEN boundary publishes
     /// (they move mid-stage, exactly when no boundary publish can happen).
     /// unwired (simnode), the published operations serve as-is.
     operations: std::sync::OnceLock<Arc<std::sync::RwLock<OperationalStatus>>>,
+    /// the live OpenMetrics exposition source — a registry encoder wired once
+    /// at boot (the commonware context's `encode`). `/metrics`, `/v1/peers`,
+    /// and the ws metrics topic all read it directly; the registry is shared
+    /// state, so encoding it never needs the actor.
+    exposition: std::sync::OnceLock<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 impl StatusCell {
@@ -98,6 +105,26 @@ impl StatusCell {
             .expect("status snapshot lock poisoned") = status;
     }
 
+    /// publish the peers standing — one whole-struct swap, same contract as
+    /// the status snapshot.
+    pub fn publish_peers(&self, standing: PeersStanding) {
+        *self
+            .inner
+            .standing
+            .write()
+            .expect("peers standing lock poisoned") = standing;
+    }
+
+    /// the last-published peers standing (zeroed before the first publish —
+    /// an empty sample with no roles, the honest pre-boundary answer).
+    pub fn peers_standing(&self) -> PeersStanding {
+        self.inner
+            .standing
+            .read()
+            .expect("peers standing lock poisoned")
+            .clone()
+    }
+
     /// wire the live operations overlay to the metrics' shared projection.
     /// once per process; a second wiring is a programming error.
     pub fn wire_metrics(&self, metrics: &NodeMetrics) {
@@ -105,6 +132,20 @@ impl StatusCell {
             .operations
             .set(metrics.operations_handle())
             .expect("status cell operations source wired twice");
+    }
+
+    /// wire the live OpenMetrics exposition source (the registry encoder).
+    /// once per process; a second wiring is a programming error.
+    pub fn wire_exposition(&self, encode: impl Fn() -> String + Send + Sync + 'static) {
+        if self.inner.exposition.set(Arc::new(encode)).is_err() {
+            panic!("status cell exposition source wired twice");
+        }
+    }
+
+    /// one live exposition sample, or `None` when no source is wired (a
+    /// handle whose embedder registers no metrics — the routes answer 503).
+    pub fn exposition(&self) -> Option<String> {
+        self.inner.exposition.get().map(|encode| encode())
     }
 
     /// the current status: the last-published boundary facts, with live

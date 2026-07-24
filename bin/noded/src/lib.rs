@@ -69,7 +69,7 @@ mod git_http;
 pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
-pub use handle::{NodeCommand, NodeHandle, StatusCell};
+pub use handle::{NodeCommand, NodeHandle, PeersStanding, StatusCell};
 
 mod module_code;
 pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
@@ -802,16 +802,27 @@ async fn status(State(handle): State<NodeHandle>) -> Response {
 
 /// GET /v1/peers — the direct-peer sample (see [`peers::PeersView`]): who the
 /// mesh holds open right now, cumulative per-peer traffic counters, and each
-/// peer's statesync progression where one exists.
+/// peer's statesync progression where one exists. composed OFF the command
+/// lane like status: the connection/traffic counters parse from the live
+/// exposition source, the committed facts (roles, height, epoch) come from
+/// the standing the owning actor last published.
 async fn peers(State(handle): State<NodeHandle>) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle.send(NodeCommand::Peers { reply }).await {
-        return resp;
-    }
-    match rx.await {
-        Ok(view) => Json(view).into_response(),
-        Err(_) => actor_gone(),
-    }
+    let cell = handle.status_cell();
+    let Some(exposition) = cell.exposition() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no metrics exposition is wired on this daemon",
+        );
+    };
+    let standing = cell.peers_standing();
+    let view = peers::peers_from_exposition(
+        &exposition,
+        stream::unix_millis(),
+        standing.height,
+        standing.epoch,
+    )
+    .with_roles(&standing.validators, &standing.residents);
+    Json(view).into_response()
 }
 
 /// POST /v1/admin/shutdown — ask the process to exit gracefully. lives on the

@@ -48,7 +48,7 @@
 
 
 use commonware_cryptography::Signer;
-use commonware_runtime::{Runner, Supervisor};
+use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
 mod agent_cli;
 mod agent_plane;
@@ -428,12 +428,17 @@ fn run_node(
             wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
-        // the /v1/status cell: operations overlay live from the metrics the
-        // moment they exist; boundary facts stay zeroed (honest — nothing is
-        // served yet) until a role loop publishes its first boundary. the
-        // boot snapshot stamps the process constants so a pre-boundary read
-        // still carries version + mesh identity.
+        // the observability cell: operations overlay live from the metrics
+        // the moment they exist; boundary facts stay zeroed (honest —
+        // nothing is served yet) until a role loop publishes its first
+        // boundary. the boot snapshot stamps the process constants so a
+        // pre-boundary read still carries version + mesh identity, and the
+        // exposition source feeds /metrics + /v1/peers off the command lane
+        // (`Context` has no Clone; a child shares the SAME registry, so its
+        // encode() serves the identical exposition).
         status.wire_metrics(&metrics);
+        let exposition_context = context.child("exposition");
+        status.wire_exposition(move || exposition_context.encode());
         status.publish(noded::NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             public_key: status_public_key.clone(),

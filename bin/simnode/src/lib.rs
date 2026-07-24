@@ -885,7 +885,15 @@ fn run_sim(
         };
 
         // the boot snapshot: /v1/status answers from the cell before the
-        // first command, exactly like the real daemons.
+        // first command, exactly like the real daemons. the exposition source
+        // feeds /metrics + /v1/peers off-lane (no mesh: the sample parses
+        // honestly empty, roles stay absent). `Context` has no Clone; a child
+        // shares the SAME registry, so its encode() serves the identical
+        // exposition.
+        let exposition_context = context.child("exposition");
+        sim.handle
+            .status_cell()
+            .wire_exposition(move || exposition_context.encode());
         sim.publish_status();
         loop {
             select! {
@@ -946,25 +954,6 @@ fn run_sim(
                         let result =
                             sim.node.host().query(&target, &req).await.map_err(|err| err.to_string());
                         let _ = reply.send(result);
-                    }
-                    Some(NodeCommand::Peers { reply }) => {
-                        // the sim has no mesh: its exposition carries no peer
-                        // families, so this parses to the honest empty sample
-                        // (same shape as the embedded daemon — logical clock,
-                        // no consensus, so no epoch either).
-                        let sampled_at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64;
-                        let _ = reply.send(noded::peers::peers_from_exposition(
-                            &context.encode(),
-                            sampled_at_ms,
-                            sim.height(),
-                            None,
-                        ));
-                    }
-                    Some(NodeCommand::Metrics { reply }) => {
-                        let _ = reply.send(context.encode());
                     }
                     None => break,
                 },
@@ -1340,9 +1329,15 @@ impl Sim {
     }
 
     /// publish the current committed snapshot into the shared `/v1/status`
-    /// cell — the http route reads the cell, never the command lane.
+    /// cell — the http route reads the cell, never the command lane. the
+    /// peers standing rides along (no mesh: height only, no roles or epoch).
     fn publish_status(&self) {
-        self.handle.status_cell().publish(self.status());
+        let cell = self.handle.status_cell();
+        cell.publish(self.status());
+        cell.publish_peers(noded::PeersStanding {
+            height: self.height(),
+            ..Default::default()
+        });
     }
 
     fn status(&self) -> NodeStatus {

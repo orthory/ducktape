@@ -42,14 +42,25 @@ impl ValidatorRuntime<'_> {
         );
     }
 
-    /// the ONE `/v1/status` publish seam: refresh the pricier operations
-    /// sections (throttled to `OPS_REFRESH_INTERVAL`), then publish this
-    /// node's boundary snapshot into the shared cell. called at startup and
-    /// at the end of every drain turn.
+    /// the ONE observability publish seam: refresh the pricier sections
+    /// (throttled to `OPS_REFRESH_INTERVAL` — the exposition parse AND the
+    /// valset standing reads ride the same pace), then publish this node's
+    /// boundary snapshot into the shared cell. called at startup and at the
+    /// end of every drain turn.
     pub(super) async fn publish_status(&mut self) {
         if self.context.current() >= self.next_ops_refresh {
             let exposition = self.context.encode();
             self.refresh_operations(&exposition).await;
+            // the peers standing: committed valset roles + chain position for
+            // the off-lane /v1/peers composition. roles move only on valset
+            // change, so the 1/s pace bounds staleness far below block rate.
+            let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
+            self.status.publish_peers(noded::PeersStanding {
+                validators: hex_set(read_valset_members(self.node.host()).await),
+                residents: hex_set(read_valset_residents(self.node.host()).await),
+                height: self.node.finalized().map(|f| f.height).unwrap_or(0),
+                epoch: Some(self.orchestrator.epoch()),
+            });
             self.next_ops_refresh = self.context.current() + OPS_REFRESH_INTERVAL;
         }
         super::publish_boundary_status(
@@ -596,16 +607,6 @@ impl ValidatorRuntime<'_> {
                     .await
                     .map_err(|e| e.to_string());
                 let _ = reply.send(result);
-            }
-            noded::NodeCommand::Peers { reply } => {
-                let _ = reply.send(self.peers_sample().await);
-            }
-            noded::NodeCommand::Metrics { reply } => {
-                // one registry: commonware's runtime series plus the
-                // `ducktape_*` block series the drain loop records.
-                let exposition = self.context.encode();
-                self.refresh_operations(&exposition).await;
-                let _ = reply.send(self.context.encode());
             }
         }
     }

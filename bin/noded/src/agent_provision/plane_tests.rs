@@ -127,7 +127,6 @@ fn spawn_session_actor(
                     ));
                     let _ = reply.send(Ok(committed_block()));
                 }
-                _ => panic!("the stand-in session actor got an unexpected command"),
             }
         }
     });

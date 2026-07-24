@@ -47,6 +47,9 @@ impl InProcDaemon {
         let port = nettest::free_port();
         let (handle, cmd_rx, _events) = NodeHandle::channel();
         let status = handle.status_cell();
+        // the testkit has no mesh and no registry: an empty exposition
+        // parses to the honest empty peers sample and an empty scrape.
+        status.wire_exposition(String::new);
 
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
@@ -167,14 +170,6 @@ pub fn run_actor(
                     let result = host.query(&target, &req).await.map_err(|e| e.to_string());
                     let _ = reply.send(result);
                 }
-                NodeCommand::Peers { reply } => {
-                    // the testkit has no mesh and no registry: an empty
-                    // exposition parses to the honest empty sample.
-                    let _ = reply.send(crate::peers::peers_from_exposition("", 0, height, None));
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(String::new());
-                }
             }
         }
     });
@@ -203,6 +198,11 @@ fn publish_status(
         modules,
         public_key: String::new(),
         operations: Default::default(),
+    });
+    // no mesh: height only, no roles or epoch — same as the embedded daemon.
+    status.publish_peers(crate::PeersStanding {
+        height,
+        ..Default::default()
     });
 }
 

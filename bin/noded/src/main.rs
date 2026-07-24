@@ -319,11 +319,19 @@ fn run_node(
         let metrics = NodeMetrics::register(&context);
         metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
 
-        // the /v1/status snapshot cell: this single-writer loop is the ONE
-        // publisher; the http route reads the cell without crossing the
-        // command lane, with live operations overlaid from the metrics.
+        // the observability cell: this single-writer loop is the ONE
+        // publisher; the status/peers routes read the cell without crossing
+        // the command lane, operations overlay live from the metrics, and
+        // /metrics + the ws metrics topic encode the registry through the
+        // wired exposition source. no mesh identity here — the peers
+        // standing stays role-less, and the sample parses honestly empty.
         let status = node_handle.status_cell();
         status.wire_metrics(&metrics);
+        // `Context` has no Clone; a child shares the SAME registry (the
+        // label only prefixes new registrations), so its encode() serves
+        // the identical exposition.
+        let exposition_context = context.child("exposition");
+        status.wire_exposition(move || exposition_context.encode());
 
         // OFF-LOOP execution: the pool gates effects inline but runs the
         // provider CLI on spawned tasks; a completed run re-enters as a
@@ -451,28 +459,6 @@ fn run_node(
                         .await
                         .map_err(|err| err.to_string());
                     let _ = reply.send(result);
-                }
-                NodeCommand::Peers { reply } => {
-                    // the embedded daemon has no mesh, so the exposition
-                    // carries no peer families and the honest sample is empty;
-                    // no consensus either, so the epoch stays absent.
-                    let _ = reply.send(noded::peers::peers_from_exposition(
-                        &context.encode(),
-                        unix_millis(),
-                        height,
-                        None,
-                    ));
-                }
-                NodeCommand::Metrics { reply } => {
-                    metrics.update_storage(
-                        0,
-                        index.is_poisoned(),
-                        MODULE_IDS.iter().map(|id| {
-                            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
-                        }),
-                    );
-                    // the context owns the registry; encode it to OpenMetrics text.
-                    let _ = reply.send(context.encode());
                 }
             }
         }
@@ -630,6 +616,12 @@ fn publish_status(
         // key as "no peer-routed features here".
         public_key: String::new(),
         operations: metrics.operational_status(),
+    });
+    // no mesh, no consensus: the standing carries only the height — the
+    // peers route parses an honestly empty sample with no roles or epoch.
+    status.publish_peers(noded::PeersStanding {
+        height,
+        ..Default::default()
     });
 }
 
