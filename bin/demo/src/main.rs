@@ -568,7 +568,13 @@ async fn demo_genesis(
     // the duckfs/files module the portable composer pins its source
     // head from (W2) — mandatory for envelope composition.
     .with_files_module("files");
-    let automations = Automations::new("automations", "chat", "tasks", "inbox");
+    let automations = Automations::new(
+        "automations",
+        Box::new(QmdbStore::init(context.child("automations"), "automations").await),
+        "chat",
+        "tasks",
+        "inbox",
+    );
     Host::genesis(vec![
         Box::new(kv),
         Box::new(directory),

@@ -767,7 +767,6 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "serde_json",
- "sha2",
  "statesync",
  "tasks",
 ]
