@@ -1042,6 +1042,29 @@ impl PodmanService {
         data_dir.join("podman").join("podman.sock")
     }
 
+    /// start the service for a resolved [`crate::SandboxBackend`] — a no-op
+    /// (returns `None`) for a non-Podman backend, so a boot path can call this
+    /// unconditionally and hold the returned guard for the node's lifetime. The
+    /// `data_dir` is derived from the backend's socket path (which
+    /// [`Self::socket_path`] built), and `podman` + `self_exe` are resolved
+    /// here. A start failure is fatal (fail-closed: no firewall, no runs).
+    pub async fn start_for(
+        backend: &crate::SandboxBackend,
+        self_exe: &Path,
+    ) -> Result<Option<Self>, String> {
+        let crate::SandboxBackend::Podman { socket, .. } = backend else {
+            return Ok(None);
+        };
+        // socket = <data_dir>/podman/podman.sock → data_dir is two parents up.
+        let data_dir = socket
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| format!("podman socket {} has no node data dir", socket.display()))?;
+        let podman = find_system_tool("podman")
+            .ok_or_else(|| "podman is not on PATH; the sandbox cannot start its service".to_string())?;
+        Self::start(data_dir, &podman, self_exe).await.map(Some)
+    }
+
     /// start the node-private service under `data_dir`, writing the egress hook
     /// JSON that points back at `self_exe __egress-hook`. Idempotent per node:
     /// a stale socket file is removed first. `podman_bin` is the resolved
