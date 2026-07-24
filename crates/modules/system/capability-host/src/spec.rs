@@ -224,8 +224,9 @@ pub enum BrokerKind {
     /// the OpenAI Responses API, as `codex exec` speaks it (see [`crate::broker`]).
     CodexResponses,
     /// the Anthropic Messages API (`POST /v1/messages`, SSE), as Claude Code
-    /// speaks it. the child is aimed by ENV (`ANTHROPIC_BASE_URL` +
-    /// `ANTHROPIC_AUTH_TOKEN`), not argv (see [`crate::broker`]).
+    /// speaks it. the child is aimed by ENV (`ANTHROPIC_BASE_URL`) + a
+    /// `claudeAiOauth` creds file seeded into the config home, not argv (see
+    /// [`crate::broker`]).
     AnthropicMessages,
 }
 

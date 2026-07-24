@@ -478,7 +478,8 @@ async fn run_output_has(port: u16, id: &str, marker: &str, budget: Duration) -> 
 
 /// One script-backed provider for the `sched-claude` tag. `broker` picks the
 /// isolation: the anthropic-messages broker (the executing node's credential
-/// source rides `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`) for the run leg, or
+/// source rides `ANTHROPIC_BASE_URL` + a `claudeAiOauth` creds file the broker
+/// seeds into `CLAUDE_CONFIG_DIR`) for the run leg, or
 /// none for the refusal leg (which never reaches execution). the refusal leg's
 /// script logs one host-path line per invocation — the never-spawned tripwire;
 /// the run leg's execution count lives on the mock upstream (the host log path
@@ -508,11 +509,13 @@ impl ScriptProvider {
              set -e\n\
              cat > /dev/null\n\
              node -e '\n\
+             const fs = require(\"fs\");\n\
+             const creds = JSON.parse(fs.readFileSync(process.env.CLAUDE_CONFIG_DIR + \"/.credentials.json\", \"utf8\"));\n\
              const body = {model:\"claude-sonnet-5\",max_tokens:16,messages:[{role:\"user\",content:\"PING\"}]};\n\
              fetch(process.env.ANTHROPIC_BASE_URL + \"/v1/messages\", {\n\
                method: \"POST\",\n\
                headers: {\n\
-                 authorization: \"Bearer \" + process.env.ANTHROPIC_AUTH_TOKEN,\n\
+                 authorization: \"Bearer \" + creds.claudeAiOauth.accessToken,\n\
                  \"content-type\": \"application/json\",\n\
                  \"anthropic-version\": \"2023-06-01\",\n\
                  \"anthropic-beta\": \"oauth-2025-04-20\",\n\
