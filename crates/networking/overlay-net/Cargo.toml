@@ -24,6 +24,9 @@ defguard_wireguard_rs = { workspace = true }
 wireguard = { workspace = true }
 # the virtual host terminating TCP/UDP at the node's overlay ULA.
 smoltcp = { workspace = true }
+# peer-labeled session lifecycle events (`ducktape::overlay`); boringtun's own
+# contextless timer lines are pinned off in noded's log filter.
+tracing = { workspace = true }
 # the socket seam this backend feeds (ADR phase 2): `VirtualSocketFactory`
 # implements data-plane's `SocketFactory` over the virtual stack. traits
 # only — the plane itself stays instantiated in the node layer.
