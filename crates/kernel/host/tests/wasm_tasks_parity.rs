@@ -5,9 +5,8 @@
 //! IDENTICAL query replies across BOTH boards (the assigned-list task board AND
 //! the first-claim job board), and their roots move in lockstep (move on commit,
 //! hold on abort AND on an accepted no-op). the roots THEMSELVES differ — the
-//! port persists the native canonical snapshot as one host-KV value, a declared
-//! state-schema break (revision 3, the merge) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! port persists the native canonical snapshot as one host-KV value, an
+//! intentional greenfield root break pinned by this proof.
 
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Error, Msg, Origin, StateRoot};
@@ -23,11 +22,7 @@ use wasm_host::WasmModule;
 const TASKS_WASM: &[u8] = include_bytes!("fixtures/tasks.component.wasm");
 
 fn wasm_tasks() -> WasmModule {
-    WasmModule::from_bytes("tasks", TASKS_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 3 of the tasks
-        // canonical state (revision 3 = the tasks+jobs merge).
-        .with_state_schema_revision(3)
+    WasmModule::from_bytes("tasks", TASKS_WASM).expect("load component")
 }
 
 fn native_host() -> Host {
@@ -249,9 +244,17 @@ async fn same_ops_inner() {
         // and t2 moves once.
         (24, ext(&alice), op_task(&create("t1", "ship the port"))),
         (25, ext(&alice), op_task(&create("t2", "prove the port"))),
-        (26, ext(&alice), op_task(&update("t1", TaskStatus::InProgress))),
+        (
+            26,
+            ext(&alice),
+            op_task(&update("t1", TaskStatus::InProgress)),
+        ),
         (27, ext(&alice), op_task(&update("t1", TaskStatus::Done))),
-        (28, ext(&alice), op_task(&update("t2", TaskStatus::InProgress))),
+        (
+            28,
+            ext(&alice),
+            op_task(&update("t2", TaskStatus::InProgress)),
+        ),
     ];
 
     for (height, origin, msg) in ops {
@@ -407,8 +410,16 @@ async fn rejections_inner() {
     // the rejection matrix across BOTH boards. each rejected block must leave
     // BOTH roots byte-identical (the abort path: staged writes discarded).
     let rejects: Vec<(Origin, Msg, &str)> = vec![
-        (ext(&alice), op_task(&create("", "no id")), "task_id must not be empty"),
-        (ext(&alice), op_task(&create("seed", "dup")), "task already exists"),
+        (
+            ext(&alice),
+            op_task(&create("", "no id")),
+            "task_id must not be empty",
+        ),
+        (
+            ext(&alice),
+            op_task(&create("seed", "dup")),
+            "task already exists",
+        ),
         (
             ext(&alice),
             op_task(&update("ghost", TaskStatus::Done)),

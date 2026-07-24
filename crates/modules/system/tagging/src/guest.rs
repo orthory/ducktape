@@ -48,11 +48,8 @@
 //!   restores the pre-dispatch overlay — the native execute's error paths
 //!   likewise leave the staged map untouched.
 //!
-//! the persisted encoding is the native module's canonical snapshot stored as
-//! ONE host-KV value, so the wasm root is the host-KV encoding over the two
-//! reserved keys — a STATE-SCHEMA BREAK versus the native root (revision 2 of
-//! the tagging canonical state, declared at cutover in `MODULE_STATE_SCHEMAS`;
-//! beta networks re-genesis, no back-compat shim).
+//! the canonical snapshot is stored as one host-KV value under the adapter's
+//! reserved keys.
 
 use crate::TaggingModule;
 

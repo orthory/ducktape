@@ -15,14 +15,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn flags_select_the_expected_policy() {
-    // Legacy fully-open.
-    let anon = select_policy(&["--allow-anonymous".into()]).unwrap();
-    assert!(matches!(anon, AuthPolicy::Open { require_pop: false }));
-
-    // Deployed default: public + proof-of-possession.
+fn default_policy_requires_proof_of_possession() {
     let default = select_policy(&[]).unwrap();
-    assert!(matches!(default, AuthPolicy::Open { require_pop: true }));
+    assert!(matches!(default, AuthPolicy::Public));
 }
 
 #[test]
@@ -57,35 +52,6 @@ fn genesis_set_pins_the_validators_from_network_toml() {
 }
 
 #[test]
-fn conflicting_allow_anonymous_and_genesis_set_is_a_hard_error() {
-    // --allow-anonymous and --genesis-set are mutually exclusive (the USAGE
-    // string declares them with `|`). Passing BOTH must fail closed with a hard
-    // error rather than silently picking the weaker (fully-open) policy — a
-    // stray or env-templated --allow-anonymous must never quietly disable a
-    // genesis pin. The file need not even exist: the conflict is rejected first.
-    let err = select_policy(&[
-        "--allow-anonymous".into(),
-        "--genesis-set".into(),
-        "/does/not/exist.toml".into(),
-    ])
-    .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-    assert!(
-        err.to_string().contains("mutually exclusive"),
-        "expected a mutual-exclusion message, got: {err}"
-    );
-
-    // Order-independent: --genesis-set first, --allow-anonymous second still conflicts.
-    let err = select_policy(&[
-        "--genesis-set".into(),
-        "/does/not/exist.toml".into(),
-        "--allow-anonymous".into(),
-    ])
-    .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-}
-
-#[test]
 fn genesis_set_missing_file_is_a_hard_error() {
     let err = select_policy(&["--genesis-set".into(), "/no/such/network.toml".into()]).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
@@ -104,7 +70,7 @@ fn network_toml(body: &str) -> (tempfile::TempDir, String) {
 #[test]
 fn genesis_set_with_no_value_is_a_hard_error_not_a_downgrade() {
     // A bare `--genesis-set` (or as the final token) must NOT silently fall
-    // through to Open { require_pop: true } — an operator who meant Private but
+    // through to Public — an operator who meant Private but
     // whose templated path expanded to nothing gets an error, not a weaker
     // public policy.
     let err = select_policy(&["--genesis-set".into()]).unwrap_err();

@@ -12,7 +12,7 @@
 //!
 //! ## Origin-gated intake (spoof-proofing)
 //!
-//! dispatch is routed by the HOST-ASSIGNED origin, exactly like agent v2:
+//! dispatch is routed by the host-assigned origin:
 //! - `Origin::Module("chat")` → the payload is a raw `chat::ChatEvent`
 //!   (chat's generic hook fan-out delivers the event bytes verbatim, unwrapped),
 //!   decoded in the NO-FAIL hook arm.
@@ -38,7 +38,7 @@
 //! [`RunRecord`] with `action_ok = false` — never a block failure.
 //!
 //! on top of that, chat/task actions are PROBED before they are emitted (agent
-//! v2's no-fail-arm pattern applied to follow-ups): host-routed queries against
+//! the no-fail-arm pattern also applies to follow-ups): host-routed queries against
 //! the target module's staged-or-committed state — deterministic on every
 //! validator — verify that a `PostMessage` target channel exists and its
 //! deterministic message id is unused (a user could pre-post the composed id to
@@ -417,7 +417,7 @@ impl Automations {
     /// when the action is structurally impossible or a probe rejects it
     /// (recorded, not a block failure).
     ///
-    /// the probe layer (agent v2's no-fail-arm pattern applied to follow-ups):
+    /// the probe layer (the no-fail-arm pattern applied to follow-ups):
     /// every structurally-KNOWABLE follow-up failure is checked here via
     /// host-routed queries against the target's staged-or-committed state —
     /// deterministic on every validator — so a missing channel, a squatted

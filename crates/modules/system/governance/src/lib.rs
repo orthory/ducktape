@@ -43,10 +43,10 @@ use identity::{
     IdentityMsg, IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_msg as identity_encode_msg, encode_query as identity_encode_query,
 };
+use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
 use sdk::codec::{Cursor, push_bytes};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
 use valset::{
     ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
@@ -231,9 +231,8 @@ impl Governance {
     /// account acts for that account — its ballots are the account's bound
     /// nodes. an origin that is no account member acts as ITSELF (a node key):
     /// a validator node remains a first-class governance actor (its own
-    /// automation, upgrade tooling, self-serving ops), so this arm is the
-    /// model, not a compat alias — the deleted thing is the node-local
-    /// re-signing TRANSPORT, not node principals.
+    /// automation, upgrade tooling, self-serving ops), so node principals are
+    /// part of the current actor model.
     async fn resolve_actor(&self, ctx: &dyn Ctx, origin: &[u8]) -> Result<Actor, Error> {
         // an origin that is no account member — including a network with no
         // identity module at all (an identity query error means the module is
@@ -400,8 +399,7 @@ impl Governance {
             let actor = self.resolve_actor(ctx, submitter).await?;
             if !actor.nodes().iter().any(|node| members.contains(node)) {
                 return Err(Error::Module(
-                    "submitter holds no validator-set standing (no member node bound to it)"
-                        .into(),
+                    "submitter holds no validator-set standing (no member node bound to it)".into(),
                 ));
             }
             actor.principal().to_vec()
@@ -469,7 +467,11 @@ impl Governance {
             status: p.status,
             votes: p.votes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             voter_kind: electorate.voter_kind,
-            electorate: electorate.powers.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            electorate: electorate
+                .powers
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             voting_rule: electorate.rule,
         }
     }
@@ -638,13 +640,8 @@ impl Governance {
                     out.extend_from_slice(&power.to_le_bytes());
                 }
             }
-            // The original extension implied share mode from registry
-            // presence. Preserve those exact bytes/roots; append one override
-            // byte only after governance switches a configured registry off.
-            if share_mode != shares.is_some() {
                 out.push(u8::from(share_mode));
             }
-        }
         out
     }
 
@@ -677,7 +674,10 @@ impl Governance {
     /// any error. success drops the stage (it belonged to the replaced state).
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
         let (proposals, redeemed, shares, share_mode) = decode_state(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&proposals, &redeemed, shares.as_ref(), share_mode), expected)?;
+        sdk::verify_snapshot_root(
+            Self::root_of(&proposals, &redeemed, shares.as_ref(), share_mode),
+            expected,
+        )?;
         self.proposals = proposals;
         self.redeemed = redeemed;
         self.shares = shares;
@@ -805,8 +805,12 @@ impl Governance {
         // the lifecycle module is their sole authority at ingest. a net without a
         // wired code registry deterministically rejects these (genesis wiring is
         // identical on every node).
-        if let GovAction::UpdateModule { name, module_id, .. }
-        | GovAction::RegisterModule { name, module_id, .. }
+        if let GovAction::UpdateModule {
+            name, module_id, ..
+        }
+        | GovAction::RegisterModule {
+            name, module_id, ..
+        }
         | GovAction::CancelModuleUpdate { name, module_id } = &action
         {
             if self.code_registry_id.is_none() {
@@ -887,7 +891,9 @@ impl Governance {
             // account held when each node voted for itself.
             VoterKind::ValidatorNode => {
                 let voters = self
-                    .node_ballots(ctx, &submitter, &|node| electorate.powers.contains_key(node))
+                    .node_ballots(ctx, &submitter, &|node| {
+                        electorate.powers.contains_key(node)
+                    })
                     .await?;
                 if voters.is_empty() {
                     return Err(Error::Module(
@@ -1292,7 +1298,16 @@ impl Module for Governance {
                 role,
                 expires_unix_secs,
             } => {
-                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof, role, expires_unix_secs)
+                self.handle_redeem(
+                    ctx,
+                    issuer,
+                    nonce,
+                    token_sig,
+                    joiner,
+                    proof,
+                    role,
+                    expires_unix_secs,
+                )
                     .await
             }
         }
@@ -1694,13 +1709,7 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, Error> {
             );
             previous_id = Some(id);
         }
-        let share_mode = if cur.remaining() == 0 {
-            // Compatibility with the original extension: registry presence
-            // implied that account shares governed future proposals.
-            shares.is_some()
-        } else {
-            cur.bool("snapshot share-mode override")?
-        };
+        let share_mode = cur.bool("snapshot share mode")?;
         if share_mode && shares.is_none() {
             return Err(Error::Module(
                 "snapshot enables share mode without a registry".into(),
@@ -1782,8 +1791,8 @@ mod dead_electorate_refusal {
         push_bytes(&mut bytes, b"p"); // names the proposal
         bytes.push(0); // voter_kind ValidatorNode
         bytes.push(0); // voting-rule tag 0 — the retired dynamic rule
-        let err = decode_state(&bytes)
-            .expect_err("the retired dynamic voting-rule tag must not decode");
+        let err =
+            decode_state(&bytes).expect_err("the retired dynamic voting-rule tag must not decode");
         assert!(
             matches!(&err, Error::Module(m) if m.contains("bad voting-rule tag")),
             "unexpected error: {err:?}"

@@ -1,8 +1,7 @@
 //! the encrypted `user.key` codec: argon2id-derived KEK + XChaCha20-Poly1305 at rest,
 //! and the BIP39 mnemonic <-> 32-byte-seed encoding used to reveal/restore
 //! the user's ed25519 identity. Mirrors `config::load_or_generate_identity`'s
-//! file discipline (0600, `create_new`, temp+rename for in-place rewrites)
-//! for the persisted file; see
+//! file discipline (0600 and `create_new`) for the persisted file; see
 //! docs/superpowers/specs/2026-07-07-identity-onboarding-design.md
 //! ("The custody model" + "File format" sections) for the binding design.
 //!
@@ -11,9 +10,7 @@
 //!   [`seed_of_mnemonic`] use `Mnemonic::from_entropy` / `to_entropy` only —
 //!   NEVER `to_seed`'s BIP39 PBKDF2 stretch — so the 24 words are a
 //!   checksum-carrying, identity-preserving encoding of the raw 32-byte
-//!   ed25519 seed. Every existing plaintext v1 `user.key` can be revealed as
-//!   a mnemonic retroactively, and restore-by-mnemonic reproduces
-//!   byte-identical keys.
+//!   ed25519 seed. Restore-by-mnemonic reproduces byte-identical keys.
 //! - **the password is local-encryption-only.** It never enters key
 //!   derivation for the identity itself; it only wraps the seed at rest
 //!   (argon2id -> XChaCha20-Poly1305 KEK), so a forgotten password is
@@ -30,11 +27,9 @@
 //! - the format prefix ([`USER_KEY_ENCRYPTED_PREFIX`]) is bound as the AEAD
 //!   associated data, so ciphertext minted under one format tag can never be
 //!   replayed as another.
-//! - the plaintext shape stays a bare 64-lowercase-hex seed (see
-//!   `config::load_or_generate_identity`).
 //!
-//! this module's CLI wiring (`user-key init/restore/unlock/reveal/encrypt/
-//! status`) lives in `main.rs`'s `user_key_*`/`cmd_user_key_*` verbs.
+//! this module's CLI wiring (`user key init/restore/unlock/reveal/status`)
+//! lives in `userkey_cli.rs`.
 
 use std::path::Path;
 
@@ -46,8 +41,6 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use rand::RngCore as _;
 use zeroize::Zeroizing;
-
-use crate::config::unhex;
 
 /// the encrypted line prefix — also the literal AEAD associated data bound to the
 /// ciphertext (see module docs).
@@ -88,14 +81,6 @@ const T_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=64;
 const P_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=8;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-/// a `user.key` file's contents, sniffed by shape: 64 lowercase hex chars
-/// (plaintext) vs the [`USER_KEY_ENCRYPTED_PREFIX`] (encrypted).
-#[derive(Debug)]
-pub enum UserKeyFile {
-    Plaintext(ed25519::PrivateKey),
-    Encrypted(EncryptedUserKey),
-}
 
 /// a parsed encrypted blob. `pubkey` rides in the clear (public data — lets
 /// `status` report identity without a password); everything needed to
@@ -330,22 +315,14 @@ pub fn open_user_key(line: &str, password: &str) -> Result<ed25519::PrivateKey, 
     Ok(key)
 }
 
-/// sniff `path`'s contents: an encrypted line, a bare 64-hex seed (plaintext
-/// — see `config::load_or_generate_identity`), or an error (absent file, or
-/// content that's neither shape).
-pub fn read_user_key_file(path: &Path) -> Result<UserKeyFile, String> {
+/// Read and validate an encrypted v1 key file.
+pub fn read_user_key_file(path: &Path) -> Result<EncryptedUserKey, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let line = text.trim();
     if line.is_empty() {
         return Err(format!("{path:?} is empty"));
     }
-    if line.starts_with(USER_KEY_ENCRYPTED_PREFIX) {
-        return Ok(UserKeyFile::Encrypted(parse_encrypted(line)?));
-    }
-    let raw = unhex(line).map_err(|e| format!("{path:?}: {e}"))?;
-    let key = ed25519::PrivateKey::decode(raw.as_slice())
-        .map_err(|e| format!("{path:?} is not an ed25519 secret: {e}"))?;
-    Ok(UserKeyFile::Plaintext(key))
+    parse_encrypted(line).map_err(|error| format!("{path:?}: {error}"))
 }
 
 /// the 24-word BIP39 mnemonic encoding `seed`'s raw bytes as entropy (with
@@ -371,7 +348,7 @@ pub fn seed_of_mnemonic(words: &str) -> Result<[u8; 32], String> {
         .map_err(|_| format!("mnemonic encodes {len} bytes of entropy, want 32"))
 }
 
-/// write a fresh encrypted (or plaintext) line to `path`. born 0600 (no
+/// Write a fresh encrypted line to `path`. Born 0600 (no
 /// write-then-chmod window), and `create_new` so a concurrent init can't
 /// clobber an existing identity.
 pub fn write_user_key_new(path: &Path, line: &str) -> Result<(), String> {
@@ -395,48 +372,6 @@ pub fn write_user_key_new(path: &Path, line: &str) -> Result<(), String> {
         return Err(format!("write {path:?}: {e}"));
     }
     Ok(())
-}
-
-/// replace `path`'s content with `line` atomically: write a temp file in
-/// the SAME directory (so the rename is same-filesystem, hence atomic),
-/// then rename over the target. used for in-place rewrites (encrypt,
-/// password rotation) where the identity file must never observably not
-/// exist.
-pub fn rewrite_user_key(path: &Path, line: &str) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| format!("{path:?} has no file name"))?
-        .to_string_lossy();
-    let tmp_path = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
-
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    {
-        let mut f = opts
-            .open(&tmp_path)
-            .map_err(|e| format!("create {tmp_path:?}: {e}"))?;
-        if let Err(e) = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!("write {tmp_path:?}: {e}"));
-        }
-        if let Err(e) = f.sync_all() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(format!("sync {tmp_path:?}: {e}"));
-        }
-    }
-    std::fs::rename(&tmp_path, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp_path);
-        format!("rename {tmp_path:?} -> {path:?}: {e}")
-    })
 }
 
 #[cfg(test)]
@@ -504,7 +439,7 @@ mod tests {
         let seed = [4u8; 32];
         let line = seal_user_key(&seed, "pw").unwrap();
         let enc = parse_encrypted(&line).unwrap();
-        let err = decrypt_seed(&enc, "pw", b"ducktape-user-key-v3:").unwrap_err();
+        let err = decrypt_seed(&enc, "pw", b"different-user-key-format:").unwrap_err();
         assert_eq!(err, "corrupt or wrong password");
     }
 
@@ -519,25 +454,18 @@ mod tests {
         let expected = ed25519::PrivateKey::decode(seed.as_slice())
             .unwrap()
             .public_key();
-        match read_user_key_file(&path).unwrap() {
-            UserKeyFile::Encrypted(enc) => assert_eq!(enc.pubkey, expected.as_ref().to_vec()),
-            UserKeyFile::Plaintext(_) => panic!("expected Encrypted"),
-        }
+        let enc = read_user_key_file(&path).unwrap();
+        assert_eq!(enc.pubkey, expected.as_ref().to_vec());
     }
 
     #[test]
-    fn bare_hex_parses_to_plaintext_with_matching_pubkey() {
+    fn bare_hex_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("user.key");
         let seed = [6u8; 32];
-        let key = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
         let hex_line = seed.iter().map(|b| format!("{b:02x}")).collect::<String>();
         write_user_key_new(&path, &hex_line).unwrap();
-
-        match read_user_key_file(&path).unwrap() {
-            UserKeyFile::Plaintext(k) => assert_eq!(k.public_key(), key.public_key()),
-            UserKeyFile::Encrypted(_) => panic!("expected Plaintext"),
-        }
+        assert!(read_user_key_file(&path).is_err());
     }
 
     #[test]
@@ -606,24 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_user_key_replaces_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user.key");
-        write_user_key_new(&path, "old-content").unwrap();
-        rewrite_user_key(&path, "new-content").unwrap();
-        let contents = read_file(&path);
-        assert_eq!(contents.trim(), "new-content");
-        assert!(!contents.contains("old-content"));
-
-        // no stray temp file left behind in the directory.
-        let entries: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(entries, vec![std::ffi::OsString::from("user.key")]);
-    }
-
-    #[test]
     fn parse_rejects_out_of_range_argon2_params() {
         let line = seal_user_key(&[12u8; 32], "pw").unwrap();
         // oversized memory must be rejected at PARSE time, before any argon2
@@ -680,9 +590,7 @@ mod tests {
         // pins EVERYTHING at once — argon2id KDF output, XChaCha ciphertext,
         // field order, LE param encoding, base64 alphabet (url-safe, no
         // pad), and the prefix — independently of the encoder. if this test
-        // breaks, existing user.key files in the field can no longer be
-        // opened: that is a consensus-grade compat break, not a test to
-        // "fix" by re-pinning.
+        // changes to these bytes alter the current encrypted format.
         let seed = [7u8; 32];
         let salt = [0xA1u8; SALT_LEN];
         let nonce = [0xB2u8; NONCE_LEN];
@@ -760,10 +668,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("user.key");
         write_user_key_new(&path, "content").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-
-        rewrite_user_key(&path, "content2").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

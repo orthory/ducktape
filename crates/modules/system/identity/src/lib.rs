@@ -57,9 +57,6 @@
 //! of identity's ONE root/snapshot (encoded after the accounts), so a joiner
 //! restores it with the rest of the account plane.
 //!
-//! this is the account format at schema revision 3; a mixed-revision network
-//! would fork.
-
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
@@ -673,9 +670,9 @@ impl Module for Identity {
                     });
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
-            IdentityQuery::Clients => {
-                Ok(encode_reply(&IdentityReply::Clients(self.effective_clients())))
-            }
+            IdentityQuery::Clients => Ok(encode_reply(&IdentityReply::Clients(
+                self.effective_clients(),
+            ))),
         }
     }
 
@@ -1109,7 +1106,9 @@ fn clean_field(value: Option<String>, max: usize, what: &str) -> Result<Option<S
             if trimmed.is_empty() {
                 Ok(None)
             } else if trimmed.len() > max {
-                Err(Error::Module(format!("{what} exceeds the {max}-byte limit")))
+                Err(Error::Module(format!(
+                    "{what} exceeds the {max}-byte limit"
+                )))
             } else {
                 Ok(Some(trimmed.to_string()))
             }

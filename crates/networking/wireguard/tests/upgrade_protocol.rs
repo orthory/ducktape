@@ -132,8 +132,7 @@ fn mesh_view_uses_only_admitted_validators_and_has_deterministic_version() {
 
     let expected_a = set.stable_index(id(&a)).unwrap();
     let expected_b = set.stable_index(id(&b)).unwrap();
-    let view_ab =
-        MeshView::verify(set.clone(), vec![ad_a.clone(), ad_b.clone()], &policy).unwrap();
+    let view_ab = MeshView::verify(set.clone(), vec![ad_a.clone(), ad_b.clone()], &policy).unwrap();
     let view_ba = MeshView::verify(set, vec![ad_b, ad_a], &policy).unwrap();
 
     assert_eq!(view_ab.mesh_version, view_ba.mesh_version);
@@ -572,12 +571,11 @@ fn record_check_mirrors_the_per_record_view_rules() {
 }
 
 #[test]
-fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
+fn an_endpoint_less_record_signs_verifies_and_round_trips() {
     // the NAT'd-joiner shape: a record advertising NO WireGuard endpoint.
     // it must (a) pass the per-record checks (there is no endpoint to
     // policy-check), (b) sign and verify, (c) omit the field on the JSON
-    // wire, and (d) leave endpoint-FUL records exactly as they were — an
-    // old-wire record (field present, no Option wrapper) still decodes.
+    // wire, and (d) round-trip endpoint-FUL records.
     let a = PrivateKey::from_seed(1);
     let policy = prod_policy();
     let set = active_set(id(&a), id(&PrivateKey::from_seed(2)));
@@ -593,8 +591,7 @@ fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
     let signed = SignedEndpointRecord::sign(endpoint_less.clone(), &a);
     signed.verify().expect("owner signature verifies");
 
-    // None omits the field entirely — an endpoint-ful record's JSON is
-    // byte-identical to the pre-Option wire.
+    // None omits the field entirely.
     let json = serde_json::to_string(&endpoint_less).unwrap();
     assert!(
         !json.contains("wireguard_endpoint"),
@@ -603,13 +600,15 @@ fn an_endpoint_less_record_signs_verifies_and_stays_wire_compatible() {
     let round: EndpointRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(round, endpoint_less);
 
-    // the legacy wire shape (field present) decodes as Some — old records
-    // from an un-upgraded peer keep working.
+    // The current endpoint-ful shape decodes as Some.
     let with_endpoint = record_for(&a, &set, [8, 8, 8, 10], xkey(1), 1);
-    let legacy_json = serde_json::to_string(&with_endpoint).unwrap();
-    assert!(legacy_json.contains("wireguard_endpoint"), "{legacy_json}");
-    let legacy: EndpointRecord = serde_json::from_str(&legacy_json).unwrap();
-    assert_eq!(legacy.wireguard_endpoint, with_endpoint.wireguard_endpoint);
+    let endpoint_json = serde_json::to_string(&with_endpoint).unwrap();
+    assert!(
+        endpoint_json.contains("wireguard_endpoint"),
+        "{endpoint_json}"
+    );
+    let decoded: EndpointRecord = serde_json::from_str(&endpoint_json).unwrap();
+    assert_eq!(decoded.wireguard_endpoint, with_endpoint.wireguard_endpoint);
 
     // and the two SIGNING encodings can never collide: flipping the same
     // record between None and Some changes its signature domain bytes.

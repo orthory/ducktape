@@ -35,13 +35,7 @@ fn exact_comment_anchor_rebases_with_target_text() {
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
             *anchor = Some(RelativeAnchor { start: 0, end: 99 });
         }
-        apply_err_as(
-            &mut p,
-            &anchored,
-            user("alice"),
-            "invalid text range",
-        )
-        .await;
+        apply_err_as(&mut p, &anchored, user("alice"), "invalid text range").await;
         if let PageMsg::AddComment { anchor, .. } = &mut anchored {
             *anchor = Some(RelativeAnchor { start: 0, end: 2 });
         }
@@ -180,6 +174,31 @@ fn add_comment_rejects_over_length_ids_before_staging() {
     });
 }
 
+#[test]
+fn add_comment_rejects_oversized_origins() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        for (comment, origin) in [
+            (
+                "m1",
+                sdk::Origin::External(vec![b'x'; MAX_COMMENT_AUTHOR_BYTES + 1]),
+            ),
+            (
+                "m2",
+                sdk::Origin::Module("m".repeat(MAX_COMMENT_AUTHOR_BYTES + 1)),
+            ),
+        ] {
+            apply_err_as(
+                &mut p,
+                &add("t1", comment, "b1", "hi"),
+                origin,
+                "comment author is too large",
+            )
+            .await;
+        }
+    });
+}
+
 /// pin the ESCAPE vector: an id carrying a serde_json-escaping char (`"`,
 /// `\`, or a control char < 0x20) is rejected at admission even under the
 /// length cap — otherwise its escaped serialization (2–6 B/char) could still
@@ -245,6 +264,79 @@ fn bounded_ids_keep_the_derived_blocks_under_max_block_len() {
 }
 
 #[test]
+fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
+    deterministic::Runner::default().start(|_context| async move {
+        assert_eq!(MAX_COMMENTS_PER_THREAD + 2, MAX_TRAVERSAL_WORK);
+        let mut p = Pages::new("pages", Box::new(sdk_testkit::MemStore::new()));
+        let comment_ids: Vec<_> = (0..MAX_COMMENTS_PER_THREAD)
+            .map(|index| format!("comment-{index}"))
+            .collect();
+        p.store_block(&Block {
+            id: "target".into(),
+            parent: None,
+            page: "target".into(),
+            kind: BlockKind::Page,
+            text: String::new(),
+            marks: Vec::new(),
+            checked: false,
+            children: Vec::new(),
+        })
+        .unwrap();
+        p.stage_index(&BTreeMap::from([("target".into(), None)]))
+            .unwrap();
+        p.stage(
+            "\0ct:thread",
+            serde_json::to_vec(&Thread {
+                id: "thread".into(),
+                target: "target".into(),
+                opener: AuthorRef::System,
+                created_at: 0,
+                anchor: None,
+                resolved: false,
+                resolved_by: None,
+                comment_ids: comment_ids.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        p.stage("\0ci:target", serde_json::to_vec(&vec!["thread"]).unwrap())
+            .unwrap();
+        for id in &comment_ids {
+            p.stage(
+                &format!("\0cc:{id}"),
+                serde_json::to_vec(&Comment {
+                    id: id.clone(),
+                    thread_id: "thread".into(),
+                    author: AuthorRef::System,
+                    text: String::new(),
+                    created_at: 0,
+                    edited_at: None,
+                    deleted: false,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        p.commit_block().await.unwrap();
+
+        p.apply(
+            PageMsg::RemoveBlock {
+                block_id: "target".into(),
+            },
+            &Origin::System,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(p.load_block("target").await.unwrap().is_none());
+        assert!(p.load_thread("thread").await.unwrap().is_none());
+        assert!(p.load_comment(&comment_ids[0]).await.unwrap().is_none());
+        assert!(p.load_index().await.unwrap().is_empty());
+    });
+}
+
+#[test]
 fn as_agent_refines_a_module_origin_into_an_agent_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
@@ -260,7 +352,10 @@ fn as_agent_refines_a_module_origin_into_an_agent_author() {
             agent_id: "bot".into(),
         };
         assert_eq!(view.thread.opener, agent, "the opener is the agent");
-        assert_eq!(view.comments[0].author, agent, "the comment author too");
+        assert_eq!(
+            view.comments[0].author, agent,
+            "the comment author too"
+        );
     });
 }
 
@@ -280,6 +375,18 @@ fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
             &add_as_agent("t1", "m1", "b1", ""),
             sdk::Origin::Module("runs".into()),
             "empty as_agent",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &add_as_agent(
+                "t1",
+                "m1",
+                "b1",
+                &"a".repeat(MAX_COMMENT_AGENT_ID_BYTES + 1),
+            ),
+            sdk::Origin::Module("runs".into()),
+            "as_agent is too large",
         )
         .await;
     });
@@ -556,14 +663,13 @@ fn deleting_a_block_purges_its_comment_threads() {
             &PageMsg::CreatePage {
                 page_id: "p2".into(),
                 title: "keep".into(),
-                parent: None,
             },
         )
         .await;
         apply_commit(
             &mut p,
-            &PageMsg::DeletePage {
-                page_id: "p1".into(),
+            &PageMsg::RemoveBlock {
+                block_id: "p1".into(),
             },
         )
         .await;

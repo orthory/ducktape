@@ -155,11 +155,7 @@ fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
     ]);
     let host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new(
-            "governance",
-            "valset",
-            "identity",
-        )),
+        Box::new(Governance::new("governance", "valset", "identity")),
         Box::new(identity),
     ])
     .expect("genesis");
@@ -493,6 +489,14 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             .install(&bytes, root)
             .expect("install shares snapshot");
         assert_eq!(rebuilt.root(), root);
+        let mut missing_mode = bytes.clone();
+        missing_mode.pop();
+        assert!(
+            Governance::new("governance", "valset", "identity")
+                .install(&missing_mode, root)
+                .is_err(),
+            "a share snapshot must state its mode"
+        );
         let reply = rebuilt
             .query(&encode_query(&GovQuery::Shares))
             .await
@@ -665,7 +669,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
     });
 }
 
-// ── account-signed governance frames (ADR A1, W2 migration) ──
+// ── account-signed governance frames (ADR A1) ──
 //
 // admit/promote/demote/leave now arrive as account-signed frames on the public
 // surface: the verified origin is an account MEMBER key, and the module
@@ -702,7 +706,8 @@ fn an_account_member_key_proposes_and_its_vote_casts_all_its_bound_node_ballots(
             "the proposer is recorded as the ACCOUNT, not a node key"
         );
         // the frozen electorate is still the three validator NODES.
-        let mut electorate: Vec<Vec<u8>> = opened.electorate.iter().map(|(k, _)| k.clone()).collect();
+        let mut electorate: Vec<Vec<u8>> =
+            opened.electorate.iter().map(|(k, _)| k.clone()).collect();
         electorate.sort();
         let mut want = vec![nodes[0].clone(), nodes[1].clone(), nodes[2].clone()];
         want.sort();
@@ -722,8 +727,12 @@ fn an_account_member_key_proposes_and_its_vote_casts_all_its_bound_node_ballots(
         .await
         .expect("account vote");
         let voted = proposal(&host, "acct-signal").await;
-        let mut yes_nodes: Vec<Vec<u8>> =
-            voted.votes.iter().filter(|(_, y)| *y).map(|(k, _)| k.clone()).collect();
+        let mut yes_nodes: Vec<Vec<u8>> = voted
+            .votes
+            .iter()
+            .filter(|(_, y)| *y)
+            .map(|(k, _)| k.clone())
+            .collect();
         yes_nodes.sort();
         let mut expect_nodes = vec![nodes[0].clone(), nodes[1].clone()];
         expect_nodes.sort();
@@ -754,7 +763,10 @@ fn an_account_member_key_proposes_and_its_vote_casts_all_its_bound_node_ballots(
         )
         .await
         .expect("execute");
-        assert_eq!(proposal(&host, "acct-signal").await.status, ProposalStatus::Passed);
+        assert_eq!(
+            proposal(&host, "acct-signal").await.status,
+            ProposalStatus::Passed
+        );
     });
 }
 
@@ -770,7 +782,9 @@ fn a_key_with_no_bound_member_node_is_refused() {
             1,
             GovMsg::Propose {
                 proposal_id: "no-standing".into(),
-                action: GovAction::Signal { text: "nope".into() },
+                action: GovAction::Signal {
+                    text: "nope".into(),
+                },
                 voting_period: 20,
             },
         )
@@ -790,7 +804,9 @@ fn a_key_with_no_bound_member_node_is_refused() {
             2,
             GovMsg::Propose {
                 proposal_id: "stranger".into(),
-                action: GovAction::Signal { text: "nope".into() },
+                action: GovAction::Signal {
+                    text: "nope".into(),
+                },
                 voting_period: 20,
             },
         )
@@ -826,15 +842,35 @@ fn an_account_revote_overwrites_its_node_ballots_not_doubles_them() {
         .await
         .expect("propose");
 
-        submit(&mut host, &accounts[0], 2, GovMsg::Vote { proposal_id: "p".into(), approve: true })
+        submit(
+            &mut host,
+            &accounts[0],
+            2,
+            GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            },
+        )
             .await
             .expect("first vote");
-        submit(&mut host, &accounts[0], 3, GovMsg::Vote { proposal_id: "p".into(), approve: false })
+        submit(
+            &mut host,
+            &accounts[0],
+            3,
+            GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: false,
+            },
+        )
             .await
             .expect("re-vote");
 
         let view = proposal(&host, "p").await;
-        assert_eq!(view.votes.len(), 2, "one ballot per bound node, never doubled");
+        assert_eq!(
+            view.votes.len(),
+            2,
+            "one ballot per bound node, never doubled"
+        );
         assert!(
             view.votes.iter().all(|(_, approve)| !approve),
             "the re-vote overwrote both node ballots: {:?}",
@@ -863,19 +899,43 @@ fn an_account_vote_overwrites_its_nodes_direct_ballot() {
         .expect("propose");
 
         // nodes[0] casts its own ballot (a node stays a first-class actor)…
-        submit(&mut host, &nodes[0], 2, GovMsg::Vote { proposal_id: "p".into(), approve: true })
+        submit(
+            &mut host,
+            &nodes[0],
+            2,
+            GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            },
+        )
             .await
             .expect("node vote");
         // …then the owning account votes the other way: nodes[0]'s ballot flips
         // (overwritten by node key) and nodes[1] gains its ballot.
-        submit(&mut host, &accounts[0], 3, GovMsg::Vote { proposal_id: "p".into(), approve: false })
+        submit(
+            &mut host,
+            &accounts[0],
+            3,
+            GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: false,
+            },
+        )
             .await
             .expect("account vote");
 
         let view = proposal(&host, "p").await;
-        assert_eq!(view.votes.len(), 2, "nodes[0] was overwritten, not doubled: {:?}", view.votes);
+        assert_eq!(
+            view.votes.len(),
+            2,
+            "nodes[0] was overwritten, not doubled: {:?}",
+            view.votes
+        );
         for (node, approve) in &view.votes {
-            assert!(!approve, "ballot for {node:?} carries the account's later direction");
+            assert!(
+                !approve,
+                "ballot for {node:?} carries the account's later direction"
+            );
         }
     });
 }
@@ -890,7 +950,10 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
         let accounts = [key(11), key(12), key(13)];
         let second_key = key(21);
         let mut identity = IdentityStub::new(vec![
-            (accounts[0].clone(), vec![nodes[0].clone(), nodes[1].clone()]),
+            (
+                accounts[0].clone(),
+                vec![nodes[0].clone(), nodes[1].clone()],
+            ),
             (accounts[1].clone(), vec![nodes[2].clone()]),
             (accounts[2].clone(), vec![nodes[3].clone()]),
         ]);
@@ -921,20 +984,44 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
 
         // founding key votes yes, the second device's key votes no: SAME two
         // node ballots, overwritten — never four.
-        submit(&mut host, &accounts[0], 2, GovMsg::Vote { proposal_id: "p".into(), approve: true })
+        submit(
+            &mut host,
+            &accounts[0],
+            2,
+            GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            },
+        )
             .await
             .expect("founding-key vote");
-        submit(&mut host, &second_key, 3, GovMsg::Vote { proposal_id: "p".into(), approve: false })
+        submit(
+            &mut host,
+            &second_key,
+            3,
+            GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: false,
+            },
+        )
             .await
             .expect("second-member-key vote");
 
         let view = proposal(&host, "p").await;
-        assert_eq!(view.votes.len(), 2, "both keys cast the SAME node ballots: {:?}", view.votes);
+        assert_eq!(
+            view.votes.len(),
+            2,
+            "both keys cast the SAME node ballots: {:?}",
+            view.votes
+        );
         let mut balloted: Vec<Vec<u8>> = view.votes.iter().map(|(k, _)| k.clone()).collect();
         balloted.sort();
         let mut expect = vec![nodes[0].clone(), nodes[1].clone()];
         expect.sort();
-        assert_eq!(balloted, expect, "ballots are keyed by the account's bound nodes");
+        assert_eq!(
+            balloted, expect,
+            "ballots are keyed by the account's bound nodes"
+        );
         assert!(
             view.votes.iter().all(|(_, approve)| !approve),
             "the later member key's direction won: {:?}",

@@ -268,11 +268,10 @@ pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.context_doc = ws.context_doc();
 }
 
-// ---- runner result (v1 wire) ----------------------------------------------------
+// ---- runner result ----------------------------------------------------------
 // Dispatch produces only the facets it owns: model prose, the workspace
 // receipt, requested sink, and the host-observed status. Runs owns strict
-// response parsing and retains decode compatibility for historical data and
-// effects facets.
+// response parsing.
 
 /// the O1/O2 output sink: `Chain` (default — the next run reads this run's
 /// output_ref) / `Pr` (open a forge PR). the concrete routing is runs'
@@ -338,8 +337,7 @@ struct RunnerResultWire<'a> {
 /// `ducktape_runner_result` (R1, host-assembled). the version is
 /// [`crate::envelope::RUNNER_RESULT_VERSION`] — the SINGLE owner, never a second
 /// const; `runs` reads it back as `u32 == 1` and unwraps `response_text`
-/// deterministically on every node. empty/default facets skip-serialize, so a
-/// plain run's bytes stay byte-compatible with the pre-v4 minimal shape.
+/// deterministically on every node. Empty/default facets skip serialization.
 ///
 /// the assembled bytes are delivered as the saga's Ok payload, and the saga
 /// ABORTS any Ok larger than [`saga::MAX_RESULT_BYTES`] at the block — the
@@ -617,7 +615,10 @@ mod tests {
         let duckfs = WorkspaceReceipt::committed(&spec(), "cc".repeat(32), 9, false);
         let v = serde_json::to_value(&duckfs).unwrap();
         let obj = v.as_object().unwrap();
-        assert!(!obj.contains_key("branch"), "None branch must skip-serialize");
+        assert!(
+            !obj.contains_key("branch"),
+            "None branch must skip-serialize"
+        );
         assert!(
             !obj.contains_key("output_commit"),
             "None output_commit must skip-serialize"
@@ -695,8 +696,7 @@ mod tests {
 
     #[test]
     fn retired_facets_are_not_serialized() {
-        // Runs retains decode-only compatibility for historical data/effects;
-        // Dispatch must not produce either key.
+        // Dispatch does not produce retired data/effects facets.
         let r = WorkspaceReceipt::no_changes(&spec());
         let bytes = assemble_runner_result("hi", &r, Sink::Chain, Status::Ok);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -709,5 +709,4 @@ mod tests {
         assert!(!obj.contains_key("sink"), "chain sink must skip-serialize");
         assert!(!obj.contains_key("status"), "ok status must skip-serialize");
     }
-
 }

@@ -523,12 +523,6 @@ impl Module for Lifecycle {
         Self::root_of(&self.committed)
     }
 
-    /// 2: the module-code-only encoding (the protocol-version snapshot section
-    /// was removed with the no-versioning reset).
-    fn state_schema_revision(&self) -> u32 {
-        2
-    }
-
     fn snapshot_bytes(&self) -> Option<Vec<u8>> {
         Some(self.snapshot())
     }

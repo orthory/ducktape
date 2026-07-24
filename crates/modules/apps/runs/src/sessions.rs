@@ -76,7 +76,7 @@ use super::{
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN,
+    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN, SiblingReadBudget,
     delegated_run_id_for, delegation_id_for, dispatch_decode_reply, dispatch_encode_query,
     dispatch_id_for, page_thread_id,
 };
@@ -203,7 +203,6 @@ impl RunsModule {
                 AgentResponse {
                     reply_blocks: Vec::new(),
                     actions: vec![action.clone()],
-                    delegations: Vec::new(),
                     commit_message: None,
                 },
             )
@@ -264,6 +263,7 @@ impl RunsModule {
         run_id: String,
         request_id: String,
         request: DelegationRequest,
+        budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
         let Origin::External(submitter) = &ctx.env().origin else {
             return Err(Error::Module(
@@ -434,6 +434,7 @@ impl RunsModule {
                 entry.anchor_seq,
                 Some((&workspace_agent, &context)),
                 &extra,
+                budget,
             )
             .await
             .map_err(Error::Module)?;
@@ -512,10 +513,7 @@ impl RunsModule {
             return Err("the run holds no execution lease".into());
         };
         let reply = ctx
-            .query(
-                &self.saga,
-                &saga_encode_query(&SagaQuery::Get { saga_id }),
-            )
+            .query(&self.saga, &saga_encode_query(&SagaQuery::Get { saga_id }))
             .await
             .map_err(|e| format!("saga lookup failed: {e}"))?;
         match saga_decode_reply(&reply) {

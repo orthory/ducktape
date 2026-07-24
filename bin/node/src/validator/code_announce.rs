@@ -133,12 +133,12 @@ mod tests {
     fn resident_bytes_signal_once_absent_bytes_fetch_once() {
         let mut s = CodeReadinessSignaller::new(me());
         let modules = vec![
-            pending("held", "v2", 1, false, &[]),
-            pending("missing", "v2", 2, false, &[]),
+            pending("held", "replacement", 1, false, &[]),
+            pending("missing", "replacement", 2, false, &[]),
         ];
         let acts = s.decide(&modules, |d| d == &[1u8; 32]);
         assert_eq!(acts.signals.len(), 1);
-        assert_eq!(acts.signals[0].0, ("held".into(), "v2".into()));
+        assert_eq!(acts.signals[0].0, ("held".into(), "replacement".into()));
         assert_eq!(acts.fetches, vec![[2u8; 32]]);
 
         // second tick: the signal is latched, the fetch deduped.
@@ -151,17 +151,17 @@ mod tests {
         s.fetching.clear();
         let acts = s.decide(&modules, |_| true);
         assert_eq!(acts.signals.len(), 1);
-        assert_eq!(acts.signals[0].0, ("missing".into(), "v2".into()));
+        assert_eq!(acts.signals[0].0, ("missing".into(), "replacement".into()));
     }
 
     #[test]
     fn committed_readiness_and_ready_latch_keep_quiet() {
         let mut s = CodeReadinessSignaller::new(me());
         // our signal already committed: silent.
-        let ours = vec![pending("a", "v2", 1, false, &[me()])];
+        let ours = vec![pending("a", "replacement", 1, false, &[me()])];
         assert!(s.decide(&ours, |_| true).signals.is_empty());
         // swap already ready: silent, even though we never signed.
-        let armed = vec![pending("b", "v2", 1, true, &[])];
+        let armed = vec![pending("b", "replacement", 1, true, &[])];
         let acts = s.decide(&armed, |_| true);
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());
         // no pending at all: silent.
@@ -177,10 +177,10 @@ mod tests {
     #[test]
     fn unlatch_retries_a_failed_submit() {
         let mut s = CodeReadinessSignaller::new(me());
-        let modules = vec![pending("a", "v2", 1, false, &[])];
+        let modules = vec![pending("a", "replacement", 1, false, &[])];
         assert_eq!(s.decide(&modules, |_| true).signals.len(), 1);
         assert!(s.decide(&modules, |_| true).signals.is_empty(), "latched");
-        s.unlatch(&("a".into(), "v2".into()));
+        s.unlatch(&("a".into(), "replacement".into()));
         assert_eq!(s.decide(&modules, |_| true).signals.len(), 1, "retries");
     }
 }

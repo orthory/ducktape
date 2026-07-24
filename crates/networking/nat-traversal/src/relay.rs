@@ -944,7 +944,7 @@ mod tests {
     /// its advert is resolvable — the register datagram lands asynchronously.
     async fn register_member(rig: &Rig, seed: u64) -> (NatClient, NodeKey) {
         let (signer, key) = keypair(seed);
-        let member = NatClient::bind_multi_auth(key, vec![rig.coord_addr], signer, None)
+        let member = NatClient::bind(key, vec![rig.coord_addr], signer, None)
             .await
             .unwrap();
         member.register().await.unwrap();
@@ -996,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn relayed_intro_reaches_member_and_reply_pumps_back() {
-        let rig = rig(AuthPolicy::Open { require_pop: true }).await;
+        let rig = rig(AuthPolicy::Public).await;
         let (member, member_key) = register_member(&rig, 40).await;
 
         // The fake member: sees the sealed bytes VERBATIM (the relay moved
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[tokio::test]
     async fn retransmitted_intro_forwards_again_after_the_pacing_floor() {
-        let rig = rig(AuthPolicy::Open { require_pop: true }).await;
+        let rig = rig(AuthPolicy::Public).await;
         let (member, member_key) = register_member(&rig, 42).await;
 
         let (joiner_signer, joiner_key) = keypair(43);
@@ -1080,7 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_pop_is_refused_as_not_authorized() {
-        let rig = rig(AuthPolicy::Open { require_pop: true }).await;
+        let rig = rig(AuthPolicy::Public).await;
         let (_member, member_key) = register_member(&rig, 44).await;
 
         // The intro claims one caller but is signed by a DIFFERENT key.
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregistered_target_is_refused() {
-        let rig = rig(AuthPolicy::Open { require_pop: true }).await;
+        let rig = rig(AuthPolicy::Public).await;
         let (joiner_signer, joiner_key) = keypair(47);
         let intro = sign_relay_intro(
             &joiner_signer,
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_intro_naming_a_different_target_closes_the_session() {
-        let rig = rig(AuthPolicy::Open { require_pop: true }).await;
+        let rig = rig(AuthPolicy::Public).await;
         let (member, member_key) = register_member(&rig, 48).await;
 
         let (joiner_signer, joiner_key) = keypair(49);
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_ip_session_cap_refuses_the_next_connection() {
-        let rig = rig(AuthPolicy::Open { require_pop: true }).await;
+        let rig = rig(AuthPolicy::Public).await;
         // Fill the per-IP budget (loopback: one IP) with idle connections.
         let mut held = Vec::new();
         for _ in 0..MAX_SESSIONS_PER_IP {

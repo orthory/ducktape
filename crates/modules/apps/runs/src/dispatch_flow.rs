@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use super::{
     AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
     DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
-    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin, SkillRef,
-    agent_decode_reply, agent_encode_query, chat_decode_reply, chat_encode_query,
-    dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope,
-    files_decode_reply, files_encode_query, inject, recipe_id_for,
+    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin,
+    SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query, chat_decode_reply,
+    chat_encode_query, dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query,
+    dispatch_id_for, envelope, files_decode_reply, files_encode_query, inject, recipe_id_for,
 };
 use crate::facets::WireSink;
 
@@ -171,7 +171,7 @@ impl RunsModule {
     /// head (W2), so the composed bytes are consensus-uniform; a head query
     /// that FAILS becomes the run's error (a loud skip at the callsite), never
     /// a silent unpinned source. unwired (dev tools/tests) the head is an
-    /// explicit null pin — the envelope still composes v3.
+    /// explicit null pin — the envelope still composes v1.
     pub(super) async fn portable_inputs(
         &self,
         ctx: &dyn Ctx,
@@ -242,6 +242,7 @@ impl RunsModule {
     /// (M1): the item-session workspace source, the requested PR sink, and
     /// the injected item context — see [`super::forge_source`]. any other
     /// channel composes the duckfs lane exactly as before.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_dispatch(
         &self,
         ctx: &dyn Ctx,
@@ -250,9 +251,12 @@ impl RunsModule {
         channel_id: &str,
         anchor_seq: u64,
         extra: &[SkillRef],
+        budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
-        self.prepare_dispatch_with_context(ctx, agent, run_id, channel_id, anchor_seq, None, extra)
-            .await
+        self.prepare_dispatch_with_context(
+            ctx, agent, run_id, channel_id, anchor_seq, None, extra, budget,
+        )
+        .await
     }
 
     /// The ordinary chat/Forge composition path plus delegation's parent
@@ -268,6 +272,7 @@ impl RunsModule {
         anchor_seq: u64,
         delegation: Option<(&AgentRecord, &str)>,
         extra: &[SkillRef],
+        budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
@@ -303,8 +308,13 @@ impl RunsModule {
         // then attachment). attachments render the referenced file's committed
         // TEXT; images/binaries are named, not inlined (the agent plane is
         // text-only).
-        let page_section = self.page_context(ctx, &sources).await;
-        let attachment_section = self.attachment_context(ctx, &sources).await;
+        let mut remaining_reference_queries = super::MAX_SIBLING_QUERY_READS;
+        let page_section = self
+            .page_context(ctx, &sources, &mut remaining_reference_queries, budget)
+            .await;
+        let attachment_section = self
+            .attachment_context(ctx, &sources, &mut remaining_reference_queries, budget)
+            .await;
         for section in [page_section, attachment_section].into_iter().flatten() {
             portable.context = Some(match portable.context.take() {
                 Some(item) => format!("{item}\n\n{section}"),
@@ -350,6 +360,7 @@ impl RunsModule {
         run_id: &str,
         thread_id: &str,
         ordinal: u64,
+        budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
         let pages = self
             .pages
@@ -375,6 +386,7 @@ impl RunsModule {
             .comments
             .get(index)
             .filter(|comment| !comment.deleted)
+            .cloned()
             .ok_or_else(|| format!("pages comment is missing: {thread_id}/{ordinal}"))?;
         let author = match &comment.author {
             pages::AuthorRef::User(key) => format!("user:{}", crate::hex(key)),
@@ -396,7 +408,9 @@ impl RunsModule {
             _ => return Err(format!("pages target is missing: {}", view.thread.target)),
         };
         let mut portable = self.portable_inputs(ctx, agent, &[]).await?;
-        let blocks = self.page_blocks(ctx, pages, &page_id).await;
+        let blocks = self
+            .page_blocks_for_execute(ctx, pages, &page_id, budget)
+            .await;
         portable.context = Some(inject::render_pages_section(&[(page_id, blocks)]));
         let payload = envelope::render_page_comment_payload(
             agent,

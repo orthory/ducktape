@@ -23,11 +23,11 @@ use governance::{
     GovMsg, GovQuery, GovReply, Governance, decode_reply as gov_decode, encode_msg as gov_encode,
     encode_query as gov_query,
 };
+use host::{BlockContext, Host, SubmitError};
 use identity::Identity;
 use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode, encode_query as identity_query,
 };
-use host::{BlockContext, Host, SubmitError};
 use sdk::{Error, Msg, Origin};
 use valset::Valset;
 use valset::{
@@ -47,9 +47,14 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 
 /// re-state the invite-grant preimage here rather than reach into
 /// `governance::invite`: a preimage drift in the crate then FAILS these tests
-/// loudly instead of silently signing a stale shape. v2: `binding ‖ nonce ‖
-/// role ‖ expiry` — no kind byte, no target.
-fn grant_preimage_for_tests(binding: &[u8], nonce: &[u8], role: InviteRole, expires: u64) -> Vec<u8> {
+/// loudly instead of silently signing a stale shape: `binding ‖ nonce ‖ role ‖
+/// expiry` — no kind byte, no target.
+fn grant_preimage_for_tests(
+    binding: &[u8],
+    nonce: &[u8],
+    role: InviteRole,
+    expires: u64,
+) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(binding);
     out.extend_from_slice(nonce);
@@ -95,10 +100,7 @@ fn gov_host() -> Host {
     Host::genesis(vec![
         Box::new(valset),
         Box::new(Identity::new("identity", None, "testnet".into())),
-        Box::new(
-            Governance::new("governance", "valset", "identity")
-                .with_invite_binding(BINDING),
-        ),
+        Box::new(Governance::new("governance", "valset", "identity").with_invite_binding(BINDING)),
     ])
     .expect("genesis")
 }
@@ -237,8 +239,8 @@ fn a_token_is_single_use_and_survives_snapshot_round_trip() {
         }) else {
             panic!("governance must advertise snapshot bytes");
         };
-        let mut rebuilt = Governance::new("governance", "valset", "identity")
-            .with_invite_binding(BINDING);
+        let mut rebuilt =
+            Governance::new("governance", "valset", "identity").with_invite_binding(BINDING);
         rebuilt.install(&bytes, expected_root).expect("install");
         assert_eq!(rebuilt.root(), expected_root, "round-trip root");
     });
@@ -302,11 +304,7 @@ fn a_network_without_a_binding_refuses_redemption() {
         let mut host = Host::genesis(vec![
             Box::new(valset),
             // no with_invite_binding — the dev-seed shape.
-            Box::new(Governance::new(
-                "governance",
-                "valset",
-                "identity",
-            )),
+            Box::new(Governance::new("governance", "valset", "identity")),
         ])
         .expect("genesis");
 
@@ -340,7 +338,10 @@ fn a_bearer_resident_token_is_first_wins_single_use() {
         submit_as(&mut host, &key_bytes(&a), 10, redeem_msg(&token, &a))
             .await
             .expect("A redeems the bearer resident invite");
-        assert!(residents(&host).await.contains(&key_bytes(&a)), "A holds resident standing");
+        assert!(
+            residents(&host).await.contains(&key_bytes(&a)),
+            "A holds resident standing"
+        );
 
         // key B presents the SAME token with its OWN valid proof: the nonce is
         // spent — single-use first-wins is the whole bearer containment story.
@@ -349,7 +350,10 @@ fn a_bearer_resident_token_is_first_wins_single_use() {
             .await
             .expect_err("second redemption of a spent bearer token");
         assert!(format!("{err:?}").contains("already redeemed"), "{err:?}");
-        assert!(!residents(&host).await.contains(&key_bytes(&b)), "B gained nothing");
+        assert!(
+            !residents(&host).await.contains(&key_bytes(&b)),
+            "B gained nothing"
+        );
 
         // expiry is deliberately NOT consensus-enforced: consensus_time is
         // block height on this chain (no deterministic wall clock exists
@@ -432,7 +436,11 @@ fn a_client_token_is_single_use() {
                 if m.contains("already redeemed") || m.contains("already holds client standing")),
             "got {err:?}"
         );
-        assert_eq!(clients(&host).await, vec![key_bytes(&client)], "still one client");
+        assert_eq!(
+            clients(&host).await,
+            vec![key_bytes(&client)],
+            "still one client"
+        );
     });
 }
 
@@ -460,7 +468,10 @@ fn the_join_proof_is_enforced_for_a_client_token_too() {
         let err = submit_as(&mut host, &key_bytes(&claimed), 11, forged)
             .await
             .expect_err("bad join proof");
-        assert!(format!("{err:?}").contains("proof-of-possession"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("proof-of-possession"),
+            "{err:?}"
+        );
 
         assert!(clients(&host).await.is_empty(), "nothing was granted");
     });

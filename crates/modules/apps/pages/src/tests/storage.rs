@@ -79,7 +79,6 @@ fn staged_writes_are_visible_within_one_block() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "one".into(),
-                parent: None,
             },
         )
         .await;
@@ -144,7 +143,6 @@ fn oversized_block_is_rejected_before_staging() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "one".into(),
-                parent: None,
             },
         )
         .await;
@@ -180,8 +178,7 @@ fn corrupt_stored_block_errors_as_corruption_not_absence() {
         let mut p = pages_on!(context, "pages");
         // commit bytes that are NOT valid Block json under blk1's key
         // (simulating on-disk corruption; unreachable through PageMsg ops).
-        p.staged
-            .stage(b"blk1".to_vec(), b"not json".to_vec());
+        p.staged.stage(b"blk1".to_vec(), b"not json".to_vec());
         p.commit_block().await.unwrap();
 
         apply_expect_err(
@@ -199,7 +196,6 @@ fn corrupt_stored_block_errors_as_corruption_not_absence() {
             &PageMsg::CreatePage {
                 page_id: "blk1".into(),
                 title: "steal".into(),
-                parent: None,
             },
             "corrupt",
         )

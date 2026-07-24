@@ -1,5 +1,5 @@
-//! `hello-wasm-v2` — the v2 reference wasm module. Byte-compatible durable state
-//! with `hello-wasm` (the same `count` key, little-endian u64), but DIFFERENT
+//! `hello-wasm-replacement` — the replacement reference wasm module. It uses
+//! the same durable state as `hello-wasm` (the `count` key, little-endian u64), but DIFFERENT
 //! logic: `inc` steps the counter by `STEP` (100) instead of 1. Authored against
 //! the same `ducktape:module` world, so it is a drop-in code swap over a store
 //! that `hello-wasm` populated — the host keeps the store, only the logic changes.
@@ -14,7 +14,7 @@ use ducktape::module::host;
 struct Component;
 
 const COUNT_KEY: &[u8] = b"count";
-/// the v2 step — the one observable difference from `hello-wasm` (which steps 1).
+/// the replacement step — the one observable difference from `hello-wasm` (which steps 1).
 const STEP: u64 = 100;
 
 fn read_count() -> u64 {

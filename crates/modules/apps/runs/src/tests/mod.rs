@@ -20,6 +20,7 @@ use files::{
 };
 use futures::executor::block_on;
 use sdk::Env;
+use std::cell::{Cell, RefCell};
 use tagging::{Author, encode_event as tagging_encode_event};
 use tasks::{
     Claim as JobClaim, Job, Task, decode_task_msg as tasks_decode_msg,
@@ -37,6 +38,8 @@ type Registry = BTreeMap<String, AgentRecord>;
 /// (the host provides the real routing in integration).
 struct CaptureCtx {
     env: Env,
+    query_count: Cell<usize>,
+    query_keys: RefCell<BTreeSet<(String, Vec<u8>)>>,
     /// agent id -> registry record served by the "agent" arm.
     agents: Registry,
     /// channel -> messages with contiguous seqs starting at 1.
@@ -63,10 +66,12 @@ struct CaptureCtx {
     /// saga_id -> the winning attempt's lease holder, served by the "saga"
     /// Get arm as a Done saga (the sink's executing-node attribution).
     saga_assignees: BTreeMap<String, Vec<u8>>,
-    /// page_id -> the whole page in preorder, served by the "pages" GetPage
-    /// arm (the M2 `[[page:<id>]]` injection lane); the GetBlock arm scans
-    /// these pages by block id (the pages-effects target resolution).
+    /// page_id -> the canonical whole page in preorder, sliced by the "pages"
+    /// GetPage arm (the M2 `[[page:<id>]]` injection lane); GetBlock scans the
+    /// same pages by block id (the pages-effects target resolution).
     pages: BTreeMap<String, Vec<pages::Block>>,
+    page_query_count: Cell<usize>,
+    page_query_fail_after: Option<usize>,
     /// explicit committed page comment threads used by Pages-triggered runs.
     page_threads: BTreeMap<String, pages::ThreadView>,
     /// thread/comment ids the pages module already holds — the squat
@@ -75,7 +80,7 @@ struct CaptureCtx {
     /// target -> committed thread count served by the TargetThreadCount arm
     /// (the capacity probe); absent targets serve zero threads.
     page_target_threads: BTreeMap<String, usize>,
-    /// the committed duckfs head served by the "files" Refs arm — the v3
+    /// the committed duckfs head served by the "files" Refs arm — the v1
     /// composer's `source_snapshot` pin. `None` = a fresh network (null pin).
     files_head: Option<String>,
     /// committed attachment bytes served by the "files" Read arm, keyed by
@@ -94,6 +99,8 @@ impl CaptureCtx {
                 origin: Origin::System,
                 me: "runs".into(),
             },
+            query_count: Cell::new(0),
+            query_keys: RefCell::new(BTreeSet::new()),
             agents: Registry::new(),
             transcripts: BTreeMap::new(),
             tasks: Vec::new(),
@@ -104,6 +111,8 @@ impl CaptureCtx {
             forge_items: BTreeMap::new(),
             saga_assignees: BTreeMap::new(),
             pages: BTreeMap::new(),
+            page_query_count: Cell::new(0),
+            page_query_fail_after: None,
             page_threads: BTreeMap::new(),
             taken_page_ids: BTreeSet::new(),
             page_target_threads: BTreeMap::new(),
@@ -117,6 +126,12 @@ impl CaptureCtx {
         self.env.height = view;
         self.env.consensus_time = view;
         self
+    }
+    fn query_count(&self) -> usize {
+        self.query_count.get()
+    }
+    fn distinct_query_count(&self) -> usize {
+        self.query_keys.borrow().len()
     }
     /// register a born branch under `repo` (the sink's branch-born probe;
     /// tip = a fixed zero oid where the tip does not matter).
@@ -145,11 +160,18 @@ impl CaptureCtx {
         self.saga_assignees.insert(saga_id.into(), key.to_vec());
         self
     }
-    /// register a committed page (whole preorder Vec, root first) served by
-    /// the "pages" GetPage arm.
+    /// register a committed page (whole preorder Vec, root first) served in
+    /// bounded slices by the "pages" GetPage arm.
     fn with_page(mut self, page_id: &str, blocks: Vec<pages::Block>) -> Self {
         self.pages.insert(page_id.into(), blocks);
         self
+    }
+    fn fail_page_queries_after(mut self, successful_queries: usize) -> Self {
+        self.page_query_fail_after = Some(successful_queries);
+        self
+    }
+    fn page_query_count(&self) -> usize {
+        self.page_query_count.get()
     }
     fn with_page_thread(mut self, view: pages::ThreadView) -> Self {
         self.page_threads.insert(view.thread.id.clone(), view);
@@ -170,7 +192,7 @@ impl CaptureCtx {
         self.page_target_threads.insert(target.into(), count);
         self
     }
-    /// set the committed duckfs head the "files" Refs arm serves (the v3
+    /// set the committed duckfs head the "files" Refs arm serves (the v1
     /// composer's `source_snapshot`).
     fn with_files_head(mut self, head: &str) -> Self {
         self.files_head = Some(head.into());
@@ -225,8 +247,10 @@ impl CaptureCtx {
     /// origin the session lane lets open a session.
     fn with_lease_holder(mut self, run_id: &str, key: &[u8]) -> Self {
         let dispatch_id = dispatch_id_for(run_id);
-        self.saga_assignees
-            .insert(crate::sink::saga_id_for_dispatch("runs", &dispatch_id), key.to_vec());
+        self.saga_assignees.insert(
+            crate::sink::saga_id_for_dispatch("runs", &dispatch_id),
+            key.to_vec(),
+        );
         self.dispatch_assignees.insert(dispatch_id, key.to_vec());
         self
     }
@@ -365,6 +389,11 @@ impl Ctx for CaptureCtx {
         None
     }
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let query_count = self.query_count.get();
+        self.query_count.set(query_count + 1);
+        self.query_keys
+            .borrow_mut()
+            .insert((target.to_string(), req.to_vec()));
         match target {
             "agent" => match agent::decode_query(req).map_err(Error::Module)? {
                 AgentQuery::Agent { agent_id } => Ok(agent_encode_reply(&AgentReply::Agent(
@@ -455,13 +484,11 @@ impl Ctx for CaptureCtx {
                 _ => Err(Error::QueryUnsupported),
             },
             "files" => match files_decode_query(req).map_err(Error::Module)? {
-                FilesQuery::Refs {} => Ok(files_encode_reply(&FilesReply::Refs(
-                    files::RefsInfo {
-                        head: self.files_head.clone(),
-                        pins: BTreeMap::new(),
-                        window_len: 0,
-                    },
-                ))),
+                FilesQuery::Refs {} => Ok(files_encode_reply(&FilesReply::Refs(files::RefsInfo {
+                    head: self.files_head.clone(),
+                    pins: BTreeMap::new(),
+                    window_len: 0,
+                }))),
                 FilesQuery::Read {
                     path, offset, len, ..
                 } => {
@@ -471,8 +498,7 @@ impl Ctx for CaptureCtx {
                             let end = (start + len as usize).min(bytes.len());
                             let slice = &bytes[start..end];
                             FilesReply::Read {
-                                b64: base64::engine::general_purpose::STANDARD
-                                    .encode(slice),
+                                b64: base64::engine::general_purpose::STANDARD.encode(slice),
                                 eof: end == bytes.len(),
                             }
                         }
@@ -517,9 +543,49 @@ impl Ctx for CaptureCtx {
                 _ => Err(Error::QueryUnsupported),
             },
             "pages" => match pages::decode_query(req).map_err(Error::Module)? {
-                pages::PageQuery::GetPage { page_id } => Ok(pages::encode_reply(
-                    &pages::PageReply::Page(self.pages.get(&page_id).cloned()),
-                )),
+                pages::PageQuery::GetPage {
+                    page_id,
+                    after,
+                    limit,
+                } => {
+                    let query_count = self.page_query_count.get();
+                    self.page_query_count.set(query_count + 1);
+                    if self.page_query_fail_after == Some(query_count) {
+                        return Err(Error::QueryUnsupported);
+                    }
+                    let Some(blocks) = self.pages.get(&page_id) else {
+                        return Ok(pages::encode_reply(&pages::PageReply::Page(None)));
+                    };
+                    let start = match after {
+                        Some(cursor) => blocks
+                            .iter()
+                            .position(|block| block.id == cursor)
+                            .and_then(|index| index.checked_add(1))
+                            .ok_or(Error::QueryUnsupported)?,
+                        None => 0,
+                    };
+                    let limit = if limit == 0 {
+                        pages::MAX_PAGE_QUERY_LIMIT
+                    } else {
+                        limit.min(pages::MAX_PAGE_QUERY_LIMIT)
+                    };
+                    let end = start.saturating_add(usize::from(limit)).min(blocks.len());
+                    let page_blocks = blocks[start..end].to_vec();
+                    let has_more = end < blocks.len();
+                    let next_after = has_more.then(|| {
+                        page_blocks
+                            .last()
+                            .expect("a non-final page contains a block")
+                            .id
+                            .clone()
+                    });
+                    Ok(pages::encode_reply(&pages::PageReply::Page(Some(
+                        pages::PageBlockPage {
+                            blocks: page_blocks,
+                            next_after,
+                        },
+                    ))))
+                }
                 pages::PageQuery::GetBlock { block_id } => {
                     Ok(pages::encode_reply(&pages::PageReply::Block(
                         self.pages
@@ -846,6 +912,34 @@ fn page_blocks(page_id: &str, title: &str) -> Vec<pages::Block> {
     ]
 }
 
+fn page_with_block_count(total: usize, text: &str) -> Vec<pages::Block> {
+    assert!(total > 0);
+    let child_ids = (1..total)
+        .map(|index| format!("block-{index}"))
+        .collect::<Vec<_>>();
+    let mut blocks = vec![pages::Block {
+        id: "plan".into(),
+        parent: None,
+        page: "plan".into(),
+        kind: pages::BlockKind::Page,
+        text: "Project Plan".into(),
+        marks: Vec::new(),
+        checked: false,
+        children: child_ids.clone(),
+    }];
+    blocks.extend(child_ids.into_iter().map(|id| pages::Block {
+        id,
+        parent: Some("plan".into()),
+        page: "plan".into(),
+        kind: pages::BlockKind::Paragraph,
+        text: text.into(),
+        marks: Vec::new(),
+        checked: false,
+        children: Vec::new(),
+    }));
+    blocks
+}
+
 /// a committed module with one watch on "general" under `policy`. the
 /// registry itself lives in each ctx (`with_registry`), never here.
 fn watched(policy: TurnPolicy, registry: &Registry) -> RunsModule {
@@ -929,7 +1023,6 @@ fn response_json(reply: &[&str], actions: Vec<AgentAction>) -> Vec<u8> {
             })
             .collect(),
         actions,
-        delegations: Vec::new(),
         commit_message: None,
     })
 }
@@ -949,7 +1042,6 @@ fn job_registry() -> Registry {
 }
 mod admin;
 mod composition;
-mod delegation;
 mod delivery;
 mod engagement;
 mod facets;

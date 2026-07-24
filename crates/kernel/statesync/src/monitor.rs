@@ -195,7 +195,6 @@ mod tests {
             participants: vec![],
             residents: vec![],
             floor_cert: None,
-            state_schema: [0u8; 32],
             entries: vec![],
         }
     }

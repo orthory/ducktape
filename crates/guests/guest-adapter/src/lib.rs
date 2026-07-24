@@ -24,9 +24,8 @@
 //!   as ONE value in the host-owned store each dispatch (under [`STATE_KEY`],
 //!   with its 32-byte root under [`ROOT_KEY`] so reloads verify-then-adopt).
 //!   the `WasmModule` root is therefore the host-KV encoding over these two
-//!   keys — a STATE-SCHEMA BREAK versus the native module's root, declared by
-//!   bumping the module's state-schema revision in the same change. there is
-//!   no back-compat constraint (beta networks re-genesis on a schema break).
+//!   keys and intentionally differs from the native module's root. greenfield
+//!   networks re-genesis when adopting such a cutover.
 //! * [`load_config`] — the GENESIS-CONFIG read for tenants whose native
 //!   constructor takes per-network parameters (a chain id, an invite binding):
 //!   the host installs an `sdk::genesis_config`-encoded `__config` store entry

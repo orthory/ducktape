@@ -1,6 +1,7 @@
 use super::{
-    Ctx, EngagementEvent, EntityRef, Error, RunsModule, TurnPolicy, canonical_origin,
-    dispatch_id_for, page_channel_id, page_run_id_for, run_id_for, tagging_decode_event,
+    Ctx, EngagementEvent, EntityRef, Error, RunsModule, SiblingReadBudget, TurnPolicy,
+    canonical_origin, dispatch_id_for, page_channel_id, page_run_id_for, run_id_for,
+    tagging_decode_event,
 };
 
 impl RunsModule {
@@ -60,6 +61,7 @@ impl RunsModule {
         &mut self,
         ctx: &mut dyn Ctx,
         payload: &[u8],
+        budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
         let Ok(event) = tagging_decode_event(payload) else {
             self.note(ctx, "dropped undecodable engagement event".into());
@@ -122,10 +124,10 @@ impl RunsModule {
                 }
             };
             let prepared = if is_page {
-                self.prepare_page_dispatch(&*ctx, &agent, &run_id, &container, seq)
+                self.prepare_page_dispatch(&*ctx, &agent, &run_id, &container, seq, budget)
                     .await
             } else {
-                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq, &[])
+                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq, &[], budget)
                     .await
             };
             match prepared {

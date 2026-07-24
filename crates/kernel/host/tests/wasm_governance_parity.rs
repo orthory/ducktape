@@ -3,8 +3,8 @@
 //! behind `guest-adapter`) and the native `Governance` module answer the SAME
 //! op sequence with IDENTICAL query replies, and their roots move in lockstep.
 //! the roots THEMSELVES differ — the port persists the native canonical
-//! snapshot as one host-KV value, a declared state-schema break (revision 2) —
-//! and this proof pins that difference.
+//! snapshot as one host-KV value — and this proof pins that representation
+//! difference.
 //!
 //! governance's per-network parameter is the INVITE BINDING, which travels as
 //! GENESIS CONFIG (a host-installed `__config` store entry —
@@ -21,25 +21,26 @@
 //! host ctx — including the UpdateModule flow proving a WASM governance can
 //! still drive the code registry that live-updates the other wasm tenants.
 
-use commonware_cryptography::ed25519::PrivateKey;
 use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
 use governance::invite::{
-    InviteRole, InviteToken, INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, sign_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
 };
 use governance::{
-    encode_msg, encode_query, GovAction, GovMsg, GovQuery, Governance, ShareAllocation,
+    GovAction, GovMsg, GovQuery, Governance, ShareAllocation, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{bind_preimage, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof,
-    IDENTITY_BIND_NS};
+use identity::{
+    IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
+};
 use lifecycle::{
-    decode_reply as lifecycle_decode_reply, encode_query as lifecycle_encode_query, Lifecycle,
-    LifecycleQuery, LifecycleReply,
+    Lifecycle, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode_reply,
+    encode_query as lifecycle_encode_query,
 };
 use sdk::{Error, Module as _, Msg, Origin, StateRoot};
 use valset::{
-    decode_reply as valset_decode_reply, encode_query as valset_encode_query, Valset, ValsetQuery,
-    ValsetReply,
+    Valset, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
+    encode_query as valset_encode_query,
 };
 use wasm_host::WasmModule;
 
@@ -59,14 +60,12 @@ const CHAIN_ID: &str = "test-chain";
 /// host-computed initial store carrying the `__config` genesis parameters —
 /// exactly the production construction (`bin/node/src/host_state.rs`).
 fn wasm_governance_with_invite(invite: &[u8]) -> WasmModule {
-    let mut module = WasmModule::from_bytes("governance", GOVERNANCE_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the governance
-        // canonical state.
-        .with_state_schema_revision(2);
+    let mut module = WasmModule::from_bytes("governance", GOVERNANCE_WASM).expect("load component");
     let config = sdk::genesis_config::encode_config(&[("invite", invite)]);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module.install(&bytes, root).expect("install genesis config");
+    module
+        .install(&bytes, root)
+        .expect("install genesis config");
     module
 }
 
@@ -164,7 +163,7 @@ fn execute(id: &str) -> Msg {
 /// proof-of-possession) into the Redeem op — deterministic: the nonce is
 /// caller-chosen and ed25519 signing is deterministic.
 fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &Ed) -> Msg {
-    // bearer (기명 dropped in v2), Resident-role, far-future expiry — the v2
+    // bearer, Resident-role, far-future expiry — the current
     // grant preimage (binding || nonce || role || expires_le; no kind, no
     // target).
     let expires: u64 = 4_102_444_800; // 2100-01-01 — far future, wall-clock-shaped
@@ -378,14 +377,14 @@ async fn same_ops_inner() {
     let mut native = native_host(&validators);
     let mut wasm = wasm_host_(&validators);
 
-    // the schema break is visible from GENESIS, asymmetrically: the native
+    // the representation difference is visible from GENESIS, asymmetrically: the native
     // empty module is the ZERO sentinel, the wasm root commits to the host-KV
     // store already carrying the genesis config.
     assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
     assert_ne!(
         root_of(&native),
         root_of(&wasm),
-        "genesis roots must differ — the port is a DECLARED schema break"
+        "genesis roots must differ — the port uses a distinct root representation"
     );
 
     // ---- the membership loop: proposal → ballots → tally → valset follow-up.
@@ -395,7 +394,11 @@ async fn same_ops_inner() {
         &ids,
         1,
         Origin::External(a_pub.clone()),
-        propose("p-add-res", GovAction::AddResident { key: c_pub.clone() }, 500),
+        propose(
+            "p-add-res",
+            GovAction::AddResident { key: c_pub.clone() },
+            500,
+        ),
         true,
         &[],
     )
@@ -448,7 +451,13 @@ async fn same_ops_inner() {
         &ids,
         5,
         Origin::External(b_pub.clone()),
-        propose("p-sig", GovAction::Signal { text: "quack?".into() }, 3),
+        propose(
+            "p-sig",
+            GovAction::Signal {
+                text: "quack?".into(),
+            },
+            3,
+        ),
         true,
         &[],
     )
@@ -490,7 +499,7 @@ async fn same_ops_inner() {
         propose(
             "p-code",
             GovAction::UpdateModule {
-                name: "hello-v2".into(),
+                name: "hello-replacement".into(),
                 module_id: "hello".into(),
                 activation_height: 500,
                 code_hash: vec![0xBB; 32],
@@ -501,8 +510,28 @@ async fn same_ops_inner() {
         &[],
     )
     .await;
-    roundtrip(&mut native, &mut wasm, &ids, 14, Origin::External(a_pub.clone()), vote("p-code", true), true, &[]).await;
-    roundtrip(&mut native, &mut wasm, &ids, 15, Origin::External(b_pub.clone()), vote("p-code", true), true, &[]).await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        14,
+        Origin::External(a_pub.clone()),
+        vote("p-code", true),
+        true,
+        &[],
+    )
+    .await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        15,
+        Origin::External(b_pub.clone()),
+        vote("p-code", true),
+        true,
+        &[],
+    )
+    .await;
     roundtrip(
         &mut native,
         &mut wasm,
@@ -517,10 +546,15 @@ async fn same_ops_inner() {
     // decoded proof on BOTH hosts: the registry now carries the pending swap.
     for host in [&native, &wasm] {
         let reply = host
-            .query("lifecycle", &lifecycle_encode_query(&LifecycleQuery::ModuleStatus))
+            .query(
+                "lifecycle",
+                &lifecycle_encode_query(&LifecycleQuery::ModuleStatus),
+            )
             .await
             .expect("lifecycle module status");
-        let LifecycleReply::ModuleStatus { modules } = lifecycle_decode_reply(&reply).expect("decode") else {
+        let LifecycleReply::ModuleStatus { modules } =
+            lifecycle_decode_reply(&reply).expect("decode")
+        else {
             panic!("expected Status reply");
         };
         let hello = modules
@@ -528,7 +562,7 @@ async fn same_ops_inner() {
             .find(|m| m.module_id == "hello")
             .expect("hello is registered");
         let pending = hello.pending.as_ref().expect("a swap is scheduled");
-        assert_eq!(pending.name, "hello-v2");
+        assert_eq!(pending.name, "hello-replacement");
         assert_eq!(pending.activation_height, 500);
         assert_eq!(pending.code_hash, vec![0xBB; 32]);
     }
@@ -902,10 +936,16 @@ async fn share_mode_inner() {
     // blocks leave governance alone on both runtimes.
     let (n0, w0) = (root_of(&native), root_of(&wasm));
     for host in [&mut native, &mut wasm] {
-        host.submit_at(block(1, Origin::External(a_pub.clone())), bind(&founder_a, &a_pub))
+        host.submit_at(
+            block(1, Origin::External(a_pub.clone())),
+            bind(&founder_a, &a_pub),
+        )
             .await
             .expect("bind A");
-        host.submit_at(block(2, Origin::External(b_pub.clone())), bind(&founder_b, &b_pub))
+        host.submit_at(
+            block(2, Origin::External(b_pub.clone())),
+            bind(&founder_b, &b_pub),
+        )
             .await
             .expect("bind B");
     }
@@ -941,8 +981,28 @@ async fn share_mode_inner() {
         &[],
     )
     .await;
-    roundtrip(&mut native, &mut wasm, &ids, 4, Origin::External(a_pub.clone()), vote("shares", true), true, &[]).await;
-    roundtrip(&mut native, &mut wasm, &ids, 5, Origin::External(b_pub.clone()), vote("shares", true), true, &[]).await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        4,
+        Origin::External(a_pub.clone()),
+        vote("shares", true),
+        true,
+        &[],
+    )
+    .await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        5,
+        Origin::External(b_pub.clone()),
+        vote("shares", true),
+        true,
+        &[],
+    )
+    .await;
     roundtrip(
         &mut native,
         &mut wasm,
@@ -964,13 +1024,39 @@ async fn share_mode_inner() {
         &ids,
         7,
         Origin::External(a_pub.clone()),
-        propose("sig2", GovAction::Signal { text: "by-shares".into() }, 500),
+        propose(
+            "sig2",
+            GovAction::Signal {
+                text: "by-shares".into(),
+            },
+            500,
+        ),
         true,
         &[],
     )
     .await;
-    roundtrip(&mut native, &mut wasm, &ids, 8, Origin::External(a_pub.clone()), vote("sig2", true), true, &[]).await;
-    roundtrip(&mut native, &mut wasm, &ids, 9, Origin::External(b_pub.clone()), vote("sig2", false), true, &[]).await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        8,
+        Origin::External(a_pub.clone()),
+        vote("sig2", true),
+        true,
+        &[],
+    )
+    .await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        9,
+        Origin::External(b_pub.clone()),
+        vote("sig2", false),
+        true,
+        &[],
+    )
+    .await;
     // ParticipatingMajority: participation 3 ≥ quorum 2, yes (2) > no (1),
     // irreversible early (yes > total - yes) — Passed on both runtimes.
     roundtrip(
@@ -1003,7 +1089,11 @@ async fn share_mode_inner() {
     };
     assert_eq!(view.status, governance::ProposalStatus::Passed);
     assert_eq!(view.voter_kind, governance::VoterKind::Account);
-    assert_eq!(view.proposer, ed_pub(&founder_a), "proposer resolved to the ACCOUNT");
+    assert_eq!(
+        view.proposer,
+        ed_pub(&founder_a),
+        "proposer resolved to the ACCOUNT"
+    );
     // ballots and the frozen electorate are keyed by ACCOUNT id, served in
     // ascending key order (the module's BTreeMap projection).
     let mut expected_votes = vec![(ed_pub(&founder_a), true), (ed_pub(&founder_b), false)];

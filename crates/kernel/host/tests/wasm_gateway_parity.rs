@@ -3,9 +3,8 @@
 //! behind `guest-adapter`) and the native `Gateway` module answer the SAME op
 //! sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 3) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! the port persists the native canonical snapshot as one host-KV value, an
+//! intentional greenfield root break pinned by this proof.
 //!
 //! gateway now owns the WHOLE `.duck` name → AccountId → route pipeline: BOTH
 //! the route plane AND the `.duck` handle plane absorbed from the retired
@@ -27,19 +26,20 @@
 //! WASM host carries NATIVE identity + valset: each parity proof isolates ONE
 //! wasm tenant.
 
-use commonware_cryptography::ed25519::PrivateKey;
 use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
 use gateway::{
-    decode_reply, encode_msg, encode_query, route_signing_preimage, DuckDnsName, Gateway,
-    GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, ResolvedAccount, RouteAudience,
-    RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
-    GATEWAY_ROUTE_NS, MAX_QUERY_LIMIT,
+    DuckDnsName, GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply,
+    MAX_QUERY_LIMIT, MemberAuthorization, ResolvedAccount, RouteAudience, RouteDefinition,
+    RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget, decode_reply, encode_msg,
+    encode_query, route_signing_preimage,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{bind_preimage, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof,
-    IDENTITY_BIND_NS};
+use identity::{
+    IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
+};
 use sdk::{Error, Module as _, Msg, Origin, StateRoot};
-use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
+use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `gateway` module's guest port by
@@ -55,14 +55,12 @@ const CHAIN_ID: &str = "test-chain";
 /// store carrying the `__config` genesis parameters — exactly the production
 /// construction (`bin/node/src/host_state.rs`).
 fn wasm_gateway_with_chain(chain_id: &str) -> WasmModule {
-    let mut module = WasmModule::from_bytes("gateway", GATEWAY_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 3 of the merged
-        // gateway canonical state (route plane + absorbed handle plane).
-        .with_state_schema_revision(3);
+    let mut module = WasmModule::from_bytes("gateway", GATEWAY_WASM).expect("load component");
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module.install(&bytes, root).expect("install genesis config");
+    module
+        .install(&bytes, root)
+        .expect("install genesis config");
     module
 }
 
@@ -485,7 +483,13 @@ async fn same_ops_inner() {
         10,
         Origin::External(w.node_a.clone()),
         set_route(
-            statement(&w.a_id(), Some("web"), &w.node_a, 1, Some(content_route(0x33))),
+            statement(
+                &w.a_id(),
+                Some("web"),
+                &w.node_a,
+                1,
+                Some(content_route(0x33)),
+            ),
             &w.founder_a,
         ),
         true,
@@ -523,7 +527,10 @@ async fn same_ops_inner() {
         ),
         (b"definitely-not-json".to_vec(), "expected value"),
     ] {
-        let n_err = native.query("gateway", &q).await.expect_err("native rejects");
+        let n_err = native
+            .query("gateway", &q)
+            .await
+            .expect_err("native rejects");
         let w_err = wasm.query("gateway", &q).await.expect_err("wasm rejects");
         let Error::Module(n_msg) = n_err else {
             panic!("native query error shape: {n_err:?}");
@@ -572,7 +579,13 @@ async fn rejections_inner() {
 
     // a statement whose label the canonical grammar refuses (module-side
     // validation is under test, so the authorization is explicit junk).
-    let bad_label = statement(&w.a_id(), Some("Bad_Label"), &w.node_a, 1, Some(loopback_route()));
+    let bad_label = statement(
+        &w.a_id(),
+        Some("Bad_Label"),
+        &w.node_a,
+        1,
+        Some(loopback_route()),
+    );
     let zero_revision = statement(&w.a_id(), Some("api"), &w.node_a, 0, Some(loopback_route()));
     // a content route violating the signed content-policy shape (POST).
     let mut bad_content = content_route(0x44);
@@ -773,14 +786,26 @@ async fn multi_dispatch_inner() {
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("multi"), &w.node_a, 1, Some(content_route(0x11))),
+                statement(
+                    &w.a_id(),
+                    Some("multi"),
+                    &w.node_a,
+                    1,
+                    Some(content_route(0x11)),
+                ),
                 &w.founder_a,
             ),
         ),
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("multi"), &w.node_a, 2, Some(loopback_route())),
+                statement(
+                    &w.a_id(),
+                    Some("multi"),
+                    &w.node_a,
+                    2,
+                    Some(loopback_route()),
+                ),
                 &w.founder_a,
             ),
         ),
@@ -816,14 +841,26 @@ async fn multi_dispatch_inner() {
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("iso"), &w.node_a, 1, Some(content_route(0x22))),
+                statement(
+                    &w.a_id(),
+                    Some("iso"),
+                    &w.node_a,
+                    1,
+                    Some(content_route(0x22)),
+                ),
                 &w.founder_a,
             ),
         ),
         (
             Origin::External(w.node_a.clone()),
             set_route(
-                statement(&w.a_id(), Some("iso"), &w.node_a, 1, Some(content_route(0x33))),
+                statement(
+                    &w.a_id(),
+                    Some("iso"),
+                    &w.node_a,
+                    1,
+                    Some(content_route(0x33)),
+                ),
                 &w.founder_a,
             ),
         ),
@@ -994,7 +1031,10 @@ async fn handle_replies(h: &Host) -> Vec<Vec<u8>> {
 }
 
 async fn resolved(h: &Host, handle: &str) -> Option<ResolvedAccount> {
-    let reply = h.query("gateway", &resolve_query(handle)).await.expect("resolve");
+    let reply = h
+        .query("gateway", &resolve_query(handle))
+        .await
+        .expect("resolve");
     match decode_reply(&reply).expect("decode") {
         GatewayReply::Resolved(r) => r,
         other => panic!("expected Resolved, got {other:?}"),
@@ -1015,12 +1055,20 @@ async fn handle_plane_inner() {
     // the schema break is visible from genesis (native ZERO sentinel vs the
     // wasm host-KV root that already commits to `__config`).
     assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
-    assert_ne!(root_of(&native), root_of(&wasm), "genesis roots differ (schema break)");
+    assert_ne!(
+        root_of(&native),
+        root_of(&wasm),
+        "genesis roots differ (schema break)"
+    );
 
     // sibling-only seed blocks leave the gateway root untouched on both sides.
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
-    assert_eq!(root_of(&native), StateRoot::ZERO, "seed holds the native root");
+    assert_eq!(
+        root_of(&native),
+        StateRoot::ZERO,
+        "seed holds the native root"
+    );
 
     // every handle op family in one deterministic sequence; `moves` says
     // whether committed state changes — root movement must agree on both sides.
@@ -1038,7 +1086,10 @@ async fn handle_plane_inner() {
         let height = i as u64 + 5;
         let (n_before, w_before) = (root_of(&native), root_of(&wasm));
         native
-            .submit_at(block(height, Origin::External(who.clone())), set_handle(handle))
+            .submit_at(
+                block(height, Origin::External(who.clone())),
+                set_handle(handle),
+            )
             .await
             .expect("native submit");
         wasm.submit_at(block(height, Origin::External(who)), set_handle(handle))
@@ -1063,25 +1114,39 @@ async fn handle_plane_inner() {
     // resolution stops at the stable AccountId (the founding key), never a node.
     assert_eq!(
         resolved(&wasm, "renamed").await,
-        Some(ResolvedAccount { account_id: w.a_id() }),
+        Some(ResolvedAccount {
+            account_id: w.a_id()
+        }),
         "A's rename resolves to A's account id"
     );
     assert_eq!(
         resolved(&wasm, "orthory").await,
-        Some(ResolvedAccount { account_id: w.b_id() }),
+        Some(ResolvedAccount {
+            account_id: w.b_id()
+        }),
         "the freed handle now belongs to B's account"
     );
-    assert_eq!(resolved(&wasm, "quack-2").await, None, "B's old name is gone");
+    assert_eq!(
+        resolved(&wasm, "quack-2").await,
+        None,
+        "B's old name is gone"
+    );
 
     // a reserved root label is refused identically on both runtimes, and the
     // reject leaves BOTH roots byte-identical to pre-block (abort, no trace).
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let n_err = native
-        .submit_at(block(20, Origin::External(w.node_a.clone())), set_handle(Some("net")))
+        .submit_at(
+            block(20, Origin::External(w.node_a.clone())),
+            set_handle(Some("net")),
+        )
         .await
         .expect_err("native rejects reserved");
     let w_err = wasm
-        .submit_at(block(20, Origin::External(w.node_a.clone())), set_handle(Some("net")))
+        .submit_at(
+            block(20, Origin::External(w.node_a.clone())),
+            set_handle(Some("net")),
+        )
         .await
         .expect_err("wasm rejects reserved");
     for err in [n_err, w_err] {

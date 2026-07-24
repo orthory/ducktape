@@ -33,10 +33,8 @@
 //! never be aborted by this module on either runtime (pinned by
 //! `wasm_automations_parity.rs`).
 //!
-//! the persisted encoding is the native module's canonical snapshot stored as
-//! ONE host-KV value, so the wasm root is the host-KV encoding over the two
-//! reserved keys — a STATE-SCHEMA BREAK versus the native root (revision 2 in
-//! `MODULE_STATE_SCHEMAS`; beta networks re-genesis, no back-compat shim).
+//! the canonical snapshot is stored as one host-KV value under the adapter's
+//! reserved keys.
 
 use crate::Automations;
 

@@ -86,12 +86,12 @@ type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::
 ///
 /// # the rekey / respawn contract (read before wiring a new scheme or dynamic validators)
 /// the scheme AND the validator set are fixed at simplex `Engine` construction — neither
-/// can be hot-swapped in a running engine. changing EITHER (a scheme migration, or a
+/// can be hot-swapped in a running engine. changing EITHER (a scheme change, or a
 /// validator join/leave) requires an **epoch transition**: at a height the OLD engine
 /// finalizes, every validator tears down the current engine and RE-SPAWNS a new one with
 /// the new `(scheme, participants)`. finalizing the switch through the old engine FIRST is
 /// what makes every node cut over at the SAME point (else they fork). this one
-/// teardown-and-respawn mechanism backs both scheme migration and dynamic valset. the same
+/// teardown-and-respawn mechanism backs both a scheme change and dynamic valset. the same
 /// epoch boundary is where validator-owned transport membership rotates: bootnodes,
 /// relayers, and control participants must be derived from that epoch's validator set,
 /// not from a static external relay.
@@ -211,7 +211,10 @@ mod sim_carrier {
         pub async fn register(oracle: &Oracle<Pk, E>, me: Pk, quota: Quota) -> Self {
             let control = oracle.control(me.clone());
             let vote = control.register(0, quota).await.expect("register vote");
-            let certificate = control.register(1, quota).await.expect("register certificate");
+            let certificate = control
+                .register(1, quota)
+                .await
+                .expect("register certificate");
             let resolver = control.register(2, quota).await.expect("register resolver");
             let payload = control.register(3, quota).await.expect("register payload");
             let fetch = control.register(4, quota).await.expect("register fetch");
@@ -237,7 +240,9 @@ mod sim_carrier {
             self.vote.take().expect("vote channel taken once")
         }
         fn certificate(&mut self) -> Pair<E> {
-            self.certificate.take().expect("certificate channel taken once")
+            self.certificate
+                .take()
+                .expect("certificate channel taken once")
         }
         fn resolver(&mut self) -> Pair<E> {
             self.resolver.take().expect("resolver channel taken once")
@@ -675,8 +680,8 @@ where
 
 /// simplex requires a [`Relay`], but with one shared [`ContentStore`] every node
 /// already resolves any finalized digest, so there is nothing to disseminate.
-/// `broadcast` is a no-op that just satisfies the trait. (a real deployment
-/// swaps this for the legacy gossip relay behind the same seam.)
+/// `broadcast` is a no-op that just satisfies the trait. A deployment with
+/// independent stores supplies a disseminating relay behind the same seam.
 #[derive(Clone, Default)]
 pub struct NoopRelay<P>(std::marker::PhantomData<fn() -> P>);
 
@@ -1445,7 +1450,7 @@ impl SimplexOrderer {
     /// `S::PublicKey` pinned to ed25519 — the transport identity every p2p bound in
     /// this crate keys on; only the vote/certificate signatures vary by scheme. also
     /// generic over the runtime `context` E, the `blocker` B, and the three engine
-    /// channel pairs (forwarded to `engine.start`). config is the tuned legacy
+    /// channel pairs (forwarded to `engine.start`). config is the tuned
     /// default. the engine's handle lives inside the returned orderer, whose
     /// `Drop` explicitly ABORTS it (a bare handle drop would leak the task).
     ///
@@ -1874,10 +1879,8 @@ where
     R: rand_core::CryptoRngCore,
 {
     use commonware_parallel::Sequential;
-    let finalization = Finalization::<S, Digest>::decode_cfg(
-        bytes,
-        &scheme.certificate_codec_config(),
-    )
+    let finalization =
+        Finalization::<S, Digest>::decode_cfg(bytes, &scheme.certificate_codec_config())
     .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
     if !finalization.verify(rng, scheme, &Sequential) {
         return Err(
@@ -2004,8 +2007,15 @@ impl FollowerOrderer {
         FR: commonware_p2p::Receiver<PublicKey = commonware_cryptography::ed25519::PublicKey>,
     {
         let inbox = FinalizedInbox::new();
-        let (mailbox, fetch_handle) =
-            spawn_payload_fetch(&context, blocker, provider, me, store.clone(), inbox.clone(), fetch);
+        let (mailbox, fetch_handle) = spawn_payload_fetch(
+            &context,
+            blocker,
+            provider,
+            me,
+            store.clone(),
+            inbox.clone(),
+            fetch,
+        );
 
         Self {
             store,
@@ -2220,7 +2230,9 @@ mod tests {
             newest_finalization_at_or_below(&retained, sealed_tip).expect("cert retained");
         assert_eq!((view, cert), (1, b"cert-one".to_vec()));
         assert!(
-            inbox.min_unreleased_view().is_none_or(|pending| pending > view),
+            inbox
+                .min_unreleased_view()
+                .is_none_or(|pending| pending > view),
             "everything at or below the selected certificate has released"
         );
         // ...even though the inbox is NOT empty (the old gate's starvation).

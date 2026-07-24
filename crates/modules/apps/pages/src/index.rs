@@ -265,6 +265,9 @@ fn delete_subtree(read: &impl StateRead, out: &mut Writes, root: PageBlockRow) -
     while let Some(row) = stack.pop() {
         delete_toks(out, &row);
         index_guest::delete(out, blk_key(&row.block_id));
+        if row.kind == BlockKind::Page {
+            index_guest::delete(out, page_key(&row.block_id));
+        }
         purge_target_threads(read, out, &row.block_id)?;
         for child in &row.children {
             if let Some(child_row) = read_row(read, child)? {
@@ -366,11 +369,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
     let mut out = Writes::new();
     match msg {
-        PageMsg::CreatePage {
-            page_id,
-            title,
-            parent,
-        } => {
+        PageMsg::CreatePage { page_id, title } => {
             // idempotence mirror: re-creating an existing page is a no-op
             // that changes neither the title nor the parent.
             if read_row(read, &page_id)?.is_some() {
@@ -381,7 +380,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 &PageRow {
                     id: page_id.clone(),
                     title: title.clone(),
-                    parent,
+                    parent: None,
                 },
             )?;
             let row = PageBlockRow {
@@ -402,9 +401,22 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut parent_row) = read_row(read, &parent)? else {
                 return Ok(out);
             };
+            let page_id = if block.kind == BlockKind::Page {
+                put_page(
+                    &mut out,
+                    &PageRow {
+                        id: block.id.clone(),
+                        title: block.text.clone(),
+                        parent: Some(parent_row.page_id.clone()),
+                    },
+                )?;
+                block.id.clone()
+            } else {
+                parent_row.page_id.clone()
+            };
             let row = PageBlockRow {
                 block_id: block.id.clone(),
-                page_id: parent_row.page_id.clone(),
+                page_id,
                 parent: Some(parent.clone()),
                 kind: block.kind,
                 text: block.text,
@@ -445,8 +457,8 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         PageMsg::MoveBlock {
             block_id, parent, ..
         } => {
-            // same-page move (the module rejects the rest): re-home the
-            // membership edge, page and text unchanged.
+            // Re-home the membership edge. Page rows keep their own page id
+            // while non-page rows stay within their page.
             let Some(mut row) = read_row(read, &block_id)? else {
                 return Ok(out);
             };
@@ -455,7 +467,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             // special-cases it too). re-reading the parent below would see
             // the pre-op row (this op's writes apply after the decision)
             // and re-push a duplicate child — so: no-op.
-            if row.parent.as_deref() == Some(parent.as_str()) {
+            if row.parent == parent {
                 return Ok(out);
             }
             if let Some(old_parent) = &row.parent
@@ -464,11 +476,13 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 old.children.retain(|c| c != &block_id);
                 put_row(&mut out, &old)?;
             }
-            if let Some(mut new_parent) = read_row(read, &parent)? {
+            if let Some(parent) = &parent
+                && let Some(mut new_parent) = read_row(read, parent)?
+            {
                 new_parent.children.push(block_id.clone());
                 put_row(&mut out, &new_parent)?;
             }
-            row.parent = Some(parent);
+            row.parent = parent;
             put_row(&mut out, &row)?;
         }
         PageMsg::RemoveBlock { block_id } => {
@@ -590,47 +604,6 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             thread.resolved = resolved;
             thread.resolved_by = resolved.then(|| render_author(&op.origin, None));
             put_thread(&mut out, &thread)?;
-        }
-        PageMsg::SetPageParent { page_id, parent } => {
-            let Some(mut page) = read_page(read, &page_id)? else {
-                return Ok(out);
-            };
-            page.parent = parent;
-            put_page(&mut out, &page)?;
-        }
-        PageMsg::DeletePage { page_id } => {
-            // drop the page root and its whole block subtree (rows +
-            // postings + anchored threads), exactly like RemoveBlock but
-            // starting from a root. child PAGES are separate roots, so their
-            // block trees survive — but their folder parent PROMOTES to the
-            // deleted page's parent, matching the module.
-            let promoted_parent = read_page(read, &page_id)?.and_then(|page| page.parent);
-            index_guest::delete(&mut out, page_key(&page_id));
-            let mut after: Option<Vec<u8>> = None;
-            loop {
-                let page = read.scan_page(b"page/", after.as_deref(), MAX_PAGE_LIMIT);
-                for (_key, value) in &page.entries {
-                    let row: PageRow = serde_json::from_slice(value)
-                        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
-                    if row.parent.as_deref() == Some(page_id.as_str()) {
-                        put_page(
-                            &mut out,
-                            &PageRow {
-                                parent: promoted_parent.clone(),
-                                ..row
-                            },
-                        )?;
-                    }
-                }
-                if !page.has_more {
-                    break;
-                }
-                after = page.next_after.map(String::into_bytes);
-            }
-            let Some(row) = read_row(read, &page_id)? else {
-                return Ok(out);
-            };
-            delete_subtree(read, &mut out, row)?;
         }
     }
     Ok(out)
@@ -759,10 +732,22 @@ mod tests {
     }
 
     fn create(id: &str, title: &str, parent: Option<&str>) -> PageMsg {
-        PageMsg::CreatePage {
-            page_id: id.into(),
-            title: title.into(),
-            parent: parent.map(str::to_string),
+        match parent {
+            None => PageMsg::CreatePage {
+                page_id: id.into(),
+                title: title.into(),
+            },
+            // a foldered page is a Page-kind block inserted under its parent.
+            Some(parent) => PageMsg::InsertBlock {
+                parent: parent.into(),
+                after: None,
+                block: NewBlock {
+                    id: id.into(),
+                    kind: BlockKind::Page,
+                    text: title.into(),
+                    marks: Vec::new(),
+                },
+            },
         }
     }
 
@@ -821,7 +806,6 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "roadmap draft".into(),
-                    parent: None,
                 },
                 insert("p1", "b1", "quarter goals"),
                 insert("b1", "b2", "nested milestone detail"),
@@ -842,7 +826,6 @@ mod tests {
             &[PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "usurper".into(),
-                parent: None,
             }],
         );
         assert!(search(&map, serde_json::json!({"search": {"text": "usurper"}})).is_empty());
@@ -850,6 +833,48 @@ mod tests {
             search(&map, serde_json::json!({"search": {"text": "roadmap"}})).len(),
             1
         );
+    }
+
+    #[test]
+    fn page_blocks_start_and_remove_their_own_search_scope() {
+        let mut map = Map::new();
+        apply(
+            &mut map,
+            1,
+            &[
+                PageMsg::CreatePage {
+                    page_id: "root".into(),
+                    title: "root document".into(),
+                },
+                PageMsg::InsertBlock {
+                    parent: "root".into(),
+                    after: None,
+                    block: NewBlock {
+                        id: "child".into(),
+                        kind: BlockKind::Page,
+                        text: "child document".into(),
+                        marks: Vec::new(),
+                    },
+                },
+                insert("child", "inside", "nested body"),
+            ],
+        );
+
+        for term in ["child", "nested"] {
+            let hits = search(&map, serde_json::json!({"search": {"text": term}}));
+            assert_eq!(hits.len(), 1, "{term}");
+            assert_eq!(hits[0].page_id, "child", "{term}");
+        }
+
+        apply(
+            &mut map,
+            2,
+            &[PageMsg::RemoveBlock {
+                block_id: "child".into(),
+            }],
+        );
+        assert!(search(&map, serde_json::json!({"search": {"text": "child"}})).is_empty());
+        assert!(search(&map, serde_json::json!({"search": {"text": "nested"}})).is_empty());
     }
 
     #[test]
@@ -862,7 +887,6 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
-                    parent: None,
                 },
                 insert("p1", "b1", "toggle section"),
                 insert("b1", "b2", "hidden inner text"),
@@ -895,7 +919,6 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "home".into(),
-                    parent: None,
                 },
                 insert("p1", "b1", "first"),
                 insert("p1", "b2", "second"),
@@ -908,7 +931,7 @@ mod tests {
             2,
             &[PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: Some("b2".into()),
             }],
         );
@@ -917,7 +940,7 @@ mod tests {
             3,
             &[PageMsg::MoveBlock {
                 block_id: "b1".into(),
-                parent: "p1".into(),
+                parent: Some("p1".into()),
                 after: None,
             }],
         );
@@ -942,12 +965,10 @@ mod tests {
                 PageMsg::CreatePage {
                     page_id: "p1".into(),
                     title: "alpha".into(),
-                    parent: None,
                 },
                 PageMsg::CreatePage {
                     page_id: "p2".into(),
                     title: "beta".into(),
-                    parent: None,
                 },
                 insert("p1", "b1", "shared term"),
                 insert("p2", "b2", "shared term"),
@@ -1032,27 +1053,6 @@ mod tests {
             ]
         );
 
-        // SetPageParent re-nests and detaches in the list.
-        apply(
-            &mut map,
-            3,
-            &[PageMsg::SetPageParent {
-                page_id: "zebra".into(),
-                parent: Some("mid".into()),
-            }],
-        );
-        let zebra = |rows: Vec<PageRow>| rows.into_iter().find(|r| r.id == "zebra").unwrap();
-        assert_eq!(zebra(list(&map)).parent.as_deref(), Some("mid"));
-        apply(
-            &mut map,
-            4,
-            &[PageMsg::SetPageParent {
-                page_id: "zebra".into(),
-                parent: None,
-            }],
-        );
-        assert_eq!(zebra(list(&map)).parent, None);
-
         // cursor paging: the reply's `next_after` resumes the ascending scan.
         let PagesViewReply::Pages {
             pages,
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_page_promotes_child_pages_and_unindexes_the_tree() {
+    fn removing_a_subpage_block_unindexes_its_page_subtree() {
         let mut map = Map::new();
         // grand -> parent -> child; parent also carries a content block.
         apply(
@@ -1092,23 +1092,17 @@ mod tests {
         apply(
             &mut map,
             2,
-            &[PageMsg::DeletePage {
-                page_id: "parent".into(),
+            &[PageMsg::RemoveBlock {
+                block_id: "parent".into(),
             }],
         );
 
-        // parent's row is gone; child PROMOTED to grand (no cascade).
+        // the subtree removal takes parent AND its nested child page rows.
         let got: Vec<(String, Option<String>)> = list(&map)
             .into_iter()
             .map(|r| (r.id, r.parent))
             .collect();
-        assert_eq!(
-            got,
-            [
-                ("child".into(), Some("grand".into())),
-                ("grand".into(), None),
-            ]
-        );
+        assert_eq!(got, [("grand".into(), None)]);
         // the deleted page's block subtree left the search index with it.
         assert!(search(&map, serde_json::json!({"search": {"text": "doomed"}})).is_empty());
     }

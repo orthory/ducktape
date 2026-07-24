@@ -60,8 +60,13 @@ impl<'a> EpochSpawner<'a> {
         store: ContentStore,
         floor_bytes: Option<Vec<u8>>,
     ) -> SimplexOrderer {
-        let slot = self.channel_bank
-        .get_mut(epoch.checked_sub(self.bank_base).expect("epochs never rebase down") as usize)
+        let slot = self
+            .channel_bank
+            .get_mut(
+                epoch
+                    .checked_sub(self.bank_base)
+                    .expect("epochs never rebase down") as usize,
+            )
         .and_then(|s| s.take())
         .unwrap_or_else(|| {
             fatal!(
@@ -76,7 +81,7 @@ impl<'a> EpochSpawner<'a> {
         // in_process_cluster.rs) for this real encrypted-TCP transport.
         let carrier = super::DiscoveryMesh::new(slot, self.oracle.clone());
         // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
-        // rekey/respawn contract for what a scheme migration would take.
+        // rekey/respawn contract for a scheme change.
         let scheme =
             simplex_ed25519::Scheme::signer(&self.namespace, participants, self.signer.clone())
                 .expect("our key is in the validator participant set");

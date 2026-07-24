@@ -27,7 +27,7 @@
 #   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
 #                      ducktape:module world binding every port shares), the
 #                      wasm32 dep stubs, and the kernel-fixture test guests
-#                      (hello, hello-v2, sibling, object). every module
+#                      (hello, hello-replacement, sibling, object). every module
 #                      carries its OWN port (src/guest.rs behind the `guest`
 #                      feature) and bin/guest-builder synthesizes the
 #                      packaging — no per-module crate lives here
@@ -183,7 +183,7 @@ p256 = "0.13"
 unicode-normalization = "0.1"
 # tests only: isolated on-disk module data dirs.
 tempfile = "3"
-# user-key v2 at-rest custody (bin/node/src/userkey.rs only): BIP39
+# user-key v1 at-rest custody (bin/node/src/userkey.rs only): BIP39
 # wordlist + entropy checksum (the PBKDF2 `to_seed` path is deliberately
 # unused — see the identity-onboarding design doc's custody model),
 # argon2id KEK derivation, and XChaCha20-Poly1305 AEAD. zeroize scrubs the

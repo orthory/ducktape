@@ -36,17 +36,17 @@ pub const MAX_ACTIONS_PER_RUN: usize = 8;
 /// emitting.
 pub const MAX_ACTIONS_BYTES: usize = 8 * 1024;
 
-/// hard cap on one delegated child's instruction. delegation is a final-only
-/// response declaration, but its text is injected into the child's composed
-/// payload, so it needs its own trust-boundary bound before composition.
+/// hard cap on one live peer call's instruction. The text is injected into the
+/// callee's composed payload, so it needs its own trust-boundary bound before
+/// composition.
 pub const MAX_DELEGATION_INSTRUCTION_BYTES: usize = 4 * 1024;
 
-/// hard cap on the serialized delegation batch. `subagent_budget` plus the
-/// fixed concurrent-call cap bound compute; this independently bounds
+/// hard cap on one serialized live peer-call request. `subagent_budget` plus
+/// the fixed concurrent-call cap bound compute; this independently bounds
 /// replicated input bytes.
 pub const MAX_DELEGATIONS_BYTES: usize = 8 * 1024;
 
-/// hard cap on the children one final response may fan out to, independent of
+/// hard cap on concurrent live peer calls in one root run tree, independent of
 /// the owner's potentially larger budget grant.
 pub const MAX_DELEGATIONS_PER_RUN: usize = 8;
 
@@ -195,7 +195,7 @@ fn is_zero(n: &u32) -> bool {
 
 /// whether a [`ResourceCaps`] is the empty default — used to keep the empty
 /// record's serialized JSON (and its `MAX_AGENT_RECORD_BYTES` size check)
-/// byte-lean, so a pre-v4-shaped record is unchanged on the wire.
+/// byte-lean.
 pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
     *c == ResourceCaps::default()
 }
@@ -287,11 +287,6 @@ pub enum AgentStatus {
 pub enum AgentRole {
     #[default]
     General,
-    /// Reserved discriminant, not emitted by any current producer (no
-    /// registration path sets a non-General role yet). Kept stable — renumbering
-    /// would make committed state undecodable if a future writer uses it — but it
-    /// selects no special execution or knowledge-loading path.
-    ProjectLibrarian,
 }
 
 /// one registered agent — an ordered-op registration, so which capability and
@@ -490,10 +485,9 @@ pub struct ReplyBlock {
     pub lang: Option<String>,
 }
 
-/// One run-scoped call to a registered peer agent. The live MCP path is the
-/// primary API; the final response field is the settlement-time path, secondary
-/// to the live agent-call tool. Runs derives identity/authority from the caller
-/// and accepts only an existing agent plus a bounded instruction.
+/// One run-scoped call to a registered peer agent. Runs derives
+/// identity/authority from the caller and accepts only an existing agent plus a
+/// bounded instruction.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DelegationRequest {
     pub agent_id: String,
@@ -509,8 +503,7 @@ pub struct DelegationRequest {
 }
 
 /// the formal agent response: reply blocks, a bounded list of [`AgentAction`]s,
-/// a settlement-time final delegation batch, and an optional workspace
-/// commit message.
+/// and an optional workspace commit message.
 /// lenient by construction — all fields default, unknown JSON fields are
 /// ignored — so a model answer either IS this shape or the consumer wraps it
 /// as one; validation (grants, caps, probes) is a separate, strict step.
@@ -520,10 +513,6 @@ pub struct AgentResponse {
     pub reply_blocks: Vec<ReplyBlock>,
     #[serde(default)]
     pub actions: Vec<AgentAction>,
-    /// one settlement-time child wave. This is deliberately NOT an
-    /// [`AgentAction`]: the mid-run session/MCP action lane cannot invoke it.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub delegations: Vec<DelegationRequest>,
     /// complete Git commit message authored by the agent for uncommitted
     /// workspace changes. Optional; a clean response (no workspace changes) omits
     /// it; existing agent commits keep their own messages. The host owns only

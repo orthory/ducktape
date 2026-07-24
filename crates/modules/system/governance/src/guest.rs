@@ -25,9 +25,7 @@
 //! the host's staged overlay, run the native `execute`, commit the INNER
 //! module, save the canonical snapshot back as OUTER staged writes) is
 //! the `agent` guest port verbatim; see that crate for the
-//! equivalence argument. the persisted encoding is the native canonical
-//! snapshot as ONE host-KV value: a STATE-SCHEMA BREAK versus the native root
-//! (revision 2; beta networks re-genesis, no back-compat shim).
+//! equivalence argument. The canonical snapshot is stored as one host-KV value.
 
 use crate::Governance;
 use guest_adapter::{host, load_config};

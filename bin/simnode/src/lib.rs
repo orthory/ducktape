@@ -623,6 +623,17 @@ impl SimHandle {
     pub fn shutdown(mut self) {
         self.node.request_shutdown();
         self.join_threads();
+        // once both sim threads have exited, this handle's StatusCell
+        // exposition closure owns the LAST commonware-executor ref, and
+        // dropping the tokio runtime inside it panics on an async embedder
+        // thread (the app's current_thread tests) — hand the final drop to a
+        // scratch thread and wait for it.
+        let reaper = std::thread::Builder::new()
+            .name("sim-drop".into())
+            .spawn(move || drop(self));
+        if let Ok(reaper) = reaper {
+            let _ = reaper.join();
+        }
     }
 
     /// send one control command and block for its reply. a torn-down actor is
@@ -770,8 +781,7 @@ fn run_sim(
             Some("tasks".into()),
             Some("tasks".into()),
         )
-        // the duckfs/files module the portable (v3) composer pins its source
-        // head from (W2) — mandatory for envelope composition.
+        // The portable composer pins its source head from duckfs/files.
         .with_files_module("files")
         // the pages module the composer renders [[page:<id>]] refs from and
         // the pages effects lane writes to; unwired, both degrade.
@@ -1203,6 +1213,19 @@ impl Sim {
                 self.stream_hub
                     .publish_block(projection.height, hex_root(&root_hash));
             }
+        }
+        // the deterministic lane's read barrier: fold triggers drain on a
+        // background runner, and a sim commit must imply the derived views
+        // answer the block (a client read — or the ws `changed` event that
+        // prompts one — must never race the fold). production daemons stay
+        // async by design; their clients re-read on the next event.
+        if let Err(err) = self.index.wait_folds_drained() {
+            tracing::error!(
+                target: "ducktape::consensus",
+                event = "node_index_poisoned",
+                error = %err,
+                "module index fold failed — the sim's views are now STALE"
+            );
         }
         Ok((drained, self.node.take_events()))
     }

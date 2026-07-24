@@ -130,12 +130,11 @@ where
         })
     });
 
-    // the REAL workspace provisioner: portable (v3) runs materialize a per-run
+    // the REAL workspace provisioner: portable v1 runs materialize a per-run
     // duckfs checkout under a root VALIDATED to be outside <storage> (D7),
     // drive it over the daemon's OWN actor lane (no self-dial), commit the
     // output_ref, and clean up. LIVE for every agent run: the daemon wires the
-    // files module unconditionally, so the runs composer emits v3 (the
-    // de-versioned activation — no flag day, pre-production re-genesis). a
+    // files module unconditionally, so the runs composer emits v1. a
     // misconfigured root (inside <storage>) is a boot error, never a silent
     // D7 hole.
     let provisioner: SharedProvisioner = Arc::new(

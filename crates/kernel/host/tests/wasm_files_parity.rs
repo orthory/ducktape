@@ -1,9 +1,9 @@
 //! the ROOT-CONTINUITY proof for files (duckfs): the files guest component over
 //! `WasmModule::with_odb(FilesOdbBacking)` and the native `Files` module over the
 //! same disk substrate are BYTE-IDENTICAL block-by-block. unlike the whole-state
-//! adapter ports (whose roots diverge by a declared schema break), files' root is
+//! adapter ports (whose root representations differ), files' root is
 //! `sha256(encode_refs)` on BOTH runtimes — the cutover changes the executor, not
-//! one committed byte — so `("files", 1)` stays and this proof pins that: the same
+//! one committed byte — and this proof pins that: the same
 //! op stream commits the identical files root after EVERY block from genesis, the
 //! same query replies, the same committed-only mid-block reads, the same watch
 //! fan-out, and the same object-possession serve bytes.
@@ -21,8 +21,8 @@ use futures::executor::block_on;
 use files::objects::object_id;
 use files::{
     CHUNK_SIZE, Change, Content, Files, FilesMsg, FilesOdbBacking, FilesQuery, FilesReply,
-    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_OBJECT_READS_PER_OP, MAX_READ_BYTES, encode_msg,
-    encode_putblob, encode_query, encode_sync_req, to_hex,
+    FilesSyncReq, Kind, MAX_CHANGES_PER_COMMIT, MAX_OBJECT_READS_PER_OP, MAX_READ_BYTES,
+    encode_msg, encode_putblob, encode_query, encode_sync_req, to_hex,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
@@ -58,7 +58,9 @@ fn native_host(dir: &tempfile::TempDir) -> Host {
 fn wasm_host(dir: &tempfile::TempDir) -> Host {
     let backing = FilesOdbBacking::open(FILES, dir.path().to_path_buf()).expect("open odb backing");
     Host::genesis(vec![
-        Box::new(WasmModule::with_odb(FILES, FILES_WASM, Box::new(backing)).expect("load component")),
+        Box::new(
+            WasmModule::with_odb(FILES, FILES_WASM, Box::new(backing)).expect("load component"),
+        ),
         Box::new(Recorder::new("recorder")),
         Box::new(QueryProbe::new()),
     ])
@@ -332,8 +334,12 @@ fn happy_path_matrix_roots_identical_block_by_block() {
     let owner = Origin::External(b"tester".to_vec());
 
     // ROOT CONTINUITY from block zero: both sides commit to the SAME empty refs,
-    // so — unlike the whole-state ports — the roots are EQUAL, not a schema break.
-    assert_eq!(all_roots(&native), all_roots(&wasm), "genesis roots diverge");
+    // so — unlike the whole-state ports — the roots are EQUAL.
+    assert_eq!(
+        all_roots(&native),
+        all_roots(&wasm),
+        "genesis roots diverge"
+    );
     // the host sees the wasm tenant exactly as it saw native files: resolver-backed
     // (the duckfs-odb object-possession lane), never snapshot bytes.
     assert!(native.resolver_backed_ids().contains(FILES));
@@ -379,11 +385,19 @@ fn happy_path_matrix_roots_identical_block_by_block() {
                 "roots diverge after block {height}"
             );
             assert_ne!(files_root(&native), before, "files root stuck at {height}");
-            assert_eq!(replies(&native), replies(&wasm), "replies diverge at {height}");
+            assert_eq!(
+                replies(&native),
+                replies(&wasm),
+                "replies diverge at {height}"
+            );
         }
         head(&native)
     };
-    assert_eq!(head_hex, head(&wasm), "hosts disagree on the committed head");
+    assert_eq!(
+        head_hex,
+        head(&wasm),
+        "hosts disagree on the committed head"
+    );
 
     // pin [5] then unpin the head — owner-gated; same owner threads both.
     for (height, msg) in [
@@ -400,7 +414,11 @@ fn happy_path_matrix_roots_identical_block_by_block() {
         let before = files_root(&native);
         block_on(native.submit_at(block(height, owner.clone()), msg.clone())).expect("native pin");
         block_on(wasm.submit_at(block(height, owner.clone()), msg)).expect("wasm pin");
-        assert_eq!(all_roots(&native), all_roots(&wasm), "pin block {height} diverges");
+        assert_eq!(
+            all_roots(&native),
+            all_roots(&wasm),
+            "pin block {height} diverges"
+        );
         assert_ne!(files_root(&native), before, "pin/unpin must move the root");
     }
 
@@ -453,21 +471,31 @@ fn same_block_faces_match_native() {
         let mut native = native_host(&dir_n);
         let mut wasm = wasm_host(&dir_w);
         let batch = vec![
-            (Origin::System, commit_op(None, "inline", vec![put_inline("/a", content)])),
+            (
+                Origin::System,
+                commit_op(None, "inline", vec![put_inline("/a", content)]),
+            ),
             (
                 Origin::System,
                 commit_op(
                     None,
                     "chunks",
-                    vec![put_chunks("/b", content.len() as u64, std::slice::from_ref(&chunk))],
+                    vec![put_chunks(
+                        "/b",
+                        content.len() as u64,
+                        std::slice::from_ref(&chunk),
+                    )],
                 ),
             ),
         ];
-        let n_out = block_on(native.submit_block(block(1, Origin::System), batch.clone())).expect("native");
+        let n_out =
+            block_on(native.submit_block(block(1, Origin::System), batch.clone())).expect("native");
         let w_out = block_on(wasm.submit_block(block(1, Origin::System), batch)).expect("wasm");
         for out in [&n_out, &w_out] {
             assert!(
-                out.members.iter().all(|m| matches!(m, MemberOutcome::Applied { .. })),
+                out.members
+                    .iter()
+                    .all(|m| matches!(m, MemberOutcome::Applied { .. })),
                 "both same-block members must apply (face 1): {:?}",
                 out.members
             );
@@ -484,14 +512,20 @@ fn same_block_faces_match_native() {
         let mut native = native_host(&dir_n);
         let mut wasm = wasm_host(&dir_w);
         let batch = vec![
-            (Origin::System, commit_op(None, "inline", vec![put_inline("/a", content)])),
+            (
+                Origin::System,
+                commit_op(None, "inline", vec![put_inline("/a", content)]),
+            ),
             (Origin::System, putblob_op(content)),
         ];
-        let n_out = block_on(native.submit_block(block(1, Origin::System), batch.clone())).expect("native");
+        let n_out =
+            block_on(native.submit_block(block(1, Origin::System), batch.clone())).expect("native");
         let w_out = block_on(wasm.submit_block(block(1, Origin::System), batch)).expect("wasm");
         for out in [&n_out, &w_out] {
             assert!(
-                out.members.iter().all(|m| matches!(m, MemberOutcome::Applied { .. })),
+                out.members
+                    .iter()
+                    .all(|m| matches!(m, MemberOutcome::Applied { .. })),
                 "both same-block members must apply (face 2): {:?}",
                 out.members
             );
@@ -547,7 +581,11 @@ fn rejections_match_and_leave_roots_and_odb_unmoved() {
             "changed since base",
         ),
         // [6] resource cap (staging-quota substitute): one over the change cap.
-        (3, commit_op(None, "flood", over_cap), "commit exceeds the change cap"),
+        (
+            3,
+            commit_op(None, "flood", over_cap),
+            "commit exceeds the change cap",
+        ),
         // a staging-path reject too: a chunk one byte over CHUNK_SIZE.
         (
             4,
@@ -640,7 +678,11 @@ fn object_read_cap_rejects_oversized_commit_on_both_runtimes() {
     // the aborted block moved nothing on either runtime.
     assert_eq!(all_roots(&native), genesis, "native root moved on reject");
     assert_eq!(all_roots(&wasm), genesis, "wasm root moved on reject");
-    assert_eq!(all_roots(&native), all_roots(&wasm), "post-reject roots diverge");
+    assert_eq!(
+        all_roots(&native),
+        all_roots(&wasm),
+        "post-reject roots diverge"
+    );
 }
 
 /// a deterministic module rejection whose reason CONTAINS `needle` — the wasm
@@ -650,7 +692,10 @@ fn assert_module_reject(who: &str, height: u64, err: &SubmitError, needle: &str)
     let SubmitError::Rejected(Error::Module(reason)) = err else {
         panic!("{who} rejection shape at {height}: {err:?}");
     };
-    assert!(reason.contains(needle), "{who} reason at {height}: {reason}");
+    assert!(
+        reason.contains(needle),
+        "{who} reason at {height}: {reason}"
+    );
 }
 
 // ============================================================================
@@ -673,7 +718,11 @@ fn watch_notification_delivery_parity() {
     let reg = watch_op("/watched", "recorder");
     block_on(native.submit_at(block(1, Origin::System), reg.clone())).expect("native watch");
     block_on(wasm.submit_at(block(1, Origin::System), reg)).expect("wasm watch");
-    assert_eq!(all_roots(&native), all_roots(&wasm), "watch-reg roots diverge");
+    assert_eq!(
+        all_roots(&native),
+        all_roots(&wasm),
+        "watch-reg roots diverge"
+    );
 
     // recorder is still empty (nothing delivered yet) — proves the next block is
     // what moves it.
@@ -685,15 +734,26 @@ fn watch_notification_delivery_parity() {
     block_on(native.submit_at(block(2, Origin::System), fire.clone())).expect("native fire");
     block_on(wasm.submit_at(block(2, Origin::System), fire)).expect("wasm fire");
 
-    assert_eq!(all_roots(&native), all_roots(&wasm), "post-notify roots diverge");
+    assert_eq!(
+        all_roots(&native),
+        all_roots(&wasm),
+        "post-notify roots diverge"
+    );
     let rec_after = native.module_root("recorder").expect("recorder");
-    assert_ne!(rec_after, rec_before, "recorder must have received the notification");
+    assert_ne!(
+        rec_after, rec_before,
+        "recorder must have received the notification"
+    );
     assert_eq!(
         rec_after,
         wasm.module_root("recorder").expect("recorder"),
         "the wasm guest must emit the byte-identical duckfs_notify the native module does"
     );
-    assert_eq!(replies(&native), replies(&wasm), "post-notify replies diverge");
+    assert_eq!(
+        replies(&native),
+        replies(&wasm),
+        "post-notify replies diverge"
+    );
 }
 
 // ============================================================================
@@ -734,16 +794,23 @@ fn mid_block_sibling_probe_serves_committed_refs() {
             },
         ),
     ];
-    let n_out = block_on(native.submit_block(block(2, Origin::System), batch.clone())).expect("native");
+    let n_out =
+        block_on(native.submit_block(block(2, Origin::System), batch.clone())).expect("native");
     let w_out = block_on(wasm.submit_block(block(2, Origin::System), batch)).expect("wasm");
     for out in [&n_out, &w_out] {
         assert!(
-            out.members.iter().all(|m| matches!(m, MemberOutcome::Applied { .. })),
+            out.members
+                .iter()
+                .all(|m| matches!(m, MemberOutcome::Applied { .. })),
             "all members must apply: {:?}",
             out.members
         );
     }
-    assert_eq!(all_roots(&native), all_roots(&wasm), "post-probe roots diverge");
+    assert_eq!(
+        all_roots(&native),
+        all_roots(&wasm),
+        "post-probe roots diverge"
+    );
     // the probe committed the mid-block reply it saw — identical on both runtimes.
     assert_eq!(
         native.module_root("probe"),
@@ -802,20 +869,16 @@ fn gc_after_window_slide_stays_root_equal() {
         );
     }
     // final full-matrix equality after gc has run and the window has slid.
-    assert_eq!(all_roots(&native), all_roots(&wasm), "post-gc roots diverge");
+    assert_eq!(
+        all_roots(&native),
+        all_roots(&wasm),
+        "post-gc roots diverge"
+    );
     assert_eq!(replies(&native), replies(&wasm), "post-gc replies diverge");
 }
 
-// ============================================================================
-// CASE 10: ("files", 1) state_schema_revision on both — no schema fence
-// ============================================================================
-
-/// the committed encoding is unchanged (same refs image, same root — proven
-/// above), so the canonical-state revision must stay 1 on both runtimes:
-/// pre-cutover workspaces reopen without a schema fence, and the declared sync
-/// surface is verbatim native's.
 #[test]
-fn revision_stays_one_and_sync_handle_matches_native() {
+fn sync_handle_matches_native() {
     let dir_n = tempfile::tempdir().unwrap();
     let dir_w = tempfile::tempdir().unwrap();
     let native = Files::open(FILES, dir_n.path().to_path_buf()).expect("open native");
@@ -826,16 +889,17 @@ fn revision_stays_one_and_sync_handle_matches_native() {
     )
     .expect("load component");
 
-    assert_eq!(Module::state_schema_revision(&native), 1, "native revision");
-    assert_eq!(Module::state_schema_revision(&wasm), 1, "wasm revision");
-    // the resolver sync surface is verbatim the native declaration (duckfs-odb).
     assert_eq!(
         native.state_sync_handle().expect("native handle"),
         wasm.state_sync_handle().expect("wasm handle"),
         "sync handles diverge"
     );
     // genesis roots equal directly at the module level (both empty refs).
-    assert_eq!(Module::root(&native), Module::root(&wasm), "genesis module roots diverge");
+    assert_eq!(
+        Module::root(&native),
+        Module::root(&wasm),
+        "genesis module roots diverge"
+    );
 }
 
 // ============================================================================
@@ -878,9 +942,14 @@ fn reopen_preserves_equal_roots() {
         let mut native = native_host(&dir_n);
         let mut wasm = wasm_host(&dir_w);
         for (height, origin, msg) in &ops {
-            block_on(native.submit_at(block(*height, origin.clone()), msg.clone())).expect("native");
+            block_on(native.submit_at(block(*height, origin.clone()), msg.clone()))
+                .expect("native");
             block_on(wasm.submit_at(block(*height, origin.clone()), msg.clone())).expect("wasm");
-            assert_eq!(all_roots(&native), all_roots(&wasm), "pre-drop block {height} diverges");
+            assert_eq!(
+                all_roots(&native),
+                all_roots(&wasm),
+                "pre-drop block {height} diverges"
+            );
         }
         (all_roots(&native), all_roots(&wasm))
         // both hosts drop here, releasing the disk handles.
@@ -900,5 +969,9 @@ fn reopen_preserves_equal_roots() {
         files_root(&native2),
         "wasm reopen root must equal native reopen root"
     );
-    assert_eq!(replies(&native2), replies(&wasm2), "post-reopen replies diverge");
+    assert_eq!(
+        replies(&native2),
+        replies(&wasm2),
+        "post-reopen replies diverge"
+    );
 }

@@ -1,8 +1,7 @@
 use duckdns::{
     DuckDnsMsg, DuckDnsName, DuckDnsQuery, DuckDnsReply, Registry, ResolvedAccount, decode_msg,
-    decode_query, decode_reply, encode_msg, encode_query, encode_reply, parse_hostname,
+    decode_query, decode_reply, encode_msg, encode_query, encode_reply,
 };
-use sha2::{Digest, Sha256};
 
 fn account_name(handle: &str) -> DuckDnsName {
     DuckDnsName {
@@ -10,76 +9,20 @@ fn account_name(handle: &str) -> DuckDnsName {
     }
 }
 
-/// Forge the canonical bytes an OLD binary committed, before `agents` was
-/// reserved. `agentx` is the same byte length, so swapping the label in place
-/// leaves every length prefix in the encoding valid — the result is exactly what
-/// `encode_state` would have produced for a squatted `agents` handle.
-fn legacy_snapshot_holding(owner: &[u8], reserved: &str) -> Vec<u8> {
-    let stand_in = format!("agent{}", "x".repeat(reserved.len() - 5));
-    assert_eq!(stand_in.len(), reserved.len());
-    let mut old = Registry::new();
-    old.set_handle(owner, Some(stand_in.clone())).unwrap();
-    old.commit();
-    let bytes = old.snapshot();
-    let at = bytes
-        .windows(stand_in.len())
-        .position(|w| w == stand_in.as_bytes())
-        .expect("the stand-in label is in the canonical bytes");
-    let mut forged = bytes;
-    forged[at..at + reserved.len()].copy_from_slice(reserved.as_bytes());
-    forged
-}
-
-/// THE FLAG-DAY GATE. `agents` joined `RESERVED_ROOT_LABELS` in this change —
-/// so out there is a snapshot an old binary committed with `agents` registered:
-/// precisely the squat the reservation exists to close. Reserving a label must
-/// change only what ADMITS, never what DECODES. If decode enforced the policy, a
-/// node on the new binary could not install duckdns state at all (no state sync)
-/// and could not restore its own recovery checkpoint (it reinstalls canonical
-/// snapshot bytes for non-persisting modules at boot): a permanent brick with no
-/// migration path. The legacy squat decodes. It is merely INERT.
 #[test]
-fn a_snapshot_holding_a_newly_reserved_handle_still_installs_and_is_inert() {
-    let squatter = vec![7; 32];
-    let legacy = legacy_snapshot_holding(&squatter, "agents");
-    let root: [u8; 32] = Sha256::digest(&legacy).into();
-
-    let mut node = Registry::new();
-    node.install(&legacy, root)
-        .expect("a legacy `agents` handle must still DECODE — see validate_handle_shape");
-    assert_eq!(node.snapshot(), legacy, "and re-encode canonically");
-    assert_eq!(node.root_bytes(), root);
-    assert_eq!(
-        node.registrations(0, 8).unwrap()[0].handle,
-        "agents",
-        "the squat is still in state, plainly visible"
-    );
-
-    // ...but it is inert: it never resolves, and it is not a hostname.
-    assert!(node.resolve(&account_name("agents")).is_err());
-    assert!(parse_hostname("agents.duck").is_err());
-
-    // nobody may claim it anew — not another account, not even the squatter.
-    assert!(
-        node.set_handle(&[9; 32], Some("agents".into()))
-            .unwrap_err()
-            .contains("reserved")
-    );
-    assert!(
-        node.set_handle(&squatter, Some("agents".into()))
-            .unwrap_err()
-            .contains("reserved")
-    );
-
-    // and the squatter can still move off it — the state is not frozen.
-    node.set_handle(&squatter, Some("orthory".into())).unwrap();
-    node.commit();
-    assert!(
-        node.registrations(0, 8)
-            .unwrap()
-            .iter()
-            .all(|r| r.handle != "agents")
-    );
+fn a_snapshot_holding_a_reserved_root_label_is_refused() {
+    let mut registry = Registry::new();
+    registry
+        .set_handle(&[7; 32], Some("agentx".into()))
+        .unwrap();
+    registry.commit();
+    let mut snapshot = registry.snapshot();
+    let at = snapshot
+        .windows("agentx".len())
+        .position(|bytes| bytes == b"agentx")
+        .expect("handle is encoded");
+    snapshot[at..at + "agents".len()].copy_from_slice(b"agents");
+    assert!(Registry::new().adopt(&snapshot).is_err());
 }
 
 /// ADMISSION: the whole point of the reservation.

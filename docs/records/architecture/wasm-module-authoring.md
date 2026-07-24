@@ -3,8 +3,8 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/guests/hello-wasm` (v1),
-`crates/guests/hello-wasm-v2` (its live-update target), and
+the reference modules are `crates/guests/hello-wasm`,
+`crates/guests/hello-wasm-replacement` (its live-update target), and
 `crates/guests/sibling-wasm` (the cross-module-read reference). The first
 REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
 the `directory` module, bytes-compatible with the native implementation it
@@ -74,16 +74,15 @@ answer memoized. Design consequences:
   Host-routed queries (`ctx.query` from a native peer, external node queries)
   resolve sibling reads for real.
 
-## State layout is the compatibility contract
+## State layout is the code-swap contract
 
-A live update swaps CODE while KEEPING the store. Version N+1 of your module
-reads the store version N wrote, so the state layout — keys and value
-encodings — is your compatibility surface across updates:
+A live update swaps code while keeping the store, so it is valid only when the
+replacement reads the exact same keys and value encodings:
 
-- Keep it byte-stable, or make N+1 read both layouts and migrate lazily on
-  write. There is no offline migration hook: the swap boundary is a plain block
-  boundary.
-- `hello-wasm-v2` demonstrates the discipline: same `count` key, same
+- Keep the layout byte-stable for a code-only swap.
+- If the layout changes while greenfield, replace it outright and re-genesis.
+  Do not add a second decoder or lazy migration.
+- `hello-wasm-replacement` demonstrates the discipline: same `count` key, same
   little-endian `u64` value, different logic (`inc` steps 100, not 1).
 
 ## Build: crate → component

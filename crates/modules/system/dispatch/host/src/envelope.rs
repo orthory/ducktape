@@ -8,8 +8,7 @@
 //! `<instructions>\n\n[<context>\n\n]<contract>\n\n<conversation>` (the
 //! bracketed section rides only when the envelope carries it).
 //!
-//! the agent's PERSONA is deliberately NOT in here any more: `prompt_hash` and
-//! the blob-store prompt lane are retired (flag day). a persona is a skill now
+//! An agent persona is represented as an always-loaded skill.
 //! — the skills already ride the envelope as content-addressed duckfs pins, and
 //! the provisioner assembles the `always` ones into the run's context document
 //! (see [`crate::soul`]). that also kills the trap where a present `prompt_hash`
@@ -19,8 +18,7 @@
 //! a payload that is not a run envelope — or one that cannot be honored
 //! (unknown version, malformed fields) — fails the run loudly: feeding a
 //! half-understood payload is exactly the quiet corruption this format exists
-//! to kill. the flat-string passthrough and the v2 tolerance are gone (flag day
-//! — in-flight legacy runs are unsupported).
+//! to kill.
 
 use capability_host::RunContext;
 use serde::Deserialize;
@@ -34,16 +32,16 @@ use crate::workspace_source::WireWorkspace;
 pub const RUN_ENVELOPE_VERSION: u64 = 1;
 /// the runner-result wrapper version — the SINGLE owner across this crate. the
 /// provisioning wrapper's [`crate::provision::assemble_runner_result`] stamps
-/// it, the v3 accept slice validates the envelope requests it, and `runs`
+/// it, the v1 accept slice validates the envelope requests it, and `runs`
 /// reads it back as `u32 == 1`. never redeclare a second const.
 pub const RUNNER_RESULT_VERSION: u64 = 1;
 
 /// the wire shape shared by supported envelopes. field ORDER is the composer's
-/// business (committed bytes); decoding here is by name. serde ignores unknown
-/// fields on this tagged shape. `ducktape_run` is validated before this body is
-/// deserialized, so the marker is intentionally absent here.
+/// business (committed bytes); decoding here is by name.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireEnvelope {
+    ducktape_run: u64,
     agent_id: String,
     /// the run's CONSENSUS id — what `runs` resolves the run by (the id its
     /// pending map is keyed on, and the one its agent session lane binds). the
@@ -90,6 +88,7 @@ struct WireEnvelope {
 /// plan's [`crate::provision::RoMount`] set; `source_snapshot` is consumed by
 /// the provisioning wrapper at the flip.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireSkill {
     name: String,
     source_prefix: String,
@@ -102,6 +101,7 @@ struct WireSkill {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireResultContract {
     ducktape_runner_result: u64,
     /// the REQUESTED output sink (contract §1) — an ABSENT key is the Chain
@@ -126,8 +126,8 @@ pub struct Prepared {
 }
 
 /// turn one dispatch payload into the provider's input and per-run context.
-/// every payload MUST be a v3 run envelope; anything else — flat strings, v2
-/// envelopes, unknown versions, malformed fields — is a loud `Err` that becomes
+/// every payload MUST be the current v1 run envelope; anything with a different
+/// shape, unknown version, or malformed fields is a loud `Err` that becomes
 /// the saga result (NEVER a silent fallback: the pinned workspace and the
 /// curated skills are the whole point).
 ///
@@ -136,8 +136,7 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
         Ok(Value::Object(map)) if map.contains_key("ducktape_run") => Value::Object(map),
         _ => {
             return Err(
-                "dispatch payload carries no ducktape_run envelope marker; legacy flat \
-                 payloads are unsupported (flag day) — recompose the run"
+                "dispatch payload carries no ducktape_run envelope marker; recompose the run"
                     .to_string(),
             );
         }
@@ -156,6 +155,7 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
     }
     let envelope: WireEnvelope =
         serde_json::from_value(claimed).map_err(|e| format!("run envelope is malformed: {e}"))?;
+    debug_assert_eq!(envelope.ducktape_run, version);
 
     let agent_display_name = envelope.agent_display_name;
     let mut ctx = RunContext {
@@ -254,16 +254,16 @@ fn accept_portable_envelope(
     agent_display_name: String,
     library_readable: bool,
 ) -> Result<PortablePlan, String> {
-    let workspace = workspace.ok_or_else(|| "v3 run envelope is missing workspace".to_string())?;
+    let workspace = workspace.ok_or_else(|| "v1 run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
     // non-empty-prefix rule; forge requires repo/commit/branch) with loud,
     // field-naming errors — see [`crate::workspace_source`].
     let source = workspace.validate()?;
     let result_contract =
-        result_contract.ok_or_else(|| "v3 run envelope is missing result_contract".to_string())?;
+        result_contract.ok_or_else(|| "v1 run envelope is missing result_contract".to_string())?;
     if result_contract.ducktape_runner_result != RUNNER_RESULT_VERSION {
         return Err(format!(
-            "v3 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
+            "v1 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
             result_contract.ducktape_runner_result
         ));
     }
@@ -274,7 +274,7 @@ fn accept_portable_envelope(
         .iter()
         .any(|s| s.name.is_empty() || s.source_prefix.is_empty())
     {
-        return Err("v3 run envelope skill entries must carry a name and source_prefix".into());
+        return Err("v1 run envelope skill entries must carry a name and source_prefix".into());
     }
 
     // mark portable (no host-local session resume) but set NO
@@ -404,9 +404,7 @@ mod tests {
 
     #[test]
     fn non_envelope_payloads_are_loud_errors_never_passthrough() {
-        // FLAG DAY: the legacy flat-string passthrough is gone — anything
-        // that is not a marker-carrying JSON object fails the run.
-        for legacy in [
+        for invalid in [
             "a plain rendered prompt",
             "",
             "{not json at all",
@@ -415,10 +413,10 @@ mod tests {
             r#"{"run_id":"r","agent_id":"a"}"#,
             "the ducktape_run marker is discussed here",
         ] {
-            let err = prepare(legacy).unwrap_err();
+            let err = prepare(invalid).unwrap_err();
             assert!(
                 err.contains("no ducktape_run envelope marker"),
-                "{legacy:?} must be rejected loudly, got {err:?}"
+                "{invalid:?} must be rejected loudly, got {err:?}"
             );
         }
     }
@@ -448,15 +446,10 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_prompt_hash_key_can_never_resurrect_the_blob_lane() {
-        // the prompt blob is RETIRED (flag day). a stale composer's leftover
-        // pin must be inert data — tolerated like any unknown field, never
-        // resolved, and above all never able to suppress `instructions` (the
-        // trap the old worker shipped: a present pin silently dropped them).
-        let mut stale: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        stale["prompt_hash"] = serde_json::json!("07".repeat(32));
-        let Prepared { input, .. } = prepare(&stale.to_string()).unwrap();
-        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+    fn an_unknown_prompt_hash_key_is_rejected() {
+        let mut unknown: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        unknown["prompt_hash"] = serde_json::json!("07".repeat(32));
+        assert!(prepare(&unknown.to_string()).is_err());
     }
 
     #[test]
@@ -475,13 +468,10 @@ mod tests {
     }
 
     #[test]
-    fn additive_fields_under_the_same_version_are_tolerated() {
-        // a newer composer may add an OPTIONAL field without a flag day; the
-        // worker must not kill in-flight runs over it.
-        let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        v["a_future_field"] = serde_json::json!("x");
-        let Prepared { input, .. } = prepare(&v.to_string()).unwrap();
-        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
+    fn unknown_fields_under_the_same_version_are_rejected() {
+        let mut unknown: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        unknown["a_future_field"] = serde_json::json!("x");
+        assert!(prepare(&unknown.to_string()).is_err());
     }
 
     #[test]
@@ -570,7 +560,7 @@ mod tests {
         v["skills"] = serde_json::json!([
             {"name":"persona","source_prefix":"/shared/skills/persona","always":true},
             {"name":"release","source_prefix":"/shared/skills/release","always":false},
-            {"name":"legacy","source_prefix":"/shared/skills/legacy","always":false},
+            {"name":"optional","source_prefix":"/shared/skills/optional","always":false},
         ]);
         let Prepared { workspace, .. } = prepare(&v.to_string()).unwrap();
         let modes: Vec<(&str, bool)> = workspace
@@ -580,7 +570,7 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec![("persona", true), ("release", false), ("legacy", false)],
+            vec![("persona", true), ("release", false), ("optional", false)],
             "curation order survives verbatim, and always:false is on-demand"
         );
     }
@@ -619,36 +609,17 @@ mod tests {
             "the run id crosses the envelope verbatim, separators and all"
         );
 
-        // FLAG DAY: run_id is REQUIRED — an envelope that omits it is a
-        // mixed-binary signal that fails the decode loudly, never a run that
-        // silently executes without a name.
-        let mut legacy: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        legacy.as_object_mut().unwrap().remove("run_id");
-        let err = prepare(&legacy.to_string()).unwrap_err();
+        let mut missing_id: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        missing_id.as_object_mut().unwrap().remove("run_id");
+        let err = prepare(&missing_id.to_string()).unwrap_err();
         assert!(err.contains("malformed"), "got {err:?}");
     }
 
     #[test]
-    fn an_old_shape_envelope_that_still_carries_mount_path_decodes_fine() {
-        // the composer no longer emits mount_path (D7), but an ADDITIVE field
-        // inside the tagged workspace object must never reject an in-flight
-        // envelope — the extra field is tolerated (decoded and ignored).
-        let mut old_shape: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        old_shape["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
-        let Prepared { ctx, workspace, .. } = prepare(&old_shape.to_string()).unwrap();
-        assert!(
-            ctx.portable,
-            "an old-shape envelope is still accepted + portable"
-        );
-        assert!(
-            matches!(
-                &workspace.source,
-                crate::workspace_source::WorkspaceSource::Duckfs { source_prefix, .. }
-                    if source_prefix == "/shared/agent-workspaces/bot"
-            ),
-            "got {:?}",
-            workspace.source
-        );
+    fn an_envelope_with_unknown_workspace_fields_is_rejected() {
+        let mut unknown: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        unknown["workspace"]["mount_path"] = serde_json::json!("/tmp/ducktape-workspace");
+        assert!(prepare(&unknown.to_string()).is_err());
     }
 
     #[test]
@@ -717,16 +688,10 @@ mod tests {
     }
 
     #[test]
-    fn the_retired_runtime_section_is_no_longer_assembled_into_the_input() {
-        // the runtime section (tool plane + skill listing) MOVED into the
-        // assembled context document. a stale composer that still emits the key
-        // must not have it spliced back into the prompt — one assembly, one
-        // place, or the two drift.
-        let mut with_runtime: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
-        with_runtime["runtime"] = serde_json::json!("TOOL PLANE");
-        let Prepared { input, .. } = prepare(&with_runtime.to_string()).unwrap();
-        assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
-        assert!(!input.contains("TOOL PLANE"));
+    fn an_unknown_runtime_section_is_rejected() {
+        let mut unknown: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
+        unknown["runtime"] = serde_json::json!("TOOL PLANE");
+        assert!(prepare(&unknown.to_string()).is_err());
     }
 
     #[test]

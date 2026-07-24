@@ -41,9 +41,9 @@
 //! origin — a class is claimed by the module that serves it, so External and
 //! System origins reject. first claim wins deterministically; a re-claim by
 //! the owner is an idempotent no-op. there is deliberately NO unclaim op:
-//! dropping a claim would dangle every `<class>:` route already minted
-//! against it, so removal waits for an explicit, migration-shaped handoff op.
-//! class claims ride the same v2 snapshot as their own count-prefixed
+//! dropping a claim would dangle every `<class>:` route already minted, so
+//! claims are permanent.
+//! class claims ride the current snapshot as their own count-prefixed
 //! section, appended after the node section.
 //!
 //! state model mirrors valset's host-lent staging seam: `execute` STAGES into
@@ -183,8 +183,7 @@ impl CapabilityRegistry {
     // peer, is the trust anchor.
 
     /// canonical bytes of the COMMITTED registry — exactly the byte stream
-    /// `root()` hashes, two count-prefixed sections back to back (v2 — FLAG
-    /// DAY: a v1 stream no longer decodes):
+    /// `root()` hashes, two count-prefixed sections back to back:
     ///
     /// 1. announcements — node count u64-le, then per sorted node key its len
     ///    u64-le + key bytes + tag count u64-le, then per sorted tag its len
@@ -674,25 +673,18 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_class_v1_snapshot_no_longer_decodes() {
-        // FLAG DAY: the v2 wire appends a class-count section (see the snapshot
-        // doc). a pre-class v1 stream is the node section with no trailing
-        // class count; the modern decoder must REFUSE it, never silently adopt
-        // it — the alternate-root recovery mode that once read it is gone.
+    fn a_snapshot_without_the_class_section_is_rejected() {
         let mut src = ungated();
         let node = vec![42u8; 32];
-        futures::executor::block_on(
-            src.execute(&mut ctx_external(&node), &announce(&["codex"])),
-        )
+        futures::executor::block_on(src.execute(&mut ctx_external(&node), &announce(&["codex"])))
         .unwrap();
         futures::executor::block_on(src.commit_block()).unwrap();
 
-        // strip the trailing zero class count -> exactly the v1 encoding.
-        let v2 = src.snapshot();
-        let v1 = &v2[..v2.len() - 8];
+        let snapshot = src.snapshot();
+        let truncated = &snapshot[..snapshot.len() - 8];
         assert!(
-            ungated().install(v1, src.root()).is_err(),
-            "a class-less v1 snapshot no longer decodes"
+            ungated().install(truncated, src.root()).is_err(),
+            "a snapshot without its class count must not decode"
         );
     }
 
@@ -977,9 +969,7 @@ mod tests {
         // leave every layer untouched.
         let mut dst = ungated();
         let b = vec![15u8; 32];
-        futures::executor::block_on(
-            dst.execute(&mut ctx_external(&b), &announce(&["claude"])),
-        )
+        futures::executor::block_on(dst.execute(&mut ctx_external(&b), &announce(&["claude"])))
         .unwrap();
         futures::executor::block_on(dst.commit_block()).unwrap();
         futures::executor::block_on(dst.execute(&mut ctx_external(&b), &announce(&["other"])))
