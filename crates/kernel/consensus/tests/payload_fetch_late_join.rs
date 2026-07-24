@@ -208,9 +208,9 @@ async fn run_late_join(mut context: deterministic::Context) {
     loop {
         context.sleep(Duration::from_millis(50)).await;
         for (i, n) in nodes.iter_mut().enumerate() {
-            // the production drain flushes the batch window every BLOCK_TIME tick
-            // (bin/node main); enqueue-only submits never propose without it — the
-            // sim mirrors that cadence (a no-op when nothing is pending).
+            // the production run loop flushes pending ops event-driven (bin/node
+            // `pump_eager_flush`); enqueue-only submits never propose without a flush —
+            // the sim drives that flush on its own tick (a no-op when nothing is pending).
             n.flush_batch().await.expect("flush");
             applied[i] += n.drain_delivered().await.expect("drain");
         }

@@ -77,6 +77,14 @@ pub enum RelayMsg {
         digest: [u8; 32],
         error: Option<String>,
     },
+    /// a validator-to-validator LEADER NUDGE: the sender holds real parked
+    /// proposals and (by its local estimate) the receiver leads the CURRENT
+    /// view — close it now by beating the idle nop early, so leadership
+    /// rotation runs at network speed instead of the 1s idle beat. carries
+    /// nothing and grants nothing: the receiver acts only when quiet, only
+    /// ever by beating one deterministic nop, and only for a sender that is a
+    /// current validator — a stray, stale, or mis-aimed nudge is harmless.
+    Nudge,
     /// the validator's answer, keyed by the frame's content address.
     Reply {
         frame_id: [u8; 32],

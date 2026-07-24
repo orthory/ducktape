@@ -23,6 +23,10 @@ commonware-resolver = { workspace = true }
 commonware-codec = { workspace = true }
 bytes = "1"
 rand_core = "0.6.4"
+# the enqueue signal (tokio::sync::Notify) and the propose-side event select —
+# executor-agnostic sync/select primitives only, no runtime pulled in.
+futures = { workspace = true }
+tokio = { workspace = true }
 
 [features]
 # the mesh-carrier sim arm: `SimMesh` over commonware `simulated::Network`,

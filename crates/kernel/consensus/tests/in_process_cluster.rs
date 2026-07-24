@@ -21,8 +21,9 @@
 //! WAIT DISCIPLINE: the loop terminates on the DELIVERED-FRAME event — it exits
 //! exactly when every node has drained the full op-set, never after a fixed number
 //! of iterations. The `context.sleep` between drains is the deterministic virtual
-//! block-tick (the same cadence `bin/node`'s production drain loop runs on:
-//! flush + drain every `BLOCK_TIME`), NOT a wall-clock wait — virtual time makes
+//! block-tick (a coarser but still valid cut of `bin/node`'s production run
+//! loop, which flushes pending ops and drains finalizations event-driven with
+//! the tick as backstop), NOT a wall-clock wait — virtual time makes
 //! it non-flaky regardless of CI speed. `Runner::timed` is the liveness backstop:
 //! a wiring regression (unshared inbox, dropped engine handle, a carrier that
 //! hands out a dead channel) surfaces as a deadline panic — you cannot make BFT
