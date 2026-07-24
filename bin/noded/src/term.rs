@@ -165,6 +165,11 @@ struct SessionRing {
     bytes: usize,
     touched: u64,
     chunks: VecDeque<(u64, String)>,
+    /// the child (and its container) has exited — the pump reached EOF. A
+    /// `term:<id>` ws subscriber that has drained the ring learns the session
+    /// is over from this and closes, rather than blocking forever on a topic
+    /// that will never append again (the wedge that stranded `agent pty`).
+    ended: bool,
 }
 
 impl Default for TermRing {
@@ -202,6 +207,32 @@ impl TermRing {
     /// Only a Shared session (the huddle-style path) forwards.
     pub fn append_local_only(&self, session: &str, chunk_b64: String) {
         self.push(session, chunk_b64, false);
+    }
+
+    /// flag a session's ring as ended (the pump reached EOF) and wake its ws
+    /// subscribers so the catch-up path can emit the terminal frame. A no-op for
+    /// a session already evicted from the ring — no subscriber can be waiting on
+    /// a ring that is gone. Bumps `version` so `term:<id>` `watch` fires exactly
+    /// as an append would.
+    pub fn mark_ended(&self, session: &str) {
+        let mut inner = self.inner.lock().expect("term ring lock poisoned");
+        let Some(ring) = inner.sessions.get_mut(session) else {
+            return;
+        };
+        if ring.ended {
+            return;
+        }
+        ring.ended = true;
+        inner.version += 1;
+        let version = inner.version;
+        let _ = self.watch.send(version);
+    }
+
+    /// whether the session's pump has reached EOF. `false` for an unknown or
+    /// evicted session — a caller with no ring to drain has nothing to close on.
+    pub fn is_ended(&self, session: &str) -> bool {
+        let inner = self.inner.lock().expect("term ring lock poisoned");
+        inner.sessions.get(session).is_some_and(|ring| ring.ended)
     }
 
     fn push(&self, session: &str, chunk_b64: String, publish: bool) {
@@ -824,8 +855,13 @@ impl TerminalSessions {
                     }
                 }
             }
-            // whoever removes the entry owns teardown + the lifecycle log, so an
-            // explicit close() racing the EOF here never double-terminates.
+            // mark the ring ended FIRST, so the terminal frame reaches every
+            // `term:<id>` ws subscriber (an `agent pty` client blocks on this
+            // topic and only unblocks when it sees the session is over). Then
+            // finish() removes the entry: whoever removes it owns teardown + the
+            // lifecycle log, so an explicit close() racing the EOF here never
+            // double-terminates.
+            ring.mark_ended(&id);
             if let Some(session) = manager.finish(&id) {
                 session.close().await;
                 tracing::info!(target: "ducktape::term", session = %id, "session_ended");
@@ -1299,6 +1335,21 @@ mod tests {
         assert!(none.is_empty());
         // an unknown session is empty, never a panic.
         assert!(ring.read_after("nope", 0, 64).0.is_empty());
+    }
+
+    #[test]
+    fn ring_marks_ended_idempotently_and_ignores_unknown_sessions() {
+        let ring = TermRing::default();
+        ring.append("s", STANDARD.encode(b"hi"));
+        assert!(!ring.is_ended("s"), "a live session is not ended");
+        ring.mark_ended("s");
+        assert!(ring.is_ended("s"), "the pump's EOF marks the ring ended");
+        ring.mark_ended("s"); // idempotent — the double-close race is a no-op
+        assert!(ring.is_ended("s"));
+        // an unknown/evicted session is never ended and never panics.
+        assert!(!ring.is_ended("nope"));
+        ring.mark_ended("nope");
+        assert!(!ring.is_ended("nope"));
     }
 
     #[test]
