@@ -113,15 +113,15 @@ const PROVIDER_CONTROL_TOKEN_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 
 /// the upstream credential env vars a broker takes over. the HOST reads these;
 /// the child must not see them, or it would dial the provider directly and walk
-/// straight past the broker. a sandbox backend's env is an ALLOWLIST, so they
+/// straight past the broker — and an inherited `ANTHROPIC_AUTH_TOKEN` would also
+/// force the CLI into API mode, overriding the subscription-shaped `claudeAiOauth`
+/// creds file the broker seeds. a sandbox backend's env is an ALLOWLIST, so they
 /// never enter a real run; only the test-only bare harness inherits the parent
 /// env and must actively remove them (which is exactly what the tests pin).
-/// covers both the OpenAI (codex) and
-/// Anthropic (claude) upstreams. `ANTHROPIC_AUTH_TOKEN` is NOT here: the broker
-/// sets it to the opaque run bearer, so it must survive into the child.
+/// covers both the OpenAI (codex) and Anthropic (claude) upstreams.
 #[cfg(test)]
-const UPSTREAM_CREDENTIAL_ENV: [&str; 3] =
-    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
+const UPSTREAM_CREDENTIAL_ENV: [&str; 4] =
+    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
 
 /// the `-c` overrides that aim a codex invocation at this run's loopback broker:
 /// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
@@ -659,7 +659,7 @@ impl CliProvider {
         // half. (a sandbox backend has no such problem: its env is an allowlist.)
         self.apply_auth_env(auth, |k, v| {
             cmd.env(k, v);
-        });
+        })?;
         if auth.broker.is_some() {
             for key in UPSTREAM_CREDENTIAL_ENV {
                 cmd.env_remove(key);
@@ -818,7 +818,7 @@ impl CliProvider {
             };
             envs.push((key.clone(), value));
         }
-        self.apply_auth_env(auth, |k, v| envs.push((k.to_string(), v)));
+        self.apply_auth_env(auth, |k, v| envs.push((k.to_string(), v)))?;
         // spec.rs already rejected absolute / `..` entries, so join is safe.
         let rw_dirs: Vec<PathBuf> = self
             .spec
@@ -1065,19 +1065,30 @@ impl CliProvider {
     /// the run's auth env, backend-independent: the fresh config home (so the
     /// CLI cannot read the operator's real one), the way the child reaches the
     /// broker (codex: an opaque model bearer + its separately-scoped
-    /// provider-control capability; claude: ANTHROPIC_BASE_URL + the opaque
-    /// bearer). `set` is how the caller applies one binding — the Podman
-    /// process environment behind a value-free `-e K`.
+    /// provider-control capability; claude: ANTHROPIC_BASE_URL + a `claudeAiOauth`
+    /// credentials file seeded into the config home). `set` is how the caller
+    /// applies one binding — the Podman process environment behind a value-free
+    /// `-e K`.
     ///
-    /// NOTE what is NOT here: the credential itself. that is the whole point —
-    /// the host holds it and the broker spends it, so there is nothing to pass.
+    /// NOTE what is NOT here: the REAL credential. that is the whole point — the
+    /// host holds it and the broker spends it. what the child gets is only the
+    /// OPAQUE per-run bearer (loopback-only, dies with the run); for claude it
+    /// rides a `claudeAiOauth` file rather than `ANTHROPIC_AUTH_TOKEN` so Claude
+    /// Code runs in OAuth/subscription mode (unlocking subscription-only models
+    /// like Fable) instead of API mode. The credential SOURCE, not the base URL,
+    /// picks the mode: an env bearer forces API mode; an OAuth file behind a
+    /// custom base URL does not.
     ///
     /// The config-home binding is shared; the broker-reach bindings DIFFER by
     /// kind. codex is aimed by ARGV (see [`Self::broker_argv`]) and only needs
-    /// the bearer here in [`BROKER_TOKEN_ENV`]; claude is aimed entirely by ENV —
-    /// base URL, bearer, and the fresh config home — plus the hardening vars that
-    /// keep Claude Code from dialing out around the broker.
-    fn apply_auth_env(&self, auth: &RunAuth<'_>, mut set: impl FnMut(&str, String)) {
+    /// the bearer here in [`BROKER_TOKEN_ENV`]; claude is aimed by ENV (base URL +
+    /// the fresh config home) plus the seeded credentials file, with hardening
+    /// vars that keep Claude Code from dialing out around the broker.
+    fn apply_auth_env(
+        &self,
+        auth: &RunAuth<'_>,
+        mut set: impl FnMut(&str, String),
+    ) -> Result<(), String> {
         if let (Some(name), Some(dir)) = (
             self.spec.isolation.config_home_env.as_deref(),
             auth.config_home,
@@ -1085,23 +1096,49 @@ impl CliProvider {
             set(name, dir.display().to_string());
         }
         let Some(broker) = auth.broker else {
-            return;
+            return Ok(());
         };
         match self.spec.isolation.broker {
             Some(BrokerKind::AnthropicMessages) => {
                 set("ANTHROPIC_BASE_URL", broker.base_url.clone());
-                set("ANTHROPIC_AUTH_TOKEN", broker.run_bearer.clone());
+                // Seed the run bearer as a `claudeAiOauth` credentials file in the
+                // config home, NOT as `ANTHROPIC_AUTH_TOKEN`. Same opaque loopback
+                // bearer either way, but the OAuth-file shape makes Claude Code run
+                // in subscription mode (sends `anthropic-beta: oauth-*`, offers
+                // Fable) instead of API mode. `expiresAt` is far-future so the CLI
+                // never refreshes — the broker serves only /v1/messages and swaps
+                // in the real host-held credential upstream.
+                let Some(dir) = auth.config_home else {
+                    return Err(format!(
+                        "{}: claude broker run has no config home to seed credentials",
+                        self.spec.tag
+                    ));
+                };
+                let creds = dir.join(".credentials.json");
+                let blob = serde_json::json!({
+                    "claudeAiOauth": {
+                        "accessToken": broker.run_bearer,
+                        "refreshToken": broker.run_bearer,
+                        "expiresAt": 4102444800000_i64,
+                        "scopes": ["user:inference", "user:profile"],
+                        "subscriptionType": "max",
+                    }
+                })
+                .to_string();
+                std::fs::write(&creds, blob).map_err(|e| {
+                    format!("{}: write claude credentials {}: {e}", self.spec.tag, creds.display())
+                })?;
                 // hardening: kill non-essential outbound traffic + the auto-updater
                 // so the CLI never dials Anthropic around the broker.
                 //
                 // NOTE: CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is deliberately NOT set.
                 // It scrubs ANTHROPIC_* from the CLI's subprocesses, but our only
-                // ANTHROPIC_* var is the OPAQUE run bearer (not a real credential —
-                // it authenticates to the loopback broker and dies with the run), so
-                // scrubbing it protects nothing. And live-verified it actively breaks
-                // the CLI: headless `claude -p` refuses to run with the scrub set
-                // unless allowedTools is declared ("Permission mode forced to
-                // default"). The real credential never enters the container at all.
+                // ANTHROPIC_* var is ANTHROPIC_BASE_URL (the loopback broker, not a
+                // credential — the bearer rides the config-home file), so scrubbing
+                // protects nothing. And live-verified it actively breaks the CLI:
+                // headless `claude -p` refuses to run with the scrub set unless
+                // allowedTools is declared ("Permission mode forced to default").
+                // The real credential never enters the container at all.
                 set("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".into());
                 set("DISABLE_AUTOUPDATER", "1".into());
             }
@@ -1112,8 +1149,8 @@ impl CliProvider {
                 set(PROVIDER_CONTROL_URL_ENV, broker.control_url.clone());
                 set(PROVIDER_CONTROL_TOKEN_ENV, broker.control_token.clone());
             }
-
         }
+        Ok(())
     }
 
     /// point the executor at this run's broker, by splicing a custom model
@@ -5267,8 +5304,10 @@ broker = "anthropic-messages"
     fn a_claude_broker_aims_the_child_by_env_not_argv() {
         // the Anthropic broker's opposite of codex: the argv is UNTOUCHED (a
         // claude argv has no `-c model_providers` splice), and the child is aimed
-        // entirely by env — base URL, opaque bearer, fresh config home, plus the
-        // hardening vars that keep Claude Code from dialing out around the broker.
+        // by env — base URL and fresh config home — plus a `claudeAiOauth` creds
+        // file seeded into that config home (so the CLI runs subscription mode,
+        // not API mode), plus the hardening vars that keep Claude Code from
+        // dialing out around the broker.
         let provider =
             CliProvider::from_spec(
             anthropic_broker_spec("cl"),
@@ -5282,7 +5321,8 @@ broker = "anthropic-messages"
             control_url: String::new(),
             control_token: String::new(),
         };
-        let config_home = PathBuf::from("/tmp/wd/.ducktape-run/slot/provider-config");
+        // a real dir: apply_auth_env WRITES the creds file into the config home.
+        let config_home = scratch("claude_broker_creds");
         let auth = RunAuth {
             config_home: Some(&config_home),
             broker: Some(&endpoint),
@@ -5311,15 +5351,27 @@ broker = "anthropic-messages"
             .collect();
         let got = |k: &str| envs.get(k).cloned().flatten();
         assert_eq!(got("ANTHROPIC_BASE_URL").as_deref(), Some("http://127.0.0.1:54321"));
-        assert_eq!(got("ANTHROPIC_AUTH_TOKEN").as_deref(), Some("opaque-run-bearer"));
+        // the run bearer rides a `claudeAiOauth` creds file, NOT ANTHROPIC_AUTH_TOKEN:
+        // an env bearer would force API mode and override subscription mode.
+        assert_eq!(got("ANTHROPIC_AUTH_TOKEN"), None);
+        let creds: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(config_home.join(".credentials.json"))
+                .expect("creds file seeded into config home"),
+        )
+        .expect("creds file is json");
+        assert_eq!(
+            creds["claudeAiOauth"]["accessToken"].as_str(),
+            Some("opaque-run-bearer"),
+            "the loopback run bearer is the seeded OAuth accessToken"
+        );
         assert_eq!(
             got("CLAUDE_CONFIG_DIR").as_deref(),
             Some(config_home.to_str().unwrap()),
             "the fresh config home blocks the ~/.claude fallback"
         );
         // SUBPROCESS_ENV_SCRUB is deliberately NOT set — it breaks headless
-        // `claude -p` and protects nothing here (the only ANTHROPIC_* var is the
-        // opaque run bearer). See apply_auth_env.
+        // `claude -p` and protects nothing here (the only ANTHROPIC_* var is
+        // ANTHROPIC_BASE_URL; the bearer rides the creds file). See apply_auth_env.
         assert_eq!(got("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"), None);
         assert_eq!(got("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(), Some("1"));
         assert_eq!(got("DISABLE_AUTOUPDATER").as_deref(), Some("1"));
