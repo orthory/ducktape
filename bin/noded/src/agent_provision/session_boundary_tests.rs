@@ -133,6 +133,7 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
         Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(agent::AgentModule::new(
             "agent",
+            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
             "saga",
             Some("runs".into()),
         )),

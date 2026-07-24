@@ -35,7 +35,7 @@ use chat::{
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
-use commonware_runtime::{Runner as _, deterministic};
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::DispatchModule;
 use dispatch::{
     DispatchQuery, DispatchReply, DispatchStatus, decode_work_spec,
@@ -241,13 +241,23 @@ fn scripted_ops() -> Vec<(u64, Origin, Msg)> {
 }
 
 async fn genesis(context: deterministic::Context) -> Host {
-    let chat = Chat::new("chat", Box::new(QmdbStore::init(context, "chat").await)).with_tagging("tagging");
+    let chat = Chat::new(
+        "chat",
+        Box::new(QmdbStore::init(context.child("chat"), "chat").await),
+    )
+    .with_tagging("tagging");
+    let agent = AgentModule::new(
+        "agent",
+        Box::new(QmdbStore::init(context.child("agent"), "agent").await),
+        "saga",
+        Some("runs".into()),
+    );
     Host::genesis(vec![
         Box::new(chat),
         Box::new(TaggingModule::new("tagging")),
         Box::new(SagaModule::new("saga")),
         Box::new(DispatchModule::new("dispatch", "saga")),
-        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        Box::new(agent),
         Box::new(RunsModule::new(
             "runs",
             "chat",

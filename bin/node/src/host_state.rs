@@ -120,15 +120,17 @@ const GOVERNANCE_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/governance/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
 
-/// saga / agent / automations — adapter-ported tenants of the async engine's
+/// saga / automations — adapter-ported tenants of the async engine's
 /// deterministic half and its consumers. every decision in their execute
 /// paths reads staged-over-committed state, so the whole-state fold is
 /// behavior-identical (pinned by their parity proofs); their work-order
-/// events, P6 callbacks, registry hooks, and chat-hook probe reads all cross
-/// the wit seam unchanged.
+/// events, P6 callbacks, and chat-hook probe reads all cross the wit seam
+/// unchanged.
 const SAGA_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/saga/component.wasm");
 const SAGA_MODULE_ID: &str = "saga";
+/// agent — a STORE-BACKED tenant like pages/chat: the registry rides a
+/// host-constructed qmdb store and the wasm root is the store's merkle root.
 const AGENT_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/agent/component.wasm");
 const AGENT_MODULE_ID: &str = "agent";
@@ -343,18 +345,22 @@ fn genesis_capability_wasm() -> WasmModule {
         .expect("embedded capability component loads")
 }
 
-/// saga / agent / automations at their GENESIS code (adapter-ported). the
-/// sibling wiring — saga's valset/capability assignment reads, agent's
-/// saga dead-letter + runs hook, automations' chat/tasks/inbox lanes — is
-/// genesis-constant and compiled into the guests (the exact production
-/// constructors these builders used to call natively).
+/// saga / automations at their GENESIS code (adapter-ported). the sibling
+/// wiring — saga's valset/capability assignment reads, automations'
+/// chat/tasks/inbox lanes — is genesis-constant and compiled into the guests
+/// (the exact production constructors these builders used to call natively).
+/// agent's wiring (saga dead-letter + runs hook) is compiled into its guest
+/// the same way; only its store arrives host-constructed ([`agent_wasm`]).
 fn genesis_saga_wasm() -> WasmModule {
     WasmModule::from_bytes(SAGA_MODULE_ID, SAGA_WASM_COMPONENT)
         .expect("embedded saga component loads")
 }
 
-fn genesis_agent_wasm() -> WasmModule {
-    WasmModule::from_bytes(AGENT_MODULE_ID, AGENT_WASM_COMPONENT)
+/// agent at its GENESIS code over the host-constructed store (see
+/// [`pages_wasm`] for the three store lifecycles — init, reopen, sync_from —
+/// which all hand the store in the same way).
+fn agent_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(AGENT_MODULE_ID, AGENT_WASM_COMPONENT, store)
         .expect("embedded agent component loads")
 }
 
@@ -542,14 +548,18 @@ pub(super) async fn genesis_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Host {
-    // pages/chat are STORE-BACKED wasm tenants: the host still constructs the
-    // concrete qmdb stores exactly as before — only the executor wrapped
-    // around them changed (and `.with_tagging` moved into the guests).
+    // pages/chat/agent are STORE-BACKED wasm tenants: the host still
+    // constructs the concrete qmdb stores exactly as before — only the
+    // executor wrapped around them changed (and the sibling wiring moved
+    // into the guests).
     let pages = pages_wasm(Box::new(
         QmdbStore::init(context.child("pages"), "pages").await,
     ));
     let chat = chat_wasm(Box::new(
         QmdbStore::init(context.child("chat"), "chat").await,
+    ));
+    let agent = agent_wasm(Box::new(
+        QmdbStore::init(context.child("agent"), "agent").await,
     ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
@@ -624,9 +634,9 @@ pub(super) async fn genesis_host(
         files: files_wasm(duckfs_dir.to_path_buf()).expect("duckfs open"),
         // the agent registry: a self-contained record book; its hook keeps
         // each agent's dispatch recipe in lockstep via the runs module.
-        // adapter-ported; the saga dead-letter + runs hook ids are compiled
-        // into the guest.
-        agent: genesis_agent_wasm(),
+        // store-backed over the host-constructed qmdb store; the saga
+        // dead-letter + runs hook ids are compiled into the guest.
+        agent,
         // the collaboration loop's actor: watches, engagement, composition,
         // dispatch, and response delivery — reads the registry by query.
         // adapter-ported; the whole production wiring (chat/saga/tagging/
@@ -666,6 +676,9 @@ pub(super) async fn restore_host(
     ));
     let chat = chat_wasm(Box::new(
         QmdbStore::init(context.child("chat"), "chat").await,
+    ));
+    let agent = agent_wasm(Box::new(
+        QmdbStore::init(context.child("agent"), "agent").await,
     ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
@@ -771,12 +784,6 @@ pub(super) async fn restore_host(
     // replays forward from that height, so reboot needs no checkpoint bytes or
     // object fetch here. The reopened root is `sha256(encode_refs)`.
     let files = files_wasm(duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
-
-    let mut agent = genesis_agent_wasm();
-    let (bytes, root) = snapshot_of(AGENT_MODULE_ID)?;
-    agent
-        .install(bytes, root)
-        .map_err(|e| format!("agent install: {e}"))?;
 
     let mut runs = genesis_runs_wasm();
     let (bytes, root) = snapshot_of(RUNS_MODULE_ID)?;
@@ -954,6 +961,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    let (target, resolver) = fetch_target("agent").await?;
+    let agent = agent_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("agent")),
+            "agent",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1094,12 +1112,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     drop(files_possession);
     let files = files_wasm(files_scratch.dir().to_path_buf())
         .map_err(|e| format!("duckfs compose: {e}"))?;
-
-    let (bytes, root) = snapshot_of(AGENT_MODULE_ID).await?;
-    let mut agent = genesis_agent_wasm();
-    agent
-        .install(&bytes, root)
-        .map_err(|e| format!("agent install: {e}"))?;
 
     let (bytes, root) = snapshot_of(RUNS_MODULE_ID).await?;
     let mut runs = genesis_runs_wasm();

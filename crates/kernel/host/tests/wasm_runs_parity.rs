@@ -110,26 +110,33 @@ fn native_runs() -> RunsModule {
 }
 
 /// the shared native sibling set under the production ids. `chat_label` /
-/// `pages_label` keep the two hosts' qmdb runtime children distinct;
-/// `files_dir` is each host's own (empty) odb dir — the files root is
-/// content-derived, so the two empty instances agree from genesis.
+/// `pages_label` / `agent_label` keep the two hosts' qmdb runtime children
+/// distinct; `files_dir` is each host's own (empty) odb dir — the files root
+/// is content-derived, so the two empty instances agree from genesis.
 async fn siblings(
     context: &deterministic::Context,
     chat_label: &'static str,
     pages_label: &'static str,
+    agent_label: &'static str,
     files_dir: std::path::PathBuf,
     saga: saga::SagaModule,
     assignment_members: Option<&[Vec<u8>]>,
 ) -> Vec<Box<dyn sdk::Module>> {
     let chat_store = QmdbStore::init(context.child(chat_label), "chat").await;
     let pages_store = QmdbStore::init(context.child(pages_label), "pages").await;
+    let agent_store = QmdbStore::init(context.child(agent_label), "agent").await;
     let mut modules: Vec<Box<dyn sdk::Module>> = vec![
         Box::new(Chat::new("chat", Box::new(chat_store)).with_tagging("tagging")),
         Box::new(Pages::new("pages", Box::new(pages_store)).with_tagging("tagging")),
         Box::new(TaggingModule::new("tagging")),
         Box::new(saga),
         Box::new(DispatchModule::new("dispatch", "saga")),
-        Box::new(AgentModule::new("agent", "saga", Some("runs".into()))),
+        Box::new(AgentModule::new(
+            "agent",
+            Box::new(agent_store),
+            "saga",
+            Some("runs".into()),
+        )),
         Box::new(Tasks::new("tasks")),
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
@@ -152,6 +159,7 @@ async fn native_host(context: &deterministic::Context, files_dir: std::path::Pat
         context,
         "native_chat",
         "native_pages",
+        "native_agent",
         files_dir,
         saga::SagaModule::new("saga"),
         None,
@@ -166,6 +174,7 @@ async fn wasm_host_(context: &deterministic::Context, files_dir: std::path::Path
         context,
         "wasm_chat",
         "wasm_pages",
+        "wasm_agent",
         files_dir,
         saga::SagaModule::new("saga"),
         None,

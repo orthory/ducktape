@@ -56,7 +56,14 @@ impl Harness {
         let daemon = InProcDaemon::start(
             move || {
                 Host::genesis(vec![
-                    Box::new(agent::AgentModule::new("agent", "saga", None)),
+                    // no commonware context in this sync closure, so the
+                    // registry rides the in-memory store test double.
+                    Box::new(agent::AgentModule::new(
+                        "agent",
+                        Box::new(sdk_testkit::MemStore::new()),
+                        "saga",
+                        None,
+                    )),
                     Box::new(saga::SagaModule::new("saga")),
                     Box::new(tasks::Tasks::new("tasks")),
                     Box::new(dispatch::DispatchModule::new("dispatch", "saga")),

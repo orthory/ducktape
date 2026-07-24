@@ -770,7 +770,12 @@ fn run_sim(
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new("automations", "chat", "tasks", "inbox");
-        let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+        let agent = AgentModule::new(
+            "agent",
+            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
+            "saga",
+            Some("runs".into()),
+        );
         let runs = RunsModule::new(
             "runs",
             "chat",
