@@ -62,6 +62,7 @@ mod config;
 mod constants;
 mod cred_cli;
 mod node_http;
+mod tty;
 mod cred_resolve;
 mod drain_actions;
 mod explorer;

@@ -469,9 +469,10 @@ fn preflight_binary(provider: ProviderArg) -> CredResult {
 }
 
 /// Run the vendor login on a local pty, pointing its config home at `dir`. The
-/// wrap is PRESENTATION, not interception: it mirrors every byte the vendor CLI
-/// prints straight to this terminal and forwards this terminal's stdin, and — as
-/// a convenience — reprints the first authorize URL it sees on its own line.
+/// wrap is a TRANSPARENT terminal: this terminal goes raw, the vendor CLI's own
+/// full-screen TUI is mirrored byte-for-byte, and keystrokes are forwarded
+/// verbatim — so its interactive authorize-and-paste flow renders and behaves
+/// exactly as if the vendor login were run directly.
 fn run_vendor_login(provider: ProviderArg, dir: &Path) -> CredResult {
     let mut command = tokio::process::Command::new(provider.binary());
     command.args(provider.login_args());
@@ -489,6 +490,13 @@ fn run_vendor_login(provider: ProviderArg, dir: &Path) -> CredResult {
 async fn pump_login(command: tokio::process::Command) -> CredResult {
     use std::sync::Arc;
     use tokio::io::AsyncReadExt as _;
+
+    // Raw mode for the whole login: `claude setup-token` / `codex login` drive a
+    // full-screen TUI, so this terminal must pass keystrokes through verbatim —
+    // otherwise the pasted auth code is line-buffered, locally echoed, and its
+    // Enter arrives as `\n` instead of the `\r` the child's prompt submits on, so
+    // the code never registers. The guard restores the tty on return AND on panic.
+    let _raw = crate::tty::RawGuard::enter();
 
     let session = Arc::new(capability_host::InteractiveSession::spawn_local(command)?);
 
@@ -508,7 +516,6 @@ async fn pump_login(command: tokio::process::Command) -> CredResult {
         }
     });
 
-    let mut printed_url = false;
     let mut buf = [0u8; 4096];
     loop {
         let n = session
@@ -518,14 +525,12 @@ async fn pump_login(command: tokio::process::Command) -> CredResult {
         if n == 0 {
             break;
         }
+        // Mirror the vendor login's own full-screen TUI verbatim — it already
+        // presents the authorize URL and prompts for the code interactively.
+        // We add nothing to the stream: injecting a line mid-redraw would corrupt
+        // its layout, and raw mode (above) lets its UI render exactly as if run
+        // directly.
         mirror_stdout(&buf[..n])?;
-        let first_url = (!printed_url)
-            .then(|| extract_auth_url(&buf[..n]))
-            .flatten();
-        if let Some(url) = first_url {
-            printed_url = true;
-            println!("\nopen this url: {url}");
-        }
     }
     input.abort();
     session.close().await;
@@ -555,16 +560,6 @@ fn derive_default_name(display: &str, provider: ProviderArg, existing: &[&str]) 
         .max()
         .unwrap_or(0);
     format!("{prefix}{}", highest + 1)
-}
-
-/// The first `https://…` URL in a chunk of login output (up to the next
-/// whitespace), or `None` — the convenience reprint the login wrap surfaces.
-fn extract_auth_url(chunk: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(chunk);
-    let start = text.find("https://")?;
-    let rest = &text[start..];
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    Some(rest[..end].to_string())
 }
 
 // ============================================================================
@@ -706,13 +701,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn login_stream_url_extraction() {
-        let chunk = b"Visit the following URL to authorize:\n  https://claude.ai/oauth/authorize?code=abc\nthen paste the code.";
-        assert_eq!(
-            extract_auth_url(chunk),
-            Some("https://claude.ai/oauth/authorize?code=abc".to_string())
-        );
-        assert_eq!(extract_auth_url(b"no url here"), None);
-    }
 }
