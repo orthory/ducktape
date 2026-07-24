@@ -370,6 +370,18 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // no `node.toml [sandbox]` = no compute plane: nothing is discovered or
     // announced and the pool below has nothing it could ever spawn — a bare
     // host spawn is unrepresentable.
+    // the node-private podman service (own socket + storage + egress hooks) must
+    // be up before anything is discovered or spawned; held for the node's life.
+    // A non-Podman backend yields `None`. Fail-closed: a start failure panics
+    // like a broken spec would, never a silently unsandboxed node.
+    let self_exe = std::env::current_exe()
+        .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
+    let _podman_service = match &sandbox {
+        Some(backend) => capability_host::PodmanService::start_for(backend, &self_exe)
+            .await
+            .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
+        None => None,
+    };
     let providers = match sandbox {
         Some(backend) => capability_host::discover(
             signer.public_key().as_ref(),

@@ -549,7 +549,12 @@ async fn demo_genesis(
     let gateway = Gateway::new("gateway", "identity", None, "demo");
     let inbox = Inbox::new("inbox");
     let files = Files::open("files", duckfs_dir.to_path_buf()).expect("duckfs open");
-    let agent = AgentModule::new("agent", "saga", Some("runs".into()));
+    let agent = AgentModule::new(
+        "agent",
+        Box::new(QmdbStore::init(context.child("agent"), "agent").await),
+        "saga",
+        Some("runs".into()),
+    );
     let runs = RunsModule::new(
         "runs",
         "chat",
@@ -563,7 +568,13 @@ async fn demo_genesis(
     // the duckfs/files module the portable composer pins its source
     // head from (W2) — mandatory for envelope composition.
     .with_files_module("files");
-    let automations = Automations::new("automations", "chat", "tasks", "inbox");
+    let automations = Automations::new(
+        "automations",
+        Box::new(QmdbStore::init(context.child("automations"), "automations").await),
+        "chat",
+        "tasks",
+        "inbox",
+    );
     Host::genesis(vec![
         Box::new(kv),
         Box::new(directory),

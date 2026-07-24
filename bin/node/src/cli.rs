@@ -259,8 +259,12 @@ fn platform_sandbox() -> (config::SandboxToml, capability_host::SandboxBackend) 
             image: config::DEFAULT_TART_IMAGE.into(),
         })
     } else {
+        // the socket is left empty here: `platform_sandbox` only writes the
+        // default [sandbox] TOML at `node init`; the real socket is named by
+        // `resolve_sandbox` from the workspace when the node actually boots.
         ("podman", config::DEFAULT_PODMAN_IMAGE, capability_host::SandboxBackend::Podman {
             image: config::DEFAULT_PODMAN_IMAGE.into(),
+            socket: std::path::PathBuf::new(),
         })
     };
     let table = config::SandboxToml {

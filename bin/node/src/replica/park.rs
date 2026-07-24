@@ -682,6 +682,16 @@ pub(super) async fn park(
     // detection.
     // no `node.toml [sandbox]` = no compute plane, same as the validator
     // boot: nothing discovered, nothing announced, nothing spawnable.
+    // node-private podman service up before discovery; held for the node's
+    // life (see the validator boot for the rationale). fail-closed on error.
+    let self_exe = std::env::current_exe()
+        .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
+    let _podman_service = match &sandbox {
+        Some(backend) => capability_host::PodmanService::start_for(backend, &self_exe)
+            .await
+            .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
+        None => None,
+    };
     let resident_provider_set = match sandbox {
         Some(backend) => capability_host::discover(
             &me_bytes,

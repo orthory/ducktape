@@ -92,6 +92,10 @@ pub const SANDBOX_IMAGE_ENV: &str = "DUCKTAPE_SANDBOX_IMAGE";
 /// which sandbox backend hosts interactive sessions: `"podman"` (default, Linux)
 /// or `"tart"` (macOS guest VM). mirrors `bin/node`'s `sandbox` selector.
 pub const SANDBOX_BACKEND_ENV: &str = "DUCKTAPE_SANDBOX_BACKEND";
+/// the node-private podman socket the Podman backend drives (see
+/// `capability_host::PodmanService`). `bin/node` derives this from the
+/// workspace; `bin/noded` (no toml) reads it here.
+pub const SANDBOX_SOCKET_ENV: &str = "DUCKTAPE_PODMAN_SOCKET";
 
 /// the ws topic a session's output rides.
 pub fn topic(session_id: &str) -> String {
@@ -1085,7 +1089,12 @@ pub fn backend_from_env() -> Option<SandboxBackend> {
         .as_deref()
         .map(str::trim)
     {
-        None | Some("") | Some("podman") => Some(SandboxBackend::Podman { image }),
+        None | Some("") | Some("podman") => {
+            let socket = std::path::PathBuf::from(
+                std::env::var(SANDBOX_SOCKET_ENV).unwrap_or_default(),
+            );
+            Some(SandboxBackend::Podman { image, socket })
+        }
         Some("tart") => Some(SandboxBackend::Tart { image }),
         Some(other) => {
             tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; compute plane disabled");

@@ -1,12 +1,25 @@
-//! the agent module — the platform's agent registry, and nothing more.
+//! qmdb-backed agent module — the platform's agent registry, and nothing more.
 //!
-//! a pure state-machine module (in the root-hash) holding one map: agent id →
-//! record (owner, capability tag, curated skills, granted actions, status). it is
-//! 100% self-contained — no other module's interface crosses this crate
-//! (`SagaOrigin` and the capability tag shape rule are platform vocabulary,
-//! not module guts) — and it consumes no other module's events. everything
-//! that ACTS on agents (engagement, composition, dispatch, response
-//! delivery) lives in the runs module, which reads this registry by query.
+//! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
+//! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
+//! to [`AgentModule::new`], so this crate never names a storage crate. the
+//! store is used for what it is — hash-addressable authenticated state, one
+//! logical record per agent, every read a point lookup — plus ONE enumeration
+//! record the registry cannot do without: the roster (the sorted id list).
+//! the roster is not scan machinery for a human surface — CONSENSUS consumes
+//! it (the runs module's `All`/`RoundRobin` engagement domain reads every
+//! active agent inside `execute()`), and consensus can never depend on the
+//! unverifiable derived tier, so the enumeration stays canonical. it is
+//! bounded by [`MAX_REGISTERED_AGENTS`]. there is no index guest: every read
+//! this module serves is dispatch-consumed (runs' registry reads, the MCP
+//! read plane through the same canonical queries).
+//!
+//! the module is 100% self-contained — no other module's interface crosses
+//! this crate (`SagaOrigin` and the capability tag shape rule are platform
+//! vocabulary, not module guts) — and it consumes no other module's events.
+//! everything that ACTS on agents (engagement, composition, dispatch,
+//! response delivery) lives in the runs module, which reads this registry by
+//! query.
 //!
 //! the one seam left is the registry hook: a registration (and a capability
 //! change) emits an [`AgentEvent`] follow-up to a genesis-configured hook
@@ -25,24 +38,32 @@
 //! - anything else → an [`AgentMsg`] (registry admin). module origins are
 //!   legitimate submitters — a module may own agents.
 //!
-//! `root()` folds in every field of the map, so any transition moves the
-//! root-hash. a joiner rebuilds this module from a peer via
-//! [`AgentModule::snapshot`] / [`AgentModule::install`]: the snapshot ships
-//! the committed map in the exact canonical encoding `root()` hashes, and
-//! install re-derives the root from the decoded temporaries before adopting
-//! them — the consensus-agreed root, not the peer, is the trust anchor.
+//! writes are staged during a block and flushed to the store in one batch at
+//! `commit_block`; the module root IS the store's merkle root. sync belongs
+//! to the store, not this module: a joiner rebuilds the concrete store from a
+//! peer (`QmdbStore::sync_from`) and wraps a fresh `AgentModule` around it —
+//! this module only forwards the trait's serve surface.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+// the wasm-guest port: the store-backed dispatch shell that adapts this
+// module to the ducktape:module world. compiled only by the guest-builder's
+// synthesized wasm32 cdylib workspace (feature `guest`), never by the native
+// build.
+#[cfg(feature = "guest")]
+mod guest;
+
+use std::collections::BTreeSet;
 
 use capability::validate_tag;
 use saga::SagaOrigin;
-use sdk::codec;
-use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
-use sha2::{Digest, Sha256};
+use sdk::{
+    Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle,
+};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// the canonical state form of an op origin (see [`SagaOrigin`]).
 fn canonical_origin(origin: &Origin) -> SagaOrigin {
@@ -53,181 +74,19 @@ fn canonical_origin(origin: &Origin) -> SagaOrigin {
     }
 }
 
-/// one registered agent. the id is the map key, so it isn't repeated here.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AgentState {
-    /// the registration origin — the owner capability for every mutation.
-    owner: SagaOrigin,
-    display_name: String,
-    /// the capability registry tag this agent's runs are dispatched on —
-    /// WHAT the run needs; how it executes (binary, flags, model) is host
-    /// policy in each provider's spec, invisible to consensus.
-    capability: String,
-    /// granted action names from the known vocabulary, deduped and sorted.
-    allowed_actions: BTreeSet<String>,
-    /// false = paused: the agent never engages new runs.
-    active: bool,
-    created_at: u64,
-    updated_at: u64,
-    /// runtime-identity tail. all three are empty/default when unset, and
-    /// [`encode_committed`] always appends them to the canonical encoding.
-    ///
-    /// W4 recipe content-address: empty (unset) or exactly [`RECIPE_HASH_LEN`].
-    recipe_hash: Vec<u8>,
-    /// D3 resource caps — each list canonical sorted+deduped.
-    caps: ResourceCaps,
-    /// C4 ordered skill refs — the agent's SOUL (order is significant to the
-    /// hash, and to the order `Always` bodies assemble in host-side).
-    skills: Vec<SkillRef>,
+/// per-agent record key: prefix + 0 + id (the single-component shape chat
+/// uses). safe because both key literals are fixed and neither is the other
+/// followed by a 0 byte.
+fn agent_key(agent_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5 + 1 + agent_id.len());
+    key.extend_from_slice(b"agent");
+    key.push(0);
+    key.extend_from_slice(agent_id.as_bytes());
+    key
 }
 
-// ---- canonical encoding -------------------------------------------------------
-// u64-le counts, sorted keys, every field in declaration order: u64-le length
-// prefixes for byte strings, single-byte discriminants for enums, a 0/1 tag
-// byte for options, u64-le integers. this is the exact preimage
-// [`Module::root`] hashes, so a snapshot and the root that must authenticate
-// it cannot drift. every entry ALWAYS carries the recipe_hash/caps/skills tail
-// (empty/default when unset) — the runtime identity is part of the root-hash.
-// length-prefixed bytes go through the shared `sdk::codec` writer.
-
-fn put_origin(out: &mut Vec<u8>, origin: &SagaOrigin) {
-    match origin {
-        SagaOrigin::External(key) => {
-            out.push(0);
-            codec::push_bytes(out, key);
-        }
-        SagaOrigin::Module(module) => {
-            out.push(1);
-            codec::push_bytes(out, module.as_bytes());
-        }
-        SagaOrigin::System => out.push(2),
-    }
-}
-
-/// a canonical string SET: a u64-le count then each entry length-prefixed.
-/// callers pass an already sorted+deduped slice (the write path canonicalizes;
-/// the decoder rejects a non-ascending list). part of the runtime-identity tail.
-fn put_str_set(out: &mut Vec<u8>, items: &[String]) {
-    out.extend_from_slice(&(items.len() as u64).to_le_bytes());
-    for s in items {
-        codec::push_bytes(out, s.as_bytes());
-    }
-}
-
-/// the D3 caps segment: seven canonical string sets in field order, then the
-/// budget as u64-le (the field is u32; the decoder range-checks). part of the
-/// runtime-identity tail.
-fn put_caps(out: &mut Vec<u8>, c: &ResourceCaps) {
-    put_str_set(out, &c.forge_read);
-    put_str_set(out, &c.forge_push);
-    put_str_set(out, &c.duckfs_read);
-    put_str_set(out, &c.duckfs_write);
-    put_str_set(out, &c.tools);
-    put_str_set(out, &c.secrets);
-    put_str_set(out, &c.pages_write);
-    out.extend_from_slice(&(c.subagent_budget as u64).to_le_bytes());
-}
-
-/// the C4 skills segment: a u64-le count then each ref in ORDER (order is
-/// significant) — name, source_prefix, a 0/1 option tag for the pinned
-/// snapshot, then the load-mode discriminant. part of the runtime-identity tail.
-///
-/// the load mode is IN the preimage because it decides what the host inlines
-/// into the agent's assembled context document: flipping a skill from on-demand
-/// to always changes what the model is, so it must change the root-hash.
-fn put_skills(out: &mut Vec<u8>, skills: &[SkillRef]) {
-    out.extend_from_slice(&(skills.len() as u64).to_le_bytes());
-    for s in skills {
-        codec::push_bytes(out, s.name.as_bytes());
-        codec::push_bytes(out, s.source_prefix.as_bytes());
-        match &s.source_snapshot {
-            Some(snap) => {
-                out.push(1);
-                codec::push_bytes(out, snap.as_bytes());
-            }
-            None => out.push(0),
-        }
-        out.push(match s.load {
-            LoadMode::Always => 0,
-            LoadMode::OnDemand => 1,
-        });
-    }
-}
-
-fn encode_committed(agents: &BTreeMap<String, AgentState>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(agents.len() as u64).to_le_bytes());
-    for (id, a) in agents {
-        codec::push_bytes(&mut out, id.as_bytes());
-        put_origin(&mut out, &a.owner);
-        codec::push_bytes(&mut out, a.display_name.as_bytes());
-        codec::push_bytes(&mut out, a.capability.as_bytes());
-        out.extend_from_slice(&(a.allowed_actions.len() as u64).to_le_bytes());
-        for action in &a.allowed_actions {
-            codec::push_bytes(&mut out, action.as_bytes());
-        }
-        out.push(if a.active { 0 } else { 1 });
-        out.extend_from_slice(&a.created_at.to_le_bytes());
-        out.extend_from_slice(&a.updated_at.to_le_bytes());
-        // the runtime-identity tail — ALWAYS appended (empty/default when unset).
-        codec::push_bytes(&mut out, &a.recipe_hash);
-        put_caps(&mut out, &a.caps);
-        put_skills(&mut out, &a.skills);
-    }
-    out
-}
-
-/// the state-based commitment over the committed map — shared by `root()`
-/// and `install()` so the verification a snapshot must pass is definitionally
-/// the same algorithm the live module answers with.
-fn committed_root(agents: &BTreeMap<String, AgentState>) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(agents)).into())
-}
-
-// ---- canonical decoding (UNTRUSTED input) ---------------------------------
-// bounds are validated against the remaining input BEFORE any allocation,
-// keys must be strictly ascending (one encoding per state, uniqueness for
-// free), unknown discriminants/tags and trailing bytes are rejected. never
-// panics on malformed input.
-
-// primitives are the shared `sdk::codec::Cursor` (u64/byte/bytes/string, each
-// bounds-checked before it reads); the module-specific readers below thread one
-// `Cursor` through the whole decode.
-
-fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, Error> {
-    match cur.byte("origin discriminant")? {
-        0 => Ok(SagaOrigin::External(cur.bytes("origin key")?.to_vec())),
-        1 => Ok(SagaOrigin::Module(cur.string("origin module")?)),
-        2 => Ok(SagaOrigin::System),
-        d => Err(Error::Module(format!(
-            "snapshot has unknown origin discriminant {d}"
-        ))),
-    }
-}
-
-/// a section count, bounded by what the remaining input could possibly hold
-/// given each entry's minimum encoded size — rejected before the loop builds
-/// anything (`Cursor::bound`).
-fn take_count(cur: &mut codec::Cursor, min_entry_bytes: u64, what: &str) -> Result<u64, Error> {
-    let count = cur.u64(what)?;
-    cur.bound(count, min_entry_bytes, what)?;
-    Ok(count)
-}
-
-/// enforce strictly-ascending map keys while inserting.
-fn insert_ascending<V>(map: &mut BTreeMap<String, V>, key: String, value: V) -> Result<(), Error> {
-    if let Some((last, _)) = map.iter().next_back()
-        && last.as_str() >= key.as_str()
-    {
-        return Err(Error::Module("snapshot keys not strictly ascending".into()));
-    }
-    map.insert(key, value);
-    Ok(())
-}
-
-fn contains_reserved_separator(value: &str) -> bool {
-    value.contains(RESERVED_ID_SEPARATOR)
-}
+/// the roster record's whole key. collides with no `agent\0...` key.
+const ROSTER_KEY: &[u8] = b"roster";
 
 /// the longest agent id consensus admits — one DNS label (RFC 1035), which is
 /// also what an RFC 5321 local part (64 bytes) holds verbatim.
@@ -268,158 +127,9 @@ pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// decode a canonical string SET, enforcing strictly-ascending order so a
-/// non-canonical (unsorted / duplicated) snapshot is rejected — the same
-/// discipline `allowed_actions` uses. part of the runtime-identity tail.
-fn take_str_set(cur: &mut codec::Cursor) -> Result<Vec<String>, Error> {
-    let n = take_count(cur, 8, "cap")?;
-    let mut v: Vec<String> = Vec::new();
-    for _ in 0..n {
-        let s = cur.string("cap")?;
-        if v.last().is_some_and(|last| last.as_str() >= s.as_str()) {
-            return Err(Error::Module("snapshot caps not strictly ascending".into()));
-        }
-        v.push(s);
-    }
-    Ok(v)
-}
-
-/// decode the D3 caps segment; the budget is range-checked to `u32` so a
-/// byzantine value above `u32::MAX` is rejected, never truncated. part of the
-/// runtime-identity tail.
-fn take_caps(cur: &mut codec::Cursor) -> Result<ResourceCaps, Error> {
-    let forge_read = take_str_set(cur)?;
-    let forge_push = take_str_set(cur)?;
-    let duckfs_read = take_str_set(cur)?;
-    let duckfs_write = take_str_set(cur)?;
-    let tools = take_str_set(cur)?;
-    let secrets = take_str_set(cur)?;
-    let pages_write = take_str_set(cur)?;
-    let subagent_budget = u32::try_from(cur.u64("subagent_budget")?)
-        .map_err(|_| Error::Module("snapshot subagent_budget exceeds u32".to_string()))?;
-    Ok(ResourceCaps {
-        forge_read,
-        forge_push,
-        duckfs_read,
-        duckfs_write,
-        tools,
-        secrets,
-        pages_write,
-        subagent_budget,
-    })
-}
-
-/// decode the C4 skills segment IN ORDER (skills are an ordered list, not a
-/// set — no ascending check). an unknown option tag or load discriminant is
-/// rejected: one valid encoding per state. part of the runtime-identity tail.
-fn take_skills(cur: &mut codec::Cursor) -> Result<Vec<SkillRef>, Error> {
-    // per-entry minimum: a name prefix, a source_prefix prefix, the option tag
-    // byte, and the load-mode byte.
-    let n = take_count(cur, 8 + 8 + 1 + 1, "skill")?;
-    let mut v: Vec<SkillRef> = Vec::new();
-    for _ in 0..n {
-        let name = cur.string("skill name")?;
-        let source_prefix = cur.string("skill source_prefix")?;
-        let source_snapshot = match cur.byte("skill snapshot tag")? {
-            0 => None,
-            1 => Some(cur.string("skill snapshot")?),
-            d => {
-                return Err(Error::Module(format!(
-                    "snapshot has unknown skill snapshot tag {d}"
-                )));
-            }
-        };
-        let load = match cur.byte("skill load mode")? {
-            0 => LoadMode::Always,
-            1 => LoadMode::OnDemand,
-            d => {
-                return Err(Error::Module(format!(
-                    "snapshot has unknown skill load mode {d}"
-                )));
-            }
-        };
-        v.push(SkillRef {
-            name,
-            source_prefix,
-            source_snapshot,
-            load,
-        });
-    }
-    Ok(v)
-}
-
-fn decode_committed(bytes: &[u8]) -> Result<BTreeMap<String, AgentState>, Error> {
-    // per-entry minimum size: an agent costs its id prefix, one origin
-    // discriminant, two length prefixes (display_name, capability), an action
-    // count, a status byte, two u64s, and the ALWAYS-present runtime-identity
-    // tail (a recipe_hash length prefix, seven cap-set counts, the budget u64,
-    // and the skills count).
-    const MIN_AGENT_BYTES: u64 = (8 + 1 + 8 + 8 + 8 + 1 + 8 + 8) + 8 + 7 * 8 + 8 + 8;
-
-    let mut cur = codec::Cursor::new(bytes);
-    let mut agents: BTreeMap<String, AgentState> = BTreeMap::new();
-    let count = take_count(&mut cur, MIN_AGENT_BYTES, "agent")?;
-    for _ in 0..count {
-        let id = cur.string("agent id")?;
-        if contains_reserved_separator(&id) {
-            return Err(Error::Module(
-                "snapshot agent_id contains reserved unit separator".into(),
-            ));
-        }
-        let owner = take_origin(&mut cur)?;
-        let display_name = cur.string("agent display_name")?;
-        let capability = cur.string("agent capability")?;
-        let mut allowed_actions: BTreeSet<String> = BTreeSet::new();
-        let actions = take_count(&mut cur, 8, "action")?;
-        for _ in 0..actions {
-            let action = cur.string("action")?;
-            if let Some(last) = allowed_actions.iter().next_back()
-                && last.as_str() >= action.as_str()
-            {
-                return Err(Error::Module(
-                    "snapshot actions not strictly ascending".into(),
-                ));
-            }
-            allowed_actions.insert(action);
-        }
-        let active = match cur.byte("agent status")? {
-            0 => true,
-            1 => false,
-            d => {
-                return Err(Error::Module(format!(
-                    "snapshot has unknown agent status {d}"
-                )));
-            }
-        };
-        let created_at = cur.u64("agent created_at")?;
-        let updated_at = cur.u64("agent updated_at")?;
-        // the runtime-identity tail — ALWAYS present (empty/default when unset).
-        let recipe_hash = cur.bytes("agent recipe_hash")?.to_vec();
-        let caps = take_caps(&mut cur)?;
-        let skills = take_skills(&mut cur)?;
-        insert_ascending(
-            &mut agents,
-            id,
-            AgentState {
-                owner,
-                display_name,
-                capability,
-                allowed_actions,
-                active,
-                created_at,
-                updated_at,
-                recipe_hash,
-                caps,
-                skills,
-            },
-        )?;
-    }
-    cur.finish("snapshot")?;
-    Ok(agents)
-}
-
 // ---- the module -----------------------------------------------------------
 
+/// storage-backed agent registry.
 pub struct AgentModule {
     id: ModuleId,
     /// dead-letter routing only: a saga callback pointed here by a foreign
@@ -430,19 +140,22 @@ pub struct AgentModule {
     /// in lockstep. an opaque id: this crate never decodes its interface.
     /// `None` (test-only) means no notifications — and no recipes.
     hook: Option<ModuleId>,
-    /// committed state — what `root()` and the root-hash commit to.
-    agents: BTreeMap<String, AgentState>,
-    /// this block's staged writes, read ahead of committed state
-    /// (read-your-writes) but merged in — and reflected in `root()` — only at
-    /// `commit_block`. agents are upsert-only.
-    pending_agents: BTreeMap<String, AgentState>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl AgentModule {
-    /// wire the module. the ids must be pairwise distinct — the saga
-    /// dead-letter is origin-routed, and a colliding hook id would collapse
-    /// that namespace.
-    pub fn new(id: impl Into<ModuleId>, saga: impl Into<ModuleId>, hook: Option<ModuleId>) -> Self {
+    /// wrap the host-constructed store under module identity `id`. the ids
+    /// must be pairwise distinct — the saga dead-letter is origin-routed, and
+    /// a colliding hook id would collapse that namespace.
+    pub fn new(
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+        saga: impl Into<ModuleId>,
+        hook: Option<ModuleId>,
+    ) -> Self {
         let id = id.into();
         let saga = saga.into();
         let mut ids = BTreeSet::from([id.clone(), saga.clone()]);
@@ -460,50 +173,66 @@ impl AgentModule {
             id,
             saga,
             hook,
-            agents: BTreeMap::new(),
-            pending_agents: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
 
     // ---- staged-over-committed reads ---------------------------------------
 
-    fn agent(&self, agent_id: &str) -> Option<&AgentState> {
-        self.pending_agents
-            .get(agent_id)
-            .or_else(|| self.agents.get(agent_id))
-    }
-
-    fn visible_ids(&self) -> Vec<String> {
-        self.pending_agents
-            .keys()
-            .chain(self.agents.keys())
-            .cloned()
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect()
-    }
-
-    // ---- views ---------------------------------------------------------------
-
-    fn agent_view(agent_id: &str, a: &AgentState) -> AgentRecord {
-        AgentRecord {
-            agent_id: agent_id.to_string(),
-            owner: a.owner.clone(),
-            display_name: a.display_name.clone(),
-            capability: a.capability.clone(),
-            allowed_actions: a.allowed_actions.iter().cloned().collect(),
-            status: if a.active {
-                AgentStatus::Active
-            } else {
-                AgentStatus::Paused
-            },
-            role: AgentRole::General,
-            created_at: a.created_at,
-            updated_at: a.updated_at,
-            recipe_hash: a.recipe_hash.clone(),
-            caps: a.caps.clone(),
-            skills: a.skills.clone(),
+    async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: DeserializeOwned,
+    {
+        match self.staged.get(key).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
         }
+    }
+
+    fn store<T>(&mut self, key: Vec<u8>, value: &T)
+    where
+        T: Serialize,
+    {
+        self.staged.stage(
+            key,
+            serde_json::to_vec(value).expect("agent value is serializable"),
+        );
+    }
+
+    /// stage a value only if its serialized size fits `cap` — the write-time
+    /// guard against poison values (the qmdb codec cap is decode-only).
+    fn store_bounded<T>(
+        &mut self,
+        key: Vec<u8>,
+        value: &T,
+        cap: usize,
+        what: &str,
+    ) -> Result<(), Error>
+    where
+        T: Serialize,
+    {
+        let bytes = serde_json::to_vec(value).expect("agent value is serializable");
+        if bytes.len() > cap {
+            return Err(Error::Module(format!(
+                "{what} record too large: {} > {cap} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(key, bytes);
+        Ok(())
+    }
+
+    async fn agent(&self, agent_id: &str) -> Result<Option<AgentRecord>, Error> {
+        self.load(&agent_key(agent_id)).await
+    }
+
+    /// the registry roster — every registered id, sorted. the ONE enumeration
+    /// record: consensus itself consumes it (runs' engagement domain), so it
+    /// stays canonical, bounded by [`MAX_REGISTERED_AGENTS`].
+    async fn roster(&self) -> Result<Vec<String>, Error> {
+        Ok(self.load(ROSTER_KEY).await?.unwrap_or_default())
     }
 
     // ---- shared validation ----------------------------------------------------
@@ -516,8 +245,8 @@ impl AgentModule {
     }
 
     /// every granted action must come from the known vocabulary, so a grant
-    /// always means something; duplicates collapse into the set.
-    fn validate_actions(actions: Vec<String>) -> Result<BTreeSet<String>, Error> {
+    /// always means something; duplicates collapse into the sorted set.
+    fn validate_actions(actions: Vec<String>) -> Result<Vec<String>, Error> {
         let mut set = BTreeSet::new();
         for action in actions {
             if !KNOWN_ACTIONS.contains(&action.as_str()) {
@@ -525,7 +254,7 @@ impl AgentModule {
             }
             set.insert(action);
         }
-        Ok(set)
+        Ok(set.into_iter().collect())
     }
 
     /// a v4 recipe hash is empty (unset) or exactly [`RECIPE_HASH_LEN`] bytes.
@@ -540,9 +269,9 @@ impl AgentModule {
     }
 
     /// canonicalize the D3 caps: reject empty entries, then sort+dedup every
-    /// list so the committed encoding is canonical (the decoder enforces
-    /// strictly-ascending, so a non-canonicalized write would produce a
-    /// snapshot no joiner accepts). budget needs no normalization.
+    /// list so the committed record is canonical — one valid byte encoding
+    /// per state, and `permits` reads the same shape everywhere. budget needs
+    /// no normalization.
     fn validate_caps(mut caps: ResourceCaps) -> Result<ResourceCaps, Error> {
         for list in [
             &mut caps.forge_read,
@@ -599,20 +328,6 @@ impl AgentModule {
         Ok(())
     }
 
-    /// registry entries live in the root preimage and every snapshot —
-    /// size-gate them up front (the write-time-caps lesson).
-    fn validate_record_size(agent_id: &str, state: &AgentState) -> Result<(), Error> {
-        let bytes =
-            serde_json::to_vec(&Self::agent_view(agent_id, state)).expect("record is serializable");
-        if bytes.len() > MAX_AGENT_RECORD_BYTES {
-            return Err(Error::Module(format!(
-                "agent record too large: {} > {MAX_AGENT_RECORD_BYTES} bytes",
-                bytes.len()
-            )));
-        }
-        Ok(())
-    }
-
     /// the owner capability: registration takes a non-empty external key or a
     /// module as the owner. the pre-consensus empty external default and the
     /// system origin (which any genesis path could wear) never own agents.
@@ -628,16 +343,16 @@ impl AgentModule {
         }
     }
 
-    fn owned_agent(&self, ctx: &dyn Ctx, agent_id: &str) -> Result<&AgentState, Error> {
-        let agent = self
-            .agent(agent_id)
-            .ok_or_else(|| Error::Module(format!("unknown agent: {agent_id}")))?;
-        if agent.owner != canonical_origin(&ctx.env().origin) {
+    async fn owned_agent(&self, ctx: &dyn Ctx, agent_id: &str) -> Result<AgentRecord, Error> {
+        let Some(record) = self.agent(agent_id).await? else {
+            return Err(Error::Module(format!("unknown agent: {agent_id}")));
+        };
+        if record.owner != canonical_origin(&ctx.env().origin) {
             return Err(Error::Module(format!(
                 "only the owner may modify agent {agent_id}"
             )));
         }
-        Ok(agent)
+        Ok(record)
     }
 
     /// notify the registry hook — same block, so whatever the hook stages
@@ -686,33 +401,53 @@ impl AgentModule {
                 let caps = Self::validate_caps(caps.unwrap_or_default())?;
                 let skills = skills.unwrap_or_default();
                 Self::validate_skills(&skills)?;
-                if self.agent(&agent_id).is_some() {
-                    return Err(Error::Module(format!("agent already exists: {agent_id}")));
+                // the roster is the ONE existence authority: record and roster
+                // are staged (and commit or abort) together, so membership in
+                // one is membership in both.
+                let mut roster = self.roster().await?;
+                let position = match roster.binary_search(&agent_id) {
+                    Ok(_) => {
+                        return Err(Error::Module(format!("agent already exists: {agent_id}")));
+                    }
+                    Err(position) => position,
+                };
+                if roster.len() >= MAX_REGISTERED_AGENTS {
+                    return Err(Error::Module(format!(
+                        "agent registry is full: {MAX_REGISTERED_AGENTS} agents"
+                    )));
                 }
-                let state = AgentState {
+                roster.insert(position, agent_id.clone());
+                let record = AgentRecord {
+                    agent_id: agent_id.clone(),
                     owner,
                     display_name,
                     capability: capability.clone(),
                     allowed_actions,
-                    active: true,
+                    status: AgentStatus::Active,
+                    role: AgentRole::default(),
                     created_at: now,
                     updated_at: now,
                     recipe_hash,
                     caps,
                     skills,
                 };
-                Self::validate_record_size(&agent_id, &state)?;
+                self.store_bounded(
+                    agent_key(&agent_id),
+                    &record,
+                    MAX_AGENT_RECORD_BYTES,
+                    "agent",
+                )?;
+                self.store(ROSTER_KEY.to_vec(), &roster);
                 // the hook stages the agent's dispatch recipe in this same
                 // block: a rejected recipe (squatted or oversized id) aborts
                 // the block and the staged record with it (P2).
                 self.emit_hook(
                     ctx,
                     &AgentEvent::Registered {
-                        agent_id: agent_id.clone(),
+                        agent_id,
                         capability,
                     },
                 );
-                self.pending_agents.insert(agent_id, state);
                 Ok(())
             }
             AgentMsg::UpdateAgent {
@@ -724,14 +459,14 @@ impl AgentModule {
                 caps,
                 skills,
             } => {
-                let mut state = self.owned_agent(&*ctx, &agent_id)?.clone();
+                let mut record = self.owned_agent(&*ctx, &agent_id).await?;
                 if let Some(display_name) = display_name {
                     Self::validate_non_empty("display_name", &display_name)?;
-                    state.display_name = display_name;
+                    record.display_name = display_name;
                 }
                 if let Some(capability) = capability {
                     validate_tag(&capability).map_err(Error::Module)?;
-                    if capability != state.capability {
+                    if capability != record.capability {
                         // the hook retunes the agent's dispatch recipe onto
                         // the new tag, atomically with the record change.
                         self.emit_hook(
@@ -742,77 +477,62 @@ impl AgentModule {
                             },
                         );
                     }
-                    state.capability = capability;
+                    record.capability = capability;
                 }
                 if let Some(allowed_actions) = allowed_actions {
-                    state.allowed_actions = Self::validate_actions(allowed_actions)?;
+                    record.allowed_actions = Self::validate_actions(allowed_actions)?;
                 }
                 // runtime-identity fields: each Some overwrites, None keeps
                 // the current value.
                 if let Some(recipe_hash) = recipe_hash {
                     Self::validate_recipe_hash(&recipe_hash)?;
-                    state.recipe_hash = recipe_hash;
+                    record.recipe_hash = recipe_hash;
                 }
                 if let Some(caps) = caps {
-                    state.caps = Self::validate_caps(caps)?;
+                    record.caps = Self::validate_caps(caps)?;
                 }
                 if let Some(skills) = skills {
                     Self::validate_skills(&skills)?;
-                    state.skills = skills;
+                    record.skills = skills;
                 }
-                state.updated_at = now;
-                Self::validate_record_size(&agent_id, &state)?;
-                self.pending_agents.insert(agent_id, state);
-                Ok(())
+                record.updated_at = now;
+                self.store_bounded(
+                    agent_key(&agent_id),
+                    &record,
+                    MAX_AGENT_RECORD_BYTES,
+                    "agent",
+                )
             }
-            AgentMsg::PauseAgent { agent_id } => self.stage_active(ctx, agent_id, false, now),
-            AgentMsg::ResumeAgent { agent_id } => self.stage_active(ctx, agent_id, true, now),
+            AgentMsg::PauseAgent { agent_id } => {
+                self.stage_status(ctx, agent_id, AgentStatus::Paused, now).await
+            }
+            AgentMsg::ResumeAgent { agent_id } => {
+                self.stage_status(ctx, agent_id, AgentStatus::Active, now).await
+            }
         }
     }
 
-    fn stage_active(
+    async fn stage_status(
         &mut self,
         ctx: &dyn Ctx,
         agent_id: String,
-        active: bool,
+        status: AgentStatus,
         now: u64,
     ) -> Result<(), Error> {
-        let state = self.owned_agent(ctx, &agent_id)?;
-        if state.active == active {
-            // idempotent: staging nothing keeps the root byte-identical.
+        let mut record = self.owned_agent(ctx, &agent_id).await?;
+        if record.status == status {
+            // idempotent: staging nothing keeps the op log — and the root —
+            // byte-identical to no write at all.
             return Ok(());
         }
-        let mut state = state.clone();
-        state.active = active;
-        state.updated_at = now;
-        self.pending_agents.insert(agent_id, state);
-        Ok(())
-    }
-
-    // ---- state-sync ---------------------------------------------------------
-    // hand a joiner the committed continuation state as canonical bytes; the
-    // consensus-agreed root — never the serving peer — decides whether they land.
-
-    /// serialize the COMMITTED continuation state (never the staged overlay)
-    /// into the canonical encoding `root()` commits to. deterministic across
-    /// nodes — a plain body, no container magic.
-    pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.agents)
-    }
-
-    /// adopt a peer's snapshot as own committed state — but only after the
-    /// decoded temporaries re-derive `expected` via the exact `root()`
-    /// algorithm, so a byzantine snapshot cannot land under an agreed root it
-    /// doesn't match. all-or-nothing: on any Err this module (and its root)
-    /// is byte-identical to before the call. on success the staged overlay is
-    /// dropped — a snapshot describes a block boundary, and nothing
-    /// half-applied may shadow it.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let agents = decode_committed(bytes)?;
-        sdk::verify_snapshot_root(committed_root(&agents), expected)?;
-        self.agents = agents;
-        self.pending_agents.clear();
-        Ok(())
+        record.status = status;
+        record.updated_at = now;
+        self.store_bounded(
+            agent_key(&agent_id),
+            &record,
+            MAX_AGENT_RECORD_BYTES,
+            "agent",
+        )
     }
 }
 
@@ -822,16 +542,25 @@ impl Module for AgentModule {
         self.id.clone()
     }
 
-    /// state-based commitment: sha256 over the canonical committed encoding —
-    /// a length-prefixed fold of every agent field in sorted-key order.
-    /// sensitive to every field, so any transition moves the root. the
-    /// preimage IS the snapshot encoding.
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        committed_root(&self.agents)
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -853,29 +582,31 @@ impl Module for AgentModule {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             AgentQuery::Agents => {
-                let agents = self
-                    .visible_ids()
-                    .into_iter()
-                    .filter_map(|id| self.agent(&id).map(|a| Self::agent_view(&id, a)))
-                    .collect();
+                // roster order IS the reply order (sorted by id). a rostered
+                // id without a record is a store bug — loud, never skipped.
+                let mut agents = Vec::new();
+                for agent_id in self.roster().await? {
+                    let Some(record) = self.agent(&agent_id).await? else {
+                        return Err(Error::Module(format!("missing agent record: {agent_id}")));
+                    };
+                    agents.push(record);
+                }
                 Ok(encode_reply(&AgentReply::Agents(agents)))
             }
             AgentQuery::Agent { agent_id } => Ok(encode_reply(&AgentReply::Agent(
-                self.agent(&agent_id)
-                    .map(|a| Self::agent_view(&agent_id, a)),
+                self.agent(&agent_id).await?,
             ))),
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, agent) in std::mem::take(&mut self.pending_agents) {
-            self.agents.insert(id, agent);
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending_agents.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -883,79 +614,36 @@ impl Module for AgentModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
-    };
     use futures::executor::block_on;
-    use sdk::{Env, StateSyncHandle};
-
-    /// a minimal `Ctx` that captures emitted msgs/effects/events — enough to
-    /// unit-test `execute` in isolation (the host provides the real routing
-    /// in integration).
-    struct CaptureCtx {
-        env: Env,
-        msgs: Vec<Msg>,
-        #[allow(dead_code)]
-        events: Vec<Event>,
-    }
-    impl CaptureCtx {
-        fn new() -> Self {
-            Self {
-                env: Env {
-                    height: 0,
-                    consensus_time: 0,
-                    origin: Origin::System,
-                    me: "agent".into(),
-                },
-                msgs: Vec::new(),
-                events: Vec::new(),
-            }
-        }
-        fn at(mut self, view: u64) -> Self {
-            self.env.height = view;
-            self.env.consensus_time = view;
-            self
-        }
-        fn with_origin(mut self, origin: Origin) -> Self {
-            self.env.origin = origin;
-            self
-        }
-        /// decoded hook events emitted this dispatch.
-        fn hook_events(&self) -> Vec<AgentEvent> {
-            self.msgs
-                .iter()
-                .filter(|m| m.target == "runs")
-                .map(|m| decode_event(&m.payload).expect("hook event"))
-                .collect()
-        }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Ctx for CaptureCtx {
-        fn env(&self) -> &Env {
-            &self.env
-        }
-        fn module_root(&self, _target: &str) -> Option<StateRoot> {
-            None
-        }
-        async fn query(&self, target: &str, _req: &[u8]) -> Result<Vec<u8>, Error> {
-            Err(Error::UnknownModule(target.into()))
-        }
-        fn emit_msg(&mut self, msg: Msg) {
-            self.msgs.push(msg);
-        }
-        fn emit_event(&mut self, ev: Event) {
-            self.events.push(ev);
-        }
-    }
+    use sdk::Env;
+    use sdk_testkit::{MemStore, TestCtx};
 
     // ---- fixtures -----------------------------------------------------------
 
     fn module() -> AgentModule {
-        AgentModule::new("agent", "saga", Some("runs".into()))
+        AgentModule::new("agent", Box::new(MemStore::new()), "saga", Some("runs".into()))
     }
 
     fn user(byte: u8) -> Origin {
         Origin::External(vec![byte; 32])
+    }
+
+    fn ctx_at(height: u64, origin: Origin) -> TestCtx {
+        TestCtx::with_env(Env {
+            height,
+            consensus_time: height,
+            origin,
+            me: "agent".into(),
+        })
+    }
+
+    /// decoded hook events emitted this dispatch.
+    fn hook_events(ctx: &TestCtx) -> Vec<AgentEvent> {
+        ctx.msgs()
+            .iter()
+            .filter(|m| m.target == "runs")
+            .map(|m| decode_event(&m.payload).expect("hook event"))
+            .collect()
     }
 
     #[test]
@@ -1028,38 +716,6 @@ mod tests {
         }
     }
 
-    /// the fixed 2-agent registry the golden-hex + container-gating tests pin.
-    fn build_fixture_registry() -> AgentModule {
-        let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
-        exec(
-            &mut m,
-            &mut ctx,
-            &admin(&register("alpha", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])),
-        )
-        .unwrap();
-        exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
-        commit(&mut m);
-        m
-    }
-
-    /// lowercase hex, for the golden-byte pin.
-    fn hex(bytes: &[u8]) -> String {
-        use std::fmt::Write as _;
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            let _ = write!(s, "{b:02x}");
-        }
-        s
-    }
-
-    fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
-            .collect()
-    }
-
     fn admin(m: &AgentMsg) -> Msg {
         Msg {
             target: "agent".into(),
@@ -1067,7 +723,7 @@ mod tests {
         }
     }
 
-    fn exec(m: &mut AgentModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
+    fn exec(m: &mut AgentModule, ctx: &mut TestCtx, op: &Msg) -> Result<(), Error> {
         block_on(m.execute(ctx, op))
     }
 
@@ -1103,7 +759,7 @@ mod tests {
     #[test]
     fn register_validates_stages_an_active_agent_and_notifies_the_hook() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+        let mut ctx = ctx_at(3, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1121,7 +777,7 @@ mod tests {
         // the hook is notified in the same block, so the agent's dispatch
         // recipe lands (or aborts) atomically with the record.
         assert_eq!(
-            ctx.hook_events(),
+            hook_events(&ctx),
             vec![AgentEvent::Registered {
                 agent_id: "bot".into(),
                 capability: "model-1".into(),
@@ -1251,7 +907,7 @@ mod tests {
                     skills: None,
                 },
             ),
-            // an oversized record is rejected before staging.
+            // an oversized record is rejected before staging lands.
             (
                 user(9),
                 AgentMsg::RegisterAgent {
@@ -1266,11 +922,11 @@ mod tests {
             ),
         ];
         for (origin, op) in cases {
-            let mut ctx = CaptureCtx::new().with_origin(origin.clone());
+            let mut ctx = ctx_at(0, origin.clone());
             let err = exec(&mut m, &mut ctx, &admin(&op)).unwrap_err();
             assert!(matches!(err, Error::Module(_)), "{origin:?} / {op:?}");
             assert!(
-                ctx.hook_events().is_empty(),
+                hook_events(&ctx).is_empty(),
                 "a rejected register never notifies the hook: {op:?}"
             );
             abort(&mut m);
@@ -1281,7 +937,7 @@ mod tests {
     #[test]
     fn update_pause_resume_are_owner_gated() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let mut ctx = ctx_at(0, user(9));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
         commit(&mut m);
 
@@ -1303,14 +959,14 @@ mod tests {
                 agent_id: "bot".into(),
             },
         ] {
-            let mut ctx = CaptureCtx::new().with_origin(user(2));
+            let mut ctx = ctx_at(0, user(2));
             let err = exec(&mut m, &mut ctx, &admin(&op)).unwrap_err();
             assert!(matches!(err, Error::Module(_)));
             abort(&mut m);
         }
 
         // the owner updates fields selectively and toggles status.
-        let mut ctx = CaptureCtx::new().at(5).with_origin(user(9));
+        let mut ctx = ctx_at(5, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1328,7 +984,7 @@ mod tests {
         // a capability change notifies the hook, which retunes the agent's
         // dispatch recipe atomically.
         assert_eq!(
-            ctx.hook_events(),
+            hook_events(&ctx),
             vec![AgentEvent::CapabilityChanged {
                 agent_id: "bot".into(),
                 capability: "model-2".into(),
@@ -1354,7 +1010,7 @@ mod tests {
         assert_eq!(record.updated_at, 5);
 
         // an update that keeps the capability does NOT notify the hook.
-        let mut ctx = CaptureCtx::new().at(6).with_origin(user(9));
+        let mut ctx = ctx_at(6, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1369,12 +1025,12 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(ctx.hook_events().is_empty(), "same capability, no retune");
+        assert!(hook_events(&ctx).is_empty(), "same capability, no retune");
         commit(&mut m);
 
         // pausing a paused agent stages nothing: root byte-identical.
         let paused_root = m.root();
-        let mut ctx = CaptureCtx::new().at(7).with_origin(user(9));
+        let mut ctx = ctx_at(7, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1386,7 +1042,7 @@ mod tests {
         commit(&mut m);
         assert_eq!(m.root(), paused_root, "an idempotent pause is a no-op");
 
-        let mut ctx = CaptureCtx::new().at(8).with_origin(user(9));
+        let mut ctx = ctx_at(8, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -1403,7 +1059,7 @@ mod tests {
     fn a_direct_saga_callback_is_a_dead_letter() {
         let mut m = module();
         let root0 = m.root();
-        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("saga".into()));
+        let mut ctx = ctx_at(0, Origin::Module("saga".into()));
         // arbitrary (non-AgentMsg) bytes: the callback-poison rule says this
         // must be swallowed, never abort the saga's terminal block.
         exec(
@@ -1415,7 +1071,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!ctx.events.is_empty(), "the tombstone leaves a breadcrumb");
+        assert!(!ctx.events().is_empty(), "the tombstone leaves a breadcrumb");
         commit(&mut m);
         assert_eq!(m.root(), root0);
     }
@@ -1423,7 +1079,7 @@ mod tests {
     #[test]
     fn a_module_origin_may_own_an_agent() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().with_origin(Origin::Module("automations".into()));
+        let mut ctx = ctx_at(0, Origin::Module("automations".into()));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
         commit(&mut m);
         assert_eq!(
@@ -1434,10 +1090,10 @@ mod tests {
 
     #[test]
     fn without_a_hook_registration_stages_but_notifies_nobody() {
-        let mut m = AgentModule::new("agent", "saga", None);
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let mut m = AgentModule::new("agent", Box::new(MemStore::new()), "saga", None);
+        let mut ctx = ctx_at(0, user(9));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
-        assert!(ctx.msgs.is_empty(), "no hook, no follow-ups");
+        assert!(ctx.msgs().is_empty(), "no hook, no follow-ups");
         commit(&mut m);
         assert!(get_agent(&m, "bot").is_some());
     }
@@ -1447,7 +1103,7 @@ mod tests {
     #[test]
     fn queries_list_agents_staged_over_committed() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let mut ctx = ctx_at(0, user(9));
         exec(&mut m, &mut ctx, &admin(&register("alpha", &[]))).unwrap();
         commit(&mut m);
         exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
@@ -1460,6 +1116,36 @@ mod tests {
         let ids: Vec<String> = list_agents(&m).into_iter().map(|a| a.agent_id).collect();
         assert_eq!(ids, vec!["alpha".to_string()]);
         assert!(get_agent(&m, "beta").is_none());
+    }
+
+    #[test]
+    fn the_listing_is_sorted_by_id_regardless_of_registration_order() {
+        let mut m = module();
+        let mut ctx = ctx_at(0, user(9));
+        exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
+        exec(&mut m, &mut ctx, &admin(&register("alpha", &[]))).unwrap();
+        commit(&mut m);
+        let ids: Vec<String> = list_agents(&m).into_iter().map(|a| a.agent_id).collect();
+        assert_eq!(ids, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    /// the registry COUNT cap: the roster is one replicated record and the
+    /// `All` engagement domain, so registration `MAX_REGISTERED_AGENTS + 1`
+    /// is refused loudly — and the refusal names the cap.
+    #[test]
+    fn the_registry_count_cap_refuses_the_next_registration() {
+        let mut m = module();
+        let mut ctx = ctx_at(0, user(9));
+        for i in 0..MAX_REGISTERED_AGENTS {
+            exec(&mut m, &mut ctx, &admin(&register(&format!("a{i:04}"), &[]))).unwrap();
+        }
+        let err = exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Module(msg) if msg.contains(&MAX_REGISTERED_AGENTS.to_string())),
+            "the refusal must name the cap: {err:?}"
+        );
+        commit(&mut m);
+        assert_eq!(list_agents(&m).len(), MAX_REGISTERED_AGENTS);
     }
 
     #[test]
@@ -1489,9 +1175,7 @@ mod tests {
         let run = || {
             let mut m = module();
             for (i, (origin, op)) in ops.iter().enumerate() {
-                let mut ctx = CaptureCtx::new()
-                    .at(i as u64 + 1)
-                    .with_origin(origin.clone());
+                let mut ctx = ctx_at(i as u64 + 1, origin.clone());
                 exec(&mut m, &mut ctx, &admin(op)).unwrap();
                 commit(&mut m);
             }
@@ -1502,108 +1186,26 @@ mod tests {
         assert_ne!(a.root(), module().root(), "state moved the root");
     }
 
+    /// the module rides the store's resolver sync lane — the manifest capture
+    /// path branches on this handle, so agent joins/restores like the other
+    /// qmdb modules (never as checkpoint snapshot bytes).
     #[test]
-    fn snapshots_install_only_under_their_own_root() {
-        let mut m = module();
-        let mut ctx = CaptureCtx::new().at(1).with_origin(user(9));
-        exec(
-            &mut m,
-            &mut ctx,
-            &admin(&register("alpha", &[ACTION_CHAT_POST])),
-        )
-        .unwrap();
-        exec(&mut m, &mut ctx, &admin(&register("beta", &[]))).unwrap();
-        commit(&mut m);
-
-        let bytes = m.snapshot();
-        let root = m.root();
-
-        let mut joiner = module();
-        joiner.install(&bytes, root).unwrap();
-        assert_eq!(joiner.root(), root);
-        assert_eq!(
-            list_agents(&joiner).len(),
-            2,
-            "the joiner serves the installed registry"
-        );
-
-        // a snapshot under a foreign root is rejected, leaving no trace.
-        let mut fresh = module();
-        let before = fresh.root();
-        assert!(fresh.install(&bytes, before).is_err());
-        assert_eq!(fresh.root(), before);
-
-        // truncated bytes never land.
-        let mut fresh = module();
-        assert!(fresh.install(&bytes[..bytes.len() - 1], root).is_err());
-    }
-
-    #[test]
-    fn state_sync_handle_exposes_the_snapshot_bytes() {
-        let mut m = module();
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
-        exec(&mut m, &mut ctx, &admin(&register("alpha", &[]))).unwrap();
-        commit(&mut m);
+    fn state_sync_handle_is_resolver_backed() {
+        let m = module();
         match m.state_sync_handle().unwrap() {
-            StateSyncHandle::SnapshotBytes(bytes) => assert_eq!(bytes, m.snapshot()),
+            StateSyncHandle::ResolverBacked { backend, .. } => assert_eq!(backend, "qmdb"),
             other => panic!("unexpected handle: {other:?}"),
         }
     }
 
     // ---- runtime identity ------------------------------------------------------
 
-    /// the load-bearing determinism proof: a stable golden of the committed
-    /// encoding over the fixed 2-agent fixture. the record ALWAYS carries the
-    /// recipe_hash/caps/skills tail (empty/default here); if the encoding ever
-    /// drifts, this fails loudly.
-    ///
-    /// re-pinned for the SOUL flag day: `prompt_hash` retired, so every agent
-    /// loses its 8-byte length prefix and 32 pin bytes from the preimage (each
-    /// skill entry also gains a load-mode byte, invisible here — the fixture
-    /// mounts none). the root-hash moves; that is the flag day, declared.
-    #[test]
-    fn committed_bytes_match_the_golden() {
-        const GOLDEN_HEX: &str = "02000000000000000500000000000000616c70686100200000000000000009090909090909090909090909090909090909090909090909090909090909090500000000000000414c50484107000000000000006d6f64656c2d3102000000000000000900000000000000636861742e706f73740c000000000000007461736b732e63726561746500030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000062657461002000000000000000090909090909090909090909090909090909090909090909090909090909090904000000000000004245544107000000000000006d6f64656c2d31000000000000000000030000000000000003000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-        let m = build_fixture_registry();
-        assert_eq!(
-            hex(&m.snapshot()),
-            GOLDEN_HEX,
-            "the committed bytes must never move"
-        );
-        assert_eq!(
-            m.root(),
-            StateRoot(Sha256::digest(unhex(GOLDEN_HEX)).into()),
-            "root is sha256 of exactly the golden bytes"
-        );
-    }
-
-    /// `root()` hashes exactly the snapshot bytes (there is no container magic),
-    /// and a snapshot round-trips into a fresh joiner under the agreed root.
-    #[test]
-    fn snapshot_install_round_trips_and_root_hashes_the_snapshot() {
-        let m = build_fixture_registry();
-        let (bytes, root) = (m.snapshot(), m.root());
-        assert_eq!(
-            root,
-            StateRoot(Sha256::digest(&bytes).into()),
-            "root() hashes exactly the snapshot bytes"
-        );
-        let mut joiner = module();
-        joiner.install(&bytes, root).unwrap();
-        assert_eq!(joiner.root(), root);
-        assert_eq!(
-            joiner.snapshot(),
-            bytes,
-            "the joiner re-encodes identically"
-        );
-    }
-
-    /// register the runtime-identity fields, commit, snapshot -> install into a
-    /// fresh joiner: roots and every field round-trip.
+    /// register the runtime-identity fields, commit: every field round-trips
+    /// through the committed record.
     #[test]
     fn round_trips_recipe_caps_and_skills() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+        let mut ctx = ctx_at(3, user(9));
         let caps = ResourceCaps {
             forge_read: vec!["repo-a".into()],
             forge_push: vec!["repo-a".into()],
@@ -1645,20 +1247,12 @@ mod tests {
         assert_eq!(rec.caps, caps);
         assert_eq!(rec.skills, skills);
         assert_eq!(rec.recipe_hash, vec![9u8; RECIPE_HASH_LEN]);
-
-        let (bytes, root) = (m.snapshot(), m.root());
-        let mut joiner = module();
-        joiner.install(&bytes, root).unwrap();
-        assert_eq!(joiner.root(), root);
-        let jrec = get_agent(&joiner, "bot").unwrap();
-        assert_eq!(jrec.caps, caps);
-        assert_eq!(jrec.skills, skills);
-        assert_eq!(jrec.recipe_hash, vec![9u8; RECIPE_HASH_LEN]);
     }
 
     /// the soul is the curated skill set: an agent registers with NO prompt at
-    /// all, and its persona is just a skill loaded `Always`. the load mode is in
-    /// the preimage, so flipping one moves the root — what the model IS changed.
+    /// all, and its persona is just a skill loaded `Always`. the load mode is
+    /// committed state, so flipping one moves the root — what the model IS
+    /// changed.
     #[test]
     fn the_load_mode_is_committed_state() {
         let skill = |name: &str, load| SkillRef {
@@ -1669,7 +1263,7 @@ mod tests {
         };
         let registry = |load| {
             let mut m = module();
-            let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
+            let mut ctx = ctx_at(3, user(9));
             exec(
                 &mut m,
                 &mut ctx,
@@ -1697,19 +1291,13 @@ mod tests {
         assert_eq!(rec.skills[0].load, LoadMode::Always);
         assert_eq!(rec.skills[1].load, LoadMode::OnDemand);
 
-        // …and through snapshot → install, under the agreed root.
-        let (bytes, root) = (m.snapshot(), m.root());
-        let mut joiner = module();
-        joiner.install(&bytes, root).unwrap();
-        assert_eq!(joiner.root(), root);
-        assert_eq!(get_agent(&joiner, "bot").unwrap().skills, rec.skills);
-
-        // the SAME skills with one load mode flipped is a different root-hash:
-        // an always-skill is inlined into the assembled context document and an
-        // on-demand one is not, so the two agents do not think alike.
+        // …and the SAME skills with one load mode flipped is a different
+        // root: an always-skill is inlined into the assembled context
+        // document and an on-demand one is not, so the two agents do not
+        // think alike.
         assert_ne!(
             registry(LoadMode::OnDemand).root(),
-            root,
+            m.root(),
             "the load mode is part of the committed state, not host policy"
         );
     }
@@ -1739,7 +1327,7 @@ mod tests {
             subagent_budget: 1,
             ..Default::default()
         };
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let mut ctx = ctx_at(0, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -2000,7 +1588,7 @@ mod tests {
     #[test]
     fn register_accepts_the_pages_action_grants() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let mut ctx = ctx_at(0, user(9));
         exec(
             &mut m,
             &mut ctx,
@@ -2022,11 +1610,11 @@ mod tests {
     }
 
     /// `MAX_AGENT_RECORD_BYTES` counts the runtime-identity fields — an oversized
-    /// caps list is rejected before staging.
+    /// caps list is rejected before staging lands.
     #[test]
     fn record_size_gate_counts_runtime_fields() {
         let mut m = module();
-        let mut ctx = CaptureCtx::new().with_origin(user(9));
+        let mut ctx = ctx_at(0, user(9));
         let huge = ResourceCaps {
             tools: vec!["x".repeat(MAX_AGENT_RECORD_BYTES)],
             ..Default::default()
@@ -2058,7 +1646,7 @@ mod tests {
         }];
         let run = || {
             let mut m = module();
-            let mut ctx = CaptureCtx::new().at(1).with_origin(user(9));
+            let mut ctx = ctx_at(1, user(9));
             exec(
                 &mut m,
                 &mut ctx,
@@ -2145,57 +1733,4 @@ mod tests {
             assert!(duckdns::validate_handle(label).is_err(), "{label}");
         }
     }
-
-    /// THE TRAP THE DUCKDNS SIDE FELL INTO, PINNED SHUT HERE. `validate_agent_id`
-    /// is an ADMISSION rule and must NEVER reach `decode_committed`: decode must
-    /// accept whatever a consensus-agreed root commits to, so its accept-set is a
-    /// SUPERSET of what admission allows. A committed snapshot can hold an id that
-    /// admission would reject (`"qa luna"`). If decode enforced the admission
-    /// rule, a node on the new binary could not install that state (no state sync)
-    /// and could not restore its own recovery checkpoint — a permanent brick.
-    /// Decode accepts; only registration validates.
-    #[test]
-    fn decode_does_not_enforce_the_admission_label_rule() {
-        // forge a snapshot holding an id admission would reject: register a
-        // same-length label id and swap it in the canonical encoding (every
-        // length prefix stays valid). `register` uppercases the display name, so
-        // the id is the only occurrence of this window.
-        const NON_LABEL: &str = "qa luna";
-        const STAND_IN: &str = "qa-luna";
-        assert_eq!(NON_LABEL.len(), STAND_IN.len());
-        assert!(
-            validate_agent_id(NON_LABEL).is_err(),
-            "no live Register could ever admit it"
-        );
-
-        let mut old = module();
-        let mut ctx = CaptureCtx::new().at(3).with_origin(user(9));
-        exec(&mut old, &mut ctx, &admin(&register(STAND_IN, &[]))).unwrap();
-        commit(&mut old);
-
-        let mut bytes = old.snapshot();
-        let at = bytes
-            .windows(STAND_IN.len())
-            .position(|w| w == STAND_IN.as_bytes())
-            .expect("the stand-in id is in the canonical bytes");
-        bytes[at..at + NON_LABEL.len()].copy_from_slice(NON_LABEL.as_bytes());
-        let root = StateRoot(Sha256::digest(&bytes).into());
-
-        let mut joiner = module();
-        joiner
-            .install(&bytes, root)
-            .expect("a non-label id must still DECODE");
-        assert_eq!(joiner.root(), root);
-        assert_eq!(joiner.snapshot(), bytes, "and re-encode identically");
-        assert!(
-            get_agent(&joiner, NON_LABEL).is_some(),
-            "the agent is intact and keeps working"
-        );
-    }
 }
-
-// the wasm-guest port: the dispatch shell that adapts this module to the
-// ducktape:module world. compiled only by the guest-builder's synthesized
-// wasm32 cdylib workspace (feature `guest`), never by the native build.
-#[cfg(feature = "guest")]
-mod guest;

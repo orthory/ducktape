@@ -152,6 +152,9 @@ noded = { path = "../noded", features = ["testkit"] }
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
 async-trait = { workspace = true }
+# the mcp harness genesis has no commonware runtime context, so the agent
+# registry rides the in-memory MerkleStore test double.
+sdk-testkit = { workspace = true }
 # paused-clock unit tests (`#[tokio::test(start_paused = true)]`) — the
 # first-contact window guard proves "a mute plane cannot hang the race"
 # in milliseconds of wall time instead of minutes.

@@ -1,4 +1,4 @@
-//! deterministic user-defined automations over chat hooks.
+//! qmdb-backed deterministic user-defined automations over chat hooks.
 //!
 //! an operator registers rules — a [`Trigger`] (chat post filters) plus an
 //! [`Action`] (post a chat message, create a task, or deliver an inbox
@@ -7,8 +7,8 @@
 //! in the SAME block as the event (P2).
 //!
 //! [`Trigger`] is a chat message-posted filter (chat is the only event source
-//! today) and is a flat single-shape struct in the snapshot codec. A future
-//! non-chat trigger is its own state break (flag day).
+//! today) and is a flat single-shape struct on the wire. A future non-chat
+//! trigger is its own state break (flag day).
 //!
 //! ## Origin-gated intake (spoof-proofing)
 //!
@@ -65,19 +65,38 @@
 //!
 //! ## State model
 //!
-//! committed state is `BTreeMap<rule_id, Rule>` plus a bounded run-history ring
-//! (`VecDeque`, capped at [`MAX_RUN_HISTORY`], oldest dropped — deterministic).
-//! writes stage during `execute` and publish at `commit_block`; `root()` is a
-//! sha256 over the canonical committed encoding, which is byte-identical to the
-//! `snapshot()` preimage. every size cap is enforced at execute with rejection,
-//! so oversized bytes never enter the root preimage (the repo's poison-value
-//! lesson).
+//! pure logic over a host-injected [`sdk::MerkleStore`]: the HOST constructs
+//! the concrete store (qmdb today — `statesync::qmdb::QmdbStore`) and hands it
+//! to [`Automations::new`], so this crate never names a storage crate. one
+//! logical record per rule plus TWO aggregate records consensus itself
+//! consumes, so both stay canonical (never index-tier scan machinery):
+//!
+//! - the ROSTER (the sorted rule-id list, bounded by [`MAX_RULES`]) — every
+//!   hook event evaluates every rule inside `execute`, so consensus consumes
+//!   the enumeration on every hooked post;
+//! - the run-history CURSOR (`head`/`next` ring bounds) — the write path
+//!   consumes it on every append to place the new record and trim the ring to
+//!   [`MAX_RUN_HISTORY`] (point deletes, no scan).
+//!
+//! run records are seq-keyed point records between the cursor's bounds; the
+//! `RunHistory` query walks them by derived key, never by store iteration.
+//!
+//! writes are staged during a block and flushed to the store in one batch at
+//! `commit_block`; the module root IS the store's merkle root. sync belongs
+//! to the store, not this module: a joiner rebuilds the concrete store from a
+//! peer (`QmdbStore::sync_from`) and wraps a fresh `Automations` around it.
+//!
+//! oversized values never reach the store (the poison-value lesson — the qmdb
+//! wire codec bounds a value at decode, so an over-cap committed value would
+//! wedge every syncing peer): rule fields are individually capped at execute,
+//! which bounds the rule record; the roster record is byte-capped at create
+//! ([`MAX_ROSTER_RECORD_BYTES`]); and a run record is bounded by chat's own
+//! channel-record cap plus this module's id/template caps.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
 
-use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 
 use chat::{
@@ -89,9 +108,11 @@ use inbox::{
     InboxMsg, MAX_BODY_BYTES as INBOX_MAX_BODY_BYTES, MAX_KIND_BYTES, MAX_MEMBER_BYTES,
     encode_msg as inbox_encode_msg,
 };
-use sdk::codec::{self, Cursor};
-use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, require_non_empty};
-use sha2::{Digest, Sha256};
+use sdk::{
+    Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    StateRoot, StateSyncHandle, require_non_empty,
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tasks::{
     TaskMsg, TaskQuery, TaskReply, decode_task_reply as tasks_decode_reply,
     encode_task_msg as tasks_encode_msg, encode_task_query as tasks_encode_query,
@@ -110,6 +131,50 @@ pub const MAX_RUN_HISTORY: usize = 1024;
 /// actions emitted per incoming event; matching rules past this are recorded as
 /// skipped (`action_ok = false`, `detail = "action budget exceeded"`).
 pub const MAX_ACTIONS_PER_EVENT: usize = 8;
+/// serialized roster-record byte bound, enforced at create. the per-field caps
+/// do not bound the roster's SERIALIZED form tightly enough on their own:
+/// [`MAX_RULES`] ids of [`MAX_ID_BYTES`] control characters JSON-escape past
+/// the qmdb wire codec's decode ceiling — a committed over-cap value would
+/// wedge every syncing peer (the poison-value lesson), so the create op
+/// refuses loudly instead.
+pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
+
+/// per-rule record key: prefix + 0 + id (the single-component shape chat
+/// uses). safe because every key literal below is fixed and none is another
+/// followed by a 0 byte.
+fn rule_key(rule_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + 1 + rule_id.len());
+    key.extend_from_slice(b"rule");
+    key.push(0);
+    key.extend_from_slice(rule_id.as_bytes());
+    key
+}
+
+/// per-run-record key: prefix + 0 + seq (big-endian).
+fn run_key(seq: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(3 + 1 + 8);
+    key.extend_from_slice(b"run");
+    key.push(0);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// the roster record's whole key. collides with no `rule\0...`/`run\0...` key.
+const ROSTER_KEY: &[u8] = b"roster";
+
+/// the run-history cursor record's whole key.
+const RUN_CURSOR_KEY: &[u8] = b"runcursor";
+
+/// the run-history ring bounds, maintained by the write path: `head` is the
+/// oldest live record's seq, `next` the seq the next append takes (empty ring
+/// when equal). consensus consumes it on every append — placing the new
+/// record and trimming the ring are decided from this record, never from a
+/// store scan — so it stays canonical.
+#[derive(Serialize, Deserialize, Default)]
+struct RunCursor {
+    head: u64,
+    next: u64,
+}
 
 pub struct Automations {
     id: ModuleId,
@@ -120,18 +185,17 @@ pub struct Automations {
     tasks: ModuleId,
     /// the inbox module id — the `DeliverInbox` follow-up target.
     inbox: ModuleId,
-    // committed state (the root preimage).
-    rules: BTreeMap<String, Rule>,
-    history: VecDeque<RunRecord>,
-    // staged overlay, published at commit_block. `Some` upserts a rule, `None`
-    // tombstones it; run-history appends collect here in emit order.
-    pending_rules: BTreeMap<String, Option<Rule>>,
-    pending_history: Vec<RunRecord>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl Automations {
+    /// wrap the host-constructed store under module identity `id`.
     pub fn new(
         id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
         chat: impl Into<ModuleId>,
         tasks: impl Into<ModuleId>,
         inbox: impl Into<ModuleId>,
@@ -141,11 +205,84 @@ impl Automations {
             chat: chat.into(),
             tasks: tasks.into(),
             inbox: inbox.into(),
-            rules: BTreeMap::new(),
-            history: VecDeque::new(),
-            pending_rules: BTreeMap::new(),
-            pending_history: Vec::new(),
+            staged: StagedStore::new(store),
         }
+    }
+
+    // ---- staged-over-committed reads ----------------------------------------
+
+    async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
+    where
+        T: DeserializeOwned,
+    {
+        match self.staged.get(key).await? {
+            Some(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// stage a value whose serialized size the execute-time field caps already
+    /// bound (rule records, run records, the cursor) — see the module doc's
+    /// poison-value paragraph. the roster goes through [`Self::store_bounded`].
+    fn store<T>(&mut self, key: Vec<u8>, value: &T)
+    where
+        T: Serialize,
+    {
+        self.staged.stage(
+            key,
+            serde_json::to_vec(value).expect("automations value is serializable"),
+        );
+    }
+
+    /// stage a value only if its serialized size fits `cap` — the write-time
+    /// guard against poison values (the qmdb codec cap is decode-only).
+    fn store_bounded<T>(
+        &mut self,
+        key: Vec<u8>,
+        value: &T,
+        cap: usize,
+        what: &str,
+    ) -> Result<(), Error>
+    where
+        T: Serialize,
+    {
+        let bytes = serde_json::to_vec(value).expect("automations value is serializable");
+        if bytes.len() > cap {
+            return Err(Error::Module(format!(
+                "{what} record too large: {} > {cap} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(key, bytes);
+        Ok(())
+    }
+
+    async fn rule(&self, rule_id: &str) -> Result<Option<Rule>, Error> {
+        self.load(&rule_key(rule_id)).await
+    }
+
+    /// the rule roster — every registered id, sorted. record and roster are
+    /// staged (and commit or abort) together, so membership in one is
+    /// membership in both; the roster is the ONE existence authority at create.
+    async fn roster(&self) -> Result<Vec<String>, Error> {
+        Ok(self.load(ROSTER_KEY).await?.unwrap_or_default())
+    }
+
+    /// every rule, in roster (rule-id) order — the ONE enumeration read:
+    /// consensus itself consumes it (each hook event evaluates each rule), so
+    /// it stays canonical, bounded by [`MAX_RULES`]. a rostered id without a
+    /// record is a store bug — loud, never skipped.
+    async fn all_rules(&self) -> Result<Vec<Rule>, Error> {
+        let mut rules = Vec::new();
+        for rule_id in self.roster().await? {
+            let Some(rule) = self.rule(&rule_id).await? else {
+                return Err(Error::Module(format!("missing rule record: {rule_id}")));
+            };
+            rules.push(rule);
+        }
+        Ok(rules)
     }
 
     // ---- validation ---------------------------------------------------------
@@ -210,42 +347,9 @@ impl Automations {
         Ok(())
     }
 
-    // ---- staged-overlay reads -----------------------------------------------
-
-    /// the effective rule under the staged overlay: a staged upsert wins, a
-    /// staged tombstone hides the committed rule, otherwise the committed rule.
-    fn rule(&self, rule_id: &str) -> Option<Rule> {
-        match self.pending_rules.get(rule_id) {
-            Some(staged) => staged.clone(),
-            None => self.rules.get(rule_id).cloned(),
-        }
-    }
-
-    /// committed rules merged with the staged overlay (upserts win, tombstones
-    /// remove), in `rule_id` order.
-    fn effective_rules(&self) -> BTreeMap<String, Rule> {
-        let mut merged = self.rules.clone();
-        for (id, staged) in &self.pending_rules {
-            match staged {
-                Some(rule) => {
-                    merged.insert(id.clone(), rule.clone());
-                }
-                None => {
-                    merged.remove(id);
-                }
-            }
-        }
-        merged
-    }
-
-    /// committed history followed by staged appends (read-your-writes in-block).
-    fn effective_history(&self) -> impl Iterator<Item = &RunRecord> {
-        self.history.iter().chain(self.pending_history.iter())
-    }
-
     // ---- admin ops ----------------------------------------------------------
 
-    fn stage_create_rule(
+    async fn stage_create_rule(
         &mut self,
         rule_id: String,
         trigger: Trigger,
@@ -256,46 +360,63 @@ impl Automations {
         Self::validate_len("rule_id", &rule_id, MAX_ID_BYTES)?;
         Self::validate_trigger(&trigger)?;
         Self::validate_action(&action)?;
-        if self.rule(&rule_id).is_some() {
-            return Err(Error::Module(format!("rule already exists: {rule_id}")));
-        }
-        if self.effective_rules().len() >= MAX_RULES {
+        let mut roster = self.roster().await?;
+        let position = match roster.binary_search(&rule_id) {
+            Ok(_) => {
+                return Err(Error::Module(format!("rule already exists: {rule_id}")));
+            }
+            Err(position) => position,
+        };
+        if roster.len() >= MAX_RULES {
             return Err(Error::Module(format!("rule cap reached ({MAX_RULES})")));
         }
-        self.pending_rules.insert(
-            rule_id.clone(),
-            Some(Rule {
-                rule_id,
+        roster.insert(position, rule_id.clone());
+        // the roster's byte gate first: a refusal must stage NOTHING.
+        self.store_bounded(
+            ROSTER_KEY.to_vec(),
+            &roster,
+            MAX_ROSTER_RECORD_BYTES,
+            "roster",
+        )?;
+        self.store(
+            rule_key(&rule_id),
+            &Rule {
+                rule_id: rule_id.clone(),
                 enabled: true,
                 trigger,
                 action,
                 created_at: consensus_time,
                 fire_count: 0,
-            }),
+            },
         );
         Ok(())
     }
 
-    fn stage_set_enabled(&mut self, rule_id: String, enabled: bool) -> Result<(), Error> {
+    async fn stage_set_enabled(&mut self, rule_id: String, enabled: bool) -> Result<(), Error> {
         require_non_empty("rule_id", &rule_id)?;
-        let mut rule = self
-            .rule(&rule_id)
-            .ok_or_else(|| Error::Module(format!("unknown rule: {rule_id}")))?;
+        let Some(mut rule) = self.rule(&rule_id).await? else {
+            return Err(Error::Module(format!("unknown rule: {rule_id}")));
+        };
         if rule.enabled == enabled {
-            // idempotent: staging nothing keeps the committed root byte-identical.
+            // idempotent: staging nothing keeps the op log — and the root —
+            // byte-identical to no write at all.
             return Ok(());
         }
         rule.enabled = enabled;
-        self.pending_rules.insert(rule_id, Some(rule));
+        self.store(rule_key(&rule_id), &rule);
         Ok(())
     }
 
-    fn stage_delete_rule(&mut self, rule_id: String) -> Result<(), Error> {
+    async fn stage_delete_rule(&mut self, rule_id: String) -> Result<(), Error> {
         require_non_empty("rule_id", &rule_id)?;
-        if self.rule(&rule_id).is_none() {
+        let mut roster = self.roster().await?;
+        let Ok(position) = roster.binary_search(&rule_id) else {
             return Err(Error::Module(format!("unknown rule: {rule_id}")));
-        }
-        self.pending_rules.insert(rule_id, None);
+        };
+        roster.remove(position);
+        self.staged.delete(rule_key(&rule_id));
+        // shrinking keeps the roster under its create-time byte gate.
+        self.store(ROSTER_KEY.to_vec(), &roster);
         Ok(())
     }
 
@@ -320,7 +441,7 @@ impl Automations {
             return Ok(());
         }
         let height = ctx.env().height;
-        let effective = self.effective_rules();
+        let rules = self.all_rules().await?;
 
         // fetch the post's text ONCE, and only if some rule that already matches
         // on channel + mention needs it (a `text_contains` filter, or a `{text}`
@@ -328,7 +449,7 @@ impl Automations {
         // which is distinct from a legitimately empty body (`Some("")`): rules
         // that need text record a failure on `None` instead of silently
         // matching against emptiness.
-        let needs_text = effective.values().any(|rule| {
+        let needs_text = rules.iter().any(|rule| {
             rule.enabled
                 && Self::matches_channel_and_mention(rule, &channel_id, &mentions)
                 && Self::rule_wants_text(rule)
@@ -344,16 +465,16 @@ impl Automations {
             .map(display_author)
             .unwrap_or_else(String::new);
 
-        // evaluate in deterministic rule_id order (BTreeMap iteration).
+        // evaluate in deterministic rule_id order (roster order).
         let mut budget = 0usize;
-        let mut fired: Vec<(String, Rule)> = Vec::new();
+        let mut fired: Vec<Rule> = Vec::new();
         let mut records: Vec<RunRecord> = Vec::new();
-        for (rule_id, rule) in &effective {
+        for rule in &rules {
             if !rule.enabled || !Self::matches_channel_and_mention(rule, &channel_id, &mentions) {
                 continue;
             }
             let record = |action_ok: bool, detail: String| RunRecord {
-                rule_id: rule_id.clone(),
+                rule_id: rule.rule_id.clone(),
                 channel_id: channel_id.clone(),
                 seq,
                 height,
@@ -394,7 +515,7 @@ impl Automations {
                     budget += 1;
                     let mut updated = rule.clone();
                     updated.fire_count = updated.fire_count.saturating_add(1);
-                    fired.push((rule_id.clone(), updated));
+                    fired.push(updated);
                     records.push(record(true, detail));
                 }
                 Err(detail) => {
@@ -405,10 +526,29 @@ impl Automations {
                 }
             }
         }
-        for (rule_id, updated) in fired {
-            self.pending_rules.insert(rule_id, Some(updated));
+        for updated in fired {
+            self.store(rule_key(&updated.rule_id), &updated);
         }
-        self.pending_history.extend(records);
+        self.append_history(records).await
+    }
+
+    /// append this event's run records and trim the ring to
+    /// [`MAX_RUN_HISTORY`]: place each record at `next`, then point-delete
+    /// from `head` — every decision reads the cursor, never a store scan.
+    async fn append_history(&mut self, records: Vec<RunRecord>) -> Result<(), Error> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut cursor: RunCursor = self.load(RUN_CURSOR_KEY).await?.unwrap_or_default();
+        for record in records {
+            self.store(run_key(cursor.next), &record);
+            cursor.next += 1;
+        }
+        while cursor.next - cursor.head > MAX_RUN_HISTORY as u64 {
+            self.staged.delete(run_key(cursor.head));
+            cursor.head += 1;
+        }
+        self.store(RUN_CURSOR_KEY.to_vec(), &cursor);
         Ok(())
     }
 
@@ -611,32 +751,6 @@ impl Automations {
             } => member_template.contains("{text}") || body_template.contains("{text}"),
         }
     }
-
-    // ---- state-sync ---------------------------------------------------------
-
-    fn root_of(rules: &BTreeMap<String, Rule>, history: &VecDeque<RunRecord>) -> StateRoot {
-        let mut h = Sha256::new();
-        h.update(encode_state(rules, history));
-        StateRoot(h.finalize().into())
-    }
-
-    /// the canonical committed encoding — byte-identical to the `root()` preimage.
-    pub fn snapshot(&self) -> Vec<u8> {
-        encode_state(&self.rules, &self.history)
-    }
-
-    /// adopt a peer snapshot only after re-deriving `expected` via the exact
-    /// `root()` algorithm. all-or-nothing: on any error this module (and its
-    /// root) is byte-identical to before the call.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (rules, history) = decode_state(bytes)?;
-        sdk::verify_snapshot_root(Self::root_of(&rules, &history), expected)?;
-        self.rules = rules;
-        self.history = history;
-        self.pending_rules.clear();
-        self.pending_history.clear();
-        Ok(())
-    }
 }
 
 // ---- deterministic author display -------------------------------------------
@@ -740,211 +854,31 @@ fn substitute_vars(template: &str, vars: &TemplateVars<'_>) -> String {
     out
 }
 
-// ---- canonical byte codec (root preimage) -----------------------------------
-
-fn encode_state(rules: &BTreeMap<String, Rule>, history: &VecDeque<RunRecord>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(rules.len() as u64).to_le_bytes());
-    for rule in rules.values() {
-        codec::push_str(&mut out, &rule.rule_id);
-        out.push(rule.enabled as u8);
-        push_trigger(&mut out, &rule.trigger);
-        push_action(&mut out, &rule.action);
-        out.extend_from_slice(&rule.created_at.to_le_bytes());
-        out.extend_from_slice(&rule.fire_count.to_le_bytes());
-    }
-    out.extend_from_slice(&(history.len() as u64).to_le_bytes());
-    for record in history {
-        codec::push_str(&mut out, &record.rule_id);
-        codec::push_str(&mut out, &record.channel_id);
-        out.extend_from_slice(&record.seq.to_le_bytes());
-        out.extend_from_slice(&record.height.to_le_bytes());
-        out.push(record.action_ok as u8);
-        codec::push_str(&mut out, &record.detail);
-    }
-    out
-}
-
-fn push_trigger(out: &mut Vec<u8>, trigger: &Trigger) {
-    // Trigger is a flat single-shape struct in the snapshot (no kind byte).
-    codec::push_opt_str(out, trigger.channel_id.as_deref());
-    codec::push_opt_str(out, trigger.mention.as_deref());
-    codec::push_opt_str(out, trigger.text_contains.as_deref());
-}
-
-fn push_action(out: &mut Vec<u8>, action: &Action) {
-    match action {
-        Action::PostMessage {
-            channel_id,
-            template,
-        } => {
-            out.push(0);
-            codec::push_str(out, channel_id);
-            codec::push_str(out, template);
-        }
-        Action::CreateTask {
-            task_id_prefix,
-            title_template,
-        } => {
-            out.push(1);
-            codec::push_str(out, task_id_prefix);
-            codec::push_str(out, title_template);
-        }
-        Action::DeliverInbox {
-            member_template,
-            kind,
-            body_template,
-        } => {
-            out.push(2);
-            codec::push_str(out, member_template);
-            codec::push_str(out, kind);
-            codec::push_str(out, body_template);
-        }
-    }
-}
-
-fn decode_state(bytes: &[u8]) -> Result<(BTreeMap<String, Rule>, VecDeque<RunRecord>), Error> {
-    let mut c = Cursor::new(bytes);
-    let rule_count = c.u64("snapshot rule count")?;
-    // each rule costs at least one byte, bounding a forged count.
-    c.bound(rule_count, 1, "snapshot rule count")?;
-    let mut rules: BTreeMap<String, Rule> = BTreeMap::new();
-    for _ in 0..rule_count {
-        let rule_id = c.string("snapshot rule_id")?;
-        require_non_empty("rule_id", &rule_id)?;
-        Automations::validate_len("rule_id", &rule_id, MAX_ID_BYTES)?;
-        let enabled = c.bool("snapshot rule enabled")?;
-        let trigger = read_trigger(&mut c)?;
-        let action = read_action(&mut c)?;
-        let created_at = c.u64("snapshot rule created_at")?;
-        let fire_count = c.u64("snapshot rule fire_count")?;
-        if rules
-            .last_key_value()
-            .is_some_and(|(last, _)| last.as_str() >= rule_id.as_str())
-        {
-            return Err(Error::Module(
-                "snapshot rule ids not strictly ascending".into(),
-            ));
-        }
-        rules.insert(
-            rule_id.clone(),
-            Rule {
-                rule_id,
-                enabled,
-                trigger,
-                action,
-                created_at,
-                fire_count,
-            },
-        );
-    }
-
-    let history_count = c.u64("snapshot history count")?;
-    if history_count > MAX_RUN_HISTORY as u64 {
-        return Err(Error::Module("snapshot run history exceeds cap".into()));
-    }
-    c.bound(history_count, 1, "snapshot history count")?;
-    let mut history: VecDeque<RunRecord> = VecDeque::with_capacity(history_count as usize);
-    for _ in 0..history_count {
-        // rule_id is always a registered rule's id, so the execute-time caps
-        // hold for it. channel_id and detail derive from the chat EVENT (chat
-        // does not bound channel-id length), so no length checks on them:
-        // install must accept every execute-reachable state — the root
-        // comparison is the integrity check (the poison-value lesson).
-        let rule_id = c.string("snapshot record rule_id")?;
-        require_non_empty("run record rule_id", &rule_id)?;
-        Automations::validate_len("run record rule_id", &rule_id, MAX_ID_BYTES)?;
-        let channel_id = c.string("snapshot record channel_id")?;
-        let seq = c.u64("snapshot record seq")?;
-        let height = c.u64("snapshot record height")?;
-        let action_ok = c.bool("snapshot record action_ok")?;
-        let detail = c.string("snapshot record detail")?;
-        history.push_back(RunRecord {
-            rule_id,
-            channel_id,
-            seq,
-            height,
-            action_ok,
-            detail,
-        });
-    }
-
-    c.finish("automations snapshot")?;
-    Ok((rules, history))
-}
-
-/// a PLAIN optional string (flag byte + length-prefixed string). deliberately
-/// not [`Cursor::opt_str`]: its non-empty rule would reject the
-/// execute-reachable `Some("")` mention/text filters.
-fn read_opt_string(c: &mut Cursor<'_>, what: &str) -> Result<Option<String>, Error> {
-    Ok(if c.bool(what)? {
-        Some(c.string(what)?)
-    } else {
-        None
-    })
-}
-
-fn read_trigger(c: &mut Cursor<'_>) -> Result<Trigger, Error> {
-    let channel_id = read_opt_string(c, "trigger channel_id")?;
-    if let Some(channel_id) = &channel_id {
-        require_non_empty("trigger channel_id", channel_id)?;
-        Automations::validate_len("trigger channel_id", channel_id, MAX_ID_BYTES)?;
-    }
-    let mention = read_opt_string(c, "trigger mention")?;
-    if let Some(mention) = &mention {
-        Automations::validate_len("trigger mention", mention, MAX_FILTER_BYTES)?;
-    }
-    let text_contains = read_opt_string(c, "trigger text_contains")?;
-    if let Some(text_contains) = &text_contains {
-        Automations::validate_len("trigger text_contains", text_contains, MAX_FILTER_BYTES)?;
-    }
-    Ok(Trigger {
-        channel_id,
-        mention,
-        text_contains,
-    })
-}
-
-fn read_action(c: &mut Cursor<'_>) -> Result<Action, Error> {
-    let action = match c.byte("snapshot action kind")? {
-        0 => Action::PostMessage {
-            channel_id: c.string("action channel_id")?,
-            template: c.string("action template")?,
-        },
-        1 => Action::CreateTask {
-            task_id_prefix: c.string("action task_id_prefix")?,
-            title_template: c.string("action title_template")?,
-        },
-        2 => Action::DeliverInbox {
-            member_template: c.string("action member_template")?,
-            kind: c.string("action kind")?,
-            body_template: c.string("action body_template")?,
-        },
-        other => {
-            return Err(Error::Module(format!(
-                "snapshot has unknown action discriminant {other}"
-            )));
-        }
-    };
-    Automations::validate_action(&action)?;
-    Ok(action)
-}
-
 #[async_trait::async_trait(?Send)]
 impl Module for Automations {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
 
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        Self::root_of(&self.rules, &self.history)
+        self.staged.root()
     }
 
-    /// advertise the snapshot lane: [`Automations::snapshot`] is the exact
-    /// preimage of `root()`, and [`Automations::install`] verifies before
-    /// adopting — so a joiner can rebuild this module against the agreed root.
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -960,11 +894,15 @@ impl Module for Automations {
                     rule_id,
                     trigger,
                     action,
-                } => self.stage_create_rule(rule_id, trigger, action, ctx.env().consensus_time),
-                AutomationsMsg::SetEnabled { rule_id, enabled } => {
-                    self.stage_set_enabled(rule_id, enabled)
+                } => {
+                    let consensus_time = ctx.env().consensus_time;
+                    self.stage_create_rule(rule_id, trigger, action, consensus_time)
+                        .await
                 }
-                AutomationsMsg::DeleteRule { rule_id } => self.stage_delete_rule(rule_id),
+                AutomationsMsg::SetEnabled { rule_id, enabled } => {
+                    self.stage_set_enabled(rule_id, enabled).await
+                }
+                AutomationsMsg::DeleteRule { rule_id } => self.stage_delete_rule(rule_id).await,
                 AutomationsMsg::HookEvent(_) => Err(Error::Module(
                     "hook events must originate from the chat module".into(),
                 )),
@@ -975,20 +913,28 @@ impl Module for Automations {
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
             AutomationsQuery::ListRules => Ok(encode_reply(&AutomationsReply::Rules(
-                self.effective_rules().into_values().collect(),
+                self.all_rules().await?,
             ))),
-            AutomationsQuery::GetRule { rule_id } => {
-                Ok(encode_reply(&AutomationsReply::Rule(self.rule(&rule_id))))
-            }
+            AutomationsQuery::GetRule { rule_id } => Ok(encode_reply(&AutomationsReply::Rule(
+                self.rule(&rule_id).await?,
+            ))),
             AutomationsQuery::RunHistory { rule_id, limit } => {
                 let limit = usize::try_from(limit)
                     .unwrap_or(usize::MAX)
                     .min(MAX_RUN_HISTORY);
-                let mut matched: Vec<RunRecord> = self
-                    .effective_history()
-                    .filter(|record| record.rule_id == rule_id)
-                    .cloned()
-                    .collect();
+                // walk the ring by derived key between the cursor's bounds
+                // (≤ MAX_RUN_HISTORY point reads). a seq inside the bounds
+                // without a record is a store bug — loud, never skipped.
+                let cursor: RunCursor = self.load(RUN_CURSOR_KEY).await?.unwrap_or_default();
+                let mut matched: Vec<RunRecord> = Vec::new();
+                for seq in cursor.head..cursor.next {
+                    let Some(record) = self.load::<RunRecord>(&run_key(seq)).await? else {
+                        return Err(Error::Module(format!("missing run record: {seq}")));
+                    };
+                    if record.rule_id == rule_id {
+                        matched.push(record);
+                    }
+                }
                 if matched.len() > limit {
                     matched = matched.split_off(matched.len() - limit);
                 }
@@ -997,29 +943,14 @@ impl Module for Automations {
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, staged) in std::mem::take(&mut self.pending_rules) {
-            match staged {
-                Some(rule) => {
-                    self.rules.insert(id, rule);
-                }
-                None => {
-                    self.rules.remove(&id);
-                }
-            }
-        }
-        for record in std::mem::take(&mut self.pending_history) {
-            self.history.push_back(record);
-            while self.history.len() > MAX_RUN_HISTORY {
-                self.history.pop_front();
-            }
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending_rules.clear();
-        self.pending_history.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -1027,8 +958,9 @@ impl Module for Automations {
 #[cfg(test)]
 mod tests;
 
-// the wasm-guest port: the dispatch shell that adapts this module to the
-// ducktape:module world. compiled only by the guest-builder's synthesized
-// wasm32 cdylib workspace (feature `guest`), never by the native build.
+// the wasm-guest port: the store-backed dispatch shell that adapts this module
+// to the ducktape:module world. compiled only by the guest-builder's
+// synthesized wasm32 cdylib workspace (feature `guest`), never by the native
+// build.
 #[cfg(feature = "guest")]
 mod guest;

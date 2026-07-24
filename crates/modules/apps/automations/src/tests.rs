@@ -1,5 +1,6 @@
 //! the unit-test suite for the automations module: a CaptureCtx harness over
-//! `execute` (probes included), the codec round-trips, and install validation.
+//! `execute` (probes included) atop a `MemStore`-backed module, and the
+//! store-backed staging/root semantics.
 
 use super::*;
 
@@ -19,7 +20,7 @@ fn retired_tagged_trigger_shape_rejects_loudly() {
     assert!(err.is_err(), "retired tagged trigger shape must not decode");
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{AutomationsReply, decode_reply, encode_msg, encode_query};
 use chat::{
@@ -30,7 +31,7 @@ use chat::{
 use futures::executor::block_on;
 use inbox::{InboxMsg, decode_msg as inbox_decode_msg};
 use sdk::{Env, Event};
-use sdk_testkit::TestCtx;
+use sdk_testkit::{MemStore, TestCtx};
 use tasks::{
     Task, TaskStatus, decode_task_msg as tasks_decode_msg, encode_task_reply as tasks_encode_reply,
 };
@@ -195,7 +196,7 @@ impl Ctx for CaptureCtx {
 // ---- fixtures -----------------------------------------------------------
 
 fn module() -> Automations {
-    Automations::new(ME, CHAT, TASKS, INBOX)
+    Automations::new(ME, Box::new(MemStore::new()), CHAT, TASKS, INBOX)
 }
 
 fn user(byte: u8) -> AuthorRef {
@@ -1269,34 +1270,23 @@ fn oversized_composed_id_is_recorded_not_emitted() {
 
 #[test]
 fn fire_count_saturates_at_u64_max() {
-    // craft a committed state whose rule already sits at u64::MAX via the
-    // canonical codec (install verifies it against its own root), then
-    // fire: the count must saturate, not wrap.
-    let mut rules: BTreeMap<String, Rule> = BTreeMap::new();
-    rules.insert(
-        "r".into(),
-        Rule {
-            rule_id: "r".into(),
-            enabled: true,
-            trigger: Trigger {
-                channel_id: None,
-                mention: None,
-                text_contains: None,
-            },
-            action: Action::CreateTask {
-                task_id_prefix: "auto".into(),
-                title_template: "T".into(),
-            },
-            created_at: 0,
-            fire_count: u64::MAX,
-        },
-    );
-    let history_ring: VecDeque<RunRecord> = VecDeque::new();
-    let bytes = encode_state(&rules, &history_ring);
-    let root = Automations::root_of(&rules, &history_ring);
-
+    // craft a committed state whose rule already sits at u64::MAX — staged
+    // directly through the in-crate store seam (no admin op can produce this
+    // count in a test's lifetime) — then fire: the count must saturate, not
+    // wrap.
     let mut m = module();
-    m.install(&bytes, root).expect("install crafted state");
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create("r", post_trigger(None, None), task_action("auto", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit rule");
+    let mut rule = block_on(m.rule("r")).expect("load").expect("r");
+    rule.fire_count = u64::MAX;
+    m.store(rule_key("r"), &rule);
+    block_on(m.commit_block()).expect("commit crafted count");
 
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
@@ -1395,142 +1385,157 @@ fn abort_discards_staged_rules_and_history() {
     assert!(history(&m, "r", 16).is_empty());
 }
 
-// ---- snapshot / install -------------------------------------------------
+// ---- store-backed state semantics ---------------------------------------
 
+/// two instances replaying the same ops (rule CRUD + a hooked fire) produce
+/// identical roots — the determinism the shared store root relies on.
 #[test]
-fn snapshot_install_round_trip_and_root_stability() {
-    let mut source = module();
-    let mut ctx = CaptureCtx::new();
-    exec(
-        &mut source,
-        &mut ctx,
-        &create(
-            "r1",
-            post_trigger(Some("general"), None),
-            post_action("general", "hi {seq}"),
-        ),
-    )
-    .expect("create r1");
-    exec(
-        &mut source,
-        &mut ctx,
-        &create(
-            "r2",
-            post_trigger(None, Some("x")),
-            task_action("p", "t {text}"),
-        ),
-    )
-    .expect("create r2");
-    exec(
-        &mut source,
-        &mut ctx,
-        &create(
-            "r3",
-            Trigger {
-                channel_id: None,
-                mention: Some("ops".into()),
-                text_contains: None,
-            },
-            inbox_action("{author}", "notify", "posted {channel}@{seq}"),
-        ),
-    )
-    .expect("create r3");
-    block_on(source.commit_block()).expect("commit rules");
+fn two_instances_replaying_the_same_ops_produce_identical_roots() {
+    let run = || {
+        let mut m = module();
+        let mut ctx = CaptureCtx::new();
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                "r1",
+                post_trigger(Some("general"), None),
+                post_action("general", "hi {seq}"),
+            ),
+        )
+        .expect("create r1");
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                "r2",
+                post_trigger(None, Some("x")),
+                task_action("p", "t {text}"),
+            ),
+        )
+        .expect("create r2");
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                "r3",
+                Trigger {
+                    channel_id: None,
+                    mention: Some("ops".into()),
+                    text_contains: None,
+                },
+                inbox_action("{author}", "notify", "posted {channel}@{seq}"),
+            ),
+        )
+        .expect("create r3");
+        block_on(m.commit_block()).expect("commit rules");
 
-    // fire r1 to populate the run-history ring (the transcript provides the
-    // channel for the probe and text for r2's filter, which does not match).
-    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_transcript(
-        "general",
-        vec![message(
+        // fire r1 to populate the run-history ring (the transcript provides
+        // the channel for the probe and text for r2's filter, which does not
+        // match).
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_transcript(
             "general",
-            1,
-            user(1),
-            vec![Block::paragraph("hello")],
-        )],
-    );
-    exec(
-        &mut source,
-        &mut chat_ctx,
-        &posted("general", 1, user(1), Vec::new()),
-    )
-    .expect("fire");
-    block_on(source.commit_block()).expect("commit fire");
-
-    let expected = source.root();
-    let handle = source.state_sync_handle().expect("handle");
-    let bytes = match handle {
-        sdk::StateSyncHandle::SnapshotBytes(bytes) => bytes,
-        other => panic!("expected SnapshotBytes, got {other:?}"),
+            vec![message(
+                "general",
+                1,
+                user(1),
+                vec![Block::paragraph("hello")],
+            )],
+        );
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", 1, user(1), Vec::new()),
+        )
+        .expect("fire");
+        block_on(m.commit_block()).expect("commit fire");
+        m
     };
-    assert_eq!(
-        bytes,
-        source.snapshot(),
-        "handle carries the snapshot preimage"
-    );
+    let (a, b) = (run(), run());
+    assert_eq!(a.root(), b.root());
+    assert_ne!(a.root(), module().root(), "state moved the root");
+    assert_eq!(list_rules(&a), list_rules(&b));
+    assert_eq!(history(&a, "r1", 16), history(&b, "r1", 16));
+}
 
-    let mut target = module();
-    target.install(&bytes, expected).expect("install");
-    assert_eq!(target.root(), expected, "root matches after install");
-    assert_eq!(list_rules(&target), list_rules(&source));
-    assert_eq!(history(&target, "r1", 16), history(&source, "r1", 16));
+/// the module rides the store's resolver sync lane — the manifest capture
+/// path branches on this handle, so automations joins/restores like the
+/// other qmdb modules (never as checkpoint snapshot bytes).
+#[test]
+fn state_sync_handle_is_resolver_backed() {
+    let m = module();
+    match m.state_sync_handle().unwrap() {
+        StateSyncHandle::ResolverBacked { backend, .. } => assert_eq!(backend, "qmdb"),
+        other => panic!("unexpected handle: {other:?}"),
+    }
 }
 
 #[test]
-fn install_rejects_wrong_root() {
-    let mut source = module();
+fn run_records_with_oversized_event_fields_still_commit() {
+    // chat does not bound an event channel id with THIS module's caps, so a
+    // matching rule can stage a run record whose channel_id exceeds them
+    // (here via the composed-id guard record). the NO-FAIL arm never rejects
+    // a run record — it must record and commit.
+    let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
-        &mut source,
+        &mut m,
         &mut ctx,
         &create("r", post_trigger(None, None), task_action("t", "T")),
     )
     .expect("create");
-    block_on(source.commit_block()).expect("commit");
-    let bytes = source.snapshot();
-
-    let mut target = module();
-    let err = target
-        .install(&bytes, StateRoot([9u8; sdk::ROOT_LEN]))
-        .expect_err("wrong root must reject");
-    assert!(matches!(err, Error::Module(msg) if msg.contains("root mismatch")));
-    assert_eq!(
-        target.root(),
-        module().root(),
-        "rejected install left state untouched"
-    );
-}
-
-#[test]
-fn install_accepts_run_records_with_oversized_event_fields() {
-    // chat does not bound channel-id length, so a matching rule can commit
-    // a run record whose channel_id exceeds this module's own id caps
-    // (here via the composed-id guard record). install must accept every
-    // execute-reachable state — the root comparison is the integrity check.
-    let mut source = module();
-    let mut ctx = CaptureCtx::new();
-    exec(
-        &mut source,
-        &mut ctx,
-        &create("r", post_trigger(None, None), task_action("t", "T")),
-    )
-    .expect("create");
-    block_on(source.commit_block()).expect("commit rule");
+    block_on(m.commit_block()).expect("commit rule");
+    let root_before = m.root();
 
     let long_channel = "c".repeat(MAX_ID_BYTES * 2);
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
-        &mut source,
+        &mut m,
         &mut chat_ctx,
         &posted(&long_channel, 1, user(1), Vec::new()),
     )
     .expect("fire");
-    block_on(source.commit_block()).expect("commit fire");
-    assert_eq!(history(&source, "r", 4).len(), 1, "the match was recorded");
+    block_on(m.commit_block()).expect("commit fire");
+    let records = history(&m, "r", 4);
+    assert_eq!(records.len(), 1, "the match was recorded");
+    assert_eq!(records[0].channel_id, long_channel);
+    assert_ne!(m.root(), root_before, "the record moved the root");
+}
 
-    let mut target = module();
-    target
-        .install(&source.snapshot(), source.root())
-        .expect("install must accept execute-reachable records");
-    assert_eq!(target.root(), source.root());
-    assert_eq!(history(&target, "r", 4), history(&source, "r", 4));
+/// the run-history ring trims to [`MAX_RUN_HISTORY`]: the cursor places each
+/// append and point-deletes the oldest past the cap, so only the newest
+/// records survive.
+#[test]
+fn run_history_ring_drops_the_oldest_past_the_cap() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create("r", post_trigger(None, None), task_action("t", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit rule");
+
+    let overflow = 2u64;
+    let total = MAX_RUN_HISTORY as u64 + overflow;
+    for seq in 1..=total {
+        let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_channel("general");
+        exec(
+            &mut m,
+            &mut chat_ctx,
+            &posted("general", seq, user(1), Vec::new()),
+        )
+        .expect("fire");
+    }
+    block_on(m.commit_block()).expect("commit fires");
+
+    let records = history(&m, "r", MAX_RUN_HISTORY as u64);
+    assert_eq!(records.len(), MAX_RUN_HISTORY, "the ring holds exactly the cap");
+    assert_eq!(
+        records.first().expect("oldest").seq,
+        overflow + 1,
+        "the oldest records were dropped"
+    );
+    assert_eq!(records.last().expect("newest").seq, total);
 }

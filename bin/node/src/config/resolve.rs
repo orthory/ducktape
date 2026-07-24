@@ -155,6 +155,7 @@ pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:lates
 /// error naming the audited adapters.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
+    workspace: &Path,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
     let Some(sandbox) = sandbox else {
         return Ok((None, BTreeMap::new()));
@@ -186,7 +187,10 @@ fn resolve_sandbox(
     };
     let image = sandbox.image.clone();
     match sandbox.runtime.as_str() {
-        "podman" => Ok((Some(SandboxBackend::Podman { image }), probed()?)),
+        "podman" => {
+            let socket = capability_host::PodmanService::socket_path(workspace);
+            Ok((Some(SandboxBackend::Podman { image, socket }), probed()?))
+        }
         "tart" => {
             let capacity = probed()?;
             if capacity.get("cores").copied().unwrap_or(0) < capability_host::TART_MIN_CORES {
@@ -304,7 +308,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_listen,
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), base)?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -510,9 +514,14 @@ fn resolve_advertised(
 /// the dev-seed shape, replicating the historical semantics exactly: node 0
 /// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
-    // resolved before any field of `raw` is moved out below (they borrow the
-    // whole struct).
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
+    // the workspace/storage dir doubles as the podman-socket base, so it is
+    // derived before `resolve_sandbox` (which names the socket) — and before any
+    // other field of `raw` is moved out below.
+    let storage_dir = match &raw.storage_dir {
+        Some(path) => absolute_runtime_path(Path::new(path))?,
+        None => std::env::temp_dir().join(format!("ducktape-{}", raw.id)),
+    };
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), &storage_dir)?;
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let invite_listen = resolved_intro_listener(
         raw.advertised.as_deref(),
@@ -573,10 +582,6 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         &ed25519::PrivateKey::from_seed(id).public_key(),
     )?;
 
-    let storage_dir = match raw.storage_dir {
-        Some(path) => absolute_runtime_path(Path::new(&path))?,
-        None => std::env::temp_dir().join(format!("ducktape-{id}")),
-    };
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
     let gateway_listen = raw
         .gateway_listen
@@ -1046,11 +1051,14 @@ mod tests {
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve podman");
-        assert_eq!(
-            resolved.sandbox,
-            Some(SandboxBackend::Podman {
-                image: "docker.io/library/node:22-slim".into()
-            })
+        assert!(
+            matches!(
+                &resolved.sandbox,
+                Some(SandboxBackend::Podman { image, .. })
+                    if image == "docker.io/library/node:22-slim"
+            ),
+            "podman backend with the probed image: {:?}",
+            resolved.sandbox
         );
         assert!(
             resolved.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
@@ -1067,11 +1075,13 @@ mod tests {
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
-        assert_eq!(
-            resolved.sandbox,
-            Some(SandboxBackend::Podman {
-                image: "docker.io/library/rust:1".into()
-            })
+        assert!(
+            matches!(
+                &resolved.sandbox,
+                Some(SandboxBackend::Podman { image, .. }) if image == "docker.io/library/rust:1"
+            ),
+            "custom image honored: {:?}",
+            resolved.sandbox
         );
         assert_eq!(resolved.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.sandbox_capacity.get("mem_gb"), Some(&128));
