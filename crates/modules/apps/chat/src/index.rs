@@ -370,8 +370,10 @@ fn plain_text(blocks: &[Block]) -> String {
 }
 
 /// render the author the way chat derives it: origin decides, `as_agent`
-/// refines a module origin into an agent author.
-fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
+/// refines a module origin into an agent author. pub: feed followers outside
+/// the fold (the desktop app folding the same op stream) must render
+/// authorship identically or rows drift between hydration and deltas.
+pub fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
     let id = origin.id.as_deref().unwrap_or_default();
     match (origin.kind, as_agent) {
         (OriginKind::Module, Some(agent)) => format!("agent:{id}/{agent}"),

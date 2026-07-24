@@ -23,9 +23,7 @@ on reconnect
   connected_rpc = rpc
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "idle"
-  live_dirty = false
   loading = true
   connected = false
   channels = []
@@ -126,61 +124,73 @@ on workspace_connected(next)
   connected = true
   loading = false
   mutation_phase = "idle"
-  sync_phase = "idle"
   hydration_retry_attempt = 0
   error = ""
 
-on workspace_refreshed(next)
-  return if next.generation != hydration_generation
-  return if sync_phase != "refreshing"
-  mutation_phase = "idle"
-  sync_phase = "idle"
-  hydration_retry_attempt = 0
+on live_updated(next)
   status = next.status
-  block_height = next.height
-  channels = next.channels
-  failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == next.active_channel)
-  selected_message_seq = refreshed_required_message_seq(next.messages, active_channel, next.active_channel, selected_message_seq)
+  return if next.kind == "retry"
+  block_height = keep_i64(next.height >= 0, next.height, block_height)
+  channels = apply_chat_channels(channels, next.chat)
+  messages = apply_chat_messages(messages, next.chat, active_channel)
+  thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
+  channel_members = apply_chat_members(channel_members, next.chat, active_channel)
+  thread_next_reply_offset = thread_offset_after_live(thread_next_reply_offset, thread_has_more, next.chat, active_channel, active_thread_seq)
+  active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
+  active_channel_archived = channel_flag_archived(channels, active_channel, active_channel_archived)
+  active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
+  active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
+  channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  return if !next.load_chat && !next.load_pages
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  run live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+
+on live_resynced(next)
+  return if next.generation != hydration_generation
+  hydration_retry_attempt = 0
+  channels = keep_channels(next.chat_loaded, next.channels, channels)
+  channel_reads = initial_channel_reads(channels, channel_reads)
+  messages = keep_messages(next.chat_loaded, merge_pending_messages(next.messages, messages, active_channel, next.active_channel, ""), messages)
+  failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel))
+  selected_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), selected_message_seq)
   failed_message_draft = remember_failed_draft(failed_message_draft, message_action, message_edit_draft, selected_message_seq > 0 || message_action != "editing")
   selected_message_rev = message_seq_after_failure(selected_message_rev, "message-edit", selected_message_seq <= 0)
   message_action = message_action_after_failure(message_action, "message-edit", selected_message_seq <= 0)
   message_edit_draft = message_text_after_failure(message_edit_draft, "message-edit", selected_message_seq <= 0)
-  hovered_message_seq = refreshed_required_message_seq(next.messages, active_channel, next.active_channel, hovered_message_seq)
-  channel_settings_open = channel_settings_open && active_channel == next.active_channel
-  channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, next.active_channel)
-  member_key_draft = retain_for_endpoint(member_key_draft, active_channel, next.active_channel)
-  thread_generation = thread_generation_after_refresh(thread_generation, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
-  thread_loading = thread_loading_after_refresh(thread_loading, active_channel, next.active_channel, active_thread_seq, refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq))
-  failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, next.active_channel)
-  active_thread_seq = refreshed_known_message_seq(next.messages, active_channel, next.active_channel, active_thread_seq)
+  hovered_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), hovered_message_seq)
+  channel_settings_open = channel_settings_open && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
+  channel_name_draft = retain_for_endpoint(channel_name_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  member_key_draft = retain_for_endpoint(member_key_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
+  thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
+  failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  active_thread_seq = refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq)
   failed_reply_draft = remember_failed_draft(failed_reply_draft, "thread", reply_draft, active_thread_seq > 0)
-  thread_target_seq = refreshed_channel_value(active_channel, next.active_channel, thread_target_seq)
-  thread_next_reply_offset = refreshed_channel_value(active_channel, next.active_channel, thread_next_reply_offset)
-  thread_target_seq = message_seq_after_failure(thread_target_seq, "message-edit", active_thread_seq <= 0)
-  thread_next_reply_offset = message_seq_after_failure(thread_next_reply_offset, "message-edit", active_thread_seq <= 0)
+  thread_target_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_target_seq)
+  thread_next_reply_offset = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_offset)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
-  thread_has_more = thread_has_more && active_channel == next.active_channel && active_thread_seq > 0
-  reply_draft = retain_for_endpoint(reply_draft, active_channel, next.active_channel)
-  pending_reply = retain_for_endpoint(pending_reply, active_channel, next.active_channel)
-  reply_draft = message_text_after_failure(reply_draft, "message-edit", active_thread_seq <= 0)
-  pending_reply = message_text_after_failure(pending_reply, "message-edit", active_thread_seq <= 0)
-  message_draft = retain_for_endpoint(message_draft, active_channel, next.active_channel)
-  pending_message = retain_for_endpoint(pending_message, active_channel, next.active_channel)
-  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
-  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
-  active_channel = next.active_channel
-  active_channel_name = next.active_channel_name
-  active_channel_archived = next.active_channel_archived
-  active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
-  channel_members = next.channel_members
-  pages = next.pages
-  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, next.blocks, selected_block_id, block_edit_draft, block_autosave_status)
-  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, next.blocks, selected_block_id, block_comment_draft)
-  block_edit_draft = refreshed_block_draft(next.blocks, selected_block_id, block_edit_draft, block_autosave_status)
-  block_autosave_generation = cancel_missing_block_autosave(connected_rpc, block_autosave_generation, next.blocks, selected_block_id)
-  selected_block_id = refreshed_selected_block(next.blocks, selected_block_id)
+  thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
+  reply_draft = retain_for_endpoint(reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  pending_reply = retain_for_endpoint(pending_reply, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  message_draft = retain_for_endpoint(message_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  message_editor = editor(message_draft)
+  pending_message = retain_for_endpoint(pending_message, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
+  active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
+  active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
+  active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)
+  active_channel_huddle_count = keep_i64(next.chat_loaded, next.active_channel_huddle_count, active_channel_huddle_count)
+  channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
+  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  pages = keep_pages(next.pages_loaded, next.pages, pages)
+  blocks = keep_blocks(next.pages_loaded, merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, ""), blocks)
+  orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, blocks, selected_block_id, block_comment_draft)
+  block_edit_draft = refreshed_block_draft(blocks, selected_block_id, block_edit_draft, block_autosave_status)
+  block_autosave_generation = cancel_missing_block_autosave(connected_rpc, block_autosave_generation, blocks, selected_block_id)
+  selected_block_id = refreshed_selected_block(blocks, selected_block_id)
   selected_block_kind = retain_selected_string(selected_block_kind, selected_block_id)
   selected_block_checked = selected_block_checked && !empty(selected_block_id)
   block_comments_open = block_comments_open && !empty(selected_block_id)
@@ -200,14 +210,13 @@ on workspace_refreshed(next)
   block_edit_draft = retain_selected_string(block_edit_draft, selected_block_id)
   block_delete_armed = block_delete_armed && !empty(selected_block_id)
   block_actions_open = block_actions_open && !empty(selected_block_id)
-  block_insert_open = block_insert_open && active_page == next.active_page
-  block_insert_after_id = refreshed_selected_block(next.blocks, block_insert_after_id)
-  blocks = merge_pending_blocks(next.blocks, blocks, active_page, next.active_page, "")
-  page_delete_armed = page_delete_armed && active_page == next.active_page
-  page_title_selected = page_title_selected && active_page == next.active_page
-  active_page = next.active_page
-  active_page_title = next.active_page_title
-  active_page_parent = next.active_page_parent
+  block_insert_open = block_insert_open && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
+  block_insert_after_id = refreshed_selected_block(blocks, block_insert_after_id)
+  page_delete_armed = page_delete_armed && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
+  page_title_selected = page_title_selected && active_page == keep_str(next.pages_loaded, next.active_page, active_page)
+  active_page = keep_str(next.pages_loaded, next.active_page, active_page)
+  active_page_title = keep_str(next.pages_loaded, next.active_page_title, active_page_title)
+  active_page_parent = keep_str(next.pages_loaded, next.active_page_parent, active_page_parent)
   error = ""
   block_comments_generation = block_comments_generation + 1
   live_thread_generation = live_thread_generation + 1
@@ -215,21 +224,16 @@ on workspace_refreshed(next)
     run refresh_live_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset, live_thread_generation) -> live_thread_refreshed _ | live_thread_refresh_failed _
     run refresh_block_comments(connected_rpc, block_comments_target, active_block_comment_thread, block_comments_generation) -> live_block_comments_refreshed _ | live_block_comments_failed _
 
-on live_updated(next)
-  status = next.status
-  return if next.kind != "changed"
-  live_dirty = true
-  return if loading || thread_loading || mutation_phase != "idle"
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+on live_resync_failed(cause)
+  return if cause.generation != hydration_generation
+  status = "Sync delayed"
+  error = "Live sync interrupted. Retrying…"
+  hydration_retry_attempt = hydration_retry_attempt + 1
+  run live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, hydration_retry_attempt) -> live_resynced _ | live_resync_failed _
 
 on live_thread_refreshed(next)
   return if next.generation != live_thread_generation
   return if next.channel_id != active_channel || next.root_seq != active_thread_seq
-  live_dirty = live_dirty || thread_loading || mutation_phase != "idle"
   return if thread_loading || mutation_phase != "idle"
   thread_target_seq = next.target_seq
   thread_messages = merge_pending_messages(next.messages, thread_messages, active_channel, next.channel_id, "")
@@ -258,14 +262,6 @@ on live_block_comments_failed(cause)
   block_thread_comments_loading = false
   error = cause.message
 
-on refresh_failed(cause)
-  return if cause.generation != hydration_generation
-  return if sync_phase != "refreshing"
-  status = "Sync delayed"
-  error = "Live sync interrupted. Retrying…"
-  hydration_retry_attempt = hydration_retry_attempt + 1
-  run retry_refresh(connected_rpc, active_channel, active_page, hydration_generation, hydration_retry_attempt) -> workspace_refreshed _ | refresh_failed _
-
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
 
@@ -284,13 +280,11 @@ on mutation_failed(cause)
   pending_channel = ""
   pending_page = ""
   error = cause.message
-  live_dirty = live_dirty || cause.committed
-  return if !live_dirty
+  return if !cause.committed
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
-  live_dirty = false
   hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+  hydration_retry_attempt = 0
+  run live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on dismiss_error
   error = ""
@@ -318,6 +312,5 @@ on failed(cause)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = false
-  sync_phase = "idle"
   status = "Offline"
   error = cause.message

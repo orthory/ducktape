@@ -46,6 +46,13 @@ mod guest;
 // database is `index_guest` below.
 pub mod index;
 
+// the CLIENT view model: rendered row types, composer parsing, optimistic
+// merges, and the op-delta fold a feed-following UI splices state with.
+// module-owned beside the index fold (same feed, same vocabulary); pure
+// data-in/data-out, so the module-bundled-UI lane can compile it into the
+// shipped ui.wasm unchanged.
+pub mod client;
+
 // the wasm index-mapper shell: wires the pure core into the fluent31 engine.
 // compiled only by `guest-builder --index`'s synthesized wasm32 workspace
 // (feature `index-guest`), never by the native build.
