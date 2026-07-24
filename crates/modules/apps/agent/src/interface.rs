@@ -50,9 +50,17 @@ pub const MAX_DELEGATIONS_BYTES: usize = 8 * 1024;
 /// the owner's potentially larger budget grant.
 pub const MAX_DELEGATIONS_PER_RUN: usize = 8;
 
-/// hard cap on a serialized [`AgentRecord`] — registry entries live in the
-/// root preimage and every snapshot, so registration is size-gated up front.
+/// hard cap on a serialized [`AgentRecord`] — registry entries are replicated
+/// consensus state, so registration is size-gated up front (at stage time).
 pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
+
+/// hard cap on the COUNT of registered agents. the registry's roster — the
+/// enumeration record consensus itself consumes (runs' `All`/`RoundRobin`
+/// engagement domain reads EVERY active agent) — is one replicated record,
+/// and every id in it also costs a dispatch fan-out under `All` engagement;
+/// both must stay bounded. deliberately generous: a thousand agents is a
+/// fleet, and each still costs [`MAX_AGENT_RECORD_BYTES`] of replicated state.
+pub const MAX_REGISTERED_AGENTS: usize = 1024;
 
 /// hard cap on the COUNT of skills one agent curates. an unbounded skill list
 /// is unbounded replicated state (it rides the record, hence every snapshot)
