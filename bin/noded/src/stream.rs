@@ -168,6 +168,11 @@ pub struct StreamOpRow {
     pub payload: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload_hex: Option<String>,
+    /// the module-assigned stamp of the dispatch (empty stamps are omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_hex: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +195,11 @@ pub enum StreamOriginKind {
 fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
     let payload: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
     let payload_hex = payload.is_none().then(|| crate::hex_bytes(&row.payload));
+    let assigned: Option<serde_json::Value> = (!row.assigned.is_empty())
+        .then(|| serde_json::from_slice(&row.assigned).ok())
+        .flatten();
+    let assigned_hex = (!row.assigned.is_empty() && assigned.is_none())
+        .then(|| crate::hex_bytes(&row.assigned));
     StreamOpRow {
         height: row.height,
         seq: row.seq,
@@ -204,6 +214,8 @@ fn stream_op_row(row: indexer::OpRow) -> StreamOpRow {
         },
         payload,
         payload_hex,
+        assigned,
+        assigned_hex,
     }
 }
 
@@ -1685,6 +1697,7 @@ mod tests {
                 module: "chat".into(),
                 origin: OriginTag::external("tester"),
                 payload: serde_json::to_vec(&payload).expect("payload json"),
+                assigned: Vec::new(),
             })
             .collect();
         store

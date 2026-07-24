@@ -384,6 +384,7 @@ fn shipped_index_round_trips_over_the_wire_protocol() {
                         module: "chat".into(),
                         origin: indexer::OriginTag::external("jess"),
                         payload: br#"{"post":"hi"}"#.to_vec(),
+                        assigned: Vec::new(),
                     }],
                     record: Some(format!(r#"{{"height":{h}}}"#).into_bytes()),
                 })

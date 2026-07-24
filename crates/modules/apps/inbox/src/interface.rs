@@ -70,10 +70,30 @@ pub enum InboxMsg {
     Clear { member: String, up_to_seq: u64 },
 }
 
+/// the assigned stamp inbox declares per applied op
+/// ([`sdk::Ctx::set_assigned`]): the per-member sequence a `Deliver`
+/// assigned in-state. rides the dispatch trace onto the derived-tier
+/// op-feed row, so the fold consumes the exact assignment instead of
+/// re-deriving it by counting.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxAssigned {
+    /// `Deliver`: the notification's assigned per-member sequence.
+    Delivered { seq: u64 },
+}
+
 pub fn encode_msg(m: &InboxMsg) -> Vec<u8> {
     sdk::wire::encode(m)
 }
 
 pub fn decode_msg(b: &[u8]) -> Result<InboxMsg, String> {
+    sdk::wire::decode(b)
+}
+
+pub fn encode_assigned(a: &InboxAssigned) -> Vec<u8> {
+    sdk::wire::encode(a)
+}
+
+pub fn decode_assigned(b: &[u8]) -> Result<InboxAssigned, String> {
     sdk::wire::decode(b)
 }

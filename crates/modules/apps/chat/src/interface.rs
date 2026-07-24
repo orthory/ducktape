@@ -321,6 +321,20 @@ pub enum ChatEvent {
     },
 }
 
+/// the assigned stamp chat declares per applied op ([`sdk::Ctx::set_assigned`]):
+/// the values the module assigned in-state that the op payload cannot carry.
+/// rides the dispatch trace onto the derived-tier op-feed row, so feed
+/// followers (the index fold, clients) consume exact assignments instead of
+/// re-deriving them by counting.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAssigned {
+    /// `PostMessage`: the message's assigned per-channel sequence.
+    Posted { seq: u64 },
+    /// `EditMessage`: the new head's assigned revision.
+    Edited { rev: u32 },
+}
+
 pub fn encode_msg(m: &ChatMsg) -> Vec<u8> {
     sdk::wire::encode(m)
 }
@@ -350,5 +364,13 @@ pub fn encode_event(e: &ChatEvent) -> Vec<u8> {
 }
 
 pub fn decode_event(b: &[u8]) -> Result<ChatEvent, String> {
+    sdk::wire::decode(b)
+}
+
+pub fn encode_assigned(a: &ChatAssigned) -> Vec<u8> {
+    sdk::wire::encode(a)
+}
+
+pub fn decode_assigned(b: &[u8]) -> Result<ChatAssigned, String> {
     sdk::wire::decode(b)
 }

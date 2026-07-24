@@ -499,6 +499,7 @@ mod tests {
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_task_msg(msg),
+            assigned: Vec::new(),
         }
     }
 
@@ -619,6 +620,7 @@ mod tests {
             time: 1_000 + height,
             origin,
             payload: crate::encode_work_msg(&WorkMsg::Job(msg.clone())),
+            assigned: Vec::new(),
         }
     }
 

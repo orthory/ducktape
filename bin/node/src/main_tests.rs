@@ -683,6 +683,7 @@ fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRec
         payload: payload.to_vec(),
         emitted_msgs: 0,
         emitted_events: 0,
+        assigned: Vec::new(),
     }]
 }
 

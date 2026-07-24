@@ -9,10 +9,11 @@
 //! tier; this tier never feeds consensus.
 //!
 //! key spaces (inside chat's per-module index database):
-//! - `seq/{channel}`                    — mirror of the channel's head_seq.
-//!   faithful BY CONSTRUCTION: a failed op aborts its whole block and never
-//!   reaches the index, so every applied `PostMessage` assigned exactly the
-//!   next sequence, in drain order.
+//! - `seq/{channel}`                    — mirror of the channel's head_seq,
+//!   written from each applied `PostMessage`'s assigned stamp
+//!   ([`crate::ChatAssigned::Posted`] on the feed row) — the module's exact
+//!   in-state assignment, never a counted derivation, so the mirror cannot
+//!   desync across a boundary stamp.
 //! - `channel/{id}`                     — one [`ChannelRow`]: metadata, post
 //!   policy, owner, archive flag, hooks, and the live huddle roster.
 //!   enumeration IS the keyspace — the channel list is a prefix scan.
@@ -35,11 +36,11 @@
 //!   by the same fold with the same tombstone/re-fold discipline.
 //!
 //! caveat (shared by every mapper): the view reflects ops folded SINCE the
-//! index existed. a boundary-stamped or freshly-enabled index has no rows —
-//! and a stale `seq/` mirror — below its floor until a shipped index
-//! (`sync_index`, the default join path) or a chain replay establishes them;
-//! pages honestly skip absent rows rather than erroring. the durable fix —
-//! feed rows carrying the module-assigned sequence — is phase-2 kernel work.
+//! index existed. a boundary-stamped or freshly-enabled index has no rows
+//! below its floor until a shipped index (`sync_index`, the default join
+//! path) or a chain replay establishes them; pages honestly skip absent rows
+//! rather than erroring. sequences are exact even across a boundary: every
+//! feed row carries the module-assigned stamp, so numbering never restarts.
 //!
 //! this file is the DECISION core — pure functions over [`StateRead`],
 //! compiled natively and unit-tested against a plain map. the wasm shell
@@ -52,7 +53,7 @@ use index_guest::search::{self, DEFAULT_POSTING_CAP};
 use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes, user_handle};
 use serde::{Deserialize, Serialize};
 
-use crate::{Block, ChatMsg, PostPolicy, Span, decode_msg};
+use crate::{Block, ChatAssigned, ChatMsg, PostPolicy, Span, decode_assigned, decode_msg};
 
 mod tags;
 pub use tags::{MAX_TAG_CHARS, MAX_TAGS_PER_MESSAGE, TagRow};
@@ -73,6 +74,10 @@ const FAIL_OP_DECODE: i32 = 2;
 const FAIL_ROW_DECODE: i32 = 3;
 /// [`Fail`] code: a view request this mapper does not speak.
 const FAIL_BAD_REQUEST: i32 = 4;
+/// [`Fail`] code: an applied op that assigns (post, edit) carried a missing
+/// or undecodable assigned stamp — the same interface-drift class as
+/// [`FAIL_OP_DECODE`]: the feed holds until a fixed guest ships.
+const FAIL_ASSIGNED_DECODE: i32 = 5;
 
 /// the stored head row of one message — the renderable read-model record
 /// every message view returns (pages, threads, search hits, point lookups).
@@ -463,6 +468,14 @@ fn delete_toks(out: &mut Writes, row: &MsgRow) {
     }
 }
 
+/// decode the module-assigned stamp an applied assigning op carries on its
+/// feed row. every applied post/edit stamps ([`crate::Module::execute`] sets
+/// it unconditionally), so an empty or undecodable stamp is interface drift —
+/// the [`FAIL_OP_DECODE`] class: fail loudly, the feed holds.
+fn decode_stamp(op: &OpRow) -> Result<ChatAssigned, Fail> {
+    decode_assigned(&op.assigned).map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))
+}
+
 /// fold one applied op into derived writes. an applied op decoded fine in the
 /// module; failing HERE means the interface crates drifted — fail loudly (the
 /// feed holds and surfaces it), never guess. an applied op also PASSED every
@@ -519,7 +532,12 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             thread,
             as_agent,
         } => {
-            let seq = read_u64(read, &seq_key(&channel_id)) + 1;
+            let ChatAssigned::Posted { seq } = decode_stamp(op)? else {
+                return Err(Fail::new(
+                    FAIL_ASSIGNED_DECODE,
+                    "applied PostMessage carried a non-Posted stamp",
+                ));
+            };
             index_guest::put(&mut out, seq_key(&channel_id), seq.to_be_bytes().to_vec());
             index_guest::put(
                 &mut out,
@@ -571,6 +589,12 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             blocks,
             base_rev,
         } => {
+            let ChatAssigned::Edited { rev } = decode_stamp(op)? else {
+                return Err(Fail::new(
+                    FAIL_ASSIGNED_DECODE,
+                    "applied EditMessage carried a non-Edited stamp",
+                ));
+            };
             // absent row == the message predates this index; nothing to
             // retokenize (see the module doc's pre-index caveat).
             let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
@@ -597,7 +621,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             row.blocks = blocks;
             row.tags = new_tags;
             row.edited = true;
-            row.rev += 1;
+            row.rev = rev;
             row.edited_at = Some(op.time);
             row.base_rev = base_rev;
             put_row_and_toks(&mut out, &row)?;
@@ -1019,19 +1043,43 @@ mod tag_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode_msg;
+    use crate::{encode_assigned, encode_msg};
     use index_guest::apply_to_map;
     use std::collections::BTreeMap;
 
     type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 
-    fn op(height: u64, msg: &ChatMsg) -> OpRow {
+    /// the test twin of the module's in-state assignment (`stage_message` /
+    /// `stage_edit`): posts take the channel's next sequence, edits the row's
+    /// next revision, everything else assigns nothing. boundary tests pass an
+    /// explicit stamp through [`op_with`] instead.
+    fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
+        match msg {
+            ChatMsg::PostMessage { channel_id, .. } => {
+                encode_assigned(&ChatAssigned::Posted {
+                    seq: read_u64(map, &seq_key(channel_id)) + 1,
+                })
+            }
+            ChatMsg::EditMessage {
+                channel_id, seq, ..
+            } => {
+                let row = read_row(map, &msg_key(channel_id, *seq))
+                    .expect("row reads")
+                    .expect("edited row exists");
+                encode_assigned(&ChatAssigned::Edited { rev: row.rev + 1 })
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn op_with(height: u64, msg: &ChatMsg, assigned: Vec<u8>) -> OpRow {
         OpRow {
             height,
             seq: 0,
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_msg(msg),
+            assigned,
         }
     }
 
@@ -1046,7 +1094,7 @@ mod tests {
     }
 
     fn fold(map: &mut Map, height: u64, msg: &ChatMsg) {
-        let writes = fold_op(&op(height, msg), map).expect("fold");
+        let writes = fold_op(&op_with(height, msg, assigned_for(map, msg)), map).expect("fold");
         apply_to_map(map, writes);
     }
 
@@ -1074,6 +1122,39 @@ mod tests {
             Some(&2u64.to_be_bytes().to_vec()),
             "the seq mirror tracks the channel head"
         );
+    }
+
+    #[test]
+    fn stamped_sequences_survive_a_boundary_stamp() {
+        // a boundary-stamped index starts EMPTY mid-life: no rows, no seq
+        // mirror. the first folded post carries the module's true assignment
+        // (here 42) — the fold must honor the stamp, never restart from 1.
+        let mut map = Map::new();
+        let msg = post("general", "m42", "first post after the boundary");
+        let writes = fold_op(
+            &op_with(9, &msg, encode_assigned(&ChatAssigned::Posted { seq: 42 })),
+            &map,
+        )
+        .expect("fold");
+        apply_to_map(&mut map, writes);
+
+        let hits = search(&map, serde_json::json!({"search": {"text": "boundary"}}));
+        assert_eq!(hits[0].seq, 42);
+        assert_eq!(
+            map.get(b"seq/general".as_slice()),
+            Some(&42u64.to_be_bytes().to_vec()),
+            "the mirror resumes at the stamped head, not at 1"
+        );
+    }
+
+    #[test]
+    fn a_post_without_a_stamp_fails_the_fold() {
+        // an applied assigning op with no stamp is interface drift — the fold
+        // holds loudly instead of guessing a sequence.
+        let map = Map::new();
+        let msg = post("general", "m1", "unstamped");
+        let fail = fold_op(&op_with(1, &msg, Vec::new()), &map).expect_err("must fail");
+        assert_eq!(fail.code, FAIL_ASSIGNED_DECODE);
     }
 
     #[test]
@@ -1172,6 +1253,7 @@ mod tests {
                     thread: None,
                     as_agent: Some("helper".into()),
                 }),
+                assigned: encode_assigned(&ChatAssigned::Posted { seq: 1 }),
             },
             &map,
         )

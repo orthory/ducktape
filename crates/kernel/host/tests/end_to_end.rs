@@ -171,6 +171,7 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
                     payload: Vec::new(),
                     emitted_msgs: 1,
                     emitted_events: 0,
+                    assigned: Vec::new(),
                 },
                 DispatchRecord {
                     module: KV_ID.to_string(),
@@ -181,6 +182,7 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
                     }),
                     emitted_msgs: 0,
                     emitted_events: 0,
+                    assigned: Vec::new(),
                 },
             ],
         );
