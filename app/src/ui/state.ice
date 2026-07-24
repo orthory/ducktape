@@ -85,6 +85,8 @@ state
   gov_rows:[ProposalRow] = []
   gov_generation:i64 = 0
   gov_voting = ""
+  agents_rows:[AgentRow] = []
+  agents_generation:i64 = 0
   settings_endpoint = ""
   settings_node_key = ""
   settings_height:i64 = 0

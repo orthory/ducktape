@@ -966,6 +966,30 @@ view
                         text "this node" size=11.0 wrapping=none @text-primary
                     space width=fill
                     text member.key size=11.0 wrapping=none font=mono @text-muted
+    agents:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=8.0 align=center
+          text "Agents" size=14.0 font=display @text-fg
+          space width=fill
+        if empty(agents_rows)
+          EmptyState title="No agents registered" detail="Registered agents appear here with their capability and grants."
+        if !empty(agents_rows)
+          scroll direction=vertical width=fill height=fill
+            col width=fill spacing=4.0
+              for agent in agents_rows
+                container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  col width=fill spacing=3.0
+                    row width=fill spacing=8.0 align=center
+                      text agent.name size=13.0 wrapping=none font=medium @text-fg
+                      text agent.id size=11.0 wrapping=none font=mono @text-muted
+                      space width=fill
+                      text agent.status size=11.0 wrapping=none font=mono @text-primary
+                    row width=fill spacing=8.0 align=center
+                      text agent.capability size=11.0 wrapping=none font=mono @text-muted
+                      text "·" size=11.0 wrapping=none @text-muted
+                      text agent.owner size=11.0 wrapping=none font=mono @text-muted
+                    if !empty(agent.actions)
+                      text agent.actions size=11.0 font=mono @text-muted
     governance:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

@@ -104,6 +104,9 @@ extern crate::backend
   SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, open_tabs:i64)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
+  AgentRow(id:str, name:str, capability:str, status:str, actions:str, owner:str)
+  AgentsData(generation:i64, agents:[AgentRow])
+  load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   ProposalRow(id:str, action:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, electorate:i64, open:bool)
   GovernanceData(generation:i64, proposals:[ProposalRow])
   load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError

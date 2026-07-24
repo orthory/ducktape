@@ -277,6 +277,7 @@ on select_shell_tab(next)
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
+  agents_generation = agents_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == "explorer"
@@ -289,6 +290,14 @@ on select_shell_tab(next)
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
+    run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
+
+on agents_loaded(next)
+  return if next.generation != agents_generation
+  agents_rows = next.agents
+
+on agents_failed(cause)
+  return if cause.generation != agents_generation
 
 on node_log_line(line)
   node_log_lines = push_log_line(node_log_lines, line)

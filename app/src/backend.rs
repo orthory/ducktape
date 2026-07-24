@@ -1773,6 +1773,76 @@ pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, Hydra
     })
 }
 
+/// One registered agent, rendered.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentRow {
+    pub id: String,
+    pub name: String,
+    pub capability: String,
+    pub status: String,
+    pub actions: String,
+    pub owner: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentsData {
+    pub generation: i64,
+    pub agents: Vec<AgentRow>,
+}
+
+/// Load the agent roster from the canonical registry.
+pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc.query("agent", &serde_json::json!("agents")).await?;
+        let agents = reply["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| {
+                let status = record["status"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        record["status"]
+                            .as_object()
+                            .and_then(|tagged| tagged.keys().next().cloned())
+                            .unwrap_or_default()
+                    });
+                let owner = record["owner"]
+                    .as_object()
+                    .and_then(|tagged| tagged.keys().next().cloned())
+                    .or_else(|| record["owner"].as_str().map(str::to_string))
+                    .unwrap_or_default();
+                AgentRow {
+                    id: record["agent_id"].as_str().unwrap_or_default().to_string(),
+                    name: record["display_name"].as_str().unwrap_or_default().to_string(),
+                    capability: record["capability"].as_str().unwrap_or_default().to_string(),
+                    actions: record["allowed_actions"]
+                        .as_array()
+                        .map(|actions| {
+                            actions
+                                .iter()
+                                .filter_map(|action| action.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default(),
+                    status,
+                    owner,
+                }
+            })
+            .collect();
+        Ok(AgentsData { generation, agents })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -1790,6 +1860,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
         ("pages", "Pages", "▤"),
         ("files", "Files", "▣"),
         ("members", "Members", "◎"),
+        ("agents", "Agents", "🤖"),
         ("governance", "Governance", "⚖"),
         ("explorer", "Explorer", "⛓"),
         ("node", "Node", "⛭"),
