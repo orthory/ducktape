@@ -96,7 +96,7 @@ test: wasm-modules-check
 # Every product/example module carries its own guest port (src/guest.rs behind
 # the `guest` feature); guest-builder synthesizes the packaging workspace and
 # writes the canonical component.wasm into the module directory itself. The
-# four kernel-fixture test guests (hello, hello-v2, sibling, object) keep
+# four kernel-fixture test guests (hello, hello-replacement, sibling, object) keep
 # their standalone crates/guests workspaces below.
 BUILDER_MODULES := \
   crates/examples/directory \
@@ -129,8 +129,9 @@ wasm-modules:
 	  $(CARGO) run -q -p guest-builder -- --index $$m || exit 1; \
 	done
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
-	# straight to the wasm-host fixture with no guest copy; hello-v2 builds the v2
-	# crate directly into the host fixture. Each shape is unique — kept explicit.
+	# straight to the wasm-host fixture with no guest copy; hello-replacement
+	# builds the replacement crate directly into the host fixture. Each shape is
+	# unique — kept explicit.
 	cd crates/guests/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
@@ -139,10 +140,10 @@ wasm-modules:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	cd crates/guests/hello-wasm-v2 && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/hello-wasm-replacement && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
-	  crates/guests/hello-wasm-v2/target/wasm32-unknown-unknown/release/hello_wasm_v2.wasm \
-	  -o crates/kernel/host/tests/fixtures/hello-v2.component.wasm
+	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
+	  -o crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
 	cd crates/guests/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \

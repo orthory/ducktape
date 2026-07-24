@@ -13,7 +13,7 @@ const USAGE: &str = "\
 ducktape coordinator
 
 Usage:
-  coordinator [--listen <addr>] [--relay-listen <addr|none>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml> | --allow-anonymous]
+  coordinator [--listen <addr>] [--relay-listen <addr|none>] [--workers <1|4>] [--metrics-interval <secs>] [--genesis-set <network.toml>]
 
 Options:
   --listen <addr>              UDP bind address [default: 0.0.0.0:3478]
@@ -21,11 +21,10 @@ Options:
   --workers <1|4>              Signature-verification workers [default: 1]
   --metrics-interval <secs>    Structured metrics period; 0 disables [default: 10]
   --genesis-set <network.toml> Private mode: pin admission to genesis validators
-  --allow-anonymous            Legacy development mode: disable proof-of-possession
   -h, --help                   Print this help and exit
 
 Default auth policy:
-  public proof-of-possession (no --genesis-set and no --allow-anonymous)
+  public proof-of-possession (no --genesis-set)
 ";
 
 fn arg_value(flag: &str) -> Option<String> {
@@ -56,7 +55,6 @@ fn validate_args(args: &[String]) -> std::io::Result<()> {
                 }
                 i += 2;
             }
-            "--allow-anonymous" => i += 1,
             "-h" | "--help" => i += 1,
             other => {
                 return Err(std::io::Error::new(
@@ -140,11 +138,10 @@ async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, s
             .map(|rss| format!("{:.2}", rss as f64 / 1_048_576.0))
             .unwrap_or_else(|| "na".into());
         eprintln!(
-            "coordinator_metrics | traffic received={} authenticated={} rejected={} legacy={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
+            "coordinator_metrics | traffic received={} authenticated={} rejected={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
             m.received,
             m.authenticated,
             m.rejected,
-            m.legacy,
             m.malformed,
             m.replies,
             m.send_errors,
@@ -189,7 +186,6 @@ async fn main() -> std::io::Result<()> {
 
     // The per-network authorization policy, selected from CLI flags:
     //   --genesis-set <network.toml>  => Private (PoP + pinned valset admission)
-    //   --allow-anonymous             => fully-open (legacy, no auth)
     //   (no flag)                     => public with proof-of-possession
     // A malformed --genesis-set path/file is a HARD error, never a silent
     // fall-through to a weaker policy. The Arc is shared verbatim with the

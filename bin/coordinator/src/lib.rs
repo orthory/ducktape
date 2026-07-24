@@ -67,34 +67,13 @@ struct GenesisPin {
 
 /// Select the authorization policy from CLI flags:
 /// `--genesis-set <path>` => Private (pinned to that network.toml's valset);
-/// `--allow-anonymous`    => fully-open (legacy);
-/// otherwise              => public with proof-of-possession (deployed default).
+/// otherwise              => public with proof-of-possession.
 pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPolicy> {
-    let allow_anonymous = args.iter().any(|a| a == "--allow-anonymous");
-    let has_genesis_set = args.iter().any(|a| a == "--genesis-set");
-    // `--allow-anonymous` and `--genesis-set` are mutually exclusive (the USAGE
-    // string declares them so with `|`). Passing BOTH is contradictory, so it is
-    // a HARD error and NOT a silent pick of the weaker policy. Failing closed
-    // here is what keeps a stray or env-templated `--allow-anonymous` from
-    // quietly disabling a genesis pin — the same "malformed/conflicting args
-    // hard-fail, never downgrade to a weaker policy" contract the value-less
-    // `--genesis-set` check below already upholds. (Previously `--allow-anonymous`
-    // short-circuited first and silently won, downgrading a Private coordinator
-    // to fully-open on a config mistake.)
-    if allow_anonymous && has_genesis_set {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "--allow-anonymous and --genesis-set are mutually exclusive",
-        ));
-    }
-    if allow_anonymous {
-        return Ok(nat_traversal::AuthPolicy::Open { require_pop: false });
-    }
     // `--genesis-set` presence is detected SEPARATELY from its value: a present
     // but value-less flag (bare `--genesis-set`, `--genesis-set` as the final
     // token, or immediately followed by another `--flag` — e.g. an unset shell
     // variable that collapses to nothing) is a HARD error, never a silent
-    // fall-through to the weaker `Open { require_pop: true }`. Downgrading a
+    // fall-through to the weaker public policy. Downgrading a
     // Private (genesis/cap-gated) coordinator to public-PoP on a typo'd path
     // would admit any node with a valid proof-of-possession.
     if let Some(i) = args.iter().position(|a| a == "--genesis-set") {
@@ -110,7 +89,7 @@ pub fn select_policy(args: &[String]) -> std::io::Result<nat_traversal::AuthPoli
         let genesis_set = load_genesis_pubkeys(path)?;
         return Ok(nat_traversal::AuthPolicy::Private { genesis_set });
     }
-    Ok(nat_traversal::AuthPolicy::Open { require_pop: true })
+    Ok(nat_traversal::AuthPolicy::Public)
 }
 
 /// Parse the PUBLIC genesis validator pubkeys out of a `network.toml`. This is

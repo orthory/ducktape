@@ -21,7 +21,7 @@ pub(crate) struct Surfaces {
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     /// the host-side session manager (a clone of the one on the http handle), so
     /// the term plane's control handler can spawn peer-attached sessions. `None`
-    /// on a node that hosts no terminal plane (no sandbox / sync-only / joiner).
+    /// on a node that hosts no terminal plane (sync-only / no http surface).
     pub(crate) terminals: Option<noded::TerminalSessions>,
     /// the guest-side remote-session lane the term plane's client half drains.
     pub(crate) session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
@@ -32,9 +32,6 @@ pub(crate) struct Surfaces {
 
 pub(crate) struct BindConfig<'a> {
     pub(crate) sync_only: bool,
-    /// a not-yet-admitted joiner: it binds and serves http reads-only while
-    /// parked, but must NOT host the interactive terminal plane (no standing).
-    pub(crate) joiner: bool,
     pub(crate) label: &'a str,
     pub(crate) storage: &'a std::path::Path,
     /// the config dir where `gateway-routes.json` lives (= `storage` in the dev
@@ -63,7 +60,6 @@ pub(crate) struct BindConfig<'a> {
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
     let BindConfig {
         sync_only,
-        joiner,
         label,
         storage,
         workspace,
@@ -253,13 +249,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // reads it without crossing the command lane.
     let status = http_handle.status_cell();
     // the REAL portable-agent-run provisioner, built from a clone of the http
-    // handle BEFORE the serve/drop match consumes it. portable (v3) runs
+    // handle BEFORE the serve/drop match consumes it. portable v1 runs
     // materialize a per-run duckfs checkout under a root VALIDATED to be
     // outside <storage> (D7) and drive checkout/commit over this SAME
     // NodeHandle actor lane the /v1/fs/workspaces RPC already rides here.
     // LIVE for every agent run: this binary wires the files module
-    // unconditionally, so the runs composer emits v3 (the de-versioned
-    // activation — no flag day, pre-production re-genesis). a misconfigured
+    // unconditionally, so the runs composer emits v1. a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
     let agent_provisioner: dispatch_host::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(
@@ -296,10 +291,15 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     let cred_resolver: dispatch_host::SharedCredentialResolver =
         std::sync::Arc::new(crate::cred_resolve::NodeCredentialResolver::new(&http_handle));
     // the node-local, off-chain interactive terminal-session plane (lives on the
-    // http handle like the stream hub — never consensus). Wired only where the
-    // app surface is actually served for a real member: not sync-only, not a
-    // parked joiner, and only when an http address was configured. Sourced from
-    // the node's OWN config — the resolved `node.toml [sandbox]` backend and
+    // http handle like the stream hub — never consensus). Wired wherever the app
+    // surface is served: not sync-only, and an http address configured. A parked
+    // joiner/resident gets the plane too — its park loop already spawns the full
+    // term plane (guest lane included), and that is the credential-lending guest
+    // shape: a resident laptop routing a pty to a compute host must not need a
+    // validator seat. Membership is not this gate's job: cross-node reach rides
+    // the mesh session plane, which only has tunnels to nodes with standing, so
+    // an unadmitted joiner's directed create dies in the lane, not here. Sourced
+    // from the node's OWN config — the resolved `node.toml [sandbox]` backend and
     // this node's signer identity (`node_key`) — so a consensus-only node has
     // no terminal plane by construction, and Podman container reaping scopes
     // to the SAME execution id as the node's real agent runs (validator/run.rs
@@ -307,8 +307,8 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // wiring; a sandboxed node's create returns a session (or a clear spawn
     // error), an unsandboxed node's a "requires a configured sandbox" 503 —
     // never the "terminal sessions are not enabled" 503 that meant the plane
-    // was missing entirely (this bug).
-    let terminals = if !sync_only && !joiner && http_listen.is_some() {
+    // was missing entirely.
+    let terminals = if !sync_only && http_listen.is_some() {
         let interactive = sandbox.and_then(|backend| {
             noded::term::discover_interactive(
                 &node_key,

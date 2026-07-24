@@ -13,8 +13,8 @@ use super::identity::load_identity;
 use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
 use super::{
     Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
-    StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap,
-    load_invite_fronts, load_invite_token, load_invite_wireguard,
+    StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts,
+    load_invite_token, load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -24,7 +24,7 @@ pub struct Resolved {
     /// log prefix: "#<id>" for the dev shape, the identity's short hex
     /// otherwise.
     pub label: String,
-    /// the chain-id (network shape) or legacy namespace bytes.
+    /// the network genesis namespace, or the dev shape's raw namespace.
     pub namespace: Vec<u8>,
     /// this network's chain id — the descriptor's own `chain_id` field (network
     /// shape) or the raw configured namespace (dev shape, which has no
@@ -44,7 +44,7 @@ pub struct Resolved {
     /// self. hostname ingresses stay hostnames — dialers re-resolve them.
     pub bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
     /// reach targets that need the nat client: (target key, coordinator
-    /// ingress, coordinator key). empty unless a v3 invite carried Coordinated
+    /// ingress, coordinator key). empty unless an invite carries Coordinated
     /// hints. the runtime rendezvous/hole-punches through the coordinator to
     /// each target, then authenticates the target's own key end-to-end.
     pub coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
@@ -87,7 +87,7 @@ pub struct Resolved {
     pub invite_wireguard: Option<StoredInviteWireGuard>,
     /// the inviter's offered member fronts a `join` stored, if any — the
     /// ADDITIONAL first-contact paths the joiner races alongside the inviter.
-    /// Empty for the dev shape, for members, and for pre-feature invites.
+    /// Empty for the dev shape and for members.
     pub invite_fronts: Vec<Front>,
     /// shipped-index warm start when joining (default on); see
     /// `NodeToml::sync_index`.
@@ -174,8 +174,7 @@ fn resolve_sandbox(
         if sandbox.mem_gb != 0 {
             capacity.insert("mem_gb".into(), sandbox.mem_gb);
         }
-        capability::validate_resources(&capacity)
-            .map_err(|e| format!("sandbox capacity: {e}"))?;
+        capability::validate_resources(&capacity).map_err(|e| format!("sandbox capacity: {e}"))?;
         for dimension in ["cores", "mem_gb"] {
             if !capacity.contains_key(dimension) {
                 return Err(format!(
@@ -262,7 +261,9 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     for (key, dial) in descriptor.reach_entries()? {
         match dial {
             ReachDial::Direct(ingress) => bootstrap.push((key, ingress)),
-            ReachDial::Coordinated { coord, coord_key } => coordinated.push((key, coord, coord_key)),
+            ReachDial::Coordinated { coord, coord_key } => {
+                coordinated.push((key, coord, coord_key))
+            }
         }
     }
     // mesh = validators ∪ every reach identity (direct + coordinated). A
@@ -465,7 +466,6 @@ pub fn invite_wireguard_endpoint(
     let host = endpoint_host(advertised, listen, wireguard_listen, None)?;
     Ok(format!("{host}:{}", wireguard_listen.port()))
 }
-
 
 /// resolve the `advertised` config value into a dial ingress. the sentinel
 /// `"overlay"` advertises this node's chain-derived WireGuard overlay address
@@ -739,14 +739,9 @@ mod tests {
         };
         d.add_bootstrap(&founder, "203.0.113.7:41000");
         d.save(&dir.join("network.toml")).expect("save");
-        std::fs::write(
-            dir.join("node.toml"),
-            network_shape_toml(&[]),
-        )
-        .expect("write");
-        let r = resolve(&dir.join("node.toml")).expect(
-            "a joiner with no advertised and a non-dialable listen must resolve",
-        );
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
+        let r = resolve(&dir.join("node.toml"))
+            .expect("a joiner with no advertised and a non-dialable listen must resolve");
         assert_eq!(r.signer.public_key(), me.public_key());
         assert_eq!(r.bootstrappers.len(), 1, "it dials the founder's hint");
     }
@@ -857,10 +852,7 @@ mod tests {
         )
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
-        assert_eq!(
-            default.storage_dir,
-            std::env::temp_dir().join("ducktape-8")
-        );
+        assert_eq!(default.storage_dir, std::env::temp_dir().join("ducktape-8"));
         assert!(default.storage_dir.is_absolute());
     }
 
@@ -875,7 +867,10 @@ mod tests {
 
             std::env::set_current_dir(doomed_cwd).expect("enter doomed cwd");
             std::fs::remove_dir(doomed_cwd).expect("remove launch cwd");
-            assert!(std::env::current_dir().is_err(), "cwd is genuinely unavailable");
+            assert!(
+                std::env::current_dir().is_err(),
+                "cwd is genuinely unavailable"
+            );
 
             let network = resolve(Path::new(network_config)).expect("absolute network config");
             assert!(network.storage_dir.is_absolute());
@@ -885,8 +880,7 @@ mod tests {
         }
 
         let network_dir = tmp("deleted-cwd-network");
-        let (me, _) =
-            load_or_generate_identity(&network_dir.join("identity.key")).expect("keygen");
+        let (me, _) = load_or_generate_identity(&network_dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "deleted-cwd#11223344".into(),
             scheme: SCHEME_ED25519.into(),
@@ -1356,9 +1350,10 @@ mod tests {
              wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"0.0.0.0:0\"\n",
         )
         .expect("write");
-        let err = resolve(&dir.join("node.toml"))
-            .expect_err("an explicit unspecified/port0 value is a config error, not a silent \
-                          fallback to endpoint-less");
+        let err = resolve(&dir.join("node.toml")).expect_err(
+            "an explicit unspecified/port0 value is a config error, not a silent \
+                          fallback to endpoint-less",
+        );
         assert!(err.contains("wireguard_advertised"), "{err}");
     }
 
@@ -1377,7 +1372,12 @@ mod tests {
             "wireguard_advertised wins even over a concrete wireguard_listen IP"
         );
         assert_eq!(
-            endpoint_host(None, "127.0.0.1:0", unspecified, Some("tunnel.example.com:9999"))
+            endpoint_host(
+                None,
+                "127.0.0.1:0",
+                unspecified,
+                Some("tunnel.example.com:9999")
+            )
                 .unwrap(),
             "tunnel.example.com",
             "a hostname override stays a hostname"

@@ -204,7 +204,10 @@ pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Ve
 /// cancelled (their futures are dropped). Exhaustion ⇒ an honest
 /// [`FirstContactOutcome::Terminal`]. Pure over the attempt function so the
 /// selection logic is unit-testable without a live plane.
-pub async fn race_first_contact<F, Fut>(candidates: Vec<Candidate>, attempt: F) -> FirstContactOutcome
+pub async fn race_first_contact<F, Fut>(
+    candidates: Vec<Candidate>,
+    attempt: F,
+) -> FirstContactOutcome
 where
     F: Fn(Candidate) -> Fut,
     Fut: Future<Output = AttemptResult>,
@@ -415,8 +418,7 @@ pub async fn drive_first_contact(
 }
 
 /// Open one ack datagram for this attempt and decode the member's reply.
-/// Post-verify acks arrive SEALED to this joiner's WG key; a pre-verify
-/// `Refused` is cleartext — try the seal first, fall back to the raw bytes.
+/// Every ack arrives SEALED to this joiner's WG key.
 /// `None` ⇒ junk, or another attempt's ack (nonce mismatch): the announcer
 /// ignores it and keeps sending.
 fn open_ack(
@@ -424,9 +426,7 @@ fn open_ack(
     token_nonce: &[u8],
     datagram: &[u8],
 ) -> Option<lobby::IntroReply> {
-    let opened = keypair
-        .open_sealed(datagram)
-        .unwrap_or_else(|_| datagram.to_vec());
+    let opened = keypair.open_sealed(datagram).ok()?;
     let ack = lobby::decode_intro_ack(&opened).ok()?;
     if ack.nonce != token_nonce {
         return None;
@@ -476,13 +476,18 @@ impl Drop for StopGuard {
 /// Only when no intro is advertised (fronts never advertise one) does the
 /// underlay `wg_port + 1` default apply. Pure, so it is unit-testable without a
 /// live plane.
-fn resolve_intro_dest(candidate: &Candidate, endpoint_addr: SocketAddr) -> Result<SocketAddr, String> {
+fn resolve_intro_dest(
+    candidate: &Candidate,
+    endpoint_addr: SocketAddr,
+) -> Result<SocketAddr, String> {
     match &candidate.intro {
         Some(advertised) => match advertised.to_socket_addrs() {
             Ok(mut addrs) => addrs
                 .next()
                 .ok_or_else(|| format!("advertised intro endpoint {advertised:?} did not resolve")),
-            Err(e) => Err(format!("advertised intro endpoint {advertised:?} unusable ({e})")),
+            Err(e) => Err(format!(
+                "advertised intro endpoint {advertised:?} unusable ({e})"
+            )),
         },
         None => Ok(SocketAddr::new(
             endpoint_addr.ip(),
@@ -510,9 +515,15 @@ async fn direct_attempt(
     let endpoint_addr = match endpoint.to_socket_addrs() {
         Ok(mut addrs) => match addrs.next() {
             Some(addr) => addr,
-            None => return AttemptResult::Failed(format!("front endpoint {endpoint:?} did not resolve")),
+            None => {
+                return AttemptResult::Failed(format!(
+                    "front endpoint {endpoint:?} did not resolve"
+                ));
+            }
         },
-        Err(e) => return AttemptResult::Failed(format!("front endpoint {endpoint:?} unusable ({e})")),
+        Err(e) => {
+            return AttemptResult::Failed(format!("front endpoint {endpoint:?} unusable ({e})"));
+        }
     };
 
     // (a) merge the peer onto the interface so this side can initiate.
@@ -647,12 +658,14 @@ async fn coordinated_attempt(
     for attempt in 1..=iters {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if reach
-            .send(reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
+            .send(
+                reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
                 peer: candidate.key.clone(),
                 wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
                 intro: sealed_intro.clone(),
                 reply: reachability::CoordinatedInviteReply(reply_tx),
-            })
+                },
+            )
             .await
             .is_err()
         {
@@ -902,8 +915,20 @@ mod tests {
     async fn race_admits_the_first_to_settle_without_waiting_on_the_rest() {
         let winner = key(1);
         let candidates = vec![
-            Candidate { key: winner.clone(), wg: [1; 32], mesh_port: 1, endpoint: Some("win".into()), intro: None },
-            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: Some("slow".into()), intro: None },
+            Candidate {
+                key: winner.clone(),
+                wg: [1; 32],
+                mesh_port: 1,
+                endpoint: Some("win".into()),
+                intro: None,
+            },
+            Candidate {
+                key: key(2),
+                wg: [2; 32],
+                mesh_port: 2,
+                endpoint: Some("slow".into()),
+                intro: None,
+            },
         ];
         let outcome = race_first_contact(candidates, |c| async move {
             match c.endpoint.as_deref() {
@@ -917,7 +942,12 @@ mod tests {
         })
         .await;
         match outcome {
-            FirstContactOutcome::Admitted { key, via, height, cap } => {
+            FirstContactOutcome::Admitted {
+                key,
+                via,
+                height,
+                cap,
+            } => {
                 assert_eq!(key, winner);
                 assert_eq!(via, ContactVia::Direct("win".into()));
                 assert_eq!(height, 7);
@@ -933,8 +963,20 @@ mod tests {
         // truth — the race must surface it, never churn the remaining
         // candidates toward the same answer.
         let candidates = vec![
-            Candidate { key: key(1), wg: [1; 32], mesh_port: 1, endpoint: Some("reject".into()), intro: None },
-            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: Some("slow".into()), intro: None },
+            Candidate {
+                key: key(1),
+                wg: [1; 32],
+                mesh_port: 1,
+                endpoint: Some("reject".into()),
+                intro: None,
+            },
+            Candidate {
+                key: key(2),
+                wg: [2; 32],
+                mesh_port: 2,
+                endpoint: Some("slow".into()),
+                intro: None,
+            },
         ];
         let outcome = race_first_contact(candidates, |c| async move {
             match c.endpoint.as_deref() {
@@ -961,8 +1003,14 @@ mod tests {
         assert_eq!(ack_resolution(lobby::IntroReply::Installed), None);
         // Admitted settles the attempt with the authoritative outcome.
         assert_eq!(
-            ack_resolution(lobby::IntroReply::Admitted { height: 3, cap: None }),
-            Some(AttemptResult::Admitted { height: 3, cap: None })
+            ack_resolution(lobby::IntroReply::Admitted {
+                height: 3,
+                cap: None
+            }),
+            Some(AttemptResult::Admitted {
+                height: 3,
+                cap: None
+            })
         );
         // a TERMINAL reject stops the race; a non-terminal one fails over.
         assert!(matches!(
@@ -971,7 +1019,10 @@ mod tests {
                 detail: "spent".into(),
                 terminal: true,
             }),
-            Some(AttemptResult::Rejected { code: lobby::RejectCode::Spent, .. })
+            Some(AttemptResult::Rejected {
+                code: lobby::RejectCode::Spent,
+                ..
+            })
         ));
         assert!(matches!(
             ack_resolution(lobby::IntroReply::Rejected {
@@ -982,13 +1033,15 @@ mod tests {
             Some(AttemptResult::Failed(_))
         ));
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Refused { detail: "no".into() }),
+            ack_resolution(lobby::IntroReply::Refused {
+                detail: "no".into()
+            }),
             Some(AttemptResult::Failed(_))
         ));
     }
 
     #[test]
-    fn open_ack_opens_sealed_and_cleartext_and_drops_foreign_nonces() {
+    fn open_ack_requires_sealing_and_drops_foreign_nonces() {
         let dir = tempfile::tempdir().unwrap();
         let joiner = reachability::WireGuardKeypair::load_or_generate(&dir.path().join("j.key"))
             .unwrap()
@@ -996,20 +1049,21 @@ mod tests {
         let nonce = vec![9u8; 4];
         let ack = lobby::IntroAck {
             nonce: nonce.clone(),
-            reply: lobby::IntroReply::Admitted { height: 1, cap: None },
+            reply: lobby::IntroReply::Admitted {
+                height: 1,
+                cap: None,
+            },
         };
         let plain = lobby::encode_intro_ack(&ack);
-        // sealed (the post-verify shape) opens with the joiner's own key…
         let sealed = reachability::seal(&joiner.public_key().0, &plain);
         assert_eq!(
             open_ack(&joiner, &nonce, &sealed),
-            Some(lobby::IntroReply::Admitted { height: 1, cap: None })
+            Some(lobby::IntroReply::Admitted {
+                height: 1,
+                cap: None
+            })
         );
-        // …and a cleartext pre-verify refusal still decodes via the fallback.
-        assert_eq!(
-            open_ack(&joiner, &nonce, &plain),
-            Some(lobby::IntroReply::Admitted { height: 1, cap: None })
-        );
+        assert_eq!(open_ack(&joiner, &nonce, &plain), None);
         // another attempt's nonce is not ours to interpret.
         assert_eq!(open_ack(&joiner, &[7u8; 4], &sealed), None);
     }
@@ -1017,8 +1071,20 @@ mod tests {
     #[tokio::test]
     async fn race_returns_honest_terminal_when_all_fail() {
         let candidates = vec![
-            Candidate { key: key(1), wg: [1; 32], mesh_port: 1, endpoint: Some("a".into()), intro: None },
-            Candidate { key: key(2), wg: [2; 32], mesh_port: 2, endpoint: None, intro: None },
+            Candidate {
+                key: key(1),
+                wg: [1; 32],
+                mesh_port: 1,
+                endpoint: Some("a".into()),
+                intro: None,
+            },
+            Candidate {
+                key: key(2),
+                wg: [2; 32],
+                mesh_port: 2,
+                endpoint: None,
+                intro: None,
+            },
         ];
         let outcome = race_first_contact(candidates, |_c| async move {
             AttemptResult::Failed("nope".into())
@@ -1027,7 +1093,10 @@ mod tests {
         match outcome {
             FirstContactOutcome::Terminal { tried, reason } => {
                 assert_eq!(tried, 2);
-                assert!(reason.contains("nope"), "reason names the failure: {reason}");
+                assert!(
+                    reason.contains("nope"),
+                    "reason names the failure: {reason}"
+                );
             }
             other => panic!("expected Terminal, got {other:?}"),
         }
@@ -1214,7 +1283,7 @@ mod tests {
         let metrics = nat_traversal::RelayMetrics::default();
         tokio::spawn(nat_traversal::run_relay_listener(
             listener,
-            Arc::new(nat_traversal::AuthPolicy::Open { require_pop: true }),
+            Arc::new(nat_traversal::AuthPolicy::Public),
             coordinator.adverts(),
             metrics.clone(),
         ));
@@ -1262,15 +1331,21 @@ mod tests {
         let member_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let member_addr = member_udp.local_addr().unwrap();
         let mut coordinator =
-            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Open {
-                require_pop: true,
-            });
-        coordinator.handle_at(
+            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Public);
+        let member_node_key = reachability::node_key(reachability::identity_of(&member_key));
+        let register = nat_traversal::Msg::Register {
+            key: member_node_key,
+        };
+        let now = nat_traversal::now_secs();
+        let auth = nat_traversal::sign_authenticator(&member_signer, &register.encode(), now, None);
+        coordinator.handle_auth(
             member_addr,
-            nat_traversal::Msg::Register {
-                key: reachability::node_key(reachability::identity_of(&member_key)),
+            nat_traversal::AuthRequest {
+                caller: member_node_key,
+                inner: register,
+                auth,
             },
-            nat_traversal::now_secs(),
+            now,
         );
         let (relay_addr, metrics) = relay_rig(&coordinator).await;
 
@@ -1364,9 +1439,7 @@ mod tests {
         // nobody ever registered with this coordinator: the relay must refuse
         // with `target_unregistered`, and the folded terminal must NAME it.
         let coordinator =
-            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Open {
-                require_pop: true,
-            });
+            nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Public);
         let (relay_addr, _metrics) = relay_rig(&coordinator).await;
 
         let member_key = ed25519::PrivateKey::from_seed(83).public_key();

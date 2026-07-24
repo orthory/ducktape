@@ -9,13 +9,11 @@
 //! axum/tokio worker), and drives them through [`ActorNodeApi`] so there is
 //! no self-dial.
 //!
-//! LIVE, not dormant: this branch de-versioned the ADR's phased rollout
-//! (pre-production — no committed history, no mixed-binary set). both binaries
-//! wire the files module unconditionally, so the runs composer emits v3 for
+//! LIVE, not dormant: both binaries wire the files module unconditionally, so
+//! the runs composer emits v1 for
 //! every agent run and the pool takes the full provision → bind → run →
-//! commit → cleanup bracket through this provisioner. the v2/scratch path
-//! survives only for embedders that never wire a files module (dev tools,
-//! tests).
+//! commit → cleanup bracket through this provisioner. Embedders that do not
+//! wire a files module compose the same v1 envelope with a null source pin.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

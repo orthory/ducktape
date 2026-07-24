@@ -5,10 +5,9 @@
 //! the store's root, and qmdb's batch canonicalizes mutations by hashed key,
 //! so the native logical-key commit order and the wasm hashed-key drain order
 //! produce the same op log), the same query replies, and the same resolver
-//! sync surface. the state schema revision therefore STAYS 1 — this cutover
-//! changes the executor, not one committed byte — and this proof pins that
-//! explicitly, unlike the whole-state adapter ports whose roots diverge by
-//! declared schema break.
+//! sync surface. this cutover changes the executor, not one committed byte, and
+//! this proof pins that explicitly, unlike whole-state adapter ports whose root
+//! representations differ.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
@@ -137,9 +136,28 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
         encode_query(&PageQuery::GetPage {
             page_id: "home".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "home".into(),
+            after: Some("home".into()),
+            limit: 1,
         }),
         encode_query(&PageQuery::GetPage {
             page_id: "absent".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "empty".into(),
+            after: None,
+            limit: 1,
+        }),
+        encode_query(&PageQuery::GetPage {
+            page_id: "empty".into(),
+            after: Some("empty".into()),
+            limit: 1,
         }),
         encode_query(&PageQuery::GetBlock {
             block_id: "b1".into(),
@@ -183,7 +201,7 @@ fn same_ops_identical_roots_block_by_block() {
 
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
         // (empty) qmdb store, so unlike the whole-state ports the roots are
-        // EQUAL, not a declared schema break.
+        // EQUAL.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
 
         // the host's snapshot orchestration sees the wasm tenant exactly as it
@@ -191,7 +209,7 @@ fn same_ops_identical_roots_block_by_block() {
         assert!(native.resolver_backed_ids().contains("pages"));
         assert!(wasm.resolver_backed_ids().contains("pages"));
 
-        // every op family, one block each: tree edits, folder nesting, the
+        // every op family, one block each: tree edits, page nesting, the
         // comment plane (which also emits the tagging follow-up), and subtree
         // removal. `moves` marks blocks that must change the pages root.
         let ops: Vec<(Vec<u8>, PageMsg)> = vec![
@@ -200,7 +218,6 @@ fn same_ops_identical_roots_block_by_block() {
                 PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 },
             ),
             (
@@ -253,23 +270,34 @@ fn same_ops_identical_roots_block_by_block() {
                 alice.clone(),
                 PageMsg::MoveBlock {
                     block_id: "b2".into(),
-                    parent: "b3".into(),
+                    parent: Some("b3".into()),
                     after: None,
                 },
             ),
+            // Empty nested pages terminate at their own root even though the
+            // containing document has a following sibling (`b3`).
             (
                 alice.clone(),
-                PageMsg::CreatePage {
-                    page_id: "notes".into(),
-                    title: "Notes".into(),
-                    parent: Some("home".into()),
+                PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b1".into()),
+                    block: nb("empty", BlockKind::Page, "Empty"),
                 },
             ),
             (
                 alice.clone(),
-                PageMsg::SetPageParent {
-                    page_id: "notes".into(),
+                PageMsg::InsertBlock {
+                    parent: "home".into(),
+                    after: Some("b3".into()),
+                    block: nb("notes", BlockKind::Page, "Notes"),
+                },
+            ),
+            (
+                alice.clone(),
+                PageMsg::MoveBlock {
+                    block_id: "notes".into(),
                     parent: None,
+                    after: None,
                 },
             ),
             // the comment plane: authorship derives from origin, the staged
@@ -330,8 +358,8 @@ fn same_ops_identical_roots_block_by_block() {
             ),
             (
                 alice.clone(),
-                PageMsg::DeletePage {
-                    page_id: "notes".into(),
+                PageMsg::RemoveBlock {
+                    block_id: "notes".into(),
                 },
             ),
         ];
@@ -416,13 +444,6 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
         )
         .expect("load component");
 
-        // the committed encoding is UNCHANGED (same store, same op log, same
-        // root — proven above), so the canonical-state revision must stay 1:
-        // pre-cutover workspaces reopen without a schema fence.
-        assert_eq!(Module::state_schema_revision(&native), 1);
-        assert_eq!(Module::state_schema_revision(&wasm), 1);
-
-        // and the declared sync surface is verbatim the native declaration.
         let n_handle = native.state_sync_handle().expect("native handle");
         let w_handle = wasm.state_sync_handle().expect("wasm handle");
         assert_eq!(n_handle, w_handle, "sync handles diverge");
@@ -456,7 +477,6 @@ fn rejections_match_and_leave_no_trace() {
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 }),
             )
             .await
@@ -493,26 +513,27 @@ fn rejections_match_and_leave_no_trace() {
                 "duplicate block id",
             ),
             (
-                PageMsg::InsertBlock {
-                    parent: "home".into(),
-                    after: None,
-                    block: nb("p", BlockKind::Page, "sneaky page"),
+                PageMsg::SetKind {
+                    block_id: "b1".into(),
+                    kind: BlockKind::Page,
                 },
-                "created by CreatePage",
+                "page blocks cannot",
             ),
             (
                 PageMsg::MoveBlock {
                     block_id: "home".into(),
-                    parent: "b1".into(),
+                    parent: Some("b1".into()),
                     after: None,
                 },
-                "page roots cannot",
+                "inside the moved subtree",
             ),
             (
-                PageMsg::RemoveBlock {
-                    block_id: "home".into(),
+                PageMsg::MoveBlock {
+                    block_id: "b1".into(),
+                    parent: None,
+                    after: None,
                 },
-                "page roots cannot",
+                "only page blocks",
             ),
             (
                 PageMsg::EditComment {
@@ -570,18 +591,18 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
 
         // ONE block, four dispatches: the insert reads the page CREATED one
         // dispatch earlier (staged, not committed), the probe host-routes a
-        // GetPage query MID-BLOCK (the wasm side answers it staged-over-store
-        // through the replay), and the comment reads the staged block. on the
-        // wasm side dispatch N+1's reads come from the OUTER staged overlay —
-        // the guest's inner pending died with dispatch N — which is exactly
-        // the native pending-persists-across-dispatches view.
+        // GetPage continuation MID-BLOCK (the wasm side answers it
+        // staged-over-store through the replay), and the comment reads the
+        // staged block. on the wasm side dispatch N+1's reads come from the
+        // OUTER staged overlay — the guest's inner pending died with dispatch
+        // N — which is exactly the native pending-persists-across-dispatches
+        // view.
         let batch = vec![
             (
                 Origin::External(alice.clone()),
                 op(&PageMsg::CreatePage {
                     page_id: "home".into(),
                     title: "Home".into(),
-                    parent: None,
                 }),
             ),
             (
@@ -598,6 +619,8 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                     target: "probe".into(),
                     payload: encode_query(&PageQuery::GetPage {
                         page_id: "home".into(),
+                        after: Some("home".into()),
+                        limit: 1,
                     }),
                 },
             ),
@@ -648,6 +671,8 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                 "pages",
                 &encode_query(&PageQuery::GetPage {
                     page_id: "home".into(),
+                    after: Some("home".into()),
+                    limit: 1,
                 }),
             )
             .await

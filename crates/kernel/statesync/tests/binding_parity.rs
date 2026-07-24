@@ -100,10 +100,7 @@ fn full_suite() -> Vec<(&'static str, SyncRequest)> {
         ),
         ("TipCoords", SyncRequest::TipCoords),
         ("Blob", SyncRequest::Blob { digest: [7u8; 32] }),
-        (
-            "BlobInfo",
-            SyncRequest::BlobInfo { digest: [8u8; 32] },
-        ),
+        ("BlobInfo", SyncRequest::BlobInfo { digest: [8u8; 32] }),
         (
             "BlobRange",
             SyncRequest::BlobRange {
@@ -138,7 +135,6 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             participants: vec![vec![1u8; 32]],
             residents: vec![vec![2u8; 32]],
             floor_cert: Some(vec![0xAB; 8]),
-            state_schema: [0xAB; 32],
             entries: vec![ManifestEntry {
                 module_id: "kv".into(),
                 root: StateRoot([3u8; 32]),

@@ -3,8 +3,8 @@
 //! wasm behind `guest-adapter`) and the native `Automations` module answer
 //! the SAME op sequence with IDENTICAL query replies, and their roots move in
 //! lockstep. the roots THEMSELVES differ — the port persists the native
-//! canonical snapshot as one host-KV value, a declared state-schema break
-//! (revision 2) — and this proof pins that difference from genesis
+//! canonical snapshot as one host-KV value — and this proof pins that
+//! representation difference from genesis
 //! (automations' empty encoding carries TWO zero counts, so unlike saga/agent
 //! its genesis root already differs from the empty host-KV store's).
 //!
@@ -21,8 +21,8 @@
 //! a RunRecord instead of aborting the posting user's block.
 
 use automations::{
-    Action, Automations, AutomationsMsg, AutomationsQuery, AutomationsReply, Trigger,
-    decode_reply, encode_msg, encode_query, MAX_FILTER_BYTES, MAX_ID_BYTES, MAX_TEMPLATE_BYTES,
+    Action, Automations, AutomationsMsg, AutomationsQuery, AutomationsReply, MAX_FILTER_BYTES,
+    MAX_ID_BYTES, MAX_TEMPLATE_BYTES, Trigger, decode_reply, encode_msg, encode_query,
 };
 use chat::{Block, Chat, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -41,11 +41,7 @@ use wasm_host::WasmModule;
 const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.wasm");
 
 fn wasm_automations() -> WasmModule {
-    WasmModule::from_bytes("automations", AUTOMATIONS_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the
-        // automations canonical state.
-        .with_state_schema_revision(2)
+    WasmModule::from_bytes("automations", AUTOMATIONS_WASM).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
@@ -155,7 +151,8 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
 }
 
 fn root_of(h: &Host) -> StateRoot {
-    h.module_root("automations").expect("automations registered")
+    h.module_root("automations")
+        .expect("automations registered")
 }
 
 const SIBLING_IDS: [&str; 3] = ["chat", "tasks", "inbox"];
@@ -199,7 +196,7 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    // the roots themselves always differ (the pinned schema break).
+    // the roots themselves always differ (the pinned representation difference).
     assert_ne!(root_of(native), root_of(wasm));
 }
 
@@ -260,7 +257,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         let user = Origin::External(key(0xA1));
         let ops = Origin::External(key(0xB2));
 
-        // the schema break is visible from GENESIS here: automations' empty
+        // the representation difference is visible from GENESIS here: automations' empty
         // canonical encoding is TWO zero counts (rules + history), the wasm
         // port's empty host-KV store is ONE — different preimages, different
         // roots (contrast saga/agent, whose single-count empty encodings
@@ -269,7 +266,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         assert_ne!(
             root_of(&native),
             root_of(&wasm),
-            "genesis roots must differ — the port is a DECLARED schema break"
+            "genesis roots must differ — the port uses a distinct root representation"
         );
         // the inbox sibling's empty root, for the delivery-landed claims below
         // (the inbox has no read surface — its module root is the whole
@@ -483,7 +480,11 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         )
         .await;
         // no NEW task landed (the squat is the only "job-general-6").
-        assert_eq!(task_ids(&wasm).await.len(), 3, "the probe downgraded the fire");
+        assert_eq!(
+            task_ids(&wasm).await.len(),
+            3,
+            "the probe downgraded the fire"
+        );
 
         // ---- DeleteRule: the tombstone hides the rule from reads.
         roundtrip(

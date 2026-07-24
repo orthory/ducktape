@@ -297,15 +297,16 @@ pub(crate) struct BrokerEndpoint {
 /// how the provider child reaches this run's broker — which drives BOTH the
 /// bind address and the `base_url` the child is handed.
 ///
-/// `Loopback` is a same-netns child (Podman under `--network=host`):
+/// `Loopback` is a same-netns child that shares the host's loopback: only the
+/// test-only Bare host, which runs the executor directly with no container.
 /// bind `127.0.0.1`, hand it `http://127.0.0.1:<port>`.
 ///
 /// `HostGateway(host)` is a child in a SEPARATE netns that reaches the host only
 /// through a gateway name in its `/etc/hosts` — a Tart VM guest (`ducktape-host`)
-/// or a private-netns Podman container (`host.containers.internal`). The broker
-/// binds a routable interface and the base_url names the gateway. The opaque
-/// per-run bearer still gates it; binding beyond loopback is the reachability
-/// cost of the stronger network isolation.
+/// or a private-netns Podman container (`host.containers.internal`, which every
+/// Podman run now uses). The broker binds a routable interface and the base_url
+/// names the gateway. The opaque per-run bearer still gates it; binding beyond
+/// loopback is the reachability cost of the stronger network isolation.
 #[derive(Clone, Copy)]
 pub(crate) enum Reachability {
     Loopback,

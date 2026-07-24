@@ -7,17 +7,15 @@ use files::paths::canonical as canonical_duckfs_path;
 
 use super::facets::{WireStatus, decode_run_result_v1, encode_delivery_receipt, output_ref_of};
 use super::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, AgentStatus,
-    BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx, DELEGATED_CHILD_CORES,
-    DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationResult, DelegationState, DelegationStatus,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
+    Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
     DispatchMsg, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
-    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES,
-    MAX_DELEGATIONS_BYTES, MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES,
-    Msg, Origin, PendingState, PreparedDispatch, ReplyBlock, ResultEvent, RunsModule, SagaOrigin,
-    TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
-    chat_encode_query, decode_result_event, dispatch_encode_msg, dispatch_id_for,
-    files_decode_reply, files_encode_msg, files_encode_query, page_thread_id, reply_message_id,
-    run_id_for, tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
+    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg,
+    Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin, TaskMsg, TaskQuery,
+    TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
+    decode_result_event, dispatch_encode_msg, dispatch_id_for, files_decode_reply,
+    files_encode_msg, files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply,
+    tasks_encode_msg, tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
@@ -44,7 +42,6 @@ pub(super) fn agent_response_from_text(text: &str, job_run: bool) -> AgentRespon
             vec![paragraph_block(non_empty_text(text))]
         },
         actions: Vec::new(),
-        delegations: Vec::new(),
         commit_message: None,
     });
     normalize_response(parsed, text, job_run)
@@ -197,13 +194,6 @@ fn non_empty_text(text: &str) -> String {
 /// byte bound on the error excerpt a failure reply carries — same order as
 /// the host's diagnostic excerpts (capability-host bounds stderr to 400).
 pub(super) const FAILURE_EXCERPT_BYTES: usize = 400;
-
-struct PreparedDelegation {
-    run_id: String,
-    agent_id: String,
-    authority: super::RunAuthority,
-    dispatch: PreparedDispatch,
-}
 
 /// a failed run's error as ONE bounded chat line: whitespace runs (newlines
 /// included) collapse to single spaces, then the excerpt bound applies.
@@ -560,13 +550,6 @@ impl RunsModule {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
-        let delegations = match self
-            .prepare_delegations(&*ctx, run_id, entry, &response.delegations)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
-        };
         // build the faceted finalize payload — and render the message facet
         // the PR sink derives its title/body from — BEFORE moving `response`
         // into emit_response; emission order is response → sink → finalize.
@@ -582,7 +565,6 @@ impl RunsModule {
             .await;
         self.emit_response(ctx, run_id, entry, Lane::Settle, response)
             .await;
-        self.stage_delegations(ctx, entry, delegations);
         let pr_number = self
             .emit_sink(
                 ctx,
@@ -612,156 +594,6 @@ impl RunsModule {
         });
         self.emit_job_finalize_if_current_claimant(ctx, entry, true, payload)
             .await;
-    }
-
-    /// Validate and fully compose one final-only child wave before any effect
-    /// is staged. A failure therefore fails the parent response without
-    /// admitting a partial batch.
-    async fn prepare_delegations(
-        &self,
-        ctx: &dyn Ctx,
-        parent_run_id: &str,
-        entry: &PendingState,
-        delegations: &[DelegationRequest],
-    ) -> Result<Vec<PreparedDelegation>, String> {
-        if delegations.is_empty() {
-            return Ok(Vec::new());
-        }
-        let bytes = serde_json::to_vec(delegations)
-            .expect("delegations are serializable")
-            .len();
-        if bytes > MAX_DELEGATIONS_BYTES {
-            return Err(format!(
-                "delegations are {bytes} bytes; the cap is {MAX_DELEGATIONS_BYTES}"
-            ));
-        }
-        if delegations.len() > MAX_DELEGATIONS_PER_RUN {
-            return Err(format!(
-                "{} delegations exceed the cap of {MAX_DELEGATIONS_PER_RUN}",
-                delegations.len()
-            ));
-        }
-        let parent = self
-            .agent_for_run(ctx, entry)
-            .await?
-            .ok_or_else(|| format!("parent agent is not registered: {}", entry.agent_id))?;
-        if parent.status != AgentStatus::Active {
-            return Err(format!("parent agent is paused: {}", parent.agent_id));
-        }
-        let workspace_agent = self
-            .agent_record(ctx, &entry.workspace_agent_id)
-            .await?
-            .ok_or_else(|| {
-                format!(
-                    "workspace agent is not registered: {}",
-                    entry.workspace_agent_id
-                )
-            })?;
-        let count = delegations.len() as u32; // already capped at 8 above
-        if count > parent.caps.subagent_budget {
-            return Err(format!(
-                "delegation needs {count} children but the parent budget is {}",
-                parent.caps.subagent_budget
-            ));
-        }
-
-        let mut ids = BTreeSet::new();
-        let mut prepared = Vec::with_capacity(delegations.len());
-        for request in delegations {
-            let instruction = request.instruction.trim();
-            if instruction.is_empty() {
-                return Err("delegation instruction must be non-empty".into());
-            }
-            if request.instruction.len() > MAX_DELEGATION_INSTRUCTION_BYTES {
-                return Err(format!(
-                    "delegation instruction is {} bytes; the cap is {MAX_DELEGATION_INSTRUCTION_BYTES}",
-                    request.instruction.len()
-                ));
-            }
-            if !ids.insert(request.agent_id.as_str()) {
-                return Err(format!("duplicate delegated agent: {}", request.agent_id));
-            }
-            if request.agent_id == parent.agent_id {
-                return Err("an agent cannot delegate to itself".into());
-            }
-            let child = self
-                .agent_record(ctx, &request.agent_id)
-                .await?
-                .ok_or_else(|| format!("unknown child agent: {}", request.agent_id))?;
-            if child.status != AgentStatus::Active {
-                return Err(format!("child agent is paused: {}", child.agent_id));
-            }
-            let mut scoped_child = parent.scoped_for_call(&child);
-            // Terminal (sessionless) delegation has no call edge with which to
-            // count a recursive tree. Keep that lane to one final wave; live
-            // recursive calls use DelegateRun and its root-wide live-call cap.
-            scoped_child.caps.subagent_budget = 0;
-            // the parent CURATES library skills for this child, on top of the
-            // child's own — confined to the library by construction (names, not
-            // paths). the child keeps its persona and gains what this task needs.
-            let extra = crate::envelope::library_skills(&request.skills)?;
-            if let Some(skill) = extra
-                .iter()
-                .find(|skill| !parent.permits(&agent::CapRequest::DuckfsRead(&skill.source_prefix)))
-            {
-                return Err(format!(
-                    "the call authority cannot read delegated skill {}",
-                    skill.name
-                ));
-            }
-            let run_id = run_id_for(&entry.channel_id, entry.anchor_seq, &child.agent_id);
-            if self.turn_taken(ctx, &dispatch_id_for(&run_id)).await? {
-                return Err(format!("delegated child turn is already taken: {run_id}"));
-            }
-            let context = format!(
-                "## Delegated task\nParent run: {parent_run_id}\nParent agent: {}\n\nInstruction:\n{instruction}",
-                parent.agent_id
-            );
-            let dispatch = self
-                .prepare_dispatch_with_context(
-                    ctx,
-                    &scoped_child,
-                    &run_id,
-                    &entry.channel_id,
-                    entry.anchor_seq,
-                    Some((&workspace_agent, &context)),
-                    &extra,
-                )
-                .await?;
-            prepared.push(PreparedDelegation {
-                run_id,
-                agent_id: child.agent_id,
-                authority: super::RunAuthority::from_record(&scoped_child),
-                dispatch,
-            });
-        }
-        Ok(prepared)
-    }
-
-    fn stage_delegations(
-        &mut self,
-        ctx: &mut dyn Ctx,
-        parent: &PendingState,
-        delegations: Vec<PreparedDelegation>,
-    ) {
-        for child in delegations {
-            self.stage_scoped_dispatch_run(
-                ctx,
-                &child.run_id,
-                child.agent_id,
-                parent.workspace_agent_id.clone(),
-                parent.channel_id.clone(),
-                parent.anchor_seq,
-                parent.requester.clone(),
-                child.dispatch,
-                BTreeMap::from([
-                    ("cores".into(), DELEGATED_CHILD_CORES),
-                    ("mem_gb".into(), DELEGATED_CHILD_MEM_GB),
-                ]),
-                Some(child.authority),
-                None,
-            );
-        }
     }
 
     /// deterministic response validation — THE safety boundary (design §5).
@@ -796,25 +628,8 @@ impl RunsModule {
             .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        if !response.delegations.is_empty() {
-            if !matches!(lane, Lane::Settle) {
-                return Err(
-                    "terminal delegation is compatibility-only; use the live agent-call tool"
-                        .into(),
-                );
-            }
-            if entry.job_id.is_some() || page_thread_id(&entry.channel_id).is_some() {
-                return Err("delegation requires a chat or Forge run".into());
-            }
-        }
-        if response.reply_blocks.is_empty()
-            && response.actions.is_empty()
-            && response.delegations.is_empty()
-        {
-            return Err(
-                "response carries neither reply blocks nor actions; no delegations were requested"
-                    .into(),
-            );
+        if response.reply_blocks.is_empty() && response.actions.is_empty() {
+            return Err("response carries neither reply blocks nor actions".into());
         }
         if response.actions.len() > MAX_ACTIONS_PER_RUN {
             return Err(format!(
@@ -1440,11 +1255,7 @@ impl RunsModule {
     }
 }
 
-fn validate_duckfs_text_write(
-    agent: &AgentRecord,
-    path: &str,
-    text: &str,
-) -> Result<(), String> {
+fn validate_duckfs_text_write(agent: &AgentRecord, path: &str, text: &str) -> Result<(), String> {
     canonical_duckfs_path(path)?;
     if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
         return Err(format!(
@@ -1453,7 +1264,10 @@ fn validate_duckfs_text_write(
         ));
     }
     if !agent.permits(&CapRequest::DuckfsWrite(path)) {
-        return Err(format!("agent {} may not write duckfs path {path}", agent.agent_id));
+        return Err(format!(
+            "agent {} may not write duckfs path {path}",
+            agent.agent_id
+        ));
     }
     Ok(())
 }
@@ -1493,12 +1307,9 @@ mod tests {
         )
         .expect("granted path");
 
-        let sibling = validate_duckfs_text_write(
-            &agent,
-            "/shared/agents/qa-fixer-policy/SKILL.md",
-            "lesson",
-        )
-        .unwrap_err();
+        let sibling =
+            validate_duckfs_text_write(&agent, "/shared/agents/qa-fixer-policy/SKILL.md", "lesson")
+                .unwrap_err();
         assert!(sibling.contains("may not write duckfs path"), "{sibling}");
 
         let relative = validate_duckfs_text_write(&agent, "shared/out.txt", "lesson").unwrap_err();

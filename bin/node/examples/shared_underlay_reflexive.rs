@@ -45,7 +45,9 @@ async fn main() {
         eprintln!("usage: shared_underlay_reflexive --coord <host:port> [--seed <u64>]");
         std::process::exit(2);
     });
-    let seed: u64 = arg(&args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(11);
+    let seed: u64 = arg(&args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(11);
 
     let coord: SocketAddr = tokio::net::lookup_host(&coord_host)
         .await
@@ -67,7 +69,7 @@ async fn main() {
         NatSocket::Owned(owned_sock),
         me,
         vec![coord],
-        Some(signer.clone()),
+        signer.clone(),
         None,
     )
     .expect("owned client");
@@ -90,7 +92,7 @@ async fn main() {
         NatSocket::shared(underlay.sender(), bypass).expect("shared socket"),
         me,
         vec![coord],
-        Some(signer.clone()),
+        signer.clone(),
         None,
     )
     .expect("shared client");
@@ -111,7 +113,11 @@ async fn main() {
             let match_ip = o.ip() == s.ip();
             println!(
                 "\nverdict: shared underlay is {} bound; reflexive IPs {} (owned {} / shared {})",
-                if shared_local.is_ipv4() { "IPv4" } else { "IPv6" },
+                if shared_local.is_ipv4() {
+                    "IPv4"
+                } else {
+                    "IPv6"
+                },
                 if match_ip { "MATCH" } else { "DIVERGE" },
                 o.ip(),
                 s.ip(),
@@ -131,7 +137,11 @@ async fn main() {
 }
 
 fn family(addr: SocketAddr) -> &'static str {
-    if addr.is_ipv4() { "AF_INET" } else { "AF_INET6" }
+    if addr.is_ipv4() {
+        "AF_INET"
+    } else {
+        "AF_INET6"
+    }
 }
 
 fn show(r: &std::io::Result<SocketAddr>) -> String {

@@ -1,14 +1,14 @@
 use super::*;
 
-// ---- the composer always emits the portable v3 wire --------------------------
+// ---- the composer always emits the portable v1 wire --------------------------
 
 #[test]
-fn a_run_composes_v3_with_or_without_files_wired() {
+fn a_run_composes_v1_with_or_without_files_wired() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let agent = record("bot", &[ACTION_CHAT_POST]);
     let head = "aa".repeat(32);
 
-    // no files module (dev tools/tests): still the v3 wire, with a null pin.
+    // no files module (dev tools/tests): still the v1 wire, with a null pin.
     let m0 = module();
     let ctx0 = CaptureCtx::new()
         .with_registry(&registry)
@@ -20,16 +20,17 @@ fn a_run_composes_v3_with_or_without_files_wired() {
         "general",
         2,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
-    assert_eq!(v["ducktape_run"], 3, "every composer emits v3 (flag day)");
+    assert_eq!(v["ducktape_run"], 1, "every composer emits v1");
     assert!(
         v["workspace"]["source_snapshot"].is_null(),
         "an unwired files module composes an explicit null pin"
     );
 
-    // files wired: the v3 payload pins the committed head.
+    // files wired: the v1 payload pins the committed head.
     let m4 = module().with_files_module("files");
     let ctx4 = CaptureCtx::new()
         .with_registry(&registry)
@@ -42,10 +43,11 @@ fn a_run_composes_v3_with_or_without_files_wired() {
         "general",
         2,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
-    assert_eq!(v["ducktape_run"], 3, "a wired files module composes v3");
+    assert_eq!(v["ducktape_run"], 1, "a wired files module composes v1");
     assert_eq!(
         v["workspace"]["source_prefix"],
         "/shared/agent-workspaces/bot"
@@ -56,7 +58,7 @@ fn a_run_composes_v3_with_or_without_files_wired() {
     );
     assert!(
         v["workspace"].get("mount_path").is_none(),
-        "the composed v3 workspace carries NO mount_path (D7)"
+        "the composed v1 workspace carries NO mount_path (D7)"
     );
 }
 
@@ -221,6 +223,7 @@ fn compose_forge(
         channel,
         2,
         &[],
+        &SiblingReadBudget::default(),
     ))?;
     Ok(serde_json::from_slice(&prepared.payload).expect("payload is JSON"))
 }
@@ -238,7 +241,7 @@ fn an_issue_run_forks_dev_with_an_unborn_item_branch_and_requests_a_pr() {
         .with_files_head(&"aa".repeat(32));
     let v = compose_forge(&m, &ctx, &registry, "forge:app:7").unwrap();
 
-    assert_eq!(v["ducktape_run"], 3);
+    assert_eq!(v["ducktape_run"], 1);
     assert_eq!(v["workspace"]["kind"], "forge");
     assert_eq!(v["workspace"]["repo"], "app");
     assert_eq!(v["workspace"]["item_title"], "Fix the gate");
@@ -343,6 +346,127 @@ fn a_pr_item_run_works_the_prs_own_source_branch() {
 // ---- `[[page:<id>]]` page-spec injection (M2) ---------------------------------
 
 #[test]
+fn page_reads_follow_every_cursor_until_the_page_is_complete() {
+    let total = usize::from(pages::MAX_PAGE_QUERY_LIMIT) + 1;
+    let m = module().with_pages_module("pages");
+    let ctx = CaptureCtx::new().with_page("plan", page_with_block_count(total, ""));
+
+    let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("page exists");
+
+    assert_eq!(blocks.len(), total);
+    assert_eq!(ctx.page_query_count(), 2);
+}
+
+#[test]
+fn page_reads_keep_accumulated_blocks_when_a_later_page_fails() {
+    let total = usize::from(pages::MAX_PAGE_QUERY_LIMIT) + 1;
+    let m = module().with_pages_module("pages");
+    let ctx = CaptureCtx::new()
+        .with_page("plan", page_with_block_count(total, ""))
+        .fail_page_queries_after(1);
+
+    let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("first page survives");
+    let rendered = crate::inject::render_pages_section(&[("plan".into(), Some(blocks.clone()))]);
+
+    assert_eq!(blocks.len(), usize::from(pages::MAX_PAGE_QUERY_LIMIT) + 1);
+    assert_eq!(ctx.page_query_count(), 2);
+    assert!(
+        rendered.contains("[page context truncated at bounded read limit]"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn page_reads_mark_the_reference_query_ceiling_as_truncated() {
+    let page_limit = usize::from(pages::MAX_PAGE_QUERY_LIMIT);
+    let query_limit = crate::MAX_SIBLING_QUERY_READS;
+    let total = page_limit * query_limit + 1;
+    let m = module().with_pages_module("pages");
+    let ctx = CaptureCtx::new().with_page("plan", page_with_block_count(total, ""));
+
+    let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("partial page survives");
+    let rendered = crate::inject::render_pages_section(&[("plan".into(), Some(blocks.clone()))]);
+
+    assert_eq!(blocks.len(), page_limit * query_limit + 1);
+    assert_eq!(ctx.page_query_count(), query_limit);
+    assert!(
+        rendered.contains("[page context truncated at bounded read limit]"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn request_run_keeps_reference_reads_inside_the_global_sibling_budget() {
+    let page_limit = usize::from(pages::MAX_PAGE_QUERY_LIMIT);
+    let query_limit = crate::MAX_SIBLING_QUERY_READS;
+    let registry = forge_read_registry();
+    let mut m = forge_module();
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(9))
+        .with_registry(&registry)
+        .with_transcript(
+            "forge:app:7",
+            vec![message(
+                1,
+                "[Plan](duck://page/plan) [notes](duck://files/shared/attachments/u/notes.md)",
+            )],
+        )
+        .with_forge_item("app", forge_issue(7, "Fix", "body"))
+        .with_forge_tip("app", "dev", &"cd".repeat(20))
+        .with_page(
+            "plan",
+            page_with_block_count(page_limit * query_limit + 1, ""),
+        )
+        .with_file("/shared/attachments/u/notes.md", b"must remain readable");
+
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&RunsMsg::RequestRun {
+            agent_id: "bot".into(),
+            channel_id: "forge:app:7".into(),
+            anchor_seq: 1,
+            demands: Default::default(),
+            skills: Vec::new(),
+        }),
+    )
+    .expect("reference injection degrades before the host rejects the dispatch");
+
+    assert_eq!(ctx.query_count(), 64, "the 65th sibling read was attempted");
+    assert_eq!(ctx.distinct_query_count(), 64);
+    let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+        panic!("expected a dispatch");
+    };
+    let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let context = payload["context"].as_str().unwrap();
+    assert!(
+        context.contains("[page context truncated at bounded read limit]"),
+        "{context}"
+    );
+    assert!(
+        context.contains("[attachment context truncated at bounded read limit]"),
+        "{context}"
+    );
+    assert!(!context.contains("must remain readable"), "{context}");
+}
+
+#[test]
+fn page_reads_stop_when_the_render_budget_is_full() {
+    let page_limit = usize::from(pages::MAX_PAGE_QUERY_LIMIT);
+    let total = page_limit + 1;
+    let text = "x".repeat(crate::inject::PAGE_CONTEXT_BYTES / page_limit + 16);
+    let m = module().with_pages_module("pages");
+    let ctx = CaptureCtx::new().with_page("plan", page_with_block_count(total, &text));
+
+    let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("page exists");
+    let rendered = crate::inject::render_pages_section(&[("plan".into(), Some(blocks.clone()))]);
+
+    assert_eq!(blocks.len(), page_limit);
+    assert_eq!(ctx.page_query_count(), 1);
+    assert_eq!(rendered.len(), crate::inject::PAGE_CONTEXT_BYTES);
+}
+
+#[test]
 fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
     // a PLAIN channel (the duckfs lane): the trigger message's ref alone
     // composes a context section carrying the page subtree.
@@ -368,6 +492,7 @@ fn a_page_ref_in_the_trigger_message_injects_the_page_section() {
         "general",
         2,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -418,6 +543,7 @@ fn a_file_ref_in_the_trigger_message_injects_the_attachment_text() {
         "general",
         1,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -431,6 +557,34 @@ fn a_file_ref_in_the_trigger_message_injects_the_attachment_text() {
         context.contains("[attachment: shot.png — binary content, not shown]"),
         "{context}"
     );
+}
+
+#[test]
+fn attachment_reads_stop_when_the_rendered_section_is_full() {
+    let m = module().with_files_module("files");
+    let ctx = CaptureCtx::new()
+        .with_file(
+            "/shared/attachments/u/full.txt",
+            &vec![b'x'; crate::inject::ATTACHMENT_CONTEXT_BYTES],
+        )
+        .with_file(
+            "/shared/attachments/u/unread.txt",
+            b"must not spend another sibling read",
+        );
+    let mut remaining = MAX_SIBLING_QUERY_READS;
+    let budget = SiblingReadBudget::default();
+    let section = block_on(m.attachment_context(
+        &ctx,
+        &["[full](duck://files/shared/attachments/u/full.txt) \
+           [unread](duck://files/shared/attachments/u/unread.txt)"],
+        &mut remaining,
+        &budget,
+    ))
+    .unwrap();
+
+    assert_eq!(ctx.query_count(), 1);
+    assert_eq!(remaining, MAX_SIBLING_QUERY_READS - 1);
+    assert!(section.ends_with("\n[attachment context truncated at 64 KiB]"));
 }
 
 #[test]
@@ -452,6 +606,7 @@ fn an_unresolvable_file_ref_composes_its_marker_never_a_failure() {
         "general",
         1,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .expect("an unresolvable attachment never fails compose");
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -479,7 +634,10 @@ fn a_page_ref_in_the_forge_item_body_appends_after_the_item_context() {
     let context = v["context"].as_str().unwrap();
     // the M1 item context is untouched and leads; the page section follows.
     assert!(context.starts_with("Forge item context"), "{context}");
-    assert!(context.contains("spec at [Plan](duck://page/plan)"), "{context}");
+    assert!(
+        context.contains("spec at [Plan](duck://page/plan)"),
+        "{context}"
+    );
     let item_body = context.find("spec at").unwrap();
     let pages_at = context
         .find("Referenced pages:")
@@ -515,6 +673,7 @@ fn a_missing_page_ref_composes_its_marker_never_a_failure() {
         "general",
         1,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .expect("an unresolvable ref never fails compose");
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -537,6 +696,7 @@ fn page_refs_without_a_wired_pages_module_compose_no_page_section() {
         "general",
         1,
         &[],
+        &SiblingReadBudget::default(),
     ))
     .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
@@ -560,8 +720,26 @@ fn page_injection_composes_byte_deterministically() {
     };
     let agent = registry.get("bot").unwrap();
     let run = crate::run_id_for("forge:app:7", 2, "bot");
-    let a = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2, &[])).unwrap();
-    let b = block_on(m.prepare_dispatch(&ctx(), agent, &run, "forge:app:7", 2, &[])).unwrap();
+    let a = block_on(m.prepare_dispatch(
+        &ctx(),
+        agent,
+        &run,
+        "forge:app:7",
+        2,
+        &[],
+        &SiblingReadBudget::default(),
+    ))
+    .unwrap();
+    let b = block_on(m.prepare_dispatch(
+        &ctx(),
+        agent,
+        &run,
+        "forge:app:7",
+        2,
+        &[],
+        &SiblingReadBudget::default(),
+    ))
+    .unwrap();
     assert_eq!(a.payload, b.payload, "same committed state, same bytes");
 }
 

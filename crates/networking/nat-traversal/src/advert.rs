@@ -178,17 +178,6 @@ impl AdvertBook {
             .filter(|a| !self.expired(a, now))
             .map(|a| a.reflexive)
     }
-
-    /// Reverse-map an observed source back to the key that advertised it. Used
-    /// by the coordinator to bind a caller's datagram source to its identity.
-    /// Expired mappings do not resolve.
-    pub fn key_for_src(&self, src: SocketAddr, now: u64) -> Option<NodeKey> {
-        self.latest
-            .iter()
-            .filter(|(_, a)| !self.expired(a, now))
-            .find(|(_, a)| a.reflexive == src)
-            .map(|(k, _)| *k)
-    }
 }
 
 /// One [`AdvertBook`] shared between the UDP rendezvous state machine (the
@@ -245,12 +234,6 @@ mod tests {
             AdvertOutcome::Superseded
         );
         assert_eq!(book.current(key, 0), Some(addr(2, 5000)));
-        assert_eq!(book.key_for_src(addr(2, 5000), 0), Some(key));
-        assert_eq!(
-            book.key_for_src(addr(1, 4000), 0),
-            None,
-            "stale mapping is gone"
-        );
     }
 
     #[test]
@@ -297,11 +280,6 @@ mod tests {
             book.current(key, 0),
             Some(addr(2, 5000)),
             "a stale nonce-0 register cannot clobber a rebind re-advertisement"
-        );
-        assert_eq!(
-            book.key_for_src(addr(1, 4000), 0),
-            None,
-            "stale mapping stays gone"
         );
     }
 
@@ -356,11 +334,6 @@ mod tests {
             Some(victim_src),
             "the replayed register cannot hijack the victim's reflexive mapping"
         );
-        assert_eq!(
-            book.key_for_src(attacker_src, 1_010),
-            None,
-            "the attacker's source never became the victim's mapping"
-        );
         // The victim's own keepalive readvertise (strictly-higher nonce) still
         // works normally afterward — a genuine rebind is unaffected.
         assert_eq!(
@@ -412,11 +385,6 @@ mod tests {
             "alive at exactly ttl"
         );
         assert_eq!(book.current(key, 1_121), None, "expired past ttl");
-        assert_eq!(
-            book.key_for_src(addr(1, 4000), 1_121),
-            None,
-            "reverse map expires too"
-        );
     }
 
     #[test]

@@ -8,11 +8,12 @@ publish = false
 chat.workspace = true
 ducktape-rpc.workspace = true
 pages.workspace = true
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "tokio", "wgpu", "x11"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "18c07913715d22c3867ba8b0d71ac7fda2b37827" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "18c07913715d22c3867ba8b0d71ac7fda2b37827", version = "=0.1.0" }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "5a17c58ad71ee0b3386662919069e4aa7a3e5af2" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui-lang.git", rev = "5a17c58ad71ee0b3386662919069e4aa7a3e5af2", version = "=0.1.0" }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true

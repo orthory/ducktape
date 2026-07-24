@@ -11,7 +11,7 @@ use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
-/// bind — joiner/promoted state, the chain-id string, the mesh-state path,
+/// bind — promoted state, the chain-id string, the mesh-state path,
 /// and the cold-restart mesh dial seeds folded into `bootstrappers`.
 pub(crate) struct BootEnv {
     pub(crate) signer: ed25519::PrivateKey,
@@ -68,7 +68,6 @@ pub(crate) struct BootEnv {
     /// resources. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
     pub(crate) promoted: bool,
-    pub(crate) joiner: bool,
 }
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
@@ -344,6 +343,5 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         sandbox,
         sandbox_capacity,
         promoted,
-        joiner,
     }
 }

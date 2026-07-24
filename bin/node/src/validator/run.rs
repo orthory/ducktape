@@ -376,8 +376,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
             agent_dirs.clone(),
             Some(stream_hub.run_output().output_sink()),
             backend,
-            // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-            false,
         )
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
         None => capability_host::ProviderSet::empty(),

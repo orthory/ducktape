@@ -73,7 +73,7 @@ observably (`/v1/index/status` `fold.{module}`), never atomically.
 
 | Bin | Runs | What to touch |
 |---|---|---|
-| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` + `MODULE_STATE_SCHEMAS` (bump the `[..; N]` literals). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
+| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` (bump the `[..; N]` literal). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
 | `bin/demo` | in-process walkthrough | same shape |
@@ -82,9 +82,8 @@ noded/simnode/demo run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
 if it should be testable in sim-lane or visible in the app, it does.
 
-A new module joins the two live arrays — `MODULE_IDS` and
-`MODULE_STATE_SCHEMAS` — and keep each array's declared `[..; N]` length equal
-to its contents (the auto-merge count trap).
+A new module joins `MODULE_IDS`; keep its declared `[..; N]` length equal to
+its contents (the auto-merge count trap).
 
 ## 4. Gates — ordering is load-bearing
 

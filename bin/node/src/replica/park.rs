@@ -10,7 +10,7 @@
 
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
-use commonware_cryptography::{ed25519, Signer as _};
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::authenticated::discovery;
 use commonware_p2p::{Manager, Receiver as P2pReceiver};
 use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
@@ -21,10 +21,7 @@ use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_index};
-use noded::projection::{BlockProjection, project_block};
-use crate::host_reads::{
-    joiner_epoch_mesh, read_valset_members, read_valset_residents,
-};
+use crate::host_reads::{joiner_epoch_mesh, read_valset_members, read_valset_residents};
 use crate::host_state::{NetworkBindings, SyncSubstrates, restore_host, sync_all_modules};
 use crate::oracle_pool;
 use crate::relay;
@@ -33,14 +30,15 @@ use crate::replica;
 use crate::resident_announce;
 use crate::resident_dispatch;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
-use crate::sync::catchup::{catch_up_post_reboot_frames, PostRebootCatchupError};
+use crate::sync::catchup::{PostRebootCatchupError, catch_up_post_reboot_frames};
 use crate::sync::serve::{
-    reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
-    replica_verifier, verify_manifest_floor, write_boundary_checkpoint, ServedSeal,
+    ServedSeal, reopen_preflight_synced_host, reopen_recovery, replica_backfill,
+    replica_orchestrator_at, replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
 };
 use crate::util::{fatal, hex};
+use noded::projection::{BlockProjection, project_block};
 
-use super::promotion::{choose_promotion_boundary, joiner_manifest_fetch_retry, PromotionBoundary};
+use super::promotion::{PromotionBoundary, choose_promotion_boundary, joiner_manifest_fetch_retry};
 use super::wiring::ReplicaChannels;
 use crate::validator::PromotionBaton;
 
@@ -79,8 +77,16 @@ async fn replica_roles(
 ) {
     match host {
         Some(host) => (
-            read_valset_members(host).await.iter().map(|k| hex_bytes(k)).collect(),
-            read_valset_residents(host).await.iter().map(|k| hex_bytes(k)).collect(),
+            read_valset_members(host)
+                .await
+                .iter()
+                .map(|k| hex_bytes(k))
+                .collect(),
+            read_valset_residents(host)
+                .await
+                .iter()
+                .map(|k| hex_bytes(k))
+                .collect(),
         ),
         None => (
             announce_targets.iter().map(|k| hex_bytes(k.as_ref())).collect(),
@@ -268,8 +274,7 @@ pub(super) async fn park(
         node = %label,
         "joining: awaiting redemption"
     );
-    let media_peers = if wireguard_listen.is_some()
-    {
+    let media_peers = if wireguard_listen.is_some() {
         let tracked = crate::voice_plane::MediaPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
         );
@@ -334,7 +339,10 @@ pub(super) async fn park(
                 label: label.clone(),
                 book: std::sync::Arc::clone(&book),
                 me: signer.public_key(),
-                factory: crate::overlay_book::socket_factory(wireguard_listen.is_some(), &overlay_slot),
+                factory: crate::overlay_book::socket_factory(
+                    wireguard_listen.is_some(),
+                    &overlay_slot,
+                ),
                 pacer: bulk_pacer.clone(),
                 planes: planes.clone(),
                 commands: gateway_commands,
@@ -436,10 +444,7 @@ pub(super) async fn park(
     // serve window; the fold driver feeds `.1.orderer_mut()`.
     let mut serving: Option<(
         u64,
-        node::OrderedNode<
-            consensus::FollowerOrderer,
-            Recovery<commonware_runtime::tokio::Context>,
-        >,
+        node::OrderedNode<consensus::FollowerOrderer, Recovery<commonware_runtime::tokio::Context>>,
     )> = None;
     // the joiner's recovery journal, slot-shaped: ascension moves it
     // into the replica node (it IS the node's block sink); a descend
@@ -481,9 +486,7 @@ pub(super) async fn park(
     // observe/ceiling/cutover mirror the validator drain; the SWAP
     // exchanges the follower orderer where a validator respawns an
     // engine.
-    let mut replica_orchestrator: Option<
-        consensus::ValsetOrchestrator<ed25519::PublicKey>,
-    > = None;
+    let mut replica_orchestrator: Option<consensus::ValsetOrchestrator<ed25519::PublicKey>> = None;
     // the last checkpoint's (height, oplog position) — the prune
     // anchor: the journal below it drops once the floor passes it.
     let mut replica_prev_ckpt: (Option<u64>, u64) = (None, 0);
@@ -506,9 +509,6 @@ pub(super) async fn park(
     // the Frames lane the moment the first certificate's parent
     // linkage names it.
     if let Some(ckpt) = manifest.as_ref() {
-        if let Err(e) = crate::host_state::preflight_recovery_schema(ckpt) {
-            fatal!(label, "cannot recover — {e}");
-        }
         let restored = restore_host(
             &context,
             &forge_repo,
@@ -538,11 +538,14 @@ pub(super) async fn park(
         let rec = match recovery.recover_with_sink(&mut host, ckpt, None).await {
             Ok(r) => r,
             Err(e) => {
-                fatal!(label, "{e}\n\
+                fatal!(
+                    label,
+                    "{e}\n\
                      [node {label}] replica state cannot be locally recovered. wipe \
                      the app-state partitions and re-join — but ALWAYS keep the \
                      consensus journal partitions: they are the anti-equivocation \
-                     record for this key.");
+                     record for this key."
+                );
             }
         };
         // seed the shared store with every retained frame so a
@@ -687,8 +690,6 @@ pub(super) async fn park(
             // the operator's `node.toml [sandbox]` runtime, same as the
             // validator boot — a resident sandboxes its runs identically.
             backend,
-            // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-            false,
         )
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
         None => capability_host::ProviderSet::empty(),
@@ -709,11 +710,8 @@ pub(super) async fn park(
         sandbox_capacity,
         Some(cred_resolver.clone()),
     );
-    let mut resident_dispatch = resident_dispatch::ResidentDispatch::new(
-        resident_pool,
-        resident_control,
-        me_bytes.clone(),
-    );
+    let mut resident_dispatch =
+        resident_dispatch::ResidentDispatch::new(resident_pool, resident_control, me_bytes.clone());
 
     // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
     // a fresh TOKENED joiner's sealed intro IS its gate request: the wiring
@@ -738,11 +736,14 @@ pub(super) async fn park(
             // ~30 minutes of 2s retries: parking forever is operator
             // guidance territory, not a silent spin. (a RESIDENT
             // holds standing indefinitely — that bail is gated off.)
-            fatal!(label, "still no standing after {attempt} attempts — \
+            fatal!(
+                label,
+                "still no standing after {attempt} attempts — \
                  the invite may be spent or expired, or no member is reachable; \
                  ask for a fresh invite (manual fallback: `ducktape node \
                  resident accept {}`)",
-                hex_bytes(&me_bytes));
+                hex_bytes(&me_bytes)
+            );
         }
         // the serve window: between manifest polls, pump the local
         // read surfaces from the last pre-synced boundary. the window
@@ -1283,8 +1284,7 @@ pub(super) async fn park(
                 // a BACKFILLED height's trust is the served seal:
                 // what our fold produced must match it exactly, or
                 // this replica has diverged from the quorum's fold.
-                if let Some((_, served_hash, served_roots)) =
-                    pending_seal_checks.remove(&height)
+                if let Some((_, served_hash, served_roots)) = pending_seal_checks.remove(&height)
                     && sealed_hash.is_some_and(|h| h != served_hash)
                 {
                     // name the diverging module(s) — the one lead an
@@ -1302,10 +1302,13 @@ pub(super) async fn park(
                             );
                         }
                     }
-                    fatal!(label, "backfilled height {height} folded to \
+                    fatal!(
+                        label,
+                        "backfilled height {height} folded to \
                          {} but the quorum sealed {} — state diverged",
                         hex(&sealed_hash.expect("checked above")),
-                        hex(&served_hash));
+                        hex(&served_hash)
+                    );
                 }
                 let ops = indexer::BlockOps {
                     record,
@@ -1867,11 +1870,7 @@ pub(super) async fn park(
                         Ok(m) => m,
                         Err(e) => {
                             metrics.record_sync_retry(e.to_string());
-                            let retry = joiner_manifest_fetch_retry(
-                                &label,
-                                resident_standing,
-                                &e,
-                            );
+                            let retry = joiner_manifest_fetch_retry(&label, resident_standing, &e);
                             tracing::debug!(
                                 target: "ducktape::statesync",
                                 attempts = attempt,
@@ -2014,8 +2013,7 @@ pub(super) async fn park(
                             // store miss surfaces as Unresolvable and
                             // the driver backfills over the Frames
                             // lane.
-                            let follower =
-                                consensus::FollowerOrderer::new(replica_store.clone());
+                            let follower = consensus::FollowerOrderer::new(replica_store.clone());
                             let code_source = recovery.code_source();
                             let mut node_r = node::OrderedNode::resume(
                                 host,
@@ -2028,8 +2026,7 @@ pub(super) async fn park(
                                 m.view_base,
                             );
                             node_r.set_code_source(code_source);
-                            replica_scheme =
-                                Some(replica_verifier(&namespace, &m.participants));
+                            replica_scheme = Some(replica_verifier(&namespace, &m.participants));
                             replica_orchestrator = Some(replica_orchestrator_at(
                                 m.epoch,
                                 m.view_base,
@@ -2133,8 +2130,7 @@ pub(super) async fn park(
                     // accept-lane-only provider and never enters a
                     // tag's rendezvous pool.
                     if announce_capabilities
-                        && let Some(msg) =
-                            resident_announcer.maybe_announce(host, now).await
+                        && let Some(msg) = resident_announcer.maybe_announce(host, now).await
                     {
                         match resident_relay.submit_unheld(
                             &signer,
@@ -2268,8 +2264,9 @@ pub(super) async fn park(
         // the classic cold flow: sync the served (frozen) boundary,
         // fabricate its checkpoint, and seat from it.
         if recovery_slot.is_none() {
-            recovery_slot =
-                Some(reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await);
+            recovery_slot = Some(
+                reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await,
+            );
         }
         metrics.begin_sync(Some(client.current_source().to_string()), m.height);
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
@@ -2341,8 +2338,7 @@ pub(super) async fn park(
                             "promotion boundary chosen"
                         );
                         let boundary = boundary.clone();
-                        let boundary_floor =
-                            match verify_manifest_floor(&namespace, &boundary) {
+                        let boundary_floor = match verify_manifest_floor(&namespace, &boundary) {
                                 Ok(floor) => floor,
                                 Err(e) => {
                                     fatal!(label, "promotion floor verify: {e}");

@@ -67,3 +67,75 @@ fn same_name_founds_two_distinct_registry_workspaces() {
     let listing = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(listing.contains(&first) && listing.contains(&second), "list: {listing:?}");
 }
+
+/// init a workspace with the child's PATH pinned to `path_dir`, returning the
+/// generated node.toml — the seam that makes compute detection hermetic: the
+/// probe only checks executability on PATH, it never runs the binary.
+fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
+        .env("DUCKTAPE_HOME", home)
+        .env("PATH", path_dir)
+        .output()
+        .expect("run ducktape");
+    assert!(
+        out.status.success(),
+        "init failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let chain_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::fs::read_to_string(
+        home.join("workspaces")
+            .join(&chain_id)
+            .join("node.toml"),
+    )
+    .expect("read generated node.toml")
+}
+
+/// fresh-workspace compute detection: the platform adapter's runtime on PATH
+/// (a fake executable — podman on Linux, tart on macOS) makes a flagless init
+/// write a LIVE `[sandbox]` table with the capability announce still off; an
+/// empty PATH keeps today's commented example.
+#[test]
+fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // the probe wants the platform adapter AND its hard deps executable on
+    // PATH (podman additionally needs slirp4netns for the private netns), so
+    // the fake dir carries the full set — detection only writes a table the
+    // boot probe would accept.
+    let (runtime, fake_bins): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("tart", &["tart"])
+    } else {
+        ("podman", &["podman", "slirp4netns"])
+    };
+    let bins = tempfile::tempdir().expect("fake bin dir");
+    for bin in fake_bins {
+        let fake = bins.path().join(bin);
+        std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake runtime");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("mark fake runtime executable");
+    }
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let toml = init_with_path(home.path(), "computed", bins.path());
+    assert!(toml.contains("\n[sandbox]"), "live table written:\n{toml}");
+    assert!(
+        toml.contains(&format!("runtime = \"{runtime}\"")),
+        "the platform adapter is chosen:\n{toml}"
+    );
+    // detection never opts the node into publishing capacity to the network.
+    assert!(
+        toml.contains("announce_capabilities = false"),
+        "announce stays off:\n{toml}"
+    );
+
+    let empty = tempfile::tempdir().expect("empty PATH dir");
+    let home = tempfile::tempdir().expect("tempdir");
+    let toml = init_with_path(home.path(), "bare", empty.path());
+    assert!(
+        toml.contains("#[sandbox]") && !toml.contains("\n[sandbox]"),
+        "no runtime on PATH keeps the commented example:\n{toml}"
+    );
+}

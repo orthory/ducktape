@@ -3,12 +3,11 @@
 //! compiled to wasm behind `guest-adapter`) and the native `RunsModule`
 //! answer the SAME op sequence with IDENTICAL query replies, emit IDENTICAL
 //! event traces (WorkerRequests included), land IDENTICAL follow-ups on every
-//! sibling, and their roots move in lockstep. the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value
-//! (plus the delivered-runs ring under its own key), a declared state-schema
-//! break (revision 3) — and this proof pins that difference from genesis
-//! (runs' empty canonical encoding carries THREE zero counts, the empty
-//! host-KV store ONE — different preimages).
+//! sibling, and their roots move in lockstep. the roots THEMSELVES differ:
+//! the port persists the native canonical snapshot as one host-KV value plus
+//! the delivered-runs ring under its own key. This proof pins that current v1
+//! layout from genesis (runs' empty canonical encoding carries THREE zero
+//! counts, the empty host-KV store ONE — different preimages).
 //!
 //! runs is the collaboration loop's actor, so this proof drives the REAL
 //! loop (the `crates/modules/apps/runs/tests/collaboration_loop.rs` shape) through
@@ -47,10 +46,10 @@
 
 use agent::{
     ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentModule,
-    AgentMsg, AgentResponse, DelegationRequest, LoadMode, ReplyBlock, ResourceCaps, SkillRef,
-    encode_msg as agent_encode_msg, encode_response,
+    AgentMsg, AgentResponse, ReplyBlock, ResourceCaps, SkillRef, encode_msg as agent_encode_msg,
+    encode_response,
 };
-use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_encode_msg};
+use capability::CapabilityRegistry;
 use chat::{
     AuthorRef, Block, Chat, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
@@ -63,7 +62,6 @@ use dispatch::{
 };
 use files::Files;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use tasks::{JobsMsg, encode_job_msg as jobs_encode_msg};
 use pages::Pages;
 use runs::{
     RunsModule, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
@@ -71,12 +69,13 @@ use runs::{
     job_run_id_for, reply_message_id, run_id_for,
 };
 use saga::{
-    LeasePolicy, SagaMsg, SagaQuery, SagaReply, decode_reply as saga_decode_reply,
-    decode_worker_request, encode_msg as saga_encode_msg, encode_query as saga_encode_query,
+    SagaMsg, SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
+    encode_msg as saga_encode_msg, encode_query as saga_encode_query,
 };
 use sdk::{Error, Event, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tagging::TaggingModule;
+use tasks::{JobsMsg, encode_job_msg as jobs_encode_msg};
 use tasks::{
     TaskQuery, TaskReply, Tasks, decode_task_reply as tasks_decode_reply,
     encode_task_query as tasks_encode_query,
@@ -89,11 +88,7 @@ use wasm_host::WasmModule;
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 
 fn wasm_runs() -> WasmModule {
-    WasmModule::from_bytes("runs", RUNS_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 3 of the runs
-        // canonical state (the native encoding was already at 2).
-        .with_state_schema_revision(3)
+    WasmModule::from_bytes("runs", RUNS_WASM).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`) — the exact
@@ -180,27 +175,6 @@ async fn wasm_host_(context: &deterministic::Context, files_dir: std::path::Path
     Host::genesis(modules).expect("genesis")
 }
 
-async fn assigned_host(
-    context: &deterministic::Context,
-    chat_label: &'static str,
-    pages_label: &'static str,
-    files_dir: std::path::PathBuf,
-    members: &[Vec<u8>],
-    runs: Box<dyn sdk::Module>,
-) -> Host {
-    let mut modules = siblings(
-        context,
-        chat_label,
-        pages_label,
-        files_dir,
-        saga::SagaModule::with_assignment("saga", "valset", "capability", LeasePolicy::Strict),
-        Some(members),
-    )
-    .await;
-    modules.push(runs);
-    Host::genesis(modules).expect("genesis")
-}
-
 /// one block's agreed context. consensus_time == height, as on the real
 /// validator network (runs stamps `created_at`/`opened_at` from it).
 fn block(height: u64, origin: Origin) -> BlockContext {
@@ -213,20 +187,6 @@ fn block(height: u64, origin: Origin) -> BlockContext {
 
 fn alice() -> Origin {
     Origin::External(vec![0xA1; 32])
-}
-
-fn requester() -> Origin {
-    Origin::External(vec![0xB2; 32])
-}
-
-fn announce_provider() -> Msg {
-    Msg {
-        target: "capability".into(),
-        payload: capability_encode_msg(&CapabilityMsg::Announce {
-            capabilities: vec!["mock-llm-1".into()],
-            resources: [("cores".into(), 2), ("mem_gb".into(), 4)].into(),
-        }),
-    }
 }
 
 fn runs_op(m: &RunsMsg) -> Msg {
@@ -321,6 +281,27 @@ fn plain_post(channel_id: &str, message_id: &str) -> Msg {
     }
 }
 
+/// One all-policy trigger whose reference set consumes most of Runs' shared
+/// sibling-read ledger on the first compose. Later composes may replay those
+/// exact reads for free; only their agent and turn lookups are new.
+fn reference_post(channel_id: &str, message_id: &str) -> Msg {
+    let mut text = (0..50)
+        .map(|index| format!("[page-{index}](duck://page/page-{index})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    text.push_str(" [notes](duck://files/shared/attachments/u/notes.md)");
+    Msg {
+        target: "chat".into(),
+        payload: chat_encode_msg(&ChatMsg::PostMessage {
+            channel_id: channel_id.into(),
+            message_id: message_id.into(),
+            blocks: vec![Block::paragraph(text)],
+            thread: None,
+            as_agent: None,
+        }),
+    }
+}
+
 /// a benign op to advance one block — what triggers the hosts' committed
 /// delivery injection.
 fn noop_block(n: u64) -> Msg {
@@ -356,26 +337,6 @@ fn canned_response(run_id: &str) -> Vec<u8> {
         actions: vec![AgentAction::CreateTask {
             task_id: "task-1".into(),
             title: "follow up on the mention".into(),
-        }],
-        delegations: Vec::new(),
-        commit_message: None,
-    })
-}
-
-fn delegated_response(child: &str) -> Vec<u8> {
-    encode_response(&AgentResponse {
-        reply_blocks: vec![ReplyBlock {
-            kind: "paragraph".into(),
-            text: "delegated the bounded child task".into(),
-            lang: None,
-        }],
-        actions: Vec::new(),
-        delegations: vec![DelegationRequest {
-            agent_id: child.into(),
-            instruction: "verify native and wasm parity".into(),
-            // a library skill CURATED for this child — it crosses the wasm
-            // boundary and unions onto the child's own "specialist".
-            skills: vec!["rust-gates".into()],
         }],
         commit_message: None,
     })
@@ -449,7 +410,10 @@ async fn roundtrip(
         event_tuples(&w_out.events),
         "event traces diverge at {height}"
     );
-    let (n_reqs, w_reqs) = (worker_requests(&n_out.events), worker_requests(&w_out.events));
+    let (n_reqs, w_reqs) = (
+        worker_requests(&n_out.events),
+        worker_requests(&w_out.events),
+    );
     assert_eq!(
         n_reqs, w_reqs,
         "decoded work orders diverge at {height} — the reactor would feed workers differently"
@@ -638,7 +602,11 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
         // port's empty host-KV store is ONE — different preimages, different
         // roots (contrast saga/agent, whose single-count empty encodings
         // coincide with the empty store until the first write).
-        assert_ne!(root_of(&native), StateRoot::ZERO, "runs has no ZERO sentinel");
+        assert_ne!(
+            root_of(&native),
+            StateRoot::ZERO,
+            "runs has no ZERO sentinel"
+        );
         assert_ne!(
             root_of(&native),
             root_of(&wasm),
@@ -653,8 +621,24 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
         // the identical snapshot and both roots hold. the registry block
         // after it proves exactly that: the hook runs THROUGH runs (the
         // recipe lives in dispatch), and neither root moves.
-        roundtrip(&mut native, &mut wasm, 1, alice(), create_channel("general"), false).await;
-        roundtrip(&mut native, &mut wasm, 2, alice(), watch_channel("general"), true).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            create_channel("general"),
+            false,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            2,
+            alice(),
+            watch_channel("general"),
+            true,
+        )
+        .await;
         roundtrip(
             &mut native,
             &mut wasm,
@@ -721,7 +705,11 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
         // outcome, executing-node attribution) survives the whole-state fold
         // record for record.
         let native_ring = recent_runs(&native).await;
-        assert_eq!(native_ring.len(), 1, "the native ring recorded the delivery");
+        assert_eq!(
+            native_ring.len(),
+            1,
+            "the native ring recorded the delivery"
+        );
         assert_eq!(native_ring[0].run_id, run_id);
         assert_eq!(
             native_ring,
@@ -738,31 +726,12 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
 }
 
 #[test]
-fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
+fn multi_compose_exhaustion_degrades_before_the_real_wasm_host_budget() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
     deterministic::Runner::default().start(|context| async move {
-        let providers = vec![vec![0xC1; 32], vec![0xC2; 32]];
-        let mut native = assigned_host(
-            &context,
-            "native_delegation_chat",
-            "native_delegation_pages",
-            native_files,
-            &providers,
-            Box::new(native_runs()),
-        )
-        .await;
-        let mut wasm = assigned_host(
-            &context,
-            "wasm_delegation_chat",
-            "wasm_delegation_pages",
-            wasm_files,
-            &providers,
-            Box::new(wasm_runs()),
-        )
-        .await;
-        let parent_run = run_id_for("general", 1, "quackbot");
-        let child_run = run_id_for("general", 1, "child");
+        let mut native = native_host(&context, native_files).await;
+        let mut wasm = wasm_host_(&context, wasm_files).await;
 
         roundtrip(
             &mut native,
@@ -778,200 +747,44 @@ fn delegated_child_dispatch_and_pending_state_match_both_runtimes() {
             &mut wasm,
             2,
             alice(),
-            watch_channel("general"),
-            true,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            3,
-            alice(),
-            register_agent(
-                "quackbot",
-                "Quackbot",
-                vec![ACTION_CHAT_POST.into()],
-                Some(ResourceCaps {
-                    duckfs_read: vec!["/".into()],
-                    subagent_budget: 1,
-                    ..Default::default()
-                }),
-                None,
-            ),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            4,
-            alice(),
-            register_agent(
-                "child",
-                "Child",
-                vec![ACTION_CHAT_POST.into()],
-                None,
-                Some(vec![SkillRef {
-                    name: "specialist".into(),
-                    source_prefix: "/shared/skills/specialist".into(),
-                    source_snapshot: None,
-                    load: LoadMode::Always,
-                }]),
-            ),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            5,
-            Origin::External(providers[0].clone()),
-            announce_provider(),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            6,
-            Origin::External(providers[1].clone()),
-            announce_provider(),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            7,
-            requester(),
-            plain_post("general", "m1"),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            8,
-            requester(),
-            runs_op(&RunsMsg::RequestRun {
-                agent_id: "quackbot".into(),
+            runs_op(&RunsMsg::WatchChannel {
                 channel_id: "general".into(),
-                anchor_seq: 1,
-                demands: Default::default(),
-                skills: Vec::new(),
+                policy: TurnPolicy::All,
             }),
             true,
         )
         .await;
-
-        let parent_assignee = dispatch_assignee(&native, &parent_run)
-            .await
-            .expect("the parent has a provider");
-        assert_eq!(
-            dispatch_assignee(&wasm, &parent_run).await,
-            Some(parent_assignee.clone())
-        );
-        let oracle = oracle_op(
-            &native,
-            &parent_run,
-            wrap_runner(delegated_response("child")),
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            9,
-            Origin::External(parent_assignee),
-            oracle,
-            false,
-        )
-        .await;
-
-        let requests = roundtrip(&mut native, &mut wasm, 10, alice(), noop_block(10), true).await;
-        assert_eq!(requests.len(), 1, "one delegated child work request");
-        let work = dispatch::decode_work_spec(&requests[0].spec).expect("child work spec");
-        assert_eq!(work.dispatch_id, dispatch_id_for(&child_run));
-        assert_eq!(
-            work.demands,
-            std::collections::BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4),])
-        );
-        let payload: serde_json::Value =
-            serde_json::from_slice(&work.payload).expect("child envelope");
-        assert_eq!(payload["run_id"], child_run);
-        assert_eq!(payload["agent_id"], "child");
-        assert_eq!(
-            payload["skills"][0]["source_prefix"],
-            "/shared/skills/specialist"
-        );
-        // the parent's curated library skill unions on, on demand, after the
-        // child's own — identical on both runtimes.
-        assert_eq!(
-            payload["skills"][1]["source_prefix"],
-            "/shared/skills/rust-gates"
-        );
-        assert_eq!(payload["skills"][1]["always"], false);
-        assert_eq!(
-            payload["workspace"]["source_prefix"],
-            "/shared/agent-workspaces/quackbot"
-        );
-        assert!(
-            payload["context"]
-                .as_str()
-                .expect("delegated context")
-                .contains(&format!("Parent run: {parent_run}"))
-        );
-        assert_eq!(pending_run_ids(&wasm).await, vec![child_run.clone()]);
-        assert!(
-            chat_message(&wasm, &reply_message_id(&parent_run))
-                .await
-                .is_some(),
-            "the parent reply follow-up landed with the child dispatch"
-        );
-
-        let first_child_assignee = dispatch_assignee(&native, &child_run)
-            .await
-            .expect("the child has a provider");
-        // Alice registered both agents and therefore owns the delegated child.
-        let requests = roundtrip(
-            &mut native,
-            &mut wasm,
-            11,
-            alice(),
-            runs_op(&RunsMsg::ReassignRun {
-                run_id: child_run.clone(),
-                attempt: 0,
-            }),
-            false,
-        )
-        .await;
-        assert_eq!(requests.len(), 1, "reassignment emits replacement work");
-        let reassigned = dispatch_assignee(&native, &child_run)
-            .await
-            .expect("the child remains assigned");
-        assert_ne!(reassigned, first_child_assignee);
-        assert_eq!(dispatch_assignee(&wasm, &child_run).await, Some(reassigned));
-        assert_eq!(pending_run_ids(&wasm).await, vec![child_run.clone()]);
-
-        // The explicit parent's requester is inherited by its child.
-        let requests = roundtrip(
-            &mut native,
-            &mut wasm,
-            12,
-            requester(),
-            runs_op(&RunsMsg::CancelRun {
-                run_id: child_run.clone(),
-            }),
-            false,
-        )
-        .await;
-        assert!(requests.is_empty(), "cancel emits no replacement work");
-        assert_eq!(pending_run_ids(&wasm).await, vec![child_run.clone()]);
-
-        roundtrip(&mut native, &mut wasm, 13, alice(), noop_block(13), true).await;
-        assert_eq!(pending_run_ids(&wasm).await, Vec::<String>::new());
-        for sibling in ["valset", "capability"] {
-            assert_eq!(native.module_root(sibling), wasm.module_root(sibling));
+        for index in 0..20 {
+            let agent_id = format!("bot-{index:02}");
+            roundtrip(
+                &mut native,
+                &mut wasm,
+                3 + index,
+                alice(),
+                register_agent(
+                    &agent_id,
+                    &agent_id,
+                    vec![ACTION_CHAT_POST.into()],
+                    None,
+                    None,
+                ),
+                false,
+            )
+            .await;
         }
+
+        let requests = roundtrip(
+            &mut native,
+            &mut wasm,
+            23,
+            alice(),
+            reference_post("general", "bounded"),
+            true,
+        )
+        .await;
+        assert_eq!(requests.len(), 5, "five complete composes fit the ledger");
+        assert_eq!(pending_run_ids(&native).await.len(), 5);
+        assert_eq!(pending_run_ids(&wasm).await.len(), 5);
     });
 }
 
@@ -1117,11 +930,35 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
         let mut native = native_host(&context, native_files).await;
         let mut wasm = wasm_host_(&context, wasm_files).await;
 
-        roundtrip(&mut native, &mut wasm, 1, alice(), create_channel("general"), false).await;
-        roundtrip(&mut native, &mut wasm, 2, alice(), create_channel("side"), false).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            create_channel("general"),
+            false,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            2,
+            alice(),
+            create_channel("side"),
+            false,
+        )
+        .await;
         // the first guest write initializes the wasm store in a block that
         // legitimately moves the native root too (see the loop test).
-        roundtrip(&mut native, &mut wasm, 3, alice(), watch_channel("warmup"), true).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            3,
+            alice(),
+            watch_channel("warmup"),
+            true,
+        )
+        .await;
         roundtrip(
             &mut native,
             &mut wasm,
@@ -1172,7 +1009,15 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
         // turn claim the first STAGED in this very block (staged pending
         // entry, read-your-writes) — an accepted no-op, not a rejection, on
         // both runtimes.
-        roundtrip(&mut native, &mut wasm, 6, alice(), plain_post("side", "m2"), false).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            6,
+            alice(),
+            plain_post("side", "m2"),
+            false,
+        )
+        .await;
         let request = runs_op(&RunsMsg::RequestRun {
             agent_id: "quackbot".into(),
             channel_id: "side".into(),
@@ -1262,8 +1107,24 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         // an in-flight run, driven through both runtimes. the watch precedes
         // the registry block so the port's first guest write rides a block
         // that legitimately moves the native root (see the loop test).
-        roundtrip(&mut native, &mut wasm, 1, alice(), create_channel("general"), false).await;
-        roundtrip(&mut native, &mut wasm, 2, alice(), watch_channel("general"), true).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            create_channel("general"),
+            false,
+        )
+        .await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            2,
+            alice(),
+            watch_channel("general"),
+            true,
+        )
+        .await;
         roundtrip(
             &mut native,
             &mut wasm,
@@ -1277,7 +1138,15 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             false,
         )
         .await;
-        roundtrip(&mut native, &mut wasm, 4, alice(), mention_post("general", "m1"), true).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            4,
+            alice(),
+            mention_post("general", "m1"),
+            true,
+        )
+        .await;
 
         // the REAL lease path: a capable node claims the announced attempt
         // (saga Accept), and the dispatch facade resolves the committed
@@ -1285,7 +1154,10 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         let saga_id = dispatch_saga_id(&native, &run_id).await;
         let accept = Msg {
             target: "saga".into(),
-            payload: saga_encode_msg(&SagaMsg::Accept { saga_id, attempt: 0 }),
+            payload: saga_encode_msg(&SagaMsg::Accept {
+                saga_id,
+                attempt: 0,
+            }),
         };
         roundtrip(
             &mut native,
@@ -1454,7 +1326,15 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
         // the first guest write initializes the wasm store in a block that
         // legitimately moves the native root (see the loop test); the two
         // stage-nothing admin blocks after it hold both roots.
-        roundtrip(&mut native, &mut wasm, 1, alice(), watch_channel("warmup"), true).await;
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            watch_channel("warmup"),
+            true,
+        )
+        .await;
         roundtrip(
             &mut native,
             &mut wasm,
@@ -1498,7 +1378,6 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
                 task_id: "job-task".into(),
                 title: "complete job".into(),
             }],
-            delegations: Vec::new(),
             commit_message: None,
         });
         let oracle = oracle_op(&native, &run_id, wrap_runner(raw)).await;

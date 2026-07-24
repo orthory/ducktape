@@ -164,6 +164,10 @@ pub enum Error {
     /// a previous apply failed; the store refuses further writes until rebuilt.
     #[error("indexer: store is poisoned by an earlier apply failure — rebuild the index")]
     Poisoned,
+    /// a fold trigger reported a drain error with a backlog still pending —
+    /// the views cannot catch up to the feed without a rebuild.
+    #[error("indexer: fold stuck: {0}")]
+    FoldStuck(String),
     /// filesystem io in the shipping lane (fork archive reads, staged
     /// installs) — io this crate performs itself, outside the engine's own
     /// error surface.
@@ -482,6 +486,41 @@ impl IndexStore {
             self.blocks.write(batch)?;
         }
         Ok(())
+    }
+
+    /// block until every folding module's trigger backlog is drained, so a
+    /// view read after this answers everything `apply_block` already fed.
+    /// the deterministic lanes' commit barrier: fluent31 drains folds on a
+    /// background runner, and a sim must not let a read (or the ws `changed`
+    /// event that prompts one) race it. mirrors fluent31's own
+    /// `wait_flushed` progress-wait idiom. `Err` = a fold failed with a
+    /// backlog still pending — the views cannot catch up.
+    pub fn wait_folds_drained(&self) -> Result<()> {
+        loop {
+            let mut pending = 0u64;
+            for (id, m) in &self.modules {
+                if !m.has_fold {
+                    continue;
+                }
+                let trigger = m
+                    .db
+                    .list_triggers()?
+                    .into_iter()
+                    .find(|t| t.name == FOLD_TRIGGER);
+                if let Some(t) = trigger
+                    && t.pending > 0
+                {
+                    if let Some(err) = t.last_error {
+                        return Err(Error::FoldStuck(format!("{id}: {err}")));
+                    }
+                    pending += t.pending;
+                }
+            }
+            if pending == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// store one explorer row at `height` WITHOUT a dispatch feed — the write

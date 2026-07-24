@@ -1,4 +1,4 @@
-//! the REAL [`WorkspaceProvisioner`] for portable (v3) agent runs: one
+//! the REAL [`WorkspaceProvisioner`] for portable (v1) agent runs: one
 //! per-run workspace under a D7-validated root, materialized from whichever
 //! source the run's envelope pinned.
 //!
@@ -64,7 +64,7 @@ mod session_boundary_tests;
 /// under. MUST be outside `<storage>` — VALIDATED here at boot, never trusted.
 /// `DUCKTAPE_AGENT_RUNS_ROOT` overrides the base (operators point it at an
 /// isolated volume); deliberately NOT `DUCKTAPE_AGENT_WORKSPACES`, which
-/// already means the legacy persistent per-agent root in `capability-host` —
+/// already means the persistent per-agent root in `capability-host` —
 /// one knob must not govern two unrelated trees. the default is the system
 /// temp tree, the same safe scratch tree `CliProvider`'s fallback workdir
 /// already uses.

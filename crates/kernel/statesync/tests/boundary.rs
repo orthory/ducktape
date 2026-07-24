@@ -176,7 +176,6 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         participants: vec![vec![3u8; 32]],
         residents: vec![],
         floor_cert: Some(vec![0xCC; 96]),
-        state_schema: [0xAB; 32],
         entries: vec![ManifestEntry {
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),
@@ -239,10 +238,7 @@ fn shipped_index_serves_only_attached_leased_boundaries() {
     let ask = |srv: &mut SyncServer, req| block_on(srv.handle(&host, None, &coords, req));
 
     // unleased boundary: refused like every other per-boundary request.
-    let resp = ask(
-        &mut srv,
-        SyncRequest::IndexModules { boundary },
-    );
+    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
     assert!(matches!(resp, SyncResponse::Error(_)));
 
     srv.insert_capture_for_test(boundary);

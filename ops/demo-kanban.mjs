@@ -1,4 +1,4 @@
-// The gateway v2 reference app (spec §8): a team kanban board published at
+// The gateway reference app (spec §8): a team kanban board published at
 // board.<handle>.duck. It exercises the whole protocol surface —
 //
 //   - static SPA shell + a dynamic loopback backend (this file),

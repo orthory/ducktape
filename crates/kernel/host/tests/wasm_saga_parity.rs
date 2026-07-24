@@ -2,11 +2,11 @@
 //! component (the NATIVE `saga` crate compiled to wasm behind `guest-adapter`)
 //! and the native `SagaModule` answer the SAME op sequence with IDENTICAL
 //! query replies, emit IDENTICAL work-order events, and their roots move in
-//! lockstep. the state-schema break is pinned with saga's OWN genesis shape:
+//! lockstep. the representation difference is pinned with saga's OWN genesis shape:
 //! unlike the ZERO-sentinel modules, saga's empty canonical encoding (a bare
 //! zero count) hashes to the SAME digest as the wasm port's empty host-KV
 //! store, so the roots COINCIDE at genesis and diverge at the first committed
-//! write — never to re-converge (revision 2 declares the break regardless).
+//! write — never to re-converge.
 //!
 //! saga is the deterministic half of the async engine, so this proof leans on
 //! three surfaces beyond the usual reply/root matrix:
@@ -28,12 +28,12 @@
 //!   runtime's memoized replay against the REAL native siblings both hosts
 //!   carry.
 
-use host::{BlockContext, BlockOutcome, Host, MemberOutcome, SubmitError};
 use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_encode_msg};
+use host::{BlockContext, BlockOutcome, Host, MemberOutcome, SubmitError};
 use saga::{
-    LeasePolicy, SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, WorkerRequest,
-    decode_reply, decode_worker_control, decode_worker_request, encode_msg, encode_query,
-    MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
+    LeasePolicy, MAX_CAPABILITY_BYTES, MAX_ERROR_BYTES, MAX_REPLY_PAYLOAD_BYTES, MAX_RESULT_BYTES,
+    SagaModule, SagaMsg, SagaQuery, SagaReply, SagaStatus, WorkerRequest, decode_reply,
+    decode_worker_control, decode_worker_request, encode_msg, encode_query,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use std::collections::BTreeMap;
@@ -45,11 +45,7 @@ use wasm_host::WasmModule;
 const SAGA_WASM: &[u8] = include_bytes!("fixtures/saga.component.wasm");
 
 fn wasm_saga() -> WasmModule {
-    WasmModule::from_bytes("saga", SAGA_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the saga
-        // canonical state.
-        .with_state_schema_revision(2)
+    WasmModule::from_bytes("saga", SAGA_WASM).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
@@ -219,10 +215,7 @@ fn announce(capabilities: &[&str], resources: &[(&str, u64)]) -> Msg {
         target: "capability".into(),
         payload: capability_encode_msg(&CapabilityMsg::Announce {
             capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
-            resources: resources
-                .iter()
-                .map(|(k, v)| (k.to_string(), *v))
-                .collect(),
+            resources: resources.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         }),
     }
 }
@@ -392,9 +385,7 @@ async fn view_of(h: &Host, id: &str) -> saga::SagaView {
     let reply = h
         .query(
             "saga",
-            &encode_query(&SagaQuery::Get {
-                saga_id: id.into(),
-            }),
+            &encode_query(&SagaQuery::Get { saga_id: id.into() }),
         )
         .await
         .expect("get");
@@ -424,8 +415,12 @@ async fn same_ops_inner() {
     // empty canonical map (a bare zero count — NOT the ZERO sentinel), and the
     // wasm root hashes the empty host-KV store — the SAME 8-zero-byte
     // preimage. the genesis roots therefore COINCIDE, and the declared break
-    // (revision 2) becomes visible at the FIRST committed write below.
-    assert_ne!(root_of(&native), StateRoot::ZERO, "saga has no ZERO sentinel");
+    // becomes visible at the FIRST committed write below.
+    assert_ne!(
+        root_of(&native),
+        StateRoot::ZERO,
+        "saga has no ZERO sentinel"
+    );
     assert_eq!(
         root_of(&native),
         root_of(&wasm),
@@ -460,11 +455,14 @@ async fn same_ops_inner() {
         &member_keys,
         3,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             deadline: Some(500),
             max_attempts: 2,
             ..trigger("t-open")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -492,10 +490,7 @@ async fn same_ops_inner() {
 
     // the assignee's result lands: Done + the P6 callback commits into the
     // recorder IN THIS BLOCK (the recorder root moves, identically, on both).
-    let (n_req_before, w_req_before) = (
-        native.module_root("req"),
-        wasm.module_root("req"),
-    );
+    let (n_req_before, w_req_before) = (native.module_root("req"), wasm.module_root("req"));
     roundtrip(
         &mut native,
         &mut wasm,
@@ -507,8 +502,16 @@ async fn same_ops_inner() {
         true,
     )
     .await;
-    assert_ne!(native.module_root("req"), n_req_before, "callback landed natively");
-    assert_ne!(wasm.module_root("req"), w_req_before, "callback landed through wasm");
+    assert_ne!(
+        native.module_root("req"),
+        n_req_before,
+        "callback landed natively"
+    );
+    assert_ne!(
+        wasm.module_root("req"),
+        w_req_before,
+        "callback landed through wasm"
+    );
 
     // ---- t-cap: a TAGGED trigger with demands draws from CapableProviders —
     // {cores: 8} narrows the llm pool to A alone, so the assignee is A on both
@@ -520,12 +523,15 @@ async fn same_ops_inner() {
         &member_keys,
         6,
         Origin::External(b.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             max_attempts: 2,
             capability: Some("llm".into()),
             demands: BTreeMap::from([("cores".to_string(), 8u64)]),
             ..trigger("t-cap")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -577,10 +583,13 @@ async fn same_ops_inner() {
         &member_keys,
         9,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             capability: Some("nobody-has-this".into()),
             ..trigger("t-ann")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -651,10 +660,13 @@ async fn same_ops_inner() {
         &member_keys,
         14,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             pinned_assignee: Some(b.clone()),
             ..trigger("t-pin")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -680,10 +692,13 @@ async fn same_ops_inner() {
         &member_keys,
         16,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             max_attempts: 3,
             ..trigger("t-cxl")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -723,11 +738,14 @@ async fn same_ops_inner() {
         &member_keys,
         19,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             lease_views: Some(4),
             capability: Some("llm".into()),
             ..trigger("t-renew")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -779,11 +797,14 @@ async fn same_ops_inner() {
         &member_keys,
         23,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             max_attempts: 3,
             capability: Some("llm".into()),
             ..trigger("t-re")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -868,7 +889,7 @@ async fn same_ops_inner() {
     );
 
     // the roots diverged at the first write and never re-converge (the
-    // declared schema break, revision 2).
+    // distinct root representation).
     assert_ne!(root_of(&native), root_of(&wasm));
 
     // queries are read-only on the wasm side too: the root is stable across
@@ -900,10 +921,13 @@ async fn crank_inner() {
         &member_keys,
         1,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             deadline: Some(4),
             ..trigger("t-dead")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -914,11 +938,14 @@ async fn crank_inner() {
         &member_keys,
         2,
         Origin::External(a.clone()),
-        saga_op(&Trig {
+        saga_op(
+            &Trig {
             lease_views: Some(2),
             max_attempts: 2,
             ..trigger("t-lease")
-        }.into()),
+            }
+            .into(),
+        ),
         true,
     )
     .await;
@@ -1000,36 +1027,48 @@ async fn rejections_inner() {
         .expect("announce solo");
         host.submit_at(
             block(2, Origin::External(a.clone())),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 max_attempts: 3,
                 capability: Some("solo".into()),
                 ..trigger("live")
-            }.into()),
+                }
+                .into(),
+            ),
         )
         .await
         .expect("trigger live");
         host.submit_at(
             block(3, Origin::External(a.clone())),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 capability: Some("solo".into()),
                 ..trigger("solo")
-            }.into()),
+                }
+                .into(),
+            ),
         )
         .await
         .expect("trigger solo");
         host.submit_at(
             block(4, Origin::External(a.clone())),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 max_attempts: 3,
                 pinned_assignee: Some(b.clone()),
                 ..trigger("pinned")
-            }.into()),
+                }
+                .into(),
+            ),
         )
         .await
         .expect("trigger pinned");
     }
     // "solo"'s only provider is A, so both live sagas lease to A.
-    assert_eq!(view_of(&wasm, "live").await.assignee.as_deref(), Some(a.as_slice()));
+    assert_eq!(
+        view_of(&wasm, "live").await.assignee.as_deref(),
+        Some(a.as_slice())
+    );
 
     // every distinct refusal family the native module implements. (the
     // 12 MiB spec cap shares its code path with the reply_payload cap below
@@ -1038,62 +1077,83 @@ async fn rejections_inner() {
     let rejects: Vec<(Origin, Msg, &str)> = vec![
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 max_attempts: 0,
                 ..trigger("r1")
-            }.into()),
+                }
+                .into(),
+            ),
             "trigger max_attempts must be >= 1",
         ),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 reply_payload: vec![7; MAX_REPLY_PAYLOAD_BYTES + 1],
                 ..trigger("r2")
-            }.into()),
+                }
+                .into(),
+            ),
             "trigger reply_payload is",
         ),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 capability: Some(String::new()),
                 ..trigger("r3")
-            }.into()),
+                }
+                .into(),
+            ),
             "trigger capability must be non-empty",
         ),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 capability: Some("x".repeat(MAX_CAPABILITY_BYTES + 1)),
                 ..trigger("r4")
-            }.into()),
+                }
+                .into(),
+            ),
             "trigger capability is",
         ),
         // the shared validate_resources invariant: zero values and non-tag
         // dimension keys reject at trigger time.
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 capability: Some("llm".into()),
                 demands: BTreeMap::from([("cores".to_string(), 0u64)]),
                 ..trigger("r5")
-            }.into()),
+                }
+                .into(),
+            ),
             "is zero",
         ),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 capability: Some("llm".into()),
                 demands: BTreeMap::from([("NOT A TAG".to_string(), 1u64)]),
                 ..trigger("r6")
-            }.into()),
+                }
+                .into(),
+            ),
             "invalid characters",
         ),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 pinned_assignee: Some(Vec::new()),
                 ..trigger("r7")
-            }.into()),
+                }
+                .into(),
+            ),
             "pinned_assignee must be non-empty",
         ),
         // the callback-poison rule: a self-targeting or unknown reply_to
@@ -1101,18 +1161,24 @@ async fn rejections_inner() {
         // sibling read — resolved through the runtime on the wasm side).
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 reply_to: Some("saga".into()),
                 ..trigger("r8")
-            }.into()),
+                }
+                .into(),
+            ),
             "must not target the saga module itself",
         ),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 reply_to: Some("ghost".into()),
                 ..trigger("r9")
-            }.into()),
+                }
+                .into(),
+            ),
             "targets unknown module ghost",
         ),
         // oversized outcomes ABORT rather than commit into the root preimage —
@@ -1288,10 +1354,13 @@ async fn multi_dispatch_inner() {
         (Origin::External(a.clone()), saga_op(&trigger("s2").into())),
         (
             Origin::External(a.clone()),
-            saga_op(&Trig {
+            saga_op(
+                &Trig {
                 max_attempts: 0,
                 ..trigger("s3")
-            }.into()),
+                }
+                .into(),
+            ),
         ),
     ];
     let n_out = native

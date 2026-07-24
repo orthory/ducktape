@@ -3,9 +3,8 @@
 //! behind `guest-adapter`) and the native `CapabilityRegistry` answer the SAME
 //! op sequence with IDENTICAL query replies, and their roots move in lockstep
 //! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, a
-//! declared state-schema break (revision 2) — and this proof pins that
-//! difference so it can never be mistaken for accidental compatibility.
+//! the port persists the native canonical snapshot as one host-KV value, and
+//! this proof pins that representation difference.
 //! (unlike inbox/tagging, capability's empty root is the ZERO sentinel while
 //! the wasm root hashes the empty host-KV store, so here the break is visible
 //! from GENESIS — as it is for vaults.)
@@ -20,14 +19,14 @@
 //! rejection (outsider) — all decided by sibling reads on the wasm side.
 
 use capability::{
-    decode_reply, encode_msg, encode_query, CapabilityMsg, CapabilityQuery, CapabilityRegistry,
-    CapabilityReply,
+    CapabilityMsg, CapabilityQuery, CapabilityRegistry, CapabilityReply, decode_reply, encode_msg,
+    encode_query,
 };
-use commonware_cryptography::ed25519::PrivateKey;
 use commonware_cryptography::Signer as _;
+use commonware_cryptography::ed25519::PrivateKey;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Error, Msg, Origin, StateRoot};
-use valset::{encode_msg as valset_encode_msg, Valset, ValsetMsg};
+use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `capability` module's guest port by
@@ -35,11 +34,7 @@ use wasm_host::WasmModule;
 const CAPABILITY_WASM: &[u8] = include_bytes!("fixtures/capability.component.wasm");
 
 fn wasm_capability() -> WasmModule {
-    WasmModule::from_bytes("capability", CAPABILITY_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the capability
-        // canonical state — the declaration bin/node makes at cutover.
-        .with_state_schema_revision(2)
+    WasmModule::from_bytes("capability", CAPABILITY_WASM).expect("load component")
 }
 
 /// EXACTLY the production wiring in bin/node's host state — the valset id is
@@ -234,7 +229,7 @@ async fn same_ops_inner() {
     let mut wasm = wasm_host_(&validators);
     let keys = [m1.clone(), m2.clone(), resident.clone(), outsider.clone()];
 
-    // the schema break is visible from GENESIS: the native empty registry
+    // the representation difference is visible from GENESIS: the native empty registry
     // reports the ZERO sentinel, the wasm root commits to the (empty) host-KV
     // store — the vaults shape, not the inbox/tagging coincidence.
     let wasm_genesis = root_of(&wasm);
@@ -242,7 +237,7 @@ async fn same_ops_inner() {
     assert_ne!(
         root_of(&native),
         wasm_genesis,
-        "genesis roots must differ — the port is a DECLARED schema break"
+        "genesis roots must differ — the port uses a distinct root representation"
     );
     // the SIBLING is byte-identical on both hosts, before and (asserted per
     // block below) after every op — it is native on both sides.
@@ -300,7 +295,7 @@ async fn same_ops_inner() {
             assert_eq!(root_of(&native), n_before, "native root moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm root moved at {height}");
         }
-        // ...and the roots themselves always differ (the pinned schema break).
+        // ...and the roots themselves always differ (the pinned representation difference).
         assert_ne!(root_of(&native), root_of(&wasm));
     }
 
@@ -599,7 +594,7 @@ async fn class_claims_inner() {
             assert_eq!(root_of(&native), n_before, "native root moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm root moved at {height}");
         }
-        // the pinned schema break: the roots themselves always differ.
+        // the pinned representation difference: the roots themselves always differ.
         assert_ne!(root_of(&native), root_of(&wasm));
     }
 

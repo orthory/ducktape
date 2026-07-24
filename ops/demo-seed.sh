@@ -23,6 +23,8 @@ DUCK="$HOME/.ducktape"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
 ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty author)
+USERKEY="$DUCK/user.key"          # the app signs writes with THIS local key
+DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -85,6 +87,24 @@ writeFileSync(path, JSON.stringify(registry, null, 2));
 JS
 log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
+# ── 3b. user identity ──────────────────────────────────────────
+# The app signs every write (send a message, add a reaction, edit, create a
+# channel) with a local user key it READS from $HOME/.ducktape/user.key — it
+# never mints one itself. Without it, the demo is read-only: the first reaction
+# fails with "cannot read local user key". Provision one so the demo is
+# writable out of the box. Channels are `open`, so any identity may post — no
+# membership step is needed. An EXISTING key is never overwritten (it may be
+# your real identity); we only report how to unlock it.
+if [ -e "$USERKEY" ]; then
+  KEY_PROVISIONED=0
+  log "user key already present at $USERKEY — unlock it with its own password"
+else
+  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" user key init --out "$USERKEY" >/dev/null \
+    || die "could not create the demo user key at $USERKEY"
+  KEY_PROVISIONED=1
+  log "created a demo user identity at $USERKEY (password: $DEMO_PASSWORD)"
+fi
+
 # ── 4. start the node, wait for its http surface ───────────────
 log "starting node (http 127.0.0.1:$P2)…"
 "$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
@@ -132,20 +152,22 @@ submit chat '{"add_reaction":{"channel_id":"general","seq":1,"emoji":"🦆"}}'
 submit chat '{"post_message":{"channel_id":"engineering","message_id":"e1","blocks":[{"paragraph":[{"text":"CI is green on dev.","marks":[]}]}],"thread":null,"as_agent":null}}'
 submit chat '{"post_message":{"channel_id":"product","message_id":"p1","blocks":[{"paragraph":[{"text":"Demo script for the deck is ready.","marks":[]}]}],"thread":null,"as_agent":null}}'
 
-# tasks — a small board with mixed statuses
-submit tasks '{"create_task":{"task_id":"t1","title":"Draft the launch announcement"}}'
-submit tasks '{"create_task":{"task_id":"t2","title":"Review the onboarding flow"}}'
-submit tasks '{"create_task":{"task_id":"t3","title":"Fix flaky identity test"}}'
-submit tasks '{"update_status":{"task_id":"t2","status":"in_progress"}}'
-submit tasks '{"update_status":{"task_id":"t3","status":"done"}}'
+# tasks — a small board with mixed statuses. both boards ride ONE wire envelope
+# (WorkMsg): task-board ops are wrapped `{"task":{…}}`, job-board ops `{"job":{…}}`.
+submit tasks '{"task":{"create_task":{"task_id":"t1","title":"Draft the launch announcement"}}}'
+submit tasks '{"task":{"create_task":{"task_id":"t2","title":"Review the onboarding flow"}}}'
+submit tasks '{"task":{"create_task":{"task_id":"t3","title":"Fix flaky identity test"}}}'
+submit tasks '{"task":{"update_status":{"task_id":"t2","status":"in_progress"}}}'
+submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
 # agent — register a demo agent, watch general for @mentions, then mention it
 submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","prompt_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
 submit runs '{"watch_channel":{"channel_id":"general","policy":"mention"}}'
 submit chat '{"post_message":{"channel_id":"general","message_id":"g4","blocks":[{"paragraph":[{"text":"hey ","marks":[]},{"text":"@quackbot","marks":[{"mention":{"agent":{"module":"runs","agent_id":"quackbot"}}}]},{"text":" can you follow up?","marks":[]}]}],"thread":null,"as_agent":null}}'
 
-# jobs — a job on the board
-submit jobs '{"submit":{"job_id":"j1","kind":"demo","spec":"render the welcome deck"}}'
+# jobs — a job on the board. the job board shares the "tasks" target under the
+# WorkMsg `{"job":{…}}` arm (there is no separate "jobs" module).
+submit tasks '{"job":{"submit":{"job_id":"j1","kind":"demo","spec":"render the welcome deck"}}}'
 
 # inbox — a starter notification for the demo author
 submit inbox '{"deliver":{"member":"demo","kind":"welcome","body":"Your demo network is ready."}}'
@@ -158,13 +180,20 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
 #   • board — the network-visible kanban reference app
+# Sign the routes with the identity we just provisioned. When the key already
+# existed, we don't hold its password, so pass an empty one — the helper then
+# fails to sign and routes are skipped (non-fatal); chat/tasks/pages are already
+# durable regardless.
 GATEWAY_ROUTES=3
-bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID"
+GATEWAY_PW=""
+[ "${KEY_PROVISIONED:-0}" -eq 1 ] && GATEWAY_PW="$DEMO_PASSWORD"
+bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" "$USERKEY" "$GATEWAY_PW"
 gateway_status=$?
+# Route publishing is a demo garnish — its failure never kills the seed. The
+# core workspace (chat, tasks, pages, identity) is committed before this runs.
 case "$gateway_status" in
   0) ;;
-  78) GATEWAY_ROUTES=0 ;;
-  *) die "gateway route publish failed" ;;
+  *) GATEWAY_ROUTES=0; log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log" ;;
 esac
 
 log "seeded $N ops + $GATEWAY_ROUTES gateway web-app routes across pages, chat, tasks, agent, runs, jobs, inbox, automations, files, gateway"
@@ -177,13 +206,28 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
+To WRITE (send a message, add a reaction, edit): the app signs with your local
+user key, so unlock it once — open the connection panel (bottom-left of the
+sidebar), type the key password, and click Connect.
 EOF
+
+if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
+cat <<EOF
+  key password: $DEMO_PASSWORD   (a fresh demo identity demo-seed just created)
+
+EOF
+else
+cat <<EOF
+  key password: (your existing $USERKEY — demo-seed left it untouched)
+
+EOF
+fi
 
 if [ "$GATEWAY_ROUTES" -eq 0 ]; then
 cat <<EOF
-Gateway web apps were not published: the embedded gateway component still
-expects Identity's retired node-list wire. Regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway);
-the seed deliberately does not submit a backwards-compatible payload.
+Gateway web apps were not published (the seed's route helper still drifts from
+the current gateway/duckdns wire) — see $WSDIR/seed.log for the exact rejection.
+This is a demo garnish only: chat, tasks, pages and your identity are all live.
 EOF
 else
 cat <<EOF

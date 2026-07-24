@@ -10,8 +10,3 @@ version.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-
-[dev-dependencies]
-# the snapshot root is sha256 over the canonical bytes; the legacy-handle
-# regression test forges snapshot bytes no live `set_handle` can produce.
-sha2 = { workspace = true }

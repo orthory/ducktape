@@ -1,6 +1,6 @@
 //! the saga module's public wire surface — types only.
 //!
-//! saga v2 is the deterministic async-RPC ledger: one effect, one agreed
+//! Saga is the deterministic async-RPC ledger: one effect, one agreed
 //! result, with attempts, leases, deadlines, and a requester callback. six op
 //! shapes cross this surface, all as [`SagaMsg`]:
 //!

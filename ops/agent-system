@@ -74,9 +74,9 @@ const rememberedUrl = () => {
     const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
     if (active?.ports?.http) return `http://127.0.0.1:${active.ports.http}`;
   } catch {
-    // Fall through to the legacy default.
+    // Fall through to the explicit-selection error.
   }
-  return "http://127.0.0.1:8844";
+  die("no node selected; run `ops/agent-system use URL` or start an active workspace");
 };
 
 let base = localUrl(rememberedUrl());

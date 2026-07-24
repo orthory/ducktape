@@ -2910,6 +2910,7 @@ dependencies = [
  "node",
  "pages",
  "sdk",
+ "serde_json",
  "simnode",
  "tempfile",
  "tokio",
@@ -2926,6 +2927,8 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
 ]
 
 [[package]]
@@ -5999,6 +6002,7 @@ dependencies = [
  "rand_core 0.6.4",
  "smoltcp",
  "tokio",
+ "tracing",
  "wireguard",
 ]
 
@@ -8643,7 +8647,7 @@ dependencies = [
 [[package]]
 name = "ui-lang"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=18c07913715d22c3867ba8b0d71ac7fda2b37827#18c07913715d22c3867ba8b0d71ac7fda2b37827"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5a17c58ad71ee0b3386662919069e4aa7a3e5af2#5a17c58ad71ee0b3386662919069e4aa7a3e5af2"
 dependencies = [
  "ui-lang-core",
 ]
@@ -8651,12 +8655,12 @@ dependencies = [
 [[package]]
 name = "ui-lang-core"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=18c07913715d22c3867ba8b0d71ac7fda2b37827#18c07913715d22c3867ba8b0d71ac7fda2b37827"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5a17c58ad71ee0b3386662919069e4aa7a3e5af2#5a17c58ad71ee0b3386662919069e4aa7a3e5af2"
 
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=18c07913715d22c3867ba8b0d71ac7fda2b37827#18c07913715d22c3867ba8b0d71ac7fda2b37827"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui-lang.git?rev=5a17c58ad71ee0b3386662919069e4aa7a3e5af2#5a17c58ad71ee0b3386662919069e4aa7a3e5af2"
 dependencies = [
  "accesskit",
  "accesskit_unix",

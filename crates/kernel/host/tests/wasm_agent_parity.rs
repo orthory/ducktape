@@ -2,12 +2,10 @@
 //! `agent` guest component (the NATIVE `agent` crate compiled to wasm behind
 //! `guest-adapter`) and the native `AgentModule` answer the SAME op sequence
 //! with IDENTICAL query replies, and their roots move in lockstep. the
-//! first state-schema break is pinned with agent's OWN genesis shape: like saga,
+//! current v1 state shape is pinned with agent's OWN genesis shape: like saga,
 //! agent's empty canonical encoding (a bare zero count) hashes to the SAME
 //! digest as the wasm port's empty host-KV store — the roots COINCIDE at
-//! genesis and diverge at the first committed write. Revision 2 declares that
-//! adapter break; revision 3 declares the later role tail in the persisted
-//! native snapshot value.
+//! genesis and diverge at the first committed write.
 //!
 //! the registry itself is self-contained (no sibling queries), so this proof
 //! pins its two FOLLOW-UP lanes across the seam:
@@ -23,9 +21,9 @@
 //!   an actual trigger → result → callback flow into the agent module.
 
 use agent::{
-    AgentModule, AgentMsg, AgentQuery, AgentReply, LoadMode, ResourceCaps, SkillRef,
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, decode_event, decode_reply, encode_msg, encode_query,
-    MAX_AGENT_ID_LEN, MAX_SKILLS_PER_AGENT, RECIPE_HASH_LEN,
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentModule, AgentMsg, AgentQuery, AgentReply, LoadMode,
+    MAX_AGENT_ID_LEN, MAX_SKILLS_PER_AGENT, RECIPE_HASH_LEN, ResourceCaps, SkillRef, decode_event,
+    decode_reply, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use saga::{SagaModule, SagaMsg, encode_msg as saga_encode_msg};
@@ -38,11 +36,7 @@ use wasm_host::WasmModule;
 const AGENT_WASM: &[u8] = include_bytes!("fixtures/agent.component.wasm");
 
 fn wasm_agent() -> WasmModule {
-    WasmModule::from_bytes("agent", AGENT_WASM)
-        .expect("load component")
-        // Revision 2 was the adapter port; revision 3 adds the role tail inside
-        // the persisted native snapshot value.
-        .with_state_schema_revision(3)
+    WasmModule::from_bytes("agent", AGENT_WASM).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
@@ -232,7 +226,11 @@ async fn roundtrip(
         assert_ne!(hook_root(native), n_hook, "no native hook at {height}");
         assert_ne!(hook_root(wasm), w_hook, "no wasm hook at {height}");
     } else {
-        assert_eq!(hook_root(native), n_hook, "spurious native hook at {height}");
+        assert_eq!(
+            hook_root(native),
+            n_hook,
+            "spurious native hook at {height}"
+        );
         assert_eq!(hook_root(wasm), w_hook, "spurious wasm hook at {height}");
     }
     if moves {
@@ -298,29 +296,13 @@ async fn same_ops_inner() {
     let mut native = native_host();
     let mut wasm = wasm_host_();
 
-    assert_eq!(
-        native
-            .state_schema()
-            .into_iter()
-            .find(|(id, _)| id == "agent")
-            .map(|(_, revision)| revision),
-        Some(2),
-        "the native role-tail encoding is revision 2"
+    // The empty canonical map and host-KV store share the same preimage, so
+    // parity becomes observable after the first committed write.
+    assert_ne!(
+        root_of(&native),
+        StateRoot::ZERO,
+        "agent has no ZERO sentinel"
     );
-    assert_eq!(
-        wasm.state_schema()
-            .into_iter()
-            .find(|(id, _)| id == "agent")
-            .map(|(_, revision)| revision),
-        Some(3),
-        "the adapter wrapper plus role-tail encoding is revision 3"
-    );
-
-    // the adapter SCHEMA-BREAK pin, agent-shaped: the empty canonical map and
-    // the empty host-KV store share the 8-zero-byte preimage, so genesis roots
-    // COINCIDE and the adapter break surfaces at the first committed write.
-    // The revision assertions above separately pin the later role-tail break.
-    assert_ne!(root_of(&native), StateRoot::ZERO, "agent has no ZERO sentinel");
     assert_eq!(
         root_of(&native),
         root_of(&wasm),

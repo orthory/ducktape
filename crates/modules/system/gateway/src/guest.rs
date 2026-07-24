@@ -5,10 +5,8 @@
 //! the wasm change).
 //!
 //! `gateway` now owns the WHOLE `.duck` name → AccountId → route pipeline: the
-//! route plane AND the `.duck` handle plane absorbed from the retired
-//! `duckdns` module. So this single guest replaces the old gateway + duckdns
-//! guest pair; its persisted snapshot is the merged canonical state
-//! (both planes under one root — a STATE-SCHEMA BREAK, revision 3).
+//! route plane and the `.duck` handle plane. Its persisted snapshot contains
+//! both planes under one root.
 //!
 //! like the `identity` guest port, the constructor takes a PER-NETWORK parameter — the
 //! chain id every route statement is scoped to — which arrives as GENESIS
@@ -23,11 +21,8 @@
 //! the whole-state dispatch model (load `__state`/`__root` through the host's
 //! staged overlay, run the native `execute`, commit the INNER module, save the
 //! canonical snapshot back as OUTER staged writes) is the `agent` guest port verbatim;
-//! see that crate for the equivalence argument.
-//! the persisted encoding is the native canonical snapshot as ONE host-KV
-//! value: a STATE-SCHEMA BREAK versus the native root (revision 3 — the merge
-//! of the handle plane into the route plane's snapshot; beta networks
-//! re-genesis, no back-compat shim).
+//! see that crate for the equivalence argument. The canonical snapshot is
+//! stored as one host-KV value.
 
 use crate::Gateway;
 

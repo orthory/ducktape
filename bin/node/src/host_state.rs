@@ -21,23 +21,7 @@ use statesync::{
 use valset::Valset;
 use wasm_host::WasmModule;
 
-use crate::constants::current_state_schema_fingerprint;
 use crate::util::hex;
-
-/// fail closed unless a recovery manifest's captured schema is EXACTLY this
-/// binary's current module set. no in-place migration route survives: every
-/// historical schema (pre-`clients`-absorb, pre-wasm-cutover, ...) re-genesises.
-pub(super) fn preflight_recovery_schema(manifest: &Manifest) -> Result<(), String> {
-    recovery::check_state_schema(manifest.state_schema, current_state_schema_fingerprint())
-        .map_err(|error| error.to_string())
-}
-
-/// the state-sync twin of [`preflight_recovery_schema`]: a peer can only offer
-/// state for the exact schema this joiner runs.
-pub(super) fn preflight_sync_schema(manifest: &statesync::Manifest) -> Result<(), String> {
-    recovery::check_state_schema(manifest.state_schema, current_state_schema_fingerprint())
-        .map_err(|error| error.to_string())
-}
 
 /// Consensus-visible network names shared by genesis, restore, and state sync.
 #[derive(Clone, Copy)]
@@ -90,21 +74,14 @@ impl host::ModuleFactory for WasmModuleFactory {
     }
 }
 
-/// the directory module's GENESIS component — the first REAL production tenant
-/// of the module runtime. bytes-compatible with the retired native
-/// implementation (the `directory` guest port stores the same keys/values under the same
-/// canonical encoding), so root(), snapshots, and pre-cutover workspace
-/// restores are all continuous across the cutover.
+/// the directory module's GENESIS component.
 const DIRECTORY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/examples/directory/component.wasm");
 
 /// the genesis-constant id the directory module registers under.
 const DIRECTORY_MODULE_ID: &str = "directory";
 
-/// inbox / tasks GENESIS components — adapter-ported tenants (the native crate
-/// compiled into the guest; canonical snapshot persisted through the host-KV
-/// store). `tasks` is the MERGED work module (task board + job board), revision
-/// 3 in `MODULE_STATE_SCHEMAS`.
+/// inbox / tasks GENESIS components. `tasks` hosts the task and job boards.
 const INBOX_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/inbox/component.wasm");
 const INBOX_MODULE_ID: &str = "inbox";
@@ -163,11 +140,10 @@ const AUTOMATIONS_MODULE_ID: &str = "automations";
 /// registry, adapter-ported like its saga collaborator (the native crate
 /// compiled into the guest; canonical snapshot persisted through the host-KV
 /// store). two things make its port shape distinct:
-///   * its schema break is TOTAL from genesis — the native empty encoding is
+///   * its root representation differs from genesis — the native empty encoding is
 ///     four zero counts (recipes / dispatches / mailbox / next_seq) while the
 ///     map-backed guest store is a lone count, so the wasm root differs from the
-///     native root before any write (revision 2, fenced by the schema preflight;
-///     flag day, no shim).
+///     native root before any write.
 ///   * its query surface is COMMITTED-ONLY regardless of caller — the host's
 ///     `PendingDeliveries` delivery injection and runs' `turn_taken` existence
 ///     read must never see a same-block staged write — pinned by the genesis
@@ -204,15 +180,8 @@ const RUNS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/runs/component.wasm");
 const RUNS_MODULE_ID: &str = "runs";
 
-/// pages / chat — the first STORE-BACKED wasm tenants: the native crates are
-/// pure logic over an injected `sdk::MerkleStore`, so the guests compile that
-/// SAME logic over the adapter's `WitStore` while the REAL qmdb store stays
-/// host-side (`WasmModule::with_store`). unlike the whole-state adapter
-/// ports there is no snapshot re-encoding: the module root IS the store's
-/// merkle root, byte-identical across the cutover (state schema revision
-/// STAYS 1 — see `constants::MODULE_STATE_SCHEMAS`), and pre-cutover
-/// workspaces reopen unchanged. NOTE the `.with_tagging("tagging")` wiring
-/// moved INTO the guests — the host builder chain drops it.
+/// pages / chat are STORE-BACKED wasm tenants. The module root is the
+/// host-side qmdb store's Merkle root; tagging wiring lives in the guests.
 const PAGES_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/pages/component.wasm");
 const PAGES_MODULE_ID: &str = "pages";
@@ -220,15 +189,10 @@ const CHAT_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/chat/component.wasm");
 const CHAT_MODULE_ID: &str = "chat";
 
-/// files (duckfs) — the ROOT-CONTINUOUS wasm tenant: the guest runs pure
+/// files (duckfs): the guest runs pure
 /// `duckfs-core` over the WIT object plane while the HOST keeps the disk odb +
-/// durable refs file behind a [`FilesOdbBacking`] (`WasmModule::with_odb`). the
-/// module root is `sha256(encode_refs)` on BOTH runtimes, so — unlike the
-/// whole-state adapter ports — there is NO schema break: `("files", 1)` stays,
-/// pre-cutover workspaces reopen unchanged, and this is the only production
-/// tenant whose cutover moves no root (pinned by `wasm_files_parity`). NO
-/// `.with_state_schema_revision` call — revision 1 is the default, matching the
-/// parity harness and the native module exactly.
+/// durable refs file behind a [`FilesOdbBacking`] (`WasmModule::with_odb`).
+/// Its module root is `sha256(encode_refs)`.
 const FILES_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/files/component.wasm");
 const FILES_MODULE_ID: &str = "files";
@@ -353,113 +317,91 @@ fn genesis_directory_wasm() -> WasmModule {
         .expect("embedded directory component loads")
 }
 
-/// inbox at its GENESIS code. adapter-ported, revision 2: the adapter port
-/// persists the native canonical snapshot under the host-KV encoding — a
-/// state-schema break from the native module's root, fenced by the
-/// recovery/state-sync preflight. same boot-time code reconciliation story as
+/// inbox at its GENESIS code. The adapter persists the canonical snapshot
+/// under the host-KV encoding. Same boot-time code reconciliation story as
 /// [`genesis_hello_wasm`].
 fn genesis_inbox_wasm() -> WasmModule {
     WasmModule::from_bytes(INBOX_MODULE_ID, INBOX_WASM_COMPONENT)
         .expect("embedded inbox component loads")
-        .with_state_schema_revision(2)
 }
 
-/// the merged `tasks` work module (task board + job board): revision 3, the
-/// merge that folded the former `jobs` module into this one.
+/// the `tasks` work module contains the task and job boards.
 fn genesis_tasks_wasm() -> WasmModule {
     WasmModule::from_bytes(TASKS_MODULE_ID, TASKS_WASM_COMPONENT)
         .expect("embedded tasks component loads")
-        .with_state_schema_revision(3)
 }
 
-/// tagging / capability at their GENESIS code (adapter-ported,
-/// revision 2 — see [`genesis_inbox_wasm`]).
+/// tagging / capability at their GENESIS code (adapter-ported; see
+/// [`genesis_inbox_wasm`]).
 fn genesis_tagging_wasm() -> WasmModule {
     WasmModule::from_bytes(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT)
         .expect("embedded tagging component loads")
-        .with_state_schema_revision(2)
 }
 
 fn genesis_capability_wasm() -> WasmModule {
     WasmModule::from_bytes(CAPABILITY_MODULE_ID, CAPABILITY_WASM_COMPONENT)
         .expect("embedded capability component loads")
-        .with_state_schema_revision(2)
 }
 
-/// saga / agent / automations at their GENESIS code (adapter-ported; saga and
-/// automations are revision 2, while agent's later role tail makes it revision
-/// 3). the sibling wiring — saga's valset/capability assignment reads, agent's
+/// saga / agent / automations at their GENESIS code (adapter-ported). the
+/// sibling wiring — saga's valset/capability assignment reads, agent's
 /// saga dead-letter + runs hook, automations' chat/tasks/inbox lanes — is
 /// genesis-constant and compiled into the guests (the exact production
 /// constructors these builders used to call natively).
 fn genesis_saga_wasm() -> WasmModule {
     WasmModule::from_bytes(SAGA_MODULE_ID, SAGA_WASM_COMPONENT)
         .expect("embedded saga component loads")
-        .with_state_schema_revision(2)
 }
 
 fn genesis_agent_wasm() -> WasmModule {
     WasmModule::from_bytes(AGENT_MODULE_ID, AGENT_WASM_COMPONENT)
         .expect("embedded agent component loads")
-        .with_state_schema_revision(3)
 }
 
 fn genesis_automations_wasm() -> WasmModule {
     WasmModule::from_bytes(AUTOMATIONS_MODULE_ID, AUTOMATIONS_WASM_COMPONENT)
         .expect("embedded automations component loads")
-        .with_state_schema_revision(2)
 }
 
 /// dispatch at its GENESIS code (adapter-ported — see the component const's
-/// doc). revision 2: the native canonical snapshot persisted as one host-KV
-/// value, a TOTAL schema break from the native root. `.with_committed_queries()`
+/// doc). The native canonical snapshot is persisted as one host-KV value, so
+/// its root representation differs from the native root. `.with_committed_queries()`
 /// pins the guest's query lane committed-only, preserving the native read
 /// facade's contract (the host's delivery injection + runs' `turn_taken` read);
 /// EXACTLY the wiring `wasm_dispatch_parity`'s `wasm_dispatch()` pins.
 fn genesis_dispatch_wasm() -> WasmModule {
     WasmModule::from_bytes(DISPATCH_MODULE_ID, DISPATCH_WASM_COMPONENT)
         .expect("embedded dispatch component loads")
-        .with_state_schema_revision(2)
         .with_committed_queries()
 }
 
 /// runs at its GENESIS code (adapter-ported — see the component const's doc).
-/// revision 3: the native canonical snapshot (itself at revision 2 since the
-/// session section landed) is persisted as one host-KV value, so the encoding
-/// breaks shape again at cutover.
+/// The native canonical snapshot and delivered-runs ring are persisted in the
+/// current v1 host-KV layout.
 fn genesis_runs_wasm() -> WasmModule {
     WasmModule::from_bytes(RUNS_MODULE_ID, RUNS_WASM_COMPONENT)
         .expect("embedded runs component loads")
-        .with_state_schema_revision(3)
 }
 
 /// pages at its GENESIS code over the host-constructed store (a fresh/reopened
 /// `QmdbStore::init`, or a `QmdbStore::sync_from` at a verified root — all
 /// three lifecycles hand the store in the same way, exactly as they handed it
-/// to the native constructor). REVISION STAYS 1: the committed encoding is the
-/// store's own op log and the module root is its merkle root, byte-identical
-/// across the cutover (pinned by `wasm_pages_parity`), so no schema fence and
-/// no re-genesis.
+/// to the module constructor). The committed encoding is the store's op log
+/// and the module root is its Merkle root.
 fn pages_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
     WasmModule::with_store(PAGES_MODULE_ID, PAGES_WASM_COMPONENT, store)
         .expect("embedded pages component loads")
 }
 
-/// chat at its GENESIS code over the host-constructed store (store-backed,
-/// revision stays 1 — see [`pages_wasm`]; pinned by `wasm_chat_parity`).
+/// chat at its GENESIS code over the host-constructed store.
 fn chat_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
     WasmModule::with_store(CHAT_MODULE_ID, CHAT_WASM_COMPONENT, store)
         .expect("embedded chat component loads")
 }
 
-/// files at its GENESIS code over a host-side duckfs substrate at `dir` — the
-/// disk odb + durable refs file the native `Files` module used to own directly,
-/// now behind a [`FilesOdbBacking`] the kernel drives. `open` recovers committed
-/// refs, durable height, and gc watermark from the on-disk envelope exactly as
-/// the native constructor did (a fresh dir yields empty refs), so genesis,
-/// restore, and the promoted state-sync dir all compose through this one builder.
-/// REVISION STAYS 1: `root()` is `sha256(refs_bytes)`, byte-identical across the
-/// cutover — no schema fence, no re-genesis (pinned by `wasm_files_parity`).
+/// files at its GENESIS code over a host-side duckfs substrate at `dir`.
+/// `open` recovers committed refs, durable height, and the GC watermark from
+/// the on-disk envelope. `root()` is `sha256(refs_bytes)`.
 fn files_wasm(dir: std::path::PathBuf) -> Result<WasmModule, sdk::Error> {
     let backing = FilesOdbBacking::open(FILES_MODULE_ID, dir)?;
     WasmModule::with_odb(FILES_MODULE_ID, FILES_WASM_COMPONENT, Box::new(backing))
@@ -479,11 +421,9 @@ fn genesis_config_wasm(
     component: &[u8],
     params: &[(&str, &[u8])],
     what: &str,
-    revision: u32,
 ) -> WasmModule {
     let mut module = WasmModule::from_bytes(module_id, component)
-        .unwrap_or_else(|e| panic!("embedded {what} component loads: {e}"))
-        .with_state_schema_revision(revision);
+        .unwrap_or_else(|e| panic!("embedded {what} component loads: {e}"));
     let config = sdk::genesis_config::encode_config(params);
     let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
     module
@@ -492,34 +432,25 @@ fn genesis_config_wasm(
     module
 }
 
-/// identity at its GENESIS code + config (adapter-ported): the per-network
-/// chain id rides `__config`. revision 3: identity absorbed the submit-door
-/// client ACL (the retired `clients` module's ed25519 key set) as a tail folded
-/// into its account snapshot/root — a state-schema break from revision 2.
+/// identity at its GENESIS code + config. The per-network chain id rides
+/// `__config`, and the submit-door client ACL is part of the account snapshot.
 fn genesis_identity_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     genesis_config_wasm(
         IDENTITY_MODULE_ID,
         IDENTITY_WASM_COMPONENT,
         &[("chain_id", bindings.identity_chain_id.as_bytes())],
         "identity",
-        3,
     )
 }
 
-/// the MERGED gateway at its GENESIS code + config: it owns the whole `.duck`
-/// name → AccountId → route pipeline (the route plane plus the `.duck` handle
-/// plane absorbed from the retired `duckdns` module). Both planes are chain-
-/// scoped, so the per-network chain id rides `__config`. Revision 3: the
-/// merged snapshot folds the handle registry into the route snapshot — a
-/// state-schema break from the routes-only revision 2 (beta re-genesis, no
-/// shim).
+/// gateway at its GENESIS code + config. It owns the `.duck` handle and route
+/// planes; both are chain-scoped, so the per-network chain id rides `__config`.
 fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     genesis_config_wasm(
         GATEWAY_MODULE_ID,
         GATEWAY_WASM_COMPONENT,
         &[("chain_id", bindings.identity_chain_id.as_bytes())],
         "gateway",
-        4,
     )
 }
 
@@ -533,7 +464,6 @@ fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
         GOVERNANCE_WASM_COMPONENT,
         &[("invite", bindings.invite)],
         "governance",
-        2,
     )
 }
 
@@ -646,13 +576,10 @@ pub(super) async fn genesis_host(
         // now a facet of the account plane, empty at genesis). adapter-ported;
         // the invite binding rides its GENESIS CONFIG, sibling ids compiled in.
         governance: genesis_governance_wasm(bindings),
-        // the network lifecycle module (merged upgrade + modreg): the
-        // no-downtime protocol-version coordinator (at-most-one pending upgrade +
-        // per-validator readiness, valset-gated) AND the module code registry
-        // (the consensus commitment to WHICH component each hot-swappable wasm
-        // module runs, seeded with the genesis hashes). governance schedules
-        // height-gated upgrades and swaps into it; the host realizes swaps at the
-        // boundary through the blobstore-backed CodeSource.
+        // the network module-code registry: the consensus commitment to WHICH
+        // component each hot-swappable wasm module runs, seeded with the genesis
+        // hashes. governance schedules height-gated swaps into it; the host
+        // realizes them through the blobstore-backed CodeSource.
         lifecycle: seeded_lifecycle(),
         // the reference wasm module — the live-update machinery's first tenant.
         hello_wasm: genesis_hello_wasm(),
@@ -671,7 +598,7 @@ pub(super) async fn genesis_host(
         capability: genesis_capability_wasm(),
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
-        // adapter-ported; committed-only query lane, TOTAL rev-2 schema break.
+        // adapter-ported; committed-only query lane and a distinct root representation.
         dispatch: genesis_dispatch_wasm(),
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
@@ -730,10 +657,6 @@ pub(super) async fn restore_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Result<Host, String> {
-    // Must precede every module/storage constructor below. A clean-break
-    // mismatch is classification, not a failed install attempt, and the
-    // archived workspace must remain byte-for-byte untouched.
-    preflight_recovery_schema(manifest)?;
     // store-backed wasm tenants restore like the other qmdb modules: the
     // stores reopen themselves at their committed positions and the wasm
     // wrapper computes root() straight from them (no snapshot install — see
@@ -775,8 +698,8 @@ pub(super) async fn restore_host(
         .install(bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
 
-    // the lifecycle module (protocol-version coordinator + code registry)
-    // restores like any in-memory module: construct at genesis shape, adopt the
+    // the lifecycle module-code registry restores like any in-memory module:
+    // construct at genesis shape, adopt the
     // checkpoint snapshot. its seeded code hashes carry the genesis registry; the
     // wasm tenants are rebuilt on their EMBEDDED genesis components here, and
     // recovery's boot-time code reconciliation swaps them to the checkpoint's
@@ -844,11 +767,9 @@ pub(super) async fn restore_host(
     // files is a duckfs-odb resolver module — NOT in the checkpoint's snapshot
     // set (like the qmdb modules above, which `init` from their own on-disk
     // stores). `files_wasm`'s `FilesOdbBacking::open` recovers committed refs,
-    // durable height, and objects from the on-disk odb/refs envelope exactly as
-    // the native constructor did, and recovery replays forward from that height
-    // (the wasm tenant surfaces the same `durable_commit_height` cursor) — so a
-    // reboot needs no checkpoint bytes and no object fetch here. root-continuous:
-    // the reopened root is `sha256(encode_refs)`, byte-identical to pre-cutover.
+    // durable height, and objects from the on-disk odb/refs envelope. Recovery
+    // replays forward from that height, so reboot needs no checkpoint bytes or
+    // object fetch here. The reopened root is `sha256(encode_refs)`.
     let files = files_wasm(duckfs_dir.to_path_buf()).map_err(|e| format!("duckfs open: {e}"))?;
 
     let mut agent = genesis_agent_wasm();
@@ -862,8 +783,6 @@ pub(super) async fn restore_host(
     runs.install(bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
-    // pre-cutover checkpoints install unchanged: the wasm directory's snapshot
-    // encoding is byte-identical to the retired native implementation's.
     let mut directory = genesis_directory_wasm();
     let (bytes, root) = snapshot_of(DIRECTORY_MODULE_ID)?;
     directory
@@ -965,9 +884,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     substrates: SyncSubstrates<'_>,
     attempt: usize,
 ) -> Result<Host, String> {
-    // Refuse before creating scratch/canonical stores. A peer can only offer
-    // state for the exact binary schema this joiner understands.
-    preflight_sync_schema(manifest)?;
     let SyncSubstrates {
         forge_repo,
         duckfs_dir,
@@ -1097,8 +1013,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .install(&bytes, root)
         .map_err(|e| format!("governance install: {e}"))?;
 
-    // the lifecycle module (protocol-version coordinator + code registry) joins
-    // like any in-memory module: adopt the served snapshot, root-checked. the
+    // the lifecycle module-code registry joins like any in-memory module: adopt
+    // the served snapshot, root-checked. the
     // wasm tenants join on their EMBEDDED genesis components — a post-swap
     // network's committed active hash differs, and the joiner's first code
     // reconciliation (before it applies any block) swaps them to the committed
@@ -1270,7 +1186,7 @@ mod tests {
     use commonware_runtime::Runner as _;
 
     use super::*;
-    use crate::constants::{MODULE_IDS, MODULE_STATE_SCHEMAS};
+    use crate::constants::MODULE_IDS;
 
     /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
     /// genesis, restore, and state sync onto one module set at compile time;
@@ -1304,82 +1220,6 @@ mod tests {
             let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
             want.sort_unstable();
             assert_eq!(got, want);
-            let declared: Vec<(String, u32)> = MODULE_STATE_SCHEMAS
-                .iter()
-                .map(|(id, revision)| ((*id).to_string(), *revision))
-                .collect();
-            assert_eq!(host.state_schema(), declared);
-            assert_eq!(
-                host.state_schema_fingerprint(),
-                current_state_schema_fingerprint()
-            );
-        });
-    }
-
-    #[test]
-    fn incompatible_schema_refuses_before_opening_or_installing_workspace_state() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let source_forge = dir.path().join("source-forge");
-        let source_duckfs = dir.path().join("source-duckfs");
-        let workspace = dir.path().join("preserved-workspace");
-        std::fs::create_dir(&workspace).expect("workspace");
-        let sentinel = workspace.join("identity.key");
-        std::fs::write(&sentinel, b"preserve-me").expect("sentinel");
-        let target_forge = workspace.join("forge-repo");
-        let target_duckfs = workspace.join("duckfs");
-        let cfg = commonware_runtime::tokio::Config::default()
-            .with_storage_directory(dir.path().join("runtime"));
-        let executor = commonware_runtime::tokio::Runner::new(cfg);
-        executor.start(|context| async move {
-            let host = genesis_host(
-                &context,
-                &source_forge,
-                &source_duckfs,
-                &[],
-                NetworkBindings {
-                    invite: b"schema-preflight-test",
-                    identity_chain_id: "schema-preflight-test",
-                },
-                blobstore::BlobHandle::default(),
-            )
-            .await;
-            let mut manifest = Manifest::capture(
-                &host,
-                None,
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-                None,
-                0,
-                1,
-            )
-            .expect("capture");
-            manifest.state_schema = [0xFF; 32];
-
-            let error = match restore_host(
-                &context,
-                &target_forge,
-                &target_duckfs,
-                &manifest,
-                NetworkBindings {
-                    invite: b"schema-preflight-test",
-                    identity_chain_id: "schema-preflight-test",
-                },
-                blobstore::BlobHandle::default(),
-            )
-            .await
-            {
-                Ok(_) => panic!("mismatch must precede module install"),
-                Err(error) => error,
-            };
-            assert!(error.contains(recovery::STATE_SCHEMA_INCOMPATIBLE_MARKER));
-            assert_eq!(
-                std::fs::read(&sentinel).expect("sentinel survives"),
-                b"preserve-me"
-            );
-            assert!(!target_forge.exists(), "Forge substrate was never opened");
-            assert!(!target_duckfs.exists(), "DuckFS substrate was never opened");
         });
     }
 }
