@@ -114,7 +114,14 @@ impl ProviderArg {
     /// the login subcommand argv the pty runs.
     fn login_args(self) -> &'static [&'static str] {
         match self {
-            Self::Claude => &["setup-token"],
+            // `auth login`, NOT `setup-token`. setup-token mints an
+            // inference-only token and PRINTS it to the tty — it writes no
+            // `.credentials.json`, so the artifact watch never fires and
+            // `cred add` hangs forever after the login completes. `auth login`
+            // runs the full-scope OAuth and writes `$CLAUDE_CONFIG_DIR/.credentials.json`
+            // (`claudeAiOauth` accessToken/refreshToken/expiresAt) — the exact
+            // artifact the airlock reads and refreshes.
+            Self::Claude => &["auth", "login"],
             // `--device-auth`: a device-code flow (enter a code on any browser)
             // instead of the default localhost:1455 redirect, which needs a
             // browser on THIS host — wrong for a headless / SSH operator node.
@@ -828,6 +835,16 @@ mod tests {
             derive_default_name("jess", ProviderArg::Claude, &[]),
             "jess-claude-1"
         );
+    }
+
+    /// Claude must log in with `auth login` (writes `.credentials.json`, which
+    /// the artifact watch keys on and the airlock reads), NEVER `setup-token`
+    /// (prints an inference-only token, writes no file → `cred add` hangs).
+    #[test]
+    fn claude_login_writes_the_credentials_artifact_not_setup_token() {
+        assert_eq!(ProviderArg::Claude.login_args(), &["auth", "login"]);
+        assert_eq!(ProviderArg::Claude.artifact(), ".credentials.json");
+        assert_eq!(ProviderArg::Codex.login_args(), &["login", "--device-auth"]);
     }
 
     /// An explicit `--key` that EXISTS resolves to itself; one that is ABSENT
