@@ -73,11 +73,10 @@ pub enum KeyKind {
 }
 
 impl KeyKind {
-    /// the stable one-byte wire tag for this kind. folded into signing
-    /// preimages (so a consent is bound to the exact kind) and the canonical
-    /// snapshot encoding (so `root()` commits to it). NEVER renumber an
-    /// existing tag -- it would silently reinterpret committed state and fork
-    /// the chain; only append.
+    /// the stable one-byte wire tag for this kind, folded into signing
+    /// preimages so a consent is bound to the exact kind being admitted.
+    /// NEVER renumber an existing tag -- it would silently invalidate every
+    /// previously signed certificate; only append.
     pub fn tag(self) -> u8 {
         match self {
             KeyKind::Ed25519 => 0,
@@ -86,21 +85,10 @@ impl KeyKind {
         }
     }
 
-    /// the inverse of [`KeyKind::tag`]; `None` for an unknown tag (a byzantine
-    /// snapshot or a newer node's kind this build doesn't recognize -- either
-    /// way, reject rather than guess).
-    pub fn from_tag(tag: u8) -> Option<Self> {
-        match tag {
-            0 => Some(KeyKind::Ed25519),
-            1 => Some(KeyKind::P256),
-            2 => Some(KeyKind::WebauthnP256),
-            _ => None,
-        }
-    }
-
     /// whether a member of this kind carries an RP-id-hash pin (WebAuthn only).
-    /// the canonical encoding and its strict decoder enforce this 1:1, so a
-    /// snapshot can't smuggle a pin onto a native key or drop it from a passkey.
+    /// the execute path establishes the pin exactly for WebAuthn members and
+    /// the stored record round-trips it verbatim, so a pin can never land on a
+    /// native key or drop off a passkey.
     pub fn expects_rp_id_hash(self) -> bool {
         matches!(self, KeyKind::WebauthnP256)
     }
