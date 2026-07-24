@@ -161,8 +161,9 @@ fn host_commits_chat_blocks_and_serves_history_queries() {
 
         let ChatReply::Messages(messages) = chat_query(
             &host,
-            ChatQuery::MessagesLatest {
+            ChatQuery::MessagesRange {
                 channel_id: "general".into(),
+                from_seq: 1,
                 limit: 16,
             },
         )

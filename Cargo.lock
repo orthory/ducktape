@@ -4479,6 +4479,7 @@ dependencies = [
  "futures",
  "guest-adapter",
  "host",
+ "index-guest",
  "sdk",
  "sdk-testkit",
  "serde",

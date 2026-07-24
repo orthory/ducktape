@@ -301,8 +301,6 @@ mod tests {
                 reply_count: 0,
                 last_reply_seq: None,
             },
-            reactions: Vec::new(),
-            channel_head_seq: seq,
         }
     }
 

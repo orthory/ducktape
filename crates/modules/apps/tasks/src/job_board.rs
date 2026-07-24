@@ -49,7 +49,7 @@ use sdk::{Ctx, Error, ModuleId, Msg, Origin};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BoardCounts, Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
+    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
     encode_job_event,
 };
 
@@ -488,38 +488,6 @@ impl JobBoard {
     pub(crate) fn query(&self, q: JobsQuery) -> JobsReply {
         match q {
             JobsQuery::Get { job_id } => JobsReply::Job(self.jobs.get(&job_id).cloned()),
-            JobsQuery::List {
-                status,
-                kind_prefix,
-                limit,
-            } => {
-                let limit = limit.min(MAX_LIST_LIMIT) as usize;
-                let jobs: Vec<Job> = self
-                    .jobs
-                    .values()
-                    .filter(|job| match &status {
-                        Some(want) => &job.status == want,
-                        None => true,
-                    })
-                    .filter(|job| job.kind.starts_with(&kind_prefix))
-                    .take(limit)
-                    .cloned()
-                    .collect();
-                JobsReply::Jobs(jobs)
-            }
-            JobsQuery::Counts {} => {
-                let mut counts = BoardCounts::default();
-                for job in self.jobs.values() {
-                    match job.status {
-                        JobStatus::Pending => counts.pending += 1,
-                        JobStatus::Processing => counts.processing += 1,
-                        JobStatus::Done => counts.done += 1,
-                        JobStatus::Failed => counts.failed += 1,
-                        JobStatus::Cancelled => counts.cancelled += 1,
-                    }
-                }
-                JobsReply::Counts(counts)
-            }
         }
     }
 

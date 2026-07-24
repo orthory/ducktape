@@ -115,6 +115,23 @@ impl Client {
         decode_json(response).await
     }
 
+    /// Submit one typed index-tier view request and decode its typed reply —
+    /// the read model behind every human-facing list, page, and search.
+    pub async fn view<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        module: &str,
+        query: &Q,
+    ) -> Result<R> {
+        let response = self
+            .http
+            .post(self.url(&format!("v1/index/{module}/view"))?)
+            .json(query)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("{module} view failed: {error}")))?;
+        decode_json(response).await
+    }
+
     /// Submit an already-signed operation frame.
     pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<()> {
         let response = self

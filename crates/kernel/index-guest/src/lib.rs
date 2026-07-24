@@ -87,6 +87,31 @@ pub const MAX_SCAN_LIMIT: usize = 1024;
 /// the key of one op row: fixed-width hex so lexicographic order IS numeric
 /// order. `seq` is the block-wide dispatch index (fits: the host drain budget
 /// is 1024 dispatches per block).
+/// render an external submitter identity for display in a read model.
+///
+/// a `User` identity is a claimed display name on the embedded daemon
+/// (printable utf-8, e.g. `jess`) but a raw ed25519 public key on the
+/// networked node (32 arbitrary bytes). printable utf-8 passes through as
+/// the name; anything else — control bytes, invalid utf-8, the common
+/// pubkey case — renders as lowercase hex, never lossy `�` boxes. the node
+/// layer renders EVERY external origin through this before it enters the
+/// feed; guests use the SAME function on payload-carried user bytes
+/// (memberships, huddle sweeps) so read-model keys and author strings
+/// always agree.
+pub fn user_handle(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes)
+        && !text.is_empty()
+        && !text.chars().any(char::is_control)
+    {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 pub fn op_key(height: u64, seq: u32) -> String {
     format!("{OP_PREFIX}{height:016x}/{seq:04x}")
 }

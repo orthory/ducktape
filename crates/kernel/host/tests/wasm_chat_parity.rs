@@ -128,24 +128,19 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     .expect("genesis")
 }
 
-/// the read matrix over one existing channel (`channel` — queries against an
-/// absent channel REJECT on several families, and a native rejection and its
-/// wit-wrapped rendering are legitimately different strings, so the byte-equal
-/// matrix only probes channels both hosts hold) plus a members probe against
-/// `members_of` and the global id lookups. the absent CHANNEL record itself
-/// answers a comparable `None`.
-async fn replies(h: &Host, channel: &str, members_of: &str, message_id: &str) -> Vec<Vec<u8>> {
+/// the read matrix — the three kept dispatch queries — over one existing
+/// channel (`channel` — a range read against an absent channel REJECTS, and a
+/// native rejection and its wit-wrapped rendering are legitimately different
+/// strings, so the byte-equal matrix only probes channels both hosts hold)
+/// plus the global id lookups. the absent CHANNEL record and the absent
+/// message id answer a comparable `None`.
+async fn replies(h: &Host, channel: &str, message_id: &str) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&ChatQuery::Channels),
         encode_query(&ChatQuery::Channel {
             channel_id: channel.into(),
         }),
         encode_query(&ChatQuery::Channel {
             channel_id: "absent".into(),
-        }),
-        encode_query(&ChatQuery::MessagesLatest {
-            channel_id: channel.into(),
-            limit: 16,
         }),
         encode_query(&ChatQuery::MessagesRange {
             channel_id: channel.into(),
@@ -157,23 +152,6 @@ async fn replies(h: &Host, channel: &str, members_of: &str, message_id: &str) ->
         }),
         encode_query(&ChatQuery::Message {
             message_id: "ghost".into(),
-        }),
-        encode_query(&ChatQuery::Revisions {
-            channel_id: channel.into(),
-            seq: 1,
-        }),
-        encode_query(&ChatQuery::Thread {
-            channel_id: channel.into(),
-            root_seq: 1,
-            from: 0,
-            limit: 16,
-        }),
-        encode_query(&ChatQuery::Reactions {
-            channel_id: channel.into(),
-            seq: 1,
-        }),
-        encode_query(&ChatQuery::Members {
-            channel_id: members_of.into(),
         }),
     ];
     let mut out = Vec::new();
@@ -402,8 +380,8 @@ fn same_ops_identical_roots_block_by_block() {
                 );
             }
             assert_eq!(
-                replies(&native, "general", "private", "m1").await,
-                replies(&wasm, "general", "private", "m1").await,
+                replies(&native, "general", "m1").await,
+                replies(&wasm, "general", "m1").await,
                 "replies diverge after block {height}"
             );
         }
@@ -442,7 +420,7 @@ fn same_ops_identical_roots_block_by_block() {
 
         // queries are read-only on the wasm side too.
         let settled = roots(&wasm);
-        let _ = replies(&wasm, "general", "private", "m1").await;
+        let _ = replies(&wasm, "general", "m1").await;
         assert_eq!(roots(&wasm), settled, "a query moved a root");
     });
 }
@@ -625,8 +603,8 @@ fn rejections_match_and_leave_no_trace() {
             assert_eq!(roots(&native), before, "native root moved on reject");
             assert_eq!(roots(&wasm), before, "wasm root moved on reject");
             assert_eq!(
-                replies(&native, "general", "private", "m1").await,
-                replies(&wasm, "general", "private", "m1").await
+                replies(&native, "general", "m1").await,
+                replies(&wasm, "general", "m1").await
             );
         }
     });
@@ -686,8 +664,8 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
         }
         assert_eq!(roots(&native), roots(&wasm));
         assert_eq!(
-            replies(&native, "room", "room", "r1").await,
-            replies(&wasm, "room", "room", "r1").await
+            replies(&native, "room", "r1").await,
+            replies(&wasm, "room", "r1").await
         );
 
         // ONE block where the SECOND member rejects: the runtime aborts the
@@ -724,8 +702,8 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
         assert_ne!(roots(&native), before, "accepted member must land");
         assert_eq!(roots(&native), roots(&wasm));
         assert_eq!(
-            replies(&native, "room", "room", "r1").await,
-            replies(&wasm, "room", "room", "r1").await
+            replies(&native, "room", "r1").await,
+            replies(&wasm, "room", "r1").await
         );
         for host in [&native, &wasm] {
             let reply = host

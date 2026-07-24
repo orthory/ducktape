@@ -73,7 +73,10 @@ pub struct NodeToml {
     pub coordinator_relay: String,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
-    /// opt-in UNVERIFIABLE shipped-index warm start on join.
+    /// shipped-index warm start on join (default ON — the read model arrives
+    /// warm from the sync source, unverified by design). `false` opts this
+    /// node down to consensus-only: verified state, derived views empty at
+    /// the boundary.
     pub sync_index: bool,
     /// whether this node publishes its provider set into the capability
     /// registry; `false` = accept-lane-only provider.
@@ -286,7 +289,7 @@ pub fn merged_plumbing(
         checkpoint_blocks: e
             .map(|r| r.checkpoint_blocks)
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
-        sync_index: e.map(|r| r.sync_index).unwrap_or(false),
+        sync_index: e.map(|r| r.sync_index).unwrap_or(true),
         announce_capabilities: e.map(|r| r.announce_capabilities).unwrap_or(false),
         sandbox: e
             .map(|r| r.sandbox.clone())
@@ -373,7 +376,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
     keyline(&mut s, "checkpoint_blocks", format_args!("{}", p.checkpoint_blocks),
         "sealed blocks between recovery checkpoints");
     keyline(&mut s, "sync_index", format_args!("{}", p.sync_index),
-        "true: UNVERIFIABLE shipped-index warm start on join");
+        "false: consensus-only (skip the unverified index warm start on join)");
     keyline(&mut s, "announce_capabilities", format_args!("{}", p.announce_capabilities),
         "true: publish this node's provider set");
     keyline(&mut s, "sandbox", format_args!("\"{}\"", p.sandbox),
@@ -431,7 +434,7 @@ mod tests {
             derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
-        assert!(!raw.sync_index);
+        assert!(raw.sync_index);
         assert!(!raw.announce_capabilities);
         assert_eq!(raw.sandbox, "direct");
         assert_eq!(raw.sandbox_image, DEFAULT_PODMAN_IMAGE);

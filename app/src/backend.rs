@@ -6,8 +6,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use chat::{AuthorRef, ChatMsg, ChatQuery, ChatReply, PostPolicy};
+use chat::index::{ChatViewQuery, ChatViewReply};
+use chat::{ChatMsg, PostPolicy};
 use ducktape_rpc::{Client as RpcClient, Status as NodeStatus};
+use pages::index::{PagesViewQuery, PagesViewReply};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
 use tokio::io::AsyncWriteExt as _;
 use zeroize::{Zeroize as _, Zeroizing};
@@ -341,17 +343,25 @@ fn tip_from_status(status: NodeStatus) -> Result<BlockTip, String> {
 }
 
 async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<ChatData, String> {
-    let reply: ChatReply = rpc.query("chat", &ChatQuery::Channels).await?;
-    let wire_channels = match reply {
-        ChatReply::Channels(channels) => channels,
-        _ => return Err("node returned an invalid channel list".into()),
+    let reply: ChatViewReply = rpc
+        .view("chat", &ChatViewQuery::Channels {
+            after: None,
+            limit: None,
+        })
+        .await?;
+    let ChatViewReply::Channels {
+        channels: wire_channels,
+        ..
+    } = reply
+    else {
+        return Err("node returned an invalid channel list".into());
     };
     let channels = wire_channels
         .iter()
-        .filter(|channel| !channel.archived && !channel.id.contains(':'))
-        .map(|channel| ChatChannel {
-            id: channel.id.clone(),
-            name: channel.name.clone(),
+        .filter(|info| !info.channel.archived && !info.channel.id.contains(':'))
+        .map(|info| ChatChannel {
+            id: info.channel.id.clone(),
+            name: info.channel.name.clone(),
         })
         .collect::<Vec<_>>();
     let active_channel = requested
@@ -372,39 +382,45 @@ async fn load_chat_data(rpc: &RpcClient, requested: Option<&str>) -> Result<Chat
 }
 
 async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<Vec<ChatMessage>, String> {
-    let reply: ChatReply = rpc
-        .query(
+    let reply: ChatViewReply = rpc
+        .view(
             "chat",
-            &ChatQuery::MessagesLatest {
+            &ChatViewQuery::MessagesLatest {
                 channel_id: channel_id.to_string(),
-                limit: 128,
+                limit: Some(128),
             },
         )
         .await?;
-    let messages = match reply {
-        ChatReply::Messages(messages) => messages,
-        _ => return Err("node returned an invalid message list".into()),
+    let ChatViewReply::Messages(messages) = reply else {
+        return Err("node returned an invalid message list".into());
     };
     Ok(messages
         .into_iter()
-        .filter(|message| message.head.thread.is_none())
-        .map(|message| ChatMessage {
-            author: author_name(&message.head.author),
-            meta: format!("#{}", message.seq),
-            body: if message.head.deleted {
+        .filter(|row| row.thread.is_none())
+        .map(|row| ChatMessage {
+            author: row.author.clone(),
+            meta: format!("#{}", row.seq),
+            body: if row.deleted {
                 "Message deleted".into()
             } else {
-                message_body(&message.head.blocks)
+                message_body(&row.blocks)
             },
         })
         .collect())
 }
 
 async fn load_pages_data(rpc: &RpcClient, requested: Option<&str>) -> Result<PagesData, String> {
-    let reply: PageReply = rpc.query("pages", &PageQuery::ListPages).await?;
-    let wire_pages = match reply {
-        PageReply::PageList(pages) => pages,
-        _ => return Err("node returned an invalid page list".into()),
+    let reply: PagesViewReply = rpc
+        .view("pages", &PagesViewQuery::ListPages {
+            after: None,
+            limit: None,
+        })
+        .await?;
+    let PagesViewReply::Pages {
+        pages: wire_pages, ..
+    } = reply
+    else {
+        return Err("node returned an invalid page list".into());
     };
     let pages = wire_pages
         .into_iter()
@@ -623,26 +639,6 @@ fn message_body(blocks: &[chat::Block]) -> String {
 
 fn span_text(spans: &[chat::Span]) -> String {
     spans.iter().map(|span| span.text.as_str()).collect()
-}
-
-fn author_name(author: &AuthorRef) -> String {
-    match author {
-        AuthorRef::User(key) => format!("user {}", short_hex(key)),
-        AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
-        AuthorRef::Module(module) => module.clone(),
-        AuthorRef::System => "system".into(),
-    }
-}
-
-fn short_hex(bytes: &[u8]) -> String {
-    let mut output = String::new();
-    for byte in bytes.iter().take(4) {
-        let _ = write!(output, "{byte:02x}");
-    }
-    if bytes.len() > 4 {
-        output.push('…');
-    }
-    output
 }
 
 const fn block_kind_name(kind: BlockKind) -> &'static str {

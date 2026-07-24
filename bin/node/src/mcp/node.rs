@@ -81,6 +81,14 @@ impl Node {
         self.send(self.client.post(url).json(&body))
     }
 
+    /// read a module's index-tier view (`POST /v1/index/{module}/view`) — the
+    /// read model every human/agent-facing list, page, and search comes from.
+    /// `query` is the module's own `*ViewQuery` enum as json.
+    pub fn view(&self, module: &str, query: Value) -> Result<Value> {
+        let url = format!("{}/v1/index/{module}/view", self.base()?);
+        self.send(self.client.post(url).json(&query))
+    }
+
     /// one of the duckfs read routes (`ls`, `read`, `grep`, ...), with its
     /// params as the query string.
     pub fn files(&self, verb: &str, params: &[(&str, String)]) -> Result<Value> {

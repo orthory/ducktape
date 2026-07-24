@@ -124,8 +124,9 @@ fn resident_posts_to_chat_with_its_own_authorship() {
             let raw = cluster.query(
                 0,
                 "chat",
-                &encode_query(&ChatQuery::MessagesLatest {
+                &encode_query(&ChatQuery::MessagesRange {
                     channel_id: "general".into(),
+                    from_seq: 1,
                     limit: 10,
                 }),
             )?;

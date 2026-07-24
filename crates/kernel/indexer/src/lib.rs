@@ -96,7 +96,7 @@ use sha2::Digest as _;
 // the shared host↔guest vocabulary: key conventions + the borsh op-row
 // envelope. re-exported so every host-side consumer names them through this
 // crate, exactly as before the wasm cutover.
-pub use index_guest::{META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key};
+pub use index_guest::{META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key, user_handle};
 
 /// key prefix of the per-block explorer rows in the internal blocks database.
 pub const BLOCK_PREFIX: &str = "blk/";
@@ -185,25 +185,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 // stream, it is not part of the consensus contract.
 // ============================================================================
 
-/// render an external submitter identity for display in a read model.
-///
-/// a `User` identity is a claimed display name on the embedded daemon (printable
-/// utf-8, e.g. `jess`) but a raw ed25519 public key on the networked node (32
-/// arbitrary bytes). printable utf-8 passes through as the name; anything else —
-/// control bytes, invalid utf-8, the common pubkey case — renders as lowercase
-/// hex, never the lossy `�` boxes `from_utf8_lossy` would leave. mirrors the
-/// client's `displayUserBytes`; the node layer renders EVERY external origin
-/// through this before it enters the feed, so guests never see raw key bytes.
-pub fn user_handle(bytes: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(bytes)
-        && !text.is_empty()
-        && !text.chars().any(char::is_control)
-    {
-        return text.to_string();
-    }
-    hex(bytes)
-}
-
 /// one dispatch a finalized block applied: the target module, the trigger, and
 /// the op bytes. order within [`BlockOps::ops`] is drain order.
 #[derive(Clone, Debug)]
@@ -235,14 +216,6 @@ fn encode_row(height: u64, seq: u32, time: u64, op: &AppliedOp) -> Result<Vec<u8
         origin: op.origin.clone(),
         payload: op.payload.clone(),
     })?)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 /// the key of one block's explorer row, same fixed-width-hex ordering rule as

@@ -80,14 +80,6 @@ async fn get_block(p: &Pages, block_id: &str) -> Option<Block> {
     }
 }
 
-async fn list_pages(p: &Pages) -> Vec<PageMeta> {
-    let reply = p.query(&encode_query(&PageQuery::ListPages)).await.unwrap();
-    match decode_reply(&reply).unwrap() {
-        PageReply::PageList(l) => l,
-        _ => panic!("expected PageList"),
-    }
-}
-
 fn ids(blocks: &[Block]) -> Vec<&str> {
     blocks.iter().map(|b| b.id.as_str()).collect()
 }
@@ -120,13 +112,15 @@ async fn apply_err_as(p: &mut Pages, m: &PageMsg, origin: sdk::Origin, needle: &
     );
     p.abort_block().await.unwrap();
 }
-async fn query_threads(p: &Pages, targets: &[&str]) -> Vec<TargetThreads> {
-    let q = PageQuery::ThreadsForTargets {
-        targets: targets.iter().map(|s| s.to_string()).collect(),
+/// the [`PageQuery::TargetThreadCount`] cap probe — the kept dispatch read
+/// over the per-target thread index (thread ENUMERATION is index-tier now).
+async fn target_thread_count(p: &Pages, target: &str) -> u64 {
+    let q = PageQuery::TargetThreadCount {
+        target: target.into(),
     };
     match decode_reply(&p.query(&encode_query(&q)).await.unwrap()).unwrap() {
-        PageReply::CommentThreads(v) => v,
-        _ => panic!("expected CommentThreads"),
+        PageReply::TargetThreadCount(n) => n,
+        _ => panic!("expected TargetThreadCount"),
     }
 }
 async fn query_thread(p: &Pages, thread_id: &str) -> Option<ThreadView> {

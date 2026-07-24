@@ -12,9 +12,9 @@
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Error, Msg, Origin, StateRoot};
 use tasks::{
-    BoardCounts, JobStatus, JobsMsg, JobsQuery, JobsReply, TaskMsg, TaskQuery, TaskReply,
-    TaskStatus, Tasks, decode_job_reply, decode_task_reply, encode_job_msg, encode_job_query,
-    encode_task_msg, encode_task_query,
+    JobStatus, JobsMsg, JobsQuery, JobsReply, TaskMsg, TaskQuery, TaskReply, TaskStatus, Tasks,
+    decode_job_reply, decode_task_reply, encode_job_msg, encode_job_query, encode_task_msg,
+    encode_task_query,
 };
 use wasm_host::WasmModule;
 
@@ -84,7 +84,8 @@ fn block(height: u64, origin: Origin) -> BlockContext {
 }
 
 /// the read matrix: the task board's whole surface (the unpaged `List`) plus
-/// every job-board query family, including the `None`/absent shapes.
+/// the job board's kept dispatch read — `Get`, hit and absent shapes alike
+/// (board enumeration is the index guest's job on the derived tier).
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
         encode_task_query(&TaskQuery::List),
@@ -97,17 +98,6 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
         encode_job_query(&JobsQuery::Get {
             job_id: "absent".into(),
         }),
-        encode_job_query(&JobsQuery::List {
-            status: None,
-            kind_prefix: String::new(),
-            limit: 64,
-        }),
-        encode_job_query(&JobsQuery::List {
-            status: Some(JobStatus::Pending),
-            kind_prefix: "c".into(),
-            limit: 64,
-        }),
-        encode_job_query(&JobsQuery::Counts {}),
     ];
     let mut out = Vec::new();
     for q in &queries {
@@ -324,22 +314,36 @@ async fn same_ops_inner() {
     assert_eq!(job.created_at_height, 2);
     assert_eq!(job.updated_at_height, 18);
 
-    // decoded census: the pruned job is GONE, the reclaimed one pending, the
-    // cancelled one terminal-but-retained.
+    // per-id spot checks (the census itself is index-tier now): the pruned
+    // job is GONE, the cancelled one terminal-but-retained (the reclaimed one
+    // is asserted Pending above).
     let reply = wasm
-        .query("tasks", &encode_job_query(&JobsQuery::Counts {}))
+        .query(
+            "tasks",
+            &encode_job_query(&JobsQuery::Get {
+                job_id: "build".into(),
+            }),
+        )
         .await
-        .expect("counts query");
+        .expect("get query");
     assert_eq!(
         decode_job_reply(&reply).expect("decode"),
-        JobsReply::Counts(BoardCounts {
-            pending: 1,
-            processing: 0,
-            done: 0,
-            failed: 0,
-            cancelled: 1,
-        })
+        JobsReply::Job(None),
+        "the pruned job answers None"
     );
+    let reply = wasm
+        .query(
+            "tasks",
+            &encode_job_query(&JobsQuery::Get {
+                job_id: "temp".into(),
+            }),
+        )
+        .await
+        .expect("get query");
+    let JobsReply::Job(Some(job)) = decode_job_reply(&reply).expect("decode") else {
+        panic!("the cancelled job is retained");
+    };
+    assert_eq!(job.status, JobStatus::Cancelled);
 
     // decoded task spot check: deterministic list order, statuses landed, and
     // the timestamps pin creation to its block and updates to the LAST real

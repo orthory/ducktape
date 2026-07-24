@@ -89,7 +89,8 @@ pub struct Resolved {
     /// ADDITIONAL first-contact paths the joiner races alongside the inviter.
     /// Empty for the dev shape, for members, and for pre-feature invites.
     pub invite_fronts: Vec<Front>,
-    /// opt-in shipped-index warm start when joining; see `NodeToml::sync_index`.
+    /// shipped-index warm start when joining (default on); see
+    /// `NodeToml::sync_index`.
     pub sync_index: bool,
     /// publish the discovered provider set into the capability registry; see
     /// `NodeToml::announce_capabilities`.
@@ -623,7 +624,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         invite_token: None,
         invite_wireguard: None,
         invite_fronts: Vec::new(),
-        sync_index: raw.sync_index.unwrap_or(false),
+        sync_index: raw.sync_index.unwrap_or(true),
         announce_capabilities: raw.announce_capabilities.unwrap_or(false),
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.

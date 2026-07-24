@@ -27,7 +27,7 @@ use automations::{
 use chat::{Block, Chat, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use inbox::{Inbox, InboxQuery, encode_query as inbox_encode_query};
+use inbox::Inbox;
 use sdk::{Error, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tasks::{
@@ -271,6 +271,10 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             root_of(&wasm),
             "genesis roots must differ — the port is a DECLARED schema break"
         );
+        // the inbox sibling's empty root, for the delivery-landed claims below
+        // (the inbox has no read surface — its module root is the whole
+        // observable committed state).
+        let inbox_genesis = native.module_root("inbox").expect("inbox registered");
 
         // ---- the shared world: a hooked channel. sibling-only blocks leave
         // automations alone on both runtimes.
@@ -390,6 +394,14 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         )
         .await;
         assert_eq!(task_ids(&wasm).await, vec!["job-general-1".to_string()]);
+        // r-inbox's Deliver landed ATOMICALLY in the posting block: the inbox
+        // sibling root moved off empty (cross-host agreement on it is pinned
+        // inside `roundtrip` via SIBLING_IDS).
+        assert_ne!(
+            native.module_root("inbox").expect("inbox registered"),
+            inbox_genesis,
+            "the hooked post delivered nothing to the inbox"
+        );
 
         // ---- a post WITHOUT the text filter's needle: r-post skips (its
         // fire_count must not bump), the unfiltered rules still fire.
@@ -499,23 +511,20 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             AutomationsReply::Rule(None)
         );
 
-        // the inbox lane really landed (decoded spot check on the wasm side;
-        // cross-host equality is already pinned via the sibling roots).
-        let reply = wasm
-            .query(
-                "inbox",
-                &inbox_encode_query(&InboxQuery::Unread {
-                    member: "ops-general".into(),
-                }),
-            )
-            .await
-            .expect("inbox query");
-        let inbox::InboxReply::UnreadCount(unread) =
-            inbox::decode_reply(&reply).expect("decode")
-        else {
-            panic!("expected UnreadCount");
-        };
-        assert_eq!(unread, 4, "one delivery per hooked user post");
+        // the inbox lane really landed, and landed IDENTICALLY: the sibling
+        // inbox roots moved off empty and agree across the hosts (the inbox
+        // has no read surface — its decoded views are the index guest's job;
+        // the module root IS its whole observable committed state).
+        assert_eq!(
+            native.module_root("inbox"),
+            wasm.module_root("inbox"),
+            "the inbox deliveries diverged between the runtimes"
+        );
+        assert_ne!(
+            native.module_root("inbox").expect("inbox registered"),
+            inbox_genesis,
+            "the hooked posts delivered nothing to the inbox"
+        );
 
         // queries are read-only on the wasm side too.
         let settled = root_of(&wasm);

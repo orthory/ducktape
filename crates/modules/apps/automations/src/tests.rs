@@ -181,7 +181,6 @@ impl Ctx for CaptureCtx {
                             .cloned(),
                     )))
                 }
-                _ => Err(Error::QueryUnsupported),
             },
             TASKS => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
             other => Err(Error::UnknownModule(other.into())),
@@ -279,8 +278,6 @@ fn message(channel: &str, seq: u64, author: AuthorRef, blocks: Vec<Block>) -> Me
             reply_count: 0,
             last_reply_seq: None,
         },
-        reactions: Vec::new(),
-        channel_head_seq: seq,
     }
 }
 

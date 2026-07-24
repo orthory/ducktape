@@ -27,36 +27,6 @@ fn create_page_is_idempotent_and_preserves_the_title() {
         let page = get_page(&p, "p1").await.unwrap();
         assert_eq!(ids(&page), ["p1", "b1", "b2", "b3"]);
         assert_eq!(page[0].text, "renamed");
-        assert_eq!(list_pages(&p).await.len(), 1);
-    });
-}
-
-#[test]
-fn list_pages_enumerates_sorted_with_live_titles() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages");
-        assert!(
-            list_pages(&p).await.is_empty(),
-            "a fresh store lists nothing"
-        );
-        // create out of order; the index comes back sorted by id.
-        for (id, title) in [("zebra", "Z"), ("alpha", "A"), ("mid", "M")] {
-            apply_commit(
-                &mut p,
-                &PageMsg::CreatePage {
-                    page_id: id.into(),
-                    title: title.into(),
-                    parent: None,
-                },
-            )
-            .await;
-        }
-        let pages = list_pages(&p).await;
-        let got: Vec<(&str, &str)> = pages
-            .iter()
-            .map(|m| (m.id.as_str(), m.title.as_str()))
-            .collect();
-        assert_eq!(got, [("alpha", "A"), ("mid", "M"), ("zebra", "Z")]);
     });
 }
 
@@ -94,41 +64,14 @@ fn reserved_index_id_is_rejected() {
         // the sentinel reads as absence on the query surface.
         assert!(get_block(&p, PAGE_INDEX_KEY).await.is_none());
         assert!(get_page(&p, PAGE_INDEX_KEY).await.is_none());
-        assert_eq!(list_pages(&p).await.len(), 1);
     });
 }
 
 // ── nested pages (folder relation in the index) ──
-
-#[test]
-fn create_with_parent_records_folder_edge() {
-    deterministic::Runner::default().start(|context| async move {
-        let mut p = pages_on!(context, "pages");
-        apply_commit(
-            &mut p,
-            &PageMsg::CreatePage {
-                page_id: "root".into(),
-                title: "Root".into(),
-                parent: None,
-            },
-        )
-        .await;
-        apply_commit(
-            &mut p,
-            &PageMsg::CreatePage {
-                page_id: "child".into(),
-                title: "Child".into(),
-                parent: Some("root".into()),
-            },
-        )
-        .await;
-        let pages = list_pages(&p).await;
-        let child = pages.iter().find(|m| m.id == "child").unwrap();
-        assert_eq!(child.parent.as_deref(), Some("root"));
-        let root = pages.iter().find(|m| m.id == "root").unwrap();
-        assert_eq!(root.parent, None);
-    });
-}
+// the folder EDGES themselves are enumeration-index shape, rendered by the
+// index tier now (see `index::tests`); here the write-path rules stay covered
+// through kept surfaces — a folder edge is observable exactly where it binds:
+// the cycle guard.
 
 #[test]
 fn create_under_missing_or_nonpage_parent_is_rejected() {
@@ -192,13 +135,8 @@ fn set_page_parent_renests_and_rejects_cycles() {
             },
         )
         .await;
-        let parent_of = |pages: &[PageMeta], id: &str| {
-            pages.iter().find(|m| m.id == id).unwrap().parent.clone()
-        };
-        let pages = list_pages(&p).await;
-        assert_eq!(parent_of(&pages, "b"), Some("a".into()));
-        assert_eq!(parent_of(&pages, "c"), Some("b".into()));
-        // a under c would cycle (a -> c -> b -> a).
+        // a under c would cycle (a -> c -> b -> a) — the rejection is ALSO the
+        // proof both renests landed: the guard walks the live folder edges.
         apply_expect_err(
             &mut p,
             &PageMsg::SetPageParent {
@@ -218,7 +156,8 @@ fn set_page_parent_renests_and_rejects_cycles() {
             "page cycle",
         )
         .await;
-        // detach to top level.
+        // detach b to top level — the just-rejected renest becomes legal
+        // (c's ancestry is now c -> b -> top), proving the detach landed.
         apply_commit(
             &mut p,
             &PageMsg::SetPageParent {
@@ -227,7 +166,14 @@ fn set_page_parent_renests_and_rejects_cycles() {
             },
         )
         .await;
-        assert_eq!(parent_of(&list_pages(&p).await, "b"), None);
+        apply_commit(
+            &mut p,
+            &PageMsg::SetPageParent {
+                page_id: "a".into(),
+                parent: Some("c".into()),
+            },
+        )
+        .await;
         // target must be a page root.
         seed_page(&mut p, "pg").await;
         apply_expect_err(
@@ -306,11 +252,21 @@ fn delete_page_removes_subtree_and_promotes_children() {
         assert!(get_block(&p, "parent").await.is_none());
         assert!(get_block(&p, "pb1").await.is_none());
         assert!(get_page(&p, "parent").await.is_none());
-        // … child was PROMOTED to grand (parent's parent), not deleted.
-        let pages = list_pages(&p).await;
-        assert!(pages.iter().all(|m| m.id != "parent"));
-        let child = pages.iter().find(|m| m.id == "child").unwrap();
-        assert_eq!(child.parent.as_deref(), Some("grand"));
+        // … child was NOT deleted (its own root survives) …
+        assert!(get_page(&p, "child").await.is_some());
+        // … and child was PROMOTED to grand: nesting grand under child must
+        // now cycle (grand -> child -> grand). had promotion detached child
+        // to top level — or left it dangling on the deleted parent — this op
+        // would succeed. (list rendering of the edge is `index::tests`'.)
+        apply_expect_err(
+            &mut p,
+            &PageMsg::SetPageParent {
+                page_id: "grand".into(),
+                parent: Some("child".into()),
+            },
+            "page cycle",
+        )
+        .await;
 
         // deleting a non-page id is rejected.
         seed_page(&mut p, "pg").await;

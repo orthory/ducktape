@@ -40,10 +40,7 @@ use greeter::Greeter;
 use host::{BlockContext, Host};
 use identity::Identity;
 use inbox::Inbox;
-use inbox::{
-    InboxMsg, InboxQuery, InboxReply, decode_reply as inbox_decode_reply,
-    encode_msg as inbox_encode_msg, encode_query as inbox_encode_query,
-};
+use inbox::{InboxMsg, encode_msg as inbox_encode_msg};
 use saga::SagaModule;
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
@@ -265,11 +262,16 @@ fn main() {
             )
             .await
             .expect("submit block 5 reaction");
+        // the dispatch read surface: `MessagesRange` over the gap-free seq
+        // space. reaction STATE is read-model territory (the index tier's
+        // `reactions` view on a full node); here the committed root moving
+        // is the reaction's receipt.
         let reply = host
             .query(
                 "chat",
-                &chat_encode_query(&ChatQuery::MessagesLatest {
+                &chat_encode_query(&ChatQuery::MessagesRange {
                     channel_id: "general".into(),
+                    from_seq: 1,
                     limit: 16,
                 }),
             )
@@ -281,14 +283,6 @@ fn main() {
             println!(
                 "  m1 replies     : {} (last reply seq: {:?})",
                 messages[0].head.reply_count, messages[0].head.last_reply_seq
-            );
-            println!(
-                "  m2 reactions   : {:?}",
-                messages[1]
-                    .reactions
-                    .iter()
-                    .map(|r| (r.emoji.as_str(), r.reactors.len()))
-                    .collect::<Vec<_>>()
             );
             println!("  chat root      : {:?}", host.module_root("chat").unwrap());
             println!("  root-hash       : {:?}", out.root_hash);
@@ -506,26 +500,11 @@ fn main() {
             )
             .await
             .expect("submit block 8");
+        // inbox serves NO canonical reads (its whole read surface is the
+        // index guest's paged views on a full node) — the moved root IS the
+        // delivery receipt here.
         println!("\n[block 8] inbox <- Deliver(quackbot) — a notification as consensus state");
-        let reply = host
-            .query(
-                "inbox",
-                &inbox_encode_query(&InboxQuery::List {
-                    member: "quackbot".into(),
-                    from_seq: 0,
-                    limit: 16,
-                }),
-            )
-            .await
-            .expect("query inbox");
-        if let InboxReply::Items(items) = inbox_decode_reply(&reply).unwrap() {
-            for note in &items {
-                println!(
-                    "  note           : seq {} [{}] from {:?} — {}",
-                    note.seq, note.kind, note.source, note.body
-                );
-            }
-        }
+        println!("  inbox root     : {:?}", host.module_root("inbox").unwrap());
         println!("  root-hash       : {:?}", out.root_hash);
 
         // every registered module, straight from the registry — the same set

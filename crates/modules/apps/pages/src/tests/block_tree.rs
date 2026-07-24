@@ -218,7 +218,8 @@ fn update_text_edits_blocks_and_renames_pages() {
         .await;
         assert_eq!(get_block(&p, "b1").await.unwrap().text, "edited");
 
-        // UpdateText on the root IS the rename; ListPages reads live roots.
+        // UpdateText on the root IS the rename: the root block's text is the
+        // live title (the page LIST rendering of it is `index::tests`').
         apply_commit(
             &mut p,
             &PageMsg::UpdateText {
@@ -228,10 +229,10 @@ fn update_text_edits_blocks_and_renames_pages() {
             },
         )
         .await;
-        let pages = list_pages(&p).await;
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].id, "p1");
-        assert_eq!(pages[0].title, "renamed");
+        let root = get_block(&p, "p1").await.unwrap();
+        assert_eq!(root.kind, BlockKind::Page);
+        assert_eq!(root.text, "renamed");
+        assert_eq!(get_page(&p, "p1").await.unwrap()[0].text, "renamed");
     });
 }
 

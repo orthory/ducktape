@@ -153,8 +153,6 @@ fn message_in(channel: &str, seq: u64, text: &str, thread: Option<u64>) -> Messa
             reply_count: 0,
             last_reply_seq: None,
         },
-        reactions: Vec::new(),
-        channel_head_seq: seq,
     }
 }
 
