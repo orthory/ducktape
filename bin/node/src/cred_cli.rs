@@ -334,7 +334,19 @@ fn cmd_add(
     let store = crate::airlock_serve::cred_store_root(&resolved.storage_dir);
     let dir = store.join(&name);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    run_vendor_login(provider, &dir)?;
+    // `DUCKTAPE_CRED_REUSE_ARTIFACT=<path>` imports an ALREADY-authenticated
+    // vendor login artifact (a `.credentials.json` / `auth.json` the operator
+    // already produced) instead of driving the vendor's browser OAuth flow —
+    // for headless hosts and re-registration without another auth round-trip.
+    // Everything downstream (artifact check, kind, seal, record, sign, submit)
+    // is identical to the browser path; the browser flow remains the default.
+    match std::env::var("DUCKTAPE_CRED_REUSE_ARTIFACT") {
+        Ok(src) if !src.is_empty() => {
+            std::fs::copy(&src, dir.join(provider.artifact()))
+                .map_err(|e| format!("reuse artifact {src}: {e}"))?;
+        }
+        _ => run_vendor_login(provider, &dir)?,
+    }
 
     let artifact = dir.join(provider.artifact());
     if !artifact.exists() {

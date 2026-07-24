@@ -264,15 +264,23 @@ fn read_kind(dir: &Path) -> Option<CredentialKind> {
     }
 }
 
-/// The refresh token out of a claude login artifact (`.credentials.json`,
-/// `claudeAiOauth.refreshToken`) — the co-host rotates it (subscription path).
+/// The claude login artifact (`.credentials.json`, `claudeAiOauth`) as a
+/// refresh credential carrying the CURRENT access token + its expiry alongside
+/// the rotating refresh token. Seeding the live access token means the gateway
+/// serves it as-is until it expires — no refresh fires meanwhile, so the owner's
+/// own local login (sharing the refresh chain) is not rotation-invalidated
+/// during that window. `expiresAt` is epoch MILLISECONDS in the artifact.
 fn claude_refresh_payload(dir: &Path) -> Option<CredentialPayload> {
     let raw = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let token = json["claudeAiOauth"]["refreshToken"]
+    let oauth = &json["claudeAiOauth"];
+    let refresh_token = oauth["refreshToken"]
         .as_str()
-        .filter(|value| !value.is_empty())?;
-    Some(CredentialPayload::Refresh { refresh_token: token.to_string() })
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let access_token = oauth["accessToken"].as_str().unwrap_or("").to_string();
+    let expires_at = oauth["expiresAt"].as_u64().map(|ms| ms / 1000).unwrap_or(0);
+    Some(CredentialPayload::Refresh { refresh_token, access_token, expires_at })
 }
 
 /// The access token out of a codex login artifact (`auth.json`,
@@ -353,6 +361,8 @@ fn resolve_env_credential() -> Result<Option<CredentialPayload>, String> {
         "bearer" => Ok(Some(CredentialPayload::Bearer { access_token: field("accessToken")? })),
         "refresh" => Ok(Some(CredentialPayload::Refresh {
             refresh_token: field("refreshToken")?,
+            access_token: oauth["accessToken"].as_str().unwrap_or("").to_string(),
+            expires_at: oauth["expiresAt"].as_u64().map(|ms| ms / 1000).unwrap_or(0),
         })),
         other => Err(format!(
             "DUCKTAPE_AIRLOCK_SERVE_CRED_KIND must be 'bearer' or 'refresh', got {other:?}"
@@ -401,7 +411,7 @@ mod tests {
         let (name, kind, payload) = &seeds[0];
         assert_eq!(name, "eddy-claude-1");
         assert_eq!(*kind, CredentialKind::Claude);
-        assert!(matches!(payload, CredentialPayload::Refresh { refresh_token } if refresh_token == "rt-eddy"));
+        assert!(matches!(payload, CredentialPayload::Refresh { refresh_token, .. } if refresh_token == "rt-eddy"));
     }
 
     #[test]

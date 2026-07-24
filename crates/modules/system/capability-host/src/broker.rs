@@ -2791,7 +2791,11 @@ mod tests {
             &seal_pk,
             "test-sub",
             airlock::wire::CredentialKind::Claude,
-            &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+            &airlock::wire::CredentialPayload::Refresh {
+                refresh_token: "ref-seed".into(),
+                access_token: String::new(),
+                expires_at: 0,
+            },
         )
         .await
         .unwrap();

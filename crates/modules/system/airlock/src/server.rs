@@ -274,10 +274,13 @@ fn cred_entry(kind: CredentialKind, payload: CredentialPayload) -> Result<CredEn
             refresh_token: String::new(),
             expires_at: u64::MAX,
         },
-        (CredentialKind::Claude, CredentialPayload::Refresh { refresh_token }) => Oauth {
-            access_token: String::new(),
+        (
+            CredentialKind::Claude,
+            CredentialPayload::Refresh { refresh_token, access_token, expires_at },
+        ) => Oauth {
+            access_token,
             refresh_token,
-            expires_at: 0,
+            expires_at,
         },
         (CredentialKind::Codex, CredentialPayload::Refresh { .. }) => {
             bail!("codex credentials must be a static bearer token; oauth refresh is not supported")

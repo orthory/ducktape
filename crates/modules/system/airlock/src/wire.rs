@@ -35,14 +35,24 @@ pub struct CredentialUpload {
 }
 
 /// Plaintext inside the sealed blob: the upstream credential the enclave holds.
-/// `Refresh` is exchanged via OAuth for an access token and ROTATES on each
-/// refresh (subscription path). `Bearer` is a STATIC access token used as-is —
-/// no refresh, no rotation — so sealing a live subscription's current access
-/// token does not invalidate the token chain the owner is still using.
+/// `Refresh` carries the subscription's CURRENT access token alongside the
+/// rotating refresh token: the enclave serves the access token as-is until
+/// `expires_at`, then exchanges the refresh token for a new one. Seeding the
+/// live access token means NO refresh fires while it is still valid — so the
+/// owner's own local login (which shares the refresh-token chain) is not
+/// rotation-invalidated during that window. `access_token` empty / `expires_at`
+/// 0 is the lazy form (refresh on first use). `Bearer` is a STATIC access token
+/// used as-is — no refresh, no rotation.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CredentialPayload {
-    Refresh { refresh_token: String },
+    Refresh {
+        refresh_token: String,
+        #[serde(default)]
+        access_token: String,
+        #[serde(default)]
+        expires_at: u64,
+    },
     Bearer { access_token: String },
 }
 

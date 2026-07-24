@@ -122,7 +122,7 @@ async fn full_custody_path_swaps_session_token_for_the_credential() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into(), access_token: String::new(), expires_at: 0 },
     )
     .await
     .unwrap();
@@ -214,7 +214,7 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into(), access_token: String::new(), expires_at: 0 },
     )
     .await
     .unwrap();
@@ -273,7 +273,7 @@ async fn a_sealed_session_refuses_a_plaintext_body() {
         &seal_pk,
         "test-sub",
         CredentialKind::Claude,
-        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+        &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into(), access_token: String::new(), expires_at: 0 },
     )
     .await
     .unwrap();
@@ -612,6 +612,8 @@ fn codex_refresh_seed_is_refused_at_build() {
         self_host_cfg(None, String::new(), String::new()),
         vec![("cx".into(), CredentialKind::Codex, CredentialPayload::Refresh {
             refresh_token: "r".into(),
+            access_token: String::new(),
+            expires_at: 0,
         })],
     );
     assert!(result.is_err(), "codex refresh seeds must be rejected (bearer-only lane)");
