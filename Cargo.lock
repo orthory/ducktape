@@ -6002,6 +6002,7 @@ dependencies = [
  "rand_core 0.6.4",
  "smoltcp",
  "tokio",
+ "tracing",
  "wireguard",
 ]
 
