@@ -29,7 +29,6 @@ serde_json = { workspace = true }
 chat = { path = "../chat", default-features = false }
 tasks = { path = "../tasks", default-features = false }
 inbox = { workspace = true }
-sha2 = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]

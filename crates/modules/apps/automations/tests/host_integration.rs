@@ -107,10 +107,17 @@ async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {
 }
 
 fn genesis() -> Host {
+    let auto = Automations::new(
+        AUTO,
+        Box::new(sdk_testkit::MemStore::new()),
+        CHAT,
+        TASKS,
+        INBOX,
+    );
     Host::genesis(vec![
         Box::new(Tasks::new(TASKS)),
         Box::new(RelayChat),
-        Box::new(Automations::new(AUTO, CHAT, TASKS, INBOX)),
+        Box::new(auto),
     ])
     .expect("genesis")
 }

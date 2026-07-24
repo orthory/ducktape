@@ -1,12 +1,11 @@
-//! the adapter-port equivalence proof for the automations cutover: the
-//! `automations` guest component (the NATIVE `automations` crate compiled to
-//! wasm behind `guest-adapter`) and the native `Automations` module answer
-//! the SAME op sequence with IDENTICAL query replies, and their roots move in
-//! lockstep. the roots THEMSELVES differ — the port persists the native
-//! canonical snapshot as one host-KV value — and this proof pins that
-//! representation difference from genesis
-//! (automations' empty encoding carries TWO zero counts, so unlike saga/agent
-//! its genesis root already differs from the empty host-KV store's).
+//! the STORE-BACKED cutover-continuity proof for automations: the
+//! `automations` guest component over `WasmModule::with_store(QmdbStore)` and
+//! the native `Automations` over the same store shape are ROOT-CONTINUOUS —
+//! the same op sequence commits the IDENTICAL qmdb merkle root after every
+//! block (both roots ARE the store's root; qmdb's batch canonicalizes
+//! mutations by hashed key, so the native logical-key commit order and the
+//! wasm hashed-key drain order produce the same op log), including the
+//! byte-identical NO-OP blocks the idempotent SetEnabled relies on.
 //!
 //! automations is a chat-HOOK SUBSCRIBER: both hosts carry the REAL native
 //! siblings under the production ids (`bin/node/src/host_state.rs` —
@@ -40,13 +39,16 @@ use wasm_host::WasmModule;
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.wasm");
 
-fn wasm_automations() -> WasmModule {
-    WasmModule::from_bytes("automations", AUTOMATIONS_WASM).expect("load component")
+fn wasm_automations(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    // NOTE: no sibling wiring here — the guest compiles the exact production
+    // builder chain (`Automations::new(.., "chat", "tasks", "inbox")`) in;
+    // only the store arrives host-constructed.
+    WasmModule::with_store("automations", AUTOMATIONS_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_automations() -> Automations {
-    Automations::new("automations", "chat", "tasks", "inbox")
+fn native_automations(store: Box<dyn sdk::MerkleStore>) -> Automations {
+    Automations::new("automations", store, "chat", "tasks", "inbox")
 }
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
@@ -71,13 +73,15 @@ async fn siblings(
 
 async fn native_host(context: &deterministic::Context) -> Host {
     let mut modules = siblings(context, "native_chat").await;
-    modules.push(Box::new(native_automations()));
+    let store = QmdbStore::init(context.child("native_auto"), "automations").await;
+    modules.push(Box::new(native_automations(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
 async fn wasm_host_(context: &deterministic::Context) -> Host {
     let mut modules = siblings(context, "wasm_chat").await;
-    modules.push(Box::new(wasm_automations()));
+    let store = QmdbStore::init(context.child("wasm_auto"), "automations").await;
+    modules.push(Box::new(wasm_automations(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
@@ -157,10 +161,11 @@ fn root_of(h: &Host) -> StateRoot {
 
 const SIBLING_IDS: [&str; 3] = ["chat", "tasks", "inbox"];
 
-/// submit one ACCEPTED op to both hosts: identical replies, per-sibling
-/// cross-host agreement (the follow-up lanes — a diverging or missing
+/// submit one ACCEPTED op to both hosts: IDENTICAL automations roots (both
+/// are the store's merkle root), identical replies, per-sibling cross-host
+/// agreement (the follow-up lanes — a diverging or missing
 /// PostMessage/CreateTask/Deliver diverges the sibling roots), lockstep
-/// automations-root movement.
+/// root movement.
 async fn roundtrip(
     native: &mut Host,
     wasm: &mut Host,
@@ -177,6 +182,11 @@ async fn roundtrip(
     wasm.submit_at(block(height, origin), m)
         .await
         .expect("wasm submit");
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "roots diverge after block {height}"
+    );
     assert_eq!(
         replies(native).await,
         replies(wasm).await,
@@ -196,8 +206,6 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    // the roots themselves always differ (the pinned representation difference).
-    assert_ne!(root_of(native), root_of(wasm));
 }
 
 /// submit one REJECTED op to both hosts: reasons carry the same needle, and
@@ -257,17 +265,13 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         let user = Origin::External(key(0xA1));
         let ops = Origin::External(key(0xB2));
 
-        // the representation difference is visible from GENESIS here: automations' empty
-        // canonical encoding is TWO zero counts (rules + history), the wasm
-        // port's empty host-KV store is ONE — different preimages, different
-        // roots (contrast saga/agent, whose single-count empty encodings
-        // coincide with the empty store until the first write).
+        // ROOT CONTINUITY from block zero: both sides commit to the SAME
+        // (empty) qmdb store — equal roots, and both ride the resolver sync
+        // lane (never the checkpoint-snapshot lane).
         assert_ne!(root_of(&native), StateRoot::ZERO);
-        assert_ne!(
-            root_of(&native),
-            root_of(&wasm),
-            "genesis roots must differ — the port uses a distinct root representation"
-        );
+        assert_eq!(root_of(&native), root_of(&wasm), "genesis roots diverge");
+        assert!(native.resolver_backed_ids().contains("automations"));
+        assert!(wasm.resolver_backed_ids().contains("automations"));
         // the inbox sibling's empty root, for the delivery-landed claims below
         // (the inbox has no read surface — its module root is the whole
         // observable committed state).

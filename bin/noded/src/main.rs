@@ -246,7 +246,13 @@ fn run_node(
         let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
-        let automations = Automations::new("automations", "chat", "tasks", "inbox");
+        let automations = Automations::new(
+            "automations",
+            Box::new(QmdbStore::init(context.child("automations"), "automations").await),
+            "chat",
+            "tasks",
+            "inbox",
+        );
         let agent = AgentModule::new(
             "agent",
             Box::new(QmdbStore::init(context.child("agent"), "agent").await),

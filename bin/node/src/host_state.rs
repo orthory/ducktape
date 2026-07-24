@@ -120,17 +120,17 @@ const GOVERNANCE_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/governance/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
 
-/// saga / automations — adapter-ported tenants of the async engine's
-/// deterministic half and its consumers. every decision in their execute
-/// paths reads staged-over-committed state, so the whole-state fold is
-/// behavior-identical (pinned by their parity proofs); their work-order
-/// events, P6 callbacks, and chat-hook probe reads all cross the wit seam
-/// unchanged.
+/// saga — an adapter-ported tenant of the async engine's deterministic half.
+/// every decision in its execute paths reads staged-over-committed state, so
+/// the whole-state fold is behavior-identical (pinned by its parity proof);
+/// its work-order events and P6 callbacks cross the wit seam unchanged.
 const SAGA_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/saga/component.wasm");
 const SAGA_MODULE_ID: &str = "saga";
-/// agent — a STORE-BACKED tenant like pages/chat: the registry rides a
+/// agent / automations — STORE-BACKED tenants like pages/chat: each rides a
 /// host-constructed qmdb store and the wasm root is the store's merkle root.
+/// automations' chat-hook probe reads are host-routed `query-module` reads
+/// against the live siblings, exactly as when it was snapshot-ported.
 const AGENT_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/agent/component.wasm");
 const AGENT_MODULE_ID: &str = "agent";
@@ -345,12 +345,13 @@ fn genesis_capability_wasm() -> WasmModule {
         .expect("embedded capability component loads")
 }
 
-/// saga / automations at their GENESIS code (adapter-ported). the sibling
-/// wiring — saga's valset/capability assignment reads, automations'
-/// chat/tasks/inbox lanes — is genesis-constant and compiled into the guests
-/// (the exact production constructors these builders used to call natively).
-/// agent's wiring (saga dead-letter + runs hook) is compiled into its guest
-/// the same way; only its store arrives host-constructed ([`agent_wasm`]).
+/// saga at its GENESIS code (adapter-ported). the sibling wiring — saga's
+/// valset/capability assignment reads — is genesis-constant and compiled into
+/// the guest (the exact production constructor these builders used to call
+/// natively). agent's wiring (saga dead-letter + runs hook) and automations'
+/// (the chat/tasks/inbox lanes) are compiled into their guests the same way;
+/// only their stores arrive host-constructed ([`agent_wasm`],
+/// [`automations_wasm`]).
 fn genesis_saga_wasm() -> WasmModule {
     WasmModule::from_bytes(SAGA_MODULE_ID, SAGA_WASM_COMPONENT)
         .expect("embedded saga component loads")
@@ -364,8 +365,10 @@ fn agent_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
         .expect("embedded agent component loads")
 }
 
-fn genesis_automations_wasm() -> WasmModule {
-    WasmModule::from_bytes(AUTOMATIONS_MODULE_ID, AUTOMATIONS_WASM_COMPONENT)
+/// automations at its GENESIS code over the host-constructed store (same
+/// three store lifecycles as [`pages_wasm`]).
+fn automations_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(AUTOMATIONS_MODULE_ID, AUTOMATIONS_WASM_COMPONENT, store)
         .expect("embedded automations component loads")
 }
 
@@ -548,8 +551,8 @@ pub(super) async fn genesis_host(
     bindings: NetworkBindings<'_>,
     blobs: blobstore::BlobHandle,
 ) -> Host {
-    // pages/chat/agent are STORE-BACKED wasm tenants: the host still
-    // constructs the concrete qmdb stores exactly as before — only the
+    // pages/chat/agent/automations are STORE-BACKED wasm tenants: the host
+    // still constructs the concrete qmdb stores exactly as before — only the
     // executor wrapped around them changed (and the sibling wiring moved
     // into the guests).
     let pages = pages_wasm(Box::new(
@@ -560,6 +563,9 @@ pub(super) async fn genesis_host(
     ));
     let agent = agent_wasm(Box::new(
         QmdbStore::init(context.child("agent"), "agent").await,
+    ));
+    let automations = automations_wasm(Box::new(
+        QmdbStore::init(context.child("automations"), "automations").await,
     ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
@@ -647,9 +653,10 @@ pub(super) async fn genesis_host(
         // implementation, so this cutover left the root-hash untouched.
         directory: genesis_directory_wasm(),
         // user-defined rules over chat posts: trusts the "chat" origin for hook
-        // events and emits chat/tasks follow-ups. adapter-ported; the
-        // chat/tasks/inbox lane ids are compiled into the guest.
-        automations: genesis_automations_wasm(),
+        // events and emits chat/tasks follow-ups. store-backed over the
+        // host-constructed qmdb store; the chat/tasks/inbox lane ids are
+        // compiled into the guest.
+        automations,
     }
     .compose()
     .expect("genesis host")
@@ -679,6 +686,9 @@ pub(super) async fn restore_host(
     ));
     let agent = agent_wasm(Box::new(
         QmdbStore::init(context.child("agent"), "agent").await,
+    ));
+    let automations = automations_wasm(Box::new(
+        QmdbStore::init(context.child("automations"), "automations").await,
     ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
@@ -795,12 +805,6 @@ pub(super) async fn restore_host(
     directory
         .install(bytes, root)
         .map_err(|e| format!("directory install: {e}"))?;
-
-    let mut automations = genesis_automations_wasm();
-    let (bytes, root) = snapshot_of(AUTOMATIONS_MODULE_ID)?;
-    automations
-        .install(bytes, root)
-        .map_err(|e| format!("automations install: {e}"))?;
 
     let host = ProductionModules {
         pages,
@@ -972,6 +976,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    let (target, resolver) = fetch_target("automations").await?;
+    let automations = automations_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("automations")),
+            "automations",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1117,12 +1132,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     let mut runs = genesis_runs_wasm();
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(AUTOMATIONS_MODULE_ID).await?;
-    let mut automations = genesis_automations_wasm();
-    automations
-        .install(&bytes, root)
-        .map_err(|e| format!("automations install: {e}"))?;
 
     let (bytes, root) = snapshot_of("forge").await?;
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
