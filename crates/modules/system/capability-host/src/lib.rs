@@ -1128,6 +1128,25 @@ impl CliProvider {
                 std::fs::write(&creds, blob).map_err(|e| {
                     format!("{}: write claude credentials {}: {e}", self.spec.tag, creds.display())
                 })?;
+                // 0600: a credentials file, even one holding only the throwaway
+                // loopback bearer (owner-only, as the old ANTHROPIC_AUTH_TOKEN env
+                // was). the config home is already 0700 (create_private_dir) so no
+                // other host user can reach it, but the file is mounted into the
+                // container — pin it directly too. no exploitable window: the
+                // container is not started until later, and the 0700 parent blocks
+                // other host users meanwhile.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| {
+                            format!(
+                                "{}: restrict claude credentials {} permissions: {e}",
+                                self.spec.tag,
+                                creds.display()
+                            )
+                        })?;
+                }
                 // hardening: kill non-essential outbound traffic + the auto-updater
                 // so the CLI never dials Anthropic around the broker.
                 //
@@ -5364,6 +5383,17 @@ broker = "anthropic-messages"
             Some("opaque-run-bearer"),
             "the loopback run bearer is the seeded OAuth accessToken"
         );
+        // owner-only, like the ANTHROPIC_AUTH_TOKEN env it replaces.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(config_home.join(".credentials.json"))
+                .expect("creds metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "credentials file must be owner-only");
+        }
         assert_eq!(
             got("CLAUDE_CONFIG_DIR").as_deref(),
             Some(config_home.to_str().unwrap()),
