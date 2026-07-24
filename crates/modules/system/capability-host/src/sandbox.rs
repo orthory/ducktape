@@ -74,22 +74,24 @@ impl SandboxBackend {
     /// verify this host can actually run the chosen adapter: the runtime
     /// binary must be executable somewhere on `PATH`. a config naming an
     /// unusable runtime is a loud boot error — there is no bare fallback.
-    /// Podman additionally requires `nft` + `nsenter` (the egress firewall the
-    /// createRuntime hook installs in each run's netns) — hard dependencies, so
-    /// a missing one fails at boot, never as a silently unfirewalled run. The
-    /// netns backend (slirp4netns / pasta) is podman's own default and is not
-    /// probed here — `nsmode = "private"` uses whichever the host provides.
+    /// Podman additionally requires `pasta` (the netns backend — podman 6's only
+    /// one; the run uses `nsmode = "pasta"` for deterministic host + DNS
+    /// addresses) plus `nft` + `nsenter` (the egress firewall the createRuntime
+    /// hook installs in each run's netns). All are hard dependencies, so a
+    /// missing one fails at boot, never as a silently unsandboxed / unfirewalled
+    /// run.
     pub fn probe(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
         let found = find_on_path(bin).ok_or_else(|| {
             format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
         })?;
         if matches!(self, SandboxBackend::Podman { .. }) {
-            for dep in ["nft", "nsenter"] {
+            for dep in ["pasta", "nft", "nsenter"] {
                 if crate::podman_api::find_system_tool(dep).is_none() {
                     return Err(format!(
                         "{dep} is not executable on PATH or a standard sbin dir; the Podman \
-                         sandbox requires it to install each run's egress firewall — install it"
+                         sandbox requires it (pasta = netns, nft + nsenter = egress firewall) \
+                         — install it"
                     ));
                 }
             }
