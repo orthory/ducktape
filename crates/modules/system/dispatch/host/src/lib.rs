@@ -6,8 +6,8 @@
 //! (whichever executor CLI the operator brought), feeds the payload to it,
 //! and submits the raw answer as a saga `OracleResult` op.
 //!
-//! the payload is a run ENVELOPE (marker `ducktape_run`, v3-only — legacy
-//! flat strings and v2 envelopes fail the run loudly), assembled host-side:
+//! the payload is a v1 run ENVELOPE (marker `ducktape_run`; non-current or
+//! malformed payloads fail the run loudly), assembled host-side:
 //! the instructions, contract and conversation the dispatcher composed. the
 //! agent's PERSONA is no longer in there — it is a curated skill, and the
 //! provisioner assembles the agent's `always` skills into the run's context

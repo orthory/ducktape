@@ -89,20 +89,10 @@ fn main() {
     let source = addr(1, 40_001);
     let peer_source = addr(2, 40_002);
 
-    let mut legacy = Coordinator::new();
-    let caller = NodeKey([0x11; 32]);
-    let peer = NodeKey([0x22; 32]);
-    legacy.handle_at(source, Msg::Register { key: caller }, NOW);
-    legacy.handle_at(peer_source, Msg::Register { key: peer }, NOW);
-    bench("legacy lookup (Vec)", 1_000_000, || {
-        black_box(legacy.handle_at(source, Msg::Lookup { key: peer }, NOW));
-    });
-    bench("legacy lookup bounded", 1_000_000, || {
-        black_box(legacy.handle_legacy_replies(source, Msg::Lookup { key: peer }, NOW));
-    });
-
     let signer = ed25519::PrivateKey::from_seed(7);
     let caller = node_key(&signer);
+    let peer_signer = ed25519::PrivateKey::from_seed(8);
+    let peer = node_key(&peer_signer);
     bench("public key decode", 100_000, || {
         black_box(
             ed25519::PublicKey::decode(black_box(caller.0.as_slice()))
@@ -116,20 +106,21 @@ fn main() {
         black_box(public.verify(b"benchmark", black_box(message), &signature));
     });
     let bind = auth_request(&signer, caller, Msg::BindRequest { from: caller }, NOW);
-    let mut authenticated = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+    let mut authenticated = Coordinator::with_policy(AuthPolicy::Public);
     bench("authenticated bind", 20_000, || {
         black_box(authenticated.handle_auth_replies(source, bind.clone(), NOW));
     });
 
-    authenticated.handle_at(peer_source, Msg::Register { key: peer }, NOW);
+    let peer_register = auth_request(&peer_signer, peer, Msg::Register { key: peer }, NOW);
+    authenticated.handle_auth_replies(peer_source, peer_register.clone(), NOW);
     let lookup = auth_request(&signer, caller, Msg::Lookup { key: peer }, NOW);
     bench("authenticated lookup", 20_000, || {
         black_box(authenticated.handle_auth_replies(source, lookup.clone(), NOW));
     });
 
     let encoded = lookup.encode();
-    let mut pipeline = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
-    pipeline.handle_at(peer_source, Msg::Register { key: peer }, NOW);
+    let mut pipeline = Coordinator::with_policy(AuthPolicy::Public);
+    pipeline.handle_auth_replies(peer_source, peer_register, NOW);
     bench("decode + lookup + encode", 20_000, || {
         let request = AuthRequest::decode(black_box(&encoded)).expect("benchmark request decodes");
         for (_, reply) in pipeline.handle_auth_replies(source, request, NOW) {

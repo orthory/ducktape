@@ -16,15 +16,7 @@ impl Pages {
         // key lead with NUL, so rejecting NUL-prefixed ids here — BEFORE any
         // storage touch — keeps a block/comment write from ever clobbering them.
         let named: Vec<&str> = match &msg {
-            PageMsg::CreatePage {
-                page_id, parent, ..
-            } => {
-                let mut v = vec![page_id.as_str()];
-                if let Some(p) = parent {
-                    v.push(p.as_str());
-                }
-                v
-            }
+            PageMsg::CreatePage { page_id, .. } => vec![page_id.as_str()],
             PageMsg::InsertBlock { parent, block, .. } => vec![parent.as_str(), block.id.as_str()],
             PageMsg::UpdateText { block_id, .. }
             | PageMsg::SetSpanMark { block_id, .. }
@@ -33,15 +25,13 @@ impl Pages {
             | PageMsg::RemoveBlock { block_id } => vec![block_id.as_str()],
             PageMsg::MoveBlock {
                 block_id, parent, ..
-            } => vec![block_id.as_str(), parent.as_str()],
-            PageMsg::SetPageParent { page_id, parent } => {
-                let mut v = vec![page_id.as_str()];
-                if let Some(p) = parent {
-                    v.push(p.as_str());
+            } => {
+                let mut ids = vec![block_id.as_str()];
+                if let Some(parent) = parent {
+                    ids.push(parent.as_str());
                 }
-                v
+                ids
             }
-            PageMsg::DeletePage { page_id } => vec![page_id.as_str()],
             PageMsg::AddComment {
                 thread_id,
                 comment_id,
@@ -71,10 +61,7 @@ impl Pages {
         ) {
             return self.apply_comment_op(msg, origin, now).await;
         }
-        if matches!(
-            &msg,
-            PageMsg::CreatePage { .. } | PageMsg::DeletePage { .. } | PageMsg::SetPageParent { .. }
-        ) {
+        if matches!(&msg, PageMsg::CreatePage { .. }) {
             return self.apply_page_op(msg).await;
         }
         self.apply_block_op(msg).await

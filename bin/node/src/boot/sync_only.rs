@@ -65,9 +65,9 @@ pub(crate) async fn run(
         for ch in [vote, cert, res, payload, fetch] {
             let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
             let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context.child(label).spawn(move |_ctx| async move {
-                while rx.recv().await.is_ok() {}
-            });
+            context
+                .child(label)
+                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
@@ -123,6 +123,8 @@ pub(crate) async fn run(
         None,
         sync_requester,
         sync_proof,
+        // sync-only never promotes: the lane is the dispatch task's for life.
+        None,
     );
 
     // the mesh takes a moment to connect, and the server only serves
@@ -156,21 +158,6 @@ pub(crate) async fn run(
         root_hash = %hex(&manifest.root_hash),
         "manifest ready"
     );
-
-    if let Err(e) = crate::host_state::preflight_sync_schema(&manifest) {
-        metrics.record_sync_failure(e.to_string());
-        metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Halted);
-        tracing::error!(
-            target: "ducktape::statesync",
-            event = "node_sync_refused",
-            role = "sync_only",
-            node = %label,
-            stage = "schema_preflight",
-            error = %e,
-            "SYNC REFUSED: {e}"
-        );
-        std::process::exit(1);
-    }
 
     // rebuild EVERY module in the manifest (a REAL joiner owns its
     // disk, so every store opens under its canonical module id) and

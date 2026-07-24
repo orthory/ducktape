@@ -27,8 +27,7 @@ pub(super) struct EpochSpawner<'a> {
     signer: ed25519::PrivateKey,
     namespace: Vec<u8>,
     label: String,
-    bank_base: u64,
-    channel_bank: super::ChannelBank,
+    channel_bank: super::LaneBank,
 }
 
 impl<'a> EpochSpawner<'a> {
@@ -39,8 +38,7 @@ impl<'a> EpochSpawner<'a> {
         signer: ed25519::PrivateKey,
         namespace: Vec<u8>,
         label: String,
-        bank_base: u64,
-        channel_bank: super::ChannelBank,
+        channel_bank: super::LaneBank,
     ) -> Self {
         Self {
             context,
@@ -48,35 +46,31 @@ impl<'a> EpochSpawner<'a> {
             signer,
             namespace,
             label,
-            bank_base,
             channel_bank,
         }
     }
 
-    pub(super) fn spawn(
+    pub(super) async fn spawn(
         &mut self,
         epoch: u64,
         participants: Set<ed25519::PublicKey>,
         store: ContentStore,
         floor_bytes: Option<Vec<u8>>,
     ) -> SimplexOrderer {
-        let slot = self.channel_bank
-        .get_mut(epoch.checked_sub(self.bank_base).expect("epochs never rebase down") as usize)
-        .and_then(|s| s.take())
-        .unwrap_or_else(|| {
+        let Some(slot) = self.channel_bank.claim(epoch).await else {
             fatal!(
                 self.label,
                 "epoch {epoch} exhausts the pre-registered channel bank \
                  ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
             );
-        });
+        };
         // bundle this epoch's discovery channel slot + the oracle behind the mesh
         // carrier seam — the swap point where the sim arm substitutes an
         // in-process `simulated::Network` (crates/kernel/consensus/tests/
         // in_process_cluster.rs) for this real encrypted-TCP transport.
         let carrier = super::DiscoveryMesh::new(slot, self.oracle.clone());
         // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
-        // rekey/respawn contract for what a scheme migration would take.
+        // rekey/respawn contract for a scheme change.
         let scheme =
             simplex_ed25519::Scheme::signer(&self.namespace, participants, self.signer.clone())
                 .expect("our key is in the validator participant set");
@@ -184,12 +178,14 @@ pub(super) async fn resume(
         boot_floor_height = %boot_floor_height,
         "promotion recovered"
     );
-    let orderer = epoch_spawner.spawn(
-        resume_epoch,
-        participants.clone(),
-        boot_store,
-        boot_floor.map(|c| c.cert),
-    );
+    let orderer = epoch_spawner
+        .spawn(
+            resume_epoch,
+            participants.clone(),
+            boot_store,
+            boot_floor.map(|c| c.cert),
+        )
+        .await;
     let view_base = resumed.as_ref().map(|r| r.view_base).unwrap_or(0);
     // the drain realizes code-registry swaps through the SAME source recovery
     // replay used (wired at Recovery::open) — lift it off before the move.

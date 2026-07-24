@@ -53,6 +53,10 @@ pub(crate) struct BootEnv {
     pub(crate) mesh_state_file: PathBuf,
     pub(crate) checkpoint_blocks: u64,
     pub(crate) dev_demo: bool,
+    /// ORPHANED by the in-process promotion seat (its only consumer was the
+    /// promotion exec-reboot's index staging); the config key survives until
+    /// the shipped-index lane is swept as one follow-up removal.
+    #[allow(dead_code)]
     pub(crate) sync_index: bool,
     pub(crate) announce_capabilities: bool,
     /// the compute plane (`node.toml [sandbox]`) — threaded to both

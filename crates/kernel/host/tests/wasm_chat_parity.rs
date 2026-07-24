@@ -5,8 +5,8 @@
 //! the store's root; qmdb's batch canonicalizes mutations by hashed key, so
 //! the native logical-key commit order and the wasm hashed-key drain order
 //! produce the same op log), including the byte-identical NO-OP blocks the
-//! idempotent reaction ops rely on. the state schema revision therefore STAYS
-//! 1 — this cutover changes the executor, not one committed byte. hook fan-out
+//! idempotent reaction ops rely on. this cutover changes the executor, not one
+//! committed byte. hook fan-out
 //! (`emit-msg` follow-ups) and `RegisterHook`'s registry check — a sibling
 //! `module-root` read resolved by the runtime's memoized replay — are pinned
 //! against a shared sink module.
@@ -178,7 +178,7 @@ fn same_ops_identical_roots_block_by_block() {
         let (alice, bob, carol) = (key(0xA1), key(0xB2), key(0xC3));
 
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
-        // (empty) qmdb store — equal roots, not a declared schema break.
+        // (empty) qmdb store — equal roots.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
         assert!(native.resolver_backed_ids().contains("chat"));
         assert!(wasm.resolver_backed_ids().contains("chat"));
@@ -426,7 +426,7 @@ fn same_ops_identical_roots_block_by_block() {
 }
 
 #[test]
-fn revision_stays_one_and_the_sync_handle_matches_native() {
+fn sync_handle_matches_native() {
     deterministic::Runner::default().start(|context| async move {
         let native = Chat::new(
             "chat",
@@ -440,13 +440,6 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
         )
         .expect("load component");
 
-        // the committed encoding is UNCHANGED (same store, same op log, same
-        // root — proven above), so the canonical-state revision must stay 1:
-        // pre-cutover workspaces reopen without a schema fence.
-        assert_eq!(Module::state_schema_revision(&native), 1);
-        assert_eq!(Module::state_schema_revision(&wasm), 1);
-
-        // and the declared sync surface is verbatim the native declaration.
         let n_handle = native.state_sync_handle().expect("native handle");
         let w_handle = wasm.state_sync_handle().expect("wasm handle");
         assert_eq!(n_handle, w_handle, "sync handles diverge");

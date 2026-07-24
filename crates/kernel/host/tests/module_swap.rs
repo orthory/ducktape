@@ -1,6 +1,6 @@
 //! The live-code-update proof: a REAL wasm module (`hello`) and the REAL code
 //! registry (`modreg`) on one host, driven across a height-gated swap boundary
-//! to a SECOND component (`hello-v2`, which `inc`s by 100 instead of 1).
+//! to a SECOND component (`hello-replacement`, which `inc`s by 100 instead of 1).
 //!
 //! What must hold at the boundary `H`:
 //!   * the host's out-of-block `realize_module_swaps(H, src)` fetches the
@@ -17,7 +17,8 @@
 //!     left to arm — still reconciles its genesis code to the committed ACTIVE
 //!     hash instead of forking on stale code.
 //!
-//! Fixtures are GENERATED artifacts (see `crates/guests/hello-wasm{,-v2}`),
+//! Fixtures are GENERATED artifacts (see `crates/guests/hello-wasm` and
+//! `crates/guests/hello-wasm-replacement`),
 //! committed so the proof is self-contained.
 
 use std::collections::BTreeMap;
@@ -31,7 +32,7 @@ use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
 const HELLO_V1: &[u8] = include_bytes!("fixtures/hello.component.wasm");
-const HELLO_V2: &[u8] = include_bytes!("fixtures/hello-v2.component.wasm");
+const HELLO_REPLACEMENT: &[u8] = include_bytes!("fixtures/hello-replacement.component.wasm");
 
 /// the swap boundary used throughout: far enough past genesis to clear
 /// `lifecycle::MIN_SWAP_LEAD` from the scheduling block.
@@ -103,7 +104,7 @@ fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
 
 fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
     lifecycle_msg(&LifecycleMsg::ScheduleSwap {
-        name: "hello-v2".into(),
+        name: "hello-replacement".into(),
         module_id: "hello".into(),
         activation_height,
         code_hash,
@@ -114,7 +115,7 @@ fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
 /// the component is verified-resident. latches the swap `ready` (R = n = 1).
 fn signal_ready_msg() -> Msg {
     lifecycle_msg(&LifecycleMsg::SwapReady {
-        name: "hello-v2".into(),
+        name: "hello-replacement".into(),
         module_id: "hello".into(),
     })
 }
@@ -136,7 +137,10 @@ fn active_hash(host: &Host) -> (Vec<u8>, bool) {
     let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
     match lifecycle::decode_reply(&bytes).expect("decode") {
         LifecycleReply::ModuleStatus { modules } => {
-            let m = modules.iter().find(|m| m.module_id == "hello").expect("hello entry");
+            let m = modules
+                .iter()
+                .find(|m| m.module_id == "hello")
+                .expect("hello entry");
             (m.active_code_hash.clone(), m.pending.is_some())
         }
         other => panic!("expected Status, got {other:?}"),
@@ -151,18 +155,28 @@ fn realize(host: &mut Host, height: u64, src: &dyn CodeSource) -> Result<(), Err
 /// headline proof and the cross-node determinism check.
 fn run_swap_scenario() -> (Host, StateRoot) {
     let mut host = host_with_wasm();
-    let src = MapSource::with(&[HELLO_V1, HELLO_V2]);
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
 
     // two v1 incs: count 2, one step each.
     submit(&mut host, 1, Origin::External(vec![7; 32]), inc_msg());
     submit(&mut host, 2, Origin::External(vec![7; 32]), inc_msg());
     assert_eq!(count(&host), 2, "v1 steps by 1");
 
-    // governance-shaped schedule: swap hello -> v2 at H.
-    submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    // governance-shaped schedule: swap hello -> replacement at H.
+    submit(
+        &mut host,
+        3,
+        Origin::System,
+        schedule_msg(H, sha(HELLO_REPLACEMENT)),
+    );
     // the (sole) member verified the bytes and signals — the swap latches
     // ready; from here activation is the height floor alone.
-    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
 
     // below H nothing arms: realization is a no-op on the running code.
     realize(&mut host, H - 1, &src).expect("below H is Ok");
@@ -170,7 +184,7 @@ fn run_swap_scenario() -> (Host, StateRoot) {
     assert_eq!(count(&host), 3, "still v1 below the boundary");
 
     // THE BOUNDARY. realize first (block H must execute the new code), then the
-    // block: its root op runs v2 logic and the drain's injected modreg Advance
+    // block: its root op runs replacement logic and the drain's injected modreg Advance
     // flips the committed active hash in the same block.
     let wasm_root_before = host.module_root("hello").expect("hello root");
     let root_hash_before = host.root_hash();
@@ -189,15 +203,23 @@ fn run_swap_scenario() -> (Host, StateRoot) {
     realize(&mut host, H, &src).expect("re-realize is Ok");
 
     submit(&mut host, H, Origin::External(vec![7; 32]), inc_msg());
-    assert_eq!(count(&host), 103, "v2 logic (+100) over KEPT state (3)");
+    assert_eq!(
+        count(&host),
+        103,
+        "replacement logic (+100) over KEPT state (3)"
+    );
     let (active, pending) = active_hash(&host);
-    assert_eq!(active, sha(HELLO_V2), "Advance flipped the committed hash at H");
+    assert_eq!(
+        active,
+        sha(HELLO_REPLACEMENT),
+        "Advance flipped the committed hash at H"
+    );
     assert!(!pending, "the pending slot is freed at H");
 
-    // after the boundary: reconciliation stays a no-op, v2 keeps running.
+    // after the boundary: reconciliation stays a no-op, replacement keeps running.
     realize(&mut host, H + 1, &src).expect("post-H realize is Ok");
     submit(&mut host, H + 1, Origin::External(vec![7; 32]), inc_msg());
-    assert_eq!(count(&host), 203, "v2 keeps stepping by 100");
+    assert_eq!(count(&host), 203, "replacement keeps stepping by 100");
 
     let final_hash = host.root_hash();
     (host, final_hash)
@@ -224,8 +246,18 @@ fn deterministic_across_nodes() {
 #[test]
 fn fails_closed_on_missing_or_tampered_bytes() {
     let mut host = host_with_wasm();
-    submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
-    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
+    submit(
+        &mut host,
+        3,
+        Origin::System,
+        schedule_msg(H, sha(HELLO_REPLACEMENT)),
+    );
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
 
     // missing bytes: the source only has v1 (this node SIGNALED honestly in
     // consensus but its local store lost the bytes — the boundary still
@@ -234,8 +266,11 @@ fn fails_closed_on_missing_or_tampered_bytes() {
     let err = realize(&mut host, H, &missing).expect_err("absent bytes fail closed");
     assert!(matches!(err, Error::Module(m) if m.contains("absent")));
 
-    // tampered bytes: v1 bytes filed under v2's hash — sha mismatch.
-    let tampered = MapSource(BTreeMap::from([(sha(HELLO_V2), HELLO_V1.to_vec())]));
+    // tampered bytes: active bytes filed under the replacement hash — sha mismatch.
+    let tampered = MapSource(BTreeMap::from([(
+        sha(HELLO_REPLACEMENT),
+        HELLO_V1.to_vec(),
+    )]));
     let err = realize(&mut host, H, &tampered).expect_err("mismatched bytes fail closed");
     assert!(matches!(err, Error::Module(m) if m.contains("do not match")));
 
@@ -245,21 +280,23 @@ fn fails_closed_on_missing_or_tampered_bytes() {
 }
 
 /// the state-sync joiner: it installs POST-activation committed registry state —
-/// active hash already v2, NO pending swap left to arm — while its genesis wiring
+/// active hash already points at the replacement, NO pending swap left to arm — while its genesis wiring
 /// loaded v1. reconciliation must read the committed ACTIVE hash (not just armed
-/// pendings) and bring the running code to v2, or the joiner forks on stale code.
+/// pendings) and bring the running code to the replacement, or the joiner forks on stale code.
 #[test]
 fn statesync_joiner_reconciles_to_committed_active_hash() {
     // source node: run the full swap so its committed registry is post-activation.
     let (source, _) = run_swap_scenario();
     let (active, pending) = active_hash(&source);
-    assert_eq!(active, sha(HELLO_V2));
+    assert_eq!(active, sha(HELLO_REPLACEMENT));
     assert!(!pending, "post-activation: nothing pending");
 
     // joiner: modreg installed from the source's committed snapshot (the
     // verify-then-adopt state-sync path), wasm module freshly wired from
     // GENESIS (v1) code.
-    let modreg_root = source.module_root(LIFECYCLE_MODULE_ID).expect("modreg root");
+    let modreg_root = source
+        .module_root(LIFECYCLE_MODULE_ID)
+        .expect("modreg root");
     let mut joined_modreg = Lifecycle::new(LIFECYCLE_MODULE_ID, "valset");
     // reach the committed snapshot through the module's own state-sync surface,
     // exactly as a joiner would receive it.
@@ -291,10 +328,14 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
 
     // the reconciliation the joiner runs before applying its first block: no
     // pending swap exists, yet the running code must land on the committed ACTIVE.
-    let src = MapSource::with(&[HELLO_V1, HELLO_V2]);
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
     realize(&mut joiner, H + 2, &src).expect("joiner reconciles");
     submit(&mut joiner, H + 2, Origin::External(vec![7; 32]), inc_msg());
-    assert_eq!(count(&joiner), 100, "the joiner runs v2 (+100), not stale v1");
+    assert_eq!(
+        count(&joiner),
+        100,
+        "the joiner runs replacement code (+100), not stale active code"
+    );
 }
 
 /// the receipt gate at the host seam: a scheduled swap whose readiness never
@@ -304,12 +345,21 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
 #[test]
 fn unready_swap_never_arms_past_its_height() {
     let mut host = host_with_wasm();
-    submit(&mut host, 3, Origin::System, schedule_msg(H, sha(HELLO_V2)));
+    submit(
+        &mut host,
+        3,
+        Origin::System,
+        schedule_msg(H, sha(HELLO_REPLACEMENT)),
+    );
     // no SignalReady: the bytes never provably reached the member set.
-    let src = MapSource::with(&[HELLO_V1, HELLO_V2]);
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
     realize(&mut host, H + 100, &src).expect("unready is a no-op, not an error");
     submit(&mut host, H + 100, Origin::External(vec![7; 32]), inc_msg());
-    assert_eq!(count(&host), 1, "still v1: receipt-gated swaps wait for R=n");
+    assert_eq!(
+        count(&host),
+        1,
+        "active code remains: receipt-gated swaps wait for R=n"
+    );
     let (active, pending) = active_hash(&host);
     assert_eq!(active, sha(HELLO_V1), "committed active hash untouched");
     assert!(pending, "the pending swap keeps waiting for its receipts");
@@ -321,10 +371,14 @@ fn unready_swap_never_arms_past_its_height() {
 fn inert_without_modreg() {
     let mut host = Host::new();
     host.register(Box::new(
-        WasmModule::from_bytes("hello", HELLO_V1).expect("load v1"),
+        WasmModule::from_bytes("hello", HELLO_V1).expect("load active component"),
     ));
-    let src = MapSource::with(&[HELLO_V1, HELLO_V2]);
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
     realize(&mut host, H, &src).expect("no registry: nothing to reconcile");
     submit(&mut host, H, Origin::External(vec![7; 32]), inc_msg());
-    assert_eq!(count(&host), 1, "plain v1 behavior, no swap side-effects");
+    assert_eq!(
+        count(&host),
+        1,
+        "plain active behavior, no swap side-effects"
+    );
 }

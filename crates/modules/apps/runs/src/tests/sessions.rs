@@ -204,6 +204,58 @@ fn a_live_session_calls_a_peer_and_collects_its_result_without_a_parent_record()
 }
 
 #[test]
+fn delegate_run_truncates_references_at_the_dispatch_wide_sibling_budget() {
+    let (mut m, registry, caller_run) = with_open_delegating_session(2);
+    m = m.with_files_module("files").with_pages_module("pages");
+    let page_limit = usize::from(pages::MAX_PAGE_QUERY_LIMIT);
+    let mut ctx = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    )
+    .with_transcript(
+        "general",
+        vec![
+            message(1, "start"),
+            message(
+                2,
+                "[Plan](duck://page/plan) [notes](duck://files/shared/attachments/u/notes.md)",
+            ),
+        ],
+    )
+    .with_page(
+        "plan",
+        page_with_block_count(page_limit * MAX_SIBLING_QUERY_READS + 1, ""),
+    )
+    .with_file(
+        "/shared/attachments/u/notes.md",
+        b"must not cross the budget",
+    );
+
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&caller_run, "bounded", "worker", "read the references"),
+    )
+    .unwrap();
+
+    assert_eq!(ctx.distinct_query_count(), MAX_SIBLING_QUERY_READS);
+    let DispatchMsg::Dispatch { payload, .. } = &ctx.dispatch_msgs()[0] else {
+        panic!("expected delegated dispatch");
+    };
+    let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let context = payload["context"].as_str().unwrap();
+    assert!(
+        context.contains("[page context truncated at bounded read limit]"),
+        "{context}"
+    );
+    assert!(
+        context.contains("[attachment context truncated at bounded read limit]"),
+        "{context}"
+    );
+}
+
+#[test]
 fn call_ids_are_idempotent_and_completed_calls_release_the_root_slot() {
     let (mut m, registry, caller_run) = with_open_delegating_session(1);
     let call = delegate(&caller_run, "one", "worker", "work");

@@ -19,12 +19,12 @@ fn pages_comment_mention_dispatches_without_a_chat_watch() {
             comment_ids: vec!["comment-1".into()],
         },
         comments: vec![pages::Comment {
-            id: "comment-1".into(),
-            thread_id: "thread-1".into(),
-            author: pages::AuthorRef::User(vec![4; 32]),
-            text: "@bot review this page".into(),
-            created_at: 1,
-            edited_at: None,
+                id: "comment-1".into(),
+                thread_id: "thread-1".into(),
+                author: pages::AuthorRef::User(vec![4; 32]),
+                text: "@bot review this page".into(),
+                created_at: 1,
+                edited_at: None,
             deleted: false,
         }],
     };
@@ -269,6 +269,53 @@ fn all_policy_engages_every_active_agent_and_paused_agents_never_engage() {
         "a paused agent never engages"
     );
     assert!(get_pending(&m, &run_id_for("general", 2, "c")).is_some());
+}
+
+#[test]
+fn all_policy_shares_one_sibling_budget_across_multiple_composes() {
+    let mut registry = Registry::new();
+    for index in 0..20 {
+        let id = format!("bot-{index:02}");
+        registry.insert(id.clone(), record(&id, &[ACTION_CHAT_POST]));
+    }
+    let mut m = watched(TurnPolicy::All, &registry)
+        .with_files_module("files")
+        .with_pages_module("pages");
+    let page_limit = usize::from(pages::MAX_PAGE_QUERY_LIMIT);
+    let mut ctx = CaptureCtx::new()
+        .at(2)
+        .with_tagging_origin()
+        .with_registry(&registry)
+        .with_transcript(
+            "general",
+            vec![
+                message(1, "start"),
+                message(
+                    2,
+                    "[Plan](duck://page/plan) [notes](duck://files/shared/attachments/u/notes.md)",
+                ),
+            ],
+        )
+        .with_page("plan", page_with_block_count(page_limit * 50, ""))
+        .with_file("/shared/attachments/u/notes.md", b"shared context");
+
+    exec(&mut m, &mut ctx, &engagement("general", 2, Vec::new())).unwrap();
+
+    assert_eq!(ctx.distinct_query_count(), MAX_SIBLING_QUERY_READS);
+    assert_eq!(
+        ctx.dispatch_msgs().len(),
+        5,
+        "five agents fit; the sixth distinct turn lookup exhausts the ledger"
+    );
+    for dispatch in ctx.dispatch_msgs() {
+        let DispatchMsg::Dispatch { payload, .. } = dispatch else {
+            panic!("expected dispatch");
+        };
+        let payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let context = payload["context"].as_str().unwrap();
+        assert!(context.contains("[Project Plan](duck://page/plan)"));
+        assert!(context.contains("shared context"));
+    }
 }
 
 #[test]

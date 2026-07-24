@@ -49,15 +49,27 @@ async fn apply_commit(p: &mut Pages, m: &PageMsg) {
 }
 
 async fn get_page(p: &Pages, page_id: &str) -> Option<Vec<Block>> {
-    let reply = p
-        .query(&encode_query(&PageQuery::GetPage {
-            page_id: page_id.into(),
-        }))
-        .await
-        .unwrap();
-    match decode_reply(&reply).unwrap() {
-        PageReply::Page(v) => v,
-        _ => panic!("expected Page"),
+    let mut blocks = Vec::new();
+    let mut after = None;
+    loop {
+        let reply = p
+            .query(&encode_query(&PageQuery::GetPage {
+                page_id: page_id.into(),
+                after: after.clone(),
+                limit: 0,
+            }))
+            .await
+            .unwrap();
+        let page = match decode_reply(&reply).unwrap() {
+            PageReply::Page(page) => page?,
+            _ => panic!("expected Page"),
+        };
+        blocks.extend(page.blocks);
+        let Some(next) = page.next_after else {
+            return Some(blocks);
+        };
+        assert_ne!(after.as_ref(), Some(&next), "page cursor must advance");
+        after = Some(next);
     }
 }
 
@@ -88,7 +100,6 @@ fn synced_store_reconstructs_source_root() {
             &PageMsg::CreatePage {
                 page_id: "p1".into(),
                 title: "one".into(),
-                parent: None,
             },
         )
         .await;
@@ -119,7 +130,13 @@ fn synced_store_reconstructs_source_root() {
             },
         )
         .await; // overwrite: op-log order matters
-        apply_commit(&mut src, &PageMsg::RemoveBlock { block_id: "c1".into() }).await; // delete rides the log too
+        apply_commit(
+            &mut src,
+            &PageMsg::RemoveBlock {
+                block_id: "c1".into(),
+            },
+        )
+        .await; // delete rides the log too
         // a comment rides the SAME store (reserved keys) — it must sync too.
         apply_commit(
             &mut src,
@@ -178,7 +195,9 @@ fn synced_store_reconstructs_source_root() {
         // the comment survived the sync too.
         let view = match decode_reply(
             &synced
-                .query(&encode_query(&PageQuery::CommentThread { thread_id: "th1".into() }))
+                .query(&encode_query(&PageQuery::CommentThread {
+                    thread_id: "th1".into(),
+                }))
                 .await
                 .unwrap(),
         )
@@ -211,7 +230,6 @@ fn synced_store_reproduces_the_page_index() {
                 &PageMsg::CreatePage {
                     page_id: id.into(),
                     title: title.into(),
-                    parent: None,
                 },
             )
             .await;

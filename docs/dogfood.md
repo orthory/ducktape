@@ -129,8 +129,9 @@ isn't shown in the editor chrome; recover it from the page enumeration:
 
 ```sh
 curl -s <base>/v1/query -X POST -H 'content-type: application/json' \
-  -d '{"target":"pages","query":"list_pages"}'
-# → ids + titles; pick your spec's id
+  -d '{"target":"pages","query":{"list_pages":{"after":null,"limit":0}}}'
+# → page_list.pages contains ids + titles; use page_list.next_after as after
+#   to read another bounded page, then pick your spec's id.
 ```
 
 ## 4. Open the issue with a `[[page:<id>]]` ref
@@ -142,7 +143,8 @@ At run compose, every ref found in the trigger message or the injected issue
 body resolves against committed pages state and the page's whole subtree is
 rendered into the run's context: headings, `- [ ]`/`- [x]` todos with an
 inline `[blk:<id>]` per block (the ids the agent targets with its pages
-actions), fenced code, 64 KiB budget with a truncation marker. An
+actions), fenced code, 64 KiB budget with a truncation marker. Page and
+attachment resolution share the dispatch's bounded reference-read budget. An
 unresolvable ref becomes a one-line "not found" marker — never a failed run.
 One limit: refs sitting past the 16 KiB item-body truncation point aren't
 seen.
@@ -189,6 +191,7 @@ the page) and that the target block/page id is correct.
 
 ## Known limits (set expectations honestly)
 - **No page read-authorization:** `[[page:<id>]]` injection renders any referenced page's subtree into the run context with no read-cap gate — pages read caps are out of scope for M2 (pages are workspace-visible to members). A member can surface any page they can already see.
+- **Page depth is bounded:** one document allows 64 parent edges. A nested Page block is a leaf in its containing document and starts a separate 64-edge document.
 
 - **Concurrent branch advance is absorbed, not lost**: on a push reject the
   provisioner fetch+rebases+re-pushes (bounded 3, `rebased: true` in the

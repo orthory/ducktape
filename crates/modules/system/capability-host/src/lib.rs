@@ -272,7 +272,7 @@ pub struct RunContext {
     /// knows how to enforce become container limit flags, the rest are inert
     /// (scheduling already matched them). Default empty.
     pub limits: BTreeMap<String, u64>,
-    /// true for portable v3 runs: native CLI sessions are host-local
+    /// true for portable v1 runs: native CLI sessions are host-local
     /// optimizations and must not be resumed or captured for portable state.
     pub portable: bool,
     /// the run's assembled context document — the agent's curated skills, built
@@ -803,9 +803,7 @@ impl CliProvider {
             envs.push(("PATH".into(), path.to_string_lossy().into_owned()));
         }
         for (key, value) in &ctx.env {
-            if key == "HOME"
-                || key == PROVIDER_CONTROL_URL_ENV
-                || key == PROVIDER_CONTROL_TOKEN_ENV
+            if key == "HOME" || key == PROVIDER_CONTROL_URL_ENV || key == PROVIDER_CONTROL_TOKEN_ENV
             {
                 continue;
             }
@@ -1615,10 +1613,7 @@ impl PodmanOwner {
         let boot_id = fields.next()?.to_string();
         let pid = fields.next()?.parse().ok()?;
         let starttime = fields.next()?.parse().ok()?;
-        (fields.next().is_none()
-            && valid_boot_id(&boot_id)
-            && pid != 0
-            && starttime != 0)
+        (fields.next().is_none() && valid_boot_id(&boot_id) && pid != 0 && starttime != 0)
             .then_some(Self {
                 boot_id,
                 pid,
@@ -1649,10 +1644,7 @@ impl PodmanRun {
             "Podman lifecycle isolation needs $HOME set for its host-only cidfile".to_string()
         })?;
         let home = canonical_mount_path(&home, "Podman HOME")?;
-        let root = home
-            .join(".ducktape")
-            .join("provider-runs")
-            .join("podman");
+        let root = home.join(".ducktape").join("provider-runs").join("podman");
         create_private_dir(&root)?;
         let root = canonical_mount_path(&root, "Podman cidfile root")?;
         let owner = PodmanOwner::current()?;
@@ -1988,7 +1980,9 @@ fn valid_container_id(id: &str) -> bool {
 fn valid_execution_node_id(id: &str) -> bool {
     !id.is_empty()
         && id.len().is_multiple_of(2)
-        && id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2489,9 +2483,7 @@ async fn wait_process_group_gone(group: u32, label: &str) {
     while process_group_alive(group) {
         observations += 1;
         if observations == 1 || observations.is_multiple_of(160) {
-            eprintln!(
-                "[capability-host] waiting for {label} process group {group} to disappear"
-            );
+            eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
         }
         tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
     }
@@ -2503,9 +2495,7 @@ fn wait_process_group_gone_blocking(group: u32, label: &str) {
     while process_group_alive(group) {
         observations += 1;
         if observations == 1 || observations.is_multiple_of(400) {
-            eprintln!(
-                "[capability-host] waiting for {label} process group {group} to disappear"
-            );
+            eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -2673,17 +2663,21 @@ struct GroupChild {
 }
 
 impl GroupChild {
-    fn spawn(
-        program: &str,
-        args: &[String],
-        capture: bool,
-    ) -> Result<Self, std::io::Error> {
+    fn spawn(program: &str, args: &[String], capture: bool) -> Result<Self, std::io::Error> {
         let mut command = tokio::process::Command::new(program);
         command
             .args(args)
             .stdin(Stdio::null())
-            .stdout(if capture { Stdio::piped() } else { Stdio::null() })
-            .stderr(if capture { Stdio::piped() } else { Stdio::null() })
+            .stdout(if capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(if capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(true);
         configure_process_group(&mut command);
         let child = command.spawn()?;
@@ -2915,12 +2909,8 @@ impl LiveChild {
             .child
             .as_mut()
             .expect("a live invocation owns its child");
-        let status = wait_owned_child_complete(
-            child,
-            process_group,
-            label,
-            &mut self.process.leader_reaped,
-        )
+        let status =
+            wait_owned_child_complete(child, process_group, label, &mut self.process.leader_reaped)
         .await?;
         self.process.cleaned = true;
         // A successful Podman CLI exit is not by itself cleanup proof. Target
@@ -2981,13 +2971,14 @@ impl TartGuard {
         capture: bool,
     ) -> Result<SetupOutput, String> {
         if cancellation.is_some_and(RunCancellation::is_cancelled) {
-            return Err(format!("`{program} {}` cancelled before spawn", args.join(" ")));
-        }
-        self.setup = Some(GroupChild::spawn(program, args, capture).map_err(|error| {
-            format!(
-                "`{program} {}` failed to spawn: {error}",
+            return Err(format!(
+                "`{program} {}` cancelled before spawn",
                 args.join(" ")
-            )
+            ));
+        }
+        self.setup =
+            Some(GroupChild::spawn(program, args, capture).map_err(|error| {
+                format!("`{program} {}` failed to spawn: {error}", args.join(" "))
         })?);
         if program == "tart" && args.first().map(String::as_str) == Some("clone") {
             // From this point clone may have created metadata even if its
@@ -3075,17 +3066,14 @@ impl TartGuard {
             .map_err(|error| format!("join `{program}` stderr reader: {error}"))?
             .map_err(|error| format!("read `{program}` stderr: {error}"))?;
         let status = match outcome {
-            Outcome::Exited(status) => status.map_err(|error| {
-                format!("wait for `{program} {}`: {error}", args.join(" "))
-            })?,
-            Outcome::Cancelled => {
-                return Err(format!("`{program} {}` cancelled", args.join(" ")))
-            }
+            Outcome::Exited(status) => status
+                .map_err(|error| format!("wait for `{program} {}`: {error}", args.join(" ")))?,
+            Outcome::Cancelled => return Err(format!("`{program} {}` cancelled", args.join(" "))),
             Outcome::TimedOut => {
                 return Err(format!(
                     "`{program} {}` exceeded {timeout:?}",
                     args.join(" ")
-                ))
+                ));
             }
         };
         Ok(SetupOutput {
@@ -3529,10 +3517,7 @@ impl CliProvider {
                     invocation.revoke();
                 }
                 live.terminate().await;
-                return Err(format!(
-                    "waiting on {} failed: {error}",
-                    self.bin.display()
-                ));
+                return Err(format!("waiting on {} failed: {error}", self.bin.display()));
             }
             WaitOutcome::Cancelled => {
                 if let Some(invocation) = &broker_invocation {
@@ -3577,12 +3562,8 @@ impl CliProvider {
         }
         let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
         let (text, usage) = match self.spec.output {
-            OutputFormat::JsonlEvents => {
-                (parse_jsonl_events(&stdout)?, parse_token_usage(&stdout))
-            }
-            OutputFormat::JsonResult => {
-                (parse_json_result(&stdout)?, parse_token_usage(&stdout))
-            }
+            OutputFormat::JsonlEvents => (parse_jsonl_events(&stdout)?, parse_token_usage(&stdout)),
+            OutputFormat::JsonResult => (parse_json_result(&stdout)?, parse_token_usage(&stdout)),
             // Plain stdout is model-authored answer text, not a provider
             // telemetry envelope. Never infer usage from answer content.
             OutputFormat::Text => (parse_text_output(&stdout)?, None),
@@ -4214,7 +4195,11 @@ format = "{format}"
         for label in labels {
             assert!(query.contains(&format!("label={label}")), "{query:?}");
         }
-        assert!(query.iter().all(|arg| !arg.contains("name=") && !arg.contains("pkill")));
+        assert!(
+            query
+                .iter()
+                .all(|arg| !arg.contains("name=") && !arg.contains("pkill"))
+        );
     }
 
     #[test]
@@ -4288,9 +4273,9 @@ format = "{format}"
                     || (args
                         .iter()
                         .any(|arg| arg == "label=io.ducktape.managed=capability-host")
-                        && args.iter().any(|arg| {
-                            arg == &format!("label=io.ducktape.node={executing_node}")
-                        })))
+                        && args
+                            .iter()
+                            .any(|arg| arg == &format!("label=io.ducktape.node={executing_node}"))))
         }));
         assert!(parse_container_ids("not-a-container-id\n").is_err());
     }
@@ -4397,7 +4382,10 @@ format = "{format}"
         #[cfg(target_os = "linux")]
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{helper}/stat")) {
             let (state, _) = linux_process_state_and_group(&stat).expect("helper proc stat");
-            assert!(matches!(state, 'Z' | 'X' | 'x'), "helper still computes: {stat}");
+            assert!(
+                matches!(state, 'Z' | 'X' | 'x'),
+                "helper still computes: {stat}"
+            );
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -4437,7 +4425,9 @@ format = "{format}"
             Some(cid)
         );
         assert_eq!(
-            PodmanRun::remove_argv(&collected).last().map(String::as_str),
+            PodmanRun::remove_argv(&collected)
+                .last()
+                .map(String::as_str),
             Some(cid)
         );
     }
@@ -4473,8 +4463,7 @@ format = "{format}"
     #[tokio::test]
     async fn setup_kill_does_not_return_before_the_child_is_reaped() {
         let args = vec!["-c".into(), "sleep 30".into()];
-        let mut process =
-            GroupChild::spawn("/bin/sh", &args, false).expect("spawn setup process");
+        let mut process = GroupChild::spawn("/bin/sh", &args, false).expect("spawn setup process");
         process.kill_and_wait_blocking();
         assert!(matches!(
             process.child.as_mut().unwrap().try_wait(),
@@ -4617,12 +4606,7 @@ rw_dirs = ["~/.claude"]
             ..podman_ctx()
         };
         let cmd = provider
-            .command(
-                &["--go".into()],
-                &workdir,
-                &ctx,
-                &RunAuth::default(),
-            )
+            .command(&["--go".into()], &workdir, &ctx, &RunAuth::default())
             .expect("podman command builds");
         let std = cmd.as_std();
         assert_eq!(std.get_program(), std::ffi::OsStr::new("podman"));
@@ -4639,7 +4623,10 @@ rw_dirs = ["~/.claude"]
         // the spec's `~/.claude` expands against the real HOME and mounts rw at
         // its IDENTICAL container path; the bin mounts ro; limits become flags.
         assert!(
-            joined.contains(&format!("-v {home}/.claude:{home}/.claude", home = home.display())),
+            joined.contains(&format!(
+                "-v {home}/.claude:{home}/.claude",
+                home = home.display()
+            )),
             "rw mount at identical path: {joined}"
         );
         assert!(
@@ -4698,7 +4685,10 @@ rw_dirs = ["~/.claude"]
                 && !joined.contains(&format!("-e {cidfile}")),
             "host cidfile is not visible inside the container: {joined}"
         );
-        assert!(joined.ends_with(&format!("img {} --go", bin.display())), "{joined}");
+        assert!(
+            joined.ends_with(&format!("img {} --go", bin.display())),
+            "{joined}"
+        );
     }
 
     #[test]
@@ -4857,10 +4847,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
             },
         );
         let ctx = RunContext {
-            env: BTreeMap::from([(
-                SKILLS_ROOT_ENV.to_string(),
-                skills.display().to_string(),
-            )]),
+            env: BTreeMap::from([(SKILLS_ROOT_ENV.to_string(), skills.display().to_string())]),
             ..podman_ctx()
         };
         let cmd = provider
@@ -5209,10 +5196,19 @@ broker = "anthropic-messages"
         // the model provider is spliced in after args[0] (`exec`), and the
         // trailing "-" (prompt on stdin) is still last.
         let joined = argv_of(&cmd);
-        assert!(joined.starts_with("exec -c model_providers.ducktape="), "{joined}");
-        assert!(joined.contains("base_url=\"http://127.0.0.1:54321/v1\""), "{joined}");
+        assert!(
+            joined.starts_with("exec -c model_providers.ducktape="),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("base_url=\"http://127.0.0.1:54321/v1\""),
+            "{joined}"
+        );
         assert!(joined.contains("model_provider=\"ducktape\""), "{joined}");
-        assert!(joined.ends_with("--json -"), "the stdin marker stays last: {joined}");
+        assert!(
+            joined.ends_with("--json -"),
+            "the stdin marker stays last: {joined}"
+        );
 
         let envs: BTreeMap<String, Option<String>> = cmd
             .as_std()
@@ -5369,7 +5365,10 @@ broker = "anthropic-messages"
             })
             .collect();
         let got = |k: &str| envs.get(k).cloned().flatten();
-        assert_eq!(got("ANTHROPIC_BASE_URL").as_deref(), Some("http://127.0.0.1:54321"));
+        assert_eq!(
+            got("ANTHROPIC_BASE_URL").as_deref(),
+            Some("http://127.0.0.1:54321")
+        );
         // the run bearer rides a `claudeAiOauth` creds file, NOT ANTHROPIC_AUTH_TOKEN:
         // an env bearer would force API mode and override subscription mode.
         assert_eq!(got("ANTHROPIC_AUTH_TOKEN"), None);
@@ -5403,7 +5402,10 @@ broker = "anthropic-messages"
         // `claude -p` and protects nothing here (the only ANTHROPIC_* var is
         // ANTHROPIC_BASE_URL; the bearer rides the creds file). See apply_auth_env.
         assert_eq!(got("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"), None);
-        assert_eq!(got("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(), Some("1"));
+        assert_eq!(
+            got("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").as_deref(),
+            Some("1")
+        );
         assert_eq!(got("DISABLE_AUTOUPDATER").as_deref(), Some("1"));
         // the codex bearer var is NOT set for a claude broker.
         assert_eq!(envs.get(BROKER_TOKEN_ENV), None);
@@ -5850,12 +5852,7 @@ printf '{"type":"turn.completed"}\n'"#,
         assert_eq!(refreshed, granted);
         assert!(refreshed > old_timer);
         assert_eq!(
-            effective_provider_deadline(
-                start,
-                idle,
-                Some(hard + Duration::from_secs(1)),
-                hard,
-            ),
+            effective_provider_deadline(start, idle, Some(hard + Duration::from_secs(1)), hard,),
             hard,
             "the same re-read never outranks the hard cap"
         );
@@ -5877,11 +5874,7 @@ printf '{"type":"turn.completed"}\n'"#,
                 endpoint_file.display()
             ),
         );
-        let provider = sh_provider(
-            broker_spec("controlled-sleeper"),
-            bin,
-            "idle-control-wd",
-        )
+        let provider = sh_provider(broker_spec("controlled-sleeper"), bin, "idle-control-wd")
         .with_timeout(Duration::from_millis(200));
         let broker = broker::RunBroker::start_for_test().await;
         let args = provider.spec.args.clone();
@@ -6243,9 +6236,9 @@ mode = "persistent"
             PathBuf::from(other),
             root.join("other").canonicalize().unwrap()
         );
-        let legacy = p.run("q", &RunContext::default()).await.unwrap();
+        let contextless = p.run("q", &RunContext::default()).await.unwrap();
         assert_eq!(
-            PathBuf::from(legacy),
+            PathBuf::from(contextless),
             scratch("workspace-cwd-scratch").canonicalize().unwrap(),
             "no agent id = the scratch fence, unchanged"
         );
@@ -6473,7 +6466,7 @@ fi"#,
         assert_eq!(
             p.run("q", &portable).await.unwrap(),
             "cold",
-            "portable v3 runs start from duckfs state, not host-local CLI sessions"
+            "portable v1 runs start from duckfs state, not host-local CLI sessions"
         );
         assert_eq!(
             sole_session_id(&sessions, "bot").as_deref(),

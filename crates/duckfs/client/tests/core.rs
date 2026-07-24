@@ -93,10 +93,23 @@ fn index_round_trips_and_rejects_future_versions() {
     // a future-version index fails loudly with a re-checkout remedy — the client
     // never silently misreads a schema it was not built for.
     let index_file = dir.path().join(".duckfs").join("index.json");
-    std::fs::write(&index_file, br#"{"version":2}"#).unwrap();
+    std::fs::write(&index_file, br#"{"version":99}"#).unwrap();
     let err = Index::load(dir.path()).unwrap_err();
     assert!(
         err.to_string().contains("re-checkout"),
         "the version-mismatch error advises a re-checkout: {err}"
+    );
+
+    // A v1 document must carry every current field. Missing fields are not an
+    // older shape to upgrade in place; the checkout must be rebuilt.
+    std::fs::write(
+        &index_file,
+        br#"{"version":1,"prefix":"/shared/ws","node":"http://node:8080"}"#,
+    )
+    .unwrap();
+    let err = Index::load(dir.path()).unwrap_err();
+    assert!(
+        matches!(err, duckfs_client::index::IndexError::Parse(_)),
+        "an incomplete v1 index must not receive removed defaults: {err}"
     );
 }

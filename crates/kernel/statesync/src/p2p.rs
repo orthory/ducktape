@@ -55,6 +55,35 @@ struct PendingEntry {
     filed_at_tick: u64,
 }
 
+/// the dispatch task's lane-reclaim seam: fire `stop` and the task hands the
+/// p2p receiver back over `handback`, then exits. built by
+/// [`LaneReclaim::arm`]; the caller keeps the returned trigger halves and
+/// passes the seam into [`P2pSyncClient::with_sources`]. reclaim is only
+/// sound once the caller has quiesced its own requests — any frame the
+/// revoked `recv()` had in flight is dropped, which with an empty pending map
+/// and no unmatched hook is exactly what the dispatch loop would have done.
+pub struct LaneReclaim<R> {
+    stop: oneshot::Receiver<()>,
+    handback: oneshot::Sender<R>,
+}
+
+impl<R> LaneReclaim<R> {
+    /// build the seam: the client-side halves (trigger, receiver-return) and
+    /// the task-side seam itself.
+    pub fn arm() -> (oneshot::Sender<()>, oneshot::Receiver<R>, Self) {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (handback_tx, handback_rx) = oneshot::channel();
+        (
+            stop_tx,
+            handback_rx,
+            Self {
+                stop: stop_rx,
+                handback: handback_tx,
+            },
+        )
+    }
+}
+
 struct Shared {
     pending: Mutex<HashMap<u64, PendingEntry>>,
     /// monotonically increasing reaper tick (written only by the reaper).
@@ -131,7 +160,9 @@ where
         E: Spawner + Clock + Send + 'static,
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
-        Self::with_sources(context, sender, receiver, vec![server], None, requester, proof)
+        Self::with_sources(
+            context, sender, receiver, vec![server], None, requester, proof, None,
+        )
     }
 
     /// bind a client to a non-empty ordered candidate set over a registered
@@ -140,6 +171,10 @@ where
     /// candidate; a transport failure advances the cursor. `unmatched`
     /// receives frames whose id belongs to no pending request here (see
     /// [`UnmatchedFrameHook`]); `None` keeps the old drop-on-miss behavior.
+    /// `reclaim` (see [`LaneReclaim`]) lets the caller revoke the dispatch
+    /// task and take the receiver back; `None` = the lane is the task's for
+    /// the process's life.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_sources<E, R>(
         context: E,
         sender: S,
@@ -148,6 +183,7 @@ where
         unmatched: Option<UnmatchedFrameHook>,
         requester: [u8; 32],
         proof: [u8; 64],
+        reclaim: Option<LaneReclaim<R>>,
     ) -> Self
     where
         E: Spawner + Clock + Send + 'static,
@@ -166,11 +202,28 @@ where
         let task_shared = Arc::clone(&shared);
         let reap_shared = Arc::clone(&shared);
         let expected = Arc::clone(&sources);
+        // ONE loop shape whether or not a reclaim seam was armed: an unarmed
+        // client parks a never-firing stop (its trigger rides in the task, so
+        // the oneshot can't cancel) and the handback goes nowhere.
+        let (stop_rx, handback_tx, _hold_open) = match reclaim {
+            Some(LaneReclaim { stop, handback }) => (stop, handback, None),
+            None => {
+                let (hold, stop) = oneshot::channel::<()>();
+                let (handback, _dropped) = oneshot::channel::<R>();
+                (stop, handback, Some(hold))
+            }
+        };
         context.spawn(move |ctx| async move {
-            // the REAPER runs as its own task: the dispatch loop below must be
-            // a bare `recv().await` loop — select-dropping an actor-backed p2p
-            // recv future mid-flight can eat a delivered message, which here
-            // would silently turn a served response into a client timeout.
+            let _hold_open = _hold_open;
+            let mut stop_rx = stop_rx;
+            // the REAPER runs as its own task: the dispatch loop below stays
+            // a bare `recv().await` loop in steady state — select-dropping an
+            // actor-backed p2p recv future mid-flight can eat a delivered
+            // message, which here would silently turn a served response into
+            // a client timeout. the stop arm only ever fires at reclaim,
+            // whose contract (see [`LaneReclaim`]) requires quiesced
+            // requests, so the one drop it can cause loses nothing a live
+            // request was owed.
             ctx.spawn(move |reap_ctx| async move {
                 loop {
                     reap_ctx.sleep(REAP_INTERVAL).await;
@@ -185,7 +238,19 @@ where
                         .retain(|_, e| now.saturating_sub(e.filed_at_tick) < 2);
                 }
             });
-            while let Ok((peer, msg)) = receiver.recv().await {
+            loop {
+                // the recv borrow must end before the receiver can be handed
+                // back, so the stop arm resolves to `None` and the handback
+                // happens outside the select expression.
+                let frame = futures::select_biased! {
+                    _ = stop_rx => None,
+                    frame = futures::FutureExt::fuse(receiver.recv()) => Some(frame),
+                };
+                let Some(frame) = frame else {
+                    let _ = handback_tx.send(receiver);
+                    return;
+                };
+                let Ok((peer, msg)) = frame else { break };
                 // only a candidate source may complete requests.
                 if !expected.candidates.contains(&peer) {
                     continue;
@@ -223,6 +288,12 @@ where
             requester,
             proof,
         }
+    }
+
+    /// a clone of the underlying channel sender — the promotion seam pairs it
+    /// with the receiver a [`LaneReclaim`] hands back.
+    pub fn lane_sender(&self) -> S {
+        self.sender.clone()
     }
 }
 

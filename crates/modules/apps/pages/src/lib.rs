@@ -1,7 +1,7 @@
 //! qmdb-backed pages module — a notion-like block tree, one block per key.
 //!
-//! a page is a TREE of [`Block`]s: the page itself is the root block (kind
-//! `Page`, text == title), every block carries an ordered `children` list, and
+//! a page is a TREE of [`Block`]s: a `Page` block starts the document (its text
+//! is the title), every block carries an ordered `children` list, and
 //! every block id is GLOBALLY UNIQUE within the module. unlike the document
 //! module's whole-doc-per-key layout, the store key here is `sha256(block_id)`
 //! and the value is ONE serialized block — so the merkle root commits to every
@@ -26,12 +26,12 @@
 //! ## enumeration via a reserved index entry
 //!
 //! one extra store entry is reserved: the sentinel logical key
-//! [`PAGE_INDEX_KEY`] whose value is the serialized SORTED set of every page
-//! (root block) id. its leading NUL makes it uncollidable with a client-minted
-//! block id, and every op that names it is rejected before any storage touch.
-//! only [`PageMsg::CreatePage`] grows the index; block edits never touch it —
-//! and because block ops can neither insert nor convert to kind `Page`,
-//! removal of a subtree can never orphan an index entry.
+//! [`PAGE_INDEX_KEY`] whose value is the serialized SORTED map from every page
+//! block id to its containing page. its leading NUL makes it uncollidable with
+//! a client-minted block id, and every op that names it is rejected before any
+//! storage touch. top-level pages enter through [`PageMsg::CreatePage`]; nested
+//! pages are ordinary `Page` blocks, so insert/move/remove update this index in
+//! the same staged transaction as the block tree.
 //!
 //! ## host-lent staging (the kv/document pattern, plus deletes)
 //!
@@ -95,18 +95,27 @@ use error::{PageError, to_page_err};
 /// bounds a single parent to tens of thousands of children.
 pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 
+/// Maximum number of block edges below one page root. Nested `Page` blocks
+/// are leaves in the containing document and start their own depth budget.
+/// This keeps every valid preorder cursor page comfortably below the wasm
+/// host's store-read ceiling while leaving far more nesting than the UI uses.
+pub const MAX_PAGE_DEPTH: usize = 64;
+
 /// the reserved logical key under which the page-enumeration INDEX rides in
-/// the same store. its value is a serialized sorted `Vec<String>` of every
-/// page (root block) id. the leading NUL makes it UNCOLLIDABLE with a real
+/// the same store. its value is a serialized sorted map from every page block
+/// id to its containing page. the leading NUL makes it UNCOLLIDABLE with a real
 /// block id (clients mint uuids), and every op that names it is rejected
 /// ([`PageError::ReservedId`]) before it can reach storage.
 const PAGE_INDEX_KEY: &str = "\u{0}page-index";
 
-/// how many parent hops a MoveBlock ancestry walk will follow before declaring
-/// the stored tree corrupt. committed state is acyclic by construction (every
-/// move re-checks), so a walk this deep can only mean a broken parent chain —
-/// the cap turns a would-be infinite loop into a loud deterministic error.
-const MAX_DEPTH: usize = 10_000;
+/// Local ceiling for tree walks and the record work they schedule. The wasm
+/// host permits 4096 reads per dispatch; the headroom covers records touched
+/// before and after the walk while making native and wasm reject at one point.
+const MAX_TRAVERSAL_WORK: usize = 3_500;
+
+/// Leaves room for the moved block, both page-depth walks, and parent writes
+/// below the wasm host's 4096 store-read ceiling.
+const MAX_MOVE_SUBTREE_READS: usize = 3_000;
 
 /// a block-tree pages module over a host-injected authenticated store.
 pub struct Pages {

@@ -455,11 +455,9 @@ impl DispatchPool {
                                 Err("attempt cancelled before provider start".into())
                             } else {
                                 match providers.resolve(&job.capability) {
-                                    Ok(provider) => {
-                                        match crate::envelope::prepare(&job.input) {
+                                    Ok(provider) => match crate::envelope::prepare(&job.input) {
                                             Ok(mut prepared) => {
-                                                prepared.ctx.run_key =
-                                                    Some(run_key_for(&job.saga_id));
+                                            prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
                                                 prepared.ctx.executing_node = Some(executing_node);
                                                 prepared.ctx.limits = job.demands.clone();
                                                 prepared.ctx.cancellation =
@@ -489,8 +487,7 @@ impl DispatchPool {
                                                 }
                                             }
                                             Err(error) => Err(clean_error(error)),
-                                        }
-                                    }
+                                    },
                                     Err(error) => Err(clean_error(error)),
                                 }
                             }
@@ -2189,7 +2186,7 @@ format = "text"
         }
     }
 
-    /// a v3 duckfs run envelope — the shape the composer emits for every run.
+    /// a v1 duckfs run envelope — the shape the composer emits for every run.
     fn envelope_payload() -> Vec<u8> {
         serde_json::json!({
             "ducktape_run": 1,
@@ -2261,12 +2258,12 @@ format = "text"
 
     // ---- the portable provisioning bracket ----------------------------------
 
-    /// the same v3 duckfs envelope, named for the provisioning-bracket tests.
-    fn v3_envelope_payload() -> Vec<u8> {
+    /// the same v1 duckfs envelope, named for the provisioning-bracket tests.
+    fn v1_envelope_payload() -> Vec<u8> {
         envelope_payload()
     }
 
-    /// a forge-sourced v3 run envelope — the EXACT byte shapes task 1's
+    /// a forge-sourced v1 run envelope — the EXACT byte shapes task 1's
     /// composer emits (task-1 report §"Exact final serde shapes"): tagged
     /// forge workspace, `context`, requested-Pr sink WITHOUT title/body keys.
     fn forge_envelope_payload() -> Vec<u8> {
@@ -2548,7 +2545,7 @@ format = "text"
             fail_commit: None,
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
-        let work = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let work = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&work).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while !provisioned.load(Ordering::SeqCst)
@@ -2739,7 +2736,7 @@ format = "text"
             "s1",
             0,
             Some(b"me"),
-            &v3_envelope_payload(),
+            &v1_envelope_payload(),
         ))
         .await
         .unwrap();
@@ -2751,7 +2748,7 @@ format = "text"
             "s2",
             0,
             Some(b"me"),
-            &v3_envelope_payload(),
+            &v1_envelope_payload(),
         ))
         .await
         .unwrap();
@@ -2789,7 +2786,7 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_v3_run_with_a_provisioner_wired_provisions_binds_commits_and_wraps_the_result() {
+    async fn a_v1_run_with_a_provisioner_wired_provisions_binds_commits_and_wraps_the_result() {
         let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (provisioned, committed, cleaned) = flags();
         let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
@@ -2800,7 +2797,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let (saga_id, attempt, outcome) = next_result(&mut rx).await;
         assert_eq!((saga_id.as_str(), attempt), ("s1", 0));
@@ -2841,7 +2838,7 @@ format = "text"
             Some(expected.display().to_string().as_str()),
             "the run-scoped workspace env was applied"
         );
-        assert!(ctx.portable, "a v3 run is portable");
+        assert!(ctx.portable, "a v1 run is portable");
         // the SOUL crosses provisioner → RunContext. it is assembled from the
         // MATERIALIZED skill mounts (only the provisioner can read them), so
         // this hop is the only way the persona ever reaches the model —
@@ -2906,7 +2903,7 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_v3_runs_skills_reach_the_spec_as_ro_mounts() {
+    async fn a_v1_runs_skills_reach_the_spec_as_ro_mounts() {
         let (providers, _probes) = slow_providers(Duration::from_millis(5), false);
         let captured: Arc<Mutex<Vec<crate::provision::RoMount>>> = Arc::new(Mutex::new(Vec::new()));
         let provisioner: SharedProvisioner = Arc::new(RoMountProbe {
@@ -2914,7 +2911,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let _ = next_result(&mut rx).await;
 
@@ -3056,7 +3053,7 @@ format = "text"
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
         let saga_id = "dispatch\u{1f}runs\u{1f}private-hash";
 
-        let eff = effect_with_payload(saga_id, 7, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload(saga_id, 7, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let _ = next_result(&mut rx).await;
 
@@ -3181,7 +3178,7 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn a_failed_v3_run_cleans_up_without_committing_and_delivers_the_error() {
+    async fn a_failed_v1_run_cleans_up_without_committing_and_delivers_the_error() {
         let (providers, _probes) = slow_providers(Duration::from_millis(5), true);
         let (provisioned, committed, cleaned) = flags();
         let provisioner: SharedProvisioner = Arc::new(MockProvisioner {
@@ -3192,7 +3189,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
 
@@ -3231,7 +3228,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
 
@@ -3316,7 +3313,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         assert!(no_oracle_result(&mut rx, Duration::from_millis(350)).await);
         assert_eq!(pool.in_flight(), 1, "the hung commit remains owned");
@@ -3363,7 +3360,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
 
@@ -3387,10 +3384,7 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn flat_and_v2_payloads_fail_the_saga_loudly() {
-        // FLAG DAY: the flat-string passthrough and the v2 tolerance are gone
-        // — both deliver a loud Err result (the saga settles a failed
-        // attempt), and the provider is never invoked.
+    async fn untagged_and_unknown_version_payloads_fail_the_saga_loudly() {
         let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (pool, mut rx) = pool_with(providers, 4);
 
@@ -3406,13 +3400,13 @@ format = "text"
         let err = outcome.unwrap_err();
         assert!(err.contains("no ducktape_run envelope marker"), "got {err}");
 
-        let mut v2: serde_json::Value = serde_json::from_slice(&envelope_payload()).unwrap();
-        v2["ducktape_run"] = serde_json::json!(2);
+        let mut unknown: serde_json::Value = serde_json::from_slice(&envelope_payload()).unwrap();
+        unknown["ducktape_run"] = serde_json::json!(2);
         pool.run(&effect_with_payload(
             "s2",
             0,
             Some(b"me"),
-            v2.to_string().as_bytes(),
+            unknown.to_string().as_bytes(),
         ))
         .await
         .unwrap();
@@ -3448,7 +3442,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &v3_envelope_payload());
+        let eff = effect_with_payload("s1", 0, Some(b"me"), &v1_envelope_payload());
         pool.run(&eff).await.unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
 
@@ -3560,12 +3554,7 @@ format = "text"
 
         // (1) the minimal shape (empty facets) still decodes and still yields
         //     response_text via the runs contract.
-        let minimal = assemble_runner_result(
-            "the answer",
-            &receipt,
-            Sink::Chain,
-            Status::Ok,
-        );
+        let minimal = assemble_runner_result("the answer", &receipt, Sink::Chain, Status::Ok);
         let parsed: RunsRunnerResult = serde_json::from_slice(&minimal)
             .expect("minimal bytes deserialize into the runs contract");
         assert_eq!(parsed.ducktape_runner_result, 1);

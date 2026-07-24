@@ -21,7 +21,6 @@
 #   2. the ACTIVE workspace's http_listen — ~/.ducktape/registry.json (.active)
 #                                            -> ~/.ducktape/workspaces/<active>/node.toml
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
-#   3. http://127.0.0.1:8844             — the web/legacy default
 #
 # Env knobs:
 #   DUCKTAPE_DEV_FORGE_URL  node base URL override (no trailing /forge/<repo>)
@@ -77,7 +76,7 @@ resolve_base_url() {
       fi
     fi
   fi
-  printf 'http://127.0.0.1:8844'
+  die "no Forge node selected; set DUCKTAPE_DEV_FORGE_URL or start an active workspace"
 }
 
 BASE_URL="$(resolve_base_url)"

@@ -29,9 +29,7 @@ use crate::codec::{Cursor, push_bytes, push_str};
 /// the reserved host-store key the config travels under.
 pub const CONFIG_KEY: &[u8] = b"__config";
 
-/// the one encoding version this codec speaks. a future shape change bumps it
-/// (and, since the config is consensus state, is a state-schema break for
-/// every tenant that carries one).
+/// The current encoding tag.
 pub const CONFIG_VERSION: u8 = 1;
 
 /// canonical bytes of a genesis parameter list. keys must be strictly

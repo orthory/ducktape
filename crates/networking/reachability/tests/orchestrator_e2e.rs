@@ -519,8 +519,7 @@ async fn established(resolver: &reachability::NatResolver) -> std::net::SocketAd
     let mut status = resolver.status().expect("resolver has coordinators");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let reachability::RendezvousStatus::Ready { reflexive } =
-                *status.borrow_and_update()
+            if let reachability::RendezvousStatus::Ready { reflexive } = *status.borrow_and_update()
             {
                 return reflexive;
             }
@@ -539,15 +538,17 @@ async fn nat_resolver_punches_over_loopback() {
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(nat_traversal::client::run_coordinator(
         coord_sock,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
+        nat_traversal::AuthPolicy::Public,
     ));
 
-    let key_a = NodeKey([0xaa; 32]);
-    let key_b = NodeKey([0xbb; 32]);
-    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr], None)
+    let signer_a = PrivateKey::from_seed(490);
+    let signer_b = PrivateKey::from_seed(491);
+    let key_a = node_key_of(&signer_a.public_key());
+    let key_b = node_key_of(&signer_b.public_key());
+    let mut a = reachability::NatResolver::bind(key_a, vec![coord_addr], (signer_a, None))
         .await
         .unwrap();
-    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr], None)
+    let mut b = reachability::NatResolver::bind(key_b, vec![coord_addr], (signer_b, None))
         .await
         .unwrap();
     established(&a).await;
@@ -577,10 +578,12 @@ async fn resolver_datagram_roundtrip_over_loopback() {
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(nat_traversal::client::run_coordinator(
         coord_sock,
-        nat_traversal::AuthPolicy::Open { require_pop: false },
+        nat_traversal::AuthPolicy::Public,
     ));
 
-    let client = nat_traversal::NatClient::bind_multi(NodeKey([0xcc; 32]), vec![coord_addr])
+    let signer = PrivateKey::from_seed(492);
+    let key = node_key_of(&signer.public_key());
+    let client = nat_traversal::NatClient::bind(key, vec![coord_addr], signer, None)
         .await
         .unwrap();
     let (sink_tx, mut sink_rx) = mpsc::channel(8);
@@ -657,10 +660,9 @@ async fn private_coordinator_admits_authenticated_bind() {
 
     // a genesis member: admitted by membership, no cap needed.
     let member_key = node_key_of(&member.public_key());
-    let m =
-        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
-            .await
-            .expect("a genesis member's authenticated bind is admitted");
+    let m = reachability::NatResolver::bind(member_key, vec![coord_addr], (member.clone(), None))
+        .await
+        .expect("a genesis member's authenticated bind is admitted");
     established(&m).await;
     assert!(
         m.reflexive().is_some(),
@@ -670,13 +672,10 @@ async fn private_coordinator_admits_authenticated_bind() {
     // a non-genesis joiner carrying a genesis-minted cap: admitted by the cap.
     let joiner_key = node_key_of(&joiner.public_key());
     let cap = nat_traversal::mint_coord_cap(&g, joiner_key, nat_traversal::now_secs() + 3600);
-    let j = reachability::NatResolver::bind(
-        joiner_key,
-        vec![coord_addr],
-        Some((joiner.clone(), Some(cap))),
-    )
-    .await
-    .expect("a capped joiner's authenticated bind is admitted");
+    let j =
+        reachability::NatResolver::bind(joiner_key, vec![coord_addr], (joiner.clone(), Some(cap)))
+            .await
+            .expect("a capped joiner's authenticated bind is admitted");
     established(&j).await;
     assert!(
         j.reflexive().is_some(),
@@ -710,21 +709,17 @@ async fn private_coordinator_denies_uncredentialed_bind() {
     // genesis member: every request, BindRequest included, is dropped by the
     // admission gate, so establishment can never discover a reflexive.
     let outsider_key = node_key_of(&outsider.public_key());
-    let denied = reachability::NatResolver::bind(
-        outsider_key,
-        vec![coord_addr],
-        Some((outsider.clone(), None)),
-    )
-    .await
-    .expect("the local socket binds; admission shows up as never-Ready");
+    let denied =
+        reachability::NatResolver::bind(outsider_key, vec![coord_addr], (outsider.clone(), None))
+            .await
+            .expect("the local socket binds; admission shows up as never-Ready");
 
     // control: a credentialed member establishes against the SAME coordinator
     // while the outsider is still being refused — the transport works.
     let member_key = node_key_of(&member.public_key());
-    let ok =
-        reachability::NatResolver::bind(member_key, vec![coord_addr], Some((member.clone(), None)))
-            .await
-            .expect("a genesis member's socket binds");
+    let ok = reachability::NatResolver::bind(member_key, vec![coord_addr], (member.clone(), None))
+        .await
+        .expect("a genesis member's socket binds");
     established(&ok).await;
 
     // one full discovery attempt (3s) has certainly concluded by now — the
@@ -764,14 +759,12 @@ async fn private_coordinator_cross_peer_punch() {
     let a_cap = nat_traversal::mint_coord_cap(&g, a_key, nat_traversal::now_secs() + 3600);
     let b_cap = nat_traversal::mint_coord_cap(&g, b_key, nat_traversal::now_secs() + 3600);
 
-    let mut a =
-        reachability::NatResolver::bind(a_key, vec![coord_addr], Some((a_signer, Some(a_cap))))
-            .await
-            .expect("A's authenticated bind is admitted");
-    let mut b =
-        reachability::NatResolver::bind(b_key, vec![coord_addr], Some((b_signer, Some(b_cap))))
-            .await
-            .expect("B's authenticated bind is admitted");
+    let mut a = reachability::NatResolver::bind(a_key, vec![coord_addr], (a_signer, Some(a_cap)))
+        .await
+        .expect("A's authenticated bind is admitted");
+    let mut b = reachability::NatResolver::bind(b_key, vec![coord_addr], (b_signer, Some(b_cap)))
+        .await
+        .expect("B's authenticated bind is admitted");
     established(&a).await;
     established(&b).await;
     assert!(a.reflexive().is_some() && b.reflexive().is_some());
@@ -791,7 +784,9 @@ async fn private_coordinator_cross_peer_punch() {
 /// An empty coordinator set degrades to pass-through resolution.
 #[tokio::test]
 async fn nat_resolver_without_coordinators_is_pass_through() {
-    let mut r = reachability::NatResolver::bind(NodeKey([1; 32]), vec![], None)
+    let signer = PrivateKey::from_seed(493);
+    let key = node_key_of(&signer.public_key());
+    let mut r = reachability::NatResolver::bind(key, vec![], (signer, None))
         .await
         .unwrap();
     assert_eq!(r.reflexive(), None);

@@ -353,7 +353,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
             .unwrap(),
         br#"{"ok":true}"#
     );
-    // v2 forwards Set-Cookie end to end (v1 stripped it).
+    // Set-Cookie is forwarded end to end.
     assert!(
         response["head"]["headers"]
             .as_array()
@@ -406,7 +406,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
 
     for (method, path, headers, expected) in [
         ("delete", "/items", serde_json::json!([]), 403),
-        // (v2: Cookie is no longer rejected at the proxy; it flows to upstream.)
+        // Cookie flows to the upstream.
         (
             "get",
             "/items",

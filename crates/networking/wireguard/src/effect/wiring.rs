@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
-use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
 use crate::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
+use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
 
 use crate::effect::WireGuardEffect;
 
@@ -221,10 +221,10 @@ fn interface_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::*;
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use defguard_wireguard_rs::net::IpAddrMask;
     use std::net::{IpAddr, Ipv4Addr};
-    use crate::*;
 
     fn id(sk: &PrivateKey) -> ValidatorIdentity {
         ValidatorIdentity::try_from(sk.public_key().as_ref()).unwrap()

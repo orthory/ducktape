@@ -236,6 +236,11 @@ pub(crate) fn ship_index_blobs(
 /// short of a staged-and-committed install converges on the same fallback:
 /// the boot heal re-derives whatever the watermarks say is missing, so
 /// failures here log and fall through, never abort the promotion.
+// ORPHANED by the in-process promotion seat (nothing exec-reboots, so
+// nothing adopts a staged index anymore); kept only until the shipped-index
+// lane (serve side, IndexStore adoption, `sync_index` key) is swept as one
+// follow-up removal.
+#[allow(dead_code)]
 pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
     client: &C,
     boundary: statesync::BoundaryId,

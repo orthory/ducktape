@@ -1052,6 +1052,7 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
     nettest::http_text(port, "GET", path)
 }
 
+#[allow(unused_imports)] // a shared prelude: not every e2e binary polls
 pub use nettest::poll_until;
 
 // `n` distinct free localhost ports, collision-safe (holds every listener at

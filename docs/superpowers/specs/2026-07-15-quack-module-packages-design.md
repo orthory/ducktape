@@ -185,8 +185,8 @@ author ──quack build──▶ .quack ──share (chat/files/web)──▶ a
   bytes and `SignalReady` (R=n latch) → at the activation height the host instantiates through
   `ModuleFactory` and registers. Registering a module changes root-hash by construction (the
   registry set is what `root_hash()` composes over), which is exactly why it rides the R=n rail.
-  Version-gated at `ADMISSION_ACTIVATION_VERSION = 4`; live ids (native or otherwise) are refused
-  via a `ctx.module_root` door; a duplicate-id refusal fails the governance Execute atomically.
+  Existing ids are refused via a `ctx.module_root` door; a duplicate-id refusal
+  fails the governance Execute atomically.
 - **install** (member, local) — verify layers 1–4, mint the per-module session key
   (`scope = { targets: submits, expires_at: h + N }`, authorized by the passkey, once), ViewHost
   loads the pinned view. The module itself is already on the network: **install is an authority and
@@ -199,8 +199,9 @@ author ──quack build──▶ .quack ──share (chat/files/web)──▶ a
   - *both*: the view must be wire-compatible across the activation boundary, or the view flip lands
     after activation. The CLI checks `[requires]` and orders the two submissions.
 - **rollback** — view: `SetRoute` back to the previous manifest (bytes are content-addressed and
-  still present — trivial). Module: `Schedule` back to the old hash (machinery exists; state-schema
-  backward compatibility is the module's own responsibility).
+  still present — trivial). Module: schedule the prior code only when it reads
+  the exact same state layout. A layout change is an outright replacement and
+  greenfield re-genesis.
 - **revoke / uninstall** — member uninstall = `RemoveMemberKey` (session key) + local view drop.
   Network kill of a malicious package = swap to inert code (module *deletion* does not exist —
   its state is in root-hash; the tombstone swap is deactivation, using existing machinery).

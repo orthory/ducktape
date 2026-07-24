@@ -1,7 +1,8 @@
 use super::{
-    AgentStatus, Ctx, DispatchMsg, Error, JobsMsg, Msg, Origin, RunsModule, RunsMsg, TaggingMsg,
-    TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg, dispatch_id_for, envelope,
-    jobs_encode_msg, reject_run_separator, run_id_for, tagging_encode_msg,
+    AgentStatus, Ctx, DispatchMsg, Error, JobsMsg, Msg, Origin, RunsModule, RunsMsg,
+    SiblingReadBudget, TaggingMsg, TurnPolicy, canonical_origin, decode_msg, dispatch_encode_msg,
+    dispatch_id_for, envelope, jobs_encode_msg, reject_run_separator, run_id_for,
+    tagging_encode_msg,
 };
 
 impl RunsModule {
@@ -35,7 +36,12 @@ impl RunsModule {
         Ok(Some(dispatch_id))
     }
 
-    pub(super) async fn on_admin(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+    pub(super) async fn on_admin(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        msg: &Msg,
+        budget: &SiblingReadBudget,
+    ) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             RunsMsg::WatchChannel { channel_id, policy } => {
                 Self::admin_origin(&ctx.env().origin)?;
@@ -145,7 +151,15 @@ impl RunsModule {
                 // on a failed preparation: this is the root op of its own
                 // block, so an error poisons nothing but the request itself.
                 let prepared = self
-                    .prepare_dispatch(&*ctx, &agent, &run_id, &channel_id, anchor_seq, &extra)
+                    .prepare_dispatch(
+                        &*ctx,
+                        &agent,
+                        &run_id,
+                        &channel_id,
+                        anchor_seq,
+                        &extra,
+                        budget,
+                    )
                     .await
                     .map_err(Error::Module)?;
                 self.stage_dispatch_run(
@@ -200,7 +214,10 @@ impl RunsModule {
                 run_id,
                 request_id,
                 request,
-            } => self.delegate_run(ctx, run_id, request_id, request).await,
+            } => {
+                self.delegate_run(ctx, run_id, request_id, request, budget)
+                    .await
+            }
         }
     }
 }

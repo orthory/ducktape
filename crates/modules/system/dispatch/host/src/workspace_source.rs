@@ -1,11 +1,9 @@
-//! the portable workspace SOURCE — the tagged `workspace` block of a v3 run
+//! the portable workspace SOURCE — the tagged `workspace` block of a v1 run
 //! envelope (wire contract §1: `kind` = `duckfs` | `forge`) and the plain-data
 //! vocabulary ([`WorkspaceSource`]) the plan/spec carry it in across the
 //! reachability wall.
 //!
-//! FLAG DAY: the pre-forge flat duckfs shape (no `kind`) no longer decodes —
-//! a mixed-binary envelope fails loudly at the serde step, never silently
-//! misreads. serde ignores unknown fields within an internally-tagged variant.
+//! Unknown or incomplete workspace fields fail at the serde step.
 
 use serde::Deserialize;
 
@@ -82,7 +80,7 @@ impl WorkspaceSource {
 /// acceptance IS validation). [`WireWorkspace::validate`] adds the per-field
 /// non-empty checks and surfaces the plain [`WorkspaceSource`].
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireWorkspace {
     Duckfs {
         source_prefix: String,
@@ -90,7 +88,7 @@ pub(crate) enum WireWorkspace {
     },
     Forge {
         repo: String,
-        /// required in v3: the composer always states the tracker title.
+        /// the composer always states the tracker title.
         item_title: String,
         commit: String,
         branch: String,
@@ -100,7 +98,7 @@ pub(crate) enum WireWorkspace {
 }
 
 impl WireWorkspace {
-    /// per-variant, per-field loud validation: a v3 marker with an empty
+    /// per-variant, per-field loud validation: an envelope with an empty
     /// coordinate is a mixed-network signal, never silently downgraded.
     pub(crate) fn validate(self) -> Result<WorkspaceSource, String> {
         match self {
@@ -109,9 +107,7 @@ impl WireWorkspace {
                 source_snapshot,
             } => {
                 if source_prefix.is_empty() {
-                    return Err(
-                        "v3 run envelope workspace.source_prefix must not be empty".into()
-                    );
+                    return Err("run envelope workspace.source_prefix must not be empty".into());
                 }
                 Ok(WorkspaceSource::Duckfs {
                     source_prefix,
@@ -129,7 +125,7 @@ impl WireWorkspace {
                 for (field, value) in [("repo", &repo), ("commit", &commit), ("branch", &branch)] {
                     if value.is_empty() {
                         return Err(format!(
-                            "v3 run envelope forge workspace.{field} must not be empty"
+                            "run envelope forge workspace.{field} must not be empty"
                         ));
                     }
                 }
@@ -210,9 +206,18 @@ mod tests {
     #[test]
     fn validation_rejects_empty_forge_coordinates_per_field() {
         let cases = [
-            (r#"{"kind":"forge","repo":"","item_title":"t","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#, "repo"),
-            (r#"{"kind":"forge","repo":"app","item_title":"t","commit":"","branch":"b","branch_born":true,"forge_push":true}"#, "commit"),
-            (r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"","branch_born":true,"forge_push":true}"#, "branch"),
+            (
+                r#"{"kind":"forge","repo":"","item_title":"t","commit":"c","branch":"b","branch_born":true,"forge_push":true}"#,
+                "repo",
+            ),
+            (
+                r#"{"kind":"forge","repo":"app","item_title":"t","commit":"","branch":"b","branch_born":true,"forge_push":true}"#,
+                "commit",
+            ),
+            (
+                r#"{"kind":"forge","repo":"app","item_title":"t","commit":"c","branch":"","branch_born":true,"forge_push":true}"#,
+                "branch",
+            ),
         ];
         for (json, field) in cases {
             let err = serde_json::from_str::<WireWorkspace>(json)
@@ -234,7 +239,10 @@ mod tests {
         .unwrap()
         .validate()
         .unwrap_err();
-        assert!(err.contains("source_prefix must not be empty"), "got {err:?}");
+        assert!(
+            err.contains("source_prefix must not be empty"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -245,7 +253,10 @@ mod tests {
         };
         assert_eq!(
             duckfs.receipt_coords(),
-            ("/shared/agent-workspaces/bot".to_string(), Some("aa".repeat(32)))
+            (
+                "/shared/agent-workspaces/bot".to_string(),
+                Some("aa".repeat(32))
+            )
         );
         // contract §5: source_prefix = "forge:<repo>", source_snapshot = the
         // pinned commit — every receipt names WHAT was checked out without a
@@ -265,14 +276,10 @@ mod tests {
     }
 
     #[test]
-    fn extra_fields_inside_a_tagged_workspace_are_tolerated() {
-        // additive-field tolerance survives the tagged shape: an old advisory
-        // mount_path (or any future additive key) inside the object decodes
-        // fine — internally-tagged serde ignores unknown fields.
-        let ws: WireWorkspace = serde_json::from_str(
+    fn extra_fields_inside_a_tagged_workspace_are_rejected() {
+        let decoded = serde_json::from_str::<WireWorkspace>(
             r#"{"kind":"duckfs","source_prefix":"/p","source_snapshot":null,"mount_path":"/tmp/x"}"#,
-        )
-        .unwrap();
-        assert!(ws.validate().is_ok());
+        );
+        assert!(decoded.is_err());
     }
 }

@@ -30,11 +30,7 @@ use wasm_host::WasmModule;
 const INBOX_WASM: &[u8] = include_bytes!("fixtures/inbox.component.wasm");
 
 fn wasm_inbox() -> WasmModule {
-    WasmModule::from_bytes("inbox", INBOX_WASM)
-        .expect("load component")
-        // the adapter port's host-KV snapshot is revision 2 of the inbox
-        // canonical state — the same declaration bin/node makes.
-        .with_state_schema_revision(2)
+    WasmModule::from_bytes("inbox", INBOX_WASM).expect("load component")
 }
 
 /// a stand-in producer module that, on any op, emits an inbox `Deliver`

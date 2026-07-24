@@ -31,8 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use sdk::{
-    Continuation, Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, Relay,
-    ResolverSyncTarget, StateRoot, StateSyncHandle,
+    Continuation, Ctx, Env, Error, Event, Module, ModuleId, Msg, Origin, Relay, ResolverSyncTarget,
+    StateRoot, StateSyncHandle,
 };
 use sha2::{Digest, Sha256};
 
@@ -66,25 +66,6 @@ pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
         h.update(root.0);
     }
     StateRoot(h.finalize().into())
-}
-
-/// Canonical fingerprint of a module set's committed-state schemas.
-///
-/// Entries are sorted by module id before hashing, so registry construction
-/// order is irrelevant. Length-prefixing keeps ids unambiguous; the domain tag
-/// prevents this digest from being confused with a root hash.
-pub fn state_schema_fingerprint<'a>(modules: impl IntoIterator<Item = (&'a str, u32)>) -> [u8; 32] {
-    let mut modules: Vec<(&str, u32)> = modules.into_iter().collect();
-    modules.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    let mut h = Sha256::new();
-    h.update(b"ducktape-state-schema-v1");
-    h.update((modules.len() as u64).to_le_bytes());
-    for (id, revision) in modules {
-        h.update((id.len() as u64).to_le_bytes());
-        h.update(id.as_bytes());
-        h.update(revision.to_le_bytes());
-    }
-    h.finalize().into()
 }
 
 /// hard cap on dispatches per `submit` (the root op plus all follow-ups). a
@@ -568,20 +549,6 @@ impl Host {
         self.registry.insert(module.id(), module);
     }
 
-    /// Sorted module ids and their canonical-state revisions.
-    pub fn state_schema(&self) -> Vec<(ModuleId, u32)> {
-        self.registry
-            .iter()
-            .map(|(id, module)| (id.clone(), module.state_schema_revision()))
-            .collect()
-    }
-
-    /// Fingerprint persisted in recovery/state-sync manifests.
-    pub fn state_schema_fingerprint(&self) -> [u8; 32] {
-        let schema = self.state_schema();
-        state_schema_fingerprint(schema.iter().map(|(id, revision)| (id.as_str(), *revision)))
-    }
-
     /// build a host from a declared module set (registry-as-genesis-state). errors
     /// on a duplicate module id, since dispatch addresses modules by id.
     pub fn genesis(modules: Vec<Box<dyn Module>>) -> Result<Self, Error> {
@@ -686,8 +653,7 @@ impl Host {
     /// until the module is registered — the query errors → `None`, keeping
     /// the drain byte-identical on a net without dispatch.
     async fn pending_deliveries(&self) -> Option<Msg> {
-        let req =
-            dispatch::encode_query(&dispatch::DispatchQuery::PendingDeliveries);
+        let req = dispatch::encode_query(&dispatch::DispatchQuery::PendingDeliveries);
         let bytes = self.query(DISPATCH_MODULE_ID, &req).await.ok()?;
         let dispatch::DispatchReply::PendingDeliveries(pending) =
             dispatch::decode_reply(&bytes).ok()?
@@ -696,9 +662,7 @@ impl Host {
         };
         (pending > 0).then(|| Msg {
             target: DISPATCH_MODULE_ID.into(),
-            payload: dispatch::encode_msg(
-                &dispatch::DispatchMsg::DeliverPending {},
-            ),
+            payload: dispatch::encode_msg(&dispatch::DispatchMsg::DeliverPending {}),
         })
     }
 
@@ -897,7 +861,9 @@ impl Host {
     /// reads this to bound-and-verify a disk module's TRAILING durable commit
     /// whose journal seal was lost to a power cut.
     pub fn durable_commit_height(&self, id: &str) -> Option<u64> {
-        self.registry.get(id).and_then(|m| m.durable_commit_height())
+        self.registry
+            .get(id)
+            .and_then(|m| m.durable_commit_height())
     }
 
     /// capture the committed registry view for a finalized block.
@@ -1195,12 +1161,7 @@ impl Host {
                     // roll the WHOLE stage back, then replay only the accepted
                     // units to rebuild their writes without this one.
                     self.abort_all(&mut touched).await?;
-                    self.replay_accepted(
-                        height,
-                        consensus_time,
-                        &mut accepted,
-                        &mut touched,
-                    )
+                    self.replay_accepted(height, consensus_time, &mut accepted, &mut touched)
                     .await?;
                     relay_outcome = Err(cap_relay_reason(&reason));
                     results[i] = Some(MemberOutcome::Rejected {
@@ -1227,8 +1188,7 @@ impl Host {
             };
             let mut cev: Vec<Event> = Vec::new();
             let mut cdi: Vec<DispatchRecord> = Vec::new();
-            let cqueue: VecDeque<(Origin, Msg)> =
-                VecDeque::from([(corigin.clone(), cmsg.clone())]);
+            let cqueue: VecDeque<(Origin, Msg)> = VecDeque::from([(corigin.clone(), cmsg.clone())]);
             match self
                 .drain_queue(
                     height,
@@ -1262,12 +1222,7 @@ impl Host {
                 }
                 Err(reason) => {
                     self.abort_all(&mut touched).await?;
-                    self.replay_accepted(
-                        height,
-                        consensus_time,
-                        &mut accepted,
-                        &mut touched,
-                    )
+                    self.replay_accepted(height, consensus_time, &mut accepted, &mut touched)
                     .await?;
                     continuations.push((
                         i,
@@ -1759,21 +1714,4 @@ impl Ctx for ReadOnlyQueryCtx<'_> {
     fn emit_msg(&mut self, _msg: Msg) {}
 
     fn emit_event(&mut self, _ev: Event) {}
-}
-
-#[cfg(test)]
-mod state_schema_tests {
-    use super::state_schema_fingerprint;
-
-    #[test]
-    fn fingerprint_is_canonically_sorted_and_revision_sensitive() {
-        let first = state_schema_fingerprint([("runs", 2), ("chat", 1)]);
-        let reordered = state_schema_fingerprint([("chat", 1), ("runs", 2)]);
-        let old_runs = state_schema_fingerprint([("chat", 1), ("runs", 1)]);
-        assert_eq!(
-            first, reordered,
-            "registry construction order is irrelevant"
-        );
-        assert_ne!(first, old_runs, "a canonical schema change requires a bump");
-    }
 }

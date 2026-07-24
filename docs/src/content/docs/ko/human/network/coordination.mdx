@@ -82,9 +82,11 @@ import { InvitationFlow } from '../../../../../components/diagram/InvitationFlow
 
 ## 코디네이터 운영하기
 
-바이너리는 `bin/coordinator`입니다. 필수 플래그 `--listen`과 모드 선택자를
-파싱합니다. 정확히 하나의 UDP 소켓을 바인딩하고, 디스크도 설정 파일도 없으며,
-시작 시 `coordinator listening on <addr>`를 출력합니다.
+바이너리는 `bin/coordinator`입니다. `--listen`은 UDP 랑데부 소켓을,
+`--relay-listen <addr|none>`은 선택적인 TCP sealed-intro fallback(기본값
+`0.0.0.0:443`)을 선택합니다. 이 fallback은 최초 admission 데이터그램만
+운반하며, 성립된 overlay나 peer 데이터는 운반하지 않습니다. 프로세스는 디스크나
+설정 파일을 유지하지 않습니다.
 
 **공개(기본값).** 모드 플래그가 필요 없으며, 소유 증명으로 서명된 모든 요청을
 받습니다:
@@ -100,13 +102,6 @@ coordinator --listen 0.0.0.0:3478
 
 ```sh
 coordinator --listen 203.0.113.10:3478 --genesis-set /etc/ducktape/network.toml
-```
-
-**레거시 완전 개방(개발 전용).** `--allow-anonymous`는 소유 증명을 끄고 인증되지
-않은 요청을 받아, 인가 이전 동작과 동일합니다. 로컬 테스트에만 쓰세요:
-
-```sh
-coordinator --listen 127.0.0.1:3478 --allow-anonymous
 ```
 
 잘못되었거나 값이 없는 `--genesis-set`은 **하드 에러**이며, 더 약한 정책으로 조용히

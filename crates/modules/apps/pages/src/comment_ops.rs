@@ -1,5 +1,6 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
+    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_AUTHOR_BYTES,
+    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
     MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
     PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
@@ -28,7 +29,11 @@ fn target_index_key(target: &str) -> String {
 fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
     match origin {
         Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
+        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
+            Err(PageError::AuthorTooLarge)
+        }
         Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
+        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
         Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
         Origin::System => Ok(AuthorRef::System),
     }
@@ -200,6 +205,9 @@ impl Pages {
                     Some(agent_id) => {
                         if agent_id.is_empty() {
                             return Err(PageError::EmptyAgent);
+                        }
+                        if agent_id.len() > MAX_COMMENT_AGENT_ID_BYTES {
+                            return Err(PageError::AgentIdTooLarge);
                         }
                         match author_from_origin(origin)? {
                             AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },

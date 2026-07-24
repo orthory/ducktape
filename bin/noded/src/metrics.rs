@@ -68,7 +68,6 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
 pub struct NodeMetrics {
     block_height: Registered<raw::Gauge>,
     blocks_total: Registered<raw::Counter>,
-    ops_total: Registered<raw::Counter>,
     apply_latency: Registered<raw::Histogram>,
     dispatch_total: Registered<raw::Family<DispatchLabels, raw::Counter>>,
     node_phase: Registered<raw::Family<PhaseLabels, raw::Gauge>>,
@@ -107,13 +106,6 @@ impl NodeMetrics {
             blocks_total: context.counter(
                 "ducktape_blocks",
                 "committed local blocks since daemon start",
-            ),
-            // one BLOCK now aggregates N member ops; `ducktape_blocks_total`
-            // counts blocks, `ducktape_ops_total` counts the aggregated ops, so
-            // ops/blocks is the average batch size.
-            ops_total: context.counter(
-                "ducktape_ops",
-                "member ops aggregated into committed local blocks since daemon start",
             ),
             apply_latency: context.histogram(
                 "ducktape_block_apply_latency_seconds",
@@ -216,16 +208,8 @@ impl NodeMetrics {
         }
     }
 
-    /// count the member ops an applied block aggregated (`ducktape_ops_total`).
-    /// called once per applied block alongside [`record_block`](Self::record_block).
-    pub fn record_ops(&self, ops: usize) {
-        self.ops_total.inc_by(ops as u64);
-    }
-
-    /// Record deterministic finalized outcomes while retaining the older
-    /// aggregate `ducktape_ops_total` compatibility series.
+    /// Record deterministic finalized operation outcomes.
     pub fn record_op_outcomes(&self, applied: usize, rejected: usize) {
-        self.record_ops(applied + rejected);
         for (outcome, count) in [("applied", applied), ("rejected", rejected)] {
             self.op_outcomes
                 .get_or_create(&OutcomeLabels {

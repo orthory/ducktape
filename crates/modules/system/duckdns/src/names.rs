@@ -4,10 +4,8 @@
 use crate::{DUCKDNS_ZONE, DuckDnsName, MAX_LABEL_LEN, RESERVED_ROOT_LABELS};
 
 /// What a handle IS: lowercase ASCII `[a-z0-9-]`, no leading/trailing hyphen,
-/// at most 63 bytes. SHAPE ONLY — deliberately no reserved-label check, because
-/// this is the rule state validation and snapshot decoding enforce, and those
-/// must stay stable for bytes already committed. The shape is frozen; the
-/// reserved set is not.
+/// at most 63 bytes. This shape-only validator is exported for other label
+/// domains; DuckDNS state itself uses [`validate_handle`].
 pub fn validate_handle_shape(handle: &str) -> Result<(), String> {
     if handle.is_empty() {
         return Err("duckdns: account handle must be non-empty".into());
@@ -34,18 +32,7 @@ pub fn validate_handle_shape(handle: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The ADMISSION rule: shape, plus the reserved-root-label policy.
-///
-/// NEVER call this from `decode_state` / `validate_state`. `RESERVED_ROOT_LABELS`
-/// grows (it just grew by `agents`), and a label added to it is one an older
-/// binary happily registered. If decoding enforced the policy, the first node to
-/// run the new binary against a snapshot holding such a handle could not install
-/// duckdns state at all: no state sync, and no restore of its OWN recovery
-/// checkpoint (which embeds canonical snapshot bytes for non-persisting modules
-/// and reinstalls them at boot). That is a permanent brick with no migration
-/// path. So: legacy squats still DECODE, they are simply inert — `parse_hostname`
-/// refuses to build the name, `resolve` refuses to answer, and no new one can be
-/// registered.
+/// The DuckDNS handle rule: shape plus the reserved-root-label policy.
 pub fn validate_handle(handle: &str) -> Result<(), String> {
     validate_handle_shape(handle)?;
     if RESERVED_ROOT_LABELS.contains(&handle) {

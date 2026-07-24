@@ -46,18 +46,17 @@
 //! process's genesis line agrees, every converged line agrees, and the sync-only
 //! joiner's synced line equals the converged line.
 
-
 use commonware_cryptography::Signer;
 use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
 mod agent_cli;
 mod agent_plane;
+mod airlock_serve;
 mod blob_fetch;
 mod boot;
-mod code_plane;
-mod term_plane;
 mod cli;
 mod cli_args;
+mod code_plane;
 mod config;
 mod constants;
 mod cred_cli;
@@ -69,7 +68,6 @@ mod explorer;
 mod first_contact_join;
 mod fs_cli;
 mod gateway_plane;
-mod airlock_serve;
 mod gateway_routes;
 mod host_reads;
 mod host_resources;
@@ -94,35 +92,36 @@ mod resident_dispatch;
 mod resource_limits;
 mod rpc;
 mod sync;
+mod term_plane;
 mod userkey;
 mod userkey_cli;
 mod util;
 mod validator;
 mod voice;
 mod voice_plane;
+use crate::util::fatal;
 use config::Resolved;
+#[cfg(test)]
+use directory::{DirQuery, DirReply, decode_reply, encode_query};
+use duckfs_disk::SyncScratch;
 #[cfg(test)]
 use explorer::sealed_frame_block_row;
 #[cfg(test)]
 use noded::projection::project_root_op;
+use recovery::Recovery;
 #[cfg(test)]
 use replica::promotion::{
     PromotionBoundary, PromotionBoundarySource, choose_promotion_boundary,
     joiner_manifest_fetch_retry,
 };
 #[cfg(test)]
+use sdk::{Msg, StateRoot};
+#[cfg(test)]
 use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
 use util::hex;
-#[cfg(test)]
-use directory::{DirQuery, DirReply, decode_reply, encode_query};
-use crate::util::fatal;
-use duckfs_disk::SyncScratch;
-use recovery::Recovery;
-#[cfg(test)]
-use sdk::{Msg, StateRoot};
 
 fn main() {
     resource_limits::cap_malloc_arenas();
@@ -270,10 +269,7 @@ fn gateway_can_start(
              loopback address"
         );
     }
-    !sync_only
-        && gateway_listen.is_some()
-        && api_is_loopback
-        && wireguard_listen.is_some()
+    !sync_only && gateway_listen.is_some() && api_is_loopback && wireguard_listen.is_some()
 }
 
 fn run_node(
@@ -313,7 +309,10 @@ fn run_node(
         mesh_state_file,
         checkpoint_blocks,
         dev_demo,
-        sync_index,
+        // the shipped-index warm start's staging client rode the retired
+        // promotion exec-reboot; the serve side and the config key await
+        // the follow-up sweep.
+        sync_index: _,
         announce_capabilities,
         sandbox,
         sandbox_capacity,
@@ -390,11 +389,8 @@ fn run_node(
     // the key/consensus/blob tree, so a `..` from a run's cwd can't reach
     // user.key/node keys/qmdb/blobstore. `DUCKTAPE_AGENT_WORKSPACES` / _SESSIONS
     // override — see capability-host. host-local only, never consensus.
-    // non-portable (v2/persistent) agent workspaces stay under <storage>, exactly
-    // as today — relocating them would be a live (non-dormant) durability change.
-    // D7 relocation applies to the PORTABLE provisioner mount (agent_runs_root),
-    // which is out of <storage>; the pre-existing non-portable D7 gap is a
-    // separate, migration-aware hardening (tracked as a follow-up).
+    // Persistent agent workspaces stay under <storage>; portable run mounts
+    // live under agent_runs_root outside it.
     let agent_dirs = capability_host::AgentDirs::under(&storage);
     // 15s instead of commonware's 60s default: this read/write deadline is
     // the mesh's only half-open detector — see `constants::MESH_IO_TIMEOUT`.
@@ -543,7 +539,7 @@ fn run_node(
                 .any(|k| k.as_slice() == signer.public_key().as_ref())
         });
         if !checkpoint_seats_me && !validators.contains(&signer.public_key()) {
-            replica::run(
+            let baton = replica::run(
                 context,
                 network,
                 &mut oracle,
@@ -551,31 +547,30 @@ fn run_node(
                 &mesh_participants,
                 sync_sources,
                 sync_source,
-                advertised_reach,
-                status_public_key,
-                signer,
-                label,
-                namespace,
+                advertised_reach.clone(),
+                status_public_key.clone(),
+                signer.clone(),
+                label.clone(),
+                namespace.clone(),
                 identity_chain_id,
-                peers,
-                validators,
+                peers.clone(),
+                validators.clone(),
                 wireguard_listen,
-                wireguard_key_file,
-                primary_coordinator,
+                wireguard_key_file.clone(),
+                primary_coordinator.clone(),
                 coordinator_relay,
-                wireguard_advertised,
+                wireguard_advertised.clone(),
                 &invite_token,
                 &invite_wireguard,
                 invite_fronts,
                 &coord_cap,
-                workspace,
-                chain_id,
-                mesh_state_file,
+                workspace.clone(),
+                chain_id.clone(),
+                mesh_state_file.clone(),
                 checkpoint_blocks,
-                sync_index,
                 announce_capabilities,
-                sandbox,
-                sandbox_capacity,
+                sandbox.clone(),
+                sandbox_capacity.clone(),
                 rpc_listener,
                 http_cmds,
                 gateway_requests,
@@ -584,15 +579,15 @@ fn run_node(
                 session_requests,
                 local_gateway_via,
                 &stream_hub,
-                index,
+                index.clone(),
                 metrics.clone(),
                 status.clone(),
                 voice_requests,
-                blobs,
+                blobs.clone(),
                 &agent_provisioner,
                 &cred_resolver,
                 &agent_dirs,
-                overlay_slot,
+                overlay_slot.clone(),
                 bulk_pacer.clone(),
                 plane_monitor.clone(),
                 storage_for_sync,
@@ -602,6 +597,50 @@ fn run_node(
                 duckfs_dir,
             )
             .await;
+            // THE PROMOTION SEAT: the park loop returned the baton — the
+            // validator role continues INSIDE this process, over the mesh
+            // and planes the parked role already runs.
+            validator::run_promoted(
+                baton,
+                oracle,
+                metrics,
+                status,
+                status_public_key,
+                signer,
+                label,
+                namespace,
+                peers,
+                validators,
+                coordinated,
+                wireguard_listen,
+                wireguard_key_file,
+                primary_coordinator,
+                wireguard_advertised,
+                invite_listen,
+                coordination,
+                coord_cap,
+                chain_id,
+                mesh_state_file,
+                advertised_reach,
+                checkpoint_blocks,
+                dev_demo,
+                announce_capabilities,
+                sandbox,
+                sandbox_capacity,
+                stream_hub,
+                index,
+                code_stage_requests,
+                blobs,
+                agent_provisioner,
+                cred_resolver,
+                agent_dirs,
+                overlay_slot,
+                bulk_pacer,
+                plane_monitor,
+                sync_monitor,
+            )
+            .await;
+            return;
         }
         validator::run_validator(
             context,

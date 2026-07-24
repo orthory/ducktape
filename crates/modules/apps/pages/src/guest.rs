@@ -10,9 +10,8 @@
 //! logic over a host-injected [`sdk::MerkleStore`] — so the port injects
 //! [`WitStore`], the adapter's `MerkleStore` over the wit `state-*` imports,
 //! and the REAL qmdb store stays host-side (`WasmModule::with_store`). there
-//! is NO per-dispatch snapshot: the store IS the state, the wasm root IS the
-//! store's merkle root, and the cutover is ROOT-CONTINUOUS (state schema
-//! revision stays 1; pre-cutover workspaces reopen unchanged).
+//! is NO per-dispatch snapshot: the store IS the state and the wasm root is
+//! the store's Merkle root.
 //!
 //! the guest is re-instantiated per dispatch, so the native module inside it
 //! must fully FLUSH per dispatch. each `execute`:
@@ -64,8 +63,8 @@ use crate::Pages;
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "pages";
-/// the engagement plane every newly-added comment is reported to — EXACTLY
-/// the production wiring the host builder chain used pre-cutover
+/// the engagement plane every newly-added comment is reported to — the
+/// production wiring in
 /// (`bin/node/src/host_state.rs`): `.with_tagging("tagging")`. the wiring is
 /// genesis config compiled into the guest; drift here would be a consensus
 /// fork.

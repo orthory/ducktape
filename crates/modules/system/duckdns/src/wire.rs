@@ -20,12 +20,7 @@ pub const DUCKDNS_ZONE: &str = "duck";
 /// `RESERVED_ROOT_LABELS` (`app/src/domain/duckdns-client.ts`, pinned to this
 /// literal by `duckdns-client.test.ts`) and `ops/demo-gateway.mjs`.
 ///
-/// THIS SET MAY ONLY BE READ AT ADMISSION. It grows over time, and every label
-/// added to it is one an older binary was happy to register. Enforce it in
-/// `set_handle` and `parse_hostname`; NEVER in `validate_state` / `decode_state`,
-/// or the growth retroactively makes an already-committed snapshot undecodable
-/// and bricks state sync and checkpoint restore for every node. See
-/// `validate_handle` vs `validate_handle_shape` in `names.rs`.
+/// Enforced by registration, hostname parsing, and snapshot validation.
 pub const RESERVED_ROOT_LABELS: &[&str] = &["net", "agents"];
 pub const MAX_LABEL_LEN: usize = 63;
 pub const MAX_QUERY_LIMIT: u64 = 256;

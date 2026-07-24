@@ -3,7 +3,11 @@
 Status: SHIPPED through phase 4 (2026-07-10; PRs #291, #293, #296 + the
 phase-4 closeout). Residents fold finalized frames, restart by journal
 replay, cross epochs by in-loop follower swap, and promote from their own
-state; state sync is join-time bootstrap only. Two deltas against the plan
+state; state sync is join-time bootstrap only. The phase-3 re-exec question
+is SETTLED (2026-07-24): promotion seats the engine IN-PROCESS — the park
+loop hands a `PromotionBaton` to `validator::run_promoted` over the same
+started mesh (the replica banks reclaimable engine lanes per epoch), and
+`reboot_self` is gone. Two deltas against the plan
 below, both forced by reality and recorded in the PRs: the promotion
 collapse (phase 3 here) landed IN phase 2 — a quorum-widening cutover halts
 the source awaiting the promoted node, so wait-for-the-source promotion

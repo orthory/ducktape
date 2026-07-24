@@ -16,9 +16,9 @@ const AUTH_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 type AuthKeyCache = Option<LruCache<NodeKey, ed25519::PublicKey>>;
 
 /// Small LRU for parsed ed25519 caller keys. Parsing a valid key is roughly a
-/// tenth of request verification cost. It allocates lazily, so the fully-open
-/// legacy coordinator pays nothing, and the library-enforced capacity keeps
-/// attacker-selected callers from growing memory without bound.
+/// tenth of request verification cost. It allocates lazily, and the
+/// library-enforced capacity keeps attacker-selected callers from growing
+/// memory without bound.
 fn resolve_auth_key(cache: &mut AuthKeyCache, key: NodeKey) -> Option<ed25519::PublicKey> {
     if let Some(cached) = cache.as_mut().and_then(|entries| entries.get(&key)) {
         return Some(cached.clone());
@@ -35,8 +35,7 @@ pub type CoordinatorReply = (SocketAddr, Msg);
 
 /// Allocation-free output from the coordinator's bounded request handler.
 /// One request can produce at most three datagrams: the lookup response and a
-/// `PunchSync` for each peer. The compatibility handlers still return `Vec`s;
-/// the live UDP loop consumes this fixed-capacity form directly.
+/// `PunchSync` for each peer.
 pub type CoordinatorReplies = ArrayVec<CoordinatorReply, 3>;
 
 /// An authenticated request ready for the ordered rendezvous state machine.
@@ -94,13 +93,6 @@ impl AuthVerifier {
             inner: req.inner,
         })
     }
-
-    fn allows_legacy(&self) -> bool {
-        matches!(
-            self.policy.as_ref(),
-            AuthPolicy::Open { require_pop: false }
-        )
-    }
 }
 
 /// The untrusted entry helper. Maps a node key to the reflexive address the
@@ -122,7 +114,7 @@ impl Default for Coordinator {
     fn default() -> Self {
         Self {
             adverts: SharedAdverts::wrap(AdvertBook::default()),
-            auth: AuthVerifier::new(AuthPolicy::default()), // fully-open
+            auth: AuthVerifier::new(AuthPolicy::default()),
             rejects: 0,
         }
     }
@@ -206,79 +198,53 @@ impl Coordinator {
         }
     }
 
-    /// Handle a legacy (unauthenticated) request at wall-clock `now` (seconds).
-    /// Accepted ONLY under the fully-open policy; any auth-requiring policy
-    /// drops it.
-    pub fn handle_legacy(
-        &mut self,
-        from: SocketAddr,
-        msg: Msg,
-        now: u64,
-    ) -> Vec<(SocketAddr, Msg)> {
-        self.handle_legacy_replies(from, msg, now)
-            .into_iter()
-            .collect()
-    }
-
-    /// Allocation-free legacy handler used by the live UDP loop.
-    pub fn handle_legacy_replies(
-        &mut self,
-        from: SocketAddr,
-        msg: Msg,
-        now: u64,
-    ) -> CoordinatorReplies {
-        if self.auth.allows_legacy() {
-            self.handle_with_caller_replies(from, msg, None, now)
-        } else {
-            self.rejects += 1;
-            CoordinatorReplies::new()
-        }
-    }
-
     pub(crate) fn handle_verified_replies(
         &mut self,
         from: SocketAddr,
         req: VerifiedRequest,
         now: u64,
     ) -> CoordinatorReplies {
-        self.handle_with_caller_replies(from, req.inner, Some(req.caller), now)
+        self.handle_replies(req.caller, from, req.inner, now)
     }
 
     pub(crate) fn record_reject(&mut self) {
         self.rejects += 1;
     }
 
-    /// Handle one datagram observed from `from` at wall-clock `now` (seconds);
-    /// return datagrams to send. The time-threading is what lets registrations
-    /// EXPIRE: a mapping older than the TTL resolves to `None` and never
-    /// receives a `PunchSync` fan-out (its NAT pinhole is long dead). The
-    /// caller identity is unknown on this path, so a `Lookup`'s PunchSync
-    /// fan-out reverse-maps the source (through the private
-    /// `handle_with_caller_replies` helper).
-    pub fn handle_at(&mut self, from: SocketAddr, msg: Msg, now: u64) -> Vec<(SocketAddr, Msg)> {
-        self.handle_with_caller_replies(from, msg, None, now)
-            .into_iter()
-            .collect()
-    }
-
-    /// Time-frozen convenience (`now = 0`) for the deterministic sims/tests,
-    /// where no wall time passes between registration and lookup.
-    pub fn handle(&mut self, from: SocketAddr, msg: Msg) -> Vec<(SocketAddr, Msg)> {
-        self.handle_with_caller_replies(from, msg, None, 0)
-            .into_iter()
-            .collect()
-    }
-
-    /// The pure handler. `caller`, when `Some`, is the AUTHENTICATED requesting
-    /// identity — used for a `Lookup`'s peer-directed `PunchSync` so the passive
-    /// side learns the caller's real key even before the caller has registered.
-    /// When `None` (legacy path) the caller key is reverse-mapped from the
-    /// datagram source, falling back to a zero key.
-    fn handle_with_caller_replies(
+    /// Auth-bypassing seam for deterministic in-memory simulations. It is
+    /// compiled only for tests/simnat and still requires the already-verified
+    /// caller identity used by the production handler.
+    #[cfg(any(test, feature = "simnat"))]
+    pub fn handle_verified_at(
         &mut self,
+        caller: NodeKey,
         from: SocketAddr,
         msg: Msg,
-        caller: Option<NodeKey>,
+        now: u64,
+    ) -> Vec<(SocketAddr, Msg)> {
+        self.handle_replies(caller, from, msg, now)
+            .into_iter()
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "simnat"))]
+    pub(crate) fn handle_verified(
+        &mut self,
+        caller: NodeKey,
+        from: SocketAddr,
+        msg: Msg,
+    ) -> Vec<(SocketAddr, Msg)> {
+        self.handle_verified_at(caller, from, msg, 0)
+    }
+
+    /// The pure ordered state step. `caller` is the authenticated requesting
+    /// identity, used for a `Lookup`'s peer-directed `PunchSync` so the passive
+    /// side learns the caller's real key even before the caller has registered.
+    fn handle_replies(
+        &mut self,
+        caller: NodeKey,
+        from: SocketAddr,
+        msg: Msg,
         now: u64,
     ) -> CoordinatorReplies {
         // One guard per request: this handler is sync (no awaits to hold it
@@ -315,14 +281,6 @@ impl Coordinator {
                     },
                 );
                 if let Some(peer_addr) = target {
-                    // The caller's key for the peer-directed PunchSync: the
-                    // AUTHENTICATED caller when we have one, else reverse-map the
-                    // datagram source (legacy path), falling back to a zero key
-                    // if it never registered (the target still learns the
-                    // caller's reflexive to punch back).
-                    let caller_key = caller
-                        .or_else(|| adverts.key_for_src(from, now))
-                        .unwrap_or(NodeKey([0u8; 32]));
                     CoordinatorReplies::from([
                         response,
                         (
@@ -335,7 +293,7 @@ impl Coordinator {
                         (
                             peer_addr,
                             Msg::PunchSync {
-                                peer: caller_key,
+                                peer: caller,
                                 peer_reflexive: from,
                             },
                         ),
@@ -388,8 +346,8 @@ mod tests {
         let b_src = addr(2, 2222);
         let a = NodeKey([0xaa; 32]);
         let b = NodeKey([0xbb; 32]);
-        c.handle(a_src, Msg::Register { key: a });
-        c.handle(b_src, Msg::Register { key: b });
+        c.handle_verified(a, a_src, Msg::Register { key: a });
+        c.handle_verified(b, b_src, Msg::Register { key: b });
 
         // A rebinds to a new reflexive and re-advertises under a higher nonce.
         let a_new = addr(1, 9999);
@@ -397,7 +355,7 @@ mod tests {
 
         // B's lookup now resolves A's NEW reflexive, and the fan-out PunchSync to
         // A targets the new mapping.
-        let out = c.handle(b_src, Msg::Lookup { key: a });
+        let out = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(out.contains(&(
             b_src,
             Msg::LookupResponse {
@@ -415,7 +373,7 @@ mod tests {
 
         // A replayed/equal-nonce re-advert is stale and does not move the mapping.
         assert_eq!(c.readvertise(a, addr(1, 7777), 1, 0), AdvertOutcome::Stale);
-        let out2 = c.handle(b_src, Msg::Lookup { key: a });
+        let out2 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(out2.contains(&(
             b_src,
             Msg::LookupResponse {
@@ -437,14 +395,17 @@ mod tests {
         let new = addr(1, 9999);
 
         // Boot: A registers from its old mapping (implicit nonce 0).
-        assert!(c.handle(old, Msg::Register { key: a }).is_empty());
+        assert!(
+            c.handle_verified(a, old, Msg::Register { key: a })
+                .is_empty()
+        );
 
         // A rebinds and re-advertises the NEW mapping over the wire under nonce 1.
         assert!(
-            c.handle(new, Msg::Readvertise { key: a, nonce: 1 })
+            c.handle_verified(a, new, Msg::Readvertise { key: a, nonce: 1 })
                 .is_empty()
         );
-        let out = c.handle(b_src, Msg::Lookup { key: a });
+        let out = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
         assert!(
             out.contains(&(
                 b_src,
@@ -458,8 +419,11 @@ mod tests {
 
         // A duplicated/reordered/replayed Register from the OLD mapping arrives
         // late. It must NOT roll the fresh {new, nonce=1} mapping back to old.
-        assert!(c.handle(old, Msg::Register { key: a }).is_empty());
-        let out2 = c.handle(b_src, Msg::Lookup { key: a });
+        assert!(
+            c.handle_verified(a, old, Msg::Register { key: a })
+                .is_empty()
+        );
+        let out2 = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
         assert!(
             out2.contains(&(
                 b_src,
@@ -473,10 +437,10 @@ mod tests {
 
         // A wire Readvertise at an equal-or-lower nonce is likewise stale.
         assert!(
-            c.handle(old, Msg::Readvertise { key: a, nonce: 1 })
+            c.handle_verified(a, old, Msg::Readvertise { key: a, nonce: 1 })
                 .is_empty()
         );
-        let out3 = c.handle(b_src, Msg::Lookup { key: a });
+        let out3 = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
         assert!(out3.contains(&(
             b_src,
             Msg::LookupResponse {
@@ -490,12 +454,8 @@ mod tests {
     fn bind_request_echoes_observed_source() {
         let mut c = Coordinator::new();
         let src = addr(7, 40000);
-        let out = c.handle(
-            src,
-            Msg::BindRequest {
-                from: NodeKey([1u8; 32]),
-            },
-        );
+        let caller = NodeKey([1u8; 32]);
+        let out = c.handle_verified(caller, src, Msg::BindRequest { from: caller });
         assert_eq!(out, vec![(src, Msg::BindResponse { reflexive: src })]);
     }
 
@@ -506,12 +466,18 @@ mod tests {
         let b_src = addr(2, 2222);
         let a = NodeKey([0xaa; 32]);
         let b = NodeKey([0xbb; 32]);
-        assert!(c.handle(a_src, Msg::Register { key: a }).is_empty());
-        assert!(c.handle(b_src, Msg::Register { key: b }).is_empty());
+        assert!(
+            c.handle_verified(a, a_src, Msg::Register { key: a })
+                .is_empty()
+        );
+        assert!(
+            c.handle_verified(b, b_src, Msg::Register { key: b })
+                .is_empty()
+        );
 
         // A looks up B: coordinator replies to A with B's reflexive AND tells
         // both sides to punch simultaneously.
-        let out = c.handle(a_src, Msg::Lookup { key: b });
+        let out = c.handle_verified(a, a_src, Msg::Lookup { key: b });
         assert!(out.contains(&(
             a_src,
             Msg::LookupResponse {
@@ -540,7 +506,7 @@ mod tests {
         let mut c = Coordinator::new();
         let a_src = addr(1, 1111);
         let missing = NodeKey([0xcc; 32]);
-        let out = c.handle(a_src, Msg::Lookup { key: missing });
+        let out = c.handle_verified(NodeKey([0xaa; 32]), a_src, Msg::Lookup { key: missing });
         assert_eq!(
             out,
             vec![(
@@ -673,7 +639,7 @@ mod tests {
         let source = addr(1, 1111);
         let now = 1_000_000;
         let inner = Msg::BindRequest { from: caller };
-        let mut coordinator = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let mut coordinator = Coordinator::with_policy(AuthPolicy::Public);
 
         assert!(coordinator.auth.auth_keys.is_none(), "cache starts lazy");
         let good = AuthRequest {
@@ -896,62 +862,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unauthenticated_request_rejected_unless_fully_open() {
-        use crate::auth::AuthPolicy;
-        let key = NodeKey([1u8; 32]);
-
-        // Fully-open: a bare Register is accepted (mapping created, nothing rejected).
-        let mut open = Coordinator::new(); // Open { require_pop: false }
-        assert!(
-            open.handle_legacy(addr(1, 1111), Msg::Register { key }, 0)
-                .is_empty()
-        );
-        assert_eq!(open.rejects(), 0, "fully-open never rejects");
-        let out = open.handle_legacy(addr(2, 2222), Msg::Lookup { key }, 0);
-        assert!(
-            out.iter().any(|(_, m)| matches!(
-                m,
-                Msg::LookupResponse {
-                    reflexive: Some(_),
-                    ..
-                }
-            )),
-            "the bare Register created a mapping under fully-open"
-        );
-
-        // require_pop: a bare, unauthenticated Register is dropped and counted.
-        let mut gated = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
-        let before = gated.rejects();
-        assert!(
-            gated
-                .handle_legacy(addr(1, 1111), Msg::Register { key }, 0)
-                .is_empty()
-        );
-        assert_eq!(gated.rejects(), before + 1);
-        // No mapping was created: a lookup for the same key resolves to None.
-        let out = gated.handle_legacy(addr(2, 2222), Msg::Lookup { key }, 0);
-        // (The lookup is itself a legacy request, also dropped under require_pop —
-        // so it too returns empty; the reject counter is the load-bearing assertion.)
-        assert!(out.is_empty());
-        assert_eq!(gated.rejects(), before + 2);
-    }
-
-    #[test]
     fn expired_registration_lookup_is_none_and_fans_no_punch_sync() {
-        let mut c = Coordinator::with_policy_and_ttl(
-            crate::auth::AuthPolicy::Open { require_pop: false },
-            120,
-        );
+        let mut c = Coordinator::with_policy_and_ttl(crate::auth::AuthPolicy::Public, 120);
         let a = NodeKey([0xaa; 32]);
+        let b = NodeKey([0xbb; 32]);
         let a_src = addr(1, 1111);
         let b_src = addr(2, 2222);
         assert!(
-            c.handle_at(a_src, Msg::Register { key: a }, 1_000)
+            c.handle_verified_at(a, a_src, Msg::Register { key: a }, 1_000)
                 .is_empty()
         );
 
         // Within TTL: resolves and fans.
-        let out = c.handle_at(b_src, Msg::Lookup { key: a }, 1_100);
+        let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_100);
         assert!(out.contains(&(
             b_src,
             Msg::LookupResponse {
@@ -965,7 +888,7 @@ mod tests {
         );
 
         // Past TTL: honest None, and crucially NO PunchSync toward the dead pinhole.
-        let out = c.handle_at(b_src, Msg::Lookup { key: a }, 1_121);
+        let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_121);
         assert_eq!(
             out,
             vec![(
@@ -980,26 +903,24 @@ mod tests {
 
     #[test]
     fn keepalive_readvertise_extends_registration_life() {
-        let mut c = Coordinator::with_policy_and_ttl(
-            crate::auth::AuthPolicy::Open { require_pop: false },
-            120,
-        );
+        let mut c = Coordinator::with_policy_and_ttl(crate::auth::AuthPolicy::Public, 120);
         let a = NodeKey([0xaa; 32]);
+        let b = NodeKey([0xbb; 32]);
         let a_src = addr(1, 1111);
         let b_src = addr(2, 2222);
         assert!(
-            c.handle_at(a_src, Msg::Register { key: a }, 1_000)
+            c.handle_verified_at(a, a_src, Msg::Register { key: a }, 1_000)
                 .is_empty()
         );
         assert!(
-            c.handle_at(a_src, Msg::Readvertise { key: a, nonce: 1 }, 1_100)
+            c.handle_verified_at(a, a_src, Msg::Readvertise { key: a, nonce: 1 }, 1_100)
                 .is_empty()
         );
         assert!(
-            c.handle_at(a_src, Msg::Readvertise { key: a, nonce: 2 }, 1_200)
+            c.handle_verified_at(a, a_src, Msg::Readvertise { key: a, nonce: 2 }, 1_200)
                 .is_empty()
         );
-        let out = c.handle_at(b_src, Msg::Lookup { key: a }, 1_300);
+        let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_300);
         assert!(
             out.contains(&(
                 b_src,
@@ -1029,7 +950,7 @@ mod tests {
         let victim = NodeKey(nb);
         let now = now_secs();
 
-        let mut c = Coordinator::with_policy(AuthPolicy::Open { require_pop: true });
+        let mut c = Coordinator::with_policy(AuthPolicy::Public);
         let victim_src = addr(1, 4000);
         let attacker_src = addr(9, 6666);
         let b_src = addr(2, 2222);
@@ -1050,7 +971,8 @@ mod tests {
 
         // A lookup still resolves the victim's ORIGINAL reflexive, and the punch
         // fan-out targets it — never the attacker.
-        let out = c.handle_at(b_src, Msg::Lookup { key: victim }, now);
+        let out =
+            c.handle_verified_at(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: victim }, now);
         assert!(
             out.contains(&(
                 b_src,

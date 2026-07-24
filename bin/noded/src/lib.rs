@@ -60,9 +60,8 @@ mod gateway_http;
 pub mod gateway_ws_token;
 pub mod origin_guard;
 pub use gateway_http::{
-    GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
-    GatewayBody, GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router,
-    serve_browser_gateway,
+    GatewayBody, GatewayFailure, GatewayJob, GatewayLane, GatewayProxyReply, GatewayProxyRequest,
+    GatewayResponse, GatewayWsMsg, collect_body, gateway_browser_router, serve_browser_gateway,
 };
 // git smart-HTTP: forge as a full push+fetch remote over /forge/{repo}/….
 mod git_http;
@@ -278,12 +277,10 @@ pub struct NodeStatus {
     /// this node's mesh identity (hex ed25519 key) — what a client stamps
     /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
     /// empty on daemons with no mesh identity (the embedded local daemon).
-    #[serde(default)]
     pub public_key: String,
     /// Node-owned operational state. This is the stable, role-aware facade for
     /// operators; dependency-specific consensus and transport metrics remain
     /// available on `/metrics` for deeper diagnosis.
-    #[serde(default)]
     pub operations: OperationalStatus,
 }
 
@@ -605,10 +602,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // topic. same trusted-local gate as the other mutating /v1 routes (see
         // term.rs). close is idempotent.
         .route("/v1/term/sessions", post(term::create_session))
-        .route(
-            "/v1/term/sessions/{id}/close",
-            post(term::close_session),
-        )
+        .route("/v1/term/sessions/{id}/close", post(term::close_session))
         .route("/v1/fs/workspaces", post(workspaces::create_workspace))
         .route(
             "/v1/fs/workspaces/{id}/commit",
@@ -632,8 +626,7 @@ pub fn router(handle: NodeHandle) -> Router {
         .route(
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
-        )
-        ;
+        );
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
     // not a gated-but-present route. its own PoP middleware is baked in.
@@ -920,20 +913,6 @@ async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Resp
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn status_from_an_older_node_defaults_operational_state() {
-        let status: NodeStatus = serde_json::from_value(serde_json::json!({
-            "version": "0.1.0",
-            "root_hash": "",
-            "height": 0,
-            "modules": []
-        }))
-        .expect("the additive status field stays backward-compatible");
-
-        assert_eq!(status.operations.role, NodeRole::Unknown);
-        assert_eq!(status.operations.phase, NodePhase::Starting);
-    }
 
     #[tokio::test]
     async fn shutdown_wakes_every_surface_and_remains_sticky() {

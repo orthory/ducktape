@@ -56,9 +56,7 @@ pub(super) fn tools() -> Vec<Tool> {
         Tool {
             name: "ducktape_agents",
             description: "List registered agents with their status, owner, allowed actions, \
-                          resource caps, and curated skills. AgentRole::ProjectLibrarian is \
-                          historical decode-only compatibility; it does not select a special \
-                          execution or knowledge path.",
+                          resource caps, and curated skills.",
             schema: bounded_list_schema,
             handler: agents_list,
         },
@@ -103,15 +101,17 @@ pub(super) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "ducktape_pages",
-            description: "List every page with its id and title.",
-            schema: || schema(&[]),
+            description: "Read one bounded page of page ids and titles. Pass next_after as after \
+                          to continue.",
+            schema: page_list_schema,
             handler: pages_list,
         },
         Tool {
             name: "ducktape_page",
-            description: "Read a whole page as its blocks, in document order. Block ids from \
-                          here are what ducktape_page_comment and ducktape_page_check take.",
-            schema: || schema(&[("page_id", "string", true, "The page to read.")]),
+            description: "Read one bounded document-order block page. Pass next_after as after \
+                          to continue. Block ids here are what ducktape_page_comment and \
+                          ducktape_page_check take.",
+            schema: page_get_schema,
             handler: page_get,
         },
         Tool {
@@ -261,22 +261,29 @@ fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
 }
 
 fn tasks_list(run: &Run, _args: &Value) -> Result<Value> {
-    run.node.query(TARGET_TASKS, encode(&WorkQuery::Task(TaskQuery::List))?)
+    run.node
+        .query(TARGET_TASKS, encode(&WorkQuery::Task(TaskQuery::List))?)
 }
 
-fn pages_list(run: &Run, _args: &Value) -> Result<Value> {
-    run.node.view(TARGET_PAGES, json!({"list_pages": {}}))
+fn pages_list(run: &Run, args: &Value) -> Result<Value> {
+    run.node.view(
+        TARGET_PAGES,
+        json!({"list_pages": {"after": page_cursor(args)?, "limit": page_limit(args)?}}),
+    )
 }
 
 fn page_get(run: &Run, args: &Value) -> Result<Value> {
     let query = PageQuery::GetPage {
         page_id: arg_str(args, "page_id")?,
+        after: page_cursor(args)?,
+        limit: page_limit(args)?,
     };
     run.node.query(TARGET_PAGES, encode(&query)?)
 }
 
 fn forge_repos(run: &Run, _args: &Value) -> Result<Value> {
-    run.node.query(TARGET_FORGE, encode(&ForgeQuery::ListRepos)?)
+    run.node
+        .query(TARGET_FORGE, encode(&ForgeQuery::ListRepos)?)
 }
 
 fn forge_items(run: &Run, args: &Value) -> Result<Value> {
@@ -368,6 +375,64 @@ fn bounded_list_schema() -> Value {
     value
 }
 
+fn page_list_schema() -> Value {
+    page_read_schema(&[])
+}
+
+fn page_get_schema() -> Value {
+    page_read_schema(&[("page_id", "string", true, "The page to read.")])
+}
+
+fn page_read_schema(required: &[(&str, &str, bool, &str)]) -> Value {
+    let mut props = required.to_vec();
+    props.extend([
+        (
+            "after",
+            "string",
+            false,
+            "Exclusive cursor from the prior page's next_after.",
+        ),
+        (
+            "limit",
+            "integer",
+            false,
+            "Records to return (default and maximum 256).",
+        ),
+    ]);
+    let mut value = schema(&props);
+    value["properties"]["limit"]["minimum"] = json!(1);
+    value["properties"]["limit"]["maximum"] = json!(pages::MAX_PAGE_QUERY_LIMIT);
+    value["properties"]["limit"]["default"] = json!(pages::MAX_PAGE_QUERY_LIMIT);
+    value["additionalProperties"] = Value::Bool(false);
+    value
+}
+
+fn page_cursor(args: &Value) -> Result<Option<String>> {
+    match args.get("after") {
+        None => Ok(None),
+        Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
+        Some(_) => Err(NodeError::Rejected(
+            "this tool needs a string \"after\" argument".into(),
+        )),
+    }
+}
+
+fn page_limit(args: &Value) -> Result<u16> {
+    let Some(value) = args.get("limit") else {
+        return Ok(pages::MAX_PAGE_QUERY_LIMIT);
+    };
+    let limit = value.as_u64().ok_or_else(|| {
+        NodeError::Rejected("this tool needs an integer \"limit\" argument".into())
+    })?;
+    if !(1..=u64::from(pages::MAX_PAGE_QUERY_LIMIT)).contains(&limit) {
+        return Err(NodeError::Rejected(format!(
+            "this tool needs \"limit\" between 1 and {}",
+            pages::MAX_PAGE_QUERY_LIMIT
+        )));
+    }
+    Ok(limit as u16)
+}
+
 fn list_limit(args: &Value) -> Result<usize> {
     let object = args
         .as_object()
@@ -450,8 +515,10 @@ mod tests {
             encode(&WorkQuery::Task(TaskQuery::List)).unwrap(),
             json!({"task": "list"})
         );
-        serde_json::from_value::<pages::index::PagesViewQuery>(json!({"list_pages": {}}))
-            .expect("the list_pages view literal is pages' view wire");
+        serde_json::from_value::<pages::index::PagesViewQuery>(
+            json!({"list_pages": {"after": "page-8", "limit": 8}}),
+        )
+        .expect("the list_pages view literal is pages' view wire");
         assert_eq!(
             encode(&ForgeQuery::GetItem {
                 repo: "app".into(),
@@ -474,6 +541,44 @@ mod tests {
         // a model that asks for the whole channel does not get to blow its own
         // context: the cap is ours, not its.
         assert_eq!(clamp(json!({"limit": 10_000})), MAX_READ_LIMIT);
+    }
+
+    #[test]
+    fn page_cursor_and_limit_are_bounded() {
+        assert_eq!(page_cursor(&json!({})).unwrap(), None);
+        assert_eq!(
+            page_cursor(&json!({"after": "b8"})).unwrap(),
+            Some("b8".into())
+        );
+        assert!(matches!(
+            page_cursor(&json!({"after": 8})),
+            Err(NodeError::Rejected(_))
+        ));
+        assert_eq!(page_limit(&json!({})).unwrap(), pages::MAX_PAGE_QUERY_LIMIT);
+        assert_eq!(page_limit(&json!({"limit": 3})).unwrap(), 3);
+        assert!(matches!(
+            page_limit(&json!({"limit": 0})),
+            Err(NodeError::Rejected(_))
+        ));
+        assert_eq!(page_limit(&json!({"limit": 99})).unwrap(), 99);
+        assert!(matches!(
+            page_limit(&json!({"limit": 257})),
+            Err(NodeError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn pages_schemas_expose_the_bounded_cursor() {
+        for name in ["ducktape_pages", "ducktape_page"] {
+            let tool = tools().into_iter().find(|tool| tool.name == name).unwrap();
+            let schema = (tool.schema)();
+            assert_eq!(schema["properties"]["after"]["type"], "string");
+            assert_eq!(
+                schema["properties"]["limit"]["maximum"],
+                pages::MAX_PAGE_QUERY_LIMIT
+            );
+            assert_eq!(schema["additionalProperties"], false);
+        }
     }
 
     #[test]

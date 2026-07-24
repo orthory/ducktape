@@ -50,7 +50,6 @@ pub struct IndexEntry {
     pub mtime_nanos: u32,
     pub exec: bool,
     pub kind: EntryKind,
-    #[serde(default)]
     pub meta: BTreeMap<String, String>,
 }
 
@@ -62,13 +61,11 @@ pub struct Index {
     pub version: u32,
     /// the snapshot per-path CAS commits against; `None` on a checkout of the
     /// empty filesystem (first commit will pass `base_snapshot: None`).
-    #[serde(default)]
     pub base_snapshot: Option<String>,
     /// the duckfs subtree this checkout covers, e.g. `/shared/ws`.
     pub prefix: String,
     /// the node http base url worktree verbs default to (a `--node` flag overrides).
     pub node: String,
-    #[serde(default)]
     pub entries: BTreeMap<String, IndexEntry>,
 }
 
