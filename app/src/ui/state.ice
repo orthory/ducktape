@@ -94,6 +94,15 @@ state
   settings_key_state = ""
   settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
+  account_bound = false
+  account_id = ""
+  account_name = ""
+  account_bio = ""
+  account_members:i64 = 0
+  account_nodes:i64 = 0
+  account_generation:i64 = 0
+  account_name_draft = ""
+  account_renaming = false
   node_log_lines:[NodeLogLine] = []
   node_log_filter = ""
   node_peers:[PeerRow] = []

@@ -1843,6 +1843,95 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
     })
 }
 
+/// The local account picture: whether THIS NODE is bound, and the account's
+/// public face.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AccountData {
+    pub generation: i64,
+    pub bound: bool,
+    pub account_id: String,
+    pub display_name: String,
+    pub bio: String,
+    pub members: i64,
+    pub nodes: i64,
+}
+
+/// Load the account this node is bound to (via the canonical resolver).
+pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let node_key_hex = client.status().await?.public_key;
+        let node_key: Vec<u8> = (0..node_key_hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&node_key_hex[i..i + 2], 16).ok())
+            .collect();
+        let reply: serde_json::Value = client
+            .query(
+                "identity",
+                &serde_json::json!({ "of_node": { "node_key": node_key } }),
+            )
+            .await?;
+        let account = &reply["account"];
+        if account.is_null() {
+            return Ok(AccountData {
+                generation,
+                bound: false,
+                account_id: String::new(),
+                display_name: String::new(),
+                bio: String::new(),
+                members: 0,
+                nodes: 0,
+            });
+        }
+        let id_bytes: Vec<u8> = account["account_id"]
+            .as_array()
+            .map(|bytes| {
+                bytes
+                    .iter()
+                    .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(AccountData {
+            generation,
+            bound: true,
+            account_id: short_label(&hex_encode(&id_bytes)),
+            display_name: account["display_name"].as_str().unwrap_or_default().to_string(),
+            bio: account["bio"].as_str().unwrap_or_default().to_string(),
+            members: count_i64(account["members"].as_array().map_or(0, |m| m.len())),
+            nodes: count_i64(account["nodes"].as_array().map_or(0, |n| n.len())),
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Rename the account this node is bound to (origin-gated: the bound node
+/// itself is the authority).
+pub async fn set_account_name(
+    rpc: String,
+    password: String,
+    display_name: String,
+) -> Result<bool, AppError> {
+    async {
+        let display_name = bounded_text(display_name, "display name", 128)?;
+        let client = rpc_client(&rpc)?;
+        signed_write(
+            &client,
+            "identity",
+            identity::encode_msg(&identity::IdentityMsg::SetAccountName { display_name }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {

@@ -2908,6 +2908,7 @@ dependencies = [
  "ducktape-rpc",
  "governance",
  "iced",
+ "identity",
  "inbox",
  "node",
  "pages",

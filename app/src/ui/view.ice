@@ -1072,6 +1072,38 @@ view
             text "Settings" size=15.0 font=display @text-fg
             container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
               col width=fill spacing=6.0
+                text "ACCOUNT" size=11.0 font=medium @text-muted
+                if !account_bound
+                  text "This node is not bound to an account yet." size=13.0 @text-muted
+                if account_bound
+                  col width=fill spacing=6.0
+                    row width=fill spacing=8.0 align=center
+                      text "Display name" width=120.0 size=13.0 @text-muted
+                      if !empty(account_name)
+                        text account_name width=fill size=13.0 wrapping=none font=medium @text-fg
+                      if empty(account_name)
+                        text "(unnamed)" width=fill size=13.0 wrapping=none @text-muted
+                    row width=fill spacing=8.0 align=center
+                      input "" #account-rename label="New display name" <-> account_name_draft change=account_name_draft_changed hint="rename account…" disabled=account_renaming width=fill padding=5.0 text-size=13.0 line-height=1.2
+                        active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                        hovered bg=elevated border=fg/21
+                        focused bg=elevated border=fg/45 border-w=1.0
+                        disabled bg=surface/54 value=muted
+                      button "Rename" disabled=(account_renaming || empty(trim(account_name_draft))) height=26.0 padding=5.0 -> account_rename_submit
+                        active bg=primary/16 text=fg border=primary/30 border-w=1.0 r=7.0
+                        hovered bg=primary/24 text=fg
+                        pressed bg=primary/30
+                        disabled bg=fg/4 text=muted
+                    row width=fill spacing=8.0 align=center
+                      text "Account" width=120.0 size=13.0 @text-muted
+                      text account_id size=13.0 wrapping=none font=mono @text-muted
+                      text "·" size=11.0 wrapping=none @text-muted
+                      text account_members size=13.0 wrapping=none font=mono @text-muted
+                      text "keys" size=11.0 wrapping=none @text-muted
+                      text account_nodes size=13.0 wrapping=none font=mono @text-muted
+                      text "nodes" size=11.0 wrapping=none @text-muted
+            container width=fill padding=10.0 bg=surface border=fg/8 border-w=1.0 r=10.0
+              col width=fill spacing=6.0
                 text "CONNECTION" size=11.0 font=medium @text-muted
                 row width=fill spacing=8.0 align=center
                   text "Endpoint" width=120.0 size=13.0 @text-muted

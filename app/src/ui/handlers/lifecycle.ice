@@ -278,6 +278,7 @@ on select_shell_tab(next)
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
   agents_generation = agents_generation + 1
+  account_generation = account_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == "explorer"
@@ -291,6 +292,38 @@ on select_shell_tab(next)
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
     run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
+    run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+
+on account_loaded(next)
+  return if next.generation != account_generation
+  account_bound = next.bound
+  account_id = next.account_id
+  account_name = next.display_name
+  account_bio = next.bio
+  account_members = next.members
+  account_nodes = next.nodes
+
+on account_failed(cause)
+  return if cause.generation != account_generation
+
+on account_name_draft_changed(next)
+  account_name_draft = next
+
+on account_rename_submit
+  return if !connected || !account_bound || account_renaming || empty(trim(account_name_draft))
+  account_renaming = true
+  error = ""
+  run set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
+
+on account_renamed(_)
+  account_renaming = false
+  account_name_draft = ""
+  account_generation = account_generation + 1
+  run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+
+on account_rename_failed(cause)
+  account_renaming = false
+  error = cause.message
 
 on agents_loaded(next)
   return if next.generation != agents_generation

@@ -101,6 +101,9 @@ extern crate::backend
   sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
+  AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
+  load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
+  set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
   SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, open_tabs:i64)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
