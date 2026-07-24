@@ -20,9 +20,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use defguard_boringtun::noise::errors::WireGuardError;
 use defguard_boringtun::noise::handshake::parse_handshake_anon;
 use defguard_boringtun::noise::{Packet, Tunn, TunnResult};
 use defguard_boringtun::x25519::{PublicKey, StaticSecret};
@@ -286,6 +288,12 @@ struct PeerState {
     /// current underlay endpoint; rewritten on every authenticated inbound
     /// datagram (roaming), read by every outbound send.
     endpoint: RwLock<Option<SocketAddr>>,
+    /// edge trigger for session-expiry logging. boringtun logs its expiry with
+    /// no peer field and then returns `ConnectionExpired` on EVERY timer tick
+    /// (its targets are pinned off in noded's log filter), so this seam — the
+    /// one place that knows the peer — logs only the down-transition, and the
+    /// recovery only on the next authenticated inbound.
+    session_down: AtomicBool,
 }
 
 impl PeerState {
@@ -338,10 +346,62 @@ impl PeerState {
                     out.authenticated = true;
                     break;
                 }
+                TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                    self.note_session_expired();
+                    break;
+                }
                 TunnResult::Err(_) => break,
             }
         }
+        let peer_proved_alive = drain && out.authenticated;
+        if peer_proved_alive {
+            self.note_session_recovered();
+        }
         out
+    }
+
+    /// the peer-labeled replacement for boringtun's contextless
+    /// `CONNECTION_EXPIRED` error: 90 s of handshakes went unanswered and the
+    /// session was torn down. fires once per down-transition, not per tick.
+    fn note_session_expired(&self) {
+        let already_down = self.session_down.swap(true, Ordering::Relaxed);
+        if already_down {
+            return;
+        }
+        let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
+        tracing::warn!(
+            target: "ducktape::overlay",
+            peer = %self.overlay_ip(),
+            endpoint = ?endpoint,
+            reason = "handshake_unanswered",
+            "wg session EXPIRED — peer stopped answering handshakes; retunnels on its next authenticated packet"
+        );
+    }
+
+    /// once per outage: the peer authenticated an inbound datagram again.
+    fn note_session_recovered(&self) {
+        let was_down = self.session_down.swap(false, Ordering::Relaxed);
+        if !was_down {
+            return;
+        }
+        let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
+        tracing::info!(
+            target: "ducktape::overlay",
+            peer = %self.overlay_ip(),
+            endpoint = ?endpoint,
+            "wg session RE-ESTABLISHED"
+        );
+    }
+
+    /// the peer's overlay `/128` — its stable, human-recognizable log label.
+    /// (`replace_peers` builds every peer from cryptokey routing, so an empty
+    /// allowed-ips list is a config defect, not a normal state.)
+    fn overlay_ip(&self) -> Ipv6Addr {
+        self.config
+            .allowed_ips
+            .first()
+            .copied()
+            .unwrap_or(Ipv6Addr::UNSPECIFIED)
     }
 }
 
@@ -438,6 +498,7 @@ impl WgDevice {
                             None,
                         )),
                         endpoint: RwLock::new(config.endpoint),
+                        session_down: AtomicBool::new(false),
                     })
                 }
             };
