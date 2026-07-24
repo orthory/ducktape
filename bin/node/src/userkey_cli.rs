@@ -70,9 +70,10 @@ pub(crate) struct AccountInitArgs {
     /// resolve the node through a registered workspace's chain id
     #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
     network: Option<String>,
-    /// path to the user key file (a fresh path mints a plain identity)
-    #[arg(long, value_name = "PATH", default_value = "user.key")]
-    key: PathBuf,
+    /// path to the user key file (defaults to the network workspace's
+    /// `user.key`, minting it there if absent — the canonical per-network key)
+    #[arg(long, value_name = "PATH")]
+    key: Option<PathBuf>,
 }
 
 /// `user key` — a nested lifecycle subcommand, or (no subcommand) the legacy
@@ -316,7 +317,10 @@ fn cmd_user_account_init(
         .ok_or("account-init needs -n/--network to locate the node's workspace")?;
     let (dir, _http) = config::resolve_network(needle)?;
     let resolved = config::resolve(&dir.join("node.toml"))?;
-    let user = load_user_signer(&args.key, stdin)?;
+    // default the key to the network's canonical `<workspace>/user.key`, so a
+    // later `cred add -n <net>` (no `--key`) finds the very key this bind used.
+    let key_path = args.key.unwrap_or_else(|| dir.join("user.key"));
+    let user = load_user_signer(&key_path, stdin)?;
     let user_pub = user.public_key();
 
     // Already bound? then the bind is a no-op — just (re)assert name + handle.

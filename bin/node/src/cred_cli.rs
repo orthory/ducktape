@@ -39,9 +39,9 @@ pub(crate) struct CredArgs {
     /// resolve the co-hosted node through a registered workspace's chain id
     #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
     network: Option<String>,
-    /// path to the user key file (a fresh path mints a plain identity)
-    #[arg(long, value_name = "PATH", global = true, default_value = "user.key")]
-    key: std::path::PathBuf,
+    /// path to the user key file (defaults to the network workspace's `user.key`)
+    #[arg(long, value_name = "PATH", global = true)]
+    key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -170,13 +170,42 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
 struct VerbCtx {
     node: Option<String>,
     network: Option<String>,
-    key: std::path::PathBuf,
+    key: Option<std::path::PathBuf>,
 }
 
 impl VerbCtx {
     /// the node's http base (explicit `--node` wins, else the workspace's).
     fn http_base(&self) -> Result<String, Box<dyn std::error::Error>> {
         redeem_node(self.node.as_deref(), self.network.as_deref())
+    }
+
+    /// the user key path for the signing verbs: explicit `--key` wins, else the
+    /// canonical `<workspace>/user.key` that `account-init` mints. A MISSING key
+    /// is a loud error, never a cue to mint: cred always signs as an
+    /// already-bound account, so an absent key means the wrong `-n`, or
+    /// `account-init` was never run — silently minting a fresh unbound identity
+    /// here is exactly the footgun that let a stray path clobber a real key.
+    fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let path = match &self.key {
+            Some(explicit) => explicit.clone(),
+            None => {
+                let needle = self
+                    .network
+                    .as_deref()
+                    .filter(|n| !n.is_empty())
+                    .ok_or("cred needs -n/--network (or an explicit --key) to locate the user key")?;
+                let (dir, _http) = config::resolve_network(needle)?;
+                dir.join("user.key")
+            }
+        };
+        if !path.exists() {
+            return Err(format!(
+                "no user key at {} — run `ducktape user account-init` first (or pass --key)",
+                path.display()
+            )
+            .into());
+        }
+        Ok(path)
     }
 
     /// the co-hosted workspace resolved from `-n/--network`: chain id, the
@@ -235,7 +264,7 @@ fn cmd_list(ctx: &VerbCtx, json: bool) -> CredResult {
 fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufRead) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key, stdin)?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
@@ -262,7 +291,7 @@ fn cmd_revoke(
 ) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key, stdin)?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let grantee = resolve_account(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
@@ -284,7 +313,7 @@ fn cmd_revoke(
 fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResult {
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key, stdin)?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let statement = gateway::RemoveCredentialStatement {
         chain_id: resolved.chain_id.clone(),
@@ -315,7 +344,7 @@ fn cmd_add(
 
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
-    let user = load_user_signer(&ctx.key, stdin)?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let user_pub = user.public_key().as_ref().to_vec();
 
     // owner account + display name (for the default name), existing names (for
@@ -799,6 +828,27 @@ mod tests {
             derive_default_name("jess", ProviderArg::Claude, &[]),
             "jess-claude-1"
         );
+    }
+
+    /// An explicit `--key` that EXISTS resolves to itself; one that is ABSENT
+    /// is a loud error, not a silent fresh mint — the regression that let a
+    /// stray path clobber a real, bound user key.
+    #[test]
+    fn key_path_uses_explicit_key_but_refuses_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("ducktape-keypath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("user.key");
+        std::fs::write(&present, b"deadbeef").unwrap();
+
+        let ctx = VerbCtx { node: None, network: None, key: Some(present.clone()) };
+        assert_eq!(ctx.key_path().unwrap(), present);
+
+        let missing = dir.join("nope.key");
+        let ctx = VerbCtx { node: None, network: None, key: Some(missing) };
+        let err = ctx.key_path().unwrap_err().to_string();
+        assert!(err.contains("no user key at"), "expected absent-key error, got {err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }
