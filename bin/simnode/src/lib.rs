@@ -766,7 +766,11 @@ fn run_sim(
             .with_tagging("tagging");
         let saga = SagaModule::new("saga");
         let dispatch = DispatchModule::new("dispatch", "saga");
-        let tagging = TaggingModule::new("tagging").with_direct_owner("runs");
+        let tagging = TaggingModule::new(
+            "tagging",
+            Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
+        )
+        .with_direct_owner("runs");
         let tasks = Tasks::new("tasks");
         let inbox = Inbox::new("inbox");
         let automations = Automations::new(

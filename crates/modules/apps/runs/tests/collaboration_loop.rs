@@ -254,7 +254,10 @@ async fn genesis(context: deterministic::Context) -> Host {
     );
     Host::genesis(vec![
         Box::new(chat),
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(SagaModule::new("saga")),
         Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(agent),

@@ -128,7 +128,10 @@ async fn siblings(
     let mut modules: Vec<Box<dyn sdk::Module>> = vec![
         Box::new(Chat::new("chat", Box::new(chat_store)).with_tagging("tagging")),
         Box::new(Pages::new("pages", Box::new(pages_store)).with_tagging("tagging")),
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(saga),
         Box::new(DispatchModule::new("dispatch", "saga")),
         Box::new(AgentModule::new(

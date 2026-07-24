@@ -109,6 +109,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# MemStore: the in-memory MerkleStore double behind store-backed modules in
+# the in-crate provision tests.
+sdk-testkit = { workspace = true }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../../crates/testing/nettest" }
 tokio-tungstenite = "0.24"

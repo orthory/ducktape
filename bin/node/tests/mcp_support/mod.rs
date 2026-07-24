@@ -67,7 +67,10 @@ impl Harness {
                     Box::new(saga::SagaModule::new("saga")),
                     Box::new(tasks::Tasks::new("tasks")),
                     Box::new(dispatch::DispatchModule::new("dispatch", "saga")),
-                    Box::new(tagging::TaggingModule::new("tagging")),
+                    Box::new(tagging::TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
                     Box::new(forge::Forge::init("forge", forge_base).expect("forge module")),
                     Box::new(runs::RunsModule::new(
                         "runs",

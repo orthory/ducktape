@@ -1,10 +1,10 @@
-//! the adapter-port equivalence proof for the tagging cutover: the
-//! `tagging` guest component (the NATIVE `tagging` crate compiled to wasm behind
-//! `guest-adapter`) and the native `TaggingModule` answer the SAME op sequence
-//! with IDENTICAL routing decisions, and their roots move in lockstep (move on
-//! commit, hold on no-ops and abort). the roots THEMSELVES differ from the
-//! first committed write — the port persists the native canonical snapshot as
-//! one host-KV value, an intentional greenfield root break pinned by this proof.
+//! the STORE-BACKED cutover-continuity proof for tagging: the `tagging` guest
+//! component over `WasmModule::with_store(QmdbStore)` and the native
+//! `TaggingModule` over the same store shape are ROOT-CONTINUOUS — the same
+//! op sequence commits the IDENTICAL qmdb merkle root after every block (both
+//! roots ARE the store's root). tagging carries no per-network genesis
+//! config, so both stores start empty and the genesis roots are already
+//! equal.
 //!
 //! tagging is a CROSS-MODULE plane, which is the point of this tenant: a
 //! Subscribe's acceptance depends on a SIBLING read (`ctx.module_root(source)`)
@@ -15,8 +15,10 @@
 //! plane's observable read surface is what it DELIVERS to them (tagging itself
 //! has no query surface).
 
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
 use sha2::{Digest, Sha256};
 use tagging::{Author, EntityRef, TagEvent, TaggingModule, TaggingMsg, decode_event, encode_msg};
 use wasm_host::WasmModule;
@@ -32,15 +34,25 @@ const TAGGING_WASM: &[u8] = include_bytes!("fixtures/tagging.component.wasm");
 const MAX_TAGS_PER_EVENT: usize = 16;
 const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
 
-fn wasm_tagging() -> WasmModule {
-    WasmModule::from_bytes("tagging", TAGGING_WASM).expect("load component")
+/// a fresh qmdb store. `label` doubles as the store id (the deterministic
+/// runtime keys storage partitions by id alone — child labels do not
+/// namespace them).
+async fn tag_store(
+    context: &deterministic::Context,
+    label: &'static str,
+) -> QmdbStore<deterministic::Context> {
+    QmdbStore::init(context.child(label), label).await
+}
+
+fn wasm_tagging(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("tagging", TAGGING_WASM, store).expect("load component")
 }
 
 /// EXACTLY the production wiring in bin/node's host state — the direct-owner
-/// set is genesis config, so both runtimes (and the guest itself) must wire
+/// set is genesis wiring, so both runtimes (and the guest itself) must wire
 /// the same set or the routing decisions fork.
-fn native_tagging() -> TaggingModule {
-    TaggingModule::new("tagging").with_direct_owner("runs")
+fn native_tagging(store: Box<dyn sdk::MerkleStore>) -> TaggingModule {
+    TaggingModule::new("tagging", store).with_direct_owner("runs")
 }
 
 /// a REAL sibling standing in for the modules the plane reads and routes to:
@@ -120,14 +132,16 @@ fn siblings() -> Vec<Box<dyn Module>> {
     ]
 }
 
-fn native_host() -> Host {
-    let mut modules: Vec<Box<dyn Module>> = vec![Box::new(native_tagging())];
+async fn native_host(context: &deterministic::Context) -> Host {
+    let store = tag_store(context, "native_tag").await;
+    let mut modules: Vec<Box<dyn Module>> = vec![Box::new(native_tagging(Box::new(store)))];
     modules.extend(siblings());
     Host::genesis(modules).expect("genesis")
 }
 
-fn wasm_host_() -> Host {
-    let mut modules: Vec<Box<dyn Module>> = vec![Box::new(wasm_tagging())];
+async fn wasm_host_(context: &deterministic::Context) -> Host {
+    let store = tag_store(context, "wasm_tag").await;
+    let mut modules: Vec<Box<dyn Module>> = vec![Box::new(wasm_tagging(Box::new(store)))];
     modules.extend(siblings());
     Host::genesis(modules).expect("genesis")
 }
@@ -212,23 +226,23 @@ fn event_tuples(events: &[Event]) -> Vec<(String, Vec<u8>)> {
 
 #[test]
 fn same_ops_same_routing_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn same_ops_inner(context: &deterministic::Context) {
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
-    // at GENESIS the roots COINCIDE by construction: tagging's canonical
-    // encoding of empty state is a lone zero count — byte-identical to the
-    // empty host-KV store's encoding, hashed by the same sha256. the declared
-    // schema break manifests on the FIRST WRITE (asserted per block below),
-    // which is what the revision-2 fence actually guards.
+    // ROOT-CONTINUITY from GENESIS: both roots are the (empty) store's merkle
+    // root, identical across the runtimes — and they stay identical after
+    // every block (asserted per block below).
     let genesis_root = root_of(&native);
     assert_eq!(
         genesis_root,
         root_of(&wasm),
-        "empty-state roots coincide by construction"
+        "genesis roots must be continuous across the runtimes"
     );
 
     // every op family, in one deterministic sequence. `moves` says whether the
@@ -400,20 +414,23 @@ async fn same_ops_inner() {
             assert_eq!(root_of(&native), n_before, "native root moved at {height}");
             assert_eq!(root_of(&wasm), w_before, "wasm root moved at {height}");
         }
-        // ...and from the first committed write on, the roots themselves
-        // always differ (the pinned schema break).
-        assert_ne!(root_of(&native), root_of(&wasm));
+        // THE continuity property: both roots ARE the same store root.
+        assert_eq!(
+            root_of(&native),
+            root_of(&wasm),
+            "the two runtimes diverged at {height}"
+        );
     }
 
-    // the emptied plane pins the schema-break asymmetry: the native root is
-    // back at its genesis value, while the wasm store now carries an EXPLICIT
-    // empty snapshot under its reserved keys — never the genesis store again.
-    assert_eq!(root_of(&native), genesis_root, "native root back to empty");
+    // the emptied plane: the RECORD SET is back to its never-subscribed shape
+    // (the deletes landed), but the op-log root has moved past genesis —
+    // identically on both runtimes.
     assert_ne!(
         root_of(&wasm),
         genesis_root,
-        "the wasm store never returns to its pre-first-write shape"
+        "the deletes are committed ops"
     );
+    assert_eq!(root_of(&native), root_of(&wasm), "continuity after emptying");
 
     // decoded spot checks on the wasm side: every delivery came from the
     // plane (Origin::Module("tagging")), with the source verified by origin.
@@ -468,12 +485,14 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn rejections_inner(context: &deterministic::Context) {
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
     let alice = vec![0xA1u8; 32];
 
     // seed one committed subscription, then fill a second scope to its cap so
@@ -596,12 +615,14 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
-    let mut native = native_host();
-    let mut wasm = wasm_host_();
+async fn multi_dispatch_inner(context: &deterministic::Context) {
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
     // ONE block, two ops: the tag's fan-out READS the subscription the first
     // op staged (the scope only exists in this block's overlay). on the wasm

@@ -57,10 +57,14 @@ use crate::TaggingModule;
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "tagging";
 
-// whole-state port: the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// no genesis config: tagging carries no per-network parameter; the direct-
+// owner set is genesis-constant wiring, compiled in like sibling ids.
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: TaggingModule,
-    new: TaggingModule::new(MODULE_ID).with_direct_owner("runs"),
+    new: TaggingModule::new(MODULE_ID, Box::new(WitStore)).with_direct_owner("runs"),
 }
