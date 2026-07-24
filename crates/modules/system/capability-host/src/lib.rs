@@ -744,7 +744,6 @@ impl CliProvider {
         if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
             ports.extend(url_port(run_action));
         }
-        let host_ip = podman_api::host_routable_ip();
 
         let executing_node = ctx.executing_node.as_deref().unwrap_or("unknown");
         let labels = vec![
@@ -763,7 +762,7 @@ impl CliProvider {
             labels: &labels,
             terminal: tty,
         });
-        spec.set_egress(&host_ip, podman_api::SLIRP_DNS, &ports);
+        spec.set_egress(&ports);
 
         let client = podman_api::Podman::new(socket.clone());
         let id = client.create(&spec).await?;

@@ -5,17 +5,21 @@
 //! `tokio::net::UnixStream` so it pulls no HTTP client dependency and the
 //! response parser + attach demux are unit-testable without a running podman.
 //!
-//! LIVE-VALIDATED against real rootless podman (5.4.2 on the dev box, 6.0.1 on
-//! macmini-duke): create+inspect confirms every `SpecGenerator` field takes
-//! effect (work_dir, mounts+RW, netns=private→slirp4netns/pasta, dropped
-//! NET_ADMIN/NET_RAW in `.BoundingCaps`, cpu/mem limits, annotations); attach
-//! returns `101 UPGRADED` and the raw-stdin/framed-stdout demux round-trips; the
-//! egress ruleset, installed via `nsenter -n` + `nft` into the container netns
-//! (netns only — the hook already runs in podman's rootless userns), blocks the
-//! LAN + tailnet (incl. tailnet DNS) while the broker port,
-//! the scoped resolver, and the public internet stay reachable. Pure logic is
-//! also unit-tested (HTTP parse, chunked decode, attach demux, spec JSON,
-//! ruleset order) so it stays green without podman.
+//! LIVE-VALIDATED against real rootless podman (pasta netns on native Linux):
+//! create+inspect confirms every `SpecGenerator` field takes effect (work_dir,
+//! mounts+RW, netns=pasta, dropped NET_ADMIN/NET_RAW in `.BoundingCaps`, cpu/mem
+//! limits, annotations); attach returns `101 UPGRADED` and the
+//! raw-stdin/framed-stdout demux round-trips; the egress ruleset, installed via
+//! `nsenter -n` + `nft` into the container netns (netns only — the hook already
+//! runs in podman's rootless userns), blocks the LAN + tailnet (incl. tailnet
+//! DNS) while pasta's host address + DNS forwarder + the public internet stay
+//! reachable. Pure logic is also unit-tested (HTTP parse, chunked decode, attach
+//! demux, spec JSON, ruleset order) so it stays green without podman.
+//!
+//! netns backend: `pasta` — podman 6's only rootless backend (slirp4netns was
+//! removed) and the `passt` package on older hosts. Using it explicitly (not
+//! `"private"`) makes the run's host + DNS addresses the fixed pasta defaults
+//! ([`PASTA_HOST`] / [`PASTA_DNS`]) the egress hook keys on.
 //!
 //! Path hiding lives here too: [`plan_mounts`] maps every host path to a
 //! NEUTRAL `/ducktape/...` guest path and [`translate`] rewrites env/argv to
@@ -178,18 +182,18 @@ pub(crate) fn translate(value: &str, mounts: &[Mount], home: &Path, guest_home: 
 /// internet, v4 and v6) falls through to `policy accept` — the broker still
 /// mediates all provider-API traffic regardless.
 ///
-/// `host_ip` is what `host.containers.internal` resolves to INSIDE the
-/// container (slirp: the host's routable LAN IP; pasta: a fixed `192.168.127.x`)
-/// — the hook reads it from the container's `/etc/hosts`, correct for any
-/// backend. `resolver_ip` is the container's PRIMARY nameserver (the slirp/pasta
-/// local forwarder). DNS is scoped to THAT IP only, NOT `dport 53` universally:
-/// the container inherits the host's resolv.conf, which on a tailnet box lists
-/// the Tailscale MagicDNS resolvers (100.100.100.100 / fd7a::53) — a blanket
-/// `dport 53 accept` would let the run reach those tailnet services and any
-/// LAN box on :53. Scoping to the local forwarder keeps name resolution working
-/// (it forwards upstream) while the tailnet/LAN resolvers stay dropped.
-/// (Live-verified on podman 5.4.2: LAN + tailnet DNS blocked, github.com still
-/// resolves through the forwarder.)
+/// `host_ip` is pasta's `host.containers.internal` ([`PASTA_HOST`], the
+/// link-local the container reaches this node's broker + RPC at). `resolver_ip`
+/// is pasta's DNS forwarder ([`PASTA_DNS`]). DNS is scoped to THAT ip only, NOT
+/// `dport 53` universally: pasta copies the host's resolv.conf into the
+/// container, so on a tailnet box it also lists the Tailscale MagicDNS resolvers
+/// (100.100.100.100 / fd7a::53) — a blanket `dport 53 accept` would let the run
+/// reach those tailnet services and any LAN box on :53. Scoping to the forwarder
+/// keeps name resolution working (it forwards upstream) while the tailnet/LAN
+/// resolvers stay dropped. Note pasta mirrors the host's own routes into the
+/// container, so this firewall is what actually contains it.
+/// (Live-verified on native-Linux pasta: broker reachable, LAN + tailnet DNS
+/// blocked, github.com still resolves through the forwarder.)
 pub fn egress_nftables(host_ip: &str, resolver_ip: &str, ports: &[u16]) -> String {
     let mut lines = vec![
         "table inet ducktape {".to_string(),
@@ -263,14 +267,6 @@ pub fn run_egress_hook() -> Result<(), String> {
     if state.annotations.get("io.ducktape.egress").map(String::as_str) != Some("1") {
         return Ok(());
     }
-    let host_ip = state
-        .annotations
-        .get("io.ducktape.egress.host")
-        .ok_or("egress hook: missing io.ducktape.egress.host annotation")?;
-    let resolver_ip = state
-        .annotations
-        .get("io.ducktape.egress.resolver")
-        .ok_or("egress hook: missing io.ducktape.egress.resolver annotation")?;
     let ports = state
         .annotations
         .get("io.ducktape.egress.ports")
@@ -283,7 +279,9 @@ pub fn run_egress_hook() -> Result<(), String> {
         .transpose()?
         .unwrap_or_default();
 
-    let ruleset = egress_nftables(host_ip, resolver_ip, &ports);
+    // host + resolver are pasta's fixed link-local defaults, so the hook needs
+    // no host-computed annotations — only the run's allowed ports.
+    let ruleset = egress_nftables(PASTA_HOST, PASTA_DNS, &ports);
     install_nft_in_netns(state.pid, &ruleset)
 }
 
@@ -362,13 +360,13 @@ pub(crate) struct OciMount {
     pub options: Vec<String>,
 }
 
-/// a libpod `Namespace` — `nsmode` is `"private"`: a NEW netns (never the
-/// host's) populated by whatever the host's default rootless network cmd is.
-/// This is version-agnostic ON PURPOSE — `"slirp4netns"` fails on podman 6
-/// (removed) and `"pasta"` fails on podman 5.4 (not shipped); `"private"`
-/// resolves to slirp4netns on 5.4 and pasta on 6. Both give a private netns
-/// reachable via `host.containers.internal`; the egress nft hook is the real
-/// enforcement on top.
+/// a libpod `Namespace` — `nsmode` is `"pasta"`: the modern rootless netns
+/// backend, and the ONLY one podman 6 ships (slirp4netns was removed). pasta is
+/// used explicitly, not via `"private"`, so the run's host + resolver addresses
+/// are the fixed pasta defaults ([`PASTA_HOST`] / [`PASTA_DNS`]) the egress hook
+/// keys on — deterministic, no host-side probing. pasta must be installed
+/// ([`crate::SandboxBackend::probe`] enforces it); it ships with podman 6 and is
+/// the `passt` package on older hosts.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct Namespace {
     pub nsmode: String,
@@ -480,7 +478,7 @@ impl SpecGenerator {
             annotations: BTreeMap::new(),
             mounts,
             netns: Namespace {
-                nsmode: "private".to_string(),
+                nsmode: "pasta".to_string(),
             },
             cap_drop: vec!["NET_ADMIN".to_string(), "NET_RAW".to_string()],
             resource_limits,
@@ -492,19 +490,12 @@ impl SpecGenerator {
     }
 
     /// attach the egress-hook annotations: the marker the `--hooks-dir` hook
-    /// matches, plus the three values it builds the ruleset from — the host IP
-    /// (`host.containers.internal`), the container's DNS forwarder, and the
-    /// allowed ports (this run's broker + node RPC).
-    ///
-    /// These are passed as ANNOTATIONS, not left for the hook to read from the
-    /// container's files, because at the `createRuntime` stage podman has not
-    /// yet written the container's `/etc/hosts` / `/etc/resolv.conf` (verified:
-    /// they are empty then, and podman blocks on the hook so a retry deadlocks).
-    /// The node computes both host-side (host_ip = its own routable IP, which
-    /// matches what podman writes; resolver = the slirp DNS forwarder) and the
-    /// hook reads them straight from the OCI state JSON. Host-side only — none
+    /// matches, plus the run's allowed ports (its broker + node RPC). The host
+    /// IP and DNS resolver are NOT passed — under pasta they are the fixed
+    /// link-local defaults [`PASTA_HOST`] / [`PASTA_DNS`], which the hook uses
+    /// directly, so nothing about them is host-computed. Host-side only — none
     /// of this reaches the guest.
-    pub(crate) fn set_egress(&mut self, host_ip: &str, resolver_ip: &str, ports: &[u16]) {
+    pub(crate) fn set_egress(&mut self, ports: &[u16]) {
         let ports = ports
             .iter()
             .map(u16::to_string)
@@ -513,38 +504,23 @@ impl SpecGenerator {
         self.annotations
             .insert("io.ducktape.egress".to_string(), "1".to_string());
         self.annotations
-            .insert("io.ducktape.egress.host".to_string(), host_ip.to_string());
-        self.annotations
-            .insert("io.ducktape.egress.resolver".to_string(), resolver_ip.to_string());
-        self.annotations
             .insert("io.ducktape.egress.ports".to_string(), ports);
     }
 }
 
-/// the slirp4netns default DNS forwarder — `.3` of its default `10.0.2.0/24`
-/// cidr. The node passes this as the run's egress resolver so the nft hook can
-/// scope DNS to it. A constant because the sandbox always runs slirp with the
-/// default cidr; if that ever changes this must move with it. (Verified live:
-/// the container's primary nameserver is `10.0.2.3` and name resolution works
-/// through it under the egress firewall.)
-pub(crate) const SLIRP_DNS: &str = "10.0.2.3";
+/// pasta's fixed `host.containers.internal` address — the link-local pasta maps
+/// the host's loopback to. The container reaches this run's broker + node RPC
+/// there, so the egress rule that allows those ports targets exactly this.
+/// (Verified live on native-Linux pasta: stable across runs at `169.254.1.2`.)
+pub(crate) const PASTA_HOST: &str = "169.254.1.2";
 
-/// the host's own routable IPv4 address — what podman sets
-/// `host.containers.internal` to for a slirp4netns run, so the egress rule that
-/// allows the broker + node ports must target exactly this. Found by opening a
-/// UDP socket toward a public address and reading back the kernel-chosen source
-/// IP (no packet is sent); falls back to `127.0.0.1` only if that fails, which
-/// would make the run reach nothing but localhost — a safe, obvious failure.
-/// (Verified live: this matches podman's `host.containers.internal` value.)
-pub(crate) fn host_routable_ip() -> String {
-    use std::net::UdpSocket;
-    UdpSocket::bind("0.0.0.0:0")
-        .and_then(|sock| {
-            sock.connect("8.8.8.8:53")?;
-            Ok(sock.local_addr()?.ip().to_string())
-        })
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-}
+/// pasta's fixed DNS forwarder — the link-local resolver pasta injects as the
+/// container's primary nameserver, forwarding to the host's real DNS. The egress
+/// rule scopes DNS to THIS ip (never a blanket `:53`), so the tailnet/LAN
+/// resolvers that pasta also copies into `resolv.conf` stay blocked. (Verified
+/// live: primary nameserver `169.254.1.1`, name resolution works, tailnet DNS
+/// dropped.)
+pub(crate) const PASTA_DNS: &str = "169.254.1.1";
 
 // ---------------------------------------------------------------------------
 // the socket client
@@ -1222,13 +1198,17 @@ mod tests {
 
     #[test]
     fn egress_ruleset_orders_allow_before_private_drop() {
-        let rs = egress_nftables("192.168.1.50", "10.0.2.3", &[45001, 8080]);
+        // pasta's link-local host + resolver both sit inside 169.254.0.0/16,
+        // which the ruleset drops — so their specific accepts MUST come first.
+        let rs = egress_nftables(PASTA_HOST, PASTA_DNS, &[45001, 8080]);
         let allow = rs.find("dport { 45001, 8080 } accept").expect("allow line");
-        let dns = rs.find("10.0.2.3 udp dport 53 accept").expect("scoped dns line");
-        let drop = rs.find("100.64.0.0/10").expect("tailnet drop line");
-        assert!(allow < drop, "broker allow must precede the private-range drop:\n{rs}");
-        assert!(dns < drop, "scoped DNS must precede the private-range drop:\n{rs}");
-        assert!(rs.contains("192.168.1.50"), "host ip pinned");
+        let dns = rs
+            .find(&format!("{PASTA_DNS} udp dport 53 accept"))
+            .expect("scoped dns line");
+        let drop_ll = rs.find("169.254.0.0/16").expect("link-local drop line");
+        assert!(allow < drop_ll, "broker allow must precede the 169.254 drop:\n{rs}");
+        assert!(dns < drop_ll, "scoped DNS must precede the 169.254 drop:\n{rs}");
+        assert!(rs.contains(PASTA_HOST), "pasta host ip pinned");
         // DNS is scoped to the resolver, NOT a blanket dport 53 — a bare
         // `dport 53 accept` (no daddr) would reach LAN/tailnet resolvers.
         assert!(
@@ -1242,9 +1222,12 @@ mod tests {
 
     #[test]
     fn egress_ruleset_with_no_ports_still_valid() {
-        let rs = egress_nftables("10.0.0.5", "10.0.2.3", &[]);
+        let rs = egress_nftables(PASTA_HOST, PASTA_DNS, &[]);
         assert!(!rs.contains("dport {"), "no port allow-list when no ports:\n{rs}");
-        assert!(rs.contains("10.0.2.3 udp dport 53 accept"), "dns still scoped:\n{rs}");
+        assert!(
+            rs.contains(&format!("{PASTA_DNS} udp dport 53 accept")),
+            "dns still scoped:\n{rs}"
+        );
         assert!(rs.contains("drop"));
     }
 
@@ -1269,18 +1252,19 @@ mod tests {
             labels: &["io.ducktape.run=abc".to_string()],
             terminal: false,
         });
-        spec.set_egress("192.168.1.50", SLIRP_DNS, &[45001, 8080]);
+        spec.set_egress(&[45001, 8080]);
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"work_dir\":\"/ducktape/workspace\""), "{json}");
         assert!(json.contains("/ducktape/bin/claude"), "{json}");
-        assert!(json.contains("\"nsmode\":\"private\""), "{json}");
+        assert!(json.contains("\"nsmode\":\"pasta\""), "{json}");
         assert!(json.contains("NET_ADMIN") && json.contains("NET_RAW"), "{json}");
         assert!(json.contains("\"remove\":false"), "own removal, no auto-remove: {json}");
         assert!(json.contains("\"quota\":400000"), "cpu quota: {json}");
         assert!(json.contains("io.ducktape.egress"), "egress marker annotation: {json}");
-        assert!(json.contains("io.ducktape.egress.host"), "host annotation: {json}");
-        assert!(json.contains("io.ducktape.egress.resolver"), "resolver annotation: {json}");
         assert!(json.contains("io.ducktape.egress.ports"), "ports annotation: {json}");
+        // host + resolver are pasta constants in the hook, NOT annotations.
+        assert!(!json.contains("io.ducktape.egress.host"), "no host annotation: {json}");
+        assert!(!json.contains("io.ducktape.egress.resolver"), "no resolver annotation: {json}");
         // the GUEST-visible fields (command, work_dir, env, mount destinations)
         // are neutral. bind-mount `source` fields legitimately carry the host
         // path — that is the host side of the mount, never seen inside the
