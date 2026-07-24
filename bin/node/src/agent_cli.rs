@@ -268,11 +268,18 @@ async fn attach(base: &str, session_id: &str, topic: &str) -> AgentResult {
                 if message.is_close() {
                     break;
                 }
-                if let Message::Text(text) = message
-                    && let Some(bytes) = decode_term_chunk(&text)
-                {
-                    stdout.write_all(&bytes).await.map_err(|e| format!("stdout: {e}"))?;
-                    stdout.flush().await.map_err(|e| format!("stdout flush: {e}"))?;
+                if let Message::Text(text) = message {
+                    // the session's child exited — the node signals the topic is
+                    // over. Stop attaching (the wedge fix): without this the loop
+                    // blocks on a dead topic and no keystroke, not even Ctrl-C,
+                    // can end it (input is dropped as the session is gone).
+                    if is_term_ended(&text) {
+                        break;
+                    }
+                    if let Some(bytes) = decode_term_chunk(&text) {
+                        stdout.write_all(&bytes).await.map_err(|e| format!("stdout: {e}"))?;
+                        stdout.flush().await.map_err(|e| format!("stdout flush: {e}"))?;
+                    }
                 }
             }
             _ = winch.recv() => {
@@ -617,6 +624,17 @@ fn decode_term_chunk(text: &str) -> Option<Vec<u8>> {
     STANDARD.decode(item).ok()
 }
 
+/// the node's terminal frame for this topic: the session's child exited and the
+/// `term:<id>` topic is complete (`{"type":"term_ended",...}`). The signal the
+/// attach loop ends on — see [`stream::ServerFrame::TermEnded`].
+fn is_term_ended(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .as_ref()
+        .and_then(|v| v["type"].as_str())
+        == Some("term_ended")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,6 +682,21 @@ mod tests {
 
         let heartbeat = serde_json::json!({ "type": "heartbeat", "height": 1 }).to_string();
         assert_eq!(decode_term_chunk(&heartbeat), None);
+    }
+
+    #[test]
+    fn term_ended_frame_ends_the_attach_but_output_chunks_do_not() {
+        // the node's terminal signal (ServerFrame::TermEnded) — the attach loop
+        // breaks on it; an output chunk or any other frame keeps it running.
+        let ended = serde_json::json!({ "type": "term_ended", "topic": "term:abc" }).to_string();
+        assert!(is_term_ended(&ended));
+
+        let chunk = serde_json::json!({
+            "type": "event", "topic": "term:abc", "cursor": "3", "item": STANDARD.encode(b"hi")
+        })
+        .to_string();
+        assert!(!is_term_ended(&chunk));
+        assert!(!is_term_ended(&serde_json::json!({ "type": "heartbeat" }).to_string()));
     }
 
     #[test]

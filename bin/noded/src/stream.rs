@@ -120,6 +120,14 @@ pub enum ServerFrame {
         cursor: String,
         item: TailItem,
     },
+    /// the interactive session's child (and its container) has exited: the
+    /// `term:<session>` topic is complete and will never append again. Sent
+    /// ONCE, after the session's final output chunks, then the topic is dropped.
+    /// A driving `agent pty` client breaks its attach loop on this (the desktop
+    /// app closes the pane); without it a client blocks forever on a dead topic.
+    TermEnded {
+        topic: String,
+    },
     Lagged {
         topic: String,
         cursor: String,
@@ -1443,6 +1451,16 @@ fn catch_up_term(
         if row_count < STREAM_CATCHUP_BUDGET {
             break;
         }
+    }
+    // the pump reached EOF and the ring is fully drained: tell the subscriber the
+    // session is over and drop the topic, so a driving client stops waiting on a
+    // stream that will never append again. Only after every buffered chunk above
+    // has been emitted — the terminal frame is the LAST thing on the topic.
+    if ring.is_ended(session) {
+        frames.push(ServerFrame::TermEnded {
+            topic: topic.to_string(),
+        });
+        return CatchUpResult::drop(frames);
     }
     CatchUpResult::keep(frames)
 }
