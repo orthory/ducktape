@@ -117,7 +117,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // the browser gateway; served on the app-surface thread below. Only when the
     // gateway plane is up to serve it; route PUBLICATION stays a one-time signed
     // operator step.
-    let airlock_bits = match crate::airlock_serve::AirlockServe::resolve(storage) {
+    // A compute/workstation node (sandbox != Direct) starts its airlock gateway
+    // even with an empty store, so `cred add` takes effect without a restart.
+    let compute_node = !matches!(sandbox, capability_host::SandboxBackend::Direct);
+    let airlock_bits = match crate::airlock_serve::AirlockServe::resolve(storage, compute_node) {
         None => None,
         Some(Err(error)) => return Err(format!("airlock serve config: {error}").into()),
         Some(Ok(serve)) if !sync_only && gateway_enabled => {
@@ -137,10 +140,21 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
                 .then(|| crate::airlock_serve::committed_grant_check(http_handle.command_sender()));
             // Build — and thus ATTEST — BEFORE registering the route or claiming
             // to listen: a node that cannot attest must fail boot loudly here,
-            // never register a route to a gateway that will not come up.
-            let (router, vendor) =
+            // never register a route to a gateway that will not come up. The
+            // self-host store path (grant_gated) wires the lazy loader so a
+            // credential added after boot is served without a restart; the TEE
+            // env path (one fixed enclave credential) has no store to reload.
+            let (router, vendor) = if serve.grant_gated {
+                airlock::server::build_self_host_reloadable(
+                    serve.cfg,
+                    serve.seeds,
+                    grant_check,
+                    crate::airlock_serve::reload_from_store(storage),
+                )
+            } else {
                 airlock::server::build_seeded_gated(serve.cfg, serve.seeds, grant_check)
-                    .map_err(|error| format!("airlock gateway: {error}"))?;
+            }
+            .map_err(|error| format!("airlock gateway: {error}"))?;
             crate::gateway_routes::register(workspace, gateway::RouteName::named("airlock"), port)
                 .map_err(|error| format!("register airlock gateway route: {error}"))?;
             tracing::info!(

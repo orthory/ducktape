@@ -76,12 +76,17 @@ impl AirlockServe {
     /// `Some(Ok)` = serve; `Some(Err)` = configured but broken (fail boot loudly,
     /// never silently skip); `None` = off. The TEE env path takes precedence over
     /// the self-host store.
-    pub fn resolve(storage: &Path) -> Option<Result<Self, String>> {
+    /// `serve_when_empty` starts the self-host gateway even with no credentials
+    /// yet (a compute/workstation node): it mints the stable seal keypair at boot
+    /// and serves whatever `cred add` writes later via the lazy store loader, so
+    /// registering a credential never needs a node restart. A plain consensus
+    /// node passes `false` and stays off until the store is non-empty.
+    pub fn resolve(storage: &Path, serve_when_empty: bool) -> Option<Result<Self, String>> {
         let tee_requested = env_nonempty("DUCKTAPE_AIRLOCK_SERVE").is_some();
         if tee_requested {
             return Some(Self::resolve_env());
         }
-        Self::resolve_store(storage).transpose()
+        Self::resolve_store(storage, serve_when_empty).transpose()
     }
 
     fn resolve_env() -> Result<Self, String> {
@@ -119,12 +124,17 @@ impl AirlockServe {
     /// `Ok(None)` = store empty (airlock off). Reads the persisted seal keypair
     /// (minting it on first boot) so the seal_pk matches what `cred add` put on
     /// consensus.
-    fn resolve_store(storage: &Path) -> Result<Option<Self>, String> {
+    fn resolve_store(storage: &Path, serve_when_empty: bool) -> Result<Option<Self>, String> {
         let root = cred_store_root(storage);
         let seeds = load_seeds(&root)?;
-        if seeds.is_empty() {
+        if seeds.is_empty() && !serve_when_empty {
             return Ok(None);
         }
+        // A compute node with an empty store still starts the gateway: create the
+        // store root so the seal keypair persists, then serve credentials as they
+        // are added (the lazy loader, wired in `boot::surfaces`).
+        std::fs::create_dir_all(&root)
+            .map_err(|e| format!("create airlock store {}: {e}", root.display()))?;
         let seal = load_or_create_seal_keypair(&root)?;
         let (anthropic_base, openai_base, oauth_token_url, oauth_client_id) = base_fields();
         let cfg = GatewayConfig {
@@ -241,6 +251,14 @@ pub fn load_seeds(
     }
     seeds.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(seeds)
+}
+
+/// The lazy store loader the running gateway consults on a credential-name miss:
+/// re-read `<store>/<name>/` so a credential `cred add` wrote after boot is
+/// served without a restart (see [`airlock::server::ReloadCredential`]).
+pub fn reload_from_store(storage: &Path) -> airlock::server::ReloadCredential {
+    let root = cred_store_root(storage);
+    std::sync::Arc::new(move |name: &str| load_cred_dir(&root.join(name)))
 }
 
 /// One credential dir → its seed, or `None` when incomplete. The `kind` marker

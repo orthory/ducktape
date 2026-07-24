@@ -108,6 +108,10 @@ struct AppState {
     /// The co-hosted-lending grant gate (see [`GrantCheck`]). `None` on gateways
     /// that never lend, where every known credential opens without a grant check.
     grant_check: Option<GrantCheck>,
+    /// Lazy store loader (see [`ReloadCredential`]): consulted on a session name
+    /// miss so a credential `cred add` wrote after boot is served without a
+    /// restart. `None` on gateways with no backing store (TEE, tests).
+    reload: Option<ReloadCredential>,
 }
 
 fn now_secs() -> u64 {
@@ -129,9 +133,29 @@ pub type Quoter = Box<dyn Fn(&[u8; attest::REPORT_DATA_LEN]) -> Result<Vec<u8>> 
 pub type GrantCheck =
     Arc<dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
+/// Lazy store loader: given a credential name, return its payload from the
+/// on-disk store, or `None` if absent. Lets a running gateway pick up a
+/// credential `cred add` wrote AFTER boot without a node restart — the session
+/// handler calls it on a name miss. `None` on gateways with no backing store.
+pub type ReloadCredential =
+    Arc<dyn Fn(&str) -> Option<(CredentialKind, CredentialPayload)> + Send + Sync>;
+
 /// Build the gateway router and report the vendor ("tdx"/"snp"/"self-host").
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
     build_seeded(cfg, Vec::new())
+}
+
+/// Self-host build with a lazy store loader: seeds the gateway with whatever the
+/// store holds now AND lets it load credentials added later (see
+/// [`ReloadCredential`]). The credential-lending node embed calls this so
+/// `cred add` takes effect without a restart.
+pub fn build_self_host_reloadable(
+    cfg: GatewayConfig,
+    seeds: Vec<(String, CredentialKind, CredentialPayload)>,
+    grant_check: Option<GrantCheck>,
+    reload: ReloadCredential,
+) -> Result<(Router, String)> {
+    build_self_host(cfg, seeds, grant_check, Some(reload))
 }
 
 /// Like [`build_seeded`], but with the co-hosted-lending grant gate wired: the
@@ -151,7 +175,7 @@ pub fn build_seeded_gated(
             };
             build_with_quoter_gated(cfg, mode.as_str(), tsm_quoter(mode), seeds, grant_check)
         }
-        AttestMode::SelfHost => build_self_host(cfg, seeds, grant_check),
+        AttestMode::SelfHost => build_self_host(cfg, seeds, grant_check, None),
     }
 }
 
@@ -197,7 +221,7 @@ fn build_with_quoter_gated(
 
     let report_data = attest::make_report_data(&seal_kp.public_bytes(), &sess_pk.to_bytes());
     let quote = quoter(&report_data)?;
-    assemble(cfg, vendor.to_string(), quote, seal_kp, sess_sk, sess_pk, seeds, grant_check)
+    assemble(cfg, vendor.to_string(), quote, seal_kp, sess_sk, sess_pk, seeds, grant_check, None)
 }
 
 /// Non-TEE build: no quote, vendor "self-host". The broker pins the seal_pk from
@@ -206,11 +230,12 @@ fn build_self_host(
     mut cfg: GatewayConfig,
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
     grant_check: Option<GrantCheck>,
+    reload: Option<ReloadCredential>,
 ) -> Result<(Router, String)> {
     let seal_kp = cfg.seal_keypair.take().unwrap_or_else(SealKeypair::generate);
     let sess_sk = SigningKey::generate(&mut OsRng);
     let sess_pk = sess_sk.verifying_key();
-    assemble(cfg, "self-host".to_string(), Vec::new(), seal_kp, sess_sk, sess_pk, seeds, grant_check)
+    assemble(cfg, "self-host".to_string(), Vec::new(), seal_kp, sess_sk, sess_pk, seeds, grant_check, reload)
 }
 
 /// Shared assembly: build the named store from the seeds, wire the state and the
@@ -226,6 +251,7 @@ fn assemble(
     sess_pk: VerifyingKey,
     seeds: Vec<(String, CredentialKind, CredentialPayload)>,
     grant_check: Option<GrantCheck>,
+    reload: Option<ReloadCredential>,
 ) -> Result<(Router, String)> {
     let mut creds = HashMap::new();
     for (name, kind, payload) in seeds {
@@ -251,6 +277,7 @@ fn assemble(
         budgets: Mutex::new(HashMap::new()),
         seen_nonces: Mutex::new(HashMap::new()),
         grant_check,
+        reload,
     });
 
     let app = Router::new()
@@ -408,15 +435,34 @@ async fn grant_allows(check: &GrantCheck, req: &SessionRequest) -> bool {
     check(req.sub.clone(), account).await
 }
 
+/// Consult the lazy store loader for `name`, inserting it into the live store on
+/// a hit. Returns whether the credential is now present. A no-op (returns false)
+/// when no loader is wired or the store has no such credential.
+fn try_load_credential(st: &AppState, name: &str) -> bool {
+    let Some(reload) = &st.reload else {
+        return false;
+    };
+    let Some((kind, payload)) = reload(name) else {
+        return false;
+    };
+    let Ok(entry) = cred_entry(kind, payload) else {
+        return false;
+    };
+    st.creds.lock().unwrap().insert(name.to_string(), Arc::new(entry));
+    true
+}
+
 async fn session(
     State(st): State<Arc<AppState>>,
     Json(req): Json<SessionRequest>,
 ) -> Result<Json<SessionResponse>, AppErr> {
-    // A session names the credential it draws on; refuse an unknown name before
-    // any handshake work (the broker resolves the name from consensus first, so
-    // a miss here is a race or a stale record).
+    // A session names the credential it draws on. A name the store already holds
+    // opens directly; a miss falls to the lazy loader (a credential `cred add`
+    // wrote after boot) before refusing — so a fresh credential is served without
+    // a node restart. A miss with no loader (or an absent name) is a race or a
+    // stale record and 404s.
     let known_credential = st.creds.lock().unwrap().contains_key(&req.sub);
-    if !known_credential {
+    if !known_credential && !try_load_credential(&st, &req.sub) {
         return Err(AppErr(StatusCode::NOT_FOUND, "credential_not_found".into()));
     }
     // Co-hosted lending: when a grant gate is wired, the session's claimed account

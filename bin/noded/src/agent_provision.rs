@@ -74,9 +74,19 @@ mod session_boundary_tests;
 /// run-dir tree — one node's W5 cleanup must never be able to delete a
 /// sibling process's in-flight checkout.
 pub fn agent_runs_root(storage: &Path) -> Result<PathBuf, String> {
+    // Default to a sibling of the storage dir (`<workspace>/agent-runs`): on the
+    // SAME real disk as storage — never a memory-backed `/tmp` that consumes RAM
+    // and that the codex CLI refuses to place its helper binaries under — while
+    // still OUTSIDE the storage tree the D7 guard forbids. The env override wins
+    // for hosts that want the run tree elsewhere.
     let base = std::env::var_os("DUCKTAPE_AGENT_RUNS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("ducktape-agent-runs"));
+        .unwrap_or_else(|| {
+            storage
+                .parent()
+                .unwrap_or(storage)
+                .join("agent-runs")
+        });
     runs_root_under(base, storage)
 }
 
