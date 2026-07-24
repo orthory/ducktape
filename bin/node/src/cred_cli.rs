@@ -491,7 +491,15 @@ fn run_vendor_login(provider: ProviderArg, dir: &Path) -> CredResult {
         .enable_all()
         .build()
         .map_err(|e| format!("login runtime: {e}"))?;
-    rt.block_on(pump_login(command, &artifact))?;
+    let result = rt.block_on(pump_login(command, &artifact));
+    // `shutdown_background`, not the implicit drop: the stdin forwarder reads
+    // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. Aborting
+    // the task can't interrupt that OS-level read, so once the login ends with no
+    // further keypress the thread stays stuck — and a normal runtime drop WAITS
+    // for its blocking pool, hanging `cred add` after the pty session is over.
+    // Detach instead: the stuck reader dies with the process.
+    rt.shutdown_background();
+    result?;
     Ok(())
 }
 
