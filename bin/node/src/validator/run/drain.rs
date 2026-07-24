@@ -676,8 +676,9 @@ impl ValidatorRuntime<'_> {
                         .expect("orchestrator membership has no duplicates");
                 // a fresh epoch: new store (pins of the torn-down
                 // epoch die with it), genesis floor.
-                let orderer =
-                    epoch_spawner.spawn(plan.epoch(), participants, ContentStore::new(), None);
+                let orderer = epoch_spawner
+                    .spawn(plan.epoch(), participants, ContentStore::new(), None)
+                    .await;
                 // the fresh engine must keep draining event-driven —
                 // re-install the finalization delivery wake on its inbox.
                 orderer.set_delivery_wake(delivery_wake_tx.clone());

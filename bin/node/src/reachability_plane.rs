@@ -34,6 +34,14 @@ pub(crate) enum IntroPath {
 pub(crate) type GateOutcomes =
     std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, lobby::IntroReply>>>;
 
+/// the caller-side halves of the plane's lane-reclaim seam (see
+/// `wire_reachability_plane`'s `lane_reclaim`): each resolves with its half
+/// of the CHANNEL_REACHABILITY pair once the plane exits.
+pub(crate) type ReachLaneHandback = (
+    futures::channel::oneshot::Receiver<crate::validator::MeshSender>,
+    futures::channel::oneshot::Receiver<crate::validator::MeshReceiver>,
+);
+
 /// The member side's link from the intro doorbell (reachability-plane thread)
 /// to its validator run loop (§4). The doorbell FORWARDS a verified gate request
 /// to the loop, which submits `Redeem` and settles; the loop's drain writes the
@@ -251,11 +259,24 @@ pub(crate) fn wire_reachability_plane<S, R>(
     gate: Option<GateHook>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
+    // the promotion seam: when armed, each pump hands its lane half back the
+    // moment the plane exits (an orderly `Shutdown`), so a member-flavored
+    // plane can be wired over the SAME registered channel in-process. `None`
+    // = the lanes die with the process, exactly the pre-promotion validator
+    // and sync-only shapes.
+    lane_reclaim: Option<(
+        futures::channel::oneshot::Sender<S>,
+        futures::channel::oneshot::Sender<R>,
+    )>,
 ) -> tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>
 where
     S: P2pSender<PublicKey = ed25519::PublicKey> + Send + Sync + 'static,
     R: P2pReceiver<PublicKey = ed25519::PublicKey> + Send + 'static,
 {
+    let (tx_handback, rx_handback) = match lane_reclaim {
+        Some((tx_handback, rx_handback)) => (Some(tx_handback), Some(rx_handback)),
+        None => (None, None),
+    };
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
 
@@ -298,23 +319,37 @@ where
         })
         .expect("spawn reachability thread");
 
-    // pump in: mesh datagrams -> orchestrator commands.
+    // pump in: mesh datagrams -> orchestrator commands. exits the moment the
+    // plane's command channel closes (an orderly Shutdown) instead of
+    // lingering until the next inbound frame notices the dead plane, so an
+    // armed handback fires promptly; a frame the exit's select drops was
+    // addressed to a plane that no longer exists.
     {
         let cmd = cmd_tx.clone();
         context
             .child("reachability_in")
             .spawn(move |_ctx| async move {
-                while let Ok((peer, msg)) = reach_p2p_rx.recv().await {
+                use futures::FutureExt as _;
+                loop {
+                    let frame = futures::select_biased! {
+                        _ = std::pin::pin!(cmd.closed().fuse()) => None,
+                        frame = reach_p2p_rx.recv().fuse() => Some(frame),
+                    };
+                    let Some(Ok((peer, msg))) = frame else { break };
                     let bytes: Vec<u8> = msg.into();
                     let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
                     if cmd.send(deliver).await.is_err() {
                         break;
                     }
                 }
+                if let Some(handback) = rx_handback {
+                    let _ = handback.send(reach_p2p_rx);
+                }
             });
     }
     // pump out: orchestrator sends -> mesh; everything else is
-    // operator-visible progress.
+    // operator-visible progress. the plane's exit closes the event channel,
+    // so this pump drains the tail and (when armed) hands the sender back.
     {
         let pump_label = label.to_string();
         let mut tx = reach_p2p_tx;
@@ -421,6 +456,9 @@ where
                             )
                         }
                     }
+                }
+                if let Some(handback) = tx_handback {
+                    let _ = handback.send(tx);
                 }
             });
     }

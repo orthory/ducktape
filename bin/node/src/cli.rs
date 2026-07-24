@@ -1044,9 +1044,11 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
-                "admitted {pubkey_hex} as STANDBY: the joiner's parked node will verify a \
-                 state sync, announce itself online, and join the consensus quorum at the \
-                 activation cutover — no quorum slot is spent until the node is actually up"
+                "admitted {pubkey_hex}: the next epoch cutover seats it in the consensus \
+                 quorum, and the chain PAUSES at that cutover until its node seats itself \
+                 and votes. a warm (pre-synced) resident seats in-process from its own \
+                 folded state within moments; a cold node first syncs the frozen boundary. \
+                 watch its log for `promoted: validator at epoch …; seating in-process`"
             );
             Ok(())
         }
