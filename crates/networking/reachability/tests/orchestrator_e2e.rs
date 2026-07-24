@@ -1231,6 +1231,114 @@ async fn cold_restart_filters_departed_members() {
         .await;
 }
 
+/// The parked-resident restart gap: a solo member (the founder shape) whose
+/// only WireGuard peer is an admitted-but-parked standby reboots. The
+/// standby cannot re-deliver its record — every transport it has rides the
+/// overlay the reboot tore down — so the member's restore must reinstall
+/// the standby from disk, or the joiner is stranded forever initiating
+/// handshakes at a peer that no longer knows its key.
+#[tokio::test]
+async fn solo_member_cold_restart_reinstalls_the_parked_standby() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // life 1: the member applies its solo epoch, then the standby's record
+    // pre-warms its tunnel — the accepted record must reach disk (a solo
+    // member has no other persist trigger: no peer adverts, no plans).
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2], vec![]);
+                retarget_all(&nodes, &[0], &[1], 1, 10).await;
+                spawn_nudgers(&local, &nodes);
+                await_prewarmed(&mut collected, &[0], &[(0, 1), (1, 1)], 1).await;
+            })
+            .await;
+    }
+    assert!(
+        dir.path().join("mesh-0.json").exists(),
+        "the member persisted the standby's accepted record"
+    );
+
+    // life 2: same directory, ZERO transport — the founder reboot. The
+    // member's restore alone must put the standby's key back on the
+    // interface (endpoint verbatim from the persisted record: the standby
+    // initiates and roams, so the endpoint is a first target, not a
+    // requirement).
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2], vec![], links_up.clone());
+            retarget_all(&nodes, &[0], &[1], 1, 10).await;
+
+            let restored = await_restored(&mut collected, &[0, 1]).await;
+            assert_eq!(restored[&0], (1, 1), "member: the standby from disk");
+            assert_eq!(restored[&1], (1, 1), "standby: the member from disk");
+            let (standby_keys, _) =
+                WireGuardKeypair::load_or_generate(&dir.path().join("wg-1.key")).unwrap();
+            let config = latest_config(&nodes[0]);
+            let entry = config
+                .peers
+                .iter()
+                .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
+                .expect("member: the parked standby is back on the interface");
+            assert_eq!(entry.public_key.as_array(), standby_keys.public_key().0);
+            assert_eq!(
+                entry.endpoint,
+                Some("8.8.8.20:51820".parse().unwrap()),
+                "member: the standby's persisted endpoint as first target"
+            );
+
+            // links back: the standby's ongoing re-offer supersedes the disk
+            // entry live — the full heal the reboot interrupted.
+            spawn_nudgers(&local, &nodes);
+            links_up.store(true, std::sync::atomic::Ordering::Relaxed);
+            await_prewarmed(&mut collected, &[], &[(0, 1)], 1).await;
+        })
+        .await;
+}
+
+/// A boot whose resident set no longer lists a persisted standby restores
+/// only the members: the departed standby's tunnel is dead weight and is
+/// never applied — the exact gate the member restore applies to adverts.
+#[tokio::test]
+async fn cold_restart_filters_departed_standbys() {
+    let dir = tempfile::tempdir().unwrap();
+
+    {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+                retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+                spawn_nudgers(&local, &nodes);
+                await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1), (2, 2)], 1).await;
+            })
+            .await;
+    }
+
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let links_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (nodes, mut collected) =
+                spawn_mesh_gated(&local, dir.path(), &[1, 2, 3], vec![], links_up);
+            // the resumed epoch dropped the standby.
+            retarget_all(&nodes, &[0, 1], &[], 2, 20).await;
+
+            let restored = await_restored(&mut collected, &[0, 1]).await;
+            for i in 0..2 {
+                assert_eq!(restored[&i], (1, 1), "node {i}: only the member peer");
+                let config = latest_config(&nodes[i]);
+                assert_eq!(config.peers.len(), 1, "node {i}: no departed-standby entry");
+                assert_eq!(config.peers[0].allowed_ips, vec![ula(nodes[1 - i].identity)]);
+            }
+        })
+        .await;
+}
+
 /// The NATed-member restart: the coordinated invite bootstrap brings the
 /// interface up (the join-window tunnel to the inviter) BEFORE the first
 /// epoch event triggers the restore. The restore must land on that live

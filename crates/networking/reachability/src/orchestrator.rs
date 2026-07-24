@@ -1361,10 +1361,12 @@ where
                 })
                 .await;
         };
-        if !self.restore_tried {
+        let restored_standbys = if self.restore_tried {
+            Vec::new()
+        } else {
             self.restore_tried = true;
-            self.restore(&event).await?;
-        }
+            self.restore(&event).await?
+        };
         let set = binding::active_set(&self.config.chain_id, event.epoch, identities.clone())?;
         let pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
             .members
@@ -1425,6 +1427,19 @@ where
         if role == Role::Member {
             state.records.insert(self.me, own.clone());
         }
+        // the restored standby records seed the boot epoch's pre-warm layer
+        // as if just delivered — the epoch's own apply REPLACES the restored
+        // interface, and a parked standby cannot re-deliver its record over
+        // the dead overlay it is parked behind. Nonces stay unseeded so the
+        // owner's live re-offer re-runs the full accept path: an idempotent
+        // reinstall plus the first-contact gossip-back it heals by.
+        for signed in restored_standbys {
+            let identity = signed.record.validator_identity;
+            state
+                .prewarm_peers
+                .insert(identity, self.standby_peer_config(&signed.record));
+            state.standby_records.insert(identity, signed);
+        }
         let peers = state.peers.clone();
         let standbys = state.standbys.clone();
         self.state = Some(state);
@@ -1462,19 +1477,26 @@ where
     /// Strictly best-effort and strictly a bootstrap: failures degrade to
     /// the pre-persistence behavior (live assembly only), and the boot
     /// epoch's own assembly replaces the restored interface at its apply.
-    async fn restore(&mut self, event: &MeshEpochEvent) -> Result<(), ReachabilityError> {
+    ///
+    /// Returns the resident-gated standby records it reinstalled, for the
+    /// caller to seed into the boot epoch's pre-warm layer — on the
+    /// restored interface alone they would die at that very replace.
+    async fn restore(
+        &mut self,
+        event: &MeshEpochEvent,
+    ) -> Result<Vec<SignedEndpointRecord>, ReachabilityError> {
         let Some(path) = &self.config.persist_file else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mesh = match store::load(path, &self.config.chain_id) {
             Ok(Some(mesh)) => mesh,
-            Ok(None) => return Ok(()),
+            Ok(None) => return Ok(Vec::new()),
             Err(err) => {
-                return self
-                    .emit(ReachabilityEvent::RestoreFailed {
-                        reason: err.to_string(),
-                    })
-                    .await;
+                self.emit(ReachabilityEvent::RestoreFailed {
+                    reason: err.to_string(),
+                })
+                .await?;
+                return Ok(Vec::new());
             }
         };
         // the BOOT epoch's members gate the restore: a departed member's
@@ -1494,8 +1516,27 @@ where
                     && member_pk_of.contains_key(&record.validator_identity)
             })
             .collect();
-        if records.is_empty() {
-            return Ok(());
+        // the boot epoch's RESIDENT set gates the persisted standby records
+        // exactly as its member set gates the adverts: a departed standby's
+        // tunnel is dead weight. One still parked is why these persist at
+        // all — it cannot re-introduce itself to a member that forgot its
+        // WireGuard key (invite token consumed at admission, every remaining
+        // transport rides this overlay), so only this reinstall lets its
+        // ongoing handshake retries land again after a reboot.
+        let standby_ids: HashSet<ValidatorIdentity> = event
+            .standbys
+            .iter()
+            .map(binding::identity_of)
+            .filter(|id| *id != self.me && !member_pk_of.contains_key(id))
+            .collect();
+        let standby_records: Vec<SignedEndpointRecord> = mesh
+            .standby_records
+            .iter()
+            .filter(|signed| standby_ids.contains(&signed.record.validator_identity))
+            .cloned()
+            .collect();
+        if records.is_empty() && standby_records.is_empty() {
+            return Ok(Vec::new());
         }
         let mut peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig> = BTreeMap::new();
         for record in &records {
@@ -1537,6 +1578,12 @@ where
                 },
             );
         }
+        for signed in &standby_records {
+            peers.insert(
+                signed.record.validator_identity,
+                self.standby_peer_config(&signed.record),
+            );
+        }
         let local_interface_ips = self
             .overlay
             .identity_allowed_ips(self.me);
@@ -1573,22 +1620,40 @@ where
         match outcome {
             Ok(()) => {
                 self.interface_live = true;
-                // the restored mesh is the interface's base — the pre-warm
-                // layer merges its record-derived peers over it.
+                // the restored mesh — standby entries included — is the
+                // interface's base; the pre-warm layer merges its live
+                // record-derived peers over it (same identity: fresher wins).
                 self.base_peers = Some(peers);
                 self.emit(ReachabilityEvent::MeshRestored {
                     epoch: mesh.epoch,
                     interface: self.interface.clone(),
                     peers: peer_count,
                 })
-                .await
+                .await?;
+                Ok(standby_records)
             }
             Err(err) => {
                 self.emit(ReachabilityEvent::RestoreFailed {
                     reason: format!("wireguard effect: {err:?}"),
                 })
-                .await
+                .await?;
+                Ok(Vec::new())
             }
+        }
+    }
+
+    /// A standby record's peer tunnel config, endpoint taken VERBATIM (no
+    /// rendezvous resolution): the parked side initiates (and roams), so
+    /// its recorded endpoint is a first target, not a requirement — the
+    /// install's real cargo is the WireGuard key.
+    fn standby_peer_config(&self, record: &EndpointRecord) -> PeerTunnelConfig {
+        PeerTunnelConfig {
+            wireguard_public_key: record.wireguard_public_key,
+            endpoint: record.wireguard_endpoint.map(|e| e.socket_addr()),
+            allowed_ips: self
+                .overlay
+                .identity_allowed_ips(record.validator_identity),
+            keepalive_seconds: Some(KEEPALIVE_SECONDS),
         }
     }
 
@@ -2017,6 +2082,32 @@ where
         self.advance().await
     }
 
+    /// Persist the mesh snapshot the cold-restart restore reads back: the
+    /// member adverts AND the accepted standby records. The records ride
+    /// along because a parked resident cannot re-introduce itself to a
+    /// member that forgot its WireGuard key — its invite token was consumed
+    /// at admission and its every remaining transport rides this overlay —
+    /// so this file is its only way back onto a rebooted member's interface.
+    async fn persist_mesh(&mut self) -> Result<(), ReachabilityError> {
+        let Some(path) = self.config.persist_file.as_deref() else {
+            return Ok(());
+        };
+        let state = self.state.as_ref().expect("persist inside an epoch");
+        let mesh = PersistedMesh::new(
+            self.config.chain_id.clone(),
+            state.epoch,
+            state.adverts.values().cloned().collect(),
+            state.standby_records.values().cloned().collect(),
+        );
+        let Err(err) = store::save(path, &mesh) else {
+            return Ok(());
+        };
+        self.emit(ReachabilityEvent::PersistFailed {
+            reason: err.to_string(),
+        })
+        .await
+    }
+
     /// A standby's owner-signed record (member role): validate, resolve its
     /// endpoint, and merge the tunnel onto the live interface — the pre-warm
     /// layer's whole trick. A higher nonce supersedes in place (the live
@@ -2065,6 +2156,11 @@ where
         } else if via == owner {
             state.routes.remove(&owner);
         }
+        // the accepted record reaches disk NOW, not at the epoch apply: a
+        // solo member never mints plans, and a reboot between accept and the
+        // next apply would otherwise strand this standby for good (it cannot
+        // re-introduce itself — see the restore).
+        self.persist_mesh().await?;
         // endpoint-less standby: install without an endpoint — it initiates.
         let endpoint = match signed.record.wireguard_endpoint.map(|e| e.socket_addr()) {
             None => None,
@@ -2228,19 +2324,8 @@ where
                 true
             }
         };
-        if accepted && let Some(path) = &self.config.persist_file {
-            let state = self.state.as_ref().expect("still in epoch");
-            let mesh = PersistedMesh::new(
-                self.config.chain_id.clone(),
-                state.epoch,
-                state.adverts.values().cloned().collect(),
-            );
-            if let Err(err) = store::save(path, &mesh) {
-                self.emit(ReachabilityEvent::PersistFailed {
-                    reason: err.to_string(),
-                })
-                .await?;
-            }
+        if accepted {
+            self.persist_mesh().await?;
         }
         let record = advert.record.clone();
         self.merge_member_prewarm(&record).await
@@ -2370,7 +2455,6 @@ where
             let epoch = state.epoch;
             let plans: Vec<TunnelInstallPlan> = state.plans.values().cloned().collect();
             let overrides = state.overrides.clone();
-            let adverts: Vec<EndpointAdvertisement> = state.adverts.values().cloned().collect();
             // the epoch's validated plans become the interface's new BASE;
             // the pre-warm peers merge over it (same identity: the fresher
             // pre-warm entry wins), so a standby tunnel that assembled
@@ -2423,18 +2507,11 @@ where
                 // the epoch's mesh is now REAL — remember it for the
                 // cold-restart re-apply. Only with member plans: an
                 // all-peers-failed epoch must not clobber the last mesh that
-                // actually carried member tunnels (pre-warm peers alone are
-                // not it — their owners persist their own side).
-                if !plans.is_empty()
-                    && let Some(path) = &self.config.persist_file
-                {
-                    let mesh = PersistedMesh::new(self.config.chain_id.clone(), epoch, adverts);
-                    if let Err(err) = store::save(path, &mesh) {
-                        self.emit(ReachabilityEvent::PersistFailed {
-                            reason: err.to_string(),
-                        })
-                        .await?;
-                    }
+                // actually carried member tunnels. (The accepted standby
+                // records ride every snapshot regardless — their own persist
+                // trigger is the accept itself.)
+                if !plans.is_empty() {
+                    self.persist_mesh().await?;
                 }
             }
             self.emit(ReachabilityEvent::TunnelsApplied {
