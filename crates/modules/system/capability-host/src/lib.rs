@@ -2076,9 +2076,18 @@ fn owner_liveness_with(
 fn reap_podman_orphans_with(
     executing_node: &str,
     current_boot_id: &str,
+    podman_present: bool,
     mut process_starttime: impl FnMut(u32) -> Result<Option<u64>, String>,
     mut run: impl FnMut(&[String]) -> Result<String, String>,
 ) -> Result<(), String> {
+    // No podman binary means no managed containers can exist — the boot reaper
+    // has nothing to reap and MUST NOT fail the node. A node configured for a
+    // podman sandbox but without podman installed still boots (consensus and
+    // networking need no sandbox); the missing binary surfaces later, with a
+    // clear error, only when an agent session actually tries to spawn one.
+    if !podman_present {
+        return Ok(());
+    }
     if !valid_execution_node_id(executing_node) {
         return Err(format!(
             "refusing Podman reaper with invalid executing-node id {executing_node:?}"
@@ -2123,6 +2132,21 @@ fn reap_podman_orphans_with(
 #[cfg(target_os = "linux")]
 fn run_podman_bounded(args: &[String]) -> Result<String, String> {
     run_command_bounded(Path::new("podman"), args, PODMAN_CONTROL_TIMEOUT)
+}
+
+/// Whether the `podman` binary is resolvable on this process's PATH. Only a
+/// genuinely absent binary (spawn `NotFound`) reads as unavailable; any other
+/// spawn outcome is treated as present so a transient failure never suppresses
+/// the reaper.
+#[cfg(target_os = "linux")]
+fn podman_available() -> bool {
+    let status = std::process::Command::new("podman")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    !matches!(status, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn kill_std_child_fail_closed(
@@ -2286,6 +2310,7 @@ fn reap_podman_orphans_once(executing_node: &str) -> Result<(), String> {
             reap_podman_orphans_with(
                 executing_node,
                 &owner.boot_id,
+                podman_available(),
                 linux_process_starttime,
                 run_podman_bounded,
             )
@@ -4172,6 +4197,22 @@ format = "{format}"
     }
 
     #[test]
+    fn podman_reaper_absent_binary_is_a_noop_not_a_failure() {
+        // A node configured for a podman sandbox but without podman installed
+        // must still boot: the reaper skips (nothing to reap) rather than
+        // failing, and never shells out.
+        let executing_node = execution_node_id(b"node-a");
+        let outcome = reap_podman_orphans_with(
+            &executing_node,
+            "11111111-2222-3333-4444-555555555555",
+            false, // podman absent
+            |_| panic!("must not touch /proc when podman is absent"),
+            |_| panic!("must not spawn podman when it is absent"),
+        );
+        assert_eq!(outcome, Ok(()));
+    }
+
+    #[test]
     fn podman_process_reaper_preserves_live_owner_and_reaps_only_dead_owner() {
         let live_cid = "0123456789abcdef";
         let dead_cid = "fedcba9876543210";
@@ -4182,6 +4223,7 @@ format = "{format}"
         reap_podman_orphans_with(
             &executing_node,
             boot_id,
+            true,
             |pid| match pid {
                 101 => Ok(Some(1001)),
                 // PID 202 exists but starttime differs: it was reused and is
@@ -4243,6 +4285,7 @@ format = "{format}"
         reap_podman_orphans_with(
             &executing_node,
             boot_id,
+            true,
             |_| Err("/proc denied".into()),
             |args| {
                 calls.push(args.to_vec());
@@ -4273,6 +4316,7 @@ format = "{format}"
         let error = reap_podman_orphans_with(
             &executing_node,
             "11111111-2222-3333-4444-555555555555",
+            true,
             |_| panic!("limit is checked before /proc"),
             |args| {
                 assert_eq!(args, query.as_slice());
