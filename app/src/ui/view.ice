@@ -876,16 +876,36 @@ view
                   col width=fill spacing=4.0
                     container width=fill padding-left=4.0
                       text "SNAPSHOTS" size=11.0 font=medium @text-muted
-                    for snapshot in fs_history
-                      container width=fill padding=7.0 bg=popover border=fg/10 border-w=1.0 r=8.0
-                        col width=fill spacing=2.0
+                    if !empty(fs_diff_from)
+                      col width=fill spacing=3.0
+                        row width=fill spacing=8.0 align=center
+                          text "Changes vs head" width=fill size=11.0 font=medium @text-muted
+                          button "Back" height=22.0 padding=4.0 -> fs_close_diff
+                            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
+                            hovered bg=fg/10 text=fg
+                            pressed bg=fg/14
+                        if empty(fs_diff)
+                          text "No differences." size=13.0 @text-muted
+                        for entry in fs_diff
                           row width=fill spacing=8.0 align=center
-                            text snapshot.short_id size=11.0 wrapping=none font=mono @text-primary
-                            text snapshot.height size=11.0 wrapping=none font=mono @text-muted
-                            space width=fill
-                            text snapshot.author size=11.0 wrapping=none font=mono @text-muted
-                          if !empty(snapshot.message)
-                            text snapshot.message size=13.0 @text-fg
+                            text entry.kind width=64.0 size=11.0 wrapping=none font=mono @text-primary
+                            text entry.path width=fill size=13.0 wrapping=none font=mono @text-fg
+                    if empty(fs_diff_from)
+                      col width=fill spacing=4.0
+                        for snapshot in fs_history
+                          container width=fill padding=7.0 bg=popover border=fg/10 border-w=1.0 r=8.0
+                            col width=fill spacing=2.0
+                              row width=fill spacing=8.0 align=center
+                                text snapshot.short_id size=11.0 wrapping=none font=mono @text-primary
+                                text snapshot.height size=11.0 wrapping=none font=mono @text-muted
+                                space width=fill
+                                text snapshot.author size=11.0 wrapping=none font=mono @text-muted
+                                button "Diff" height=20.0 padding=3.0 -> fs_show_diff(snapshot.id)
+                                  active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
+                                  hovered bg=fg/10 text=fg
+                                  pressed bg=fg/14
+                              if !empty(snapshot.message)
+                                text snapshot.message size=13.0 @text-fg
               if !fs_history_open && empty(fs_preview_path)
                 EmptyState title="Select a file" detail="Text files preview here; History shows the commit window."
               if !fs_history_open && !empty(fs_preview_path)

@@ -1218,6 +1218,100 @@ pub async fn files_write_text(
     Ok(true)
 }
 
+/// Upload a local file dropped onto the window into the current directory:
+/// small files ride inline; larger ones stage 1 MiB chunks then commit a
+/// chunk list. The dropped path never leaves this device — only bytes do.
+pub async fn files_upload(
+    rpc: String,
+    dir: String,
+    dropped: String,
+) -> Result<bool, AppError> {
+    async {
+        let source = PathBuf::from(&dropped);
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "dropped path has no file name".to_string())?
+            .to_string();
+        let bytes =
+            std::fs::read(&source).map_err(|error| format!("cannot read {dropped}: {error}"))?;
+        let rpc = rpc_client(&rpc)?;
+        let target = fs_child(dir, name.clone());
+        let content = match bytes.len() as u64 <= 256 * 1024 {
+            true => serde_json::json!({ "inline": { "b64": base64_encode(&bytes) } }),
+            false => {
+                let mut chunks = Vec::new();
+                for chunk in bytes.chunks(1024 * 1024) {
+                    chunks.push(rpc.files_stage(chunk.to_vec()).await?);
+                }
+                serde_json::json!({ "chunks": { "size": bytes.len() as u64, "chunks": chunks } })
+            }
+        };
+        files_commit_one(
+            &rpc,
+            format!("upload {name}"),
+            serde_json::json!({
+                "put": { "path": target, "exec": false, "meta": {}, "content": content }
+            }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The Added/Removed/Modified leaves between a snapshot and the head.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsDiffEntry {
+    pub path: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsDiff {
+    pub generation: i64,
+    pub from: String,
+    pub entries: Vec<FsDiffEntry>,
+}
+
+/// Diff one committed snapshot against the current head.
+pub async fn files_diff(
+    rpc: String,
+    from: String,
+    generation: i64,
+) -> Result<FsDiff, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let head = files_head(&rpc)
+            .await?
+            .ok_or_else(|| "nothing committed yet".to_string())?;
+        let reply = rpc
+            .files_get("diff", &[("from", from.as_str()), ("to", head.as_str())])
+            .await?;
+        let entries = reply["entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| FsDiffEntry {
+                path: entry["path"].as_str().unwrap_or_default().to_string(),
+                kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+            })
+            .collect();
+        Ok(FsDiff {
+            generation,
+            from,
+            entries,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -1537,7 +1631,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     }
                     Some(Ok(ModuleEvent::Changed { module, cursor, op })) => {
                         state.cursors.insert(format!("module:{module}"), cursor);
-                        match folded_update(&state.rpc, &module, op).await {
+                        match folded_update(&state.rpc, &module, *op).await {
                             Some(update) => update,
                             // invisible to the UI (hook registration) — keep
                             // draining without emitting.

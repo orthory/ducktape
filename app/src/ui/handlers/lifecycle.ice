@@ -379,6 +379,26 @@ on fs_write_failed(cause)
   fs_loading = false
   error = cause.message
 
+on fs_file_dropped(path)
+  return if shell_tab != "files" || fs_loading || !connected
+  fs_loading = true
+  error = ""
+  run files_upload(connected_rpc, fs_path, path) -> fs_wrote _ | fs_write_failed _
+
+on fs_show_diff(from)
+  return if fs_loading || !connected
+  fs_diff_from = from
+  fs_generation = fs_generation + 1
+  run files_diff(connected_rpc, fs_diff_from, fs_generation) -> fs_diffed _ | fs_failed _
+
+on fs_close_diff
+  fs_diff_from = ""
+  fs_diff = []
+
+on fs_diffed(next)
+  return if next.generation != fs_generation
+  fs_diff = next.entries
+
 on refresh_explorer
   return if !connected || explorer_loading
   explorer_generation = explorer_generation + 1
@@ -452,6 +472,7 @@ on palette_search_failed(cause)
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
   keyboard press when connected -> global_key_pressed _
+  window file-dropped -> fs_file_dropped _
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)

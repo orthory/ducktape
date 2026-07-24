@@ -92,6 +92,8 @@ state
   fs_delete_target = ""
   fs_editor:editor = ""
   fs_editing = false
+  fs_diff_from = ""
+  fs_diff:[FsDiffEntry] = []
   palette_open = false
   palette_draft = ""
   palette_key = ""

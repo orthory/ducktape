@@ -51,7 +51,7 @@ pub enum ModuleEvent {
     Changed {
         module: String,
         cursor: String,
-        op: StreamOp,
+        op: Box<StreamOp>,
     },
     /// Replay history was unavailable; hydrate a fresh snapshot at this cursor.
     Lagged { module: String, cursor: String },
@@ -137,7 +137,7 @@ enum StreamFrame {
     Event {
         topic: String,
         cursor: String,
-        op: StreamOp,
+        op: Box<StreamOp>,
     },
     Lagged {
         topic: String,
@@ -282,6 +282,25 @@ impl Client {
             .await
             .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
         decode_json(response).await
+    }
+
+    /// Stage one duckfs chunk (`POST /v1/files/stage`, raw bytes ≤ 1 MiB) —
+    /// returns the staged chunk's digest.
+    pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {
+        let response = self
+            .http
+            .post(self.url("v1/files/stage")?)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC files stage failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Staged {
+            digest: String,
+        }
+        let reply: Staged = decode_json(response).await?;
+        Ok(reply.digest)
     }
 
     /// Submit an already-signed operation frame.

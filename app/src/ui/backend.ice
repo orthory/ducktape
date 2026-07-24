@@ -78,6 +78,10 @@ extern crate::backend
   files_mkdir(rpc:str, path:str) -> bool ! AppError
   files_remove(rpc:str, path:str) -> bool ! AppError
   files_write_text(rpc:str, path:str, text:str) -> bool ! AppError
+  files_upload(rpc:str, dir:str, dropped:str) -> bool ! AppError
+  FsDiffEntry(path:str, kind:str)
+  FsDiff(generation:i64, from:str, entries:[FsDiffEntry])
+  files_diff(rpc:str, from:str, generation:i64) -> FsDiff ! HydrationError
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
