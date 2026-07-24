@@ -20,8 +20,9 @@ use crate::config::{self, hex_bytes};
 use crate::constants::*;
 use crate::first_contact_join;
 use crate::lobby;
-use crate::reachability_plane::wire_reachability_plane;
+use crate::reachability_plane::{ReachLaneHandback, wire_reachability_plane};
 use crate::util::fatal;
+use crate::validator::{DrainingSlot, LaneBank, LaneSlot, ReclaimableLane};
 
 use super::OverlayCtx;
 
@@ -36,11 +37,17 @@ use super::OverlayCtx;
 pub(super) struct ReplicaChannels {
     pub(super) context: commonware_runtime::tokio::Context,
     pub(super) replica_store: ContentStore,
+    /// the engine-lane bank: reclaimable drainers while parked, the seat
+    /// epoch's engine transport at promotion (the baton carries it on).
+    pub(super) lane_bank: LaneBank,
     pub(super) head_wake: futures::channel::mpsc::Receiver<()>,
     pub(super) cert_bridge: futures::channel::mpsc::Receiver<Vec<u8>>,
     pub(super) sync_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) sync_rx: discovery::Receiver<ed25519::PublicKey>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
+    /// the reachability lane's promotion handback — resolves once the
+    /// standby plane shuts down (`None` = no wireguard, no plane).
+    pub(super) reach_reclaim: Option<ReachLaneHandback>,
     pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
     /// the joiner's admission signal (join ADR §4): set by the first-contact
@@ -119,9 +126,17 @@ pub(super) async fn wire(
     // blocks the peer connection.
     let (cert_bridge_tx, cert_bridge) =
         futures::channel::mpsc::channel::<Vec<u8>>(256);
-    for epoch in 0..EPOCH_CHANNEL_BANK {
+    // the engine-lane bank, based at the checkpoint epoch (a fresh join
+    // has none — base 0). epochs BELOW the base are registered and
+    // permanently black-holed, exactly the validator wiring's trick: a
+    // lagging peer still gossips there, and an unregistered channel is a
+    // protocol violation that would kill its connection. the bank itself
+    // holds RECLAIMABLE drainers — promotion revokes the seat epoch's
+    // five and hands the lanes to its engine.
+    let bank_base = manifest.as_ref().map(|m| m.epoch).unwrap_or(0);
+    for epoch in 0..bank_base {
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-        for ch in [vote, res, fetch] {
+        for ch in [vote, cert, res, payload, fetch] {
             let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
             let label: &'static str =
                 Box::leak(format!("blackhole_{ch}").into_boxed_str());
@@ -129,36 +144,70 @@ pub(super) async fn wire(
                 while rx.recv().await.is_ok() {}
             });
         }
-        {
-            let (_tx, mut payload_rx) = network.register(payload, quota, MAX_BACKLOG);
-            let store = replica_store.clone();
-            let label: &'static str =
-                Box::leak(format!("payload_store_{payload}").into_boxed_str());
-            context.child(label).spawn(move |_ctx| async move {
-                while let Ok((_peer, msg)) = payload_rx.recv().await {
-                    let bytes: Vec<u8> = msg.into();
-                    // store-ONLY, never delivered: delivery is the
-                    // fold driver's verified-finalization arm.
+    }
+    let slots = (0..EPOCH_CHANNEL_BANK)
+        .map(|i| {
+            let epoch = bank_base + i;
+            let (vote, cert, res, payload, fetch) = engine_channels(epoch);
+            let cert_drain = {
+                let mut wake = head_wake_tx.clone();
+                let mut bridge = cert_bridge_tx.clone();
+                move |bytes: Vec<u8>| {
+                    // full == a wake is already pending: coalesce, never
+                    // block the drain (an unread lane kills the peer).
+                    let _ = wake.try_send(());
+                    // drop-on-full: parent linkage re-covers shed certs.
+                    let _ = bridge.try_send(bytes);
+                }
+            };
+            let payload_drain = {
+                let store = replica_store.clone();
+                // store-ONLY, never delivered: delivery is the fold
+                // driver's verified-finalization arm.
+                move |bytes: Vec<u8>| {
                     store.put(bytes);
                 }
-            });
-        }
-        let (_tx, mut cert_rx) = network.register(cert, quota, MAX_BACKLOG);
-        let label: &'static str =
-            Box::leak(format!("certbridge_{cert}").into_boxed_str());
-        let mut wake = head_wake_tx.clone();
-        let mut bridge = cert_bridge_tx.clone();
-        context.child(label).spawn(move |_ctx| async move {
-            while let Ok((_peer, msg)) = cert_rx.recv().await {
-                let bytes: Vec<u8> = msg.into();
-                // full == a wake is already pending: coalesce, never
-                // block the drain (an unread lane kills the peer).
-                let _ = wake.try_send(());
-                // drop-on-full: parent linkage re-covers shed certs.
-                let _ = bridge.try_send(bytes);
-            }
-        });
-    }
+            };
+            LaneSlot::Draining(DrainingSlot {
+                vote: ReclaimableLane::drain(
+                    &context,
+                    "blackhole",
+                    vote,
+                    network.register(vote, quota, MAX_BACKLOG),
+                    |_bytes| {},
+                ),
+                certificate: ReclaimableLane::drain(
+                    &context,
+                    "certbridge",
+                    cert,
+                    network.register(cert, quota, MAX_BACKLOG),
+                    cert_drain,
+                ),
+                resolver: ReclaimableLane::drain(
+                    &context,
+                    "blackhole",
+                    res,
+                    network.register(res, quota, MAX_BACKLOG),
+                    |_bytes| {},
+                ),
+                payload: ReclaimableLane::drain(
+                    &context,
+                    "payload_store",
+                    payload,
+                    network.register(payload, quota, MAX_BACKLOG),
+                    payload_drain,
+                ),
+                fetch: ReclaimableLane::drain(
+                    &context,
+                    "blackhole",
+                    fetch,
+                    network.register(fetch, quota, MAX_BACKLOG),
+                    |_bytes| {},
+                ),
+            })
+        })
+        .collect();
+    let lane_bank = LaneBank::new(bank_base, slots);
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota, MAX_BACKLOG);
     // the reachability lane: a parked joiner with a WireGuard config
     // runs the plane in its STANDBY role — once resident standing
@@ -171,6 +220,11 @@ pub(super) async fn wire(
     // from the SAME ambient coordinator set before it moves into the plane
     // below. empty = fallback off.
     let mut relay_endpoints: Vec<String> = Vec::new();
+    // the reachability lane's promotion seam: the standby plane's pumps hand
+    // the lane halves back through these the moment an orderly Shutdown ends
+    // the plane, so the promoted validator can wire its member-flavored
+    // plane over the same registered channel.
+    let mut reach_reclaim: Option<ReachLaneHandback> = None;
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
         let (reach_tx, mut reach_rx) =
             network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
@@ -197,6 +251,9 @@ pub(super) async fn wire(
                         }
                     };
                 relay_endpoints = coordinator_relays(coordinator_relay.as_deref(), &coordinators);
+                let (tx_handback, tx_reclaim) = futures::channel::oneshot::channel();
+                let (rx_handback, rx_reclaim) = futures::channel::oneshot::channel();
+                reach_reclaim = Some((tx_reclaim, rx_reclaim));
                 Some(wire_reachability_plane(
                     &context,
                     &label,
@@ -218,6 +275,9 @@ pub(super) async fn wire(
                     None,
                     reach_tx,
                     reach_rx,
+                    // promotion reclaims the lane once the standby plane
+                    // shuts down, and wires the member plane over it.
+                    Some((tx_handback, rx_handback)),
                 ))
             }
             None => {
@@ -462,6 +522,8 @@ pub(super) async fn wire(
     ReplicaChannels {
         context,
         replica_store,
+        lane_bank,
+        reach_reclaim,
         head_wake,
         cert_bridge,
         sync_tx,

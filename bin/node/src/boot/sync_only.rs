@@ -123,6 +123,8 @@ pub(crate) async fn run(
         None,
         sync_requester,
         sync_proof,
+        // sync-only never promotes: the lane is the dispatch task's for life.
+        None,
     );
 
     // the mesh takes a moment to connect, and the server only serves

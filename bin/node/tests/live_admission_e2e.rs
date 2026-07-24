@@ -1,11 +1,12 @@
 //! network-shape live admission: a fresh identity produced by `join` can start
-//! immediately, park as a read-only resident, and promote through the
-//! TWO-PHASE membership protocol once a running member admits it through
-//! governance — registration lands it STANDBY (cutover #1, quorum unchanged),
-//! the parked node proves a full state sync and announces ONLINE with its own
-//! signed proof, a member relays that into the ordered lane, and the
-//! ACTIVATION cutover (#2) widens the quorum, at which point the joiner
-//! promotes.
+//! immediately, park as a read-only resident, and promote once a running
+//! member admits it through governance. ONE epoch cutover seats the key —
+//! the chain pauses at that cutover awaiting the new member's votes — and
+//! the parked node seats itself IN-PROCESS: a warm resident from its own
+//! folded state (no fetch from the halted members), a cold direct admission
+//! from the frozen boundary it syncs first. `promoted: validator at epoch …;
+//! seating in-process` marks the hand-off; the same process is the
+//! validator from there.
 
 mod common;
 
@@ -50,15 +51,6 @@ fn network_shape_joiner_parks_until_promote() {
         "join should print the friend's public key hex"
     );
 
-    // the shipped-index warm start (indexable spec §7) is the DEFAULT — the
-    // generated file already carries `sync_index = true`, and the whole lane
-    // rides this admission for real: the founder cuts and serves its index
-    // checkpoints over the mesh, the friend fetches and stages them, and the
-    // promoted reboot adopts the set.
-    let cfg = cluster.config_file(1);
-    let toml = std::fs::read_to_string(&cfg).expect("read friend node.toml");
-    assert!(toml.contains("sync_index = true"), "generated file defaults the warm start on");
-
     cluster.spawn(1);
     cluster.wait_marker(1, "joiner mode:", Duration::from_secs(60));
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
@@ -68,28 +60,24 @@ fn network_shape_joiner_parks_until_promote() {
     assert!(out.contains("admitted"), "unexpected verb output:\n{out}");
 
     // direct admission: ONE cutover seats the friend; it syncs the frozen
-    // boundary and promotes there. (the staged resident flow has its own
-    // leg below.)
+    // boundary and seats there, in-process. (the staged resident flow has
+    // its own leg below.)
     cluster.wait_marker(0, "cutover complete: epoch 1", CONVERGE);
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(1, "synced root_hash=", CONVERGE);
-    cluster.wait_marker(1, "shipped index staged", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
 }
 
-/// the promotion REBOOT leg the markers above stop short of: after
-/// `promoted: validator at epoch` the node exec-reboots and must complete a
-/// post-reboot catch-up dialogue against the founder BEFORE it can serve or
-/// vote — and the founder must keep answering the statesync channel through
-/// that whole window, cutover included. every other promote leg in this
-/// suite latches the `promoted:` marker and stops, so a founder that goes
-/// silent right after the cutover (the field failure: ten
-/// `catch-up manifest unavailable ... timed out` retries, then FATAL, in a
-/// supervisor crash-loop) was invisible to CI. the exec keeps the same log
-/// fd, so markers span the reboot; a FATAL exit panics `wait_marker` with
-/// BOTH log tails — the founder's tail is the diagnosis.
+/// the SEAT leg the markers above stop short of: after `promoted: validator
+/// at epoch` the same process must actually be a validator — the seated
+/// engine votes the halted quorum back to life, the serve lanes answer, and
+/// writes finalize into the widened set. every other promote leg in this
+/// suite latches the `promoted:` marker and stops, so a node that seats and
+/// then wedges (the field failure class the retired exec-reboot flow had:
+/// a promoted node dying in its post-reboot dialogue while the founder sat
+/// halted) would be invisible to CI without the liveness assertions below.
 #[test]
-fn promoted_resident_boots_through_post_reboot_catchup() {
+fn promoted_resident_seats_in_process_and_serves() {
     use directory::{DirMsg, DirQuery, DirReply};
 
     let _serial = serial();
@@ -104,7 +92,7 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
     // resident standing first — the field node parked as a resident (staged
-    // admission) before its promote, so the reboot starts from a warm,
+    // admission) before its promote, so the seat starts from a warm,
     // boundary-following node exactly as it did in the field.
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);
@@ -118,11 +106,7 @@ fn promoted_resident_boots_through_post_reboot_catchup() {
     assert!(ok, "promote failed:\n{out}");
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
 
-    // THE property: the catch-up completes — the success line's " frames)"
-    // suffix is printed by no failure path ("unavailable" retries included).
-    cluster.wait_marker(1, " frames)", CONVERGE);
-
-    // and the network the reboot lands in is LIVE end to end: a write
+    // the network the seat lands in is LIVE end to end: a write
     // finalized through the founder becomes readable from the promoted
     // friend's own surface…
     cluster.submit(
@@ -759,18 +743,18 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }),
     );
 
-    // (7) promote: the warm resident becomes a validator through the replica
-    //     promotion collapse — it checkpoints its OWN folded state and
-    //     reboots (no re-sync: at a quorum-widening cutover the founder
-    //     halts awaiting this very node, so there is nothing to sync FROM);
-    //     valset Join clears its resident standing.
+    // (7) promote: the warm resident becomes a validator through the
+    //     in-process seat — its own fold observes the cutover that seats
+    //     it, it checkpoints its OWN folded state, and the same process
+    //     continues as the validator (no re-sync: at a quorum-widening
+    //     cutover the founder halts awaiting this very node, so there is
+    //     nothing to fetch FROM); valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
-    assert!(
-        out.contains("admitted"),
-        "unexpected promote output:\n{out}"
-    );
-    cluster.wait_marker(1, "admitted at epoch", CONVERGE);
+    assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
+    // no `admitted at epoch` marker here: that line is the COLD path's
+    // manifest fetch, and a warm seat deliberately fetches nothing — its
+    // own fold carries it straight to `promoted:`.
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     let residents = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))

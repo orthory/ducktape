@@ -1155,6 +1155,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.code_source = src;
     }
 
+    /// dismantle the node into its host and sink — the promotion seam: a
+    /// follower-ordered replica hands both to a validator-ordered rebuild
+    /// ([`Self::resume`] with an engine orderer) inside the same process.
+    /// everything else (undrained events, deferred frames, the orderer) is
+    /// dropped with `self`; callers only dismantle at a drained boundary.
+    pub fn into_parts(self) -> (Host, S) {
+        (self.host, self.sink)
+    }
+
     /// choose how each block's `consensus_time` is derived from its height (see
     /// [`ConsensusTimePolicy`]). the default `HeightIsTime` is the validator
     /// lane; the sim backend sets `Epoch{..}` for its logical millisecond clock.

@@ -16,7 +16,7 @@ use recovery::Manifest;
 use super::announce::CapabilityAnnouncer;
 use crate::constants::DRAIN_TICK;
 use crate::reachability_plane::GateOutcomes;
-use crate::rpc::{JoinRequestRecord, RpcJob, spawn_rpc_listener};
+use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
 use crate::{lobby, oracle_pool, relay_runtime, voice_plane};
@@ -130,7 +130,11 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) announce_capabilities: bool,
     pub(super) sandbox: Option<capability_host::SandboxBackend>,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
-    pub(super) rpc_listener: Option<std::net::TcpListener>,
+    /// the local rpc bridge's parsed-request queue — the caller owns the
+    /// listener spawn (a promoted node's listener pump carries over from
+    /// its parked life; a fresh boot spawns one), so both entries feed the
+    /// same seam.
+    pub(super) rpc_ingress: futures::channel::mpsc::Receiver<RpcJob>,
     pub(super) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
@@ -262,7 +266,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         announce_capabilities,
         sandbox,
         sandbox_capacity,
-        rpc_listener,
+        rpc_ingress,
         http_cmds,
         stream_hub,
         index,
@@ -275,24 +279,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status_public_key,
         coordination,
     } = state;
-    // the local rpc bridge: blocking listener threads push parsed requests
-    // into this bounded queue; the pump answers between drains.
-    let (rpc_tx, mut rpc_ingress) = futures::channel::mpsc::channel::<RpcJob>(64);
-    if let Some(listener) = rpc_listener {
-        let listen = listener
-            .local_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default();
-        tracing::info!(
-            target: "ducktape::node",
-            node = %label,
-            %listen,
-            "rpc listening on {listen}"
-        );
-        spawn_rpc_listener(listener, rpc_tx);
-    } else {
-        drop(rpc_tx); // rpc off: the branch below just stays pending forever.
-    }
+    let mut rpc_ingress = rpc_ingress;
 
     // the ordered lane SIGNS every frame. rpc submits are signed by THIS
     // node's identity (the node is the local caller's custodian until user
