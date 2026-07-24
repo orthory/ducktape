@@ -630,8 +630,6 @@ pub(super) async fn park(
             // the operator's `node.toml [sandbox]` runtime, same as the
             // validator boot — a resident sandboxes its runs identically.
             backend,
-            // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-            false,
         )
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
         None => capability_host::ProviderSet::empty(),
