@@ -187,6 +187,21 @@ impl InteractiveSession {
         }
     }
 
+    /// Resolve once the CHILD LEADER process has exited, without reaping it (the
+    /// reap stays with [`Self::close`]). Distinct from [`Self::read`] returning
+    /// EOF: the pty master only EOFs once EVERY slave fd is closed, so a child
+    /// that exits while a lingering grandchild still holds the slave (a browser
+    /// helper a vendor login forks, say) would never EOF. A caller that needs to
+    /// proceed the moment the child itself is done races this against `read`.
+    /// Never resolves if the leader pid is unknown (nothing to observe).
+    pub async fn wait_child_exit(&self) {
+        let Some(pid) = self.live.lock().await.leader_pid() else {
+            std::future::pending::<()>().await;
+            unreachable!()
+        };
+        crate::wait_leader_exit_unreaped(pid, "interactive session").await;
+    }
+
     /// end the session: terminate the child's process group and clean up the
     /// Podman container. Idempotent-ish — safe to call once on session teardown.
     pub async fn close(&self) {
@@ -450,6 +465,46 @@ mod tests {
             "expected the pty to echo 'ping', got {:?}",
             String::from_utf8_lossy(&seen)
         );
+    }
+
+    /// `wait_child_exit` resolves when the child LEADER exits even though a
+    /// lingering grandchild still holds the pty slave open — the exact shape that
+    /// hangs a plain `read`-until-EOF wrap (a vendor login that forks a helper
+    /// and exits). `sh` backgrounds a long `sleep` (which inherits the slave),
+    /// prints, then exits: the master never EOFs, but `wait_child_exit` returns.
+    #[tokio::test]
+    async fn wait_child_exit_returns_while_a_grandchild_holds_the_pty() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo ready"]);
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None, None)
+            .expect("spawn sh on a pty");
+
+        // The child leader (sh) exits right after `echo ready`; the backgrounded
+        // sleep keeps the slave open, so this must still complete promptly.
+        tokio::time::timeout(std::time::Duration::from_secs(10), session.wait_child_exit())
+            .await
+            .expect("wait_child_exit hung while a grandchild held the pty");
+
+        // Drain any buffered output; the pty must reach a BLOCK (no more data),
+        // never EOF — the sleep still holds a slave, so a read-until-EOF wrap
+        // would hang here even though wait_child_exit already returned.
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                session.read(&mut buf),
+            )
+            .await
+            {
+                Err(_) => break, // read blocked: pty open, no EOF — the point.
+                Ok(Ok(0)) => panic!("pty EOF'd — the grandchild did not hold it open"),
+                Ok(Ok(_)) => continue, // drained a chunk (e.g. "ready"), keep going.
+                Ok(Err(e)) => panic!("read errored: {e}"),
+            }
+        }
+
+        // close() terminates the process group, reaping the sleep and freeing it.
+        session.close().await;
     }
 
     /// resize sets the master's window size; the kernel reflects it back through

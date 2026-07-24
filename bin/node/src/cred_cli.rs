@@ -115,7 +115,10 @@ impl ProviderArg {
     fn login_args(self) -> &'static [&'static str] {
         match self {
             Self::Claude => &["setup-token"],
-            Self::Codex => &["login"],
+            // `--device-auth`: a device-code flow (enter a code on any browser)
+            // instead of the default localhost:1455 redirect, which needs a
+            // browser on THIS host — wrong for a headless / SSH operator node.
+            Self::Codex => &["login", "--device-auth"],
         }
     }
 
@@ -485,10 +488,15 @@ fn run_vendor_login(provider: ProviderArg, dir: &Path) -> CredResult {
     Ok(())
 }
 
-/// Pump the pty: child output → stdout (mirrored, URL surfaced once), this
-/// process's stdin → child. Returns when the child's pty closes (EOF).
+/// The Ctrl-C byte. Raw mode disables ISIG, so a Ctrl-C is delivered to us as
+/// this byte rather than a SIGINT — we treat it as "cancel the login".
+const CTRL_C: u8 = 0x03;
+
+/// Pump the pty: child output → stdout (mirrored), this process's stdin → child.
+/// Returns when the child exits or the pty closes; Ctrl-C cancels.
 async fn pump_login(command: tokio::process::Command) -> CredResult {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::AsyncReadExt as _;
 
     // Raw mode for the whole login: `claude setup-token` / `codex login` drive a
@@ -500,8 +508,14 @@ async fn pump_login(command: tokio::process::Command) -> CredResult {
 
     let session = Arc::new(capability_host::InteractiveSession::spawn_local(command)?);
 
-    // forward this terminal's stdin to the child until the session ends.
+    // Forward this terminal's stdin to the child until the session ends. A Ctrl-C
+    // (byte, not SIGINT — ISIG is off in raw mode) CANCELS: without this it would
+    // just flow to the child's TUI, which may ignore it, leaving no way out. It
+    // closes the session (killing the child) so the pump unwinds, and flags the
+    // cancel so `cred add` errors instead of registering an incomplete login.
+    let cancelled = Arc::new(AtomicBool::new(false));
     let writer = session.clone();
+    let cancel = cancelled.clone();
     let input = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1024];
@@ -510,30 +524,50 @@ async fn pump_login(command: tokio::process::Command) -> CredResult {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
+            if buf[..n].contains(&CTRL_C) {
+                cancel.store(true, Ordering::SeqCst);
+                writer.close().await;
+                break;
+            }
             if writer.write_all(&buf[..n]).await.is_err() {
                 break;
             }
         }
     });
 
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = session
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("read login output: {e}"))?;
-        if n == 0 {
-            break;
+    // Mirror the vendor login's own full-screen TUI verbatim — it already
+    // presents the authorize URL and prompts for the code interactively. We add
+    // nothing to the stream (injecting a line mid-redraw would corrupt its
+    // layout); raw mode above lets its UI render exactly as if run directly.
+    let mirror = async {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = session
+                .read(&mut buf)
+                .await
+                .map_err(|e| format!("read login output: {e}"))?;
+            if n == 0 {
+                return CredResult::Ok(());
+            }
+            mirror_stdout(&buf[..n])?;
         }
-        // Mirror the vendor login's own full-screen TUI verbatim — it already
-        // presents the authorize URL and prompts for the code interactively.
-        // We add nothing to the stream: injecting a line mid-redraw would corrupt
-        // its layout, and raw mode (above) lets its UI render exactly as if run
-        // directly.
-        mirror_stdout(&buf[..n])?;
+    };
+
+    // End on whichever comes first: the pty EOF (mirror returns) OR the child
+    // process itself exiting. `claude setup-token` prints its success and exits
+    // but leaves a lingering helper holding the pty slave, so the master never
+    // EOFs — waiting on `read` alone hangs the whole `cred add` before it can
+    // register the credential. Racing the child's exit unblocks that; `close`
+    // then terminates the process group, reaping the helper and freeing the pty.
+    tokio::select! {
+        result = mirror => result?,
+        () = session.wait_child_exit() => {}
     }
     input.abort();
     session.close().await;
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("login cancelled (ctrl-c)".into());
+    }
     Ok(())
 }
 

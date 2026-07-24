@@ -2831,6 +2831,12 @@ impl LiveChild {
             .expect("a live invocation owns its child")
     }
 
+    /// The child's process-group leader pid (its own pid), for observing exit
+    /// without reaping — the reap stays with [`Self::terminate`].
+    pub(crate) fn leader_pid(&self) -> Option<u32> {
+        self.process.process_group
+    }
+
     async fn terminate(&mut self) {
         let process_group = self.process.process_group;
         let cid = if self.process.cleaned {
