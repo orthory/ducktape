@@ -16,28 +16,27 @@ committed changes. Writes require an encrypted v1 user key from
 `~/.ducktape/user.key`. Set `DUCKTAPE_BIN` when the `ducktape` CLI is neither
 beside the app binary nor on `PATH`.
 
-## Material reference
+## Visual language
 
-The UI follows Apple's
-[Materials](https://developer.apple.com/design/human-interface-guidelines/materials)
-and [Liquid Glass](https://developer.apple.com/documentation/technologyoverviews/liquid-glass)
-guidance. Glass is a functional layer for navigation and transient controls,
-not a decoration for document or message content.
+The UI carries the Ducktape Console design source forward (the decommissioned
+Tauri app's token system): warm ink-on-paper neutrals, a terracotta accent,
+and FULLY OPAQUE surfaces — no window transparency, no blur, no glass.
+Depth comes from one-notch surface steps and soft warm shadows, never from
+translucency.
 
-| Token | Opacity | Use |
-| --- | ---: | --- |
-| `bg` | 87% | content canvas |
-| `surface` | 85% | inputs, composer, inline controls |
-| `sidebar` | 86% | the full-height navigation pane |
-| `popover` / `elevated` | 87% | alerts, menus, floating overlays |
+| Token | Value | Use |
+| --- | --- | --- |
+| `bg` | `#fcfcfc` | the app canvas the cards sit on |
+| `surface` | `#f5f5f5` | inputs, composer, inline controls (recessed wells) |
+| `sidebar` | `#f9f9f9` | the full-height navigation pane |
+| `popover` | `#ffffff` | menus, alerts, floating overlays (paper + shadow) |
+| `elevated` | `#efefef` | panels one notch above the canvas |
+| `fg` / `muted` | `#2c2b27` / `#878787` | warm ink and its secondary |
+| `primary` | `#a05a3c` | the terracotta accent (active nav, focus, unread) |
 
-- Keep the palette neutral gray; no gradients or colored accents.
-- Use native window blur and let nearby content show through the material.
-- Do not nest glass surfaces. Content rows stay flat until hover or selection.
+- Warm neutrals only; the accent is the single color voice.
 - Hover changes fill, border, and foreground only; it never changes geometry.
 - Reveal contextual row actions on hover and keep them visible while selected.
-
-This first material pass is native window blur plus semantic translucency. It
-does not claim optical lensing or refraction. Those effects require a
-multi-surface renderer path; a gradient or alpha fill alone is not Liquid
-Glass.
+- Ice theme tokens are compile-time constants, so the app ships one palette;
+  the design source's dark palette and the accent presets return with the
+  module-UI runtime lane, where tokens become runtime values.
