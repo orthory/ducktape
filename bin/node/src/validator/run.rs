@@ -51,6 +51,41 @@ fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroRepl
         .insert(joiner, reply);
 }
 
+/// assemble this node's boundary facts and publish them into the shared
+/// `/v1/status` cell — the http route reads the cell directly, never the
+/// command lane, so this is the ONE place a validator's status becomes
+/// visible (reached via [`ValidatorRuntime::publish_status`] at startup and
+/// after every drain turn). pure assembly over the node's committed state;
+/// the operations section is stamped from the shared metrics projection
+/// (and overlaid live on the read side anyway).
+pub(super) fn publish_boundary_status(
+    status: &noded::StatusCell,
+    node: &ValidatorNode,
+    metrics: &noded::NodeMetrics,
+    status_public_key: &str,
+) {
+    let modules = crate::constants::MODULE_IDS
+        .iter()
+        .map(|m| noded::ModuleStatus {
+            id: (*m).into(),
+            root: node
+                .host()
+                .module_root(m)
+                .map(|r| crate::util::hex(&r))
+                .unwrap_or_default(),
+            category: noded::ModuleCategory::of(m),
+        })
+        .collect();
+    status.publish(noded::NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash: crate::util::hex(&node.root_hash()),
+        height: node.finalized().map(|f| f.height).unwrap_or(0),
+        modules,
+        public_key: status_public_key.into(),
+        operations: metrics.operational_status(),
+    });
+}
+
 /// The long-lived state owned by the validator event loop.
 ///
 /// A single owner lets the handler modules share ordered state without locks or
@@ -104,6 +139,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) cred_resolver: dispatch_oracle::SharedCredentialResolver,
     pub(super) agent_dirs: capability_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
+    pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
     pub(super) coordination: crate::config::Coordination,
 }
@@ -138,8 +174,13 @@ struct ValidatorRuntime<'a> {
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
     metrics: noded::NodeMetrics,
+    status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
+    /// the earliest instant the NEXT `refresh_operations` may run — the
+    /// exposition parse is the pricey part of a status publish, so it is
+    /// paced here instead of riding every drained boundary.
+    next_ops_refresh: std::time::SystemTime,
     expected: usize,
     applied: usize,
     converged: bool,
@@ -230,6 +271,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         cred_resolver,
         agent_dirs,
         metrics,
+        status,
         status_public_key,
         coordination,
     } = state;
@@ -459,8 +501,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         index,
         blobs,
         metrics,
+        status,
         status_public_key,
         coordination,
+        next_ops_refresh: context.current(),
         expected,
         applied,
         converged,
@@ -488,6 +532,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         announcer,
         next_drain: context.current() + DRAIN_TICK,
     };
+    // the startup snapshot: the RECOVERED boundary serves on /v1/status the
+    // moment the loop exists, not after the first drain.
+    runtime.publish_status().await;
 
     loop {
         // Resolve on whichever signal stream installed. If neither did,

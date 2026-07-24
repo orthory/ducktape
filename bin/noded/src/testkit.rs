@@ -46,10 +46,14 @@ impl InProcDaemon {
     ) -> Self {
         let port = nettest::free_port();
         let (handle, cmd_rx, _events) = NodeHandle::channel();
+        let status = handle.status_cell();
+        // the testkit has no mesh and no registry: an empty exposition
+        // parses to the honest empty peers sample and an empty scrape.
+        status.wire_exposition(String::new);
 
         let actor = std::thread::Builder::new()
             .name("inproc-actor".into())
-            .spawn(move || run_actor(build_host(), status_modules, cmd_rx))
+            .spawn(move || run_actor(build_host(), status_modules, cmd_rx, status))
             .expect("spawn actor");
 
         let server = std::thread::Builder::new()
@@ -128,9 +132,13 @@ pub fn run_actor(
     mut host: Host,
     status_modules: Vec<String>,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
+    status: crate::StatusCell,
 ) {
     let mut height: u64 = 0;
     futures::executor::block_on(async move {
+        // the boot snapshot, then one publish per committed block — the SAME
+        // publish-into-the-cell contract the real daemons serve.
+        publish_status(&status, &host, &status_modules, height);
         while let Some(cmd) = cmd_rx.next().await {
             match cmd {
                 NodeCommand::Submit {
@@ -142,6 +150,7 @@ pub fn run_actor(
                     let result =
                         commit(&mut host, &mut height, Origin::External(origin), Msg { target, payload })
                             .await;
+                    publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
                 // the signed-frame lane, FAITHFUL to the real daemon: the origin
@@ -154,40 +163,46 @@ pub fn run_actor(
                         }
                         Err(err) => Err(err.to_string()),
                     };
+                    publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
                 NodeCommand::Query { target, req, reply } => {
                     let result = host.query(&target, &req).await.map_err(|e| e.to_string());
                     let _ = reply.send(result);
                 }
-                NodeCommand::Status { reply } => {
-                    let modules = status_modules
-                        .iter()
-                        .map(|id| ModuleStatus {
-                            id: id.clone(),
-                            root: host.module_root(id).map(|r| hex_root(&r)).unwrap_or_default(),
-                            category: ModuleCategory::of(id),
-                        })
-                        .collect();
-                    let _ = reply.send(NodeStatus {
-                        version: env!("CARGO_PKG_VERSION").into(),
-                        root_hash: hex_root(&host.root_hash()),
-                        height,
-                        modules,
-                        public_key: String::new(),
-                        operations: Default::default(),
-                    });
-                }
-                NodeCommand::Peers { reply } => {
-                    // the testkit has no mesh and no registry: an empty
-                    // exposition parses to the honest empty sample.
-                    let _ = reply.send(crate::peers::peers_from_exposition("", 0, height, None));
-                }
-                NodeCommand::Metrics { reply } => {
-                    let _ = reply.send(String::new());
-                }
             }
         }
+    });
+}
+
+/// assemble + publish the harness's `/v1/status` snapshot (each module's root
+/// read straight from the host) into the shared cell.
+fn publish_status(
+    status: &crate::StatusCell,
+    host: &Host,
+    status_modules: &[String],
+    height: u64,
+) {
+    let modules = status_modules
+        .iter()
+        .map(|id| ModuleStatus {
+            id: id.clone(),
+            root: host.module_root(id).map(|r| hex_root(&r)).unwrap_or_default(),
+            category: ModuleCategory::of(id),
+        })
+        .collect();
+    status.publish(NodeStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        root_hash: hex_root(&host.root_hash()),
+        height,
+        modules,
+        public_key: String::new(),
+        operations: Default::default(),
+    });
+    // no mesh: height only, no roles or epoch — same as the embedded daemon.
+    status.publish_peers(crate::PeersStanding {
+        height,
+        ..Default::default()
     });
 }
 

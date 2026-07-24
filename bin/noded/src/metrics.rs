@@ -5,13 +5,12 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use commonware_runtime::telemetry::metrics::{EncodeLabelSet, MetricsExt as _, Registered, raw};
-use futures::channel::oneshot;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    ConsensusOperationalStatus, IndexOperationalStatus, NodeCommand, NodeHandle, NodePhase,
-    NodeRole, OperationalStatus, SyncOperationalStatus, actor_gone,
+    ConsensusOperationalStatus, IndexOperationalStatus, NodeHandle, NodePhase, NodeRole,
+    OperationalStatus, SyncOperationalStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -275,6 +274,12 @@ impl NodeMetrics {
             .clone()
     }
 
+    /// the shared operations projection itself, for the status cell's live
+    /// overlay ([`crate::StatusCell::wire_metrics`]).
+    pub(crate) fn operations_handle(&self) -> Arc<RwLock<OperationalStatus>> {
+        Arc::clone(&self.operations)
+    }
+
     pub fn update_consensus(
         &self,
         epoch: u64,
@@ -388,22 +393,23 @@ fn quorum(validators: u64) -> u64 {
 /// the OpenMetrics content type a Prometheus scraper negotiates for `/metrics`.
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
-/// GET /metrics — the Prometheus scrape surface. the actor encodes the
-/// commonware runtime registry (which the daemon's `ducktape_*` series are
-/// registered into) to OpenMetrics text and hands it back over the command lane.
+/// GET /metrics — the Prometheus scrape surface. encodes the runtime
+/// registry (which the daemon's `ducktape_*` series are registered into)
+/// through the handle's wired exposition source — the registry is shared
+/// state, so a scrape never crosses the command lane and stays live while a
+/// sync/catch-up stage has the pump busy.
 pub(crate) async fn metrics(State(handle): State<NodeHandle>) -> Response {
-    let (reply, rx) = oneshot::channel();
-    if let Err(resp) = handle.send(NodeCommand::Metrics { reply }).await {
-        return resp;
-    }
-    match rx.await {
-        Ok(body) => (
+    match handle.status_cell().exposition() {
+        Some(body) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, OPENMETRICS_CONTENT_TYPE)],
             body,
         )
             .into_response(),
-        Err(_) => actor_gone(),
+        None => crate::error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no metrics exposition is wired on this daemon",
+        ),
     }
 }
 
