@@ -89,15 +89,19 @@ const TASKS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/tasks/component.wasm");
 const TASKS_MODULE_ID: &str = "tasks";
 
-/// tagging / capability — adapter-ported tenants whose ops resolve
-/// SIBLING READS (valset standing, identity bindings, content-module roots)
-/// through the runtime's memoized replay. the lifecycle module deliberately stays NATIVE:
+/// tagging — an adapter-ported tenant whose ops resolve SIBLING READS
+/// (valset standing, identity bindings, content-module roots) through the
+/// runtime's memoized replay. the lifecycle module deliberately stays NATIVE:
 /// its Advance decides over frozen end-of-block committed state, a surface the
 /// wit world's staged-over-committed reads cannot represent (kernel
 /// coordinators — valset, lifecycle — gate the machinery itself).
 const TAGGING_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/tagging/component.wasm");
 const TAGGING_MODULE_ID: &str = "tagging";
+/// capability — a STORE-BACKED tenant like pages/chat: the provider registry
+/// rides a host-constructed qmdb store and the wasm root is the store's
+/// merkle root. no per-network config (the valset sibling id is compiled into
+/// the guest).
 const CAPABILITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/capability/component.wasm");
 const CAPABILITY_MODULE_ID: &str = "capability";
@@ -350,8 +354,10 @@ fn genesis_tagging_wasm() -> WasmModule {
         .expect("embedded tagging component loads")
 }
 
-fn genesis_capability_wasm() -> WasmModule {
-    WasmModule::from_bytes(CAPABILITY_MODULE_ID, CAPABILITY_WASM_COMPONENT)
+/// capability at its GENESIS code over the host-constructed store (same
+/// three store lifecycles as [`pages_wasm`]).
+fn capability_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(CAPABILITY_MODULE_ID, CAPABILITY_WASM_COMPONENT, store)
         .expect("embedded capability component loads")
 }
 
@@ -621,6 +627,9 @@ pub(super) async fn genesis_host(
         .await;
         identity_wasm(Box::new(store))
     };
+    let capability = capability_wasm(Box::new(
+        QmdbStore::init(context.child("capability"), "capability").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -664,9 +673,9 @@ pub(super) async fn genesis_host(
         saga: genesis_saga_wasm(),
         // the network-wide registry of node host capabilities ("codex",
         // "claude", ...): member-gated self-announcements, so every node holds
-        // an identical view of who can run what. its genesis contribution is an
-        // empty registry (ZERO root) until nodes announce.
-        capability: genesis_capability_wasm(),
+        // an identical view of who can run what. store-backed over the
+        // host-constructed qmdb store.
+        capability,
         // the task plane: recipe manifests + capability-routed dispatch with
         // next-block result delivery (the host's DeliverPending injection).
         // adapter-ported; committed-only query lane and a distinct root representation.
@@ -754,6 +763,9 @@ pub(super) async fn restore_host(
     let identity = identity_wasm(Box::new(
         QmdbStore::init(context.child("identity"), "identity").await,
     ));
+    let capability = capability_wasm(Box::new(
+        QmdbStore::init(context.child("capability"), "capability").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -798,12 +810,6 @@ pub(super) async fn restore_host(
     let (bytes, root) = snapshot_of(SAGA_MODULE_ID)?;
     saga.install(bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
-
-    let mut capability = genesis_capability_wasm();
-    let (bytes, root) = snapshot_of(CAPABILITY_MODULE_ID)?;
-    capability
-        .install(bytes, root)
-        .map_err(|e| format!("capability install: {e}"))?;
 
     let mut dispatch = genesis_dispatch_wasm();
     let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID)?;
@@ -1060,6 +1066,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    let (target, resolver) = fetch_target("capability").await?;
+    let capability = capability_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("capability")),
+            "capability",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1091,12 +1108,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     let mut saga = genesis_saga_wasm();
     saga.install(&bytes, root)
         .map_err(|e| format!("saga install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(CAPABILITY_MODULE_ID).await?;
-    let mut capability = genesis_capability_wasm();
-    capability
-        .install(&bytes, root)
-        .map_err(|e| format!("capability install: {e}"))?;
 
     let (bytes, root) = snapshot_of(DISPATCH_MODULE_ID).await?;
     let mut dispatch = genesis_dispatch_wasm();

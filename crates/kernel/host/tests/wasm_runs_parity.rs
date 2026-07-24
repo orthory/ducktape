@@ -148,6 +148,7 @@ async fn siblings(
         modules.push(Box::new(valset));
         modules.push(Box::new(CapabilityRegistry::new(
             "capability",
+            Box::new(sdk_testkit::MemStore::new()),
             Some("valset".into()),
         )));
     }

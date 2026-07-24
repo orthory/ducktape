@@ -58,10 +58,14 @@ use crate::CapabilityRegistry;
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "capability";
 
-// whole-state port: the shell loads/saves the canonical snapshot and runs the
-// native module per dispatch (see `guest_adapter::snapshot_guest!`).
-guest_adapter::snapshot_guest! {
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// no genesis config: capability carries no per-network parameter; the valset
+// sibling id is genesis-constant wiring, compiled in like every other port's.
+guest_adapter::store_guest! {
     id: MODULE_ID,
     module: CapabilityRegistry,
-    new: CapabilityRegistry::new(MODULE_ID, Some("valset".into())),
+    new: CapabilityRegistry::new(MODULE_ID, Box::new(WitStore), Some("valset".into())),
 }
