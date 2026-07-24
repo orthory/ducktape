@@ -32,7 +32,6 @@ on open_page_search_hit(page_id, block_id)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   loading = true
   page_search_hits = []
   selected_block_id = ""
@@ -74,7 +73,6 @@ on choose_page(id)
   block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   loading = true
   page_search_hits = []
   selected_block_id = ""
@@ -111,7 +109,6 @@ on create_page_submit
   return if loading || mutation_phase != "idle" || empty(trim(page_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "page"
   pending_page = trim(page_draft)
   page_draft = ""
@@ -131,7 +128,6 @@ on delete_page_submit
   return if loading || mutation_phase != "idle" || empty(active_page) || !page_delete_armed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "page-delete"
   page_delete_armed = false
   error = ""
@@ -194,7 +190,6 @@ on add_block_submit
   return if loading || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   pending_block = block_draft
   pending_block_id = fresh_operation_id("block")
   block_draft = ""
@@ -216,12 +211,10 @@ on block_add_failed(cause)
   orphaned_block_drafts = remember_failed_block(orphaned_block_drafts, block_draft, cause.body, cause.committed)
   block_draft = restore_draft(block_draft, cause.body, cause.committed)
   error = cause.message
-  live_dirty = live_dirty || cause.committed
-  return if !live_dirty || loading || sync_phase == "refreshing"
-  live_dirty = false
+  return if !cause.committed
   hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
+  hydration_retry_attempt = 0
+  run live_resync_load(connected_rpc, active_channel, active_page, "pages", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on select_block(key, id, kind, text, checked, open_actions)
   block_menu_x = pages_pointer_x
@@ -264,7 +257,6 @@ on selected_block_kind_changed(next)
   selected_block_kind = next
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "block-kind"
   error = ""
   run save_block(connected_rpc, password, active_page, selected_block_id, selected_block_kind, block_edit_draft) -> pages_mutated _ | mutation_failed _
@@ -341,11 +333,6 @@ on block_threads_loaded(next)
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
   error = ""
-  return if !live_dirty
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on load_more_block_threads
   return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || !block_comment_threads_has_more
@@ -419,7 +406,6 @@ on post_block_comment_submit
   return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || block_comments_target != selected_block_id || empty(trim(block_comment_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "block-comment"
   pending_block_comment = trim(block_comment_draft)
   block_comment_draft = ""
@@ -447,7 +433,6 @@ on block_comment_post_failed(cause)
   pending_block_comment = ""
   mutation_phase = mutation_failure_phase(cause.committed)
   block_thread_comments_loading = false
-  live_dirty = live_dirty || cause.committed
   error = cause.message
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
@@ -462,29 +447,18 @@ on block_threads_recovered(next)
   block_comment_threads_loading = false
   mutation_phase = "idle"
   error = ""
-  return if !live_dirty
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on block_threads_recovery_failed(cause)
   return if cause.generation != block_comments_generation || !block_comments_open
   block_comment_threads_loading = false
   mutation_phase = "idle"
   error = cause.message
-  return if !live_dirty
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on block_text_changed(next)
   block_edit_draft = next
   return if loading || empty(selected_block_id) || selected_block_kind == "Divider"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   block_autosave_status = "saving"
   block_autosave_generation = block_autosave_generation + 1
   error = ""
@@ -494,11 +468,6 @@ on block_text_saved(next)
   return if next.generation != block_autosave_generation
   return if !next.written
   block_autosave_status = "saved"
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  live_dirty = false
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on block_text_save_failed(cause)
   return if cause.generation != block_autosave_generation
@@ -509,7 +478,6 @@ on toggle_block_checked
   return if loading || mutation_phase != "idle" || selected_block_kind != "Todo" || empty(selected_block_id)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "block-check"
   error = ""
   run set_block_checked(connected_rpc, password, active_page, selected_block_id, !selected_block_checked) -> pages_mutated _ | mutation_failed _
@@ -518,7 +486,6 @@ on move_block_submit(direction)
   return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "block-move"
   error = ""
   run move_block(connected_rpc, password, active_page, selected_block_id, direction) -> pages_mutated _ | mutation_failed _
@@ -531,7 +498,6 @@ on remove_block_submit
   return if loading || mutation_phase != "idle" || empty(active_page) || empty(selected_block_id) || !block_delete_armed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  sync_phase = "idle"
   mutation_phase = "block-delete"
   block_delete_armed = false
   error = ""
@@ -568,11 +534,6 @@ on pages_updated(next)
   block_delete_armed = false
   loading = false
   error = ""
-  return if !live_dirty
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _
 
 on pages_mutated(next)
   orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
@@ -613,8 +574,3 @@ on pages_mutated(next)
   block_delete_armed = false
   mutation_phase = "idle"
   error = ""
-  return if !live_dirty
-  live_dirty = false
-  hydration_generation = hydration_generation + 1
-  sync_phase = "refreshing"
-  run refresh(connected_rpc, active_channel, active_page, hydration_generation) -> workspace_refreshed _ | refresh_failed _

@@ -196,6 +196,8 @@ pub struct AppliedOp {
     pub module: String,
     pub origin: OriginTag,
     pub payload: Vec<u8>,
+    /// the module-assigned stamp of the dispatch, verbatim (empty = none).
+    pub assigned: Vec<u8>,
 }
 
 /// one finalized block's op stream.
@@ -219,6 +221,7 @@ fn encode_row(height: u64, seq: u32, time: u64, op: &AppliedOp) -> Result<Vec<u8
         time,
         origin: op.origin.clone(),
         payload: op.payload.clone(),
+        assigned: op.assigned.clone(),
     })?)
 }
 

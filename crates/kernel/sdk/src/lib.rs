@@ -139,6 +139,12 @@ pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// (identically on every node).
 pub const MAX_RELAY_ERROR_BYTES: usize = 16 * 1024;
 
+/// hard cap on a dispatch's assigned stamp ([`Ctx::set_assigned`]) — the
+/// module-assigned values of one applied op (a sequence, a revision), carried
+/// into the derived-tier op feed. a stamp is a handful of scalars, never a
+/// data lane; an oversized stamp is a deterministic rejection of the op.
+pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
+
 /// one envelope continuation: the op dispatched after the enclosing
 /// transaction's semantic completion. DEPTH IS EXACTLY 1 BY SHAPE — this body
 /// deliberately has no continuation slot of its own, so nesting is
@@ -389,6 +395,18 @@ pub trait Ctx {
     /// discards: a ctx without the continuation lane has no relay to feed,
     /// and "no output" is the specified default (`Ok(vec![])`).
     fn set_output(&mut self, _bytes: Vec<u8>) {}
+
+    /// declare this dispatch's assigned stamp — the values the module ASSIGNED
+    /// while applying this op (a message sequence, a revision number), which
+    /// exist nowhere in the op payload. the host records the stamp on the
+    /// dispatch trace, and the derived tier carries it on the op-feed row, so
+    /// feed followers (index guests, clients) consume exact assignments
+    /// instead of re-deriving them by counting. encoding is module-defined
+    /// (the module's own wire codec), opaque to the host like the payload;
+    /// capped at [`MAX_ASSIGNED_BYTES`] — exceeding the cap is a deterministic
+    /// rejection of the op. last write wins within one dispatch. the default
+    /// discards: read-only query ctxs never record a trace.
+    fn set_assigned(&mut self, _bytes: Vec<u8>) {}
 
     /// the identity to AUTHORIZE against: the relay's author for a
     /// continuation dispatch, the dispatch origin otherwise — one call,

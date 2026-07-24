@@ -9,11 +9,9 @@ state
   connected = false
   loading = false
   block_height:i64 = -1
-  sync_phase = "idle"
   hydration_generation:i64 = 0
   hydration_retry_attempt:i64 = 0
   mutation_phase = "idle"
-  live_dirty = false
   error = ""
   channels:[ChatChannel] = []
   messages:[ChatMessage] = []

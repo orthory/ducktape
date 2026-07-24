@@ -46,6 +46,13 @@ mod guest;
 // database is `index_guest` below.
 pub mod index;
 
+// the CLIENT view model: rendered row types, composer parsing, optimistic
+// merges, and the op-delta fold a feed-following UI splices state with.
+// module-owned beside the index fold (same feed, same vocabulary); pure
+// data-in/data-out, so the module-bundled-UI lane can compile it into the
+// shipped ui.wasm unchanged.
+pub mod client;
+
 // the wasm index-mapper shell: wires the pure core into the fluent31 engine.
 // compiled only by `guest-builder --index`'s synthesized wasm32 workspace
 // (feature `index-guest`), never by the native build.
@@ -615,7 +622,7 @@ impl Chat {
         blocks: Vec<Block>,
         base_rev: Option<u32>,
         now: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u32, Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
         if blocks.is_empty() {
             return Err(Error::Module("blocks must not be empty".into()));
@@ -640,9 +647,10 @@ impl Chat {
         // the new head (base_rev != prior rev), never rejected — the author
         // gate makes conflicts same-author multi-device races.
         self.store(rev_key(channel_id, seq, head.rev), &head);
+        let rev = head.rev + 1;
         let new_head = MessageHead {
             blocks,
-            rev: head.rev + 1,
+            rev,
             edited_at: Some(now),
             base_rev,
             ..head
@@ -652,7 +660,8 @@ impl Chat {
             &new_head,
             MAX_MESSAGE_HEAD_BYTES,
             "message",
-        )
+        )?;
+        Ok(rev)
     }
 
     async fn stage_delete(
@@ -1110,6 +1119,7 @@ impl Module for Chat {
                 let posted = self
                     .stage_message(author.clone(), &channel_id, message_id, blocks, thread, now)
                     .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::Posted { seq: posted.seq }));
                 // one follow-up per registered hook, drained in this block —
                 // the message and every notification commit (or abort) as one
                 // atomic unit (P2). chat stays agent-agnostic: any subscriber
@@ -1149,8 +1159,11 @@ impl Module for Chat {
                 blocks,
                 base_rev,
             } => {
-                self.stage_edit(author, &channel_id, seq, blocks, base_rev, now)
-                    .await
+                let rev = self
+                    .stage_edit(author, &channel_id, seq, blocks, base_rev, now)
+                    .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::Edited { rev }));
+                Ok(())
             }
             ChatMsg::DeleteMessage { channel_id, seq } => {
                 self.stage_delete(author, &channel_id, seq).await

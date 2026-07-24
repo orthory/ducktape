@@ -8,13 +8,26 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
-use chat::{ChatMsg, PostPolicy};
+use chat::{ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::StreamExt as _;
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
 use tokio::io::AsyncWriteExt as _;
 use zeroize::{Zeroize as _, Zeroizing};
+
+// chat's client view model is module-owned (`chat::client`) — the rendered
+// row types, the composer parsing, the optimistic merges, and the op-delta
+// splices. re-exported here because the Ice externs resolve `crate::backend`.
+pub use chat::client::{
+    ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReaction, ChatSpan,
+    append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
+    apply_chat_thread, author_name, chat_message, contains_pending_message,
+    mark_message_groups, merge_message_send_result, merge_pending_messages,
+    merge_thread_reply, optimistic_message, paragraph_blocks, parse_message,
+    rollback_pending_message, short_label, thread_offset_after_reply,
+};
+pub use pages::client::PagesDelta;
 
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;
@@ -27,29 +40,6 @@ const CHAT_TIMELINE_ROOT_LIMIT: usize = 128;
 /// the timeline walk steps in 256-row pages.
 const CHAT_VIEW_PAGE_LIMIT: u64 = 256;
 
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatChannel {
-    pub id: String,
-    pub name: String,
-    pub archived: bool,
-    pub members_only: bool,
-    pub huddle_count: i64,
-    pub head_seq: i64,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatReaction {
-    pub emoji: String,
-    pub count: i64,
-    pub reacted_by_me: bool,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatMember {
-    pub key: String,
-    pub label: String,
-}
-
 /// Client-local read cursor for one channel: the newest `seq` this device has
 /// "seen". There is no wire read-cursor — this list lives only in app state and
 /// is never sent to the node.
@@ -57,76 +47,6 @@ pub struct ChatMember {
 pub struct ChannelRead {
     pub channel: String,
     pub seq: i64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ChatMessage {
-    pub id: String,
-    pub seq: i64,
-    pub author: String,
-    pub meta: String,
-    pub body: String,
-    pub blocks: Vec<ChatBlock>,
-    pub pending: bool,
-    pub rev: i64,
-    pub edited: bool,
-    pub deleted: bool,
-    pub reply_count: i64,
-    pub thread_seq: i64,
-    pub show_author: bool,
-    pub initial: String,
-    pub avatar_r: f64,
-    pub avatar_g: f64,
-    pub avatar_b: f64,
-    pub reactions: Vec<ChatReaction>,
-}
-
-// `f64` avatar tint keeps `Hash` off the derive; hash the bit pattern instead so
-// `ChatData`/`WorkspaceData` can still derive `Hash` for view memoization.
-impl std::hash::Hash for ChatMessage {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.seq.hash(state);
-        self.author.hash(state);
-        self.meta.hash(state);
-        self.body.hash(state);
-        self.blocks.hash(state);
-        self.pending.hash(state);
-        self.rev.hash(state);
-        self.edited.hash(state);
-        self.deleted.hash(state);
-        self.reply_count.hash(state);
-        self.thread_seq.hash(state);
-        self.show_author.hash(state);
-        self.initial.hash(state);
-        self.avatar_r.to_bits().hash(state);
-        self.avatar_g.to_bits().hash(state);
-        self.avatar_b.to_bits().hash(state);
-        self.reactions.hash(state);
-    }
-}
-
-/// One rendered block of a message body. `kind` is `paragraph` | `code` |
-/// `quote` | `divider`. Plain paragraphs/quotes carry their exact text in
-/// `text` (`rich=false`); formatted ones carry word-level `spans` for a
-/// wrapping flex render (`rich=true`).
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatBlock {
-    pub kind: String,
-    pub text: String,
-    pub lang: String,
-    pub rich: bool,
-    pub spans: Vec<ChatSpan>,
-}
-
-/// A word-level run of a rich paragraph/quote, carrying its inline marks.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatSpan {
-    pub text: String,
-    pub bold: bool,
-    pub italic: bool,
-    pub highlight: bool,
-    pub link: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -149,9 +69,11 @@ pub struct ChatData {
     pub thread_has_more: bool,
 }
 
+/// The submit receipt of an optimistic send: the client-minted operation id
+/// and its channel. The committed row arrives on the delta stream and settles
+/// the pending row by id — there is no snapshot to merge.
 #[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChatSendResult {
-    pub data: ChatData,
+pub struct SendReceipt {
     pub operation_id: String,
     pub channel_id: String,
 }
@@ -379,12 +301,27 @@ pub struct HydrationError {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct LiveUpdate {
+    /// `ready` (topics subscribed — run the catch-up resync), `retry`
+    /// (stream down, reconnecting), `chat` / `pages` (one folded delta),
+    /// `resync` (this module's replay lagged — reload its slices).
     pub kind: String,
     pub status: String,
     pub height: i64,
+    /// the module needing a scoped resync (`kind == "resync"`).
+    pub module: String,
+    /// which plane(s) the handler must reload (`ready` = both after the
+    /// subscribe→hydrate ordering race; `resync` = the lagged plane; a pages
+    /// delta = the pages plane, debounced). chat deltas set neither.
+    pub load_chat: bool,
+    pub load_pages: bool,
+    /// trail 100ms so a burst of pages ops coalesces into one reload.
+    pub debounce: bool,
+    pub chat: ChatDelta,
+    pub pages: PagesDelta,
 }
+
 
 /// Custom command the multiline composer's key bindings raise. It carries no
 /// data: the only Custom binding is "send", routed straight to
@@ -411,130 +348,6 @@ pub fn composer_keys(
 
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
-}
-
-pub fn optimistic_message(
-    mut messages: Vec<ChatMessage>,
-    body: String,
-    message_id: String,
-) -> Vec<ChatMessage> {
-    let (avatar_r, avatar_g, avatar_b) = avatar_rgb_for("You");
-    let blocks = paragraph_blocks(&body);
-    messages.push(ChatMessage {
-        id: message_id,
-        seq: -1,
-        author: "You".into(),
-        meta: "Sending…".into(),
-        body,
-        blocks,
-        pending: true,
-        rev: 0,
-        edited: false,
-        deleted: false,
-        reply_count: 0,
-        thread_seq: 0,
-        show_author: true,
-        initial: "Y".into(),
-        avatar_r,
-        avatar_g,
-        avatar_b,
-        reactions: Vec::new(),
-    });
-    messages
-}
-
-pub fn merge_pending_messages(
-    mut canonical: Vec<ChatMessage>,
-    current: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-    settled_id: String,
-) -> Vec<ChatMessage> {
-    if current_channel != next_channel {
-        return canonical;
-    }
-    let mut ids = canonical
-        .iter()
-        .map(|message| message.id.clone())
-        .collect::<BTreeSet<_>>();
-    canonical.extend(current.into_iter().filter(|message| {
-        message.pending && message.id != settled_id && ids.insert(message.id.clone())
-    }));
-    canonical
-}
-
-pub fn merge_message_send_result(
-    canonical: Vec<ChatMessage>,
-    current: Vec<ChatMessage>,
-    current_channel: String,
-    next_channel: String,
-    settled_id: String,
-) -> Vec<ChatMessage> {
-    if current_channel != next_channel {
-        return canonical;
-    }
-    let canonical_ids = canonical
-        .iter()
-        .map(|message| message.id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut committed = current
-        .iter()
-        .filter(|message| !message.pending && message.seq > 0)
-        .map(|message| (message.seq, message.clone()))
-        .collect::<BTreeMap<_, _>>();
-    for message in canonical {
-        let replace = committed
-            .get(&message.seq)
-            .is_none_or(|current| message.rev >= current.rev);
-        if replace {
-            committed.insert(message.seq, message);
-        }
-    }
-    let mut merged = committed.into_values().collect::<Vec<_>>();
-    merged.extend(current.into_iter().filter(|message| {
-        message.pending && message.id != settled_id && !canonical_ids.contains(&message.id)
-    }));
-    merged
-}
-
-pub fn rollback_pending_message(
-    mut messages: Vec<ChatMessage>,
-    pending_id: String,
-    committed: bool,
-) -> Vec<ChatMessage> {
-    if !committed {
-        messages.retain(|message| !message.pending || message.id != pending_id);
-    }
-    messages
-}
-
-pub fn contains_pending_message(messages: Vec<ChatMessage>, pending_id: String) -> bool {
-    messages
-        .iter()
-        .any(|message| message.pending && message.id == pending_id)
-}
-
-pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    merge_message_send_result(next, messages, String::new(), String::new(), String::new())
-}
-
-pub fn merge_thread_reply(messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
-    let settled_id = reply.id.clone();
-    merge_message_send_result(
-        vec![reply],
-        messages,
-        String::new(),
-        String::new(),
-        settled_id,
-    )
-}
-
-pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -> i64 {
-    if !committed || offset < 0 || has_more {
-        offset
-    } else {
-        offset.saturating_add(1)
-    }
 }
 
 pub fn optimistic_block(
@@ -844,6 +657,62 @@ pub fn channel_last_read(reads: Vec<ChannelRead>, channel: String) -> i64 {
 
 pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
     head_seq_of(&channels, &channel)
+}
+
+// active-channel scalars re-derived from the (delta-folded) channel list,
+// keeping the current value when the channel is absent from the list.
+
+pub fn channel_display_name(channels: Vec<ChatChannel>, channel: String, current: String) -> String {
+    channels
+        .iter()
+        .find(|row| row.id == channel)
+        .map_or(current, |row| row.name.clone())
+}
+
+pub fn channel_flag_archived(channels: Vec<ChatChannel>, channel: String, current: bool) -> bool {
+    channels
+        .iter()
+        .find(|row| row.id == channel)
+        .map_or(current, |row| row.archived)
+}
+
+pub fn channel_flag_members_only(
+    channels: Vec<ChatChannel>,
+    channel: String,
+    current: bool,
+) -> bool {
+    channels
+        .iter()
+        .find(|row| row.id == channel)
+        .map_or(current, |row| row.members_only)
+}
+
+pub fn channel_live_huddle_count(
+    channels: Vec<ChatChannel>,
+    channel: String,
+    current: i64,
+) -> i64 {
+    channels
+        .iter()
+        .find(|row| row.id == channel)
+        .map_or(current, |row| row.huddle_count)
+}
+
+/// Advance the open thread's next-reply offset when a reply delta for THAT
+/// thread lands (the loaded page grew by one settled row).
+pub fn thread_offset_after_live(
+    offset: i64,
+    has_more: bool,
+    delta: ChatDelta,
+    active_channel: String,
+    root: i64,
+) -> i64 {
+    let is_open_thread_reply =
+        delta.kind == "reply" && delta.channel_id == active_channel && delta.root_seq == root;
+    if !is_open_thread_reply {
+        return offset;
+    }
+    thread_offset_after_reply(offset, has_more, true)
 }
 
 /// Upsert `channel`'s read cursor to `max(existing, seq)`. An empty channel id
@@ -1168,83 +1037,305 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     }
                 }
             }
-            let event = state
-                .stream
-                .as_mut()
-                .expect("stream initialized above")
-                .next()
-                .await;
-            match event {
-                Some(Ok(ModuleEvent::Ready { cursors })) => {
-                    state.cursors = cursors;
-                    state.retry_attempt = 0;
-                    Some((live_update("ready", "Live", -1), state))
-                }
-                Some(Ok(ModuleEvent::Changed {
-                    module,
-                    cursor,
-                    height,
-                })) => {
-                    state.cursors.insert(format!("module:{module}"), cursor);
-                    let height = i64::try_from(height).unwrap_or(i64::MAX);
-                    Some((
-                        live_update("changed", &format!("Live · block {height}"), height),
-                        state,
-                    ))
-                }
-                Some(Ok(ModuleEvent::Lagged { module, cursor })) => {
-                    state.cursors.insert(format!("module:{module}"), cursor);
-                    Some((live_update("changed", "Live · resyncing", -1), state))
-                }
-                Some(Err(error)) => {
-                    state.stream = None;
-                    state.retry_attempt = state.retry_attempt.saturating_add(1);
-                    Some((live_retry(error.into()), state))
-                }
-                None => {
-                    state.stream = None;
-                    state.retry_attempt = state.retry_attempt.saturating_add(1);
-                    Some((live_retry("RPC stream closed".into()), state))
-                }
+            loop {
+                let event = state
+                    .stream
+                    .as_mut()
+                    .expect("stream initialized above")
+                    .next()
+                    .await;
+                let update = match event {
+                    Some(Ok(ModuleEvent::Ready { cursors })) => {
+                        state.cursors = cursors;
+                        state.retry_attempt = 0;
+                        live_update("ready", "Live", -1)
+                    }
+                    Some(Ok(ModuleEvent::Changed { module, cursor, op })) => {
+                        state.cursors.insert(format!("module:{module}"), cursor);
+                        match folded_update(&state.rpc, &module, op).await {
+                            Some(update) => update,
+                            // invisible to the UI (hook registration) — keep
+                            // draining without emitting.
+                            None => continue,
+                        }
+                    }
+                    Some(Ok(ModuleEvent::Lagged { module, cursor })) => {
+                        state.cursors.insert(format!("module:{module}"), cursor);
+                        live_resync(&module, -1)
+                    }
+                    Some(Err(error)) => {
+                        state.stream = None;
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                        live_retry(error.into())
+                    }
+                    None => {
+                        state.stream = None;
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                        live_retry("RPC stream closed".into())
+                    }
+                };
+                return Some((update, state));
             }
         },
     )
     .boxed()
 }
 
-pub async fn refresh(
+/// Fold one applied op into a live update. A decode failure (payload or
+/// stamp) degrades to a scoped resync of that module — a CLIENT reloads,
+/// never wedges. `None` = the op is invisible to this UI.
+async fn folded_update(
+    rpc: &str,
+    module: &str,
+    op: ducktape_rpc::StreamOp,
+) -> Option<LiveUpdate> {
+    let height = i64::try_from(op.height).unwrap_or(i64::MAX);
+    let Some(payload) = op
+        .payload
+        .as_ref()
+        .and_then(|value| serde_json::to_vec(value).ok())
+    else {
+        return Some(live_resync(module, height));
+    };
+    match module {
+        "chat" => {
+            let current_user = local_user_key().await;
+            let origin_kind = match op.origin.kind {
+                ducktape_rpc::StreamOriginKind::External => "external",
+                ducktape_rpc::StreamOriginKind::Module => "module",
+                ducktape_rpc::StreamOriginKind::System => "system",
+            };
+            let folded = chat::client::delta_from_op(
+                &payload,
+                op.assigned.as_ref(),
+                origin_kind,
+                op.origin.id.as_deref(),
+                current_user.as_deref(),
+            );
+            let mut delta = match folded {
+                Ok(Some(delta)) => delta,
+                Ok(None) => return None,
+                Err(_) => return Some(live_resync("chat", height)),
+            };
+            // huddle membership is roster-derived — reload the one channel
+            // row from its canonical record instead of guessing the count.
+            if delta.kind == "channel-refresh" {
+                match load_channel_row(rpc, &delta.channel_id).await {
+                    Ok(channel) => {
+                        delta.kind = "channel-updated".into();
+                        delta.channel = channel;
+                    }
+                    Err(_) => return Some(live_resync("chat", height)),
+                }
+            }
+            Some(LiveUpdate {
+                kind: "chat".into(),
+                status: format!("Live · block {height}"),
+                height,
+                module: "chat".into(),
+                load_chat: false,
+                load_pages: false,
+                debounce: false,
+                chat: delta,
+                pages: PagesDelta::default(),
+            })
+        }
+        "pages" => match pages::client::delta_from_op(&payload) {
+            Ok(delta) => Some(LiveUpdate {
+                kind: "pages".into(),
+                status: format!("Live · block {height}"),
+                height,
+                module: "pages".into(),
+                load_chat: false,
+                load_pages: true,
+                debounce: true,
+                chat: ChatDelta::default(),
+                pages: delta,
+            }),
+            Err(_) => Some(live_resync("pages", height)),
+        },
+        _ => None,
+    }
+}
+
+/// One channel's row rebuilt from its canonical record (the dispatch-grade
+/// point read) — the huddle roster length is not derivable from the op.
+async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<ChatChannel, String> {
+    let rpc = rpc_client(rpc)?;
+    let reply: ChatReply = rpc
+        .query(
+            "chat",
+            &ChatQuery::Channel {
+                channel_id: channel_id.to_string(),
+            },
+        )
+        .await?;
+    let ChatReply::Channel(Some(channel)) = reply else {
+        return Err("channel record was not found".into());
+    };
+    Ok(ChatChannel {
+        id: channel.id,
+        name: channel.name,
+        archived: channel.archived,
+        members_only: channel.post_policy == PostPolicy::MembersOnly,
+        huddle_count: count_i64(channel.huddle.len()),
+        head_seq: number_i64(channel.head_seq),
+    })
+}
+
+/// One scoped catch-up load, flag-selected per plane: the chat slices
+/// (channel list + active window + members) and/or the pages slices (page
+/// list + active blocks). Runs on stream `ready` (the subscribe→hydrate
+/// ordering race), on a `resync` (lag or an unfoldable op), and debounced
+/// after pages deltas — never per chat commit. Unloaded planes come back
+/// with their `*_loaded` flag false and the handler keeps current state.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LiveRefresh {
+    pub generation: i64,
+    pub chat_loaded: bool,
+    pub channels: Vec<ChatChannel>,
+    pub messages: Vec<ChatMessage>,
+    pub active_channel: String,
+    pub active_channel_name: String,
+    pub active_channel_archived: bool,
+    pub active_channel_members_only: bool,
+    pub active_channel_huddle_count: i64,
+    pub channel_members: Vec<ChatMember>,
+    pub pages_loaded: bool,
+    pub pages: Vec<PageItem>,
+    pub blocks: Vec<PageBlock>,
+    pub active_page: String,
+    pub active_page_title: String,
+    pub active_page_parent: String,
+}
+
+/// `planes` is `chat` | `pages` | `both` — the flat Ice surface's
+/// discriminant for which slices to load ([`resync_planes`] builds it).
+pub async fn live_resync_load(
     rpc: String,
     channel_id: String,
     page_id: String,
+    planes: String,
+    debounce: bool,
     generation: i64,
-) -> Result<WorkspaceData, HydrationError> {
+    attempt: i64,
+) -> Result<LiveRefresh, HydrationError> {
+    if debounce {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if attempt > 0 {
+        tokio::time::sleep(retry_delay(u32::try_from(attempt).unwrap_or(u32::MAX))).await;
+    }
     async {
         let rpc = rpc_client(&rpc)?;
-        load_workspace(
-            &rpc,
-            (!channel_id.is_empty()).then_some(channel_id.as_str()),
-            (!page_id.is_empty()).then_some(page_id.as_str()),
+        let mut refresh = LiveRefresh {
             generation,
-        )
-        .await
+            chat_loaded: false,
+            channels: Vec::new(),
+            messages: Vec::new(),
+            active_channel: String::new(),
+            active_channel_name: String::new(),
+            active_channel_archived: false,
+            active_channel_members_only: false,
+            active_channel_huddle_count: 0,
+            channel_members: Vec::new(),
+            pages_loaded: false,
+            pages: Vec::new(),
+            blocks: Vec::new(),
+            active_page: String::new(),
+            active_page_title: String::new(),
+            active_page_parent: String::new(),
+        };
+        let load_chat = planes == "chat" || planes == "both";
+        let load_pages = planes == "pages" || planes == "both";
+        if load_chat {
+            let chat =
+                load_chat_data(&rpc, (!channel_id.is_empty()).then_some(channel_id.as_str()))
+                    .await?;
+            refresh.chat_loaded = true;
+            refresh.channels = chat.channels;
+            refresh.messages = chat.messages;
+            refresh.active_channel = chat.active_channel;
+            refresh.active_channel_name = chat.active_channel_name;
+            refresh.active_channel_archived = chat.active_channel_archived;
+            refresh.active_channel_members_only = chat.active_channel_members_only;
+            refresh.active_channel_huddle_count = chat.active_channel_huddle_count;
+            refresh.channel_members = chat.channel_members;
+        }
+        if load_pages {
+            let pages =
+                load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str())).await?;
+            refresh.pages_loaded = true;
+            refresh.pages = pages.pages;
+            refresh.blocks = pages.blocks;
+            refresh.active_page = pages.active_page;
+            refresh.active_page_title = pages.active_page_title;
+            refresh.active_page_parent = pages.active_page_parent;
+        }
+        Ok(refresh)
     }
     .await
-    .map_err(|message| HydrationError {
+    .map_err(|message: String| HydrationError {
         generation,
         message,
     })
 }
 
-pub async fn retry_refresh(
-    rpc: String,
-    channel_id: String,
-    page_id: String,
-    generation: i64,
-    attempt: i64,
-) -> Result<WorkspaceData, HydrationError> {
-    let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
-    tokio::time::sleep(retry_delay(attempt)).await;
-    refresh(rpc, channel_id, page_id, generation).await
+/// The planes discriminant for [`live_resync_load`].
+pub fn resync_planes(load_chat: bool, load_pages: bool) -> String {
+    match (load_chat, load_pages) {
+        (true, true) => "both".into(),
+        (true, false) => "chat".into(),
+        (false, true) => "pages".into(),
+        (false, false) => String::new(),
+    }
+}
+
+// per-field keepers: apply a refreshed value only when its plane loaded —
+// the Ice handler assigns every field unconditionally and these self-select.
+
+pub fn keep_channels(
+    loaded: bool,
+    next: Vec<ChatChannel>,
+    current: Vec<ChatChannel>,
+) -> Vec<ChatChannel> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_messages(
+    loaded: bool,
+    next: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+) -> Vec<ChatMessage> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_members(
+    loaded: bool,
+    next: Vec<ChatMember>,
+    current: Vec<ChatMember>,
+) -> Vec<ChatMember> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_blocks(loaded: bool, next: Vec<PageBlock>, current: Vec<PageBlock>) -> Vec<PageBlock> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_str(loaded: bool, next: String, current: String) -> String {
+    if loaded { next } else { current }
+}
+
+pub fn keep_bool(loaded: bool, next: bool, current: bool) -> bool {
+    if loaded { next } else { current }
+}
+
+pub fn keep_i64(loaded: bool, next: i64, current: i64) -> i64 {
+    if loaded { next } else { current }
 }
 
 pub async fn load_chat(rpc: String, channel_id: String) -> Result<ChatData, AppError> {
@@ -1327,7 +1418,7 @@ pub async fn rename_channel(
     password: String,
     channel_id: String,
     name: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let name = bounded_text(name, "channel name", 128)?;
@@ -1342,9 +1433,7 @@ pub async fn rename_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1353,7 +1442,7 @@ pub async fn archive_channel(
     rpc: String,
     password: String,
     channel_id: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let rpc = rpc_client(&rpc)?;
@@ -1367,9 +1456,7 @@ pub async fn archive_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1378,7 +1465,7 @@ pub async fn unarchive_channel(
     rpc: String,
     password: String,
     channel_id: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let rpc = rpc_client(&rpc)?;
@@ -1392,9 +1479,7 @@ pub async fn unarchive_channel(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1404,7 +1489,7 @@ pub async fn add_channel_member(
     password: String,
     channel_id: String,
     member_key: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let user = public_key(&member_key, "member public key")?;
@@ -1420,9 +1505,7 @@ pub async fn add_channel_member(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1432,7 +1515,7 @@ pub async fn remove_channel_member(
     password: String,
     channel_id: String,
     member_key: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let user = public_key(&member_key, "member public key")?;
@@ -1448,9 +1531,7 @@ pub async fn remove_channel_member(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1459,7 +1540,7 @@ pub async fn join_huddle(
     rpc: String,
     password: String,
     channel_id: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let rpc = rpc_client(&rpc)?;
@@ -1475,9 +1556,7 @@ pub async fn join_huddle(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1486,7 +1565,7 @@ pub async fn leave_huddle(
     rpc: String,
     password: String,
     channel_id: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
         let rpc = rpc_client(&rpc)?;
@@ -1499,9 +1578,7 @@ pub async fn leave_huddle(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1512,7 +1589,7 @@ pub async fn send_message(
     channel_id: String,
     message_id: String,
     body: String,
-) -> Result<ChatSendResult, OptimisticMutationError> {
+) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
     let operation_body = body.clone();
@@ -1535,14 +1612,11 @@ pub async fn send_message(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(())
     }
     .await;
     result
-        .map(|data| ChatSendResult {
-            data,
+        .map(|()| SendReceipt {
             operation_id: operation_id.clone(),
             channel_id: operation_scope.clone(),
         })
@@ -1689,7 +1763,7 @@ pub async fn send_reply(
     root_seq: i64,
     message_id: String,
     body: String,
-) -> Result<ChatMessage, OptimisticMutationError> {
+) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
     let operation_body = body.clone();
@@ -1711,14 +1785,15 @@ pub async fn send_reply(
             password,
         )
         .await?;
-        let reply = load_reply_by_id(&rpc, &message_id, &channel_id, root_seq)
-            .await
-            .map_err(committed_error)?;
-        let current_user = local_user_key().await;
-        Ok(chat_message(reply, current_user.as_deref()))
+        Ok(())
     }
     .await;
-    result.map_err(|cause: AppError| OptimisticMutationError {
+    result
+        .map(|()| SendReceipt {
+            operation_id: operation_id.clone(),
+            channel_id: operation_scope.clone(),
+        })
+        .map_err(|cause: AppError| OptimisticMutationError {
         message: cause.message,
         committed: cause.committed,
         operation_id,
@@ -1734,7 +1809,7 @@ pub async fn edit_message(
     seq: i64,
     base_rev: i64,
     body: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
         let base_rev =
@@ -1753,9 +1828,7 @@ pub async fn edit_message(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1765,7 +1838,7 @@ pub async fn delete_message(
     password: String,
     channel_id: String,
     seq: i64,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
         let rpc = rpc_client(&rpc)?;
@@ -1779,9 +1852,7 @@ pub async fn delete_message(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1792,7 +1863,7 @@ pub async fn add_reaction(
     channel_id: String,
     seq: i64,
     emoji: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
         let emoji = bounded_text(emoji, "reaction", chat::MAX_EMOJI_BYTES)?;
@@ -1808,9 +1879,7 @@ pub async fn add_reaction(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -1821,7 +1890,7 @@ pub async fn remove_reaction(
     channel_id: String,
     seq: i64,
     emoji: String,
-) -> Result<ChatData, AppError> {
+) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
         let emoji = bounded_text(emoji, "reaction", chat::MAX_EMOJI_BYTES)?;
@@ -1837,9 +1906,7 @@ pub async fn remove_reaction(
             password,
         )
         .await?;
-        load_chat_data(&rpc, Some(&channel_id))
-            .await
-            .map_err(committed_error)
+        Ok(true)
     }
     .await
 }
@@ -2588,100 +2655,6 @@ fn member_id(user: &str) -> &str {
     user.strip_prefix("user:").unwrap_or(user)
 }
 
-async fn load_messages(
-    rpc: &RpcClient,
-    channel_id: &str,
-    head_seq: u64,
-) -> Result<Vec<ChatMessage>, String> {
-    let mut cursor = head_seq;
-    let mut roots = Vec::new();
-    while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
-        let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
-        let from_seq = cursor - limit + 1;
-        let reply: ChatViewReply = rpc
-            .view(
-                "chat",
-                &ChatViewQuery::MessagesRange {
-                    channel_id: channel_id.to_string(),
-                    from_seq,
-                    limit: Some(limit as usize),
-                },
-            )
-            .await?;
-        let ChatViewReply::Messages(rows) = reply else {
-            return Err("node returned an invalid message list".into());
-        };
-        roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
-        if from_seq == 1 {
-            break;
-        }
-        cursor = from_seq - 1;
-    }
-    roots.sort_by_key(|row| row.seq);
-    let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
-    roots.drain(..excess);
-    let current_user = local_user_key().await;
-    let mut messages: Vec<ChatMessage> = roots
-        .into_iter()
-        .map(|row| chat_message(row, current_user.as_deref()))
-        .collect();
-    mark_message_groups(&mut messages);
-    Ok(messages)
-}
-
-/// Slack-style grouping: a message shows its avatar + author header only when it
-/// opens a run — the first message, or one whose author differs from the message
-/// above it. Deleted messages always break a run (neither joins nor extends one).
-fn mark_message_groups(messages: &mut [ChatMessage]) {
-    let opens_run: Vec<bool> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            index == 0
-                || message.deleted
-                || messages[index - 1].deleted
-                || messages[index - 1].author != message.author
-        })
-        .collect();
-    for (message, show) in messages.iter_mut().zip(opens_run) {
-        message.show_author = show;
-    }
-}
-
-/// One page of older history, returned to the reducer with the generation that
-/// requested it so a stale load can be discarded.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct HistoryPageData {
-    pub generation: i64,
-    pub messages: Vec<ChatMessage>,
-}
-
-/// True when the oldest loaded root is not the channel's first message, i.e.
-/// there is older history to page in.
-pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
-    messages.first().is_some_and(|message| message.seq > 1)
-}
-
-/// The seq of the oldest loaded root (the ceiling for the next older page).
-pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
-    messages.first().map_or(0, |message| message.seq)
-}
-
-/// Prepend an older page ahead of the current timeline, de-duped by seq, sorted
-/// oldest-first, and re-grouped so the seam between pages regroups correctly.
-pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let known: BTreeSet<i64> = messages.iter().map(|message| message.seq).collect();
-    let mut merged: Vec<ChatMessage> = older
-        .into_iter()
-        .filter(|message| !known.contains(&message.seq))
-        .chain(messages)
-        .collect();
-    merged.sort_by_key(|message| message.seq);
-    mark_message_groups(&mut merged);
-    merged
-}
-
-/// Load the page of root messages immediately older than `before_seq`.
 pub async fn load_older_messages(
     rpc: String,
     channel_id: String,
@@ -2786,29 +2759,80 @@ async fn load_message_at(
         .ok_or_else(|| "message was not found".into())
 }
 
-async fn load_reply_by_id(
+async fn load_messages(
     rpc: &RpcClient,
-    message_id: &str,
     channel_id: &str,
-    root_seq: u64,
-) -> Result<MsgRow, String> {
-    let reply: ChatViewReply = rpc
-        .view(
-            "chat",
-            &ChatViewQuery::Message {
-                message_id: message_id.to_string(),
-            },
-        )
-        .await?;
-    let ChatViewReply::Message(Some(row)) = reply else {
-        return Err("reply was not found".into());
-    };
-    let is_expected_reply = row.channel_id == channel_id && row.thread == Some(root_seq);
-    if !is_expected_reply {
-        return Err("node returned an invalid thread reply".into());
+    head_seq: u64,
+) -> Result<Vec<ChatMessage>, String> {
+    let mut cursor = head_seq;
+    let mut roots = Vec::new();
+    while cursor > 0 && roots.len() < CHAT_TIMELINE_ROOT_LIMIT {
+        let limit = cursor.min(CHAT_VIEW_PAGE_LIMIT);
+        let from_seq = cursor - limit + 1;
+        let reply: ChatViewReply = rpc
+            .view(
+                "chat",
+                &ChatViewQuery::MessagesRange {
+                    channel_id: channel_id.to_string(),
+                    from_seq,
+                    limit: Some(limit as usize),
+                },
+            )
+            .await?;
+        let ChatViewReply::Messages(rows) = reply else {
+            return Err("node returned an invalid message list".into());
+        };
+        roots.extend(rows.into_iter().filter(|row| row.thread.is_none()));
+        if from_seq == 1 {
+            break;
+        }
+        cursor = from_seq - 1;
     }
-    Ok(row)
+    roots.sort_by_key(|row| row.seq);
+    let excess = roots.len().saturating_sub(CHAT_TIMELINE_ROOT_LIMIT);
+    roots.drain(..excess);
+    let current_user = local_user_key().await;
+    let mut messages: Vec<ChatMessage> = roots
+        .into_iter()
+        .map(|row| chat_message(row, current_user.as_deref()))
+        .collect();
+    mark_message_groups(&mut messages);
+    Ok(messages)
 }
+
+/// One page of older history, returned to the reducer with the generation that
+/// requested it so a stale load can be discarded.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HistoryPageData {
+    pub generation: i64,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// True when the oldest loaded root is not the channel's first message, i.e.
+/// there is older history to page in.
+pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
+    messages.first().is_some_and(|message| message.seq > 1)
+}
+
+/// The seq of the oldest loaded root (the ceiling for the next older page).
+pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
+    messages.first().map_or(0, |message| message.seq)
+}
+
+/// Prepend an older page ahead of the current timeline, de-duped by seq, sorted
+/// oldest-first, and re-grouped so the seam between pages regroups correctly.
+pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let known: BTreeSet<i64> = messages.iter().map(|message| message.seq).collect();
+    let mut merged: Vec<ChatMessage> = older
+        .into_iter()
+        .filter(|message| !known.contains(&message.seq))
+        .chain(messages)
+        .collect();
+    merged.sort_by_key(|message| message.seq);
+    mark_message_groups(&mut merged);
+    merged
+}
+
 
 /// One thread's root plus its complete reply run, walked over the view's reply
 /// cursor to exhaustion.
@@ -2943,65 +2967,6 @@ fn thread_page_bound(total: u64, through_reply_offset: u64) -> (u64, bool) {
             return (from, has_more);
         }
     }
-}
-
-fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
-    let edited = row.rev > 0;
-    let meta = if edited {
-        format!("#{} · edited", row.seq)
-    } else {
-        format!("#{}", row.seq)
-    };
-    let (avatar_r, avatar_g, avatar_b) = avatar_rgb(&row.author);
-    let blocks = if row.deleted {
-        vec![deleted_block()]
-    } else {
-        blocks_view(&row.blocks)
-    };
-    ChatMessage {
-        id: row.message_id,
-        seq: number_i64(row.seq),
-        author: author_name(&row.author),
-        meta,
-        body: if row.deleted {
-            "Message deleted".into()
-        } else {
-            message_body(&row.blocks)
-        },
-        blocks,
-        pending: false,
-        rev: i64::from(row.rev),
-        edited,
-        deleted: row.deleted,
-        reply_count: number_i64(row.reply_count),
-        thread_seq: number_i64(row.thread.unwrap_or(0)),
-        show_author: true,
-        initial: avatar_initial(&row.author),
-        avatar_r,
-        avatar_g,
-        avatar_b,
-        reactions: row
-            .reactions
-            .into_iter()
-            .map(|reaction| {
-                let reacted_by_me = reacted_by_user(&reaction.reactors, current_user);
-                ChatReaction {
-                    emoji: reaction.emoji,
-                    count: count_i64(reaction.reactors.len()),
-                    reacted_by_me,
-                }
-            })
-            .collect(),
-    }
-}
-
-/// True when the local user's rendered author string (`user:{hex}`) is among a
-/// reaction's reactors.
-fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| {
-        let handle = format!("user:{}", hex_encode(key));
-        reactors.contains(&handle)
-    })
 }
 
 async fn query_block_threads(
@@ -3624,364 +3589,30 @@ fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
         kind: kind.into(),
         status: status.into(),
         height,
+        module: String::new(),
+        load_chat: kind == "ready",
+        load_pages: kind == "ready",
+        debounce: false,
+        chat: ChatDelta::default(),
+        pages: PagesDelta::default(),
     }
 }
 
 fn live_retry(_message: String) -> LiveUpdate {
-    LiveUpdate {
-        kind: "retrying".into(),
-        status: "Reconnecting…".into(),
-        height: -1,
-    }
+    live_update("retry", "Reconnecting…", -1)
 }
 
-fn message_body(blocks: &[chat::Block]) -> String {
-    blocks
-        .iter()
-        .map(|block| match block {
-            chat::Block::Paragraph(spans) => span_text(spans),
-            chat::Block::Code { lang, text } => match lang {
-                Some(lang) => format!("{lang}\n{text}"),
-                None => text.clone(),
-            },
-            chat::Block::Quote(spans) => format!("“{}”", span_text(spans)),
-            chat::Block::Divider => "────────".into(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+/// A module's replay is unavailable or unfoldable — the handler reloads that
+/// module's slices instead of folding.
+fn live_resync(module: &str, height: i64) -> LiveUpdate {
+    let mut update = live_update("resync", "Live · resyncing", height);
+    update.module = module.to_string();
+    update.load_chat = module == "chat";
+    update.load_pages = module == "pages";
+    update
 }
 
-fn span_text(spans: &[chat::Span]) -> String {
-    spans.iter().map(|span| span.text.as_str()).collect()
-}
-
-/// Parse composer text into wire `Block`s: fenced ```code``` (optional language),
-/// `>` quotes, `---`/`***` dividers, and paragraphs with inline `**bold**` /
-/// `__bold__`, `*italic*` / `_italic_`, and bare `http(s)` links. Everything the
-/// `chat` wire enums can round-trip — nothing client-only.
-pub fn parse_message(input: &str) -> Vec<chat::Block> {
-    let lines: Vec<&str> = input.lines().collect();
-    let mut blocks = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index];
-        let trimmed = line.trim();
-        let opens_fence = trimmed.starts_with("```");
-        let is_divider = trimmed == "---" || trimmed == "***";
-        let is_quote = trimmed.starts_with('>');
-        let is_blank = trimmed.is_empty();
-        if opens_fence {
-            index = push_code_block(&lines, index, trimmed, &mut blocks);
-        } else if is_divider {
-            blocks.push(chat::Block::Divider);
-            index += 1;
-        } else if is_quote {
-            index = push_quote_block(&lines, index, &mut blocks);
-        } else if is_blank {
-            index += 1;
-        } else {
-            index = push_paragraph_block(&lines, index, &mut blocks);
-        }
-    }
-    if blocks.is_empty() {
-        blocks.push(chat::Block::paragraph(input.trim().to_string()));
-    }
-    blocks
-}
-
-fn push_code_block(
-    lines: &[&str],
-    start: usize,
-    opener: &str,
-    blocks: &mut Vec<chat::Block>,
-) -> usize {
-    let lang = opener.trim_start_matches('`').trim().to_string();
-    let mut index = start + 1;
-    let mut code = Vec::new();
-    while index < lines.len() && lines[index].trim() != "```" {
-        code.push(lines[index]);
-        index += 1;
-    }
-    let closed = index < lines.len();
-    blocks.push(chat::Block::Code {
-        lang: (!lang.is_empty()).then_some(lang),
-        text: code.join("\n"),
-    });
-    if closed { index + 1 } else { index }
-}
-
-fn push_quote_block(lines: &[&str], start: usize, blocks: &mut Vec<chat::Block>) -> usize {
-    let mut index = start;
-    let mut quoted = Vec::new();
-    while index < lines.len() && lines[index].trim().starts_with('>') {
-        let stripped = lines[index].trim().trim_start_matches('>').trim_start();
-        quoted.push(stripped.to_string());
-        index += 1;
-    }
-    blocks.push(chat::Block::Quote(inline_spans(&quoted.join(" "))));
-    index
-}
-
-fn push_paragraph_block(lines: &[&str], start: usize, blocks: &mut Vec<chat::Block>) -> usize {
-    let mut index = start;
-    let mut paragraph = Vec::new();
-    while index < lines.len() {
-        let trimmed = lines[index].trim();
-        let breaks = trimmed.is_empty()
-            || trimmed.starts_with('>')
-            || trimmed.starts_with("```")
-            || trimmed == "---"
-            || trimmed == "***";
-        if breaks {
-            break;
-        }
-        paragraph.push(trimmed);
-        index += 1;
-    }
-    blocks.push(chat::Block::Paragraph(inline_spans(&paragraph.join(" "))));
-    index
-}
-
-/// Scan a single line of text for inline marks, emitting marked `Span`s. Marks do
-/// not nest; the first matching delimiter wins. Bare `http(s)://` runs become
-/// `Link`s.
-fn inline_spans(text: &str) -> Vec<chat::Span> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut spans: Vec<chat::Span> = Vec::new();
-    let mut plain = String::new();
-    let mut index = 0;
-    while index < chars.len() {
-        let url = url_len(&chars, index);
-        let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
-        let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
-        if let Some(len) = url {
-            flush_plain(&mut plain, &mut spans);
-            let target: String = chars[index..index + len].iter().collect();
-            spans.push(chat::Span {
-                text: target.clone(),
-                marks: vec![chat::Mark::Link(target)],
-            });
-            index += len;
-        } else if let Some((inner, len)) = bold {
-            flush_plain(&mut plain, &mut spans);
-            spans.push(chat::Span {
-                text: inner,
-                marks: vec![chat::Mark::Bold],
-            });
-            index += len;
-        } else if let Some((inner, len)) = italic {
-            flush_plain(&mut plain, &mut spans);
-            spans.push(chat::Span {
-                text: inner,
-                marks: vec![chat::Mark::Italic],
-            });
-            index += len;
-        } else {
-            plain.push(chars[index]);
-            index += 1;
-        }
-    }
-    flush_plain(&mut plain, &mut spans);
-    if spans.is_empty() {
-        spans.push(chat::Span::plain(String::new()));
-    }
-    spans
-}
-
-fn flush_plain(plain: &mut String, spans: &mut Vec<chat::Span>) {
-    if !plain.is_empty() {
-        spans.push(chat::Span::plain(std::mem::take(plain)));
-    }
-}
-
-/// If `chars[at..]` opens a bare link, its length in chars; else `None`.
-fn url_len(chars: &[char], at: usize) -> Option<usize> {
-    let rest: String = chars[at..].iter().collect();
-    let starts_link = rest.starts_with("http://") || rest.starts_with("https://");
-    if !starts_link {
-        return None;
-    }
-    let len = chars[at..]
-        .iter()
-        .take_while(|c| !c.is_whitespace())
-        .count();
-    (len > 0).then_some(len)
-}
-
-/// If `chars[at..]` opens with `marker` and has a later closing `marker`, the
-/// enclosed text and the total consumed length (markers included).
-fn fenced(chars: &[char], at: usize, marker: &str) -> Option<(String, usize)> {
-    let marks: Vec<char> = marker.chars().collect();
-    let opens = chars[at..].starts_with(marks.as_slice());
-    if !opens {
-        return None;
-    }
-    let body_start = at + marks.len();
-    let mut cursor = body_start;
-    while cursor + marks.len() <= chars.len() {
-        if chars[cursor..].starts_with(marks.as_slice()) {
-            let inner: String = chars[body_start..cursor].iter().collect();
-            if inner.is_empty() {
-                return None;
-            }
-            return Some((inner, cursor + marks.len() - at));
-        }
-        cursor += 1;
-    }
-    None
-}
-
-/// Convert wire `Block`s into the render model the view iterates over.
-fn blocks_view(blocks: &[chat::Block]) -> Vec<ChatBlock> {
-    blocks.iter().map(block_view).collect()
-}
-
-/// A single plain paragraph render block — for optimistic sends and fixtures
-/// that never carry inline marks.
-pub fn paragraph_blocks(text: &str) -> Vec<ChatBlock> {
-    vec![ChatBlock {
-        kind: "paragraph".into(),
-        text: text.to_string(),
-        lang: String::new(),
-        rich: false,
-        spans: Vec::new(),
-    }]
-}
-
-fn deleted_block() -> ChatBlock {
-    ChatBlock {
-        kind: "paragraph".into(),
-        text: "Message deleted".into(),
-        lang: String::new(),
-        rich: false,
-        spans: Vec::new(),
-    }
-}
-
-fn block_view(block: &chat::Block) -> ChatBlock {
-    match block {
-        chat::Block::Paragraph(spans) => rich_block("paragraph", spans),
-        chat::Block::Quote(spans) => rich_block("quote", spans),
-        chat::Block::Code { lang, text } => ChatBlock {
-            kind: "code".into(),
-            text: text.clone(),
-            lang: lang.clone().unwrap_or_default(),
-            rich: false,
-            spans: Vec::new(),
-        },
-        chat::Block::Divider => ChatBlock {
-            kind: "divider".into(),
-            text: String::new(),
-            lang: String::new(),
-            rich: false,
-            spans: Vec::new(),
-        },
-    }
-}
-
-/// A paragraph/quote block. Plain runs keep their exact text for a single
-/// wrapping `text`; any inline mark switches to word-level `spans` a wrapping
-/// flex can reflow.
-fn rich_block(kind: &str, spans: &[chat::Span]) -> ChatBlock {
-    let marked = spans.iter().any(|span| !span.marks.is_empty());
-    ChatBlock {
-        kind: kind.into(),
-        text: span_text(spans),
-        lang: String::new(),
-        rich: marked,
-        spans: if marked { word_spans(spans) } else { Vec::new() },
-    }
-}
-
-fn word_spans(spans: &[chat::Span]) -> Vec<ChatSpan> {
-    let mut out = Vec::new();
-    for span in spans {
-        let bold = span.marks.iter().any(|m| matches!(m, chat::Mark::Bold));
-        let italic = span.marks.iter().any(|m| matches!(m, chat::Mark::Italic));
-        let link = span.marks.iter().find_map(|mark| match mark {
-            chat::Mark::Link(url) => Some(url.clone()),
-            _ => None,
-        });
-        let mention = span.marks.iter().any(|m| matches!(m, chat::Mark::Mention(_)));
-        let highlight = link.is_some() || mention;
-        // Keep the trailing space baked into each token so a wrapping flex with
-        // zero column-gap reproduces exact spacing around mark boundaries (a
-        // comma right after a bold run stays attached, not " ,").
-        for token in span.text.split_inclusive(' ') {
-            if token.is_empty() {
-                continue;
-            }
-            out.push(ChatSpan {
-                text: token.to_string(),
-                bold,
-                italic,
-                highlight,
-                link: link.clone().unwrap_or_default(),
-            });
-        }
-    }
-    out
-}
-
-/// The display name for a rendered author string (`user:{id}`,
-/// `agent:{module}/{agent}`, `module:{id}`, or `system`).
-fn author_name(author: &str) -> String {
-    match author.split_once(':') {
-        Some(("user", id)) => format!("user {}", short_label(id)),
-        Some(("agent", path)) => {
-            let name = path.rsplit('/').next().unwrap_or(path);
-            format!("@{name}")
-        }
-        Some(("module", id)) => id.to_string(),
-        _ => "system".into(),
-    }
-}
-
-/// The stable identity an avatar is derived from: the shortened id for a user,
-/// the agent/module name otherwise. Both the initial glyph and the tint hash
-/// off this so a given author always looks the same.
-fn avatar_source(author: &str) -> String {
-    match author.split_once(':') {
-        Some(("user", id)) => short_label(id),
-        Some(("agent", path)) => path.rsplit('/').next().unwrap_or(path).to_string(),
-        Some(("module", id)) => id.to_string(),
-        _ => "system".into(),
-    }
-}
-
-/// The single-glyph avatar label for an author: the first alphanumeric character
-/// of its identity, uppercased. Falls back to a neutral dot when there is
-/// nothing to show.
-fn avatar_initial(author: &str) -> String {
-    initial_of(&avatar_source(author))
-}
-
-fn initial_of(source: &str) -> String {
-    source
-        .chars()
-        .find(char::is_ascii_alphanumeric)
-        .map_or_else(|| "•".into(), |c| c.to_ascii_uppercase().to_string())
-}
-
-/// Curated avatar tints — saturated mid-tones that keep near-white initials
-/// legible, indexed by a stable hash of the author identity.
-const AVATAR_PALETTE: [(u8, u8, u8); 8] = [
-    (0x60, 0x62, 0xe8), // indigo
-    (0x8a, 0x5c, 0xf0), // violet
-    (0xc7, 0x4a, 0xae), // fuchsia
-    (0xdc, 0x4f, 0x66), // rose
-    (0xc2, 0x6a, 0x24), // amber
-    (0x1a, 0x9d, 0x6e), // emerald
-    (0x0e, 0x8f, 0x96), // teal
-    (0x2f, 0x7a, 0xe0), // blue
-];
-
-/// The avatar tint for an author as linear 0..1 RGB.
-pub fn avatar_rgb(author: &str) -> (f64, f64, f64) {
-    avatar_rgb_for(&avatar_source(author))
-}
-
-/// Container style for a per-author avatar: the data-driven tint fill with a
+ /// Container style for a per-author avatar: the data-driven tint fill with a
 /// rounded-square radius and a soft drop shadow. `bg=` only takes static colors,
 /// so the dynamic tint rides in through a `container-style` extern.
 pub fn avatar_style(_theme: &iced::Theme, r: f64, g: f64, b: f64) -> iced::widget::container::Style {
@@ -4002,19 +3633,6 @@ pub fn avatar_style(_theme: &iced::Theme, r: f64, g: f64, b: f64) -> iced::widge
     }
 }
 
-/// The avatar tint for a bare identity string (used for optimistic/local authors).
-pub fn avatar_rgb_for(source: &str) -> (f64, f64, f64) {
-    let hash = source
-        .bytes()
-        .fold(0u32, |acc, byte| acc.wrapping_mul(31).wrapping_add(u32::from(byte)));
-    let (r, g, b) = AVATAR_PALETTE[(hash as usize) % AVATAR_PALETTE.len()];
-    (
-        f64::from(r) / 255.0,
-        f64::from(g) / 255.0,
-        f64::from(b) / 255.0,
-    )
-}
-
 fn short_hex(bytes: &[u8]) -> String {
     let mut output = String::new();
     for byte in bytes.iter().take(4) {
@@ -4028,14 +3646,6 @@ fn short_hex(bytes: &[u8]) -> String {
 
 /// A shortened display label for an id string: its first 8 characters, with an
 /// ellipsis when more follow.
-fn short_label(id: &str) -> String {
-    let mut label: String = id.chars().take(8).collect();
-    if id.chars().count() > 8 {
-        label.push('…');
-    }
-    label
-}
-
 const fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Page => "Page",
@@ -4328,74 +3938,8 @@ mod tests {
         );
         assert!(parse_user_key_status("absent\n").is_none());
         assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
-        let reactors = vec![
-            format!("user:{}", hex_encode(&[0xab; 32])),
-            "system".to_string(),
-        ];
-        assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
-        assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
-        assert!(!reacted_by_user(&reactors, None));
     }
 
-    #[test]
-    fn parse_message_maps_markdown_onto_wire_blocks() {
-        let input = "Hello **world** and *friends*\n\n> quote me\n> across lines\n\n```rust\nfn main() {}\n```\n\nvisit https://ducktape.example for more";
-        let blocks = parse_message(input);
-        assert_eq!(blocks.len(), 4);
-
-        // paragraph 1: plain / bold / plain / italic runs
-        let chat::Block::Paragraph(spans) = &blocks[0] else {
-            panic!("first block is a paragraph");
-        };
-        assert_eq!(spans[0].text, "Hello ");
-        assert!(spans[0].marks.is_empty());
-        assert_eq!(spans[1].text, "world");
-        assert_eq!(spans[1].marks, vec![chat::Mark::Bold]);
-        assert_eq!(spans[3].text, "friends");
-        assert_eq!(spans[3].marks, vec![chat::Mark::Italic]);
-
-        // quote joins its lines
-        let chat::Block::Quote(quote) = &blocks[1] else {
-            panic!("second block is a quote");
-        };
-        assert_eq!(span_text(quote), "quote me across lines");
-
-        // fenced code keeps its language + raw text
-        let chat::Block::Code { lang, text } = &blocks[2] else {
-            panic!("third block is code");
-        };
-        assert_eq!(lang.as_deref(), Some("rust"));
-        assert_eq!(text, "fn main() {}");
-
-        // bare url becomes a link mark
-        let chat::Block::Paragraph(spans) = &blocks[3] else {
-            panic!("fourth block is a paragraph");
-        };
-        let link = spans
-            .iter()
-            .find(|span| matches!(span.marks.first(), Some(chat::Mark::Link(_))))
-            .expect("a link span");
-        assert_eq!(link.text, "https://ducktape.example");
-        assert_eq!(
-            link.marks,
-            vec![chat::Mark::Link("https://ducktape.example".into())]
-        );
-
-        // round-trips into the flattened body + render model
-        assert!(message_body(&blocks).contains("Hello world and friends"));
-        let view = blocks_view(&blocks);
-        assert_eq!(view[0].kind, "paragraph");
-        assert!(view[0].rich, "formatted paragraph renders as spans");
-        assert!(view[0].spans.iter().any(|span| span.bold && span.text == "world"));
-        assert_eq!(view[2].kind, "code");
-        assert_eq!(view[2].text, "fn main() {}");
-
-        // a plain message stays a single non-rich paragraph
-        let plain = blocks_view(&parse_message("just text here"));
-        assert_eq!(plain.len(), 1);
-        assert!(!plain[0].rich);
-        assert_eq!(plain[0].text, "just text here");
-    }
 
     #[test]
     fn post_commit_hydration_errors_are_not_retryable() {
@@ -4748,7 +4292,18 @@ mod tests {
         )
         .await;
         let changed = live.next().await.unwrap();
-        assert_eq!(changed.kind, "changed");
+        assert_eq!(changed.kind, "chat", "a chat op folds into a chat delta");
+        assert_eq!(changed.chat.kind, "posted");
+        assert_eq!(changed.chat.channel_id, "general");
+        assert_eq!(
+            changed.chat.seq, 2,
+            "the delta carries the module-assigned sequence from the feed stamp"
+        );
+        assert_eq!(changed.chat.message.body, "arrived on the next block");
+        assert!(
+            !changed.load_chat && !changed.load_pages,
+            "a folded chat delta requires no reload"
+        );
         assert!(changed.height > workspace.height);
         let base_height = changed.height;
         submit_test(
@@ -4920,10 +4475,19 @@ mod tests {
         assert!(comments.thread_id.is_empty());
         assert!(comments.comments.is_empty());
 
-        let refreshed = refresh(origin, "general".into(), "welcome".into(), 7)
-            .await
-            .unwrap();
+        let refreshed = live_resync_load(
+            origin,
+            "general".into(),
+            "welcome".into(),
+            "both".into(),
+            false,
+            7,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(refreshed.generation, 7);
+        assert!(refreshed.chat_loaded && refreshed.pages_loaded);
         assert_eq!(refreshed.messages[1].body, "arrived on the next block");
         assert_eq!(refreshed.active_page, "welcome");
         sim.shutdown();
@@ -5389,7 +4953,8 @@ mod tests {
     ) {
         loop {
             let update = live.next().await.expect("live stream ended");
-            if update.kind == "changed" && update.height >= min_height {
+            let folded = update.kind == "chat" || update.kind == "pages";
+            if folded && update.height >= min_height {
                 return;
             }
         }

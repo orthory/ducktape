@@ -157,7 +157,7 @@ impl Inbox {
         body: String,
         source: String,
         created_at: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         Self::validate_deliver(&member, &kind, &body)?;
 
         // reject a NEW member beyond the cap BEFORE staging, so an over-cap
@@ -203,7 +203,7 @@ impl Inbox {
                 .expect("non-empty over-capacity queue");
             queue.items.remove(&oldest);
         }
-        Ok(())
+        Ok(seq)
     }
 
     fn stage_mark_read(&mut self, member: String, up_to_seq: u64) {
@@ -385,7 +385,9 @@ impl Module for Inbox {
                 // the delivering `source` is origin-derived — the only source of
                 // truth for who delivered, NEVER caller-supplied.
                 let source = ctx.env().origin.actor_string();
-                self.stage_deliver(member, kind, body, source, consensus_time)
+                let seq = self.stage_deliver(member, kind, body, source, consensus_time)?;
+                ctx.set_assigned(encode_assigned(&InboxAssigned::Delivered { seq }));
+                Ok(())
             }
             InboxMsg::MarkRead { member, up_to_seq } => {
                 self.stage_mark_read(member, up_to_seq);

@@ -113,6 +113,7 @@ pub fn index_block_ops(
                 origin: index_origin(&d.origin),
                 module: d.module.clone(),
                 payload: d.payload.clone(),
+                assigned: d.assigned.clone(),
             })
             .collect(),
         record: None,
@@ -206,6 +207,13 @@ fn op_row_json(row: &indexer::OpRow) -> serde_json::Value {
     match payload_json {
         Some(value) => out["payload"] = value,
         None => out["payload_hex"] = serde_json::Value::String(hex_bytes(&row.payload)),
+    }
+    if !row.assigned.is_empty() {
+        let assigned_json: Option<serde_json::Value> = serde_json::from_slice(&row.assigned).ok();
+        match assigned_json {
+            Some(value) => out["assigned"] = value,
+            None => out["assigned_hex"] = serde_json::Value::String(hex_bytes(&row.assigned)),
+        }
     }
     out
 }

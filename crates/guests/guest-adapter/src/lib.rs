@@ -153,6 +153,10 @@ impl Ctx for WitCtx {
     fn emit_event(&mut self, ev: Event) {
         host::emit_event(&ev.source, &ev.payload);
     }
+
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        host::set_assigned(&bytes);
+    }
 }
 
 // ============================================================================

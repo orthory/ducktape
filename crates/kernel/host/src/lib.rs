@@ -185,6 +185,13 @@ pub struct DispatchRecord {
     pub emitted_msgs: usize,
     /// count of observability `Event`s this dispatch emitted.
     pub emitted_events: usize,
+    /// the module-assigned stamp of this dispatch ([`sdk::Ctx::set_assigned`]):
+    /// values the module assigned while applying the op (a sequence, a
+    /// revision) that the payload cannot carry. module-encoded, host-opaque —
+    /// a consensus-deterministic function of `(state, msg)`, so the trace
+    /// stays a pure structural record. empty when the dispatch assigned
+    /// nothing.
+    pub assigned: Vec<u8>,
 }
 
 /// the result of applying one block (`submit`).
@@ -1538,6 +1545,7 @@ impl Host {
                 // slot after the first iteration, so follow-ups see `None`.
                 relay: if is_root { relay.take() } else { None },
                 out_output: None,
+                out_assigned: Vec::new(),
             };
 
             // owned `me` (&mut) and `ctx` (holding &rest) are disjoint borrows,
@@ -1549,6 +1557,7 @@ impl Host {
                 out_msgs,
                 out_events,
                 out_output,
+                out_assigned,
                 ..
             } = ctx;
 
@@ -1568,6 +1577,13 @@ impl Host {
                     sdk::MAX_OUTPUT_BYTES
                 )));
             }
+            if out_assigned.len() > sdk::MAX_ASSIGNED_BYTES {
+                return Err(Error::Module(format!(
+                    "op assigned stamp exceeds cap ({} > {})",
+                    out_assigned.len(),
+                    sdk::MAX_ASSIGNED_BYTES
+                )));
+            }
             if is_root {
                 root_output = out_output;
             }
@@ -1582,6 +1598,7 @@ impl Host {
                 payload: msg.payload,
                 emitted_msgs: out_msgs.len(),
                 emitted_events: out_events.len(),
+                assigned: out_assigned,
             });
 
             // local-only re-entry: emitted msgs become follow-up ops, never
@@ -1610,6 +1627,9 @@ struct HostCtx<'a> {
     /// the op's declared output ([`Ctx::set_output`]), staged with the
     /// dispatch; the drain caps it and threads the root's into the relay.
     out_output: Option<Vec<u8>>,
+    /// the dispatch's assigned stamp ([`Ctx::set_assigned`]), staged with the
+    /// dispatch; the drain caps it and records it on the trace.
+    out_assigned: Vec<u8>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1656,6 +1676,10 @@ impl Ctx for HostCtx<'_> {
 
     fn set_output(&mut self, bytes: Vec<u8>) {
         self.out_output = Some(bytes);
+    }
+
+    fn set_assigned(&mut self, bytes: Vec<u8>) {
+        self.out_assigned = bytes;
     }
 
     fn emit_event(&mut self, ev: Event) {
