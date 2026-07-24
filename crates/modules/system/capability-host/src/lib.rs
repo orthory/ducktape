@@ -77,7 +77,9 @@ const PODMAN_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PODMAN_RETRY_MIN: Duration = Duration::from_millis(250);
 const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
-#[cfg(any(target_os = "linux", test))]
+// used by the socket run path (`podman_create_and_start`), which compiles on
+// every unix — so this label must not be gated to linux the way the old CLI
+// reaper's consts were, or macOS (a Tart host) fails to build.
 const PODMAN_MANAGED_LABEL: &str = "io.ducktape.managed=capability-host";
 const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
 const TART_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
