@@ -68,6 +68,15 @@ extern crate::backend
   sync connection_degraded(status:str) -> bool
   sync palette_key_action(physical:physical-key, modifiers:key-modifiers, open:bool) -> str
   NavItem(id:str, title:str, icon:str, active:bool)
+  FsEntry(path:str, name:str, kind:str, size:i64)
+  FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
+  FsListing(generation:i64, path:str, entries:[FsEntry])
+  FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
+  FsHistory(generation:i64, snapshots:[FsSnapshot])
+  sync fs_parent(path:str) -> str
+  files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
+  files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
+  files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   sync shell_nav(tab:str) -> [NavItem]
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)

@@ -802,6 +802,77 @@ view
               layer
                 float x=(block_menu_x + 10.0) y=block_menu_y
                   BlockActionsMenu block_id=selected_block_id kind=selected_block_kind disabled=(loading || mutation_phase != "idle") delete_armed=block_delete_armed editable_kinds=editable_block_kinds
+    files:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=8.0 align=center
+          button "↑" label="Parent directory" disabled=(fs_loading || empty(fs_path)) width=26.0 height=26.0 padding=0.0 -> fs_open_parent
+            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+            hovered bg=fg/10 text=fg
+            pressed bg=fg/14
+          text fs_path width=fill size=13.0 wrapping=none font=mono @text-fg
+          if fs_loading
+            text "Loading…" size=11.0 font=mono @text-muted
+          button "History" height=26.0 padding=5.0 -> fs_toggle_history
+            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+            hovered bg=fg/10 text=fg
+            pressed bg=fg/14
+        row width=fill height=fill spacing=10.0
+          container width=340.0 height=fill padding=6.0 bg=surface border=fg/10 border-w=1.0 r=10.0
+            stack width=fill height=fill
+              if empty(fs_entries) && !fs_loading
+                EmptyState title="Empty directory" detail="Nothing committed under this path."
+              if !empty(fs_entries)
+                scroll direction=vertical width=fill height=fill
+                  col width=fill spacing=1.0
+                    for entry in fs_entries
+                      col width=fill
+                        if entry.kind == "dir"
+                          button label="Open directory" width=fill padding=6.0 -> fs_open_dir(entry.path)
+                            row width=fill height=fill spacing=8.0 align=center
+                              text "▸" width=14.0 size=11.0 align-x=center @text-muted
+                              text entry.name width=fill size=13.0 wrapping=none font=medium @text-fg
+                            active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+                            hovered bg=primary/10 text=fg
+                            pressed bg=primary/16
+                        if entry.kind != "dir"
+                          button label="Preview file" width=fill padding=6.0 -> fs_open_file(entry.path)
+                            row width=fill height=fill spacing=8.0 align=center
+                              text "·" width=14.0 size=11.0 align-x=center @text-muted
+                              text entry.name width=fill size=13.0 wrapping=none @text-fg
+                              text entry.size size=11.0 wrapping=none font=mono @text-muted
+                            active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+                            hovered bg=primary/10 text=fg
+                            pressed bg=primary/16
+          container width=fill height=fill padding=8.0 bg=surface border=fg/10 border-w=1.0 r=10.0
+            stack width=fill height=fill
+              if fs_history_open
+                scroll direction=vertical width=fill height=fill
+                  col width=fill spacing=4.0
+                    container width=fill padding-left=4.0
+                      text "SNAPSHOTS" size=11.0 font=medium @text-muted
+                    for snapshot in fs_history
+                      container width=fill padding=7.0 bg=popover border=fg/10 border-w=1.0 r=8.0
+                        col width=fill spacing=2.0
+                          row width=fill spacing=8.0 align=center
+                            text snapshot.short_id size=11.0 wrapping=none font=mono @text-primary
+                            text snapshot.height size=11.0 wrapping=none font=mono @text-muted
+                            space width=fill
+                            text snapshot.author size=11.0 wrapping=none font=mono @text-muted
+                          if !empty(snapshot.message)
+                            text snapshot.message size=13.0 @text-fg
+              if !fs_history_open && empty(fs_preview_path)
+                EmptyState title="Select a file" detail="Text files preview here; History shows the commit window."
+              if !fs_history_open && !empty(fs_preview_path)
+                scroll direction=vertical width=fill height=fill
+                  col width=fill spacing=6.0
+                    row width=fill spacing=8.0 align=center
+                      text fs_preview_path width=fill size=11.0 wrapping=none font=mono @text-muted
+                      if fs_preview_truncated
+                        text "first 64 KiB" size=11.0 wrapping=none font=mono @text-muted
+                    if fs_preview_binary
+                      text fs_preview_text size=13.0 font=mono @text-muted
+                    if !fs_preview_binary
+                      text fs_preview_text size=13.0 font=mono @text-fg
     explorer:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

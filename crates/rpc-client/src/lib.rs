@@ -243,6 +243,29 @@ impl Client {
         Ok(reply.blocks)
     }
 
+    /// One GET against a `/v1/files/*` read lane, query-string params, JSON
+    /// reply verbatim — the files browser's transport.
+    pub async fn files_get(
+        &self,
+        lane: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value> {
+        let mut url = self.url(&format!("v1/files/{lane}"))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(key, value);
+            }
+        }
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
+        decode_json(response).await
+    }
+
     /// Submit an already-signed operation frame.
     pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<()> {
         let response = self

@@ -980,6 +980,192 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+/// One files-browser row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size: i64,
+}
+
+/// One committed duckfs snapshot.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsSnapshot {
+    pub id: String,
+    pub short_id: String,
+    pub author: String,
+    pub height: i64,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsListing {
+    pub generation: i64,
+    pub path: String,
+    pub entries: Vec<FsEntry>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsPreview {
+    pub generation: i64,
+    pub path: String,
+    pub text: String,
+    pub truncated: bool,
+    pub binary: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct FsHistory {
+    pub generation: i64,
+    pub snapshots: Vec<FsSnapshot>,
+}
+
+/// List one duckfs directory (committed head), name order.
+pub async fn files_ls(
+    rpc: String,
+    path: String,
+    generation: i64,
+) -> Result<FsListing, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.files_get("ls", &[("path", path.as_str())]).await?;
+        let entries = reply["entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| {
+                let entry_path = entry["path"].as_str().unwrap_or_default().to_string();
+                let name = entry_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(entry_path.as_str())
+                    .to_string();
+                FsEntry {
+                    name,
+                    kind: entry["kind"].as_str().unwrap_or_default().to_string(),
+                    size: entry["size"].as_i64().unwrap_or(0),
+                    path: entry_path,
+                }
+            })
+            .collect();
+        Ok(FsListing {
+            generation,
+            path,
+            entries,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Read a file's head bytes for the preview pane (64 KiB window).
+pub async fn files_preview(
+    rpc: String,
+    path: String,
+    generation: i64,
+) -> Result<FsPreview, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc
+            .files_get("read", &[("path", path.as_str()), ("len", "65536")])
+            .await?;
+        let b64 = reply["b64"].as_str().unwrap_or_default();
+        let eof = reply["eof"].as_bool().unwrap_or(true);
+        let bytes = base64_decode(b64).unwrap_or_default();
+        let (text, binary) = match String::from_utf8(bytes.clone()) {
+            Ok(text) if !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') => {
+                (text, false)
+            }
+            _ => (format!("{} binary bytes", bytes.len()), true),
+        };
+        Ok(FsPreview {
+            generation,
+            path,
+            text,
+            truncated: !eof,
+            binary,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The committed snapshot window, newest first.
+pub async fn files_history(
+    rpc: String,
+    generation: i64,
+) -> Result<FsHistory, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.files_get("history", &[("limit", "50")]).await?;
+        let snapshots = reply["snapshots"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|snapshot| {
+                let id = snapshot["id"].as_str().unwrap_or_default().to_string();
+                FsSnapshot {
+                    short_id: short_digest(&id),
+                    author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
+                    height: snapshot["height"].as_i64().unwrap_or(0),
+                    message: snapshot["message"].as_str().unwrap_or_default().to_string(),
+                    id,
+                }
+            })
+            .collect();
+        Ok(FsHistory {
+            generation,
+            snapshots,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Minimal base64 (standard alphabet, padded) — the files read lane's wire.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let value = |c: u8| TABLE.iter().position(|t| *t == c).map(|i| i as u32);
+    let clean: Vec<u8> = input.bytes().filter(|b| !b" \n\r\t".contains(b)).collect();
+    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+    for chunk in clean.chunks(4) {
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for byte in chunk {
+            if *byte == b'=' {
+                break;
+            }
+            acc = (acc << 6) | value(*byte)?;
+            bits += 6;
+        }
+        while bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The breadcrumb path one level up ("" at the root).
+pub fn fs_parent(path: String) -> String {
+    match path.rfind('/') {
+        Some(0) | None => String::new(),
+        Some(cut) => path[..cut].to_string(),
+    }
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -995,6 +1181,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
     [
         ("chat", "Chat", "#"),
         ("pages", "Pages", "▤"),
+        ("files", "Files", "▣"),
         ("explorer", "Explorer", "⛓"),
     ]
     .into_iter()

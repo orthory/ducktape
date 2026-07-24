@@ -78,6 +78,16 @@ state
   explorer_generation:i64 = 0
   explorer_loading = false
   explorer_selected:i64 = 0
+  fs_path = "/shared"
+  fs_entries:[FsEntry] = []
+  fs_generation:i64 = 0
+  fs_loading = false
+  fs_preview_path = ""
+  fs_preview_text = ""
+  fs_preview_truncated = false
+  fs_preview_binary = false
+  fs_history:[FsSnapshot] = []
+  fs_history_open = false
   palette_open = false
   palette_draft = ""
   palette_key = ""

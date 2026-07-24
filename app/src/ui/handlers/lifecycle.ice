@@ -266,10 +266,65 @@ on live_block_comments_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
-  return if shell_tab != "explorer" || !connected
+  return if !connected
+  return if shell_tab == "chat" || shell_tab == "pages"
   explorer_generation = explorer_generation + 1
-  explorer_loading = true
-  run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+  fs_generation = fs_generation + 1
+  explorer_loading = shell_tab == "explorer"
+  fs_loading = shell_tab == "files"
+  parallel
+    run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
+
+on fs_open_dir(path)
+  return if fs_loading || !connected
+  fs_path = path
+  fs_generation = fs_generation + 1
+  fs_loading = true
+  fs_preview_path = ""
+  fs_preview_text = ""
+  run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+
+on fs_open_parent
+  return if fs_loading || !connected || empty(fs_path)
+  fs_path = fs_parent(fs_path)
+  fs_generation = fs_generation + 1
+  fs_loading = true
+  fs_preview_path = ""
+  fs_preview_text = ""
+  run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+
+on fs_open_file(path)
+  return if fs_loading || !connected
+  fs_preview_path = path
+  fs_generation = fs_generation + 1
+  run files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
+
+on fs_toggle_history
+  fs_history_open = !fs_history_open
+
+on fs_listed(next)
+  return if next.generation != fs_generation
+  fs_loading = false
+  fs_path = next.path
+  fs_entries = next.entries
+
+on fs_previewed(next)
+  return if next.generation != fs_generation
+  fs_preview_path = next.path
+  fs_preview_text = next.text
+  fs_preview_truncated = next.truncated
+  fs_preview_binary = next.binary
+
+on fs_history_loaded(next)
+  return if next.generation != fs_generation
+  fs_history = next.snapshots
+
+on fs_failed(cause)
+  return if cause.generation != fs_generation
+  fs_loading = false
+  error = cause.message
 
 on refresh_explorer
   return if !connected || explorer_loading

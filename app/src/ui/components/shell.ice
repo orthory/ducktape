@@ -90,6 +90,12 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
                   slot chat_sidebar
                 "pages"
                   slot pages_sidebar
+                "files"
+                  col width=fill height=fill spacing=6.0
+                    container width=fill padding-left=8.0
+                      text "FILES" size=11.0 font=medium @text-muted
+                    container width=fill padding-left=8.0
+                      text "The network's shared filesystem at its committed head." size=11.0 @text-muted
                 _
                   col width=fill height=fill spacing=6.0
                     container width=fill padding-left=8.0
@@ -124,6 +130,8 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
                 slot chat
               "pages"
                 slot pages
+              "files"
+                slot files
               _
                 slot explorer
 
