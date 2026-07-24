@@ -127,7 +127,10 @@ on workspace_connected(next)
   mutation_phase = "idle"
   hydration_retry_attempt = 0
   error = ""
-  run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
+  bell_generation = bell_generation + 1
+  parallel
+    run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
+    run load_bell(connected_rpc, bell_generation) -> bell_loaded _ | bell_failed _
 
 on live_updated(next)
   status = next.status
@@ -143,6 +146,8 @@ on live_updated(next)
   active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
   active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
+  bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
+  bell_items = apply_bell(bell_items, next.bell)
   return if !next.load_chat && !next.load_pages
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -432,6 +437,25 @@ on toggle_palette
 
 on close_palette
   palette_open = false
+
+on toggle_bell
+  bell_open = !bell_open
+  return if !bell_open || bell_unread <= 0
+  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
+
+on close_bell
+  bell_open = false
+
+on bell_loaded(next)
+  return if next.generation != bell_generation
+  bell_unread = next.unread
+  bell_items = next.items
+
+on bell_failed(cause)
+  return if cause.generation != bell_generation
+
+on bell_marked(_)
+  error = error
 
 on global_key_pressed(event)
   palette_key = palette_key_action(event.physical_key, event.modifiers, palette_open)

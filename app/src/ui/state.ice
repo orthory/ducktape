@@ -95,6 +95,10 @@ state
   fs_diff_from = ""
   fs_diff:[FsDiffEntry] = []
   palette_open = false
+  bell_open = false
+  bell_unread:i64 = 0
+  bell_items:[BellItem] = []
+  bell_generation:i64 = 0
   palette_draft = ""
   palette_key = ""
   palette_generation:i64 = 0

@@ -1,5 +1,5 @@
 view
-  WorkspaceTabs status=status loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab #workspace-tabs
+  WorkspaceTabs status=status loading=(loading || mutation_phase != "idle") degraded=connection_degraded(status) tab=shell_tab bell_count=bell_unread #workspace-tabs
     connection:
       container width=fill padding=6.0 bg=transparent border=fg/11 border-w=1.0 r=10.0
         col width=fill spacing=5.0
@@ -1029,3 +1029,27 @@ view
                               active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                               hovered bg=primary/12 text=fg
                               pressed bg=primary/18
+    bell:
+      stack width=fill height=fill
+        if bell_open
+          button label="Close notifications" width=fill height=fill padding=0.0 -> close_bell
+            space width=fill height=fill
+            active bg=transparent border=transparent
+        if bell_open
+          container width=fill height=fill align-x=end align-y=start padding-top=48.0 padding-right=120.0
+            container width=360.0 padding=8.0 bg=popover border=fg/14 border-w=1.0 r=10.0 shadow=shadow shadow-y=6.0 shadow-blur=18.0
+              col width=fill spacing=4.0
+                text "Notifications" size=13.0 font=medium @text-fg
+                if empty(bell_items)
+                  text "Nothing yet — mentions and deliveries land here." size=13.0 @text-muted
+                if !empty(bell_items)
+                  scroll direction=vertical width=fill height=320.0
+                    col width=fill spacing=3.0
+                      for item in bell_items
+                        container width=fill padding=7.0 bg=surface border=fg/8 border-w=1.0 r=8.0
+                          col width=fill spacing=2.0
+                            row width=fill spacing=8.0 align=center
+                              text item.kind size=11.0 wrapping=none font=mono @text-primary
+                              space width=fill
+                              text item.source size=11.0 wrapping=none font=mono @text-muted
+                            text item.body size=13.0 @text-fg

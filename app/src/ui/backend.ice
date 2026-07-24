@@ -30,7 +30,15 @@ extern crate::backend
   PageSearchData(generation:i64, hits:[PageSearchHit])
   AutosaveResult(generation:i64, written:bool)
   WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str)
-  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta)
+  BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
+  BellDelta(kind:str, item:BellItem, up_to_seq:i64)
+  BellData(generation:i64, unread:i64, items:[BellItem])
+  sync apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
+  sync bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
+  sync bell_head(items:[BellItem]) -> i64
+  load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
+  mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
+  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta, bell:BellDelta)
   ComposerCmd()
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)

@@ -1236,7 +1236,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
 
         let shell = include_str!("ui/components/shell.ice");
         // the shell is titlebar + optional degradation banner over the panes.
-        assert!(shell.contains("component TitleBar(status:str, loading:bool)"));
+        assert!(shell.contains("component TitleBar(status:str, loading:bool, bell_badge:i64)"));
         assert!(shell.contains("component ConnectionBanner(status:str)"));
         assert!(shell.contains("if degraded\n          ConnectionBanner status=status"));
         assert!(shell.contains(

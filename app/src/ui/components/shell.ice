@@ -6,11 +6,20 @@ component Brand()
       text "Ducktape" size=13.0 wrapping=none font=display @text-fg
       text "Workspace" size=11.0 wrapping=none @text-muted
 
-component TitleBar(status:str, loading:bool)
+component TitleBar(status:str, loading:bool, bell_badge:i64)
   container width=fill height=44.0 padding-left=14.0 padding-right=14.0 bg=sidebar border=separator border-w=1.0
     row width=fill height=fill spacing=10.0 align=center
       Brand
       space width=fill
+      button label="Notifications" height=26.0 padding=5.0 -> toggle_bell
+        row height=fill spacing=5.0 align=center
+          text "🔔" size=13.0 wrapping=none
+          if bell_badge > 0
+            container height=16.0 padding-left=5.0 padding-right=5.0 align-y=center bg=primary r=8.0
+              text bell_badge size=11.0 wrapping=none font=mono @text-popover
+        active bg=fg/4 text=muted border=fg/10 border-w=1.0 r=7.0
+        hovered bg=fg/8 text=fg border=fg/14
+        pressed bg=fg/12
       button label="Search everything" height=26.0 padding=5.0 -> toggle_palette
         row height=fill spacing=6.0 align=center
           text "Search" size=11.0 wrapping=none @text-muted
@@ -59,7 +68,7 @@ component NavButton(item:NavItem)
         hovered bg=fg/5 text=fg border=fg/8
         pressed bg=fg/8 text=fg
 
-component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
+component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_count:i64)
   state
     connection_open = false
     sidebar_width = 240.0
@@ -72,7 +81,7 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
   container width=fill height=fill clip=true bg=bg border=border border-w=1.0 px-snap=true
     stack width=fill height=fill
       col width=fill height=fill
-        TitleBar status=status loading=loading
+        TitleBar status=status loading=loading bell_badge=bell_count
         if degraded
           ConnectionBanner status=status
         row width=fill height=fill
@@ -136,3 +145,4 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
                 slot explorer
 
       slot palette
+      slot bell

@@ -2907,6 +2907,7 @@ dependencies = [
  "commonware-cryptography",
  "ducktape-rpc",
  "iced",
+ "inbox",
  "node",
  "pages",
  "sdk",

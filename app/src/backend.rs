@@ -27,6 +27,9 @@ pub use chat::client::{
     merge_thread_reply, optimistic_message, paragraph_blocks, parse_message_with_members,
     rollback_pending_message, short_label, thread_offset_after_reply,
 };
+pub use inbox::client::{
+    BellDelta, BellItem, apply_bell_items as fold_bell_items,
+};
 pub use pages::client::PagesDelta;
 
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
@@ -320,6 +323,7 @@ pub struct LiveUpdate {
     pub debounce: bool,
     pub chat: ChatDelta,
     pub pages: PagesDelta,
+    pub bell: BellDelta,
 }
 
 
@@ -1400,6 +1404,115 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
     .collect()
 }
 
+/// The local user's inbox member handle (`user:{hex}`), when a key exists.
+async fn local_member() -> Option<String> {
+    local_user_key()
+        .await
+        .map(|key| format!("user:{}", hex_encode(&key)))
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct BellData {
+    pub generation: i64,
+    pub unread: i64,
+    pub items: Vec<BellItem>,
+}
+
+/// Load the bell: this member's notification page (newest first) + unread
+/// count from the inbox views. A device without a user key has no inbox.
+pub async fn load_bell(rpc: String, generation: i64) -> Result<BellData, HydrationError> {
+    async {
+        let Some(member) = local_member().await else {
+            return Ok(BellData {
+                generation,
+                unread: 0,
+                items: Vec::new(),
+            });
+        };
+        let rpc = rpc_client(&rpc)?;
+        let listed: serde_json::Value = rpc
+            .view(
+                "inbox",
+                &serde_json::json!({ "list": { "member": member, "from_seq": 0, "limit": 50 } }),
+            )
+            .await?;
+        let unread: serde_json::Value = rpc
+            .view("inbox", &serde_json::json!({ "unread": { "member": member } }))
+            .await?;
+        let mut items: Vec<BellItem> = listed["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| BellItem {
+                seq: row["seq"].as_i64().unwrap_or(0),
+                kind: row["kind"].as_str().unwrap_or_default().to_string(),
+                body: row["body"].as_str().unwrap_or_default().to_string(),
+                source: row["source"].as_str().unwrap_or_default().to_string(),
+                height: row["height"].as_i64().unwrap_or(0),
+                read: row["read"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        items.reverse();
+        Ok(BellData {
+            generation,
+            unread: unread["unread_count"].as_i64().unwrap_or(0),
+            items,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Mark everything at or below `up_to_seq` read (signed by the local user).
+pub async fn mark_bell_read(
+    rpc: String,
+    password: String,
+    up_to_seq: i64,
+) -> Result<bool, AppError> {
+    async {
+        if up_to_seq <= 0 {
+            return Ok(());
+        }
+        let member = local_member()
+            .await
+            .ok_or_else(|| "no local user key".to_string())?;
+        let up_to_seq = u64::try_from(up_to_seq).unwrap_or(0);
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "inbox",
+            inbox::encode_msg(&inbox::InboxMsg::MarkRead {
+                member,
+                up_to_seq,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The delta-fold splices, re-exported shapes the Ice layer applies.
+pub fn apply_bell(items: Vec<BellItem>, delta: BellDelta) -> Vec<BellItem> {
+    fold_bell_items(items, delta)
+}
+
+/// The unread count after one bell delta.
+pub fn bell_unread_after(unread: i64, items: Vec<BellItem>, delta: BellDelta) -> i64 {
+    inbox::client::apply_bell_unread(unread, &items, &delta)
+}
+
+/// The mark-read watermark of the current list.
+pub fn bell_head(items: Vec<BellItem>) -> i64 {
+    inbox::client::bell_head_seq(&items)
+}
+
 /// One explorer block row.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ExplorerBlock {
@@ -1601,7 +1714,11 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                 let connected = async {
                     let rpc = rpc_client(&state.rpc)?;
                     rpc.module_events(
-                        vec!["chat".to_string(), "pages".to_string()],
+                        vec![
+                            "chat".to_string(),
+                            "pages".to_string(),
+                            "inbox".to_string(),
+                        ],
                         state.cursors.clone(),
                     )
                     .await
@@ -1679,11 +1796,7 @@ async fn folded_update(
     match module {
         "chat" => {
             let current_user = local_user_key().await;
-            let origin_kind = match op.origin.kind {
-                ducktape_rpc::StreamOriginKind::External => "external",
-                ducktape_rpc::StreamOriginKind::Module => "module",
-                ducktape_rpc::StreamOriginKind::System => "system",
-            };
+            let origin_kind = stream_origin_kind(&op.origin.kind);
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
@@ -1717,7 +1830,36 @@ async fn folded_update(
                 debounce: false,
                 chat: delta,
                 pages: PagesDelta::default(),
+                bell: BellDelta::default(),
             })
+        }
+        "inbox" => {
+            let current_user = local_user_key().await?;
+            let member = format!("user:{}", hex_encode(&current_user));
+            let origin_kind = stream_origin_kind(&op.origin.kind);
+            let folded = inbox::client::delta_from_op(
+                &payload,
+                op.assigned.as_ref(),
+                origin_kind,
+                op.origin.id.as_deref(),
+                &member,
+            );
+            match folded {
+                Ok(Some(bell)) => Some(LiveUpdate {
+                    kind: "bell".into(),
+                    status: format!("Live · block {height}"),
+                    height,
+                    module: "inbox".into(),
+                    load_chat: false,
+                    load_pages: false,
+                    debounce: false,
+                    chat: ChatDelta::default(),
+                    pages: PagesDelta::default(),
+                    bell,
+                }),
+                Ok(None) => None,
+                Err(_) => None,
+            }
         }
         "pages" => match pages::client::delta_from_op(&payload) {
             Ok(delta) => Some(LiveUpdate {
@@ -1730,10 +1872,19 @@ async fn folded_update(
                 debounce: true,
                 chat: ChatDelta::default(),
                 pages: delta,
+                bell: BellDelta::default(),
             }),
             Err(_) => Some(live_resync("pages", height)),
         },
         _ => None,
+    }
+}
+
+fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
+    match kind {
+        ducktape_rpc::StreamOriginKind::External => "external",
+        ducktape_rpc::StreamOriginKind::Module => "module",
+        ducktape_rpc::StreamOriginKind::System => "system",
     }
 }
 
@@ -4298,6 +4449,7 @@ fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
         debounce: false,
         chat: ChatDelta::default(),
         pages: PagesDelta::default(),
+        bell: BellDelta::default(),
     }
 }
 
