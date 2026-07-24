@@ -3584,6 +3584,60 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
+    /// LIVE end-to-end through the REAL Podman socket path: build a provider
+    /// whose executor is a tiny shell script that echoes its stdin, run it in an
+    /// alpine container over the node-private socket, and confirm the prompt
+    /// comes back. Exercises the whole rewritten headless path — spec build,
+    /// neutral-path mounts, create/start/attach/wait/remove over the socket, and
+    /// the demux-into-the-timeout-loop plumbing — against real podman.
+    /// `#[ignore]`: needs a running podman socket at `$DUCKTAPE_PODMAN_SOCKET`.
+    ///   DUCKTAPE_PODMAN_SOCKET=/run/user/1000/podman/dt-e2e.sock \
+    ///     cargo test -p capability-host --lib -- --ignored --nocapture podman_socket_echo
+    #[tokio::test]
+    #[ignore = "live: needs a running podman socket at $DUCKTAPE_PODMAN_SOCKET"]
+    async fn podman_socket_echo_round_trips_through_invoke() {
+        let Ok(socket) = std::env::var("DUCKTAPE_PODMAN_SOCKET") else {
+            eprintln!("skipping: DUCKTAPE_PODMAN_SOCKET unset");
+            return;
+        };
+        // a musl-safe executor: a shell script (alpine has /bin/sh) that cats
+        // stdin. The host bin is mounted at a neutral /ducktape/bin path.
+        let root = scratch("podman-socket-echo");
+        let bin = root.join("echo-stdin.sh");
+        std::fs::write(&bin, b"#!/bin/sh\ncat\n").unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt as _;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "docker.io/library/alpine:latest".into());
+        let provider = CliProvider::from_spec(
+            mock_spec("echo", "echo-stdin.sh", "text"),
+            bin,
+            SandboxBackend::Podman {
+                image,
+                socket: PathBuf::from(socket),
+            },
+        )
+        .with_workdir(root.join("wd"));
+        std::fs::create_dir_all(root.join("wd")).unwrap();
+
+        let ctx = RunContext {
+            executing_node: Some(execution_node_id(b"e2e-node")),
+            ..RunContext::default()
+        };
+        let answer = provider
+            .run("PONG-OVER-SOCKET", &ctx)
+            .await
+            .expect("run over the podman socket");
+        eprintln!("--- socket echo answer: {answer:?} ---");
+        assert!(
+            answer.contains("PONG-OVER-SOCKET"),
+            "the container echoed the prompt back through the socket path: {answer:?}"
+        );
+    }
+
 
     #[test]
     fn tart_backend_builds_a_boot_then_ssh_plan() {
