@@ -11,8 +11,6 @@ app Ducktape
     size 1120 720
     min-size 820 540
     position centered
-    transparent true
-    blur true
     platform macos
       title-hidden true
       titlebar-transparent true

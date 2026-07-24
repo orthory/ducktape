@@ -1,7 +1,7 @@
 state
   app_theme = "app"
-  app_background = "#00000000"
-  app_text = "#f2f2f4"
+  app_background = "#fcfcfc"
+  app_text = "#2c2b27"
   rpc = ""
   connected_rpc = ""
   password = ""
