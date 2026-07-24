@@ -136,6 +136,11 @@ on delete_page_submit
 on new_block_kind_changed(next)
   new_block_kind = next
 
+on pick_slash_kind(kind)
+  new_block_kind = kind
+  block_draft = ""
+  task widget focus #workspace-tabs/block-insert-row(block_insert_after_id)/block-insert
+
 on block_entered(id)
   hovered_block_id = id
 
@@ -188,6 +193,7 @@ on discard_orphaned_comment_draft(draft)
 
 on add_block_submit
   return if loading || empty(active_page) || (new_block_kind != "Divider" && empty(trim(block_draft)))
+  return if !empty(slash_kind_matches(block_draft, editable_block_kinds))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   pending_block = block_draft
@@ -201,6 +207,7 @@ on block_added(next)
   pages = next.data.pages
   return if active_page != next.page_id || next.data.active_page != next.page_id
   blocks = merge_block_insert_result(next.data.blocks, blocks, active_page, next.data.active_page, next.operation_id)
+  block_insert_after_id = next.operation_id
   active_page_title = next.data.active_page_title
   active_page_parent = next.data.active_page_parent
   error = ""

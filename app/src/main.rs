@@ -611,6 +611,59 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     }
 
     #[test]
+    fn flow_typing_inserts_blocks_in_order() {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.active_page = "welcome".into();
+        app.block_insert_open = true;
+        app.block_insert_after_id = String::new();
+
+        app.block_draft = "first".into();
+        let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
+        let first_id = app.blocks[0].id.clone();
+        let _ = app.__update(__DucktapeMessage::BlockAdded(backend::BlockInsertResult {
+            data: backend::PagesData {
+                pages: Vec::new(),
+                blocks: vec![backend::PageBlock {
+                    key: 1,
+                    id: first_id.clone(),
+                    parent: "welcome".into(),
+                    kind: "Text".into(),
+                    text: "first".into(),
+                    pending: false,
+                    checked: false,
+                    prefix: String::new(),
+                    child_count: 0,
+                    mark_count: 0,
+                }],
+                active_page: "welcome".into(),
+                active_page_title: "Welcome".into(),
+                active_page_parent: String::new(),
+                selected_block_id: String::new(),
+                selected_block_kind: String::new(),
+                selected_block_text: String::new(),
+                selected_block_checked: false,
+                page_title_selected: false,
+            },
+            operation_id: first_id.clone(),
+            page_id: "welcome".into(),
+        }));
+        assert_eq!(
+            app.block_insert_after_id, first_id,
+            "the insert anchor advances so Enter-typing appends in order"
+        );
+
+        // the next flow-typed block lands AFTER the first, not before it
+        app.block_draft = "second".into();
+        let _ = app.__update(__DucktapeMessage::AddBlockSubmit);
+        assert_eq!(app.blocks.len(), 2);
+        assert_eq!(app.blocks[0].text, "first");
+        assert_eq!(app.blocks[1].text, "second");
+        assert!(app.blocks[1].pending);
+    }
+
+    #[test]
     fn history_windows_offer_a_jump_back_to_latest() {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;

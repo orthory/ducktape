@@ -980,6 +980,20 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+/// The slash menu: a draft starting with `/` filters the insertable block
+/// kinds by case-insensitive prefix (`/h` -> the headings). Empty when the
+/// draft is not a slash command.
+pub fn slash_kind_matches(draft: String, kinds: Vec<String>) -> Vec<String> {
+    let Some(needle) = draft.strip_prefix('/') else {
+        return Vec::new();
+    };
+    let needle = needle.trim().to_ascii_lowercase();
+    kinds
+        .into_iter()
+        .filter(|kind| kind.to_ascii_lowercase().starts_with(&needle))
+        .collect()
+}
+
 /// True when the live connection is in a state the shell should banner:
 /// the stream is down, retrying, or a resync failed and is backing off.
 pub fn connection_degraded(status: String) -> bool {

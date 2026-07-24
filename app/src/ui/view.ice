@@ -645,11 +645,22 @@ view
                     InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix="" #block-insert-row(block_insert_after_id)
                       stack width=fill
                         if new_block_kind != "Divider"
-                          input "" #block-insert label="New block" <-> block_draft hint="Type and press Enter…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
-                            active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
-                            hovered bg=fg/2 border=fg/5
-                            focused bg=fg/4 border=fg/8
-                            disabled value=muted
+                          col width=fill spacing=2.0
+                            input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
+                              active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
+                              hovered bg=fg/2 border=fg/5
+                              focused bg=fg/4 border=fg/8
+                              disabled value=muted
+                            if !empty(slash_kind_matches(block_draft, editable_block_kinds))
+                              container width=fill padding=3.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=shadow shadow-y=2.0 shadow-blur=8.0
+                                col width=fill spacing=1.0
+                                  for kind in slash_kind_matches(block_draft, editable_block_kinds)
+                                    button label="Set block kind" width=fill height=24.0 padding=4.0 -> pick_slash_kind(kind)
+                                      row width=fill height=fill spacing=6.0 align=center
+                                        text kind width=fill size=13.0 wrapping=none @text-fg
+                                      active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                      hovered bg=primary/14 text=fg
+                                      pressed bg=primary/20
                         if new_block_kind == "Divider"
                           button "Insert divider" disabled=loading width=fill height=28.0 padding=5.0 -> add_block_submit
                             active bg=transparent text=muted r=6.0
@@ -690,11 +701,22 @@ view
                         InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
                           stack width=fill
                             if new_block_kind != "Divider"
-                              input "" #block-insert label="New block" <-> block_draft hint="Type and press Enter…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
-                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
-                                hovered bg=fg/2 border=fg/5
-                                focused bg=fg/4 border=fg/8
-                                disabled value=muted
+                              col width=fill spacing=2.0
+                                input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
+                                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
+                                  hovered bg=fg/2 border=fg/5
+                                  focused bg=fg/4 border=fg/8
+                                  disabled value=muted
+                                if !empty(slash_kind_matches(block_draft, editable_block_kinds))
+                                  container width=fill padding=3.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=shadow shadow-y=2.0 shadow-blur=8.0
+                                    col width=fill spacing=1.0
+                                      for kind in slash_kind_matches(block_draft, editable_block_kinds)
+                                        button label="Set block kind" width=fill height=24.0 padding=4.0 -> pick_slash_kind(kind)
+                                          row width=fill height=fill spacing=6.0 align=center
+                                            text kind width=fill size=13.0 wrapping=none @text-fg
+                                          active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                          hovered bg=primary/14 text=fg
+                                          pressed bg=primary/20
                             if new_block_kind == "Divider"
                               button "Insert divider" disabled=loading width=fill height=28.0 padding=5.0 -> add_block_submit
                                 active bg=transparent text=muted r=6.0
