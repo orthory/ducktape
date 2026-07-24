@@ -306,7 +306,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // coordinator default `apply_primary_coordinator` bakes into the
     // descriptor, so the two never silently disagree (see `docs`:
     // coordinator is ambient, node-local).
-    let plumbing = config::merged_plumbing(
+    let mut plumbing = config::merged_plumbing(
         &dir,
         net.listen.as_deref(),
         net.advertised.as_deref(),
@@ -318,6 +318,14 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
+    // `--compute` founds a workstation node: agent sessions run in a sandbox
+    // (podman on Linux, tart on macOS — chosen for the platform init runs on)
+    // and this host announces its provider capabilities. A plain consensus node
+    // leaves both off (the `direct` default).
+    if args.compute {
+        plumbing.sandbox = if cfg!(target_os = "macos") { "tart" } else { "podman" }.into();
+        plumbing.announce_capabilities = true;
+    }
 
     let me = key.public_key();
     let mut descriptor = config::NetworkDescriptor {

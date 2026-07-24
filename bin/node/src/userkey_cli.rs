@@ -51,6 +51,28 @@ pub(crate) enum UserCmd {
     P256Payload(EnrollArgs),
     /// named, grantable API credentials co-hosted through this node's gateway
     Cred(crate::cred_cli::CredArgs),
+    /// bind this user key to an account on the local node and name it — one
+    /// command for the bind + display name + `.duck` handle a fresh operator
+    /// otherwise had to submit by hand
+    AccountInit(AccountInitArgs),
+}
+
+/// `user account-init --name <name> [-n <chain-id> | --node <url>]` — the
+/// one-shot account setup for an operator running their own node.
+#[derive(Debug, clap::Args)]
+pub(crate) struct AccountInitArgs {
+    /// the account's human-readable display name (also the default `.duck` handle)
+    #[arg(long, value_name = "NAME")]
+    name: String,
+    /// the local node's http base (e.g. `http://host:port`)
+    #[arg(long, value_name = "URL")]
+    node: Option<String>,
+    /// resolve the node through a registered workspace's chain id
+    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID")]
+    network: Option<String>,
+    /// path to the user key file (a fresh path mints a plain identity)
+    #[arg(long, value_name = "PATH", default_value = "user.key")]
+    key: PathBuf,
 }
 
 /// `user key` — a nested lifecycle subcommand, or (no subcommand) the legacy
@@ -271,7 +293,62 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
         UserCmd::WebauthnChallenge(args) => cmd_user_webauthn_challenge(args),
         UserCmd::P256Payload(args) => cmd_user_p256_payload(args),
         UserCmd::Cred(args) => crate::cred_cli::run(args, &mut stdin),
+        UserCmd::AccountInit(args) => cmd_user_account_init(args, &mut stdin),
     }
+}
+
+/// `user account-init` — bind the user key to an account on the local node,
+/// set its display name, and register its `.duck` handle, in one command.
+/// Idempotent: a key already bound to an account skips the bind and only
+/// (re)asserts name + handle. Replaces the hand-built `sign-bind` + two raw
+/// `/v1/submit` calls a fresh operator used to run.
+fn cmd_user_account_init(
+    args: AccountInitArgs,
+    stdin: &mut impl std::io::BufRead,
+) -> CommandResult {
+    use identity::{IdentityMsg, IdentityQuery, IdentityReply};
+
+    let base = redeem_node(args.node.as_deref(), args.network.as_deref())?;
+    let needle = args
+        .network
+        .as_deref()
+        .filter(|n| !n.is_empty())
+        .ok_or("account-init needs -n/--network to locate the node's workspace")?;
+    let (dir, _http) = config::resolve_network(needle)?;
+    let resolved = config::resolve(&dir.join("node.toml"))?;
+    let user = load_user_signer(&args.key, stdin)?;
+    let user_pub = user.public_key();
+
+    // Already bound? then the bind is a no-op — just (re)assert name + handle.
+    let query = IdentityQuery::OfMember { member_key: user_pub.as_ref().to_vec() };
+    let reply: IdentityReply = serde_json::from_value(crate::cred_cli::query_node(
+        &base,
+        "identity",
+        serde_json::to_value(&query)?,
+    )?)?;
+    let already_bound = matches!(reply, IdentityReply::Account(Some(_)));
+
+    if !already_bound {
+        let node_pub = resolved.signer.public_key();
+        let authorizer = config::ed25519_member_auth(
+            &user,
+            identity::IDENTITY_BIND_NS,
+            &identity::bind_preimage(&resolved.chain_id, node_pub.as_ref(), 0),
+        );
+        let msg = IdentityMsg::BindNode { authorizer };
+        let height = crate::node_http::submit(&base, "identity", &serde_json::to_value(&msg)?)?;
+        println!("bound account at height {height}");
+    }
+
+    let name_msg = IdentityMsg::SetAccountName { display_name: args.name.clone() };
+    crate::node_http::submit(&base, "identity", &serde_json::to_value(&name_msg)?)?;
+
+    let handle = args.name.to_lowercase();
+    let handle_msg = serde_json::json!({ "set_handle": { "handle": handle } });
+    crate::node_http::submit(&base, "gateway", &handle_msg)?;
+
+    println!("account {} ready (handle {}.duck)", args.name, handle);
+    Ok(())
 }
 
 // ============================================================================

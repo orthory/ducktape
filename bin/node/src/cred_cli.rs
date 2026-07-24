@@ -382,6 +382,69 @@ fn cmd_add(
     };
     let height = submit_gateway(&base, &message)?;
     println!("registered {name} at height {height}");
+    // A lent credential is only reachable once the co-hosted airlock gateway has
+    // a signed on-chain route. That route is per-ACCOUNT (one `airlock` route
+    // serves every credential this account co-hosts), so publish it once and
+    // skip on later `cred add`s — the operator never hand-signs a RouteStatement.
+    ensure_airlock_route(&base, &user, &resolved, &account.account_id)?;
+    Ok(())
+}
+
+/// The `airlock` gateway route label the co-hosted gateway registers itself
+/// under; the compute broker resolves `<AIRLOCK_ROUTE>.<handle>.duck` to it.
+/// Mirrors `crate::cred_resolve::AIRLOCK_ROUTE`.
+const AIRLOCK_ROUTE: &str = "airlock";
+
+/// Publish the account's `airlock` gateway route if it is not already published
+/// — the one signed statement that makes this node's co-hosted gateway reachable
+/// over the overlay. Idempotent: a route already present is left untouched.
+fn ensure_airlock_route(
+    base: &str,
+    user: &commonware_cryptography::ed25519::PrivateKey,
+    resolved: &config::Resolved,
+    account_id: &[u8],
+) -> CredResult {
+    let name = gateway::RouteName::named(AIRLOCK_ROUTE);
+    let existing = query_gateway(
+        base,
+        &gateway::GatewayQuery::Get { account_id: account_id.to_vec(), name: name.clone() },
+    )?;
+    let already_published = matches!(existing, gateway::GatewayReply::Route(ref boxed) if boxed.is_some());
+    if already_published {
+        return Ok(());
+    }
+    // The airlock upstream is a streaming (SSE) loopback: unbounded response
+    // (`max_response_bytes = 0`), GET+POST, and it forwards the scoped session
+    // bearer (`allow_authorization`). Request cap is the module ceiling.
+    let statement = gateway::RouteStatement {
+        version: 1,
+        chain_id: resolved.chain_id.clone(),
+        account_id: account_id.to_vec(),
+        name,
+        publisher_node: resolved.signer.public_key().as_ref().to_vec(),
+        revision: 1,
+        route: Some(gateway::RouteDefinition {
+            target: gateway::RouteTarget::LoopbackHttp,
+            policy: gateway::RoutePolicy {
+                audience: gateway::RouteAudience::Network,
+                methods: vec![gateway::RouteMethod::Get, gateway::RouteMethod::Post],
+                max_request_bytes: gateway::MAX_REQUEST_BODY_BYTES,
+                max_response_bytes: 0,
+                allow_authorization: true,
+                allow_upgrade: false,
+            },
+        }),
+    };
+    let preimage = gateway::route_signing_preimage(&statement)?;
+    let message = gateway::GatewayMsg::SetRoute {
+        statement,
+        authorization: gateway::MemberAuthorization {
+            signer: user.public_key().as_ref().to_vec(),
+            signature: user.sign(gateway::GATEWAY_ROUTE_NS, &preimage).as_ref().to_vec(),
+        },
+    };
+    let height = submit_gateway(base, &message)?;
+    println!("published airlock route at height {height}");
     Ok(())
 }
 
@@ -529,21 +592,7 @@ fn submit_gateway(
     base: &str,
     message: &gateway::GatewayMsg,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let payload = serde_json::to_value(message)?;
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/submit"))
-        .json(&serde_json::json!({ "target": "gateway", "payload": payload }))
-        .send()
-        .map_err(|e| format!("POST {base}/v1/submit: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("submit rejected ({status}): {body}").into());
-    }
-    serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v["height"].as_u64())
-        .ok_or_else(|| format!("unexpected submit receipt: {body}").into())
+    crate::node_http::submit(base, "gateway", &serde_json::to_value(message)?)
 }
 
 /// Read every registered credential record from committed gateway state.
@@ -633,17 +682,7 @@ pub(crate) fn query_node(
     target: &str,
     query: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/query"))
-        .json(&serde_json::json!({ "target": target, "query": query }))
-        .send()
-        .map_err(|e| format!("POST {base}/v1/query: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("query rejected ({status}): {body}").into());
-    }
-    Ok(serde_json::from_str(&body)?)
+    crate::node_http::query(base, target, query)
 }
 
 #[cfg(test)]

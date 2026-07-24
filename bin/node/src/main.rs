@@ -61,6 +61,7 @@ mod cli_args;
 mod config;
 mod constants;
 mod cred_cli;
+mod node_http;
 mod cred_resolve;
 mod drain_actions;
 mod explorer;
