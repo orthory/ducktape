@@ -292,7 +292,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
             &seal_pk,
             "compute-node",
             CredentialKind::Claude,
-            &CredentialPayload::Refresh { refresh_token: "seed".into() },
+            &CredentialPayload::Refresh { refresh_token: "seed".into(), access_token: String::new(), expires_at: 0 },
         )
         .await
         .unwrap();
@@ -447,7 +447,7 @@ fn airlock_single_node_self_serves_its_own_route() {
             &seal_pk,
             "self",
             CredentialKind::Claude,
-            &CredentialPayload::Refresh { refresh_token: "seed".into() },
+            &CredentialPayload::Refresh { refresh_token: "seed".into(), access_token: String::new(), expires_at: 0 },
         )
         .await
         .unwrap();

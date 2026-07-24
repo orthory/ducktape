@@ -186,6 +186,8 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
         WireCredentialKind::Claude,
         &CredentialPayload::Refresh {
             refresh_token: "seed".into(),
+            access_token: String::new(),
+            expires_at: 0,
         },
     )
     .await
