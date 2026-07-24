@@ -3584,6 +3584,102 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
+    /// LIVE end-to-end for the INTERACTIVE (pty) path over the socket: a shell
+    /// script standing in for a TUI (reads a line, echoes it back) is spawned as
+    /// an interactive session, then driven — write keystrokes, read the echo,
+    /// resize, close. Exercises `from_attach` + the `Transport::Socket`
+    /// read/write/resize/close over a real `terminal=true` attach stream, which
+    /// is the exact shape a lent Claude Code PTY session uses.
+    /// `#[ignore]`: needs a running podman socket at `$DUCKTAPE_PODMAN_SOCKET`.
+    #[tokio::test]
+    #[ignore = "live: needs a running podman socket at $DUCKTAPE_PODMAN_SOCKET"]
+    async fn podman_socket_interactive_session_drives_a_tty() {
+        let Ok(socket) = std::env::var("DUCKTAPE_PODMAN_SOCKET") else {
+            eprintln!("skipping: DUCKTAPE_PODMAN_SOCKET unset");
+            return;
+        };
+        let root = scratch("podman-socket-interactive");
+        // a fake TUI: read a line from the pty, echo it with a marker, loop.
+        let bin = root.join("fake-tui.sh");
+        std::fs::write(
+            &bin,
+            b"#!/bin/sh\nwhile IFS= read -r line; do echo \"TUI-SAW:$line\"; done\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "faketui"
+[detect]
+bin = "fake-tui.sh"
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+[interactive]
+args = []
+"#,
+            "test",
+        )
+        .unwrap();
+        let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "docker.io/library/alpine:latest".into());
+        let provider = CliProvider::from_spec(
+            spec,
+            bin,
+            SandboxBackend::Podman {
+                image,
+                socket: PathBuf::from(socket),
+            },
+        )
+        .with_workdir(root.join("wd"));
+        std::fs::create_dir_all(root.join("wd")).unwrap();
+
+        let ctx = RunContext {
+            executing_node: Some(execution_node_id(b"e2e-int-node")),
+            ..RunContext::default()
+        };
+        let session = provider
+            .spawn_interactive(&ctx, false)
+            .await
+            .expect("spawn interactive session over the socket");
+        // resize must not error on the socket transport (fire-and-forget).
+        session.resize(100, 40).expect("resize the socket tty");
+        session
+            .write_all(b"knock-knock\n")
+            .await
+            .expect("write keystrokes to the container pty");
+
+        // read until the fake TUI echoes our line back through the attach stream.
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..80 {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), session.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+            }
+            if seen.windows(15).any(|w| w == b"TUI-SAW:knock-k") {
+                break;
+            }
+        }
+        session.close().await;
+        let text = String::from_utf8_lossy(&seen);
+        eprintln!("--- interactive transcript: {text:?} ---");
+        assert!(
+            text.contains("TUI-SAW:knock-knock"),
+            "the container TUI echoed our keystrokes back through the socket attach: {text:?}"
+        );
+    }
+
     /// LIVE end-to-end through the REAL Podman socket path: build a provider
     /// whose executor is a tiny shell script that echoes its stdin, run it in an
     /// alpine container over the node-private socket, and confirm the prompt
