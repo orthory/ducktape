@@ -67,6 +67,13 @@ extern crate::backend
   sync canonical_endpoint(input:str) -> str
   sync connection_degraded(status:str) -> bool
   sync palette_key_action(physical:physical-key, modifiers:key-modifiers, open:bool) -> str
+  NavItem(id:str, title:str, icon:str, active:bool)
+  sync shell_nav(tab:str) -> [NavItem]
+  ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
+  ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
+  ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
+  sync explorer_ops_at(ops:[ExplorerOp], height:i64) -> [ExplorerOp]
+  load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
   sync slash_kind_matches(draft:str, kinds:[str]) -> [str]
   sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
   sync doc_tabs_without(tabs:[str], page_id:str) -> [str]

@@ -802,6 +802,54 @@ view
               layer
                 float x=(block_menu_x + 10.0) y=block_menu_y
                   BlockActionsMenu block_id=selected_block_id kind=selected_block_kind disabled=(loading || mutation_phase != "idle") delete_armed=block_delete_armed editable_kinds=editable_block_kinds
+    explorer:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=8.0 align=center
+          text "Block explorer" size=14.0 font=display @text-fg
+          space width=fill
+          if explorer_loading
+            text "Loading…" size=11.0 font=mono @text-muted
+          button "Refresh" disabled=explorer_loading height=26.0 padding=5.0 -> refresh_explorer
+            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+            hovered bg=fg/10 text=fg border=fg/14
+            pressed bg=fg/14 text=fg
+        if empty(explorer_blocks) && !explorer_loading
+          EmptyState title="No blocks yet" detail="Non-empty blocks appear here as they finalize."
+        if !empty(explorer_blocks)
+          row width=fill height=fill spacing=10.0
+            container width=340.0 height=fill padding=6.0 bg=surface border=fg/10 border-w=1.0 r=10.0
+              scroll direction=vertical width=fill height=fill
+                col width=fill spacing=1.0
+                  for block in explorer_blocks
+                    button label="Inspect block" width=fill padding=6.0 -> select_explorer_block(block.height)
+                      row width=fill height=fill spacing=8.0 align=center
+                        text block.height size=13.0 wrapping=none font=mono @text-primary
+                        text block.hash width=fill size=11.0 wrapping=none font=mono @text-muted
+                        text block.op_count size=11.0 wrapping=none font=mono @text-muted
+                      active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+                      hovered bg=primary/10 text=fg
+                      pressed bg=primary/16
+            container width=fill height=fill padding=8.0 bg=surface border=fg/10 border-w=1.0 r=10.0
+              stack width=fill height=fill
+                if explorer_selected <= 0
+                  EmptyState title="Select a block" detail="Its operations and dispatch traces appear here."
+                if explorer_selected > 0
+                  scroll direction=vertical width=fill height=fill
+                    col width=fill spacing=6.0
+                      for op in explorer_ops_at(explorer_ops, explorer_selected)
+                        container width=fill padding=8.0 bg=popover border=fg/10 border-w=1.0 r=9.0
+                          col width=fill spacing=3.0
+                            row width=fill spacing=8.0 align=center
+                              text op.target size=13.0 wrapping=none font=medium @text-fg
+                              text op.disposition size=11.0 wrapping=none font=mono @text-primary
+                              space width=fill
+                              text op.op_hash size=11.0 wrapping=none font=mono @text-muted
+                            row width=fill spacing=8.0 align=center
+                              text "by" size=11.0 wrapping=none @text-muted
+                              text op.proposer size=11.0 wrapping=none font=mono @text-muted
+                            if !empty(op.trace)
+                              text op.trace size=11.0 font=mono @text-muted
+                            text op.payload size=13.0 @text-fg
     palette:
       stack width=fill height=fill
         if palette_open

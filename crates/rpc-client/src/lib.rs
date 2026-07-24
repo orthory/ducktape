@@ -224,6 +224,25 @@ impl Client {
         decode_json(response).await
     }
 
+    /// Read the recent non-empty block rows (`GET /v1/blocks`), oldest-first
+    /// — the explorer surface. Rows are the node's own JSON projection.
+    pub async fn blocks(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let mut url = self.url("v1/blocks")?;
+        url.set_query(Some(&format!("limit={limit}")));
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC blocks failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Blocks {
+            blocks: Vec<serde_json::Value>,
+        }
+        let reply: Blocks = decode_json(response).await?;
+        Ok(reply.blocks)
+    }
+
     /// Submit an already-signed operation frame.
     pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<()> {
         let response = self

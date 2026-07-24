@@ -138,7 +138,11 @@ mod tests {
         assert!(!view.contains("sync_phase"));
         assert!(root.contains("use \"view.ice\""));
         assert!(!lifecycle.contains("on refresh_now"));
-        assert!(!view.contains("button \"Refresh\""));
+        // live surfaces (chat/pages) never need a manual refresh — the delta
+        // stream keeps them current. The explorer's recent-window reload is
+        // the one legitimate refresh affordance.
+        let before_explorer = view.split_once("    explorer:").map_or(view, |(head, _)| head);
+        assert!(!before_explorer.contains("button \"Refresh\""));
 
         let refresh = lifecycle
             .split_once("on live_resynced(next)\n")

@@ -266,6 +266,30 @@ on live_block_comments_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
+  return if shell_tab != "explorer" || !connected
+  explorer_generation = explorer_generation + 1
+  explorer_loading = true
+  run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+
+on refresh_explorer
+  return if !connected || explorer_loading
+  explorer_generation = explorer_generation + 1
+  explorer_loading = true
+  run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+
+on explorer_loaded(next)
+  return if next.generation != explorer_generation
+  explorer_loading = false
+  explorer_blocks = next.blocks
+  explorer_ops = next.ops
+
+on explorer_failed(cause)
+  return if cause.generation != explorer_generation
+  explorer_loading = false
+  error = cause.message
+
+on select_explorer_block(height)
+  explorer_selected = height
 
 on toggle_palette
   return if !connected

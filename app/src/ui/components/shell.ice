@@ -40,6 +40,25 @@ component EmptyState(title:str, detail:str)
       text title size=14.0 font=medium @text-fg
       text detail size=13.0 @text-muted
 
+component NavButton(item:NavItem)
+  col width=fill
+    if item.active
+      button label=item.title width=fill height=32.0 padding=7.0 -> select_shell_tab(item.id)
+        row width=fill height=fill spacing=9.0 align=center
+          text item.icon width=18.0 size=14.0 align-x=center font=display @text-primary
+          text item.title width=fill size=13.0 font=medium @text-fg
+        active bg=primary/14 text=fg border=primary/30 border-w=1.0 r=9.0
+        hovered bg=primary/20 text=fg border=primary/38
+        pressed bg=primary/26 text=fg
+    if !item.active
+      button label=item.title width=fill height=32.0 padding=7.0 -> select_shell_tab(item.id)
+        row width=fill height=fill spacing=9.0 align=center
+          text item.icon width=18.0 size=14.0 align-x=center @text-muted
+          text item.title width=fill size=13.0 @text-muted
+        active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
+        hovered bg=fg/5 text=fg border=fg/8
+        pressed bg=fg/8 text=fg
+
 component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
   state
     connection_open = false
@@ -61,46 +80,22 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
             col width=fill height=fill spacing=8.0
               container width=fill padding-left=8.0
                 text "APPS" size=11.0 font=medium @text-muted
-              match tab
-                "chat"
-                  col width=fill spacing=3.0
-                    button label="Chat" width=fill height=32.0 padding=7.0 -> select_shell_tab("chat")
-                      row width=fill height=fill spacing=9.0 align=center
-                        text "#" width=18.0 size=14.0 align-x=center font=display @text-primary
-                        text "Chat" width=fill size=13.0 font=medium @text-fg
-                      active bg=primary/14 text=fg border=primary/30 border-w=1.0 r=9.0
-                      hovered bg=primary/20 text=fg border=primary/38
-                      pressed bg=primary/26 text=fg
-                    button label="Pages" width=fill height=32.0 padding=7.0 -> select_shell_tab("pages")
-                      row width=fill height=fill spacing=9.0 align=center
-                        text "▤" width=18.0 size=13.0 align-x=center @text-muted
-                        text "Pages" width=fill size=13.0 @text-muted
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
-                      hovered bg=fg/5 text=fg border=fg/8
-                      pressed bg=fg/8 text=fg
-                _
-                  col width=fill spacing=3.0
-                    button label="Chat" width=fill height=32.0 padding=7.0 -> select_shell_tab("chat")
-                      row width=fill height=fill spacing=9.0 align=center
-                        text "#" width=18.0 size=14.0 align-x=center @text-muted
-                        text "Chat" width=fill size=13.0 @text-muted
-                      active bg=transparent text=muted border=transparent border-w=1.0 r=9.0
-                      hovered bg=fg/5 text=fg border=fg/8
-                      pressed bg=fg/8 text=fg
-                    button label="Pages" width=fill height=32.0 padding=7.0 -> select_shell_tab("pages")
-                      row width=fill height=fill spacing=9.0 align=center
-                        text "▤" width=18.0 size=14.0 align-x=center font=display @text-primary
-                        text "Pages" width=fill size=13.0 font=medium @text-fg
-                      active bg=primary/14 text=fg border=primary/30 border-w=1.0 r=9.0
-                      hovered bg=primary/20 text=fg border=primary/38
-                      pressed bg=primary/26 text=fg
+              col width=fill spacing=3.0
+                for item in shell_nav(tab)
+                  NavButton item=item
               container width=fill height=1.0 bg=separator
                 text ""
               match tab
                 "chat"
                   slot chat_sidebar
-                _
+                "pages"
                   slot pages_sidebar
+                _
+                  col width=fill height=fill spacing=6.0
+                    container width=fill padding-left=8.0
+                      text "EXPLORER" size=11.0 font=medium @text-muted
+                    container width=fill padding-left=8.0
+                      text "Recent non-empty blocks, newest first. Click a block for its ops." size=11.0 @text-muted
               button label="Connection" width=fill height=28.0 padding=7.0 -> toggle_connection
                 row width=fill height=fill spacing=7.0 align=center
                   container width=7.0 height=7.0 bg=fg/48 border=fg/16 border-w=1.0 r=3.5
@@ -127,7 +122,9 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str)
             match tab
               "chat"
                 slot chat
-              _
+              "pages"
                 slot pages
+              _
+                slot explorer
 
       slot palette

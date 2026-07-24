@@ -980,6 +980,148 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+/// One shell navigation entry.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct NavItem {
+    pub id: String,
+    pub title: String,
+    pub icon: String,
+    pub active: bool,
+}
+
+/// The shell's module navigation, the active pane flagged. Modules join the
+/// shell by joining this list.
+pub fn shell_nav(tab: String) -> Vec<NavItem> {
+    [
+        ("chat", "Chat", "#"),
+        ("pages", "Pages", "▤"),
+        ("explorer", "Explorer", "⛓"),
+    ]
+    .into_iter()
+    .map(|(id, title, icon)| NavItem {
+        id: id.into(),
+        title: title.into(),
+        icon: icon.into(),
+        active: id == tab,
+    })
+    .collect()
+}
+
+/// One explorer block row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerBlock {
+    pub height: i64,
+    pub hash: String,
+    pub commit: String,
+    pub op_count: i64,
+}
+
+/// One applied (or rejected) op inside an explorer block.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerOp {
+    pub height: i64,
+    pub proposer: String,
+    pub target: String,
+    pub disposition: String,
+    pub op_hash: String,
+    pub payload: String,
+    pub trace: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ExplorerData {
+    pub generation: i64,
+    pub blocks: Vec<ExplorerBlock>,
+    pub ops: Vec<ExplorerOp>,
+}
+
+/// Load the recent block window for the explorer pane, newest first.
+pub async fn load_explorer(rpc: String, generation: i64) -> Result<ExplorerData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let rows = rpc.blocks(100).await?;
+        let mut blocks = Vec::with_capacity(rows.len());
+        let mut ops = Vec::new();
+        for row in &rows {
+            let height = row["height"].as_i64().unwrap_or(0);
+            let row_ops = row["ops"].as_array().cloned().unwrap_or_default();
+            blocks.push(ExplorerBlock {
+                height,
+                hash: short_digest(row["hash"].as_str().unwrap_or_default()),
+                commit: short_digest(row["commit_hash"].as_str().unwrap_or_default()),
+                op_count: count_i64(row_ops.len()),
+            });
+            for op in row_ops {
+                ops.push(ExplorerOp {
+                    height,
+                    proposer: short_digest(op["proposer"].as_str().unwrap_or_default()),
+                    target: op["target"].as_str().unwrap_or_default().to_string(),
+                    disposition: op["disposition"].as_str().unwrap_or_default().to_string(),
+                    op_hash: short_digest(op["op_hash"].as_str().unwrap_or_default()),
+                    payload: explorer_payload(&op["payload"]),
+                    trace: explorer_trace(op["operations"].as_array()),
+                });
+            }
+        }
+        blocks.reverse();
+        ops.reverse();
+        Ok(ExplorerData {
+            generation,
+            blocks,
+            ops,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// First 12 hex chars of a digest — the explorer's display form.
+fn short_digest(digest: &str) -> String {
+    let mut short: String = digest.chars().take(12).collect();
+    if digest.chars().count() > 12 {
+        short.push('…');
+    }
+    short
+}
+
+/// The op payload preview: verbatim short strings, else a truncated render.
+fn explorer_payload(payload: &serde_json::Value) -> String {
+    let rendered = match payload.as_str() {
+        Some(text) => text.to_string(),
+        None => payload.to_string(),
+    };
+    let mut preview: String = rendered.chars().take(160).collect();
+    if rendered.chars().count() > 160 {
+        preview.push('…');
+    }
+    preview
+}
+
+/// The dispatch trace summary: `module(+msgs/+events)` per hop.
+fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> String {
+    let Some(operations) = operations else {
+        return String::new();
+    };
+    operations
+        .iter()
+        .map(|op| {
+            let module = op["module"].as_str().unwrap_or("?");
+            let msgs = op["emitted_msgs"].as_i64().unwrap_or(0);
+            let events = op["emitted_events"].as_i64().unwrap_or(0);
+            format!("{module}(+{msgs}m/+{events}e)")
+        })
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+/// The ops of the selected block (0 selects nothing).
+pub fn explorer_ops_at(ops: Vec<ExplorerOp>, height: i64) -> Vec<ExplorerOp> {
+    ops.into_iter().filter(|op| op.height == height).collect()
+}
+
 /// The global-key router for the command palette: platform-Command+K
 /// toggles, Escape closes an open palette; anything else is `none`.
 pub fn palette_key_action(

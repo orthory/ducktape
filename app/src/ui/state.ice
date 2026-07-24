@@ -73,6 +73,11 @@ state
   chat_search_generation:i64 = 0
   history_view = false
   shell_tab = "chat"
+  explorer_blocks:[ExplorerBlock] = []
+  explorer_ops:[ExplorerOp] = []
+  explorer_generation:i64 = 0
+  explorer_loading = false
+  explorer_selected:i64 = 0
   palette_open = false
   palette_draft = ""
   palette_key = ""
