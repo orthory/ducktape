@@ -102,20 +102,25 @@ const CAPABILITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/capability/component.wasm");
 const CAPABILITY_MODULE_ID: &str = "capability";
 
-/// identity / gateway / governance — adapter-ported tenants whose native
-/// constructors take PER-NETWORK parameters (the identity chain id, the invite
-/// binding). a wasm component is fixed bytes, so those parameters travel as
-/// GENESIS CONFIG: the builders below install an initial store carrying the
-/// reserved `__config` key (`sdk::genesis_config`) at construction, and the
-/// guest decodes it per dispatch. the config is consensus state — identical on
-/// every node, in the module root (hence the root-hash) from genesis, and
-/// carried by checkpoint snapshots like any other store key.
+/// identity / gateway — adapter-ported tenants whose native constructors take
+/// PER-NETWORK parameters (the identity chain id). a wasm component is fixed
+/// bytes, so those parameters travel as GENESIS CONFIG: the builders below
+/// install an initial store carrying the reserved `__config` key
+/// (`sdk::genesis_config`) at construction, and the guest decodes it per
+/// dispatch. the config is consensus state — identical on every node, in the
+/// module root (hence the root-hash) from genesis, and carried by checkpoint
+/// snapshots like any other store key.
 const IDENTITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/identity/component.wasm");
 const IDENTITY_MODULE_ID: &str = "identity";
 const GATEWAY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/gateway/component.wasm");
 const GATEWAY_MODULE_ID: &str = "gateway";
+/// governance — a STORE-BACKED tenant like pages/chat/agent/automations,
+/// with one extra seam: its per-network invite binding travels as GENESIS
+/// CONFIG seeded INTO the qmdb store ([`seed_store_config`]) instead of an
+/// installed host-KV snapshot, so the config is an ordinary store record in
+/// the merkle root from genesis and rides state-sync like every other record.
 const GOVERNANCE_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/governance/component.wasm");
 const GOVERNANCE_MODULE_ID: &str = "governance";
@@ -463,17 +468,44 @@ fn genesis_gateway_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
     )
 }
 
-/// governance at its GENESIS code + config: the invite binding every token
-/// and join proof verify against rides `__config` (the sibling wiring —
+/// governance at its GENESIS code over the host-constructed store (same
+/// three store lifecycles as [`pages_wasm`]). the invite binding every token
+/// and join proof verify against is a `__config` STORE RECORD, seeded at
+/// genesis by [`seed_store_config`] (the sibling wiring —
 /// valset/lifecycle/identity — is genesis-constant and compiled into the
 /// guest like every other port's sibling ids).
-fn genesis_governance_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
-    genesis_config_wasm(
-        GOVERNANCE_MODULE_ID,
-        GOVERNANCE_WASM_COMPONENT,
-        &[("invite", bindings.invite)],
-        "governance",
-    )
+fn governance_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(GOVERNANCE_MODULE_ID, GOVERNANCE_WASM_COMPONENT, store)
+        .expect("embedded governance component loads")
+}
+
+/// seed a STORE-BACKED wasm tenant's genesis config: commit the reserved
+/// `__config` record ([`sdk::genesis_config`]) into its qmdb store under
+/// [`sdk::store_key`] — the exact slot the module's own `StagedStore` maps
+/// that logical key to, where the guest's `load_store_config` reads it back.
+/// committed at genesis construction, the config is part of the store's
+/// merkle root from block zero (genesis roots honestly differ per network)
+/// and rides state-sync like any other record. idempotent: a store that
+/// already carries a config (a reopened workspace re-entering the genesis
+/// path) is left byte-untouched.
+async fn seed_store_config(
+    store: &mut dyn sdk::MerkleStore,
+    params: &[(&str, &[u8])],
+    what: &str,
+) {
+    let key = sdk::store_key(sdk::genesis_config::CONFIG_KEY);
+    let already = store
+        .get(&key)
+        .await
+        .unwrap_or_else(|e| panic!("{what} genesis config read: {e}"));
+    if already.is_some() {
+        return;
+    }
+    let config = sdk::genesis_config::encode_config(params);
+    store
+        .commit_batch(vec![(key, Some(config))])
+        .await
+        .unwrap_or_else(|e| panic!("{what} genesis config seeds: {e}"));
 }
 
 /// the production module registry: ONE named field per module, so genesis,
@@ -567,6 +599,14 @@ pub(super) async fn genesis_host(
     let automations = automations_wasm(Box::new(
         QmdbStore::init(context.child("automations"), "automations").await,
     ));
+    // governance is store-backed too; its per-network invite binding is
+    // seeded into the store as the `__config` record before the wrapper
+    // composes (part of the merkle root from block zero).
+    let governance = {
+        let mut store = QmdbStore::init(context.child("governance"), "governance").await;
+        seed_store_config(&mut store, &[("invite", bindings.invite)], "governance").await;
+        governance_wasm(Box::new(store))
+    };
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -589,9 +629,10 @@ pub(super) async fn genesis_host(
         // changes: member proposals + ballots, deterministic tally, follow-up
         // membership ops, and the redeem-time client grant (an
         // `IdentityMsg::GrantClient` follow-up into identity — the client set is
-        // now a facet of the account plane, empty at genesis). adapter-ported;
-        // the invite binding rides its GENESIS CONFIG, sibling ids compiled in.
-        governance: genesis_governance_wasm(bindings),
+        // now a facet of the account plane, empty at genesis). store-backed
+        // over the host-constructed qmdb store; the invite binding is the
+        // store-seeded `__config` record, sibling ids compiled into the guest.
+        governance,
         // the network module-code registry: the consensus commitment to WHICH
         // component each hot-swappable wasm module runs, seeded with the genesis
         // hashes. governance schedules height-gated swaps into it; the host
@@ -690,6 +731,11 @@ pub(super) async fn restore_host(
     let automations = automations_wasm(Box::new(
         QmdbStore::init(context.child("automations"), "automations").await,
     ));
+    // governance reopens like the other store-backed tenants; the `__config`
+    // invite-binding record is committed store state, so no re-seeding.
+    let governance = governance_wasm(Box::new(
+        QmdbStore::init(context.child("governance"), "governance").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -710,16 +756,6 @@ pub(super) async fn restore_host(
     valset
         .install(bytes, root)
         .map_err(|e| format!("valset install: {e}"))?;
-
-    // wasm tenants with GENESIS CONFIG restore like any other wasm module:
-    // construct through the genesis builder (config-only initial store), then
-    // adopt the checkpoint snapshot — the config rides in those bytes, so the
-    // install simply replaces the interim store with the same-config one.
-    let mut governance = genesis_governance_wasm(bindings);
-    let (bytes, root) = snapshot_of(GOVERNANCE_MODULE_ID)?;
-    governance
-        .install(bytes, root)
-        .map_err(|e| format!("governance install: {e}"))?;
 
     // the lifecycle module-code registry restores like any in-memory module:
     // construct at genesis shape, adopt the
@@ -987,6 +1023,20 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    // governance joins the same way; the `__config` invite-binding record is
+    // ordinary store state, so it arrives with the synced op range and the
+    // rebuilt root commits to it exactly like the source's.
+    let (target, resolver) = fetch_target("governance").await?;
+    let governance = governance_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("governance")),
+            "governance",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1036,15 +1086,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     tagging
         .install(&bytes, root)
         .map_err(|e| format!("tagging install: {e}"))?;
-
-    // wasm tenants with GENESIS CONFIG join like any other wasm module:
-    // construct through the genesis builder (config-only initial store), then
-    // adopt the served snapshot, root-checked — the config rides in it.
-    let (bytes, root) = snapshot_of(GOVERNANCE_MODULE_ID).await?;
-    let mut governance = genesis_governance_wasm(bindings);
-    governance
-        .install(&bytes, root)
-        .map_err(|e| format!("governance install: {e}"))?;
 
     // the lifecycle module-code registry joins like any in-memory module: adopt
     // the served snapshot, root-checked. the

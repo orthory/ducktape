@@ -10,7 +10,7 @@ use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{
-    read_clients, read_redemptions_from_host, read_valset_members, read_valset_residents,
+    read_clients, read_redemption_from_host, read_valset_members, read_valset_residents,
 };
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -246,14 +246,12 @@ impl ValidatorRuntime<'_> {
 
         let joiner_bytes = fwd.joiner.clone();
         let issuer_bytes = fwd.issuer.clone();
-        // V6: nonce unspent in committed redemptions. a nonce redeemed by
-        // ANOTHER key can never redeem again — terminal Spent. (redeemed by
-        // the SAME key = this joiner already has standing; V9 handles it.)
-        let redemptions = read_redemptions_from_host(node.host()).await;
-        if let Some(spent) = redemptions
-            .iter()
-            .find(|r| r.nonce == fwd.nonce && r.joiner != joiner_bytes)
-        {
+        // V6: nonce unspent in committed redemptions — a point read by nonce
+        // against the exactly-once set. a nonce redeemed by ANOTHER key can
+        // never redeem again — terminal Spent. (redeemed by the SAME key =
+        // this joiner already has standing; V9 handles it.)
+        let redemption = read_redemption_from_host(node.host(), &fwd.nonce).await;
+        if let Some(spent) = redemption.filter(|r| r.joiner != joiner_bytes) {
             tracing::warn!(
                 target: "ducktape::join",
                 node = %label,

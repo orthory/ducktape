@@ -1,28 +1,33 @@
-//! the adapter-port equivalence proof for the governance cutover: the
-//! `governance` guest component (the NATIVE `governance` crate compiled to wasm
-//! behind `guest-adapter`) and the native `Governance` module answer the SAME
-//! op sequence with IDENTICAL query replies, and their roots move in lockstep.
-//! the roots THEMSELVES differ — the port persists the native canonical
-//! snapshot as one host-KV value — and this proof pins that representation
-//! difference.
+//! the STORE-BACKED cutover-continuity proof for governance: the `governance`
+//! guest component over `WasmModule::with_store(QmdbStore)` and the native
+//! `Governance` over the same store shape are ROOT-CONTINUOUS — the same op
+//! sequence commits the IDENTICAL qmdb merkle root after every block (both
+//! roots ARE the store's root; qmdb's batch canonicalizes mutations by hashed
+//! key, so the native logical-key commit order and the wasm hashed-key drain
+//! order produce the same op log).
 //!
 //! governance's per-network parameter is the INVITE BINDING, which travels as
-//! GENESIS CONFIG (a host-installed `__config` store entry —
-//! `sdk::genesis_config`); the config-in-the-root and config-governs-the-guest
-//! pins ride at the end of this file.
+//! GENESIS CONFIG — a `__config` RECORD seeded into the qmdb store under
+//! `sdk::store_key` (the production `seed_store_config` seam), read back by
+//! the guest's `load_store_config` per dispatch. BOTH runtimes' stores carry
+//! the identical record here (root-continuity demands it; the native twin
+//! reads its binding from the builder and simply carries the record in its
+//! root). the config-in-the-root and config-governs-the-guest pins ride at
+//! the end of this file.
 //!
 //! governance is the richest tenant the runtime hosts: proposals, ballots and
 //! the deterministic tally read the valset sibling; account-share mode reads
 //! the identity sibling; and a PASSING proposal acts by EMITTING follow-up
-//! msgs the host drains in the same block — into valset (membership), upgrade
-//! (node upgrades), and modreg (wasm code swaps). the wasm host carries the
-//! REAL NATIVE siblings for all four, so every read resolves through the
-//! runtime's memoized replay and every follow-up re-publishes through the
-//! host ctx — including the UpdateModule flow proving a WASM governance can
-//! still drive the code registry that live-updates the other wasm tenants.
+//! msgs the host drains in the same block — into valset (membership) and
+//! lifecycle (wasm code swaps). the wasm host carries the REAL NATIVE
+//! siblings, so every read resolves through the runtime's memoized replay and
+//! every follow-up re-publishes through the host ctx — including the
+//! UpdateModule flow proving a WASM governance can still drive the code
+//! registry that live-updates the other wasm tenants.
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use governance::invite::{
     INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
 };
@@ -37,7 +42,8 @@ use lifecycle::{
     Lifecycle, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode_reply,
     encode_query as lifecycle_encode_query,
 };
-use sdk::{Error, Module as _, Msg, Origin, StateRoot};
+use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
+use statesync::qmdb::QmdbStore;
 use valset::{
     Valset, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_query as valset_encode_query,
@@ -56,26 +62,43 @@ const INVITE: &[u8] = b"parity-net#feedface";
 /// hosts here; governance itself carries no chain id).
 const CHAIN_ID: &str = "test-chain";
 
-/// the wasm governance at a given invite binding: component + the
-/// host-computed initial store carrying the `__config` genesis parameters —
-/// exactly the production construction (`bin/node/src/host_state.rs`).
-fn wasm_governance_with_invite(invite: &[u8]) -> WasmModule {
-    let mut module = WasmModule::from_bytes("governance", GOVERNANCE_WASM).expect("load component");
+/// a fresh qmdb store carrying the seeded `__config` invite-binding record —
+/// exactly the production genesis seam (`bin/node/src/host_state.rs`
+/// `seed_store_config`). BOTH runtimes' stores get the identical record:
+/// root-continuity demands it, and the guest reads its binding from it.
+/// `label` doubles as the store id: the deterministic runtime keys storage
+/// partitions by id alone (child labels do not namespace them), so a shared
+/// id would make the second store REPLAY the first's journal and re-append
+/// the config. the id is not part of the qmdb root (the sync tests pin
+/// root-equality across ids), so distinct ids cost nothing.
+async fn gov_store(
+    context: &deterministic::Context,
+    label: &'static str,
+    invite: &[u8],
+) -> QmdbStore<deterministic::Context> {
+    let mut store = QmdbStore::init(context.child(label), label).await;
     let config = sdk::genesis_config::encode_config(&[("invite", invite)]);
-    let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module
-        .install(&bytes, root)
-        .expect("install genesis config");
-    module
+    store
+        .commit_batch(vec![(
+            sdk::store_key(sdk::genesis_config::CONFIG_KEY),
+            Some(config),
+        )])
+        .await
+        .expect("seed genesis config");
+    store
 }
 
-fn wasm_governance() -> WasmModule {
-    wasm_governance_with_invite(INVITE)
+/// the wasm governance over the host-constructed (config-seeded) store —
+/// exactly the production construction (`bin/node/src/host_state.rs`).
+fn wasm_governance(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("governance", GOVERNANCE_WASM, store).expect("load component")
 }
 
-/// the production wiring, verbatim (`bin/node/src/host_state.rs`).
-fn native_governance() -> Governance {
-    Governance::new("governance", "valset", "identity")
+/// the production wiring, verbatim (`bin/node/src/host_state.rs` — where the
+/// production tenant is the wasm twin; the native builder chain is what the
+/// guest compiles in).
+fn native_governance(store: Box<dyn sdk::MerkleStore>) -> Governance {
+    Governance::new("governance", store, "valset", "identity")
         .with_invite_binding(INVITE)
         .with_code_registry("lifecycle")
 }
@@ -110,15 +133,17 @@ fn siblings(validators: &[Vec<u8>]) -> Vec<Box<dyn sdk::Module>> {
     ]
 }
 
-fn native_host(validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = gov_store(context, "native_gov", INVITE).await;
     let mut modules = siblings(validators);
-    modules.push(Box::new(native_governance()));
+    modules.push(Box::new(native_governance(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
-fn wasm_host_(validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = gov_store(context, "wasm_gov", INVITE).await;
     let mut modules = siblings(validators);
-    modules.push(Box::new(wasm_governance()));
+    modules.push(Box::new(wasm_governance(Box::new(store))));
     Host::genesis(modules).expect("genesis")
 }
 
@@ -228,12 +253,18 @@ fn root_of(h: &Host) -> StateRoot {
 
 const SIBLING_IDS: [&str; 3] = ["valset", "lifecycle", "identity"];
 
-/// the read matrix: the full proposal listing, per-id gets (present + absent),
-/// the redemption audit trail, and the share registry.
+/// the read matrix: the roster-served proposal listing, per-id gets (present
+/// and absent), redemption point reads (a spent nonce, an unspent one), and
+/// the share registry.
 async fn replies(h: &Host, ids: &[&str]) -> Vec<Vec<u8>> {
     let mut queries = vec![
         encode_query(&GovQuery::Proposals),
-        encode_query(&GovQuery::Redemptions),
+        encode_query(&GovQuery::Redemption {
+            nonce: vec![7; INVITE_NONCE_LEN],
+        }),
+        encode_query(&GovQuery::Redemption {
+            nonce: vec![0; INVITE_NONCE_LEN],
+        }),
         encode_query(&GovQuery::Shares),
         encode_query(&GovQuery::Proposal {
             proposal_id: "absent".into(),
@@ -310,7 +341,12 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    assert_ne!(root_of(native), root_of(wasm));
+    // THE continuity property: both roots ARE the same store root.
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "the two runtimes diverged at {height}"
+    );
 }
 
 /// submit one REJECTED op to both hosts: reasons carry the same needle, and
@@ -365,26 +401,32 @@ async fn residents_of(h: &Host) -> Vec<Vec<u8>> {
 
 #[test]
 fn same_ops_same_replies_roots_in_lockstep_follow_ups_land() {
-    futures::executor::block_on(same_ops_inner());
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: &deterministic::Context) {
     let (a, b, c, joiner, joiner2) = (ed(1), ed(2), ed(3), ed(40), ed(41));
     let (a_pub, b_pub, c_pub) = (ed_pub(&a), ed_pub(&b), ed_pub(&c));
     let validators = vec![a_pub.clone(), b_pub.clone()];
     let ids = ["p-add-res", "p-sig", "p-upg", "p-code"];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
-    // the representation difference is visible from GENESIS, asymmetrically: the native
-    // empty module is the ZERO sentinel, the wasm root commits to the host-KV
-    // store already carrying the genesis config.
-    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
+    // ROOT-CONTINUITY from GENESIS: both roots are the store's merkle root,
+    // and the store already carries the seeded `__config` record — a real
+    // (non-sentinel) root, identical across the runtimes.
     assert_ne!(
         root_of(&native),
+        StateRoot::ZERO,
+        "the config record is in the root from block zero"
+    );
+    assert_eq!(
+        root_of(&native),
         root_of(&wasm),
-        "genesis roots must differ — the port uses a distinct root representation"
+        "genesis roots must be continuous across the runtimes"
     );
 
     // ---- the membership loop: proposal → ballots → tally → valset follow-up.
@@ -617,10 +659,12 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
+async fn rejections_inner(context: &deterministic::Context) {
     let (a, b) = (ed(1), ed(2));
     let (a_pub, b_pub) = (ed_pub(&a), ed_pub(&b));
     let d_pub = ed_pub(&ed(4));
@@ -629,8 +673,8 @@ async fn rejections_inner() {
     let validators = vec![a_pub.clone(), b_pub.clone()];
     let ids = ["p", "stale", "done"];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
     // seed three proposals: a long-lived Open one, one whose deadline will
     // lapse un-executed, and one settled at its deadline.
@@ -827,23 +871,25 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: &deterministic::Context) {
     let (a, b) = (ed(1), ed(2));
     let (a_pub, b_pub) = (ed_pub(&a), ed_pub(&b));
     let e_pub = ed_pub(&ed(5));
     let validators = vec![a_pub.clone(), b_pub.clone()];
     let ids = ["batch", "iso"];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
     // ONE block, FOUR ops: propose → two ballots → execute. every later
     // dispatch reads the earlier dispatches' STAGED writes (the ballots read
     // the staged proposal, the tally reads the staged ballots) — on the wasm
-    // side each dispatch reloads the prior dispatch's staged `__state` — and
+    // side through the host's outer staged store overlay — and
     // the passing tally emits the Grant follow-up from the FOURTH dispatch of
     // the same block.
     let (n_valset, w_valset) = (native.module_root("valset"), wasm.module_root("valset"));
@@ -919,18 +965,20 @@ async fn multi_dispatch_inner() {
 
 #[test]
 fn account_share_mode_resolves_identity_siblings_in_the_guest() {
-    futures::executor::block_on(share_mode_inner());
+    deterministic::Runner::default().start(|context| async move {
+        share_mode_inner(&context).await;
+    });
 }
 
-async fn share_mode_inner() {
+async fn share_mode_inner(context: &deterministic::Context) {
     let (a, b) = (ed(1), ed(2));
     let (a_pub, b_pub) = (ed_pub(&a), ed_pub(&b));
     let (founder_a, founder_b) = (ed(11), ed(12));
     let validators = vec![a_pub.clone(), b_pub.clone()];
     let ids = ["shares", "sig2"];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
     // seed the identity SIBLING: both validator nodes bind to accounts. these
     // blocks leave governance alone on both runtimes.
@@ -1106,30 +1154,35 @@ async fn share_mode_inner() {
 
 #[test]
 fn genesis_config_is_consensus_state_and_governs_the_guest() {
-    futures::executor::block_on(genesis_config_inner());
+    deterministic::Runner::default().start(|context| async move {
+        genesis_config_inner(&context).await;
+    });
 }
 
-async fn genesis_config_inner() {
-    // the config is IN the root: per-network genesis roots, honestly.
-    let here = wasm_governance_with_invite(INVITE);
-    let same = wasm_governance_with_invite(INVITE);
-    let other = wasm_governance_with_invite(b"other-net");
+async fn genesis_config_inner(context: &deterministic::Context) {
+    // the config record is IN the store root: per-network genesis roots,
+    // honestly.
+    let here = gov_store(context, "cfg_here", INVITE).await;
+    let same = gov_store(context, "cfg_same", INVITE).await;
+    let other = gov_store(context, "cfg_other", b"other-net").await;
     assert_eq!(here.root(), same.root(), "same config, same genesis root");
     assert_ne!(
         here.root(),
         other.root(),
         "a different invite binding IS a different genesis consensus state"
     );
+    drop((here, same));
 
     // and the config GOVERNS the guest: the same Redeem op (token minted for
     // INVITE) is accepted by the tenant configured with INVITE and
-    // deterministically refused by the tenant configured with another binding.
+    // deterministically refused by the tenant configured with another binding
+    // — the guest read its binding from the seeded store record alone.
     let (a, joiner) = (ed(1), ed(40));
     let validators = vec![ed_pub(&a)];
-    let mut wasm = wasm_host_(&validators);
+    let mut wasm = wasm_host_(context, &validators).await;
     let mut other_host = {
         let mut modules = siblings(&validators);
-        modules.push(Box::new(wasm_governance_with_invite(b"other-net")));
+        modules.push(Box::new(wasm_governance(Box::new(other))));
         Host::genesis(modules).expect("genesis")
     };
 

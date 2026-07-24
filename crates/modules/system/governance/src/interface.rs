@@ -181,8 +181,8 @@ pub struct SharesView {
     pub total: u64,
 }
 
-/// the readable projection of one settled invite redemption — the audit
-/// trail of who invited whom.
+/// the readable projection of one settled invite redemption — who invited
+/// whom, and when it landed.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RedemptionView {
     /// the redeemed token's nonce (the single-use key).
@@ -198,12 +198,15 @@ pub struct RedemptionView {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GovQuery {
-    /// every proposal, sorted by id.
+    /// every proposal, sorted by id (the roster-served enumeration — see the
+    /// module doc for why this listing stays canonical).
     Proposals,
     /// one proposal by id.
     Proposal { proposal_id: String },
-    /// every settled invite redemption, sorted by nonce.
-    Redemptions,
+    /// one settled invite redemption by token nonce — the point read the
+    /// node's join-lobby spent-invite pre-check (V6) consumes. redemptions
+    /// have no enumeration: the set is point records alone.
+    Redemption { nonce: Vec<u8> },
     /// the current share registry and whether it governs new proposals.
     Shares,
 }
@@ -213,7 +216,7 @@ pub enum GovQuery {
 pub enum GovReply {
     Proposals(Vec<ProposalView>),
     Proposal(Option<ProposalView>),
-    Redemptions(Vec<RedemptionView>),
+    Redemption(Option<RedemptionView>),
     Shares(SharesView),
 }
 

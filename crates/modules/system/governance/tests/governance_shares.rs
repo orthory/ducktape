@@ -18,6 +18,7 @@ use identity::{
     decode_query as identity_decode_query, encode_reply as identity_encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sdk_testkit::MemStore;
 use valset::Valset;
 
 fn key(seed: u8) -> Vec<u8> {
@@ -155,7 +156,12 @@ fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
     ]);
     let host = Host::genesis(vec![
         Box::new(valset),
-        Box::new(Governance::new("governance", "valset", "identity")),
+        Box::new(Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )),
         Box::new(identity),
     ])
     .expect("genesis");
@@ -469,43 +475,6 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             ProposalStatus::Rejected
         );
 
-        // The extension is root-hashed and survives state sync byte-for-byte.
-        let root = host.module_root("governance").expect("root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = host
-            .capture_finalized_snapshot(host::FinalizedBlock {
-                height: 26,
-                root_hash: host.root_hash(),
-            })
-            .expect("capture")
-            .module("governance")
-            .expect("governance")
-            .state_sync
-            .clone()
-        else {
-            panic!("snapshot bytes")
-        };
-        let mut rebuilt = Governance::new("governance", "valset", "identity");
-        rebuilt
-            .install(&bytes, root)
-            .expect("install shares snapshot");
-        assert_eq!(rebuilt.root(), root);
-        let mut missing_mode = bytes.clone();
-        missing_mode.pop();
-        assert!(
-            Governance::new("governance", "valset", "identity")
-                .install(&missing_mode, root)
-                .is_err(),
-            "a share snapshot must state its mode"
-        );
-        let reply = rebuilt
-            .query(&encode_query(&GovQuery::Shares))
-            .await
-            .expect("query rebuilt shares");
-        let GovReply::Shares(rebuilt_shares) = decode_reply(&reply).expect("decode") else {
-            panic!("shares")
-        };
-        assert_eq!(rebuilt_shares.total, 110);
-
         // The current share electorate can restore the default validator mode.
         submit(
             &mut host,
@@ -545,36 +514,6 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         let inactive = shares(&host).await;
         assert!(!inactive.active);
         assert_eq!(inactive.total, 110, "switching modes retains allocations");
-
-        // The explicit inactive-mode override is root-hashed and state-syncable.
-        let inactive_root = host.module_root("governance").expect("inactive root");
-        let sdk::StateSyncHandle::SnapshotBytes(inactive_bytes) = host
-            .capture_finalized_snapshot(host::FinalizedBlock {
-                height: 30,
-                root_hash: host.root_hash(),
-            })
-            .expect("capture inactive mode")
-            .module("governance")
-            .expect("governance")
-            .state_sync
-            .clone()
-        else {
-            panic!("snapshot bytes")
-        };
-        let mut inactive_rebuilt = Governance::new("governance", "valset", "identity");
-        inactive_rebuilt
-            .install(&inactive_bytes, inactive_root)
-            .expect("install inactive shares snapshot");
-        let reply = inactive_rebuilt
-            .query(&encode_query(&GovQuery::Shares))
-            .await
-            .expect("query inactive shares");
-        let GovReply::Shares(inactive_rebuilt_shares) = decode_reply(&reply).expect("decode")
-        else {
-            panic!("shares")
-        };
-        assert!(!inactive_rebuilt_shares.active);
-        assert_eq!(inactive_rebuilt_shares.total, 110);
 
         // In validator mode, the two nodes owned by A again count separately.
         submit(
@@ -964,7 +903,12 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
         }
         let mut host = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "identity")),
+            Box::new(Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )),
             Box::new(identity),
         ])
         .expect("genesis");

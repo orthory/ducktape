@@ -20,7 +20,8 @@ use lifecycle::{
     Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode,
     encode_msg as lifecycle_encode, encode_query as lifecycle_query,
 };
-use sdk::{Error, Module as _, Msg, Origin};
+use sdk::{Error, Msg, Origin};
+use sdk_testkit::MemStore;
 use valset::Valset;
 
 fn member_key(seed: u8) -> Vec<u8> {
@@ -45,7 +46,8 @@ async fn gov_host_with_modreg() -> Host {
     let mut host = Host::genesis(vec![
         Box::new(valset),
         Box::new(
-            Governance::new("governance", "valset", "identity").with_code_registry("lifecycle"),
+            Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
+                .with_code_registry("lifecycle"),
         ),
         Box::new(Lifecycle::new("lifecycle", "valset")),
     ])
@@ -321,7 +323,12 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         valset.insert(member_key(1));
         let mut unwired = Host::genesis(vec![
             Box::new(valset),
-            Box::new(Governance::new("governance", "valset", "identity")),
+            Box::new(Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )),
         ])
         .expect("genesis");
         let err = submit_as(
@@ -348,101 +355,6 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
     });
 }
 
-/// tags 7 (UpdateModule) and 8 (CancelModuleUpdate) round-trip through
-/// encode/decode_state — snapshot bytes reconstruct the exact action fields.
-#[test]
-fn snapshot_install_round_trips_module_update_proposals() {
-    block_on(async {
-        let mut host = gov_host_with_modreg().await;
-        let m1 = member_key(1);
-        for (id, action) in [
-            (
-                "mod-snap-update",
-                GovAction::UpdateModule {
-                    name: "hello-replacement".into(),
-                    module_id: "hello".into(),
-                    activation_height: 900,
-                    code_hash: hash(3),
-                },
-            ),
-            (
-                "mod-snap-cancel",
-                GovAction::CancelModuleUpdate {
-                    name: "hello-replacement".into(),
-                    module_id: "hello".into(),
-                },
-            ),
-        ] {
-            submit_as(
-                &mut host,
-                &m1,
-                1,
-                gov_encode(&GovMsg::Propose {
-                    proposal_id: id.into(),
-                    action,
-                    voting_period: 100,
-                }),
-            )
-            .await
-            .expect("propose");
-        }
-
-        let root = host.module_root("governance").expect("gov root");
-        let sdk::StateSyncHandle::SnapshotBytes(bytes) = ({
-            let finalized = host::FinalizedBlock {
-                height: 1,
-                root_hash: host.root_hash(),
-            };
-            host.capture_finalized_snapshot(finalized)
-                .expect("capture")
-                .module("governance")
-                .expect("gov entry")
-                .state_sync
-                .clone()
-        }) else {
-            panic!("governance must advertise snapshot bytes");
-        };
-
-        let mut rebuilt =
-            Governance::new("governance", "valset", "identity").with_code_registry("lifecycle");
-        rebuilt.install(&bytes, root).expect("install");
-        assert_eq!(
-            rebuilt.root(),
-            root,
-            "installed root equals the source root"
-        );
-
-        for (id, want) in [
-            (
-                "mod-snap-update",
-                GovAction::UpdateModule {
-                    name: "hello-replacement".into(),
-                    module_id: "hello".into(),
-                    activation_height: 900,
-                    code_hash: hash(3),
-                },
-            ),
-            (
-                "mod-snap-cancel",
-                GovAction::CancelModuleUpdate {
-                    name: "hello-replacement".into(),
-                    module_id: "hello".into(),
-                },
-            ),
-        ] {
-            let reply = rebuilt
-                .query(&gov_query(&GovQuery::Proposal {
-                    proposal_id: id.into(),
-                }))
-                .await
-                .expect("query");
-            let GovReply::Proposal(Some(view)) = gov_decode(&reply).expect("decode") else {
-                panic!("proposal {id} must be present after install");
-            };
-            assert_eq!(view.action, want);
-        }
-    });
-}
 
 /// the module lookup, admission flavor: any id, absent allowed.
 async fn module_code(host: &Host, id: &str) -> Option<lifecycle::ModuleCode> {

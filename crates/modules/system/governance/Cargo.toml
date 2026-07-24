@@ -7,8 +7,9 @@ version.workspace = true
 # deterministic tally at a consensus-time deadline. depends only on `sdk` plus
 # types-only interface crates (its own, valset's — membership checks go through
 # host-routed queries, execution through emitted follow-up msgs), per the
-# module-isolation rule. state is a canonical-bytes snapshot module (like
-# tasks): low-volume, fully replicated, root == sha256 of the encoded state.
+# module-isolation rule. state is pure logic over a host-injected qmdb
+# MerkleStore (StagedStore records); the module root IS the store's merkle
+# root.
 [features]
 # the wasm-guest port (src/guest.rs): the dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
@@ -29,7 +30,6 @@ lifecycle = { workspace = true }
 identity = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 # the invite capability (token + join-proof verification) is governance's own
 # admission surface: minted by a member, redeemed in-consensus by `Redeem`.
 commonware-cryptography = { workspace = true }
@@ -38,3 +38,7 @@ commonware-codec = { workspace = true }
 [dev-dependencies]
 host = { workspace = true }
 futures = { workspace = true }
+sdk-testkit = { workspace = true }
+# the sync round-trip proof drives a real qmdb source/joiner pair.
+statesync = { workspace = true }
+commonware-runtime = { workspace = true }
