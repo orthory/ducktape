@@ -387,12 +387,10 @@ impl CapabilityRegistry {
         };
         validate_class(&class).map_err(Error::Module)?;
         match self.class_owner(&class).await? {
-            Some(owner) if owner != module => {
-                return Err(Error::Module(format!(
-                    "class {class:?} is already claimed by module {owner:?} \
-                     (first claim wins)"
-                )));
-            }
+            Some(owner) if owner != module => Err(Error::Module(format!(
+                "class {class:?} is already claimed by module {owner:?} \
+                 (first claim wins)"
+            ))),
             // a re-claim by the owning module is an idempotent no-op: nothing
             // is staged, so the root cannot move.
             Some(_) => Ok(()),
