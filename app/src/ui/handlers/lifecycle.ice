@@ -326,6 +326,59 @@ on fs_failed(cause)
   fs_loading = false
   error = cause.message
 
+on fs_new_name_changed(next)
+  fs_new_name = next
+
+on fs_mkdir_submit
+  return if fs_loading || !connected || empty(trim(fs_new_name))
+  fs_loading = true
+  error = ""
+  run files_mkdir(connected_rpc, fs_child(fs_path, trim(fs_new_name))) -> fs_wrote _ | fs_write_failed _
+
+on fs_new_file_submit
+  return if fs_loading || !connected || empty(trim(fs_new_name))
+  fs_loading = true
+  error = ""
+  run files_write_text(connected_rpc, fs_child(fs_path, trim(fs_new_name)), "") -> fs_wrote _ | fs_write_failed _
+
+on fs_arm_delete(path)
+  fs_delete_target = path
+
+on fs_delete_submit
+  return if fs_loading || !connected || empty(fs_delete_target)
+  fs_loading = true
+  error = ""
+  run files_remove(connected_rpc, fs_delete_target) -> fs_wrote _ | fs_write_failed _
+
+on fs_begin_edit
+  return if fs_preview_binary || empty(fs_preview_path)
+  fs_editing = true
+  fs_editor = editor(fs_preview_text)
+
+on fs_cancel_edit
+  fs_editing = false
+
+on fs_save_edit
+  return if fs_loading || !connected || !fs_editing || empty(fs_preview_path)
+  fs_loading = true
+  fs_editing = false
+  fs_preview_text = editor_text(fs_editor)
+  error = ""
+  run files_write_text(connected_rpc, fs_preview_path, editor_text(fs_editor)) -> fs_wrote _ | fs_write_failed _
+
+on fs_wrote(_)
+  fs_new_name = ""
+  fs_delete_target = ""
+  fs_generation = fs_generation + 1
+  fs_loading = true
+  parallel
+    run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
+    run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
+
+on fs_write_failed(cause)
+  fs_loading = false
+  error = cause.message
+
 on refresh_explorer
   return if !connected || explorer_loading
   explorer_generation = explorer_generation + 1

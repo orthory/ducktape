@@ -74,6 +74,10 @@ extern crate::backend
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
   sync fs_parent(path:str) -> str
+  sync fs_child(path:str, name:str) -> str
+  files_mkdir(rpc:str, path:str) -> bool ! AppError
+  files_remove(rpc:str, path:str) -> bool ! AppError
+  files_write_text(rpc:str, path:str, text:str) -> bool ! AppError
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError

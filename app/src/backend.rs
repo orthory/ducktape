@@ -1134,6 +1134,118 @@ pub async fn files_history(
     })
 }
 
+/// The head snapshot id for commit CAS (empty when nothing is committed).
+async fn files_head(rpc: &RpcClient) -> Result<Option<String>, String> {
+    let refs = rpc.files_get("refs", &[]).await?;
+    Ok(refs["head"].as_str().map(str::to_string))
+}
+
+/// One files commit through the node's commit lane.
+async fn files_commit_one(
+    rpc: &RpcClient,
+    message: String,
+    change: serde_json::Value,
+) -> Result<(), String> {
+    let head = files_head(rpc).await?;
+    rpc.files_post(
+        "commit",
+        &serde_json::json!({
+            "base_snapshot": head,
+            "message": message,
+            "changes": [change],
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Create a directory.
+pub async fn files_mkdir(rpc: String, path: String) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        files_commit_one(
+            &rpc,
+            format!("mkdir {path}"),
+            serde_json::json!({ "mkdir": { "path": path } }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Remove a file or whole subtree.
+pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        files_commit_one(
+            &rpc,
+            format!("rm {path}"),
+            serde_json::json!({ "rm": { "path": path } }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Write a text file (create or replace) as inline content.
+pub async fn files_write_text(
+    rpc: String,
+    path: String,
+    text: String,
+) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        files_commit_one(
+            &rpc,
+            format!("write {path}"),
+            serde_json::json!({
+                "put": {
+                    "path": path,
+                    "exec": false,
+                    "meta": {},
+                    "content": { "inline": { "b64": base64_encode(text.as_bytes()) } },
+                }
+            }),
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut acc = 0u32;
+        for (i, byte) in chunk.iter().enumerate() {
+            acc |= u32::from(*byte) << (16 - 8 * i);
+        }
+        for i in 0..4 {
+            let live = i * 6 < chunk.len() * 8 + 6 && i <= chunk.len();
+            match live {
+                true => out.push(TABLE[((acc >> (18 - 6 * i)) & 0x3f) as usize] as char),
+                false => out.push('='),
+            }
+        }
+    }
+    out
+}
+
+/// A child path under the current directory.
+pub fn fs_child(path: String, name: String) -> String {
+    let name = name.trim().trim_matches('/');
+    if path.is_empty() {
+        return format!("/{name}");
+    }
+    format!("{path}/{name}")
+}
+
 /// Minimal base64 (standard alphabet, padded) — the files read lane's wire.
 fn base64_decode(input: &str) -> Option<Vec<u8>> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -4414,6 +4526,22 @@ mod tests {
     use iced::futures::StreamExt as _;
 
     use super::*;
+
+    #[test]
+    fn files_base64_round_trips() {
+        for sample in [
+            b"".as_slice(),
+            b"a".as_slice(),
+            b"ab".as_slice(),
+            b"abc".as_slice(),
+            b"hello duckfs \xf0\x9f\xa6\x86".as_slice(),
+        ] {
+            let encoded = base64_encode(sample);
+            assert_eq!(base64_decode(&encoded).as_deref(), Some(sample), "{encoded}");
+        }
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+    }
 
     #[test]
     fn signer_requires_the_encrypted_v1_key_format() {

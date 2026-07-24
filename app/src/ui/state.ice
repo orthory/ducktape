@@ -88,6 +88,10 @@ state
   fs_preview_binary = false
   fs_history:[FsSnapshot] = []
   fs_history_open = false
+  fs_new_name = ""
+  fs_delete_target = ""
+  fs_editor:editor = ""
+  fs_editing = false
   palette_open = false
   palette_draft = ""
   palette_key = ""

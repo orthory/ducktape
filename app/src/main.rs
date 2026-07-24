@@ -1336,7 +1336,13 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     #[test]
     fn block_comments_use_a_floating_side_panel() {
         let view = include_str!("ui/view.ice");
-        let pages = view.split_once("    pages:").unwrap().1;
+        let pages = view
+            .split_once("    pages:")
+            .unwrap()
+            .1
+            .split_once("    files:")
+            .unwrap()
+            .0;
         assert!(pages.contains("block_comments_open"));
         assert!(
             pages

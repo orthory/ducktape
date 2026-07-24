@@ -812,6 +812,21 @@ view
           text fs_path width=fill size=13.0 wrapping=none font=mono @text-fg
           if fs_loading
             text "Loading…" size=11.0 font=mono @text-muted
+          input "" #fs-new label="New entry name" <-> fs_new_name change=fs_new_name_changed hint="new name…" disabled=fs_loading width=140.0 padding=5.0 text-size=13.0 line-height=1.2
+            active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+            hovered bg=elevated border=fg/21
+            focused bg=elevated border=fg/45 border-w=1.0
+            disabled bg=surface/54 value=muted
+          button "+ Folder" disabled=(fs_loading || empty(trim(fs_new_name))) height=26.0 padding=5.0 -> fs_mkdir_submit
+            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+            hovered bg=fg/10 text=fg
+            pressed bg=fg/14
+            disabled bg=fg/3 text=muted
+          button "+ File" disabled=(fs_loading || empty(trim(fs_new_name))) height=26.0 padding=5.0 -> fs_new_file_submit
+            active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+            hovered bg=fg/10 text=fg
+            pressed bg=fg/14
+            disabled bg=fg/3 text=muted
           button "History" height=26.0 padding=5.0 -> fs_toggle_history
             active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
             hovered bg=fg/10 text=fg
@@ -835,14 +850,25 @@ view
                             hovered bg=primary/10 text=fg
                             pressed bg=primary/16
                         if entry.kind != "dir"
-                          button label="Preview file" width=fill padding=6.0 -> fs_open_file(entry.path)
-                            row width=fill height=fill spacing=8.0 align=center
-                              text "·" width=14.0 size=11.0 align-x=center @text-muted
-                              text entry.name width=fill size=13.0 wrapping=none @text-fg
-                              text entry.size size=11.0 wrapping=none font=mono @text-muted
-                            active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
-                            hovered bg=primary/10 text=fg
-                            pressed bg=primary/16
+                          row width=fill spacing=2.0 align=center
+                            button label="Preview file" width=fill padding=6.0 -> fs_open_file(entry.path)
+                              row width=fill height=fill spacing=8.0 align=center
+                                text "·" width=14.0 size=11.0 align-x=center @text-muted
+                                text entry.name width=fill size=13.0 wrapping=none @text-fg
+                                text entry.size size=11.0 wrapping=none font=mono @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
+                              hovered bg=primary/10 text=fg
+                              pressed bg=primary/16
+                            if entry.path == fs_delete_target
+                              button "rm!" label="Confirm delete" disabled=fs_loading width=34.0 height=22.0 padding=0.0 -> fs_delete_submit
+                                active bg=danger/16 text=fg border=danger/40 border-w=1.0 r=6.0
+                                hovered bg=danger/26 text=fg
+                                pressed bg=danger/34
+                            if entry.path != fs_delete_target
+                              button "×" label="Delete file" width=22.0 height=22.0 padding=0.0 -> fs_arm_delete(entry.path)
+                                active bg=transparent text=muted r=6.0
+                                hovered bg=danger/14 text=fg
+                                pressed bg=danger/22
           container width=fill height=fill padding=8.0 bg=surface border=fg/10 border-w=1.0 r=10.0
             stack width=fill height=fill
               if fs_history_open
@@ -863,16 +889,39 @@ view
               if !fs_history_open && empty(fs_preview_path)
                 EmptyState title="Select a file" detail="Text files preview here; History shows the commit window."
               if !fs_history_open && !empty(fs_preview_path)
-                scroll direction=vertical width=fill height=fill
-                  col width=fill spacing=6.0
-                    row width=fill spacing=8.0 align=center
-                      text fs_preview_path width=fill size=11.0 wrapping=none font=mono @text-muted
-                      if fs_preview_truncated
-                        text "first 64 KiB" size=11.0 wrapping=none font=mono @text-muted
-                    if fs_preview_binary
-                      text fs_preview_text size=13.0 font=mono @text-muted
-                    if !fs_preview_binary
-                      text fs_preview_text size=13.0 font=mono @text-fg
+                col width=fill height=fill spacing=6.0
+                  row width=fill spacing=8.0 align=center
+                    text fs_preview_path width=fill size=11.0 wrapping=none font=mono @text-muted
+                    if fs_preview_truncated
+                      text "first 64 KiB" size=11.0 wrapping=none font=mono @text-muted
+                    if !fs_preview_binary && !fs_editing && !fs_preview_truncated
+                      button "Edit" height=22.0 padding=4.0 -> fs_begin_edit
+                        active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
+                        hovered bg=fg/10 text=fg
+                        pressed bg=fg/14
+                    if fs_editing
+                      button "Cancel" height=22.0 padding=4.0 -> fs_cancel_edit
+                        active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
+                        hovered bg=fg/10 text=fg
+                        pressed bg=fg/14
+                    if fs_editing
+                      button "Save" disabled=fs_loading height=22.0 padding=4.0 -> fs_save_edit
+                        active bg=primary/16 text=fg border=primary/30 border-w=1.0 r=6.0
+                        hovered bg=primary/24 text=fg
+                        pressed bg=primary/30
+                  stack width=fill height=fill
+                    if fs_editing
+                      editor #fs-editor <-> fs_editor placeholder="File contents…" disabled=fs_loading min-height=200.0 size=13.0 line-height=1.3 padding=6.6 wrapping=word
+                        active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                        hovered bg=surface border=fg/21
+                        focused bg=surface border=fg/45 border-w=1.0
+                    if !fs_editing
+                      scroll direction=vertical width=fill height=fill
+                        col width=fill spacing=6.0
+                          if fs_preview_binary
+                            text fs_preview_text size=13.0 font=mono @text-muted
+                          if !fs_preview_binary
+                            text fs_preview_text size=13.0 font=mono @text-fg
     explorer:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

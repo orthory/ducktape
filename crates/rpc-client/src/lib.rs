@@ -266,6 +266,24 @@ impl Client {
         decode_json(response).await
     }
 
+    /// One POST against a `/v1/files/*` write lane with a JSON body — the
+    /// files browser's mutation transport (the node encodes + submits the
+    /// corresponding `FilesMsg`).
+    pub async fn files_post(
+        &self,
+        lane: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(self.url(&format!("v1/files/{lane}"))?)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
+        decode_json(response).await
+    }
+
     /// Submit an already-signed operation frame.
     pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<()> {
         let response = self
