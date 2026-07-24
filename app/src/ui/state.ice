@@ -78,6 +78,10 @@ state
   explorer_generation:i64 = 0
   explorer_loading = false
   explorer_selected:i64 = 0
+  members_rows:[MemberRow] = []
+  members_validators:i64 = 0
+  members_residents:i64 = 0
+  members_generation:i64 = 0
   fs_path = "/shared"
   fs_entries:[FsEntry] = []
   fs_generation:i64 = 0

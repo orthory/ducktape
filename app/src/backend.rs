@@ -1376,6 +1376,73 @@ pub fn fs_parent(path: String) -> String {
     }
 }
 
+/// One member of the network: a validator (quorum seat) or resident
+/// (mesh + statesync standing).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct MemberRow {
+    pub key: String,
+    pub label: String,
+    pub role: String,
+    pub is_this_node: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct MembersData {
+    pub generation: i64,
+    pub validators: i64,
+    pub residents: i64,
+    pub members: Vec<MemberRow>,
+}
+
+/// Load the valset directory: validators then residents, this node marked.
+pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let node_key = rpc.status().await?.public_key;
+        let mut members = Vec::new();
+        let mut counts = (0i64, 0i64);
+        for (query, role) in [("validators", "validator"), ("residents", "resident")] {
+            let reply: serde_json::Value = rpc
+                .query("valset", &serde_json::json!(query))
+                .await?;
+            let keys = reply[query].as_array().cloned().unwrap_or_default();
+            match role {
+                "validator" => counts.0 = count_i64(keys.len()),
+                _ => counts.1 = count_i64(keys.len()),
+            }
+            for key in keys {
+                let bytes: Vec<u8> = key
+                    .as_array()
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let hex = hex_encode(&bytes);
+                members.push(MemberRow {
+                    label: short_label(&hex),
+                    is_this_node: hex == node_key,
+                    role: role.into(),
+                    key: hex,
+                });
+            }
+        }
+        Ok(MembersData {
+            generation,
+            validators: counts.0,
+            residents: counts.1,
+            members,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -1392,6 +1459,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
         ("chat", "Chat", "#"),
         ("pages", "Pages", "▤"),
         ("files", "Files", "▣"),
+        ("members", "Members", "◎"),
         ("explorer", "Explorer", "⛓"),
     ]
     .into_iter()

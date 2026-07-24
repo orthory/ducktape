@@ -942,6 +942,30 @@ view
                             text fs_preview_text size=13.0 font=mono @text-muted
                           if !fs_preview_binary
                             text fs_preview_text size=13.0 font=mono @text-fg
+    members:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=10.0 align=center
+          text "Network members" size=14.0 font=display @text-fg
+          space width=fill
+          text members_validators size=13.0 wrapping=none font=mono @text-primary
+          text "validators" size=11.0 wrapping=none @text-muted
+          text members_residents size=13.0 wrapping=none font=mono @text-primary
+          text "residents" size=11.0 wrapping=none @text-muted
+        if empty(members_rows)
+          EmptyState title="No members yet" detail="Validators and residents appear as they join."
+        if !empty(members_rows)
+          scroll direction=vertical width=fill height=fill
+            col width=fill spacing=2.0
+              for member in members_rows
+                container width=fill padding=8.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  row width=fill spacing=10.0 align=center
+                    text member.label size=13.0 wrapping=none font=mono @text-fg
+                    text member.role size=11.0 wrapping=none font=mono @text-primary
+                    if member.is_this_node
+                      container height=18.0 padding-left=6.0 padding-right=6.0 align-y=center bg=primary/14 border=primary/30 border-w=1.0 r=9.0
+                        text "this node" size=11.0 wrapping=none @text-primary
+                    space width=fill
+                    text member.key size=11.0 wrapping=none font=mono @text-muted
     explorer:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

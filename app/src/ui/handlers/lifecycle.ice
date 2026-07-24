@@ -275,12 +275,23 @@ on select_shell_tab(next)
   return if shell_tab == "chat" || shell_tab == "pages"
   explorer_generation = explorer_generation + 1
   fs_generation = fs_generation + 1
+  members_generation = members_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
   parallel
     run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
+    run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
+
+on members_loaded(next)
+  return if next.generation != members_generation
+  members_rows = next.members
+  members_validators = next.validators
+  members_residents = next.residents
+
+on members_failed(cause)
+  return if cause.generation != members_generation
 
 on fs_open_dir(path)
   return if fs_loading || !connected

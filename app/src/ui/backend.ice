@@ -94,6 +94,9 @@ extern crate::backend
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   sync shell_nav(tab:str) -> [NavItem]
+  MemberRow(key:str, label:str, role:str, is_this_node:bool)
+  MembersData(generation:i64, validators:i64, residents:i64, members:[MemberRow])
+  load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
