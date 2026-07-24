@@ -74,8 +74,6 @@ pub(super) enum PageError {
     TooManyComments,
     /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
     TooManyThreads,
-    /// a ThreadsForTargets query named more than [`MAX_QUERY_TARGETS`] targets.
-    TooManyTargets,
 }
 
 impl core::fmt::Display for PageError {
@@ -110,7 +108,6 @@ impl core::fmt::Display for PageError {
             PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
-            PageError::TooManyTargets => "too many query targets",
         };
         f.write_str(s)
     }

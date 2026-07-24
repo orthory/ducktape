@@ -324,8 +324,9 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
         let reply = cluster.query(
             0,
             "chat",
-            &chat::encode_query(&ChatQuery::MessagesLatest {
+            &chat::encode_query(&ChatQuery::MessagesRange {
                 channel_id: "dispatch".into(),
+                from_seq: 1,
                 limit: 64,
             }),
         )?;

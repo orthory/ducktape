@@ -1,7 +1,7 @@
 use super::{
-    AuthorRef, BlockKind, Ctx, Error, MAX_QUERY_TARGETS, Module, ModuleId, Msg, PAGE_INDEX_KEY,
-    PageError, PageMeta, PageQuery, PageReply, Pages, ResolverSyncTarget, StateRoot,
-    StateSyncHandle, TagEvent, TaggingMsg, TargetThreads, decode_msg, decode_query, encode_reply,
+    AuthorRef, Ctx, Error, Module, ModuleId, Msg, PAGE_INDEX_KEY, PageQuery, PageReply, Pages,
+    ResolverSyncTarget, StateRoot, StateSyncHandle, TagEvent, TaggingMsg, decode_msg,
+    decode_query, encode_reply,
 };
 
 fn tag_author(author: &AuthorRef) -> tagging::Author {
@@ -127,44 +127,6 @@ impl Module for Pages {
                 };
                 Ok(encode_reply(&PageReply::Block(block)))
             }
-            PageQuery::ListPages => {
-                // id -> folder parent straight from the reserved index entry;
-                // titles read from the live roots so a rename shows without
-                // touching the index.
-                let index = self.load_index().await?;
-                let mut pages = Vec::with_capacity(index.len());
-                for (id, parent) in index {
-                    let root = self
-                        .load_block(&id)
-                        .await?
-                        .filter(|b| b.kind == BlockKind::Page)
-                        .ok_or_else(|| Error::Module(PageError::Corrupt.to_string()))?;
-                    pages.push(PageMeta {
-                        id,
-                        title: root.text,
-                        parent,
-                    });
-                }
-                Ok(encode_reply(&PageReply::PageList(pages)))
-            }
-            PageQuery::ThreadsForTargets { targets } => {
-                if targets.len() > MAX_QUERY_TARGETS {
-                    return Err(Error::Module(PageError::TooManyTargets.to_string()));
-                }
-                let err = |e: PageError| Error::Module(e.to_string());
-                let mut out = Vec::with_capacity(targets.len());
-                for target in targets {
-                    let ids = self.load_target_index(&target).await.map_err(err)?;
-                    let mut threads = Vec::new();
-                    for tid in ids {
-                        if let Some(view) = self.thread_view(&tid).await.map_err(err)? {
-                            threads.push(view);
-                        }
-                    }
-                    out.push(TargetThreads { target, threads });
-                }
-                Ok(encode_reply(&PageReply::CommentThreads(out)))
-            }
             PageQuery::CommentThread { thread_id } => {
                 let view = self
                     .thread_view(&thread_id)
@@ -178,6 +140,13 @@ impl Module for Pages {
                     .await
                     .map_err(|e| Error::Module(e.to_string()))?;
                 Ok(encode_reply(&PageReply::Comment(comment)))
+            }
+            PageQuery::TargetThreadCount { target } => {
+                let ids = self
+                    .load_target_index(&target)
+                    .await
+                    .map_err(|e| Error::Module(e.to_string()))?;
+                Ok(encode_reply(&PageReply::TargetThreadCount(ids.len() as u64)))
             }
         }
     }

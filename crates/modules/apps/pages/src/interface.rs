@@ -312,13 +312,6 @@ pub struct ThreadView {
     pub comments: Vec<Comment>,
 }
 
-/// the threads anchored to one target.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct TargetThreads {
-    pub target: String,
-    pub threads: Vec<ThreadView>,
-}
-
 pub fn encode_msg(m: &PageMsg) -> Vec<u8> {
     sdk::wire::encode(m)
 }
@@ -326,7 +319,11 @@ pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
     sdk::wire::decode(b)
 }
 
-/// read requests the pages module serves via `Module::query`.
+/// the DISPATCH read surface — the point reads other modules' `execute()`
+/// paths resolve through `Ctx::query` (runs' block/comment probes and page
+/// context assembly). UI-shaped enumeration (the page list, per-target
+/// thread panels, search) is served by pages' index guest on the derived
+/// tier instead.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageQuery {
@@ -338,13 +335,6 @@ pub enum PageQuery {
     /// and `parent`, so a resolver learns where the block lives, not just
     /// what it says.
     GetBlock { block_id: String },
-    /// enumerate every page, served from the module's reserved index entry
-    /// (sorted by id), with titles read from the live roots.
-    ListPages,
-    /// every thread anchored to any of `targets` (block or page ids), grouped
-    /// by target. a page render calls this once with all visible block ids +
-    /// the page id. `targets` beyond [`MAX_QUERY_TARGETS`] are rejected.
-    ThreadsForTargets { targets: Vec<String> },
     /// one thread with its live comments.
     CommentThread { thread_id: String },
     /// one comment by id, tombstones included — the existence probe a module
@@ -352,15 +342,11 @@ pub enum PageQuery {
     /// so a squatted id would otherwise reject the follow-up and abort its
     /// block). `None` == no comment record at that id.
     GetComment { comment_id: String },
-}
-
-/// one entry of [`PageReply::PageList`]: a page id and its current title.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct PageMeta {
-    pub id: String,
-    pub title: String,
-    /// the containing page id (folder parent), or `None` for a top-level page.
-    pub parent: Option<String>,
+    /// how many threads anchor to one target — the [`MAX_THREADS_PER_TARGET`]
+    /// cap probe a module staging `AddComment` follow-ups runs. a count off
+    /// the target's thread-index record, deliberately NOT the thread views
+    /// (those are the index guest's `threads_for_targets`).
+    TargetThreadCount { target: String },
 }
 
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
@@ -369,10 +355,9 @@ pub struct PageMeta {
 pub enum PageReply {
     Page(Option<Vec<Block>>),
     Block(Option<Block>),
-    PageList(Vec<PageMeta>),
-    CommentThreads(Vec<TargetThreads>),
     CommentThread(Option<ThreadView>),
     Comment(Option<Comment>),
+    TargetThreadCount(u64),
 }
 
 pub fn encode_query(q: &PageQuery) -> Vec<u8> {
@@ -421,11 +406,12 @@ mod interface_tests {
     }
 
     #[test]
-    fn page_meta_carries_parent() {
-        let meta = PageMeta { id: "p2".into(), title: "t".into(), parent: Some("p1".into()) };
-        let bytes = serde_json::to_vec(&meta).unwrap();
-        let back: PageMeta = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, meta);
+    fn target_thread_count_round_trips() {
+        // the cap-probe read a module staging AddComment follow-ups runs.
+        let q = PageQuery::TargetThreadCount { target: "b1".into() };
+        assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
+        let r = PageReply::TargetThreadCount(7);
+        assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);
     }
 
     #[test]

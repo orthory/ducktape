@@ -1,10 +1,12 @@
+//! write-path consensus rules of the inbox module. the module serves NO
+//! queries (the read surface — paged lists, unread counts — is the index
+//! guest's job, `src/index.rs`), so committed state is asserted through
+//! `Module::root()` and the canonical `snapshot()` bytes: the encoding IS the
+//! root preimage, so a hand-encoded expected image proves state byte-for-byte.
+
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use inbox::Inbox;
-use inbox::{
-    InboxMsg, InboxQuery, InboxReply, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS,
-    MAX_QUERY_LIMIT, Notification, decode_reply, encode_msg, encode_query,
-};
+use inbox::{Inbox, InboxMsg, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, encode_msg};
 use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sdk_testkit::TestCtx;
 
@@ -39,61 +41,6 @@ fn clear(member: &str, up_to_seq: u64) -> Msg {
     })
 }
 
-async fn list(inbox: &Inbox, member: &str, from_seq: u64, limit: u64) -> Vec<Notification> {
-    match decode_reply(
-        &inbox
-            .query(&encode_query(&InboxQuery::List {
-                member: member.into(),
-                from_seq,
-                limit,
-            }))
-            .await
-            .expect("query list"),
-    )
-    .expect("decode reply")
-    {
-        InboxReply::Items(items) => items,
-        other => panic!("expected Items, got {other:?}"),
-    }
-}
-
-async fn unread(inbox: &Inbox, member: &str) -> u64 {
-    match decode_reply(
-        &inbox
-            .query(&encode_query(&InboxQuery::Unread {
-                member: member.into(),
-            }))
-            .await
-            .expect("query unread"),
-    )
-    .expect("decode reply")
-    {
-        InboxReply::UnreadCount(count) => count,
-        other => panic!("expected UnreadCount, got {other:?}"),
-    }
-}
-
-async fn host_list(host: &Host, member: &str) -> Vec<Notification> {
-    match decode_reply(
-        &host
-            .query(
-                INBOX,
-                &encode_query(&InboxQuery::List {
-                    member: member.into(),
-                    from_seq: 0,
-                    limit: MAX_QUERY_LIMIT,
-                }),
-            )
-            .await
-            .expect("host query list"),
-    )
-    .expect("decode reply")
-    {
-        InboxReply::Items(items) => items,
-        other => panic!("expected Items, got {other:?}"),
-    }
-}
-
 // inbox's execute reads only env (origin + consensus_time); me/height are
 // cosmetic, so the shared TestCtx stands in behind two thin constructors.
 fn ctx(origin: Origin, consensus_time: u64) -> TestCtx {
@@ -107,6 +54,58 @@ fn ctx(origin: Origin, consensus_time: u64) -> TestCtx {
 
 fn sys(consensus_time: u64) -> TestCtx {
     ctx(Origin::System, consensus_time)
+}
+
+// ---- canonical snapshot bytes, hand-encoded ---------------------------------
+//
+// the module's canonical byte layout is BOTH the `root()` preimage and the
+// snapshot wire: member count, then per member (id, next_seq, item count,
+// items ascending by seq), length-prefixed strings and LE u64s throughout.
+// tests assert committed state by building these bytes and comparing them
+// against `snapshot()` (or the root they hash to).
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_str(out: &mut Vec<u8>, value: &str) {
+    push_u64(out, value.len() as u64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// one item as `(seq, kind, body, source, created_at, read)`.
+type ItemBytes<'a> = (u64, &'a str, &'a str, &'a str, u64, bool);
+
+fn push_member(out: &mut Vec<u8>, member: &str, next_seq: u64, items: &[ItemBytes]) {
+    push_str(out, member);
+    push_u64(out, next_seq);
+    push_u64(out, items.len() as u64);
+    for (seq, kind, body, source, created_at, read) in items {
+        push_u64(out, *seq);
+        push_str(out, kind);
+        push_str(out, body);
+        push_str(out, source);
+        push_u64(out, *created_at);
+        out.push(*read as u8);
+    }
+}
+
+/// the full canonical image for a committed state (members ascending by id —
+/// the caller lists them in that order, as the module's BTreeMap encodes them).
+fn snapshot_bytes(members: &[(&str, u64, &[ItemBytes])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, members.len() as u64);
+    for (member, next_seq, items) in members {
+        push_member(&mut out, member, *next_seq, items);
+    }
+    out
+}
+
+/// the root a canonical byte image hashes to: the encoding IS the root
+/// preimage.
+fn root_of_bytes(bytes: &[u8]) -> StateRoot {
+    use sha2::{Digest, Sha256};
+    StateRoot(Sha256::digest(bytes).into())
 }
 
 #[test]
@@ -128,18 +127,22 @@ fn deliver_assigns_per_member_sequence() {
             .expect("deliver b1");
         inbox.commit_block().await.expect("commit");
 
-        let alice = list(&inbox, "alice", 0, MAX_QUERY_LIMIT).await;
-        let seqs: Vec<u64> = alice.iter().map(|n| n.seq).collect();
-        assert_eq!(seqs, [1, 2], "per-member seq is monotonic from 1");
-        assert_eq!(alice[0].member, "alice");
-        assert_eq!(alice[0].kind, "mention");
-        assert_eq!(alice[0].body, "hi");
-        assert_eq!(alice[0].created_at, 10);
-        assert!(!alice[0].read, "new items are unread");
-
-        let bob = list(&inbox, "bob", 0, MAX_QUERY_LIMIT).await;
-        assert_eq!(bob.len(), 1, "bob's queue is independent");
-        assert_eq!(bob[0].seq, 1, "bob's seq starts fresh at 1");
+        // per-member seqs are monotonic from 1 and the queues independent
+        // (bob restarts at 1); created_at is the block's consensus time and
+        // new items are unread — all pinned byte-for-byte in the canonical
+        // committed image.
+        let expected = snapshot_bytes(&[
+            (
+                "alice",
+                3,
+                &[
+                    (1, "mention", "hi", "system", 10, false),
+                    (2, "reply", "yo", "system", 11, false),
+                ],
+            ),
+            ("bob", 2, &[(1, "mention", "sup", "system", 12, false)]),
+        ]);
+        assert_eq!(inbox.snapshot(), expected);
     });
 }
 
@@ -175,15 +178,21 @@ fn source_is_derived_from_origin() {
             .expect("empty-external deliver");
         inbox.commit_block().await.expect("commit");
 
-        let items = list(&inbox, "m", 0, MAX_QUERY_LIMIT).await;
-        let sources: Vec<&str> = items.iter().map(|n| n.source.as_str()).collect();
-        assert_eq!(
-            sources,
-            ["chat", "ext:deadbeef", "system", "ext:"],
-            "source = module id verbatim / \"ext:\"+hex of external bytes / \
-             \"system\" — the ext: prefix domain-separates external keys from \
-             pure-hex module ids; never caller-supplied"
-        );
+        // source = module id verbatim / "ext:"+hex of external bytes /
+        // "system" — the ext: prefix domain-separates external keys from
+        // pure-hex module ids; never caller-supplied. all four land in the
+        // committed image.
+        let expected = snapshot_bytes(&[(
+            "m",
+            5,
+            &[
+                (1, "k", "from module", "chat", 1, false),
+                (2, "k", "from external", "ext:deadbeef", 2, false),
+                (3, "k", "from system", "system", 3, false),
+                (4, "k", "from anonymous external", "ext:", 4, false),
+            ],
+        )]);
+        assert_eq!(inbox.snapshot(), expected);
     });
 }
 
@@ -223,9 +232,10 @@ fn caps_reject_oversized_and_leave_root_unchanged() {
             root0,
             "rejected deliveries never enter the root preimage"
         );
-        assert!(
-            list(&inbox, "alice", 0, MAX_QUERY_LIMIT).await.is_empty(),
-            "nothing was staged"
+        assert_eq!(
+            inbox.snapshot(),
+            snapshot_bytes(&[]),
+            "nothing was staged: committed state is byte-empty"
         );
     });
 }
@@ -234,8 +244,9 @@ fn caps_reject_oversized_and_leave_root_unchanged() {
 fn queue_overflow_drops_oldest_item() {
     block_on(async {
         let mut inbox = Inbox::new(INBOX);
+        let cap = MAX_ITEMS_PER_MEMBER as u64;
         // one over the per-member cap, all in a single block.
-        for i in 0..(MAX_ITEMS_PER_MEMBER as u64 + 1) {
+        for i in 0..=cap {
             inbox
                 .execute(&mut sys(i), &deliver("alice", "k", "b"))
                 .await
@@ -243,30 +254,15 @@ fn queue_overflow_drops_oldest_item() {
         }
         inbox.commit_block().await.expect("commit");
 
-        assert_eq!(
-            unread(&inbox, "alice").await,
-            MAX_ITEMS_PER_MEMBER as u64,
-            "queue holds exactly the cap"
-        );
-        // seq 1 (the oldest) was dropped; the window is 2..=MAX_ITEMS_PER_MEMBER+1.
-        let first_page = list(&inbox, "alice", 0, 1).await;
-        assert_eq!(
-            first_page[0].seq, 2,
-            "oldest surviving item is seq 2 — seq 1 was dropped deterministically"
-        );
-        let tail = list(
-            &inbox,
-            "alice",
-            MAX_ITEMS_PER_MEMBER as u64 + 1,
-            MAX_QUERY_LIMIT,
-        )
-        .await;
-        assert_eq!(tail.len(), 1);
-        assert_eq!(
-            tail[0].seq,
-            MAX_ITEMS_PER_MEMBER as u64 + 1,
-            "the newest item survives"
-        );
+        // seq 1 (the oldest) was dropped deterministically: the committed
+        // window is exactly 2..=cap+1 (the queue holds the cap), and next_seq
+        // kept counting past the drop. item seq s was delivered at consensus
+        // time s-1.
+        let survivors: Vec<ItemBytes> = (2..=cap + 1)
+            .map(|seq| (seq, "k", "b", "system", seq - 1, false))
+            .collect();
+        let expected = snapshot_bytes(&[("alice", cap + 2, &survivors)]);
+        assert_eq!(inbox.snapshot(), expected);
     });
 }
 
@@ -309,23 +305,35 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
                 .expect("deliver");
         }
         inbox.commit_block().await.expect("commit deliveries");
-        assert_eq!(unread(&inbox, "alice").await, 3);
 
-        // MarkRead up to seq 2, twice — idempotent.
+        // MarkRead up to seq 2 flips exactly seqs 1 and 2 in committed state.
         inbox
             .execute(&mut sys(2), &mark_read("alice", 2))
             .await
             .expect("mark read");
+        inbox.commit_block().await.expect("commit mark read");
+        let read_two = snapshot_bytes(&[(
+            "alice",
+            4,
+            &[
+                (1, "k", "b", "system", 1, true),
+                (2, "k", "b", "system", 1, true),
+                (3, "k", "b", "system", 1, false),
+            ],
+        )]);
+        assert_eq!(inbox.snapshot(), read_two, "only seqs 1,2 are read");
+        let root_after_ack = inbox.root();
+
+        // idempotent re-ack: the same MarkRead commits byte-identical state.
         inbox
             .execute(&mut sys(2), &mark_read("alice", 2))
             .await
             .expect("mark read again");
-        inbox.commit_block().await.expect("commit mark read");
-        assert_eq!(unread(&inbox, "alice").await, 1, "only seq 3 stays unread");
+        inbox.commit_block().await.expect("commit re-ack");
+        assert_eq!(inbox.root(), root_after_ack, "re-ack is idempotent");
 
         // no-op tolerance: unknown member / seq must not error and must not
         // move the root.
-        let root_before = inbox.root();
         inbox
             .execute(&mut sys(3), &mark_read("nobody", 99))
             .await
@@ -337,7 +345,7 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         inbox.commit_block().await.expect("commit no-ops");
         assert_eq!(
             inbox.root(),
-            root_before,
+            root_after_ack,
             "no-op acks never change committed state"
         );
 
@@ -348,52 +356,23 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
             .await
             .expect("clear up to 2");
         inbox
-            .execute(
-                &mut sys(5),
-                &deliver("alice", "k", "after clear"),
-            )
+            .execute(&mut sys(5), &deliver("alice", "k", "after clear"))
             .await
             .expect("deliver after clear");
         inbox.commit_block().await.expect("commit clear+deliver");
-
-        let items = list(&inbox, "alice", 0, MAX_QUERY_LIMIT).await;
-        let seqs: Vec<u64> = items.iter().map(|n| n.seq).collect();
-        assert_eq!(seqs, [3, 4], "seq 1,2 cleared; next_seq did not rewind");
-    });
-}
-
-#[test]
-fn list_pagination_and_unread_count() {
-    block_on(async {
-        let mut inbox = Inbox::new(INBOX);
-        for i in 0..10 {
-            inbox
-                .execute(&mut sys(i), &deliver("alice", "k", "b"))
-                .await
-                .expect("deliver");
-        }
-        inbox.commit_block().await.expect("commit");
-
-        // from_seq is inclusive, ascending.
-        let page = list(&inbox, "alice", 4, 3).await;
-        let seqs: Vec<u64> = page.iter().map(|n| n.seq).collect();
+        let expected = snapshot_bytes(&[(
+            "alice",
+            5,
+            &[
+                (3, "k", "b", "system", 1, false),
+                (4, "k", "after clear", "system", 5, false),
+            ],
+        )]);
         assert_eq!(
-            seqs,
-            [4, 5, 6],
-            "page starts at from_seq, ascending, limited"
+            inbox.snapshot(),
+            expected,
+            "seq 1,2 cleared; the new delivery took seq 4 — next_seq did not rewind"
         );
-
-        // limit is clamped to MAX_QUERY_LIMIT.
-        let all = list(&inbox, "alice", 0, MAX_QUERY_LIMIT + 1000).await;
-        assert_eq!(all.len(), 10, "all ten items, limit clamped");
-
-        assert_eq!(unread(&inbox, "alice").await, 10);
-        inbox
-            .execute(&mut sys(11), &mark_read("alice", 7))
-            .await
-            .expect("mark read");
-        inbox.commit_block().await.expect("commit");
-        assert_eq!(unread(&inbox, "alice").await, 3, "seq 8,9,10 remain unread");
     });
 }
 
@@ -402,6 +381,7 @@ fn root_moves_only_on_commit_and_abort_is_byte_identical() {
     block_on(async {
         let mut inbox = Inbox::new(INBOX);
         let root0 = inbox.root();
+        let empty = inbox.snapshot();
 
         inbox
             .execute(&mut sys(1), &deliver("alice", "k", "b"))
@@ -409,14 +389,15 @@ fn root_moves_only_on_commit_and_abort_is_byte_identical() {
             .expect("stage deliver");
         assert_eq!(inbox.root(), root0, "staged writes do not move the root");
         assert_eq!(
-            list(&inbox, "alice", 0, MAX_QUERY_LIMIT).await.len(),
-            1,
-            "queries read through the staged overlay"
+            inbox.snapshot(),
+            empty,
+            "snapshot is committed-state only — the stage is invisible"
         );
 
         inbox.commit_block().await.expect("commit");
         let root1 = inbox.root();
         assert_ne!(root1, root0, "commit moves the root");
+        let committed = inbox.snapshot();
 
         inbox
             .execute(&mut sys(2), &deliver("alice", "k", "b2"))
@@ -430,9 +411,9 @@ fn root_moves_only_on_commit_and_abort_is_byte_identical() {
             "abort leaves the root byte-identical to pre-block"
         );
         assert_eq!(
-            list(&inbox, "alice", 0, MAX_QUERY_LIMIT).await.len(),
-            1,
-            "aborted delivery is gone"
+            inbox.snapshot(),
+            committed,
+            "the aborted delivery left no byte behind"
         );
     });
 }
@@ -480,12 +461,9 @@ fn snapshot_install_round_trips() {
         target.install(&bytes, source.root()).expect("install");
         assert_eq!(target.root(), source.root());
         assert_eq!(
-            list(&target, "alice", 0, MAX_QUERY_LIMIT).await,
-            list(&source, "alice", 0, MAX_QUERY_LIMIT).await
-        );
-        assert_eq!(
-            list(&target, "bob", 0, MAX_QUERY_LIMIT).await,
-            list(&source, "bob", 0, MAX_QUERY_LIMIT).await
+            target.snapshot(),
+            bytes,
+            "install round-trips the canonical bytes verbatim"
         );
 
         // a wrong expected root is rejected before adopting.
@@ -499,17 +477,30 @@ fn snapshot_install_round_trips() {
             "state untouched on rejected install"
         );
 
-        // next delivery to the cleared member resumes at the preserved next_seq.
+        // next delivery to the cleared member resumes at the preserved
+        // next_seq: the full committed image after it pins alice's carried
+        // read flag AND bob's new item landing at seq 2, not a reused seq 1.
         target
-            .execute(
-                &mut sys(10),
-                &deliver("bob", "k", "after clear"),
-            )
+            .execute(&mut sys(10), &deliver("bob", "k", "after clear"))
             .await
             .expect("deliver");
         target.commit_block().await.expect("commit");
-        let bob = list(&target, "bob", 0, MAX_QUERY_LIMIT).await;
-        assert_eq!(bob[0].seq, 2, "next_seq survived the clear across snapshot");
+        let expected = snapshot_bytes(&[
+            (
+                "alice",
+                3,
+                &[
+                    (1, "mention", "hi", "chat", 5, true),
+                    (2, "k", "second", "system", 6, false),
+                ],
+            ),
+            ("bob", 3, &[(2, "k", "after clear", "system", 10, false)]),
+        ]);
+        assert_eq!(
+            target.snapshot(),
+            expected,
+            "next_seq survived the clear across the snapshot"
+        );
     });
 }
 
@@ -558,16 +549,16 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
             .expect("submit producer op");
         assert_ne!(out.root_hash, app0, "the atomic delivery moves the root-hash");
 
-        let items = host_list(&host, "alice").await;
-        assert_eq!(items.len(), 1, "the follow-up delivered in the same block");
-        assert_eq!(
-            items[0].source, "producer",
-            "source is the EMITTING module's origin, not the external submitter"
-        );
-        assert_eq!(
-            items[0].created_at, 42,
-            "created_at is the block's consensus time"
-        );
+        // the committed inbox root IS the hash of the canonical bytes, so
+        // equality against this hand-encoded image proves the follow-up
+        // delivered in THIS block, with the EMITTING module as source (not
+        // the external submitter) and the block's consensus time.
+        let expected = snapshot_bytes(&[(
+            "alice",
+            2,
+            &[(1, "event", "produced", "producer", 42, false)],
+        )]);
+        assert_eq!(host.module_root(INBOX), Some(root_of_bytes(&expected)));
     });
 }
 
@@ -614,55 +605,30 @@ fn noop_ack_follow_up_does_not_abort_the_block() {
         .await
         .expect("no-op ack must not fail the block");
 
-        let items = host_list(&host, "alice").await;
-        assert_eq!(items.len(), 1, "the delivery still committed");
+        // the delivery still committed — and the ghost ack left no trace in
+        // the committed image (no "ghost" member section).
+        let expected = snapshot_bytes(&[(
+            "alice",
+            2,
+            &[(1, "event", "produced", "producer-ack", 7, false)],
+        )]);
+        assert_eq!(host.module_root(INBOX), Some(root_of_bytes(&expected)));
     });
 }
 
 // ---- crafted snapshots: decode hardening + the seq-exhaustion boundary ------
 //
-// these tests hand-encode the module's canonical byte layout (the exact root
-// preimage): member count, then per member (id, next_seq, item count, items
-// ascending by seq), length-prefixed strings and LE u64s throughout.
+// these tests hand-encode the module's canonical byte layout via the same
+// helpers the committed-image assertions use.
 
-fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_str(out: &mut Vec<u8>, value: &str) {
-    push_u64(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
-}
-
-fn push_item(out: &mut Vec<u8>, seq: u64, kind: &str, body: &str, source: &str) {
-    push_u64(out, seq);
-    push_str(out, kind);
-    push_str(out, body);
-    push_str(out, source);
-    push_u64(out, 0); // created_at
-    out.push(0); // read = false
-}
-
-/// one member with the given counter and items — a minimal crafted snapshot.
+/// one member with the given counter and items — a minimal crafted snapshot
+/// (source "system", created_at 0, unread).
 fn snapshot_of_member(member: &str, next_seq: u64, items: &[(u64, &str, &str)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_u64(&mut out, 1); // member count
-    push_str(&mut out, member);
-    push_u64(&mut out, next_seq);
-    push_u64(&mut out, items.len() as u64);
-    for (seq, kind, body) in items {
-        push_item(&mut out, *seq, kind, body, "system");
-    }
-    out
-}
-
-/// the root a valid crafted snapshot must install against: the encoding IS the
-/// root preimage.
-fn root_of_bytes(bytes: &[u8]) -> StateRoot {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    StateRoot(h.finalize().into())
+    let items: Vec<ItemBytes> = items
+        .iter()
+        .map(|(seq, kind, body)| (*seq, *kind, *body, "system", 0, false))
+        .collect();
+    snapshot_bytes(&[(member, next_seq, &items)])
 }
 
 #[test]
@@ -720,10 +686,7 @@ fn seq_exhaustion_rejects_deterministically() {
         // ...but the NEXT delivery to that member has no seq left: reject
         // deterministically, before any mutation — never panic or wrap.
         let err = inbox
-            .execute(
-                &mut sys(1),
-                &deliver("alice", "k", "one too many"),
-            )
+            .execute(&mut sys(1), &deliver("alice", "k", "one too many"))
             .await
             .expect_err("seq space exhaustion must reject");
         assert!(
@@ -733,10 +696,7 @@ fn seq_exhaustion_rejects_deterministically() {
 
         // other members are unaffected, and the rejection left no trace.
         inbox
-            .execute(
-                &mut sys(1),
-                &deliver("bob", "k", "fresh member"),
-            )
+            .execute(&mut sys(1), &deliver("bob", "k", "fresh member"))
             .await
             .expect("an unexhausted member still accepts deliveries");
         inbox.abort_block().await.expect("abort");

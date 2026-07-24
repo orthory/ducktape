@@ -35,6 +35,18 @@
 mod interface;
 pub use interface::*;
 
+// the derived-tier read model: the PURE decision core (fold + view over
+// index_guest::StateRead), compiled everywhere and unit-tested natively.
+// the engine shell that runs it inside the module's index database is
+// `index_guest` below.
+pub mod index;
+
+// the wasm index-mapper shell: wires the pure core into the fluent31 engine.
+// compiled only by `guest-builder --index`'s synthesized wasm32 workspace
+// (feature `index-guest`), never by the native build.
+#[cfg(feature = "index-guest")]
+mod index_guest;
+
 use std::collections::BTreeMap;
 
 use sdk::codec::{self, Cursor};
@@ -222,25 +234,6 @@ impl Inbox {
         // next_seq is intentionally left untouched: it never rewinds.
     }
 
-    fn list(&self, member: &str, from_seq: u64, limit: u64) -> Vec<Notification> {
-        let limit = limit.min(MAX_QUERY_LIMIT) as usize;
-        match self.effective(member) {
-            Some(queue) => queue
-                .items
-                .range(from_seq..)
-                .take(limit)
-                .map(|(_, item)| item.clone())
-                .collect(),
-            None => Vec::new(),
-        }
-    }
-
-    fn unread(&self, member: &str) -> u64 {
-        self.effective(member)
-            .map(|queue| queue.items.values().filter(|item| !item.read).count() as u64)
-            .unwrap_or(0)
-    }
-
     fn root_of(members: &BTreeMap<String, MemberQueue>) -> StateRoot {
         let mut h = Sha256::new();
         h.update(Self::encode(members));
@@ -405,20 +398,10 @@ impl Module for Inbox {
         }
     }
 
-    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        match decode_query(req).map_err(Error::Module)? {
-            InboxQuery::List {
-                member,
-                from_seq,
-                limit,
-            } => Ok(encode_reply(&InboxReply::Items(
-                self.list(&member, from_seq, limit),
-            ))),
-            InboxQuery::Unread { member } => {
-                Ok(encode_reply(&InboxReply::UnreadCount(self.unread(&member))))
-            }
-        }
-    }
+    // NO `query`: nothing in any execute() path reads an inbox, so the whole
+    // read surface (paged lists, unread counts) is the index guest's job
+    // (`index.rs`) on the derived tier. the default `Error::QueryUnsupported`
+    // is the honest answer here.
 
     async fn commit_block(&mut self) -> Result<(), Error> {
         for (member, queue) in std::mem::take(&mut self.pending) {

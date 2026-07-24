@@ -1,7 +1,9 @@
 //! the job board under test (via the merged `tasks` work module): the full
-//! lifecycle, every race/guard rejection, caps, lease clamping, queries,
-//! origin-derived identity, snapshot/install, and commit/abort staging — plus
-//! real-`Host` proofs that first-claim-wins under the host's ordered dispatch.
+//! lifecycle, every race/guard rejection, caps, lease clamping, the `Get`
+//! point read, origin-derived identity, snapshot/install, and commit/abort
+//! staging — plus real-`Host` proofs that first-claim-wins under the host's
+//! ordered dispatch. board ENUMERATION (status/kind listings, the census) is
+//! the index tier's job now, covered by the native tests in `src/index.rs`.
 //!
 //! the board lives inside the `tasks` module now, so ops ride the `WorkMsg`
 //! envelope (`encode_job_*`) and the combined snapshot carries an empty
@@ -9,18 +11,15 @@
 
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
+use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk_testkit::TestCtx;
 use tasks::{
-    Tasks as Jobs, MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_LIST_LIMIT, MAX_PAYLOAD, MAX_SPEC,
-    MAX_WORKERS,
-};
-use tasks::{
-    BoardCounts, Job, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
+    Job, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply,
     decode_job_event as decode_jobs_event, decode_job_reply as decode_reply,
     encode_job_event as encode_jobs_event, encode_job_msg as encode_msg,
     encode_job_query as encode_query,
 };
-use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
-use sdk_testkit::TestCtx;
+use tasks::{MAX_ATTEMPTS, MAX_JOBS, MAX_KIND, MAX_PAYLOAD, MAX_SPEC, MAX_WORKERS, Tasks as Jobs};
 
 // the merged work module's genesis id -- the job board now lives here.
 const JOBS: &str = "tasks";
@@ -146,7 +145,7 @@ async fn stage_with_modules(
 }
 
 async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {
-    match decode_reply(
+    let JobsReply::Job(job) = decode_reply(
         &jobs
             .query(&encode_query(&JobsQuery::Get {
                 job_id: job_id.into(),
@@ -154,43 +153,8 @@ async fn get(jobs: &Jobs, job_id: &str) -> Option<Job> {
             .await
             .expect("query get"),
     )
-    .expect("decode")
-    {
-        JobsReply::Job(job) => job,
-        other => panic!("expected Job, got {other:?}"),
-    }
-}
-
-async fn list(jobs: &Jobs, status: Option<JobStatus>, kind_prefix: &str, limit: u64) -> Vec<Job> {
-    match decode_reply(
-        &jobs
-            .query(&encode_query(&JobsQuery::List {
-                status,
-                kind_prefix: kind_prefix.into(),
-                limit,
-            }))
-            .await
-            .expect("query list"),
-    )
-    .expect("decode")
-    {
-        JobsReply::Jobs(jobs) => jobs,
-        other => panic!("expected Jobs, got {other:?}"),
-    }
-}
-
-async fn counts(jobs: &Jobs) -> BoardCounts {
-    match decode_reply(
-        &jobs
-            .query(&encode_query(&JobsQuery::Counts {}))
-            .await
-            .expect("query counts"),
-    )
-    .expect("decode")
-    {
-        JobsReply::Counts(counts) => counts,
-        other => panic!("expected Counts, got {other:?}"),
-    }
+    .expect("decode");
+    job
 }
 
 // ============================================================================
@@ -594,7 +558,6 @@ fn prune_only_terminal_and_by_submitter_removes_record() {
         let before = jobs.root();
         apply(&mut jobs, 5, ext("submitter"), prune("j1")).await;
         assert!(get(&jobs, "j1").await.is_none(), "record removed");
-        assert!(list(&jobs, None, "", 256).await.is_empty(), "board empty");
         assert_ne!(jobs.root(), before, "prune moves the committed root");
     });
 }
@@ -731,7 +694,7 @@ fn lease_views_are_clamped() {
 // ============================================================================
 
 #[test]
-fn queries_get_list_filters_and_counts() {
+fn queries_get_hit_and_miss() {
     block_on(async {
         let mut jobs = Jobs::new(JOBS);
         apply(
@@ -745,78 +708,24 @@ fn queries_get_list_filters_and_counts() {
             &mut jobs,
             1,
             ext("submitter"),
-            submit("alpha-2", "email", ""),
-        )
-        .await;
-        apply(
-            &mut jobs,
-            1,
-            ext("submitter"),
             submit("beta-1", "report", ""),
         )
         .await;
         apply(&mut jobs, 2, ext("worker-a"), claim("alpha-1", 100)).await;
 
-        // Get hit + miss.
-        assert!(get(&jobs, "alpha-1").await.is_some());
+        // Get is the whole kept dispatch surface: a hit answers the live
+        // record per id, a miss answers None. board enumeration (status/kind
+        // listings, the census) is index-tier — the index test
+        // `job_lifecycle_moves_partitions_and_census`.
+        assert_eq!(
+            get(&jobs, "alpha-1").await.unwrap().status,
+            JobStatus::Processing
+        );
+        assert_eq!(
+            get(&jobs, "beta-1").await.unwrap().status,
+            JobStatus::Pending
+        );
         assert!(get(&jobs, "nope").await.is_none());
-
-        // status filter.
-        let pending = list(&jobs, Some(JobStatus::Pending), "", 256).await;
-        let ids: Vec<&str> = pending.iter().map(|j| j.job_id.as_str()).collect();
-        assert_eq!(ids, ["alpha-2", "beta-1"], "ascending, pending only");
-
-        // kind-prefix filter.
-        let emails = list(&jobs, None, "email", 256).await;
-        let ids: Vec<&str> = emails.iter().map(|j| j.job_id.as_str()).collect();
-        assert_eq!(ids, ["alpha-1", "alpha-2"]);
-
-        // combined filter (status Processing AND kind starts with "em").
-        let processing = list(&jobs, Some(JobStatus::Processing), "em", 256).await;
-        assert_eq!(processing.len(), 1);
-        assert_eq!(processing[0].job_id, "alpha-1");
-
-        // counts.
-        let c = counts(&jobs).await;
-        assert_eq!(
-            c,
-            BoardCounts {
-                pending: 2,
-                processing: 1,
-                done: 0,
-                failed: 0,
-                cancelled: 0,
-            }
-        );
-    });
-}
-
-#[test]
-fn list_limit_is_clamped_to_256() {
-    block_on(async {
-        let mut jobs = Jobs::new(JOBS);
-        // stage 300 jobs in one block, then commit — queries only see
-        // committed state.
-        for i in 0..300u32 {
-            stage(
-                &mut jobs,
-                1,
-                ext("submitter"),
-                submit(&format!("job-{i:03}"), "k", ""),
-            )
-            .await
-            .expect("stage");
-        }
-        jobs.commit_block().await.expect("commit");
-        let listed = list(&jobs, None, "", MAX_LIST_LIMIT * 100).await;
-        assert_eq!(
-            listed.len(),
-            MAX_LIST_LIMIT as usize,
-            "limit clamped to 256"
-        );
-        // the clamp keeps the first 256 in ascending id order.
-        assert_eq!(listed.first().unwrap().job_id, "job-000");
-        assert_eq!(listed.last().unwrap().job_id, "job-255");
     });
 }
 
@@ -937,11 +846,20 @@ fn snapshot_install_round_trip_and_root_stability() {
             .install(&bytes, expected)
             .expect("install verified snapshot");
         assert_eq!(target.root(), expected);
-        assert_eq!(
-            list(&target, None, "", 256).await,
-            list(&source, None, "", 256).await,
-            "every job survives the round trip"
-        );
+        for id in [
+            "a-pending",
+            "b-processing",
+            "c-done",
+            "d-failed",
+            "e-cancelled",
+        ] {
+            let job = get(&source, id).await.expect("source job exists");
+            assert_eq!(
+                get(&target, id).await.as_ref(),
+                Some(&job),
+                "every job survives the round trip"
+            );
+        }
 
         // the advertised state-sync handle carries those exact bytes.
         match source.state_sync_handle().expect("handle") {
@@ -1177,29 +1095,24 @@ fn queries_answer_committed_state_only() {
     block_on(async {
         let mut jobs = Jobs::new(JOBS);
 
-        // a staged-but-uncommitted submit is invisible to every projection.
+        // a staged-but-uncommitted submit is invisible to the read surface.
         stage(&mut jobs, 1, ext("submitter"), submit("j1", "k", ""))
             .await
             .expect("stage submit");
         assert!(get(&jobs, "j1").await.is_none(), "Get is blind to staging");
-        assert!(
-            list(&jobs, None, "", 256).await.is_empty(),
-            "List is blind to staging"
-        );
-        assert_eq!(
-            counts(&jobs).await,
-            BoardCounts::default(),
-            "Counts is blind to staging"
-        );
 
-        // commit publishes; the same queries now see it.
+        // commit publishes; the same query now sees it.
         jobs.commit_block().await.expect("commit");
-        assert!(get(&jobs, "j1").await.is_some());
-        assert_eq!(list(&jobs, None, "", 256).await.len(), 1);
-        assert_eq!(counts(&jobs).await.pending, 1);
+        assert_eq!(
+            get(&jobs, "j1")
+                .await
+                .expect("committed, now visible")
+                .status,
+            JobStatus::Pending
+        );
 
-        // a staged transition is equally invisible: claim staged, queries
-        // still report the committed Pending.
+        // a staged transition is equally invisible: claim staged, Get still
+        // reports the committed Pending.
         stage(&mut jobs, 2, ext("worker-a"), claim("j1", 50))
             .await
             .expect("stage claim");
@@ -1208,8 +1121,6 @@ fn queries_answer_committed_state_only() {
             JobStatus::Pending,
             "the staged claim is not served"
         );
-        assert_eq!(counts(&jobs).await.pending, 1);
-        assert_eq!(counts(&jobs).await.processing, 0);
         jobs.commit_block().await.expect("commit claim");
         assert_eq!(
             get(&jobs, "j1").await.unwrap().status,
@@ -1290,10 +1201,8 @@ async fn host_get(host: &Host, job_id: &str) -> Option<Job> {
         )
         .await
         .expect("host query");
-    match decode_reply(&bytes).expect("decode") {
-        JobsReply::Job(job) => job,
-        other => panic!("expected Job, got {other:?}"),
-    }
+    let JobsReply::Job(job) = decode_reply(&bytes).expect("decode");
+    job
 }
 
 /// a worker module that claims every submitted job it is notified about.

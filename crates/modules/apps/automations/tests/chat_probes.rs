@@ -70,8 +70,9 @@ async fn messages(host: &Host, channel: &str) -> Vec<MessageView> {
     let reply = host
         .query(
             CHAT,
-            &chat_encode_query(&ChatQuery::MessagesLatest {
+            &chat_encode_query(&ChatQuery::MessagesRange {
                 channel_id: channel.into(),
+                from_seq: 1,
                 limit: 64,
             }),
         )

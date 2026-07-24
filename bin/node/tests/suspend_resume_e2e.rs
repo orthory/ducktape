@@ -123,8 +123,9 @@ fn resident_sees(cluster: &NetworkShapeCluster, message_id: &str, what: &str, de
         let raw = cluster.query(
             1,
             "chat",
-            &encode_query(&ChatQuery::MessagesLatest {
+            &encode_query(&ChatQuery::MessagesRange {
                 channel_id: "general".into(),
+                from_seq: 1,
                 limit: 10,
             }),
         )?;

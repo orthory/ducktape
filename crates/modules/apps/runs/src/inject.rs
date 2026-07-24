@@ -726,8 +726,6 @@ mod tests {
                 reply_count: 0,
                 last_reply_seq: None,
             },
-            reactions: Vec::new(),
-            channel_head_seq: 1,
         };
         let text = message_text(&message);
         assert!(text.contains("see [Plan](duck://page/plan)"), "{text}");

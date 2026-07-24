@@ -57,8 +57,9 @@ fn read_message(
     let reply = cluster.query(
         idx,
         "chat",
-        &chat::encode_query(&ChatQuery::MessagesLatest {
+        &chat::encode_query(&ChatQuery::MessagesRange {
             channel_id: channel.into(),
+            from_seq: 1,
             limit: 64,
         }),
     )?;

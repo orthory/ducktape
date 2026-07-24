@@ -68,13 +68,12 @@ fn exact_comment_anchor_rebases_with_target_text() {
             },
         )
         .await;
-        let moved = query_threads(&p, &["b1", "b2"]).await;
-        assert!(moved[0].threads.is_empty());
-        assert_eq!(moved[1].threads[0].thread.target, "b2");
-        assert_eq!(
-            moved[1].threads[0].thread.anchor,
-            Some(RelativeAnchor { start: 0, end: 2 })
-        );
+        let moved = query_thread(&p, "t1").await.unwrap();
+        assert_eq!(moved.thread.target, "b2");
+        assert_eq!(moved.thread.anchor, Some(RelativeAnchor { start: 0, end: 2 }));
+        // the per-target index re-homed with it.
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
     });
 }
 
@@ -310,7 +309,7 @@ fn get_comment_serves_the_record_tombstones_included() {
 }
 
 #[test]
-fn comment_add_opens_then_appends_and_batches_by_target() {
+fn comment_add_opens_then_appends_and_counts_per_target() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
@@ -318,10 +317,7 @@ fn comment_add_opens_then_appends_and_batches_by_target() {
         apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
         apply_commit_as(&mut p, &add("t3", "m4", "b2", "elsewhere"), user("alice")).await;
 
-        let groups = query_threads(&p, &["b1", "b2"]).await;
-        let b1 = groups.iter().find(|g| g.target == "b1").unwrap();
-        assert_eq!(b1.threads.len(), 2);
-        let t1 = b1.threads.iter().find(|v| v.thread.id == "t1").unwrap();
+        let t1 = query_thread(&p, "t1").await.unwrap();
         assert_eq!(
             t1.comments
                 .iter()
@@ -331,15 +327,11 @@ fn comment_add_opens_then_appends_and_batches_by_target() {
         );
         assert_eq!(t1.thread.opener, AuthorRef::User(b"alice".to_vec()));
         assert_eq!(t1.comments[1].author, AuthorRef::User(b"bob".to_vec()));
-        assert_eq!(
-            groups
-                .iter()
-                .find(|g| g.target == "b2")
-                .unwrap()
-                .threads
-                .len(),
-            1
-        );
+        // the per-target index counts THREADS, not comments (per-target
+        // thread ENUMERATION is `index::tests`' now).
+        assert_eq!(target_thread_count(&p, "b1").await, 2);
+        assert_eq!(target_thread_count(&p, "b2").await, 1);
+        assert_eq!(target_thread_count(&p, "ghost").await, 0);
     });
 }
 
@@ -444,7 +436,7 @@ fn comment_deleting_last_live_removes_the_thread() {
         )
         .await;
         assert!(query_thread(&p, "t1").await.is_none());
-        assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
     });
 }
 
@@ -512,13 +504,8 @@ fn comment_caps_and_reserved_ids_reject() {
             "reserved block id",
         )
         .await;
-        // over-cap query rejected.
-        let targets: Vec<String> = (0..=MAX_QUERY_TARGETS).map(|i| format!("t{i}")).collect();
-        assert!(
-            p.query(&encode_query(&PageQuery::ThreadsForTargets { targets }))
-                .await
-                .is_err()
-        );
+        // the MAX_QUERY_TARGETS cap guards the index tier's grouped read now
+        // (`index::tests::threads_for_targets_rejects_over_cap_target_lists`).
     });
 }
 
@@ -537,7 +524,7 @@ fn comments_and_blocks_coexist_and_move_the_root() {
             ids(&get_page(&p, "p1").await.unwrap()),
             ["p1", "b1", "b2", "b3"]
         );
-        assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
     });
 }
 
@@ -550,7 +537,7 @@ fn deleting_a_block_purges_its_comment_threads() {
         seed_page(&mut p, "p1").await; // p1 + b1,b2,b3
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "on b1"), user("alice")).await;
         apply_commit_as(&mut p, &add("t2", "m2", "p1", "on the page"), user("alice")).await;
-        assert_eq!(query_threads(&p, &["b1"]).await[0].threads.len(), 1);
+        assert_eq!(target_thread_count(&p, "b1").await, 1);
 
         // remove b1 → its thread t1 (+ comment m1 + target index) is gone.
         apply_commit(
@@ -560,7 +547,7 @@ fn deleting_a_block_purges_its_comment_threads() {
             },
         )
         .await;
-        assert!(query_threads(&p, &["b1"]).await[0].threads.is_empty());
+        assert_eq!(target_thread_count(&p, "b1").await, 0);
         assert!(query_thread(&p, "t1").await.is_none());
 
         // delete the page → the page-anchored thread t2 is purged too.
@@ -581,6 +568,6 @@ fn deleting_a_block_purges_its_comment_threads() {
         )
         .await;
         assert!(query_thread(&p, "t2").await.is_none());
-        assert!(query_threads(&p, &["p1"]).await[0].threads.is_empty());
+        assert_eq!(target_thread_count(&p, "p1").await, 0);
     });
 }

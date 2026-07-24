@@ -274,8 +274,9 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
         let reply = cluster.query(
             idx,
             "chat",
-            &chat::encode_query(&ChatQuery::MessagesLatest {
+            &chat::encode_query(&ChatQuery::MessagesRange {
                 channel_id: CHANNEL.into(),
+                from_seq: 1,
                 limit: 64,
             }),
         )?;

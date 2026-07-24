@@ -31,6 +31,7 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 const CHAT_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/chat/index.wasm");
 const TASKS_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/tasks/index.wasm");
 const PAGES_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/pages/index.wasm");
+const INBOX_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/inbox/index.wasm");
 const SAGA_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/system/saga/index.wasm");
 
 /// the bundled mapper for one module id — `None` for modules that ship no
@@ -40,6 +41,7 @@ fn index_guest_wasm(id: &str) -> Option<&'static [u8]> {
         "chat" => Some(CHAT_INDEX_WASM),
         "tasks" => Some(TASKS_INDEX_WASM),
         "pages" => Some(PAGES_INDEX_WASM),
+        "inbox" => Some(INBOX_INDEX_WASM),
         "saga" => Some(SAGA_INDEX_WASM),
         _ => None,
     }

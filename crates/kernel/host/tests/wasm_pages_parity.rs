@@ -130,10 +130,11 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     .expect("genesis")
 }
 
-/// the read matrix: every query family, including the `None`/absent shapes.
+/// the read matrix: every kept query family, including the `None`/absent
+/// shapes. (the page/thread LISTING reads are index-tier now, so the matrix
+/// probes the dispatch surface only.)
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&PageQuery::ListPages),
         encode_query(&PageQuery::GetPage {
             page_id: "home".into(),
         }),
@@ -149,8 +150,8 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
         encode_query(&PageQuery::GetBlock {
             block_id: "gone".into(),
         }),
-        encode_query(&PageQuery::ThreadsForTargets {
-            targets: vec!["b1".into(), "home".into()],
+        encode_query(&PageQuery::TargetThreadCount {
+            target: "b1".into(),
         }),
         encode_query(&PageQuery::CommentThread {
             thread_id: "t1".into(),
