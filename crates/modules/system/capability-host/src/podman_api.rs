@@ -169,8 +169,14 @@ pub(crate) fn translate(value: &str, mounts: &[Mount], home: &Path, guest_home: 
 /// podman. ORDER is load-bearing: the broker/node accept precedes the
 /// private-range drop, so the two allowed host:port pairs survive even though
 /// `host_ip` is itself in a dropped range. `100.64.0.0/10` is the tailnet/CGNAT
-/// block. Everything else (the public internet) falls through to `policy
-/// accept` — the broker still mediates all provider-API traffic regardless.
+/// block; `fc00::/7` covers IPv6 ULA + tailnet-v6. Everything else (the public
+/// internet, v4 and v6) falls through to `policy accept` — the broker still
+/// mediates all provider-API traffic regardless.
+///
+/// `host_ip` is what `host.containers.internal` resolves to INSIDE the
+/// container (a fixed pasta address like `192.168.127.254`, NOT the host's
+/// routable IP) — the hook reads it from the container's `/etc/hosts`, so it is
+/// correct regardless of the network backend.
 pub fn egress_nftables(host_ip: &str, ports: &[u16]) -> String {
     let mut lines = vec![
         "table inet ducktape {".to_string(),
@@ -193,6 +199,9 @@ pub fn egress_nftables(host_ip: &str, ports: &[u16]) -> String {
          169.254.0.0/16, 127.0.0.0/8 } drop"
             .to_string(),
     );
+    // IPv6: drop ULA (incl. tailnet fd7a::/48) + link-local + loopback; public
+    // v6 falls through to policy accept, same as v4.
+    lines.push("    ip6 daddr { fc00::/7, fe80::/10, ::1/128 } drop".to_string());
     lines.push("  }".to_string());
     lines.push("}".to_string());
     lines.join("\n")
@@ -212,7 +221,9 @@ pub(crate) struct OciMount {
     pub options: Vec<String>,
 }
 
-/// a libpod `Namespace` — `nsmode` is `"slirp4netns"` for our private netns.
+/// a libpod `Namespace` — `nsmode` is `"pasta"` for our private, host-isolated
+/// netns. (podman 6 REMOVED slirp4netns; pasta is the rootless default and is
+/// more host-isolated by default. The egress nft hook is the real enforcement.)
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct Namespace {
     pub nsmode: String,
@@ -249,9 +260,6 @@ pub(crate) struct SpecGenerator {
     pub annotations: BTreeMap<String, String>,
     pub mounts: Vec<OciMount>,
     pub netns: Namespace,
-    /// slirp4netns knobs (`allow_host_loopback=false`, `enable_ipv6=false`):
-    /// `{"slirp4netns": ["allow_host_loopback=false", ...]}`.
-    pub network_options: BTreeMap<String, Vec<String>>,
     pub cap_drop: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
@@ -259,8 +267,8 @@ pub(crate) struct SpecGenerator {
     pub terminal: bool,
     /// keep stdin open so the prompt / keystrokes can be written on attach.
     pub stdin: bool,
-    /// auto-remove on exit (the old `--rm`). We also remove explicitly on
-    /// teardown; both is harmless.
+    /// We own removal explicitly on teardown (after `wait` reads the exit code);
+    /// auto-remove would race the wait/remove and 404 it, so it stays off.
     pub remove: bool,
     pub labels: BTreeMap<String, String>,
 }
@@ -319,14 +327,6 @@ impl SpecGenerator {
             .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
             .collect();
 
-        let network_options = BTreeMap::from([(
-            "slirp4netns".to_string(),
-            vec![
-                "allow_host_loopback=false".to_string(),
-                "enable_ipv6=false".to_string(),
-            ],
-        )]);
-
         SpecGenerator {
             image: inputs.image.to_string(),
             command,
@@ -335,22 +335,23 @@ impl SpecGenerator {
             annotations: BTreeMap::new(),
             mounts,
             netns: Namespace {
-                nsmode: "slirp4netns".to_string(),
+                nsmode: "pasta".to_string(),
             },
-            network_options,
             cap_drop: vec!["NET_ADMIN".to_string(), "NET_RAW".to_string()],
             resource_limits,
             terminal: inputs.terminal,
             stdin: true,
-            remove: true,
+            remove: false,
             labels,
         }
     }
 
     /// attach the egress-hook annotations: the marker the `--hooks-dir` hook
-    /// matches, plus the host IP + allowed ports the hook builds the ruleset
-    /// from. Host-side only — none of this reaches the guest.
-    pub(crate) fn set_egress(&mut self, host_ip: &str, ports: &[u16]) {
+    /// matches, plus the allowed ports (this run's broker + node RPC). The host
+    /// IP is NOT passed — the hook resolves `host.containers.internal` from the
+    /// container's own `/etc/hosts`, which is correct regardless of the network
+    /// backend. Host-side only — none of this reaches the guest.
+    pub(crate) fn set_egress(&mut self, ports: &[u16]) {
         let ports = ports
             .iter()
             .map(u16::to_string)
@@ -358,8 +359,6 @@ impl SpecGenerator {
             .join(",");
         self.annotations
             .insert("io.ducktape.egress".to_string(), "1".to_string());
-        self.annotations
-            .insert("io.ducktape.egress.host".to_string(), host_ip.to_string());
         self.annotations
             .insert("io.ducktape.egress.ports".to_string(), ports);
     }
@@ -787,7 +786,8 @@ mod tests {
         let drop = rs.find("100.64.0.0/10").expect("tailnet drop line");
         assert!(allow < drop, "allow must precede the private-range drop:\n{rs}");
         assert!(rs.contains("192.168.1.50"), "host ip pinned");
-        assert!(rs.contains("100.64.0.0/10"), "tailnet blocked");
+        assert!(rs.contains("100.64.0.0/10"), "tailnet v4 blocked");
+        assert!(rs.contains("ip6 daddr { fc00::/7"), "tailnet/ULA v6 blocked");
         assert!(rs.contains("oifname \"lo\" accept"));
     }
 
@@ -819,13 +819,13 @@ mod tests {
             labels: &["io.ducktape.run=abc".to_string()],
             terminal: false,
         });
-        spec.set_egress("192.168.1.50", &[45001, 8080]);
+        spec.set_egress(&[45001, 8080]);
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"work_dir\":\"/ducktape/workspace\""), "{json}");
         assert!(json.contains("/ducktape/bin/claude"), "{json}");
-        assert!(json.contains("\"nsmode\":\"slirp4netns\""), "{json}");
-        assert!(json.contains("allow_host_loopback=false"), "{json}");
+        assert!(json.contains("\"nsmode\":\"pasta\""), "{json}");
         assert!(json.contains("NET_ADMIN") && json.contains("NET_RAW"), "{json}");
+        assert!(json.contains("\"remove\":false"), "own removal, no auto-remove: {json}");
         assert!(json.contains("\"quota\":400000"), "cpu quota: {json}");
         assert!(json.contains("io.ducktape.egress"), "egress annotation: {json}");
         // the GUEST-visible fields (command, work_dir, env, mount destinations)

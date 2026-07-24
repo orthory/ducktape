@@ -63,12 +63,17 @@ not the guest path.
 ## Part B — egress allowlist in the container netns
 
 `SpecGenerator`:
-- `netns = {nsmode: "slirp4netns"}` + `network_options.slirp4netns =
-  ["allow_host_loopback=false", "enable_ipv6=false"]`.
+- `netns = {nsmode: "pasta"}`. podman 6 REMOVED slirp4netns ("use
+  `--network=pasta`"); pasta is the rootless default and is host-isolated by
+  default (no host-loopback shortcut, no `allow_host_loopback` knob needed). The
+  nft hook is the real enforcement, so no `network_options` are set.
 - `cap_drop = ["NET_ADMIN", "NET_RAW"]` — the workload cannot alter the
-  firewall or open raw sockets.
-- annotations `io.ducktape.egress=1`, `io.ducktape.egress.host=<ip>`,
-  `io.ducktape.egress.ports=<broker>,<node>`.
+  firewall or open raw sockets. (Validated: `.BoundingCaps` drops them.)
+- annotations `io.ducktape.egress=1`, `io.ducktape.egress.ports=<broker>,<node>`.
+  The host IP is NOT an annotation — under pasta `host.containers.internal`
+  resolves to a fixed pasta address (e.g. `192.168.127.254`), NOT the host's
+  routable IP, so the hook reads it from the container's own `/etc/hosts`
+  (`/proc/<pid>/root/etc/hosts`), correct for any backend.
 
 **The firewall is an OCI `createRuntime` hook (fails closed).** Podman runs it
 after the netns exists but before the workload execs; a hook failure aborts the
@@ -82,17 +87,18 @@ ruleset with `capability_host::egress_nftables`, and runs
 ```
 oifname "lo" accept
 ip daddr <host_ip> tcp dport { <broker>, <node> } accept   # broker + node RPC
-udp/tcp dport 53 accept                                    # DNS (slirp resolver)
+udp/tcp dport 53 accept                                    # DNS resolver
 ip daddr { 10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, 127/8 } drop
-# public internet falls through to policy accept
+ip6 daddr { fc00::/7, fe80::/10, ::1/128 } drop            # ULA (incl tailnet v6) + link-local
+# public internet (v4 + v6) falls through to policy accept
 ```
 The broker/node accept precedes the private-range drop so the two allowed
 host:port pairs survive even though `host_ip` is in a dropped range.
-`host_ip` is what `host.containers.internal` resolves to (host default-route
-source IP, computed host-side via a UDP-connect probe).
+`host_ip` = `host.containers.internal` as resolved inside the container (the
+hook reads `/proc/<pid>/root/etc/hosts`).
 
 `nft` + `nsenter` (found via `/usr/sbin` too, off a non-root PATH) become boot
-probes alongside `slirp4netns`.
+probes alongside podman/pasta.
 
 ## Client (`podman_api.rs`) — landed + unit-tested
 
@@ -107,6 +113,16 @@ Unit tests (pass, no podman needed): HTTP content-length + chunked parsing,
 error-body surfacing, attach frame demux, `plan_mounts` neutrality, `translate`
 of a codex arg + `$HOME` sanitization, `SpecGenerator` JSON shape, egress
 ruleset ordering.
+
+**LIVE-VALIDATED** against podman 6.0.1 (macmini-duke, `curl --unix-socket` +
+python over the machine socket): `/v5.0.0` prefix; create accepts the exact
+`SpecGenerator` and inspect confirms every field takes effect (work_dir,
+mounts+RW, netns=pasta, `.BoundingCaps` drops NET_ADMIN/NET_RAW, cpu
+quota/period, memory limit, annotations); start; wait exit code; attach returns
+`101 UPGRADED`, raw stdin reaches the container and stdout comes back as an
+8-byte-framed `stream=1` payload (demux matches); remove. This caught the
+slirp4netns→pasta change and the host-IP-from-`/etc/hosts` correction before any
+real-node run.
 
 ## Integration (UNVERIFIED — needs real-node QA)
 
