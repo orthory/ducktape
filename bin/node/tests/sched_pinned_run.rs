@@ -93,9 +93,13 @@ fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
 /// A mock Anthropic upstream: `/oauth/token` mints `acc-N`; `/v1/messages`
 /// accepts ONLY `Bearer acc-N` (so a 200 proves the gateway swapped the scoped
 /// session token for the sealed credential) and replies with the `PONG` marker.
+/// `messages_hits` counts accepted `/v1/messages` calls — the host-side
+/// exactly-once evidence (one provider execution = one upstream call), counted
+/// where the sandbox boundary can't hide it.
 #[derive(Default)]
 struct MockUpstream {
     n: Mutex<u64>,
+    messages_hits: Mutex<u64>,
 }
 
 async fn mock_oauth(State(st): State<Arc<MockUpstream>>) -> Json<serde_json::Value> {
@@ -121,6 +125,7 @@ async fn mock_messages(
     if got != want {
         return (axum::http::StatusCode::UNAUTHORIZED, "bad upstream bearer").into_response();
     }
+    *st.messages_hits.lock().unwrap() += 1;
     ([("content-type", "text/event-stream")], "data: PONG\n\n").into_response()
 }
 
@@ -134,13 +139,14 @@ async fn bind_and_serve(app: Router) -> String {
 }
 
 /// Boot the mock upstream and the testkit airlock gateway pointed at it.
-/// Returns `(gateway_base_url, gateway_loopback_port)`.
-async fn boot_gateway_and_upstream() -> (String, u16) {
+/// Returns `(gateway_base_url, gateway_loopback_port, upstream_counters)`.
+async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
+    let counters = Arc::new(MockUpstream::default());
     let upstream = bind_and_serve(
         Router::new()
             .route("/oauth/token", post(mock_oauth))
             .route("/v1/messages", post(mock_messages))
-            .with_state(Arc::new(MockUpstream::default())),
+            .with_state(counters.clone()),
     )
     .await;
 
@@ -166,7 +172,7 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://127.0.0.1:{port}"), port)
+    (format!("http://127.0.0.1:{port}"), port, counters)
 }
 
 /// Verify the gateway quote and seal a credential under `name` (the mock mints
@@ -198,6 +204,28 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
 // ===========================================================================
 // identity + gateway helpers (mirror airlock_gateway_e2e / gateway_e2e)
 // ===========================================================================
+
+/// providers spawn only inside a sandbox now, so both legs need a working
+/// podman; skip loudly without one, exactly like `remote_session`.
+fn podman_available() -> bool {
+    std::process::Command::new("podman")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// the `[sandbox]` table each cluster node boots with — appended LAST to the
+/// generated toml (nothing may follow a toml table header).
+fn sandbox_toml() -> Vec<String> {
+    vec![
+        "[sandbox]".into(),
+        "runtime = \"podman\"".into(),
+        "image = \"docker.io/library/node:22-slim\"".into(),
+        "cores = 0".into(),
+        "mem_gb = 0".into(),
+    ]
+}
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
     identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
@@ -358,9 +386,9 @@ fn credential_record(cluster: &Cluster, reader: usize) -> Option<CredentialRecor
 // ===========================================================================
 
 /// Submit a bare `SagaMsg::Trigger` from node `idx` (its key stamps the origin),
-/// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — a
-/// Direct run, the smallest reliable execution shape (the cpu/mem → Podman
-/// IsolationSpec dimension is not exercised here).
+/// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — the
+/// smallest reliable execution shape (the cpu/mem → Podman limit-flag
+/// dimension is not exercised here).
 fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max_attempts: u32) {
     let spec = dispatch::encode_work_spec(&dispatch::WorkSpec {
         kind: dispatch::WORK_SPEC_KIND.into(),
@@ -451,8 +479,10 @@ async fn run_output_has(port: u16, id: &str, marker: &str, budget: Duration) -> 
 /// One script-backed provider for the `sched-claude` tag. `broker` picks the
 /// isolation: the anthropic-messages broker (the executing node's credential
 /// source rides `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`) for the run leg, or
-/// none for the refusal leg (which never reaches execution). The script logs one
-/// line per invocation — the exactly-once / never-spawned evidence.
+/// none for the refusal leg (which never reaches execution). the refusal leg's
+/// script logs one host-path line per invocation — the never-spawned tripwire;
+/// the run leg's execution count lives on the mock upstream (the host log path
+/// does not exist inside the sandbox).
 struct ScriptProvider {
     spec_dir: PathBuf,
     script: PathBuf,
@@ -467,24 +497,30 @@ impl ScriptProvider {
         let exec_log = dir.join("exec.log");
         let script = dir.join("provider.sh");
 
-        // the broker leg curls the loopback broker (which swaps in the sealed
-        // credential and forwards to the mock upstream) and echoes the reply;
-        // the refusal leg never runs, so its body only needs to be valid.
+        // the broker leg runs INSIDE the podman sandbox (node:22-slim), so it
+        // dials the loopback broker with node's global fetch — the container
+        // has no curl, and a host log path would not exist in its mount
+        // namespace (execution is counted host-side by the mock upstream
+        // instead). the refusal leg never runs, so its body only needs to be
+        // valid; its host log line stays as the never-spawned tripwire.
         let body = if broker {
-            format!(
-                "#!/bin/sh\n\
-                 set -e\n\
-                 cat > /dev/null\n\
-                 echo ran >> {log}\n\
-                 curl -sS -X POST \"$ANTHROPIC_BASE_URL/v1/messages\" \\\n\
-                   -H \"Authorization: Bearer $ANTHROPIC_AUTH_TOKEN\" \\\n\
-                   -H \"content-type: application/json\" \\\n\
-                   -H \"anthropic-version: 2023-06-01\" \\\n\
-                   -H \"anthropic-beta: oauth-2025-04-20\" \\\n\
-                   -d '{{\"model\":\"claude-sonnet-5\",\"max_tokens\":16,\"messages\":[{{\"role\":\"user\",\"content\":\"PING\"}}]}}'\n\
-                 echo\n",
-                log = exec_log.display(),
-            )
+            "#!/bin/sh\n\
+             set -e\n\
+             cat > /dev/null\n\
+             node -e '\n\
+             const body = {model:\"claude-sonnet-5\",max_tokens:16,messages:[{role:\"user\",content:\"PING\"}]};\n\
+             fetch(process.env.ANTHROPIC_BASE_URL + \"/v1/messages\", {\n\
+               method: \"POST\",\n\
+               headers: {\n\
+                 authorization: \"Bearer \" + process.env.ANTHROPIC_AUTH_TOKEN,\n\
+                 \"content-type\": \"application/json\",\n\
+                 \"anthropic-version\": \"2023-06-01\",\n\
+                 \"anthropic-beta\": \"oauth-2025-04-20\",\n\
+               },\n\
+               body: JSON.stringify(body),\n\
+             }).then((r) => r.text()).then((t) => { console.log(t); });\n\
+             '\n"
+                .to_string()
         } else {
             format!(
                 "#!/bin/sh\n\
@@ -571,18 +607,24 @@ fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
+    if !podman_available() {
+        eprintln!("skipping a_granted_scheduled_run_executes_against_the_mock_upstream: no working podman");
+        return;
+    }
     let _serial = serial();
     let rt = Runtime::new().unwrap();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
 
     // the credential node's loopback services live in THIS process; the node
-    // subprocess reaches the gateway over host loopback, like a real deployment.
-    let (gw_base, gw_port) = rt.block_on(boot_gateway_and_upstream());
+    // subprocess reaches the gateway over host loopback, like a real deployment
+    // (the provider container shares the host netns — no private netns here).
+    let (gw_base, gw_port, upstream) = rt.block_on(boot_gateway_and_upstream());
     let seal_pk = rt.block_on(seal_credential(&gw_base, CRED_NAME));
 
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
+    cluster.extra_toml = sandbox_toml();
     cluster.env[0] = [provider.env(), hide_builtins(fixtures.path(), "node0")].concat();
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", CONVERGE);
@@ -669,11 +711,21 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     ));
     assert!(saw, "the mock upstream's reply streamed to the run-output ring");
 
-    assert_eq!(provider.executions(), 1, "the provider ran exactly once");
+    // exactly-once, counted host-side where the sandbox boundary can't hide
+    // it: one provider execution = one accepted upstream call.
+    assert_eq!(
+        *upstream.messages_hits.lock().unwrap(),
+        1,
+        "the provider ran exactly once"
+    );
 }
 
 #[test]
 fn an_ungranted_scheduled_run_is_refused_at_resolve() {
+    if !podman_available() {
+        eprintln!("skipping an_ungranted_scheduled_run_is_refused_at_resolve: no working podman");
+        return;
+    }
     let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
 
@@ -682,6 +734,7 @@ fn an_ungranted_scheduled_run_is_refused_at_resolve() {
     // airlock gateway: the refusal fires at the grant check, before any broker.
     let provider = ScriptProvider::stage(fixtures.path(), false);
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    cluster.extra_toml = sandbox_toml();
     cluster.env[0] = hide_builtins(fixtures.path(), "node0");
     cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.spawn(0);
