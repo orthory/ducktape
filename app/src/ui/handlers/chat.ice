@@ -91,7 +91,10 @@ on create_channel_submit
   pending_channel = trim(channel_draft)
   channel_draft = ""
   error = ""
-  run create_channel(connected_rpc, password, pending_channel) -> channel_created _ | mutation_failed _
+  run create_channel(connected_rpc, password, pending_channel, channel_create_members_only) -> channel_created _ | mutation_failed _
+
+on toggle_channel_create_members_only
+  channel_create_members_only = !channel_create_members_only
 
 on toggle_channel_create
   channel_create_open = !channel_create_open
@@ -181,7 +184,7 @@ on send_message_submit
   message_editor = editor("")
   messages = optimistic_message(messages, pending_message, pending_message_id)
   error = ""
-  run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message) -> message_sent _ | message_send_failed _
+  run send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -228,6 +231,7 @@ on chat_updated(next)
 on channel_created(next)
   pending_channel = ""
   channel_create_open = false
+  channel_create_members_only = false
   mutation_phase = "idle"
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
@@ -345,7 +349,7 @@ on edit_thread_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-edit"
   error = ""
-  run edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft)) -> chat_acked _ | mutation_failed _
+  run edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_thread_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != "delete"
@@ -522,7 +526,7 @@ on edit_message_submit
   hydration_retry_attempt = 0
   mutation_phase = "message-edit"
   error = ""
-  run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft)) -> chat_acked _ | mutation_failed _
+  run edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_message_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || message_action != "delete"
@@ -582,7 +586,7 @@ on send_reply_submit
   reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
-  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply) -> thread_reply_sent _ | thread_reply_send_failed _
+  run send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
 on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id

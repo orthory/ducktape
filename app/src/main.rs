@@ -831,7 +831,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
             .unwrap()
             .0;
         assert!(edit.contains(
-            "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft))"
+            "edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members)"
         ));
         let delete = handlers
             .split_once("on delete_thread_message_submit\n")

@@ -39,19 +39,30 @@ view
               hovered bg=fg/10 text=fg
               pressed bg=selection
         if channel_create_open
-          row width=fill height=28.0 spacing=5.0 align=center
-            input "" #new-channel label="New channel name" <-> channel_draft hint="New channel" disabled=(loading || mutation_phase != "idle" || !connected) submit=create_channel_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
-              active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
-              hovered bg=elevated border=fg/21
-              focused bg=elevated border=fg/45 border-w=1.0
-              disabled bg=surface/54 value=muted
-            button label="Create channel" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(channel_draft))) width=28.0 height=28.0 padding=0.0 -> create_channel_submit
-              container width=fill height=fill align-x=center align-y=center
-                text "+" size=14.0
-              active bg=fg/13 text=fg border=fg/18 border-w=1.0 r=8.0
-              hovered bg=fg/19
-              pressed bg=selection
-              disabled bg=fg/5 text=muted
+          col width=fill spacing=4.0
+            row width=fill height=28.0 spacing=5.0 align=center
+              input "" #new-channel label="New channel name" <-> channel_draft hint="New channel" disabled=(loading || mutation_phase != "idle" || !connected) submit=create_channel_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                hovered bg=elevated border=fg/21
+                focused bg=elevated border=fg/45 border-w=1.0
+                disabled bg=surface/54 value=muted
+              button label="Create channel" disabled=(loading || mutation_phase != "idle" || !connected || empty(trim(channel_draft))) width=28.0 height=28.0 padding=0.0 -> create_channel_submit
+                container width=fill height=fill align-x=center align-y=center
+                  text "+" size=14.0
+                active bg=fg/13 text=fg border=fg/18 border-w=1.0 r=8.0
+                hovered bg=fg/19
+                pressed bg=selection
+                disabled bg=fg/5 text=muted
+            button label="Members-only posting" width=fill height=24.0 padding=4.0 -> toggle_channel_create_members_only
+              row width=fill height=fill spacing=6.0 align=center
+                if channel_create_members_only
+                  text "☑" size=13.0 @text-primary
+                if !channel_create_members_only
+                  text "☐" size=13.0 @text-muted
+                text "Members-only posting" width=fill size=11.0 wrapping=none @text-muted
+              active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+              hovered bg=fg/5 text=fg
+              pressed bg=fg/8
         scroll direction=vertical width=fill height=fill
           col width=fill spacing=2.0
             for channel in channels

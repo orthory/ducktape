@@ -58,6 +58,7 @@ state
   pending_reply_id = ""
   channel_draft = ""
   channel_create_open = false
+  channel_create_members_only = false
   pending_channel = ""
   message_draft = ""
   message_editor:editor = ""

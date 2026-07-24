@@ -24,7 +24,7 @@ pub use chat::client::{
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_name, chat_message, contains_pending_message,
     mark_message_groups, merge_message_send_result, merge_pending_messages,
-    merge_thread_reply, optimistic_message, paragraph_blocks, parse_message,
+    merge_thread_reply, optimistic_message, paragraph_blocks, parse_message_with_members,
     rollback_pending_message, short_label, thread_offset_after_reply,
 };
 pub use pages::client::PagesDelta;
@@ -1399,6 +1399,7 @@ pub async fn create_channel(
     rpc: String,
     password: String,
     name: String,
+    members_only: bool,
 ) -> Result<ChatData, AppError> {
     async {
         let name = bounded_text(name, "channel name", 128)?;
@@ -1410,7 +1411,10 @@ pub async fn create_channel(
             chat::encode_msg(&ChatMsg::CreateChannel {
                 channel_id: channel_id.clone(),
                 name,
-                post_policy: PostPolicy::Open,
+                post_policy: match members_only {
+                    true => PostPolicy::MembersOnly,
+                    false => PostPolicy::Open,
+                },
             }),
             password,
         )
@@ -1598,6 +1602,7 @@ pub async fn send_message(
     channel_id: String,
     message_id: String,
     body: String,
+    members: Vec<ChatMember>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -1614,7 +1619,7 @@ pub async fn send_message(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: required_id(message_id, "message")?,
-                blocks: parse_message(&body),
+                blocks: parse_message_with_members(&body, &members),
                 thread: None,
                 as_agent: None,
             }),
@@ -1772,6 +1777,7 @@ pub async fn send_reply(
     root_seq: i64,
     message_id: String,
     body: String,
+    members: Vec<ChatMember>,
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
@@ -1787,7 +1793,7 @@ pub async fn send_reply(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: message_id.clone(),
-                blocks: parse_message(&body),
+                blocks: parse_message_with_members(&body, &members),
                 thread: Some(root_seq),
                 as_agent: None,
             }),
@@ -1818,6 +1824,7 @@ pub async fn edit_message(
     seq: i64,
     base_rev: i64,
     body: String,
+    members: Vec<ChatMember>,
 ) -> Result<bool, AppError> {
     async {
         let seq = positive_sequence(seq)?;
@@ -1831,7 +1838,7 @@ pub async fn edit_message(
             chat::encode_msg(&ChatMsg::EditMessage {
                 channel_id: channel_id.clone(),
                 seq,
-                blocks: parse_message(&body),
+                blocks: parse_message_with_members(&body, &members),
                 base_rev: Some(base_rev),
             }),
             password,
