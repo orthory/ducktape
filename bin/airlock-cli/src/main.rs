@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 
 use airlock::attest::{self, AttestMode, Measurement};
 use airlock::client::Gateway;
-use airlock::wire::CredentialPayload;
+use airlock::wire::{CredentialKind, CredentialPayload};
 
 /// `--flag value` / `--flag=value` lookup over argv (no clap — house rule).
 fn arg(name: &str) -> Option<String> {
@@ -108,13 +108,15 @@ async fn seal_cmd() -> Result<()> {
         &expected.to_hex()[..12]
     );
 
+    let name = arg_or("--name", "demo");
+    let vendor = credential_kind()?;
     let credential = resolve_credential()?;
-    let kind = match &credential {
+    let desc = match &credential {
         CredentialPayload::Bearer { .. } => "static access token (no rotation)",
         CredentialPayload::Refresh { .. } => "refresh token (OAuth, rotates)",
     };
-    gw.upload_sealed_credential(&seal_pk, &credential).await?;
-    println!("✓ {kind} sealed to enclave key and uploaded (gateway never sees it in clear)");
+    gw.upload_sealed_credential(&seal_pk, &name, vendor, &credential).await?;
+    println!("✓ {desc} sealed to enclave key and uploaded as {name:?} (gateway never sees it in clear)");
     Ok(())
 }
 
@@ -201,6 +203,16 @@ async fn inspect_cmd() -> Result<()> {
 /// file: `--credentials <path>` reads `claudeAiOauth.refreshToken` by default, or
 /// its current `accessToken` with `--cred-kind bearer` — the latter seals a live
 /// subscription WITHOUT rotating the refresh chain the owner is still using.
+/// Vendor the sealed credential routes to: `--vendor claude` (Anthropic, default)
+/// or `codex` (OpenAI). Cleartext routing metadata, not the secret.
+fn credential_kind() -> Result<CredentialKind> {
+    match arg_or("--vendor", "claude").as_str() {
+        "claude" => Ok(CredentialKind::Claude),
+        "codex" => Ok(CredentialKind::Codex),
+        other => bail!("--vendor must be 'claude' or 'codex', got {other:?}"),
+    }
+}
+
 fn resolve_credential() -> Result<CredentialPayload> {
     if let Some(access_token) = arg("--access-token") {
         return Ok(CredentialPayload::Bearer { access_token });

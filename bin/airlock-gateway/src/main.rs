@@ -12,7 +12,7 @@ mod mock_upstream;
 
 use anyhow::{Context, Result};
 
-use airlock::server::GatewayConfig;
+use airlock::server::{AttestMode, GatewayConfig};
 
 /// `--flag value` / `--flag=value` lookup over argv (no clap — house rule).
 fn arg(name: &str) -> Option<String> {
@@ -32,6 +32,17 @@ fn arg_or(name: &str, default: &str) -> String {
     arg(name).unwrap_or_else(|| default.to_string())
 }
 
+/// `--attest tdx|snp|auto` runs the configfs-tsm path; `self-host` serves no
+/// quote (the broker pins the seal_pk from consensus). Standalone mints a fresh
+/// seal key either way — the node embed is what injects the on-chain keypair.
+fn attest_mode() -> Result<AttestMode> {
+    let spec = arg("--attest").context("--attest is required (tdx|snp|auto|self-host)")?;
+    Ok(match spec.as_str() {
+        "self-host" => AttestMode::SelfHost,
+        _ => AttestMode::Tsm(spec),
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -49,8 +60,10 @@ async fn main() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let cfg = GatewayConfig {
-        attest: arg("--attest").context("--attest is required (tdx|snp|auto)")?,
+        attest: attest_mode()?,
+        seal_keypair: None,
         anthropic_base: arg_or("--anthropic-base", "http://127.0.0.1:9101"),
+        openai_base: arg_or("--openai-base", "http://127.0.0.1:9101"),
         oauth_token_url: arg_or("--oauth-token-url", "http://127.0.0.1:9101/oauth/token"),
         oauth_client_id: arg_or("--oauth-client-id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
         session_ttl_secs: arg("--session-ttl-secs")
