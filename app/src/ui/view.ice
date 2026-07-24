@@ -1009,6 +1009,38 @@ view
                           active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
                           hovered bg=fg/10 text=fg
                           pressed bg=fg/14
+    node:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=8.0 align=center
+          text "Node" size=14.0 font=display @text-fg
+          space width=fill
+          input "" #log-filter label="Filter logs" <-> node_log_filter change=node_log_filter_changed hint="filter…" width=180.0 padding=5.0 text-size=13.0 line-height=1.2
+            active bg=surface border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+            hovered bg=elevated border=fg/21
+            focused bg=elevated border=fg/45 border-w=1.0
+        if !empty(node_peers)
+          container width=fill padding=8.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+            col width=fill spacing=3.0
+              text "PEERS" size=11.0 font=medium @text-muted
+              for peer in node_peers
+                row width=fill spacing=8.0 align=center
+                  if peer.live
+                    container width=7.0 height=7.0 bg=success r=3.5
+                      text ""
+                  if !peer.live
+                    container width=7.0 height=7.0 bg=fg/30 r=3.5
+                      text ""
+                  text peer.key width=fill size=13.0 wrapping=none font=mono @text-fg
+                  text peer.height size=11.0 wrapping=none font=mono @text-muted
+        container width=fill height=fill padding=8.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+          stack width=fill height=fill
+            if empty(node_log_lines)
+              EmptyState title="Waiting for logs" detail="The node's log ring streams here live."
+            if !empty(node_log_lines)
+              scroll direction=vertical width=fill height=fill
+                col width=fill spacing=1.0
+                  for line in filter_log_lines(node_log_lines, node_log_filter)
+                    text line.line size=11.0 font=mono @text-fg
     settings:
       scroll direction=vertical width=fill height=fill
         container width=fill max-width=640.0 margin-x=auto padding=20.0

@@ -1646,6 +1646,133 @@ pub async fn clear_doc_tabs(rpc: String) -> bool {
     save_doc_tabs(rpc, Vec::new()).await
 }
 
+/// One log line for the operator pane.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct NodeLogLine {
+    pub cursor: String,
+    pub line: String,
+}
+
+/// The node's live log ring as an app stream — reconnects with backoff and
+/// resumes from the last cursor, exactly like the module stream.
+pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeLogLine> {
+    struct State {
+        rpc: String,
+        cursor: Option<String>,
+        stream: Option<iced::futures::stream::BoxStream<'static, ducktape_rpc::Result<ducktape_rpc::LogLine>>>,
+        retry_attempt: u32,
+    }
+    iced::futures::stream::unfold(
+        State {
+            rpc,
+            cursor: None,
+            stream: None,
+            retry_attempt: 0,
+        },
+        |mut state| async move {
+            loop {
+                if state.stream.is_none() && state.retry_attempt > 0 {
+                    tokio::time::sleep(retry_delay(state.retry_attempt)).await;
+                }
+                if state.stream.is_none() {
+                    let Ok(rpc) = rpc_client(&state.rpc) else {
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                        continue;
+                    };
+                    match rpc.log_events(state.cursor.clone()).await {
+                        Ok(stream) => state.stream = Some(stream),
+                        Err(_) => {
+                            state.retry_attempt = state.retry_attempt.saturating_add(1);
+                            continue;
+                        }
+                    }
+                }
+                match state.stream.as_mut().expect("stream initialized").next().await {
+                    Some(Ok(line)) => {
+                        state.retry_attempt = 0;
+                        state.cursor = Some(line.cursor.clone());
+                        return Some((
+                            NodeLogLine {
+                                cursor: line.cursor,
+                                line: line.line,
+                            },
+                            state,
+                        ));
+                    }
+                    Some(Err(_)) | None => {
+                        state.stream = None;
+                        state.retry_attempt = state.retry_attempt.saturating_add(1);
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// Append a log line to the pane's bounded ring (newest last, 500 kept).
+pub fn push_log_line(mut lines: Vec<NodeLogLine>, line: NodeLogLine) -> Vec<NodeLogLine> {
+    let duplicate = lines.last().is_some_and(|last| last.cursor == line.cursor);
+    if duplicate {
+        return lines;
+    }
+    lines.push(line);
+    let excess = lines.len().saturating_sub(500);
+    lines.drain(..excess);
+    lines
+}
+
+/// The pane's visible window: substring-filtered, newest last.
+pub fn filter_log_lines(lines: Vec<NodeLogLine>, filter: String) -> Vec<NodeLogLine> {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .filter(|line| line.line.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// One peer row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PeerRow {
+    pub key: String,
+    pub height: i64,
+    pub live: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PeersData {
+    pub generation: i64,
+    pub peers: Vec<PeerRow>,
+}
+
+/// Load the peers standing view.
+pub async fn load_peers(rpc: String, generation: i64) -> Result<PeersData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply = rpc.peers().await?;
+        let peers = reply["peers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peer| PeerRow {
+                key: short_label(peer["key"].as_str().unwrap_or_default()),
+                height: peer["height"].as_i64().unwrap_or(0),
+                live: peer["live"].as_bool().unwrap_or(false),
+            })
+            .collect();
+        Ok(PeersData { generation, peers })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -1665,6 +1792,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
         ("members", "Members", "◎"),
         ("governance", "Governance", "⚖"),
         ("explorer", "Explorer", "⛓"),
+        ("node", "Node", "⛭"),
         ("settings", "Settings", "⚙"),
     ]
     .into_iter()

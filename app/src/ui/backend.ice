@@ -94,6 +94,13 @@ extern crate::backend
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   sync shell_nav(tab:str) -> [NavItem]
+  NodeLogLine(cursor:str, line:str)
+  PeerRow(key:str, height:i64, live:bool)
+  PeersData(generation:i64, peers:[PeerRow])
+  sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
+  sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
+  stream node_logs(rpc:str) -> NodeLogLine
+  load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
   SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, open_tabs:i64)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool

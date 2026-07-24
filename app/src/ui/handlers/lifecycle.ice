@@ -278,6 +278,7 @@ on select_shell_tab(next)
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
   settings_generation = settings_generation + 1
+  node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
   parallel
@@ -287,6 +288,20 @@ on select_shell_tab(next)
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
+    run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
+
+on node_log_line(line)
+  node_log_lines = push_log_line(node_log_lines, line)
+
+on node_log_filter_changed(next)
+  node_log_filter = next
+
+on peers_loaded(next)
+  return if next.generation != node_peers_generation
+  node_peers = next.peers
+
+on peers_failed(cause)
+  return if cause.generation != node_peers_generation
 
 on settings_loaded(next)
   return if next.generation != settings_generation
@@ -554,6 +569,7 @@ subscribe
   run live_events(connected_rpc) when connected -> live_updated _
   keyboard press when connected -> global_key_pressed _
   window file-dropped -> fs_file_dropped _
+  run node_logs(connected_rpc) when (connected && shell_tab == "node") -> node_log_line _
 
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)

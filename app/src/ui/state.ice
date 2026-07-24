@@ -92,6 +92,10 @@ state
   settings_key_state = ""
   settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
+  node_log_lines:[NodeLogLine] = []
+  node_log_filter = ""
+  node_peers:[PeerRow] = []
+  node_peers_generation:i64 = 0
   fs_path = "/shared"
   fs_entries:[FsEntry] = []
   fs_generation:i64 = 0
