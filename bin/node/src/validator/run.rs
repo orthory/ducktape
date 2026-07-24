@@ -128,15 +128,15 @@ pub(super) struct ValidatorLoopState<'a> {
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) announce_capabilities: bool,
-    pub(super) sandbox: capability_host::SandboxBackend,
+    pub(super) sandbox: Option<capability_host::SandboxBackend>,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     pub(super) rpc_listener: Option<std::net::TcpListener>,
     pub(super) http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
     pub(super) stream_hub: noded::StreamHub,
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
-    pub(super) agent_provisioner: dispatch_oracle::SharedProvisioner,
-    pub(super) cred_resolver: dispatch_oracle::SharedCredentialResolver,
+    pub(super) agent_provisioner: dispatch_host::SharedProvisioner,
+    pub(super) cred_resolver: dispatch_host::SharedCredentialResolver,
     pub(super) agent_dirs: capability_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status: noded::StatusCell,
@@ -380,17 +380,21 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // announced set to nothing — never the reverse). routing and
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
-    let providers = capability_host::discover(
-        signer.public_key().as_ref(),
-        agent_dirs.clone(),
-        Some(stream_hub.run_output().output_sink()),
-        // the operator's `node.toml sandbox` choice: Direct (default) or a
-        // Podman container that enforces this node's announced capacity.
-        sandbox,
-        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-        false,
-    )
-    .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+    // no `node.toml [sandbox]` = no compute plane: nothing is discovered or
+    // announced and the pool below has nothing it could ever spawn — a bare
+    // host spawn is unrepresentable.
+    let providers = match sandbox {
+        Some(backend) => capability_host::discover(
+            signer.public_key().as_ref(),
+            agent_dirs.clone(),
+            Some(stream_hub.run_output().output_sink()),
+            backend,
+            // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+            false,
+        )
+        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+        None => capability_host::ProviderSet::empty(),
+    };
     let my_capabilities = providers.capabilities();
     // OFF-LOOP execution: the pool gates effects inline (lease check —
     // WorkerRequests leased to another node's key are skipped, not

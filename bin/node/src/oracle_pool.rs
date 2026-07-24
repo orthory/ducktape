@@ -1,5 +1,5 @@
 //! off-loop oracle execution for the validator: wires
-//! [`dispatch_oracle::DispatchPool`] into the runtime's background-task lane
+//! [`dispatch_host::DispatchPool`] into the runtime's background-task lane
 //! and the select loop's submit path.
 //!
 //! the pool's gate (lease check, decode, dedup) runs inline where effects
@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_oracle::{
+use dispatch_host::{
     AttemptControl, DeliverFn, DispatchPool, SharedCredentialResolver, SharedProvisioner, SpawnFn,
     SpawnKind, max_concurrent_runs_from_env,
 };

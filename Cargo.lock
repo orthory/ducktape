@@ -2777,7 +2777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd0c93bb4b0c6d9b77f4435b0ae98c24d17f1c45b2ff844c6151a07256ca923b"
 
 [[package]]
-name = "dispatch-oracle"
+name = "dispatch-host"
 version = "0.1.0"
 dependencies = [
  "agent",
@@ -5296,7 +5296,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "directory",
  "dispatch 0.1.0",
- "dispatch-oracle",
+ "dispatch-host",
  "duckdns",
  "duckfs-client",
  "duckfs-core",
@@ -5365,7 +5365,7 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "dispatch 0.1.0",
- "dispatch-oracle",
+ "dispatch-host",
  "duckdns",
  "duckfs-client",
  "duckfs-core",

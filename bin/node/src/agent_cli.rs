@@ -324,7 +324,7 @@ fn cmd_sched(args: SchedArgs, network: Option<&str>) -> AgentResult {
     let dispatch_id = fresh_dispatch_id();
     let saga_id = format!("sched\u{1f}{dispatch_id}");
     let payload =
-        dispatch_oracle::envelope::compose_headless(&saga_id, &args.prompt, Some(&args.cred))
+        dispatch_host::envelope::compose_headless(&saga_id, &args.prompt, Some(&args.cred))
             .into_bytes();
 
     let mut demands = BTreeMap::new();

@@ -2,7 +2,7 @@
 //!
 //! The provider child never receives the operator's API/OAuth credential.
 //! Only this host process reads it, and serves a single-run loopback endpoint
-//! the child dials with an unrelated random bearer. Direct/Podman bind
+//! the child dials with an unrelated random bearer. Podman binds
 //! loopback; Tart binds the host side of its private NAT so the VM can reach it
 //! by a guest-only hostname.
 //!
@@ -297,7 +297,7 @@ pub(crate) struct BrokerEndpoint {
 /// how the provider child reaches this run's broker — which drives BOTH the
 /// bind address and the `base_url` the child is handed.
 ///
-/// `Loopback` is a same-netns child (Direct, or Podman under `--network=host`):
+/// `Loopback` is a same-netns child (Podman under `--network=host`):
 /// bind `127.0.0.1`, hand it `http://127.0.0.1:<port>`.
 ///
 /// `HostGateway(host)` is a child in a SEPARATE netns that reaches the host only
@@ -1594,7 +1594,7 @@ async fn oauth_refresh(
 }
 
 impl RunBroker {
-    /// start the Anthropic Messages broker for a Direct/Podman run (loopback).
+    /// start the Anthropic Messages broker for a Podman run (loopback).
     /// `airlock` is the per-run credential source (a self-host resolution); when
     /// `None` the env boundary then a host credential decide the upstream.
     pub(crate) async fn start_anthropic(airlock: Option<AirlockConfig>) -> Result<Self, String> {

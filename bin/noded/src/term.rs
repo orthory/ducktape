@@ -965,7 +965,7 @@ impl TerminalSessions {
     }
 
     /// whether a sandbox provider set is configured — the host-side admission's
-    /// `no_sandbox` gate. False on a Direct node (no terminal plane image).
+    /// `no_sandbox` gate. False when the node has no compute plane.
     pub fn has_sandbox(&self) -> bool {
         self.0.providers.is_some()
     }
@@ -1031,19 +1031,16 @@ async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool
     }
 }
 
-/// build the sandbox-backed interactive provider set for `backend`. `None` for
-/// `Direct` (interactive requires Podman/Tart — a Direct node simply has no
-/// terminal plane, no fallback); a discovery error is logged and also disables
-/// it. The caller owns backend selection: `bin/node` passes its resolved
-/// `node.toml` backend, `bin/noded` passes [`backend_from_env`].
+/// build the sandbox-backed interactive provider set for `backend`. the
+/// caller owns backend selection — and calls this only when a sandbox is
+/// actually configured: `bin/node` passes its resolved `node.toml` backend,
+/// `bin/noded` passes [`backend_from_env`]'s `Some`. a discovery error is
+/// logged and disables the terminal plane.
 pub fn discover_interactive(
     node_identity: &[u8],
     dirs: AgentDirs,
     backend: SandboxBackend,
 ) -> Option<ProviderSet> {
-    if matches!(backend, SandboxBackend::Direct) {
-        return None;
-    }
     // force_private_net = TRUE: terminal containers host adversarial members, so
     // they must not share the host netns (see capability_host::discover).
     match capability_host::discover(node_identity, dirs, None, backend, true) {
@@ -1055,29 +1052,29 @@ pub fn discover_interactive(
     }
 }
 
-/// derive the interactive sandbox backend from the daemon's env vars
-/// (`DUCKTAPE_SANDBOX_IMAGE` / `DUCKTAPE_SANDBOX_BACKEND`). `Direct` (no
-/// terminal plane) when no image is configured, or the backend name is unknown.
-/// `bin/noded` uses this because it parses no toml; `bin/node` resolves its
-/// backend from `node.toml` instead and passes it to [`discover_interactive`].
-pub fn backend_from_env() -> SandboxBackend {
+/// derive the daemon's sandbox backend from its env vars
+/// (`DUCKTAPE_SANDBOX_IMAGE` / `DUCKTAPE_SANDBOX_BACKEND`). `None` — no
+/// compute plane, no terminal plane — when no image is configured or the
+/// backend name is unknown. `bin/noded` uses this because it parses no toml;
+/// `bin/node` resolves its backend from `node.toml` instead.
+pub fn backend_from_env() -> Option<SandboxBackend> {
     let Ok(image) = std::env::var(SANDBOX_IMAGE_ENV) else {
-        return SandboxBackend::Direct;
+        return None;
     };
     let image = image.trim().to_string();
     if image.is_empty() {
-        return SandboxBackend::Direct;
+        return None;
     }
     match std::env::var(SANDBOX_BACKEND_ENV)
         .ok()
         .as_deref()
         .map(str::trim)
     {
-        None | Some("") | Some("podman") => SandboxBackend::Podman { image },
-        Some("tart") => SandboxBackend::Tart { image },
+        None | Some("") | Some("podman") => Some(SandboxBackend::Podman { image }),
+        Some("tart") => Some(SandboxBackend::Tart { image }),
         Some(other) => {
-            tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; interactive disabled");
-            SandboxBackend::Direct
+            tracing::error!(target: "ducktape::term", backend = other, "unknown sandbox backend; compute plane disabled");
+            None
         }
     }
 }

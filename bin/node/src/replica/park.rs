@@ -164,7 +164,7 @@ pub(super) async fn park(
     checkpoint_blocks: u64,
     sync_index: bool,
     announce_capabilities: bool,
-    sandbox: capability_host::SandboxBackend,
+    sandbox: Option<capability_host::SandboxBackend>,
     sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
@@ -181,8 +181,8 @@ pub(super) async fn park(
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
     blobs: noded::blobs::BlobHandle,
-    agent_provisioner: &dispatch_oracle::SharedProvisioner,
-    cred_resolver: &dispatch_oracle::SharedCredentialResolver,
+    agent_provisioner: &dispatch_host::SharedProvisioner,
+    cred_resolver: &dispatch_host::SharedCredentialResolver,
     agent_dirs: &capability_host::AgentDirs,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -620,17 +620,22 @@ pub(super) async fn park(
     // drained by the park loop's pump pass, so a minutes-long run
     // never stalls the serve window, boundary follow, or promotion
     // detection.
-    let resident_provider_set = capability_host::discover(
-        &me_bytes,
-        agent_dirs.clone(),
-        Some(stream_hub.run_output().output_sink()),
-        // the operator's `node.toml sandbox` choice (Direct or Podman), same
-        // as the validator boot — a resident sandboxes its runs identically.
-        sandbox,
-        // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
-        false,
-    )
-    .unwrap_or_else(|e| panic!("capability specs failed to load: {e}"));
+    // no `node.toml [sandbox]` = no compute plane, same as the validator
+    // boot: nothing discovered, nothing announced, nothing spawnable.
+    let resident_provider_set = match sandbox {
+        Some(backend) => capability_host::discover(
+            &me_bytes,
+            agent_dirs.clone(),
+            Some(stream_hub.run_output().output_sink()),
+            // the operator's `node.toml [sandbox]` runtime, same as the
+            // validator boot — a resident sandboxes its runs identically.
+            backend,
+            // headless: no forced private netns (honors DUCKTAPE_SANDBOX_PRIVATE_NET).
+            false,
+        )
+        .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
+        None => capability_host::ProviderSet::empty(),
+    };
     let resident_capabilities = resident_provider_set.capabilities();
     let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
         me_bytes.clone(),

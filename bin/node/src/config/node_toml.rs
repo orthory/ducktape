@@ -35,8 +35,10 @@ pub const DEFAULT_WIREGUARD_LISTEN: &str = "0.0.0.0:51820";
 ///
 /// Where "unset" is a meaningful state it is an EXPLICIT value, never a
 /// missing key: `"none"` (primary_coordinator, coordinator_relay),
-/// `"auto"` (wireguard_advertised), `0` = probe (sandbox_cores,
-/// sandbox_mem_gb).
+/// `"auto"` (wireguard_advertised), `0` = probe ([sandbox] cores/mem_gb).
+/// the ONE table-level exception is `[sandbox]`: its PRESENCE is the
+/// compute-plane switch (see [`SandboxToml`]), so a consensus-only node
+/// simply has no such table.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeToml {
@@ -81,15 +83,27 @@ pub struct NodeToml {
     /// whether this node publishes its provider set into the capability
     /// registry; `false` = accept-lane-only provider.
     pub announce_capabilities: bool,
-    /// provider run isolation: `"direct"`, `"podman"`, or `"tart"`.
-    pub sandbox: String,
-    /// the provider environment image (used by podman/tart; ignored for
-    /// direct).
-    pub sandbox_image: String,
-    /// announced sandbox capacity; `0` = probe the host.
-    pub sandbox_cores: u64,
-    /// announced sandbox capacity in GiB; `0` = probe the host.
-    pub sandbox_mem_gb: u64,
+    /// the compute plane: PRESENT = provider runs execute in this sandbox;
+    /// ABSENT = consensus-only node (no provider discovery, no announce, no
+    /// terminal plane).
+    pub sandbox: Option<SandboxToml>,
+}
+
+/// the `[sandbox]` compute-plane table. its PRESENCE is what makes a node a
+/// compute node; inside it every key is required. there is deliberately no
+/// bare/"direct" runtime — a provider run never executes directly on the
+/// host, so the only selectable adapters are the audited in-tree ones.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxToml {
+    /// the isolation adapter: `"podman"` or `"tart"`.
+    pub runtime: String,
+    /// the provider environment image the adapter boots.
+    pub image: String,
+    /// announced capacity; `0` = probe the host.
+    pub cores: u64,
+    /// announced capacity in GiB; `0` = probe the host.
+    pub mem_gb: u64,
 }
 
 impl NodeToml {
@@ -131,10 +145,7 @@ pub struct DevSeedToml {
     pub coordinator_relay: Option<String>,
     pub sync_index: Option<bool>,
     pub announce_capabilities: Option<bool>,
-    pub sandbox: Option<String>,
-    pub sandbox_image: Option<String>,
-    pub sandbox_cores: Option<u64>,
-    pub sandbox_mem_gb: Option<u64>,
+    pub sandbox: Option<SandboxToml>,
 }
 
 /// both file shapes, discriminated by the `network` key: PRESENT means the
@@ -204,10 +215,7 @@ pub struct Plumbing {
     pub checkpoint_blocks: u64,
     pub sync_index: bool,
     pub announce_capabilities: bool,
-    pub sandbox: String,
-    pub sandbox_image: String,
-    pub sandbox_cores: u64,
-    pub sandbox_mem_gb: u64,
+    pub sandbox: Option<SandboxToml>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -291,14 +299,7 @@ pub fn merged_plumbing(
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         sync_index: e.map(|r| r.sync_index).unwrap_or(true),
         announce_capabilities: e.map(|r| r.announce_capabilities).unwrap_or(false),
-        sandbox: e
-            .map(|r| r.sandbox.clone())
-            .unwrap_or_else(|| "direct".into()),
-        sandbox_image: e
-            .map(|r| r.sandbox_image.clone())
-            .unwrap_or_else(|| DEFAULT_PODMAN_IMAGE.into()),
-        sandbox_cores: e.map(|r| r.sandbox_cores).unwrap_or(0),
-        sandbox_mem_gb: e.map(|r| r.sandbox_mem_gb).unwrap_or(0),
+        sandbox: e.and_then(|r| r.sandbox.clone()),
         wireguard_listen,
         primary_coordinator,
     })
@@ -379,14 +380,38 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         "false: consensus-only (skip the unverified index warm start on join)");
     keyline(&mut s, "announce_capabilities", format_args!("{}", p.announce_capabilities),
         "true: publish this node's provider set");
-    keyline(&mut s, "sandbox", format_args!("\"{}\"", p.sandbox),
-        "provider run isolation: \"direct\" | \"podman\" | \"tart\"");
-    keyline(&mut s, "sandbox_image", format_args!("\"{}\"", p.sandbox_image),
-        "provider image (podman/tart; unused for direct)");
-    keyline(&mut s, "sandbox_cores", format_args!("{}", p.sandbox_cores),
-        "announced capacity; 0 = probe the host");
-    keyline(&mut s, "sandbox_mem_gb", format_args!("{}", p.sandbox_mem_gb),
-        "announced capacity (GiB); 0 = probe the host");
+    // the [sandbox] table LAST — everything after a toml table header belongs
+    // to the table, so no top-level key may follow it.
+    match &p.sandbox {
+        Some(sb) => {
+            let _ = writeln!(
+                s,
+                "\n# compute plane: provider runs execute inside this sandbox and the node\n\
+                 # can announce capabilities. delete the whole table for a consensus-only node.\n\
+                 [sandbox]"
+            );
+            keyline(&mut s, "runtime", format_args!("\"{}\"", sb.runtime),
+                "isolation adapter: \"podman\" | \"tart\" (runs never execute bare on the host)");
+            keyline(&mut s, "image", format_args!("\"{}\"", sb.image),
+                "the provider environment image");
+            keyline(&mut s, "cores", format_args!("{}", sb.cores),
+                "announced capacity; 0 = probe the host");
+            keyline(&mut s, "mem_gb", format_args!("{}", sb.mem_gb),
+                "announced capacity (GiB); 0 = probe the host");
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
+                 # runtime: \"podman\" | \"tart\" — runs never execute bare on the host.\n\
+                 #[sandbox]\n\
+                 #runtime = \"podman\"\n\
+                 #image = \"{DEFAULT_PODMAN_IMAGE}\"\n\
+                 #cores = 0\n\
+                 #mem_gb = 0"
+            );
+        }
+    }
     let path = dir.join("node.toml");
     std::fs::write(&path, s).map_err(|e| format!("write {path:?}: {e}"))?;
     Ok(path)
@@ -436,10 +461,9 @@ mod tests {
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
         assert!(raw.sync_index);
         assert!(!raw.announce_capabilities);
-        assert_eq!(raw.sandbox, "direct");
-        assert_eq!(raw.sandbox_image, DEFAULT_PODMAN_IMAGE);
-        assert_eq!(raw.sandbox_cores, 0);
-        assert_eq!(raw.sandbox_mem_gb, 0);
+        // no [sandbox] table by default: a fresh node is consensus-only, and
+        // the commented example in the file must not parse as a live table.
+        assert_eq!(raw.sandbox, None);
     }
 
     /// nothing optional: a file missing ANY key refuses to parse, and the
@@ -517,16 +541,16 @@ mod tests {
         let edited = std::fs::read_to_string(dir.join("node.toml"))
             .expect("read")
             .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
-            .replace("sandbox = \"direct\"", "sandbox = \"podman\"")
-            .replace("sandbox_cores = 0", "sandbox_cores = 4");
+            + "\n[sandbox]\nruntime = \"podman\"\nimage = \"img\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
         let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
             .expect("merge");
         write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
         assert_eq!(raw.checkpoint_blocks, 7);
-        assert_eq!(raw.sandbox, "podman");
-        assert_eq!(raw.sandbox_cores, 4);
+        let sandbox = raw.sandbox.expect("hand-added [sandbox] survives rewrite");
+        assert_eq!(sandbox.runtime, "podman");
+        assert_eq!(sandbox.cores, 4);
     }
 
     /// the dev-seed shape parses through the same loader, discriminated by

@@ -10,10 +10,11 @@
 //! `[interactive]` TUI argv (not `[invoke]`'s headless one), and the child's
 //! stdio is a pty the host holds the master of, not pipes.
 //!
-//! **Podman only.** The `Direct` backend has no mount namespace and no fresh
-//! HOME, so an interactive session on it would expose the operator's whole home
-//! to whoever is typing — the exact thing the sandbox exists to prevent. So
-//! [`CliProvider::spawn_interactive_session`] refuses anything but Podman; the
+//! **Sandboxed only.** A bare spawn would have no mount namespace and no fresh
+//! HOME, so an interactive session outside the sandbox would expose the
+//! operator's whole home
+//! to whoever is typing — the exact thing the sandbox exists to prevent, and
+//! exactly why [`crate::SandboxBackend`] cannot express one; the
 //! pty primitive underneath ([`InteractiveSession::spawn_on_pty`]) is backend
 //! agnostic only so its behavior can be unit-tested against a plain local child.
 //!
@@ -110,7 +111,7 @@ impl InteractiveSession {
     /// OWN machine to capture the operator's OWN credential, so there is nothing
     /// to isolate — no foreign code, no lent credential, no shared filesystem to
     /// fence. Every OTHER interactive session (a lent agent run) MUST go through
-    /// [`CliProvider::spawn_interactive_session`], which refuses `Direct` and
+    /// [`CliProvider::spawn_interactive_session`], which
     /// keeps the broker/config-home/sandbox isolation.
     pub fn spawn_local(command: tokio::process::Command) -> Result<Self, String> {
         Self::spawn_on_pty(command, None, None, None, None)
@@ -225,9 +226,9 @@ impl InteractiveSession {
 }
 
 impl CliProvider {
-    /// spawn this capability's interactive TUI on a pty. Requires a SANDBOX
-    /// backend (Podman or Tart) — `Direct` has no mount namespace / fresh HOME
-    /// and is refused — and a spec with an `[interactive]` argv. The isolation is
+    /// spawn this capability's interactive TUI on a pty, inside the provider's
+    /// sandbox backend (Podman or Tart), from a spec with an `[interactive]`
+    /// argv. The isolation is
     /// the headless path's (a broker holding the credential, a fresh config home,
     /// the container/VM fence); only the argv and the stdio (pty, not pipes)
     /// differ. Podman keeps the container lifecycle on the pty child itself; Tart
@@ -238,13 +239,6 @@ impl CliProvider {
         ctx: &RunContext,
         restricted: bool,
     ) -> Result<InteractiveSession, String> {
-        if matches!(self.backend, SandboxBackend::Direct) {
-            return Err(format!(
-                "{}: interactive sessions require a sandbox backend (Podman or Tart); \
-                 this node runs Direct",
-                self.spec.tag
-            ));
-        }
         let Some(interactive) = self.spec.interactive.clone() else {
             return Err(format!(
                 "{}: this capability declares no [interactive] argv",
@@ -305,7 +299,10 @@ impl CliProvider {
                 command.current_dir(&workdir);
                 InteractiveSession::spawn_on_pty(command, None, Some(guard), broker, config_home)
             }
-            SandboxBackend::Direct => unreachable!("Direct is refused above"),
+            #[cfg(test)]
+            SandboxBackend::Bare => {
+                unreachable!("interactive sessions never run under the bare test harness")
+            }
         }
     }
 }

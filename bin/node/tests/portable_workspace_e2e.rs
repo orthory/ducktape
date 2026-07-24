@@ -69,6 +69,11 @@ struct PortableProvider {
     spec_dir: PathBuf,
     env_var: String,
     script: PathBuf,
+    /// the provider NODE's `$HOME` — a fixture dir, so the spec's
+    /// `[sandbox] rw_dirs = ["portable-logs"]` (home-relative by rule) makes
+    /// the log dir the ONE host↔sandbox rw seam: the script inside podman
+    /// writes the same absolute paths the host-side assertions read.
+    home: PathBuf,
     cwd_log: PathBuf,
     chain_log: PathBuf,
     skills_log: PathBuf,
@@ -80,13 +85,16 @@ impl PortableProvider {
         let dir = root.join("portable-provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let cwd_log = dir.join("cwd.log");
-        let chain_log = dir.join("chain.log");
-        let skills_log = dir.join("skills.log");
+        let home = dir.join("home");
+        let logs = home.join("portable-logs");
+        std::fs::create_dir_all(&logs).expect("provider log dir");
+        let cwd_log = logs.join("cwd.log");
+        let chain_log = logs.join("chain.log");
+        let skills_log = logs.join("skills.log");
         // what the MODEL was actually handed: the assembled context document
         // (the soul) plus the run's input. the old script piped stdin to
         // /dev/null, which is exactly why a prompt could go missing unnoticed.
-        let prompt_log = dir.join("prompt.log");
+        let prompt_log = logs.join("prompt.log");
         let script = dir.join("provider.sh");
         std::fs::write(
             &script,
@@ -141,7 +149,9 @@ impl PortableProvider {
                  prompt = \"stdin\"\n\
                  timeout_secs = 30\n\
                  [output]\n\
-                 format = \"text\"\n"
+                 format = \"text\"\n\
+                 [sandbox]\n\
+                 rw_dirs = [\"portable-logs\"]\n"
             ),
         )
         .expect("write provider spec");
@@ -150,6 +160,7 @@ impl PortableProvider {
             spec_dir,
             env_var,
             script,
+            home,
             cwd_log,
             chain_log,
             skills_log,
@@ -164,6 +175,9 @@ impl PortableProvider {
                 self.spec_dir.display().to_string(),
             ),
             (self.env_var.clone(), self.script.display().to_string()),
+            // the node's HOME anchors the spec's home-relative rw_dirs at the
+            // fixture log dir — the sanctioned rw seam into the sandbox.
+            ("HOME".into(), self.home.display().to_string()),
         ]
     }
 
@@ -194,6 +208,28 @@ impl PortableProvider {
     fn prompts(&self) -> String {
         std::fs::read_to_string(&self.prompt_log).unwrap_or_default()
     }
+}
+
+/// providers spawn only inside a sandbox now, so this e2e needs a working
+/// podman; skip loudly without one, exactly like `remote_session`.
+fn podman_available() -> bool {
+    std::process::Command::new("podman")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// the `[sandbox]` table each cluster node boots with — appended LAST to the
+/// generated toml (nothing may follow a toml table header).
+fn sandbox_toml() -> Vec<String> {
+    vec![
+        "[sandbox]".into(),
+        "runtime = \"podman\"".into(),
+        "image = \"docker.io/library/node:22-slim\"".into(),
+        "cores = 0".into(),
+        "mem_gb = 0".into(),
+    ]
 }
 
 /// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
@@ -328,6 +364,13 @@ fn artifact_stat(cluster: &Cluster, idx: usize) -> Option<u64> {
 
 #[test]
 fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
+    if !podman_available() {
+        eprintln!(
+            "skipping a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace: \
+             no working podman"
+        );
+        return;
+    }
     let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     let provider = PortableProvider::stage(fixtures.path());
@@ -341,8 +384,12 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
     // serving is opt-in now (default OFF): this test needs node 1 in the
-    // rendezvous pool, so every node opts in.
+    // rendezvous pool, so every node opts in. the [sandbox] table comes LAST
+    // (nothing may follow a toml table header) — every node boots a podman
+    // compute plane; nodes 0/2 stay hermetic (empty spec dir → nothing
+    // discovered or announced).
     cluster.extra_toml.push("announce_capabilities = true".into());
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),
@@ -472,7 +519,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     );
     // GAP 2, end to end: the agent HAS the library read cap, so the document
     // tells it the library exists and names the tools that open it. an agent
-    // without the cap is never told (proved in dispatch_oracle::soul).
+    // without the cap is never told (proved in dispatch_host::soul).
     assert!(
         prompt.contains("## The shared skill library"),
         "a library-granted agent is told the library is there: {prompt}"

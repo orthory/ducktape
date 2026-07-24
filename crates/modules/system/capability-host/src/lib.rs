@@ -22,9 +22,9 @@
 //!     dir crosses into the sandbox and the credential DOES enter the child.
 //!     claude is here, until an Anthropic-side broker exists.
 //!
-//! orthogonally, [`SandboxBackend`] decides HOW the child is spawned (Direct,
-//! or a resource-capped Podman/Tart jail). the two compose: codex under Podman
-//! gets the broker AND the jail.
+//! orthogonally, [`SandboxBackend`] decides HOW the child is spawned (a
+//! resource-capped Podman container or a Tart VM — never bare on the host).
+//! the two compose: codex under Podman gets the broker AND the jail.
 //!
 //! ## executors are data: the capability spec
 //!
@@ -113,10 +113,13 @@ const PROVIDER_CONTROL_TOKEN_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 
 /// the upstream credential env vars a broker takes over. the HOST reads these;
 /// the child must not see them, or it would dial the provider directly and walk
-/// straight past the broker. Removed whenever ANY broker is active (removing an
-/// unrelated provider's key is harmless); covers both the OpenAI (codex) and
+/// straight past the broker. a sandbox backend's env is an ALLOWLIST, so they
+/// never enter a real run; only the test-only bare harness inherits the parent
+/// env and must actively remove them (which is exactly what the tests pin).
+/// covers both the OpenAI (codex) and
 /// Anthropic (claude) upstreams. `ANTHROPIC_AUTH_TOKEN` is NOT here: the broker
 /// sets it to the opaque run bearer, so it must survive into the child.
+#[cfg(test)]
 const UPSTREAM_CREDENTIAL_ENV: [&str; 3] =
     ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"];
 
@@ -246,12 +249,12 @@ pub struct RunContext {
     /// cancelled (runs to completion); cancelling the token terminates the
     /// provider process tree and any managed Podman container.
     pub cancellation: Option<RunCancellation>,
-    /// canonical [`execution_node_id`] of the node running this attempt. Direct
-    /// runs may omit it; Podman requires it so lifecycle cleanup can never
+    /// canonical [`execution_node_id`] of the node running this attempt.
+    /// Podman requires it so lifecycle cleanup can never
     /// cross into another Ducktape node sharing the same rootless user.
     pub executing_node: Option<String>,
     /// an already-materialized workspace this specific run must execute in.
-    /// set only by the provisioning wrapper (`dispatch-oracle::bind_workspace`)
+    /// set only by the provisioning wrapper (`dispatch-host::bind_workspace`)
     /// after a successful per-run duckfs checkout — never a consensus-supplied
     /// path (D7). when set, the provider's cwd is the evidence-backed
     /// workspace; an unusable mount fails the run (W1), never falls back to
@@ -267,8 +270,7 @@ pub struct RunContext {
     /// dimension (`cores`, `mem_gb`, ...). the pool fills this before
     /// `provider.run`; under a `Podman` backend the dimensions this backend
     /// knows how to enforce become container limit flags, the rest are inert
-    /// (scheduling already matched them). Default empty — a Direct backend
-    /// ignores it entirely.
+    /// (scheduling already matched them). Default empty.
     pub limits: BTreeMap<String, u64>,
     /// true for portable v3 runs: native CLI sessions are host-local
     /// optimizations and must not be resumed or captured for portable state.
@@ -399,10 +401,10 @@ impl ProviderSet {
         Self { specs, providers }
     }
 
-    /// no specs, no providers — the "nothing installed, nothing loaded" test
-    /// seam. every resolve() fails with a clean error.
-    #[cfg(test)]
-    pub(crate) fn empty() -> Self {
+    /// no specs, no providers — a consensus-only node's provider set (no
+    /// configured sandbox means nothing to spawn in, so nothing is
+    /// discovered or announced). every resolve() fails with a clean error.
+    pub fn empty() -> Self {
         Self {
             specs: SpecSet::from_specs(Vec::new()),
             providers: Vec::new(),
@@ -529,7 +531,7 @@ pub(crate) struct CliProvider {
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
     output_sink: Option<OutputSink>,
-    /// how the child is spawned: `Direct`, rootless `Podman`, or an ephemeral
+    /// how the child is spawned: rootless `Podman` or an ephemeral
     /// Tart VM. set once at discovery for the whole provider set.
     backend: SandboxBackend,
     /// (Podman only) give the container a PRIVATE netns instead of `--network=host`,
@@ -542,9 +544,11 @@ pub(crate) struct CliProvider {
 }
 
 impl CliProvider {
-    /// the general constructor: any spec, any resolved binary. the timeout
-    /// starts at the spec's `timeout_secs`.
-    pub fn from_spec(spec: CapabilitySpec, bin: PathBuf) -> Self {
+    /// the general constructor: any spec, any resolved binary, and the
+    /// sandbox adapter every run of this provider spawns through — required
+    /// up front because there is no bare default to fall back to. the
+    /// timeout starts at the spec's `timeout_secs`.
+    pub fn from_spec(spec: CapabilitySpec, bin: PathBuf, backend: SandboxBackend) -> Self {
         let workdir = std::env::temp_dir().join(format!(
             "ducktape-provider-{}-{}",
             spec.tag,
@@ -558,7 +562,7 @@ impl CliProvider {
             timeout,
             dirs: AgentDirs::default(),
             output_sink: None,
-            backend: SandboxBackend::Direct,
+            backend,
             private_net: false,
         }
     }
@@ -566,11 +570,6 @@ impl CliProvider {
     #[cfg(test)]
     pub(crate) fn with_workdir(mut self, workdir: PathBuf) -> Self {
         self.workdir = workdir;
-        self
-    }
-
-    pub fn with_backend(mut self, backend: SandboxBackend) -> Self {
-        self.backend = backend;
         self
     }
 
@@ -623,7 +622,6 @@ impl CliProvider {
         // was substituted host-side with an executor-minted id, never job
         // content) — so nothing in a job can inject flags or commands.
         let (mut command, podman) = match &self.backend {
-            SandboxBackend::Direct => (self.direct_command(&args, ctx, auth)?, None),
             SandboxBackend::Podman { image } => {
                 let (command, run) =
                     self.podman_command(image, &args, workdir, ctx, auth, false)?;
@@ -631,10 +629,12 @@ impl CliProvider {
             }
             // Tart has a multi-process lifecycle (clone/set/boot, then SSH), so
             // [`Self::invoke`] constructs it before reaching this single-child
-            // Direct/Podman command seam.
+            // command seam.
             SandboxBackend::Tart { .. } => {
                 return Err("internal error: Tart command bypassed its VM lifecycle".into());
             }
+            #[cfg(test)]
+            SandboxBackend::Bare => (self.bare_command(&args, ctx, auth)?, None),
         };
         command
             .current_dir(workdir)
@@ -647,23 +647,16 @@ impl CliProvider {
         Ok(PreparedCommand { command, podman })
     }
 
-    /// the plain host spawn: the spec's binary with the spec's argv and an
-    /// ADDITIVE env overlay (the inherited environment plus this run's scoped
-    /// `ctx.env` / PATH bindings, plus [`Self::apply_auth_env`]). providers run
-    /// the claude/codex CLI HEADLESS, so a CLI with no broker reads its OWN
-    /// credentials from the ambient env or a dotfile under HOME (~/.claude) —
-    /// the child MUST inherit that environment or it cannot authenticate.
-    ///
-    /// D7 isolation floor — the env half: hiding the node's ambient secrets
-    /// (HOME => ~/.ducktape/user.key, DUCKTAPE_*, the data dir) from the child
-    /// WITHOUT also hiding the operator's CLI credentials (same HOME) cannot be
-    /// done with `env_clear` alone — it needs an enforcement MECHANISM. The
-    /// `Podman` backend IS that mechanism (a fresh mount namespace exposing
-    /// only the spec's `[sandbox] rw_dirs` under HOME); under `Direct` the
-    /// ACTIVE D7 measure remains the WORKSPACE RELOCATION (a portable run's cwd
-    /// is the provisioner's per-run mount OUTSIDE <storage>, so a `..` from the
-    /// cwd no longer reaches the key tree).
-    fn direct_command(
+    /// the test-harness spawn ([`SandboxBackend::Bare`]): the spec's binary
+    /// with the spec's argv and an ADDITIVE env overlay (the inherited
+    /// environment plus this run's scoped `ctx.env` / PATH bindings, plus
+    /// [`Self::apply_auth_env`]). exists so the run loop's env/auth/session
+    /// contracts stay unit-testable without a container runtime; a shipped
+    /// binary has no bare spawn — the sandbox backend (fresh mount namespace,
+    /// only the spec's `[sandbox] rw_dirs` under HOME) is the D7 isolation
+    /// mechanism on every real node.
+    #[cfg(test)]
+    fn bare_command(
         &self,
         args: &[String],
         ctx: &RunContext,
@@ -871,8 +864,7 @@ impl CliProvider {
     /// the provisioner materializes the skill ro-mounts at a SIBLING of the rw
     /// checkout (`<slug>-ro/<name>` — deliberately OUTSIDE the workdir, so
     /// `commit` never scans them) and points the child at it with
-    /// [`SKILLS_ROOT_ENV`]. under Direct that env is the whole mechanism: the
-    /// path is right there on the host. inside a container/VM only what we mount
+    /// [`SKILLS_ROOT_ENV`]. inside a container/VM only what we mount
     /// exists — so without this the agent's own skills would be a DANGLING path:
     /// the env var set, the directory simply absent.
     ///
@@ -895,14 +887,13 @@ impl CliProvider {
         {
             paths.push(doc);
         }
-        if matches!(self.backend, SandboxBackend::Direct) {
-            Ok(paths)
-        } else {
-            paths
-                .into_iter()
-                .map(|path| canonical_mount_path(&path, "sandbox read-only mount"))
-                .collect()
+        if self.backend.is_bare_test() {
+            return Ok(paths);
         }
+        paths
+            .into_iter()
+            .map(|path| canonical_mount_path(&path, "sandbox read-only mount"))
+            .collect()
     }
 
     /// where this run's assembled context doc lands — the spec's [`ContextLocation`]
@@ -1043,7 +1034,7 @@ impl CliProvider {
     /// serves an endpoint the child dials with an opaque per-run bearer; dropping
     /// it (any exit path of [`Self::run_output`]) tears the endpoint down. Tart
     /// binds the host side of its private NAT; the guest plan maps that gateway
-    /// to `ducktape-host`. Direct/Podman remain loopback-only.
+    /// to `ducktape-host`. Podman remains loopback-only.
     /// `airlock` is the per-run credential source — the narrowest seam that
     /// reaches broker construction (RunAuth is built AFTER the broker, from its
     /// endpoint, so it cannot carry this). `Some` pins a consensus-resolved
@@ -1090,8 +1081,8 @@ impl CliProvider {
     /// CLI cannot read the operator's real one), the way the child reaches the
     /// broker (codex: an opaque model bearer + its separately-scoped
     /// provider-control capability; claude: ANTHROPIC_BASE_URL + the opaque
-    /// bearer). `set` is how the caller applies one binding — a `Command` env for
-    /// Direct, or the Podman process environment behind a value-free `-e K`.
+    /// bearer). `set` is how the caller applies one binding — the Podman
+    /// process environment behind a value-free `-e K`.
     ///
     /// NOTE what is NOT here: the credential itself. that is the whole point —
     /// the host holds it and the broker spends it, so there is nothing to pass.
@@ -1169,7 +1160,7 @@ impl CliProvider {
     /// The complete Tart lifecycle up to a guest ready for work: concurrency
     /// permit, COW clone, `tart set`, headless boot with virtiofs mounts,
     /// `tart ip --wait`, and a real SSH readiness probe. Every failure after
-    /// clone is guarded by stop/delete cleanup; there is no Direct fallback.
+    /// clone is guarded by stop/delete cleanup; there is no bare fallback.
     async fn tart_setup(
         &self,
         plan: Option<&sandbox::TartPlan>,
@@ -1345,13 +1336,13 @@ impl CliProvider {
     }
 
     /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
-    /// or `None` when the run adds no entries. shared by both backends (Direct
-    /// sets it as the child's PATH env; Podman exports it via `-e PATH`).
+    /// or `None` when the run adds no entries. Podman exports it via `-e PATH`;
+    /// the test-only bare harness sets it as the child's PATH env.
     fn run_path(&self, ctx: &RunContext) -> Result<Option<OsString>, String> {
         if ctx.path_entries.is_empty() {
             return Ok(None);
         }
-        let mut path = if matches!(self.backend, SandboxBackend::Direct) {
+        let mut path = if self.backend.is_bare_test() {
             ctx.path_entries.clone()
         } else {
             ctx.path_entries
@@ -1390,7 +1381,7 @@ impl CliProvider {
     /// resolve the run's cwd to a per-run WRITABLE directory, creating it.
     ///
     /// a `workdir_override` is a workspace the provisioner ALREADY materialized
-    /// (the only setter is `dispatch-oracle`'s `bind_workspace`, after a
+    /// (the only setter is `dispatch-host`'s `bind_workspace`, after a
     /// successful checkout — the envelope itself carries no host path, D7). if
     /// creating it fails, the run must FAIL so the saga can retry elsewhere:
     /// falling back would silently execute the run in `self.workdir` — a single
@@ -3571,7 +3562,7 @@ impl CliProvider {
             return Err(format!("{} cancelled before start", self.bin.display()));
         }
         let workdir = self.ensure_writable_workdir(ctx)?;
-        let workdir = if matches!(self.backend, SandboxBackend::Direct) {
+        let workdir = if self.backend.is_bare_test() {
             workdir
         } else {
             canonical_mount_path(&workdir, "sandbox workdir")?
@@ -3953,7 +3944,7 @@ fn discover_with(
         global_timeout,
         dirs,
         None,
-        SandboxBackend::Direct,
+        SandboxBackend::Bare,
         false,
     )
 }
@@ -3982,9 +3973,8 @@ fn discover_with_sink(
             continue;
         };
         for spec in group {
-            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone())
+            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone(), backend.clone())
                 .with_agent_dirs(dirs.clone())
-                .with_backend(backend.clone())
                 .with_private_net(private_net);
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
@@ -4029,7 +4019,7 @@ fn resolve_bin(
         .find(|candidate| is_executable(candidate))
 }
 
-fn is_executable(p: &Path) -> bool {
+pub(crate) fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     p.is_file()
         && std::fs::metadata(p)
@@ -4114,7 +4104,8 @@ format = "{format}"
     /// script it reads as data.
     fn sh_provider(mut spec: CapabilitySpec, script: PathBuf, wd: &str) -> CliProvider {
         spec.args.insert(0, script.display().to_string());
-        CliProvider::from_spec(spec, PathBuf::from("/bin/sh")).with_workdir(scratch(wd))
+        CliProvider::from_spec(spec, PathBuf::from("/bin/sh"), SandboxBackend::Bare)
+            .with_workdir(scratch(wd))
     }
 
     fn mock_provider(tag: &str, format: &str, script: PathBuf, wd: &str) -> CliProvider {
@@ -4535,10 +4526,13 @@ format = "{format}"
         let workdir = root.join("wd");
         std::fs::write(&bin, b"pod").unwrap();
         std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(sandbox_spec("pod"), bin)
-            .with_backend(SandboxBackend::Podman {
+        let provider = CliProvider::from_spec(
+            sandbox_spec("pod"),
+            bin,
+            SandboxBackend::Podman {
                 image: "img".into(),
-            });
+            },
+        );
         let error = match provider.command(
             &[],
             &workdir,
@@ -4580,11 +4574,14 @@ rw_dirs = ["~/.claude"]
         let workdir = root.join("wd");
         std::fs::write(&bin, b"pod").unwrap();
         std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(spec, bin.clone())
-            .with_backend(SandboxBackend::Podman {
+        let provider = CliProvider::from_spec(
+            spec,
+            bin.clone(),
+            SandboxBackend::Podman {
                 image: "img".into(),
-            })
-            .with_private_net(true);
+            },
+        )
+        .with_private_net(true);
         let ctx = RunContext {
             env: BTreeMap::from([
                 ("RUN_SECRET".to_string(), "not-in-argv".to_string()),
@@ -4704,9 +4701,13 @@ format = "text"
         std::fs::write(&bin, b"vm").unwrap();
         let workdir = root.join("work");
         std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(spec, bin).with_backend(SandboxBackend::Tart {
-            image: "ghcr.io/example/macos-base:latest".into(),
-        });
+        let provider = CliProvider::from_spec(
+            spec,
+            bin,
+            SandboxBackend::Tart {
+                image: "ghcr.io/example/macos-base:latest".into(),
+            },
+        );
         let ctx = RunContext {
             limits: BTreeMap::from([("mem_gb".to_string(), 4u64)]),
             env: BTreeMap::from([(
@@ -4765,8 +4766,7 @@ format = "text"
 printf '%s' "$prompt" > sandbox-marker.txt
 printf 'sandbox-ok:%s' "$prompt""#,
         );
-        let provider =
-            CliProvider::from_spec(sandbox_spec("hardware-smoke"), bin).with_backend(backend);
+        let provider = CliProvider::from_spec(sandbox_spec("hardware-smoke"), bin, backend);
         let ctx = RunContext {
             workdir_override: Some(workdir.clone()),
             limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
@@ -4816,7 +4816,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
     fn a_sandboxed_run_mounts_its_skills_tree_read_only_when_it_has_one() {
         // W6 skills live at a SIBLING of the rw checkout (outside the workdir, so
         // `commit` never scans them), and the provisioner tells the child where
-        // via DUCKTAPE_RUN_SKILLS. under Direct the env alone works — the path is
+        // via DUCKTAPE_RUN_SKILLS. under the bare test harness the env alone works — the path is
         // on the host. under a sandbox, only what we mount exists, so without the
         // mount the agent would find its own skills dir simply MISSING.
         let root = scratch("podman-skills-mount");
@@ -4826,10 +4826,13 @@ printf 'sandbox-ok:%s' "$prompt""#,
         std::fs::write(&bin, b"pod").unwrap();
         std::fs::create_dir_all(&workdir).unwrap();
         std::fs::create_dir_all(&skills).unwrap();
-        let provider = CliProvider::from_spec(sandbox_spec("pod"), bin)
-            .with_backend(SandboxBackend::Podman {
+        let provider = CliProvider::from_spec(
+            sandbox_spec("pod"),
+            bin,
+            SandboxBackend::Podman {
                 image: "img".into(),
-            });
+            },
+        );
         let ctx = RunContext {
             env: BTreeMap::from([(
                 SKILLS_ROOT_ENV.to_string(),
@@ -4862,10 +4865,13 @@ printf 'sandbox-ok:%s' "$prompt""#,
         let workdir = root.join("wd");
         std::fs::write(&bin, b"pod").unwrap();
         std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(sandbox_spec("pod"), bin)
-            .with_backend(SandboxBackend::Podman {
+        let provider = CliProvider::from_spec(
+            sandbox_spec("pod"),
+            bin,
+            SandboxBackend::Podman {
                 image: "img".into(),
-            });
+            },
+        );
         let cmd = provider
             .command(&[], &workdir, &podman_ctx(), &RunAuth::default())
             .expect("podman command builds");
@@ -5020,10 +5026,10 @@ format = "text"
         let provider = CliProvider::from_spec(
             spec_with("pod", "[context]\npath = \"workspace-parent:CLAUDE.md\"\n"),
             bin.clone(),
-        )
-        .with_backend(SandboxBackend::Podman {
-            image: "img".into(),
-        });
+            SandboxBackend::Podman {
+                image: "img".into(),
+            },
+        );
         let cmd = provider
             .command(&[], &workdir, &ctx, &RunAuth::default())
             .expect("podman command builds");
@@ -5042,10 +5048,10 @@ format = "text"
                  [context]\npath = \"config-home:AGENTS.md\"\n",
             ),
             bin,
-        )
-        .with_backend(SandboxBackend::Podman {
-            image: "img".into(),
-        });
+            SandboxBackend::Podman {
+                image: "img".into(),
+            },
+        );
         let config_home = workdir.join(".ducktape-run/slot/provider-config");
         std::fs::create_dir_all(&config_home).unwrap();
         let auth = RunAuth {
@@ -5126,9 +5132,9 @@ broker = "anthropic-messages"
     async fn every_backend_accepts_the_credential_broker_shape() {
         // A missing host credential may still fail startup, but no backend is
         // structurally rejected: Tart now exposes the broker through its NAT
-        // gateway while Direct/Podman retain loopback.
+        // gateway while Podman retains loopback.
         for backend in [
-            SandboxBackend::Direct,
+            SandboxBackend::Bare,
             SandboxBackend::Podman {
                 image: "img".into(),
             },
@@ -5136,8 +5142,8 @@ broker = "anthropic-messages"
                 image: "ghcr.io/example/macos-base:latest".into(),
             },
         ] {
-            let provider = CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"))
-                .with_backend(backend.clone());
+            let provider =
+                CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"), backend.clone());
             if let Err(e) = provider.start_broker(None).await {
                 assert!(
                     !e.contains("cannot host a credential broker"),
@@ -5152,7 +5158,11 @@ broker = "anthropic-messages"
         // what the child gets: a base URL, an opaque bearer, and a fresh config
         // home. what it does NOT get: the credential — which is why the argv is
         // rewritten to point at the broker at all.
-        let provider = CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"));
+        let provider = CliProvider::from_spec(
+            broker_spec("c"),
+            PathBuf::from("/usr/bin/c"),
+            SandboxBackend::Bare,
+        );
         let endpoint = broker::BrokerEndpoint {
             base_url: "http://127.0.0.1:54321/v1".into(),
             run_bearer: "opaque-run-bearer".into(),
@@ -5218,7 +5228,7 @@ broker = "anthropic-messages"
             !joined.contains("opaque-control-token"),
             "the control credential stays out of argv: {joined}"
         );
-        // and the upstream credential is REMOVED, not merely unset: a Direct child
+        // and the upstream credential is REMOVED, not merely unset: a bare child
         // inherits this process's env, and one that still saw OPENAI_API_KEY would
         // dial OpenAI directly, straight past the broker holding it.
         assert_eq!(
@@ -5233,7 +5243,11 @@ broker = "anthropic-messages"
         // BYO providers get no model-provider splice or bearer. Reserved
         // control lookalikes are actively removed from the inherited env so a
         // stale operator value cannot turn into authority for another run.
-        let provider = CliProvider::from_spec(sandbox_spec("plain"), PathBuf::from("/usr/bin/x"));
+        let provider = CliProvider::from_spec(
+            sandbox_spec("plain"),
+            PathBuf::from("/usr/bin/x"),
+            SandboxBackend::Bare,
+        );
         let cmd = provider
             .command(
                 &["run".into()],
@@ -5264,7 +5278,11 @@ broker = "anthropic-messages"
 
     #[test]
     fn sandbox_context_cannot_supply_reserved_control_env() {
-        let provider = CliProvider::from_spec(sandbox_spec("plain"), PathBuf::from("/usr/bin/x"));
+        let provider = CliProvider::from_spec(
+            sandbox_spec("plain"),
+            PathBuf::from("/usr/bin/x"),
+            SandboxBackend::Bare,
+        );
         let mut ctx = RunContext::default();
         ctx.env
             .insert(PROVIDER_CONTROL_URL_ENV.into(), "http://foreign".into());
@@ -5285,7 +5303,11 @@ broker = "anthropic-messages"
         // entirely by env — base URL, opaque bearer, fresh config home, plus the
         // hardening vars that keep Claude Code from dialing out around the broker.
         let provider =
-            CliProvider::from_spec(anthropic_broker_spec("cl"), PathBuf::from("/usr/bin/cl"));
+            CliProvider::from_spec(
+            anthropic_broker_spec("cl"),
+            PathBuf::from("/usr/bin/cl"),
+            SandboxBackend::Bare,
+        );
         let endpoint = broker::BrokerEndpoint {
             // NOTE: no `/v1` — ANTHROPIC_BASE_URL is the API root.
             base_url: "http://127.0.0.1:54321".into(),
@@ -5337,7 +5359,7 @@ broker = "anthropic-messages"
         // the codex bearer var is NOT set for a claude broker.
         assert_eq!(envs.get(BROKER_TOKEN_ENV), None);
         // and the inherited Anthropic credential is REMOVED, not merely unset: a
-        // Direct child that still saw it would dial api.anthropic.com directly,
+        // bare child that still saw it would dial api.anthropic.com directly,
         // straight past the broker holding the real credential.
         assert_eq!(
             envs.get("ANTHROPIC_API_KEY"),
@@ -6088,7 +6110,7 @@ format = "text"
             "test",
         )
         .unwrap();
-        let p = CliProvider::from_spec(spec.clone(), PathBuf::from("/x"));
+        let p = CliProvider::from_spec(spec.clone(), PathBuf::from("/x"), SandboxBackend::Bare);
         assert_eq!(p.timeout, Duration::from_secs(42), "spec seeds the timeout");
 
         let dir = scratch("global-timeout");
@@ -6523,7 +6545,7 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"fine"}}\
     #[test]
     fn portable_and_nonportable_use_the_same_additive_env_overlay() {
         let spec = mock_spec("iso", "iso-cli", "text");
-        let p = CliProvider::from_spec(spec, PathBuf::from("/bin/true"));
+        let p = CliProvider::from_spec(spec, PathBuf::from("/bin/true"), SandboxBackend::Bare);
         let workdir = scratch("iso-portable-wd");
 
         let mut env = BTreeMap::new();

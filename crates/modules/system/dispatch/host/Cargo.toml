@@ -1,5 +1,5 @@
 [package]
-name = "dispatch-oracle"
+name = "dispatch-host"
 edition.workspace = true
 version.workspace = true
 
