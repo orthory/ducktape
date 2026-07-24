@@ -3512,6 +3512,116 @@ fn parse_user_key_status(status: &str) -> Option<Vec<u8>> {
     public_key(key, "local user key").ok()
 }
 
+/// The client-local UI prefs file (doc tabs, per-endpoint) — sibling to the
+/// user key: `$DUCKTAPE_HOME/app-prefs.json`, else `~/.ducktape/app-prefs.json`.
+/// Never wire state: purely this device's view preferences.
+fn prefs_path() -> Option<PathBuf> {
+    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
+        return Some(PathBuf::from(root).join("app-prefs.json"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".ducktape/app-prefs.json"))
+}
+
+fn read_prefs() -> serde_json::Value {
+    let Some(path) = prefs_path() else {
+        return serde_json::json!({});
+    };
+    std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_prefs(prefs: &serde_json::Value) -> bool {
+    let Some(path) = prefs_path() else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(bytes) = serde_json::to_vec_pretty(prefs) else {
+        return false;
+    };
+    std::fs::write(&path, bytes).is_ok()
+}
+
+/// This endpoint's persisted doc tabs (open page ids, in open order).
+pub async fn load_doc_tabs(rpc: String) -> Vec<String> {
+    let prefs = read_prefs();
+    prefs["doc_tabs"][&rpc]
+        .as_array()
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| tab.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist this endpoint's doc tabs. Best-effort: a failed write only costs
+/// tab restoration on the next boot.
+pub async fn save_doc_tabs(rpc: String, tabs: Vec<String>) -> bool {
+    let mut prefs = read_prefs();
+    prefs["doc_tabs"][&rpc] = serde_json::json!(tabs);
+    write_prefs(&prefs)
+}
+
+/// Add a page to the doc-tab strip (idempotent, keeps open order).
+pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
+    if page_id.is_empty() || tabs.contains(&page_id) {
+        return tabs;
+    }
+    tabs.push(page_id);
+    tabs
+}
+
+/// Close one tab.
+pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
+    tabs.retain(|tab| *tab != page_id);
+    tabs
+}
+
+/// The tabs that still exist in the page list — deleted pages drop at render
+/// time and self-heal in the persisted list on the next save.
+pub fn retain_doc_tabs(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
+    tabs.into_iter()
+        .filter(|tab| pages.iter().any(|page| page.id == *tab))
+        .collect()
+}
+
+/// One rendered doc tab.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DocTab {
+    pub id: String,
+    pub title: String,
+    pub active: bool,
+}
+
+/// The rendered tab strip: open tabs that still exist, titled from the page
+/// list, the active one flagged.
+pub fn doc_tab_rows(tabs: Vec<String>, pages: Vec<PageItem>, active: String) -> Vec<DocTab> {
+    tabs.into_iter()
+        .filter_map(|tab| {
+            let page = pages.iter().find(|page| page.id == tab)?;
+            Some(DocTab {
+                title: page.title.clone(),
+                active: tab == active,
+                id: tab,
+            })
+        })
+        .collect()
+}
+
+/// The tab to activate after closing one: the last remaining tab, or empty.
+pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String {
+    if closed != active {
+        return active;
+    }
+    tabs.into_iter().rev().find(|tab| *tab != closed).unwrap_or_default()
+}
+
 fn user_key_path() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("DUCKTAPE_USER_KEY") {
         return Ok(path.into());

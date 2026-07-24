@@ -73,6 +73,8 @@ state
   chat_search_generation:i64 = 0
   history_view = false
   pages:[PageItem] = []
+  doc_tabs:[str] = []
+  closing_doc_tab = ""
   blocks:[PageBlock] = []
   active_page = ""
   active_page_title = ""

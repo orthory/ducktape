@@ -1179,7 +1179,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         ));
         assert!(view.contains("prefix=block.prefix #block-insert-row"));
         assert!(view.contains(
-            "container width=fill padding-left=56.0\n                    PageTitleEditor"
+            "container width=fill padding-left=56.0\n                      PageTitleEditor"
         ));
     }
 

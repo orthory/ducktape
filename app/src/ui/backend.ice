@@ -67,6 +67,14 @@ extern crate::backend
   sync canonical_endpoint(input:str) -> str
   sync connection_degraded(status:str) -> bool
   sync slash_kind_matches(draft:str, kinds:[str]) -> [str]
+  sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
+  sync doc_tabs_without(tabs:[str], page_id:str) -> [str]
+  DocTab(id:str, title:str, active:bool)
+  sync retain_doc_tabs(tabs:[str], pages:[PageItem]) -> [str]
+  sync doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
+  sync next_doc_tab(tabs:[str], closed:str, active:str) -> str
+  load_doc_tabs(rpc:str) -> [str]
+  save_doc_tabs(rpc:str, tabs:[str]) -> bool
   sync retain_for_endpoint(value:str, current:str, next:str) -> str
   sync mutation_failure_phase(committed:bool) -> str
   sync message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64

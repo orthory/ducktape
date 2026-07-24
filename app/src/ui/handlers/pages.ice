@@ -541,7 +541,8 @@ on pages_updated(next)
   block_delete_armed = false
   loading = false
   error = ""
-
+  doc_tabs = doc_tabs_with(doc_tabs, active_page)
+  run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_block_drafts = remember_orphaned_block_drafts(orphaned_block_drafts, [], selected_block_id, block_edit_draft, block_autosave_status)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], selected_block_id, block_comment_draft)
@@ -581,3 +582,19 @@ on pages_mutated(next)
   block_delete_armed = false
   mutation_phase = "idle"
   error = ""
+
+on doc_tabs_saved(_)
+  error = error
+
+on doc_tabs_loaded(tabs)
+  doc_tabs = tabs
+
+on close_doc_tab(id)
+  return if loading || mutation_phase != "idle"
+  closing_doc_tab = id
+  active_page = next_doc_tab(doc_tabs, closing_doc_tab, active_page)
+  doc_tabs = doc_tabs_without(doc_tabs, closing_doc_tab)
+  closing_doc_tab = ""
+  parallel
+    run save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
+    run load_page(connected_rpc, active_page, "") -> pages_updated _ | failed _

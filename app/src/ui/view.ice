@@ -561,224 +561,244 @@ view
                                   pressed bg=fg/15
     pages:
       mouse move=pages_pointer_moved
-        stack width=fill height=fill clip=true
-          sensor show=pages_resized resize=pages_resized
-            space width=fill height=fill
-          if !connected
-            EmptyState title="Connect to a node" detail="Set the RPC endpoint in the sidebar."
-          if connected && empty(active_page)
-            EmptyState title="No page selected" detail="Create a page from the sidebar."
-          if connected && !empty(active_page)
-            scroll direction=vertical width=fill height=fill bar=hidden
-              container width=fill max-width=800.0 margin-x=auto padding-left=46.0 padding-right=46.0 padding-top=24.0 padding-bottom=80.0
-                col width=fill spacing=8.0
-                  row width=fill height=28.0 spacing=5.0 align=center
-                    if !empty(active_page_parent)
-                      text active_page_parent width=fill size=11.0 wrapping=none @text-muted
-                    if empty(active_page_parent)
-                      space width=fill
-                    input "" #page-search label="Search pages" <-> page_search_draft hint="Search pages…" disabled=(!connected || page_searching) submit=search_pages_submit width=190.0 padding=6.2 text-size=13.0 line-height=1.2
-                      active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                      hovered bg=fg/5 border=fg/8
-                      focused bg=fg/7 border=fg/12
-                      disabled value=muted
+        col width=fill height=fill
+          if connected && !empty(doc_tab_rows(doc_tabs, pages, active_page))
+            container width=fill height=34.0 padding-left=8.0 padding-right=8.0 bg=sidebar border=separator border-w=1.0
+              scroll direction=horizontal width=fill height=fill bar=hidden
+                row height=fill spacing=2.0 align=center
+                  for tab in doc_tab_rows(doc_tabs, pages, active_page)
+                    row spacing=0.0 align=center
+                      button label="Open page tab" height=26.0 padding=5.0 -> choose_page(tab.id)
+                        row height=fill spacing=5.0 align=center
+                          if tab.active
+                            text tab.title size=13.0 wrapping=none font=medium @text-fg
+                          if !tab.active
+                            text tab.title size=13.0 wrapping=none @text-muted
+                        active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+                        hovered bg=fg/5 text=fg
+                        pressed bg=fg/8
+                      button "×" label="Close page tab" width=20.0 height=20.0 padding=0.0 -> close_doc_tab(tab.id)
+                        active bg=transparent text=muted r=6.0
+                        hovered bg=fg/8 text=fg
+                        pressed bg=fg/12
+          stack width=fill height=fill clip=true
+            sensor show=pages_resized resize=pages_resized
+              space width=fill height=fill
+            if !connected
+              EmptyState title="Connect to a node" detail="Set the RPC endpoint in the sidebar."
+            if connected && empty(active_page)
+              EmptyState title="No page selected" detail="Create a page from the sidebar."
+            if connected && !empty(active_page)
+              scroll direction=vertical width=fill height=fill bar=hidden
+                container width=fill max-width=800.0 margin-x=auto padding-left=46.0 padding-right=46.0 padding-top=24.0 padding-bottom=80.0
+                  col width=fill spacing=8.0
+                    row width=fill height=28.0 spacing=5.0 align=center
+                      if !empty(active_page_parent)
+                        text active_page_parent width=fill size=11.0 wrapping=none @text-muted
+                      if empty(active_page_parent)
+                        space width=fill
+                      input "" #page-search label="Search pages" <-> page_search_draft hint="Search pages…" disabled=(!connected || page_searching) submit=search_pages_submit width=190.0 padding=6.2 text-size=13.0 line-height=1.2
+                        active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                        hovered bg=fg/5 border=fg/8
+                        focused bg=fg/7 border=fg/12
+                        disabled value=muted
+                      if !empty(page_search_hits)
+                        button label="Clear page search" width=28.0 height=28.0 padding=0.0 -> clear_page_search
+                          container width=fill height=fill align-x=center align-y=center
+                            text "×" size=14.0
+                          active bg=transparent text=muted r=7.0
+                          hovered bg=fg/10 text=fg
+                          pressed bg=fg/15
+                      if !page_delete_armed
+                        button label="Page menu" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> arm_page_delete
+                          container width=fill height=fill align-x=center align-y=center
+                            text "•••" size=13.0
+                          active bg=transparent text=muted r=7.0
+                          hovered bg=fg/10 text=fg
+                          pressed bg=fg/15
+                      if page_delete_armed
+                        button "Delete page" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> delete_page_submit
+                          active bg=fg/11 text=fg border=fg/13 border-w=1.0 r=7.0
+                          hovered bg=fg/16
+                          pressed bg=fg/20
+                    container width=fill padding-left=56.0
+                      PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
                     if !empty(page_search_hits)
-                      button label="Clear page search" width=28.0 height=28.0 padding=0.0 -> clear_page_search
-                        container width=fill height=fill align-x=center align-y=center
-                          text "×" size=14.0
-                        active bg=transparent text=muted r=7.0
+                      container width=fill height=148.0 padding=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
+                        scroll direction=vertical width=fill height=fill
+                          col width=fill spacing=1.0
+                            for hit in page_search_hits
+                              PageSearchResult hit=hit
+                    if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
+                      container width=fill padding=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
+                        col width=fill spacing=5.0
+                          text "Recovered drafts" size=11.0 font=medium @text-fg
+                          for recovered_block in orphaned_block_drafts
+                            row width=fill spacing=5.0 align=center
+                              text recovered_block width=fill size=13.0 @text-muted
+                              button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) height=26.0 padding=5.0 -> use_orphaned_block_draft(recovered_block)
+                                active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
+                                hovered bg=fg/14
+                                pressed bg=fg/18
+                              button "Discard" disabled=(loading || mutation_phase != "idle") height=26.0 padding=5.0 -> discard_orphaned_block_draft(recovered_block)
+                                active bg=transparent text=muted r=7.0
+                                hovered bg=fg/9 text=fg
+                                pressed bg=fg/14
+                          for recovered_comment in orphaned_comment_drafts
+                            row width=fill spacing=5.0 align=center
+                              text recovered_comment width=fill size=13.0 @text-muted
+                              button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) height=26.0 padding=5.0 -> use_orphaned_comment_draft(recovered_comment)
+                                active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
+                                hovered bg=fg/14
+                                pressed bg=fg/18
+                              button "Discard" disabled=(loading || mutation_phase != "idle") height=26.0 padding=5.0 -> discard_orphaned_comment_draft(recovered_comment)
+                                active bg=transparent text=muted r=7.0
+                                hovered bg=fg/9 text=fg
+                                pressed bg=fg/14
+                    if empty(blocks) && !block_insert_open
+                      container width=fill padding-left=56.0
+                        button "Write something…" label="Start writing" disabled=loading width=fill padding=6.0 -> open_root_block_insert
+                          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
+                          hovered bg=fg/4 text=fg border=fg/7
+                          pressed bg=fg/8
+                    if block_insert_open && empty(block_insert_after_id)
+                      InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix="" #block-insert-row(block_insert_after_id)
+                        stack width=fill
+                          if new_block_kind != "Divider"
+                            col width=fill spacing=2.0
+                              input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
+                                active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
+                                hovered bg=fg/2 border=fg/5
+                                focused bg=fg/4 border=fg/8
+                                disabled value=muted
+                              if !empty(slash_kind_matches(block_draft, editable_block_kinds))
+                                container width=fill padding=3.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=shadow shadow-y=2.0 shadow-blur=8.0
+                                  col width=fill spacing=1.0
+                                    for kind in slash_kind_matches(block_draft, editable_block_kinds)
+                                      button label="Set block kind" width=fill height=24.0 padding=4.0 -> pick_slash_kind(kind)
+                                        row width=fill height=fill spacing=6.0 align=center
+                                          text kind width=fill size=13.0 wrapping=none @text-fg
+                                        active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                        hovered bg=primary/14 text=fg
+                                        pressed bg=primary/20
+                          if new_block_kind == "Divider"
+                            button "Insert divider" disabled=loading width=fill height=28.0 padding=5.0 -> add_block_submit
+                              active bg=transparent text=muted r=6.0
+                              hovered bg=fg/8 text=fg
+                              pressed bg=fg/12
+                    keyed block in blocks by=block.key
+                      col width=fill spacing=1.0
+                        DocumentBlock block=block selected=(block.id == selected_block_id) hovered=(block.id == hovered_block_id) disabled=loading #block(block.id)
+                          col width=fill
+                            if block.pending
+                              container width=fill padding=5.0 bg=fg/3 r=6.0
+                                BlockContents block=block
+                            if !block.pending && block.kind == "Page"
+                              button label=block.kind description=block.text width=fill padding=5.0 -> choose_page(block.id)
+                                BlockContents block=block
+                                active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                hovered bg=fg/3 text=fg border=transparent
+                                pressed bg=fg/6 text=fg
+                            if !block.pending && block.kind != "Page" && block.id != selected_block_id
+                              button label=block.kind description=block.text width=fill padding=5.0 -> select_block(block.key, block.id, block.kind, block.text, block.checked, false)
+                                BlockContents block=block
+                                active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                hovered bg=fg/3 text=fg border=transparent
+                                pressed bg=fg/6 text=fg
+                            if !block.pending && block.kind != "Page" && block.id == selected_block_id
+                              BlockLine block=block
+                                col width=fill
+                                  if block.kind == "Divider"
+                                    container width=fill height=1.0 bg=separator
+                                      text ""
+                                  if block.kind != "Divider"
+                                    input "" #block-edit label="Edit block" <-> block_edit_draft change=block_text_changed hint="Type something…" disabled=(mutation_phase != "idle") width=fill padding=4.0 text-size=14.0 line-height=1.3
+                                      active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=5.0
+                                      hovered bg=fg/2 border=fg/5
+                                      focused bg=fg/3 border=fg/7
+                                      disabled value=muted
+                        if block_insert_open && block.id == block_insert_after_id
+                          InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
+                            stack width=fill
+                              if new_block_kind != "Divider"
+                                col width=fill spacing=2.0
+                                  input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
+                                    active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
+                                    hovered bg=fg/2 border=fg/5
+                                    focused bg=fg/4 border=fg/8
+                                    disabled value=muted
+                                  if !empty(slash_kind_matches(block_draft, editable_block_kinds))
+                                    container width=fill padding=3.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=shadow shadow-y=2.0 shadow-blur=8.0
+                                      col width=fill spacing=1.0
+                                        for kind in slash_kind_matches(block_draft, editable_block_kinds)
+                                          button label="Set block kind" width=fill height=24.0 padding=4.0 -> pick_slash_kind(kind)
+                                            row width=fill height=fill spacing=6.0 align=center
+                                              text kind width=fill size=13.0 wrapping=none @text-fg
+                                            active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
+                                            hovered bg=primary/14 text=fg
+                                            pressed bg=primary/20
+                              if new_block_kind == "Divider"
+                                button "Insert divider" disabled=loading width=fill height=28.0 padding=5.0 -> add_block_submit
+                                  active bg=transparent text=muted r=6.0
+                                  hovered bg=fg/8 text=fg
+                                  pressed bg=fg/12
+            overlay when=(connected && !empty(active_page) && block_comments_open) dismiss=close_block_comments backdrop=transparent padding=12.0 align-x=end align-y=start
+              content
+                space width=fill height=fill
+              layer
+                container width=300.0 height=380.0 padding=8.0 bg=popover border=fg/15 border-w=1.0 r=11.0 shadow=black/24 shadow-y=4.0 shadow-blur=16.0
+                  col width=fill height=fill spacing=6.0
+                    row width=fill spacing=6.0 align=center
+                      text "Comments" width=fill size=13.0 font=medium @text-fg
+                      if block_comment_thread_total > 0
+                        text block_comment_thread_total size=11.0 @text-muted
+                      if block_comment_threads_loading || block_thread_comments_loading
+                        text "Loading…" size=11.0 @text-muted
+                      button "×" label="Close comments" disabled=(mutation_phase != "idle") width=24.0 height=24.0 padding=4.0 -> close_block_comments
+                        active bg=transparent text=muted r=6.0
                         hovered bg=fg/10 text=fg
                         pressed bg=fg/15
-                    if !page_delete_armed
-                      button label="Page menu" disabled=(mutation_phase != "idle") width=28.0 height=28.0 padding=0.0 -> arm_page_delete
-                        container width=fill height=fill align-x=center align-y=center
-                          text "•••" size=13.0
-                        active bg=transparent text=muted r=7.0
-                        hovered bg=fg/10 text=fg
-                        pressed bg=fg/15
-                    if page_delete_armed
-                      button "Delete page" disabled=(mutation_phase != "idle") height=26.0 padding=5.0 -> delete_page_submit
-                        active bg=fg/11 text=fg border=fg/13 border-w=1.0 r=7.0
-                        hovered bg=fg/16
-                        pressed bg=fg/20
-                  container width=fill padding-left=56.0
-                    PageTitleEditor rpc=connected_rpc password=password page_id=active_page title=active_page_title disabled=(loading || !connected || mutation_phase != "idle") #page-title(scope_key(connected_rpc, active_page))
-                  if !empty(page_search_hits)
-                    container width=fill height=148.0 padding=5.0 bg=elevated border=fg/8 border-w=1.0 r=9.0
+                    if empty(active_block_comment_thread)
                       scroll direction=vertical width=fill height=fill
                         col width=fill spacing=1.0
-                          for hit in page_search_hits
-                            PageSearchResult hit=hit
-                  if !empty(orphaned_block_drafts) || !empty(orphaned_comment_drafts)
-                    container width=fill padding=7.0 bg=elevated border=fg/9 border-w=1.0 r=9.0
-                      col width=fill spacing=5.0
-                        text "Recovered drafts" size=11.0 font=medium @text-fg
-                        for recovered_block in orphaned_block_drafts
-                          row width=fill spacing=5.0 align=center
-                            text recovered_block width=fill size=13.0 @text-muted
-                            button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) height=26.0 padding=5.0 -> use_orphaned_block_draft(recovered_block)
-                              active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
-                              hovered bg=fg/14
-                              pressed bg=fg/18
-                            button "Discard" disabled=(loading || mutation_phase != "idle") height=26.0 padding=5.0 -> discard_orphaned_block_draft(recovered_block)
-                              active bg=transparent text=muted r=7.0
+                          if empty(block_comment_threads) && !block_comment_threads_loading
+                            text "No comments yet" width=fill size=11.0 align-x=center @text-muted
+                          for comment_thread in block_comment_threads
+                            PageCommentThreadButton thread=comment_thread
+                          if block_comment_threads_has_more
+                            button "More" disabled=(block_comment_threads_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> load_more_block_threads
+                              active bg=transparent text=muted r=6.0
                               hovered bg=fg/9 text=fg
                               pressed bg=fg/14
-                        for recovered_comment in orphaned_comment_drafts
-                          row width=fill spacing=5.0 align=center
-                            text recovered_comment width=fill size=13.0 @text-muted
-                            button "Use" label="Use as block" disabled=(loading || mutation_phase != "idle" || !empty(block_draft)) height=26.0 padding=5.0 -> use_orphaned_comment_draft(recovered_comment)
-                              active bg=fg/9 text=fg border=fg/12 border-w=1.0 r=7.0
-                              hovered bg=fg/14
-                              pressed bg=fg/18
-                            button "Discard" disabled=(loading || mutation_phase != "idle") height=26.0 padding=5.0 -> discard_orphaned_comment_draft(recovered_comment)
-                              active bg=transparent text=muted r=7.0
+                    if !empty(active_block_comment_thread)
+                      row width=fill spacing=5.0 align=center
+                        button "← Threads" disabled=(block_thread_comments_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> close_block_comment_thread
+                          active bg=transparent text=muted r=6.0
+                          hovered bg=fg/9 text=fg
+                          pressed bg=fg/14
+                      scroll direction=vertical width=fill height=fill
+                        col width=fill spacing=1.0
+                          for page_comment in block_thread_comments
+                            PageCommentCard comment=page_comment
+                          if block_thread_comments_has_more
+                            button "More" disabled=(block_thread_comments_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> load_more_block_comments
+                              active bg=transparent text=muted r=6.0
                               hovered bg=fg/9 text=fg
                               pressed bg=fg/14
-                  if empty(blocks) && !block_insert_open
-                    container width=fill padding-left=56.0
-                      button "Write something…" label="Start writing" disabled=loading width=fill padding=6.0 -> open_root_block_insert
-                        active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-                        hovered bg=fg/4 text=fg border=fg/7
-                        pressed bg=fg/8
-                  if block_insert_open && empty(block_insert_after_id)
-                    InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix="" #block-insert-row(block_insert_after_id)
-                      stack width=fill
-                        if new_block_kind != "Divider"
-                          col width=fill spacing=2.0
-                            input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
-                              active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
-                              hovered bg=fg/2 border=fg/5
-                              focused bg=fg/4 border=fg/8
-                              disabled value=muted
-                            if !empty(slash_kind_matches(block_draft, editable_block_kinds))
-                              container width=fill padding=3.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=shadow shadow-y=2.0 shadow-blur=8.0
-                                col width=fill spacing=1.0
-                                  for kind in slash_kind_matches(block_draft, editable_block_kinds)
-                                    button label="Set block kind" width=fill height=24.0 padding=4.0 -> pick_slash_kind(kind)
-                                      row width=fill height=fill spacing=6.0 align=center
-                                        text kind width=fill size=13.0 wrapping=none @text-fg
-                                      active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                                      hovered bg=primary/14 text=fg
-                                      pressed bg=primary/20
-                        if new_block_kind == "Divider"
-                          button "Insert divider" disabled=loading width=fill height=28.0 padding=5.0 -> add_block_submit
-                            active bg=transparent text=muted r=6.0
-                            hovered bg=fg/8 text=fg
-                            pressed bg=fg/12
-                  keyed block in blocks by=block.key
-                    col width=fill spacing=1.0
-                      DocumentBlock block=block selected=(block.id == selected_block_id) hovered=(block.id == hovered_block_id) disabled=loading #block(block.id)
-                        col width=fill
-                          if block.pending
-                            container width=fill padding=5.0 bg=fg/3 r=6.0
-                              BlockContents block=block
-                          if !block.pending && block.kind == "Page"
-                            button label=block.kind description=block.text width=fill padding=5.0 -> choose_page(block.id)
-                              BlockContents block=block
-                              active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                              hovered bg=fg/3 text=fg border=transparent
-                              pressed bg=fg/6 text=fg
-                          if !block.pending && block.kind != "Page" && block.id != selected_block_id
-                            button label=block.kind description=block.text width=fill padding=5.0 -> select_block(block.key, block.id, block.kind, block.text, block.checked, false)
-                              BlockContents block=block
-                              active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                              hovered bg=fg/3 text=fg border=transparent
-                              pressed bg=fg/6 text=fg
-                          if !block.pending && block.kind != "Page" && block.id == selected_block_id
-                            BlockLine block=block
-                              col width=fill
-                                if block.kind == "Divider"
-                                  container width=fill height=1.0 bg=separator
-                                    text ""
-                                if block.kind != "Divider"
-                                  input "" #block-edit label="Edit block" <-> block_edit_draft change=block_text_changed hint="Type something…" disabled=(mutation_phase != "idle") width=fill padding=4.0 text-size=14.0 line-height=1.3
-                                    active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=5.0
-                                    hovered bg=fg/2 border=fg/5
-                                    focused bg=fg/3 border=fg/7
-                                    disabled value=muted
-                      if block_insert_open && block.id == block_insert_after_id
-                        InlineBlockInsert kind=new_block_kind kinds=block_kinds disabled=loading prefix=block.prefix #block-insert-row(block_insert_after_id)
-                          stack width=fill
-                            if new_block_kind != "Divider"
-                              col width=fill spacing=2.0
-                                input "" #block-insert label="New block" <-> block_draft hint="Type, or / for a block kind…" disabled=loading submit=add_block_submit width=fill padding=5.0 text-size=14.0 line-height=1.3
-                                  active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=6.0
-                                  hovered bg=fg/2 border=fg/5
-                                  focused bg=fg/4 border=fg/8
-                                  disabled value=muted
-                                if !empty(slash_kind_matches(block_draft, editable_block_kinds))
-                                  container width=fill padding=3.0 bg=popover border=fg/12 border-w=1.0 r=8.0 shadow=shadow shadow-y=2.0 shadow-blur=8.0
-                                    col width=fill spacing=1.0
-                                      for kind in slash_kind_matches(block_draft, editable_block_kinds)
-                                        button label="Set block kind" width=fill height=24.0 padding=4.0 -> pick_slash_kind(kind)
-                                          row width=fill height=fill spacing=6.0 align=center
-                                            text kind width=fill size=13.0 wrapping=none @text-fg
-                                          active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
-                                          hovered bg=primary/14 text=fg
-                                          pressed bg=primary/20
-                            if new_block_kind == "Divider"
-                              button "Insert divider" disabled=loading width=fill height=28.0 padding=5.0 -> add_block_submit
-                                active bg=transparent text=muted r=6.0
-                                hovered bg=fg/8 text=fg
-                                pressed bg=fg/12
-          overlay when=(connected && !empty(active_page) && block_comments_open) dismiss=close_block_comments backdrop=transparent padding=12.0 align-x=end align-y=start
-            content
-              space width=fill height=fill
-            layer
-              container width=300.0 height=380.0 padding=8.0 bg=popover border=fg/15 border-w=1.0 r=11.0 shadow=black/24 shadow-y=4.0 shadow-blur=16.0
-                col width=fill height=fill spacing=6.0
-                  row width=fill spacing=6.0 align=center
-                    text "Comments" width=fill size=13.0 font=medium @text-fg
-                    if block_comment_thread_total > 0
-                      text block_comment_thread_total size=11.0 @text-muted
-                    if block_comment_threads_loading || block_thread_comments_loading
-                      text "Loading…" size=11.0 @text-muted
-                    button "×" label="Close comments" disabled=(mutation_phase != "idle") width=24.0 height=24.0 padding=4.0 -> close_block_comments
-                      active bg=transparent text=muted r=6.0
-                      hovered bg=fg/10 text=fg
-                      pressed bg=fg/15
-                  if empty(active_block_comment_thread)
-                    scroll direction=vertical width=fill height=fill
-                      col width=fill spacing=1.0
-                        if empty(block_comment_threads) && !block_comment_threads_loading
-                          text "No comments yet" width=fill size=11.0 align-x=center @text-muted
-                        for comment_thread in block_comment_threads
-                          PageCommentThreadButton thread=comment_thread
-                        if block_comment_threads_has_more
-                          button "More" disabled=(block_comment_threads_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> load_more_block_threads
-                            active bg=transparent text=muted r=6.0
-                            hovered bg=fg/9 text=fg
-                            pressed bg=fg/14
-                  if !empty(active_block_comment_thread)
                     row width=fill spacing=5.0 align=center
-                      button "← Threads" disabled=(block_thread_comments_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> close_block_comment_thread
-                        active bg=transparent text=muted r=6.0
-                        hovered bg=fg/9 text=fg
-                        pressed bg=fg/14
-                    scroll direction=vertical width=fill height=fill
-                      col width=fill spacing=1.0
-                        for page_comment in block_thread_comments
-                          PageCommentCard comment=page_comment
-                        if block_thread_comments_has_more
-                          button "More" disabled=(block_thread_comments_loading || mutation_phase != "idle") height=24.0 padding=4.0 -> load_more_block_comments
-                            active bg=transparent text=muted r=6.0
-                            hovered bg=fg/9 text=fg
-                            pressed bg=fg/14
-                  row width=fill spacing=5.0 align=center
-                    input "" #block-comment(scope_key(connected_rpc, selected_block_id)) label="New block comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=post_block_comment_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
-                      active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
-                      hovered bg=fg/4 border=fg/11
-                      focused bg=fg/6 border=fg/13
-                      disabled value=muted
-                    button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) height=28.0 padding=5.0 -> post_block_comment_submit
-                      active bg=fg/88 text=bg border=fg/5 border-w=1.0 r=8.0
-                      hovered bg=fg/78 text=bg
-                      pressed bg=fg text=bg
-                      disabled bg=fg/25 text=bg/12
-          overlay when=(connected && !empty(active_page) && !empty(selected_block_id) && block_actions_open) dismiss=close_block_actions backdrop=transparent padding=0.0 align-x=start align-y=start
-            content
-              space width=fill height=fill
-            layer
-              float x=(block_menu_x + 10.0) y=block_menu_y
-                BlockActionsMenu block_id=selected_block_id kind=selected_block_kind disabled=(loading || mutation_phase != "idle") delete_armed=block_delete_armed editable_kinds=editable_block_kinds
+                      input "" #block-comment(scope_key(connected_rpc, selected_block_id)) label="New block comment" <-> block_comment_draft hint="Add a comment…" disabled=(mutation_phase != "idle" || block_comment_threads_loading || block_thread_comments_loading) submit=post_block_comment_submit width=fill padding=6.2 text-size=13.0 line-height=1.2
+                        active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                        hovered bg=fg/4 border=fg/11
+                        focused bg=fg/6 border=fg/13
+                        disabled value=muted
+                      button "Post" disabled=(mutation_phase != "idle" || empty(trim(block_comment_draft)) || block_comment_threads_loading || block_thread_comments_loading) height=28.0 padding=5.0 -> post_block_comment_submit
+                        active bg=fg/88 text=bg border=fg/5 border-w=1.0 r=8.0
+                        hovered bg=fg/78 text=bg
+                        pressed bg=fg text=bg
+                        disabled bg=fg/25 text=bg/12
+            overlay when=(connected && !empty(active_page) && !empty(selected_block_id) && block_actions_open) dismiss=close_block_actions backdrop=transparent padding=0.0 align-x=start align-y=start
+              content
+                space width=fill height=fill
+              layer
+                float x=(block_menu_x + 10.0) y=block_menu_y
+                  BlockActionsMenu block_id=selected_block_id kind=selected_block_kind disabled=(loading || mutation_phase != "idle") delete_armed=block_delete_armed editable_kinds=editable_block_kinds

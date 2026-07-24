@@ -61,6 +61,7 @@ on reconnect
   chat_search_generation = chat_search_generation + 1
   chat_searching = false
   pages = []
+  doc_tabs = []
   blocks = []
   active_page = ""
   active_page_title = ""
@@ -126,6 +127,7 @@ on workspace_connected(next)
   mutation_phase = "idle"
   hydration_retry_attempt = 0
   error = ""
+  run load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
 
 on live_updated(next)
   status = next.status
