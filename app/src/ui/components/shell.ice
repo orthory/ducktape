@@ -111,6 +111,12 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_c
                       text "MEMBERS" size=11.0 font=medium @text-muted
                     container width=fill padding-left=8.0
                       text "Validators hold quorum seats; residents hold mesh + sync standing." size=11.0 @text-muted
+                "governance"
+                  col width=fill height=fill spacing=6.0
+                    container width=fill padding-left=8.0
+                      text "GOVERNANCE" size=11.0 font=medium @text-muted
+                    container width=fill padding-left=8.0
+                      text "Proposals freeze their electorate when opened; anyone may settle past the deadline." size=11.0 @text-muted
                 _
                   col width=fill height=fill spacing=6.0
                     container width=fill padding-left=8.0
@@ -149,6 +155,8 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_c
                 slot files
               "members"
                 slot members
+              "governance"
+                slot governance
               _
                 slot explorer
 

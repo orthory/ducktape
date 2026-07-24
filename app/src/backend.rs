@@ -1443,6 +1443,153 @@ pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, H
     })
 }
 
+/// One governance proposal, rendered.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ProposalRow {
+    pub id: String,
+    pub action: String,
+    pub proposer: String,
+    pub status: String,
+    pub deadline: i64,
+    pub approvals: i64,
+    pub rejections: i64,
+    pub electorate: i64,
+    pub open: bool,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct GovernanceData {
+    pub generation: i64,
+    pub proposals: Vec<ProposalRow>,
+}
+
+/// Load the proposal register, open proposals first, newest first within.
+pub async fn load_governance(
+    rpc: String,
+    generation: i64,
+) -> Result<GovernanceData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc
+            .query("governance", &serde_json::json!("proposals"))
+            .await?;
+        let mut proposals: Vec<ProposalRow> = reply["proposals"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|view| {
+                let votes = view["votes"].as_array().cloned().unwrap_or_default();
+                let approvals = votes
+                    .iter()
+                    .filter(|vote| vote[1].as_bool().unwrap_or(false))
+                    .count();
+                let status = view["status"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        view["status"]
+                            .as_object()
+                            .and_then(|tagged| tagged.keys().next().cloned())
+                            .unwrap_or_default()
+                    });
+                let action = view["action"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        view["action"]
+                            .as_object()
+                            .and_then(|tagged| tagged.keys().next().cloned())
+                            .unwrap_or_default()
+                    });
+                let proposer_bytes: Vec<u8> = view["proposer"]
+                    .as_array()
+                    .map(|bytes| {
+                        bytes
+                            .iter()
+                            .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ProposalRow {
+                    id: view["proposal_id"].as_str().unwrap_or_default().to_string(),
+                    open: status == "open",
+                    proposer: short_label(&hex_encode(&proposer_bytes)),
+                    deadline: view["deadline"].as_i64().unwrap_or(0),
+                    approvals: count_i64(approvals),
+                    rejections: count_i64(votes.len() - approvals),
+                    electorate: count_i64(
+                        view["electorate"].as_array().map_or(0, |members| members.len()),
+                    ),
+                    action,
+                    status,
+                }
+            })
+            .collect();
+        proposals.sort_by(|left, right| {
+            right
+                .open
+                .cmp(&left.open)
+                .then(right.deadline.cmp(&left.deadline))
+        });
+        Ok(GovernanceData {
+            generation,
+            proposals,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Cast (or change) this node's ballot.
+pub async fn governance_vote(
+    rpc: String,
+    password: String,
+    proposal_id: String,
+    approve: bool,
+) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "governance",
+            governance::encode_msg(&governance::GovMsg::Vote {
+                proposal_id,
+                approve,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Tally and settle a proposal past its deadline (anyone may trigger).
+pub async fn governance_execute(
+    rpc: String,
+    password: String,
+    proposal_id: String,
+) -> Result<bool, AppError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "governance",
+            governance::encode_msg(&governance::GovMsg::Execute { proposal_id }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -1460,6 +1607,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
         ("pages", "Pages", "▤"),
         ("files", "Files", "▣"),
         ("members", "Members", "◎"),
+        ("governance", "Governance", "⚖"),
         ("explorer", "Explorer", "⛓"),
     ]
     .into_iter()

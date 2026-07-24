@@ -276,6 +276,7 @@ on select_shell_tab(next)
   explorer_generation = explorer_generation + 1
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
+  gov_generation = gov_generation + 1
   explorer_loading = shell_tab == "explorer"
   fs_loading = shell_tab == "files"
   parallel
@@ -283,6 +284,33 @@ on select_shell_tab(next)
     run files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
     run files_history(connected_rpc, fs_generation) -> fs_history_loaded _ | fs_failed _
     run load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
+    run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+
+on governance_loaded(next)
+  return if next.generation != gov_generation
+  gov_rows = next.proposals
+
+on governance_failed(cause)
+  return if cause.generation != gov_generation
+
+on gov_vote(proposal_id, approve)
+  return if !connected || !empty(gov_voting)
+  gov_voting = proposal_id
+  run governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
+
+on gov_execute(proposal_id)
+  return if !connected || !empty(gov_voting)
+  gov_voting = proposal_id
+  run governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
+
+on gov_acted(_)
+  gov_voting = ""
+  gov_generation = gov_generation + 1
+  run load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
+
+on gov_act_failed(cause)
+  gov_voting = ""
+  error = cause.message
 
 on members_loaded(next)
   return if next.generation != members_generation

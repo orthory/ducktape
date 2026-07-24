@@ -94,6 +94,11 @@ extern crate::backend
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   sync shell_nav(tab:str) -> [NavItem]
+  ProposalRow(id:str, action:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, electorate:i64, open:bool)
+  GovernanceData(generation:i64, proposals:[ProposalRow])
+  load_governance(rpc:str, generation:i64) -> GovernanceData ! HydrationError
+  governance_vote(rpc:str, password:str, proposal_id:str, approve:bool) -> bool ! AppError
+  governance_execute(rpc:str, password:str, proposal_id:str) -> bool ! AppError
   MemberRow(key:str, label:str, role:str, is_this_node:bool)
   MembersData(generation:i64, validators:i64, residents:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError

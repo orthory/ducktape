@@ -966,6 +966,49 @@ view
                         text "this node" size=11.0 wrapping=none @text-primary
                     space width=fill
                     text member.key size=11.0 wrapping=none font=mono @text-muted
+    governance:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=8.0 align=center
+          text "Governance" size=14.0 font=display @text-fg
+          space width=fill
+        if empty(gov_rows)
+          EmptyState title="No proposals" detail="Membership and share actions appear here as proposals."
+        if !empty(gov_rows)
+          scroll direction=vertical width=fill height=fill
+            col width=fill spacing=4.0
+              for proposal in gov_rows
+                container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                  col width=fill spacing=4.0
+                    row width=fill spacing=8.0 align=center
+                      text proposal.id size=13.0 wrapping=none font=medium @text-fg
+                      text proposal.action size=11.0 wrapping=none font=mono @text-primary
+                      text proposal.status size=11.0 wrapping=none font=mono @text-muted
+                      space width=fill
+                      text proposal.proposer size=11.0 wrapping=none font=mono @text-muted
+                    row width=fill spacing=8.0 align=center
+                      text proposal.approvals size=11.0 wrapping=none font=mono @text-primary
+                      text "for" size=11.0 wrapping=none @text-muted
+                      text proposal.rejections size=11.0 wrapping=none font=mono @text-muted
+                      text "against" size=11.0 wrapping=none @text-muted
+                      text "·" size=11.0 wrapping=none @text-muted
+                      text proposal.electorate size=11.0 wrapping=none font=mono @text-muted
+                      text "electorate" size=11.0 wrapping=none @text-muted
+                      space width=fill
+                      if proposal.open
+                        button "Approve" disabled=(!empty(gov_voting)) height=22.0 padding=4.0 -> gov_vote(proposal.id, true)
+                          active bg=primary/16 text=fg border=primary/30 border-w=1.0 r=6.0
+                          hovered bg=primary/24 text=fg
+                          pressed bg=primary/30
+                      if proposal.open
+                        button "Reject" disabled=(!empty(gov_voting)) height=22.0 padding=4.0 -> gov_vote(proposal.id, false)
+                          active bg=danger/12 text=fg border=danger/30 border-w=1.0 r=6.0
+                          hovered bg=danger/20 text=fg
+                          pressed bg=danger/28
+                      if proposal.open
+                        button "Settle" disabled=(!empty(gov_voting)) height=22.0 padding=4.0 -> gov_execute(proposal.id)
+                          active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=6.0
+                          hovered bg=fg/10 text=fg
+                          pressed bg=fg/14
     explorer:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center

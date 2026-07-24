@@ -82,6 +82,9 @@ state
   members_validators:i64 = 0
   members_residents:i64 = 0
   members_generation:i64 = 0
+  gov_rows:[ProposalRow] = []
+  gov_generation:i64 = 0
+  gov_voting = ""
   fs_path = "/shared"
   fs_entries:[FsEntry] = []
   fs_generation:i64 = 0
