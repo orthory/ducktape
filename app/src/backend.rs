@@ -1932,6 +1932,201 @@ pub async fn set_account_name(
     Ok(true)
 }
 
+/// One forge repo row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeRepo {
+    pub name: String,
+    pub head: String,
+}
+
+/// One tracker item row (issue or PR).
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeItem {
+    pub number: i64,
+    pub kind: String,
+    pub title: String,
+    pub state: String,
+    pub author: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeData {
+    pub generation: i64,
+    pub repos: Vec<ForgeRepo>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeRepoData {
+    pub generation: i64,
+    pub repo: String,
+    pub branches: Vec<String>,
+    pub items: Vec<ForgeItem>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeItemData {
+    pub generation: i64,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub state: String,
+    pub kind: String,
+    pub body: String,
+    pub branches: String,
+    pub reviews: i64,
+    pub diff: String,
+}
+
+/// The repo namespace with committed heads.
+pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc.query("forge", &serde_json::json!("list_repos")).await?;
+        let repos = reply["repos"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|repo| ForgeRepo {
+                name: repo["name"].as_str().unwrap_or_default().to_string(),
+                head: short_digest(repo["head"].as_str().unwrap_or("(unborn)")),
+            })
+            .collect();
+        Ok(ForgeData { generation, repos })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// One repo's branches and tracker items.
+pub async fn load_forge_repo(
+    rpc: String,
+    repo: String,
+    generation: i64,
+) -> Result<ForgeRepoData, HydrationError> {
+    async {
+        let rpc = rpc_client(&rpc)?;
+        let refs: serde_json::Value = rpc
+            .query("forge", &serde_json::json!({ "list_refs": { "repo": repo } }))
+            .await?;
+        let items: serde_json::Value = rpc
+            .query("forge", &serde_json::json!({ "list_items": { "repo": repo } }))
+            .await?;
+        let branches = refs["refs"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|branch| branch["name"].as_str().map(str::to_string))
+            .collect();
+        let mut rows: Vec<ForgeItem> = items["items"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| ForgeItem {
+                number: item["number"].as_i64().unwrap_or(0),
+                kind: tagged_name(&item["kind"]),
+                state: tagged_name(&item["state"]),
+                title: item["title"].as_str().unwrap_or_default().to_string(),
+                author: tagged_name(&item["author"]),
+            })
+            .collect();
+        rows.reverse();
+        Ok(ForgeRepoData {
+            generation,
+            repo,
+            branches,
+            items: rows,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// One item in full, with the PR patch when there is one.
+pub async fn load_forge_item(
+    rpc: String,
+    repo: String,
+    number: i64,
+    generation: i64,
+) -> Result<ForgeItemData, HydrationError> {
+    async {
+        let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
+        let rpc = rpc_client(&rpc)?;
+        let reply: serde_json::Value = rpc
+            .query(
+                "forge",
+                &serde_json::json!({ "get_item": { "repo": repo, "number": number } }),
+            )
+            .await?;
+        let item = &reply["item"];
+        if item.is_null() {
+            return Err("item was not found".to_string());
+        }
+        let is_pr = tagged_name(&item["kind"]) == "pull";
+        let diff = match is_pr {
+            false => String::new(),
+            true => rpc
+                .query::<_, serde_json::Value>(
+                    "forge",
+                    &serde_json::json!({ "pr_diff": { "repo": repo, "number": number } }),
+                )
+                .await
+                .map(|reply| {
+                    reply["pr_diff"]["patch"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .unwrap_or_default(),
+        };
+        let branches = match (
+            item["source_branch"].as_str(),
+            item["target_branch"].as_str(),
+        ) {
+            (Some(source), Some(target)) => format!("{source} → {target}"),
+            _ => String::new(),
+        };
+        Ok(ForgeItemData {
+            generation,
+            repo,
+            number: i64::try_from(number).unwrap_or(0),
+            title: item["title"].as_str().unwrap_or_default().to_string(),
+            state: tagged_name(&item["state"]),
+            kind: tagged_name(&item["kind"]),
+            body: item["body"].as_str().unwrap_or_default().to_string(),
+            reviews: count_i64(item["reviews"].as_array().map_or(0, |reviews| reviews.len())),
+            branches,
+            diff,
+        })
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// The name of an externally-tagged wire enum value (or the string itself).
+fn tagged_name(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .as_object()
+                .and_then(|tagged| tagged.keys().next().cloned())
+        })
+        .unwrap_or_default()
+}
+
 /// One shell navigation entry.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NavItem {
@@ -1950,6 +2145,7 @@ pub fn shell_nav(tab: String) -> Vec<NavItem> {
         ("files", "Files", "▣"),
         ("members", "Members", "◎"),
         ("agents", "Agents", "🤖"),
+        ("forge", "Forge", "⌥"),
         ("governance", "Governance", "⚖"),
         ("explorer", "Explorer", "⛓"),
         ("node", "Node", "⛭"),

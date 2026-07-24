@@ -117,6 +117,12 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_c
                       text "AGENTS" size=11.0 font=medium @text-muted
                     container width=fill padding-left=8.0
                       text "The registered agent roster: capability tags, granted actions, standing." size=11.0 @text-muted
+                "forge"
+                  col width=fill height=fill spacing=6.0
+                    container width=fill padding-left=8.0
+                      text "FORGE" size=11.0 font=medium @text-muted
+                    container width=fill padding-left=8.0
+                      text "Consensus-backed repos: branches, issues, and reviewable pull requests." size=11.0 @text-muted
                 "governance"
                   col width=fill height=fill spacing=6.0
                     container width=fill padding-left=8.0
@@ -175,6 +181,8 @@ component WorkspaceTabs(status:str, loading:bool, degraded:bool, tab:str, bell_c
                 slot members
               "agents"
                 slot agents
+              "forge"
+                slot forge
               "governance"
                 slot governance
               "settings"

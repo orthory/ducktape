@@ -107,6 +107,14 @@ extern crate::backend
   SettingsFacts(generation:i64, endpoint:str, node_key:str, height:i64, key_path:str, key_state:str, open_tabs:i64)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
+  ForgeRepo(name:str, head:str)
+  ForgeItem(number:i64, kind:str, title:str, state:str, author:str)
+  ForgeData(generation:i64, repos:[ForgeRepo])
+  ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
+  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, branches:str, reviews:i64, diff:str)
+  load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
+  load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
+  load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
   AgentRow(id:str, name:str, capability:str, status:str, actions:str, owner:str)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError

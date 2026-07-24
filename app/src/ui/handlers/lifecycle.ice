@@ -279,6 +279,7 @@ on select_shell_tab(next)
   gov_generation = gov_generation + 1
   agents_generation = agents_generation + 1
   account_generation = account_generation + 1
+  forge_generation = forge_generation + 1
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == "explorer"
@@ -293,6 +294,49 @@ on select_shell_tab(next)
     run load_peers(connected_rpc, node_peers_generation) -> peers_loaded _ | peers_failed _
     run load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+    run load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
+
+on forge_loaded(next)
+  return if next.generation != forge_generation
+  forge_repos = next.repos
+
+on forge_failed(cause)
+  return if cause.generation != forge_generation
+
+on forge_open_repo(name)
+  return if !connected
+  forge_repo = name
+  forge_item_number = 0
+  forge_item_diff = ""
+  forge_generation = forge_generation + 1
+  run load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_failed _
+
+on forge_repo_loaded(next)
+  return if next.generation != forge_generation
+  forge_repo = next.repo
+  forge_branches = next.branches
+  forge_items = next.items
+
+on forge_open_item(number)
+  return if !connected || empty(forge_repo)
+  forge_item_number = number
+  forge_generation = forge_generation + 1
+  run load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_failed _
+
+on forge_item_loaded(next)
+  return if next.generation != forge_generation
+  forge_item_number = next.number
+  forge_item_title = next.title
+  forge_item_state = next.state
+  forge_item_kind = next.kind
+  forge_item_body = next.body
+  forge_item_branches = next.branches
+  forge_item_reviews = next.reviews
+  forge_item_diff = next.diff
+
+on forge_close_item
+  forge_item_number = 0
+  forge_item_diff = ""
 
 on account_loaded(next)
   return if next.generation != account_generation

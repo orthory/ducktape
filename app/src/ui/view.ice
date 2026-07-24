@@ -990,6 +990,69 @@ view
                       text agent.owner size=11.0 wrapping=none font=mono @text-muted
                     if !empty(agent.actions)
                       text agent.actions size=11.0 font=mono @text-muted
+    forge:
+      col width=fill height=fill padding=14.0 spacing=8.0
+        row width=fill height=28.0 spacing=8.0 align=center
+          text "Forge" size=14.0 font=display @text-fg
+          if !empty(forge_repo)
+            text forge_repo size=13.0 wrapping=none font=mono @text-primary
+          space width=fill
+        if empty(forge_repos)
+          EmptyState title="No repos" detail="Consensus-backed repos appear here once created."
+        if !empty(forge_repos) && empty(forge_repo)
+          scroll direction=vertical width=fill height=fill
+            col width=fill spacing=2.0
+              for repo in forge_repos
+                button label="Open repo" width=fill padding=8.0 -> forge_open_repo(repo.name)
+                  row width=fill height=fill spacing=8.0 align=center
+                    text repo.name width=fill size=13.0 wrapping=none font=medium @text-fg
+                    text repo.head size=11.0 wrapping=none font=mono @text-muted
+                  active bg=surface text=fg border=fg/8 border-w=1.0 r=9.0
+                  hovered bg=primary/10 text=fg
+                  pressed bg=primary/16
+        if !empty(forge_repo) && forge_item_number <= 0
+          col width=fill height=fill spacing=6.0
+            if !empty(forge_branches)
+              scroll direction=horizontal width=fill height=26.0 bar=hidden
+                row height=fill spacing=4.0 align=center
+                  for branch in forge_branches
+                    container height=20.0 padding-left=7.0 padding-right=7.0 align-y=center bg=surface border=fg/10 border-w=1.0 r=10.0
+                      text branch size=11.0 wrapping=none font=mono @text-muted
+            if empty(forge_items)
+              EmptyState title="No issues or PRs" detail="The tracker is empty for this repo."
+            if !empty(forge_items)
+              scroll direction=vertical width=fill height=fill
+                col width=fill spacing=2.0
+                  for item in forge_items
+                    button label="Open item" width=fill padding=7.0 -> forge_open_item(item.number)
+                      row width=fill height=fill spacing=8.0 align=center
+                        text item.number size=11.0 wrapping=none font=mono @text-muted
+                        text item.kind size=11.0 wrapping=none font=mono @text-primary
+                        text item.title width=fill size=13.0 wrapping=none @text-fg
+                        text item.state size=11.0 wrapping=none font=mono @text-muted
+                      active bg=surface text=fg border=fg/8 border-w=1.0 r=8.0
+                      hovered bg=primary/10 text=fg
+                      pressed bg=primary/16
+        if forge_item_number > 0
+          col width=fill height=fill spacing=6.0
+            row width=fill spacing=8.0 align=center
+              button "‹ Back" height=24.0 padding=5.0 -> forge_close_item
+                active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=7.0
+                hovered bg=fg/10 text=fg
+                pressed bg=fg/14
+              text forge_item_title width=fill size=13.0 wrapping=none font=medium @text-fg
+              text forge_item_kind size=11.0 wrapping=none font=mono @text-primary
+              text forge_item_state size=11.0 wrapping=none font=mono @text-muted
+            if !empty(forge_item_branches)
+              text forge_item_branches size=11.0 font=mono @text-muted
+            scroll direction=vertical width=fill height=fill
+              col width=fill spacing=8.0
+                if !empty(forge_item_body)
+                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                    text forge_item_body size=13.0 @text-fg
+                if !empty(forge_item_diff)
+                  container width=fill padding=9.0 bg=surface border=fg/8 border-w=1.0 r=9.0
+                    text forge_item_diff size=11.0 font=mono @text-fg
     governance:
       col width=fill height=fill padding=14.0 spacing=8.0
         row width=fill height=28.0 spacing=8.0 align=center
