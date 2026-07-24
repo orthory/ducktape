@@ -250,6 +250,48 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// the platform's compute adapter — podman on Linux, tart on macOS — as the
+/// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
+/// the probeable backend, so `--compute` and detection share one choice.
+fn platform_sandbox() -> (config::SandboxToml, capability_host::SandboxBackend) {
+    let (runtime, image, backend) = if cfg!(target_os = "macos") {
+        ("tart", config::DEFAULT_TART_IMAGE, capability_host::SandboxBackend::Tart {
+            image: config::DEFAULT_TART_IMAGE.into(),
+        })
+    } else {
+        ("podman", config::DEFAULT_PODMAN_IMAGE, capability_host::SandboxBackend::Podman {
+            image: config::DEFAULT_PODMAN_IMAGE.into(),
+        })
+    };
+    let table = config::SandboxToml {
+        runtime: runtime.into(),
+        image: image.into(),
+        cores: 0,
+        mem_gb: 0,
+    };
+    (table, backend)
+}
+
+/// fresh-workspace compute detection (init without `--compute`, join): the
+/// platform adapter's runtime binary on PATH ⇒ a live `[sandbox]` table, with
+/// a stderr note; absent ⇒ `None` (today's commented example). Detection never
+/// flips `announce_capabilities` — publishing capacity to the network stays
+/// the explicit `--compute`/operator opt-in; this only makes the node's OWN
+/// compute (agent runs, the interactive terminal plane) work out of the box.
+fn detect_platform_sandbox() -> Option<config::SandboxToml> {
+    let (table, backend) = platform_sandbox();
+    let Ok(runtime_path) = backend.probe() else {
+        return None;
+    };
+    eprintln!(
+        "compute plane: {} found at {} — writing a live [sandbox] table \
+         (announce stays off; delete the table for a consensus-only node)",
+        table.runtime,
+        runtime_path.display()
+    );
+    Some(table)
+}
+
 /// `init --name <human name> [--dir <dir>] [--listen a] [--advertised a] [--http a]
 /// [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
@@ -305,6 +347,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // coordinator default `apply_primary_coordinator` bakes into the
     // descriptor, so the two never silently disagree (see `docs`:
     // coordinator is ambient, node-local).
+    let fresh_workspace = !dir.join("node.toml").exists();
     let mut plumbing = config::merged_plumbing(
         &dir,
         net.listen.as_deref(),
@@ -319,21 +362,16 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // `--compute` founds a workstation node: a [sandbox] table (podman on
     // Linux, tart on macOS — chosen for the platform init runs on) and the
-    // capability announce. A plain consensus node has no [sandbox] table and
-    // no compute plane at all.
+    // capability announce. Without the flag a FRESH workspace still detects
+    // the platform runtime and writes the table (announce stays off); an
+    // existing node.toml keeps whatever the operator chose — a deleted table
+    // is never resurrected.
     if args.compute {
-        let (runtime, image) = if cfg!(target_os = "macos") {
-            ("tart", config::DEFAULT_TART_IMAGE)
-        } else {
-            ("podman", config::DEFAULT_PODMAN_IMAGE)
-        };
-        plumbing.sandbox = Some(config::SandboxToml {
-            runtime: runtime.into(),
-            image: image.into(),
-            cores: 0,
-            mem_gb: 0,
-        });
+        let (sandbox, _) = platform_sandbox();
+        plumbing.sandbox = Some(sandbox);
         plumbing.announce_capabilities = true;
+    } else if fresh_workspace {
+        plumbing.sandbox = detect_platform_sandbox();
     }
 
     let me = key.public_key();
@@ -1339,7 +1377,8 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // so a corrupt existing node.toml aborts the join without leaving a
     // partially written dir.
     let net = &args.plumbing;
-    let plumbing = config::merged_plumbing(
+    let fresh_workspace = !dir.join("node.toml").exists();
+    let mut plumbing = config::merged_plumbing(
         &dir,
         net.listen.as_deref(),
         net.advertised.as_deref(),
@@ -1351,11 +1390,22 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
-    // Fold the inviter's and every offered front's overlay ULA into this
-    // joiner's reach hints so the mesh can dial them once a tunnel is up.
+    // a FRESH joining workspace gets the same compute detection as init: the
+    // platform runtime on PATH ⇒ a live [sandbox] table (announce stays off),
+    // so agent runs and the terminal plane work without a config edit. a
+    // re-join over an existing node.toml keeps the operator's choice.
+    if fresh_workspace {
+        plumbing.sandbox = detect_platform_sandbox();
+    }
+    if config::invite_requires_reachability_defaults(&invite) {
+        // a WireGuard or Coordinated invite makes the reachability plane the
+        // dial path: fold the inviter's (and every offered front's) overlay
+        // ULA into this joiner's reach hints so the mesh can dial them the
+        // moment a tunnel is up.
         {
             let wg = &invite.wireguard;
-        let issuer_identity = wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
+            let issuer_identity =
+                wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
                     .map_err(|e| format!("inviter identity: {e:?}"))?;
             let inviter_ula =
                 wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), issuer_identity);
@@ -1377,6 +1427,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
                 reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),
             });
         }
+    }
     descriptor.save(&dir.join("network.toml"))?;
     // identity was minted + target-checked at the top of the join.
     config::write_node_toml(&dir, &plumbing)?;

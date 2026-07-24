@@ -17,6 +17,13 @@ use super::{
 /// at decode.
 const INVITE_PREFIX: &str = "🦆";
 
+/// the WireGuard/overlay plane is MANDATORY, so an invite always brings up
+/// the joiner's reachability plane. Kept as a named predicate
+/// (call sites read as intent) rather than inlining a bare `true`.
+pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
+    true
+}
+
 // ============================================================================
 // invite tokens — the capability an invite blob carries. minted by a member
 // (`invite`), presented by the joiner over the lobby channel, redeemed
