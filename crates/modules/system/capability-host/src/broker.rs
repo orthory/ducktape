@@ -124,9 +124,51 @@ impl UpstreamCredential {
     }
 }
 
+/// The codex broker's upstream credential SOURCE — the mirror of
+/// [`AnthropicAuth`] on the OpenAI/Responses wire shape. `Host` is the operator's
+/// local Codex credential proxied straight to the provider; `Airlock` is a
+/// verified/pinned gateway that HOLDS the credential and is reached with a
+/// scoped, sealed session, so the sandbox host never sees the secret — the same
+/// execution/auth separation as the claude side.
+enum CodexAuth {
+    Host(UpstreamCredential),
+    Airlock(AirlockSession),
+}
+
+impl CodexAuth {
+    /// Establish the airlock credential source and return the arm plus the URL
+    /// the broker forwards `/v1/responses` to (the gateway, which swaps the
+    /// scoped session token for the real credential in-enclave).
+    async fn airlock(cfg: AirlockConfig) -> Result<(Self, String), String> {
+        let (session, base) = open_airlock_session(cfg).await?;
+        let responses_url = format!("{}/v1/responses", base.trim_end_matches('/'));
+        Ok((Self::Airlock(session), responses_url))
+    }
+}
+
+/// Resolve the codex upstream: a per-run airlock gateway when configured, else
+/// the operator's local Codex credential → the provider directly. Mirrors
+/// [`resolve_anthropic_upstream`], but codex has no env airlock arm — only the
+/// explicit per-run config (a self-host resolution) or a host credential — so a
+/// codex run never picks up a claude-shaped `DUCKTAPE_AIRLOCK_*` gateway.
+async fn resolve_codex_upstream(
+    explicit: Option<AirlockConfig>,
+) -> Result<(CodexAuth, String), String> {
+    if let Some(cfg) = explicit {
+        return CodexAuth::airlock(cfg).await;
+    }
+    let host = UpstreamCredential::from_host()?;
+    let responses_url = host.url.clone();
+    Ok((CodexAuth::Host(host), responses_url))
+}
+
 struct BrokerState {
     run_bearer: String,
-    upstream: UpstreamCredential,
+    /// behind a lock because the airlock path RE-MINTS the session on a 401.
+    auth: tokio::sync::Mutex<CodexAuth>,
+    /// where the broker POSTs the responses request: the provider directly on the
+    /// host path, the gateway's `/v1/responses` on the airlock path.
+    responses_url: String,
     client: reqwest::Client,
     requests: AtomicU32,
     bytes: AtomicU64,
@@ -296,26 +338,25 @@ pub(crate) struct RunBroker {
 }
 
 impl RunBroker {
-    pub(crate) async fn start() -> Result<Self, String> {
-        Self::start_with(UpstreamCredential::from_host()?, Reachability::Loopback).await
+    /// `airlock` is the per-run credential source (a self-host resolution); when
+    /// `None` the operator's local Codex credential proxies to the provider.
+    pub(crate) async fn start(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+        let (auth, url) = resolve_codex_upstream(airlock).await?;
+        Self::start_codex(auth, url, Reachability::Loopback).await
     }
 
-    pub(crate) async fn start_for_tart() -> Result<Self, String> {
-        Self::start_with(
-            UpstreamCredential::from_host()?,
-            Reachability::HostGateway("ducktape-host"),
-        )
-        .await
+    pub(crate) async fn start_for_tart(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+        let (auth, url) = resolve_codex_upstream(airlock).await?;
+        Self::start_codex(auth, url, Reachability::HostGateway("ducktape-host")).await
     }
 
     /// a private-netns Podman container reaches the loopback host only via the
     /// `host.containers.internal` gateway podman adds to its `/etc/hosts`.
-    pub(crate) async fn start_for_podman_private() -> Result<Self, String> {
-        Self::start_with(
-            UpstreamCredential::from_host()?,
-            Reachability::HostGateway("host.containers.internal"),
-        )
-        .await
+    pub(crate) async fn start_for_podman_private(
+        airlock: Option<AirlockConfig>,
+    ) -> Result<Self, String> {
+        let (auth, url) = resolve_codex_upstream(airlock).await?;
+        Self::start_codex(auth, url, Reachability::HostGateway("host.containers.internal")).await
     }
 
     #[cfg(test)]
@@ -332,7 +373,19 @@ impl RunBroker {
         .unwrap()
     }
 
+    /// host-path convenience for tests: wrap a literal credential and serve. The
+    /// live path goes through [`Self::start`]/[`resolve_codex_upstream`].
+    #[cfg(test)]
     async fn start_with(upstream: UpstreamCredential, reach: Reachability) -> Result<Self, String> {
+        let responses_url = upstream.url.clone();
+        Self::start_codex(CodexAuth::Host(upstream), responses_url, reach).await
+    }
+
+    async fn start_codex(
+        auth: CodexAuth,
+        responses_url: String,
+        reach: Reachability,
+    ) -> Result<Self, String> {
         let bind = reach.bind();
         let listener = tokio::net::TcpListener::bind((bind, 0))
             .await
@@ -358,7 +411,8 @@ impl RunBroker {
         });
         let state = Arc::new(BrokerState {
             run_bearer: run_bearer.clone(),
-            upstream,
+            auth: tokio::sync::Mutex::new(auth),
+            responses_url,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -483,33 +537,8 @@ async fn forward_responses(
         );
     };
 
-    let mut request = state
-        .client
-        .post(&state.upstream.url)
-        .bearer_auth(&state.upstream.bearer)
-        .body(body);
-    // Match the official Codex responses-api-proxy posture: preserve Codex's
-    // protocol/version/session headers, but replace auth and hop-by-hop HTTP
-    // framing. The incoming authorization is only the opaque run bearer.
-    for (name, value) in &headers {
-        if matches!(
-            name.as_str(),
-            "authorization" | "host" | "content-length" | "connection" | "transfer-encoding"
-        ) {
-            continue;
-        }
-        if let (Ok(name), Ok(value)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
-        ) {
-            request = request.header(name, value);
-        }
-    }
-    if let Some(account_id) = &state.upstream.account_id {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
-    let mut upstream = match request.send().await {
-        Ok(response) => response,
+    let (mut upstream, mut binding) = match send_codex(&state, &headers, &body).await {
+        Ok(sent) => sent,
         Err(e) => {
             return response(
                 StatusCode::BAD_GATEWAY,
@@ -517,12 +546,32 @@ async fn forward_responses(
             );
         }
     };
+    // Airlock only: a gateway 401 means the scoped session token's TTL lapsed.
+    // Re-handshake once and retry. Host runs pass straight through (reauth is a
+    // no-op and returns false).
+    let token_expired = upstream.status() == StatusCode::UNAUTHORIZED;
+    if token_expired && codex_airlock_reauth(&state).await {
+        (upstream, binding) = match send_codex(&state, &headers, &body).await {
+            Ok(sent) => sent,
+            Err(e) => {
+                return response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("provider upstream failed: {e}"),
+                );
+            }
+        };
+    }
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
+    let content_type_str = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let mut output = Vec::new();
     loop {
         match upstream.chunk().await {
@@ -552,12 +601,166 @@ async fn forward_responses(
     {
         return response(StatusCode::BAD_GATEWAY, "run broker byte budget exhausted");
     }
+    // Airlock sealed session: the enclave's success body is an opaque sealed
+    // stream — unseal it to the plaintext the unmodified codex sandbox expects.
+    // A gateway ERROR body (minted before the proxy path) is plaintext and
+    // relays as-is; a plaintext SUCCESS on a sealed session can only be a path
+    // host forging one, so it is refused.
+    let seal_keys = {
+        let auth = state.auth.lock().await;
+        match &*auth {
+            CodexAuth::Airlock(session) => Some(session.keys.clone()),
+            CodexAuth::Host(_) => None,
+        }
+    };
+    if let Some(keys) = seal_keys {
+        let sealed_outer = content_type_str
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("application/octet-stream"));
+        if sealed_outer {
+            return match open_sealed_buffer(&keys, &binding, &output) {
+                Ok((inner_ct, plain)) => codex_body(status, inner_ct, plain),
+                Err(e) => response(StatusCode::BAD_GATEWAY, &format!("airlock: {e}")),
+            };
+        }
+        if status.is_success() {
+            return response(
+                StatusCode::BAD_GATEWAY,
+                "airlock: sealed session received a plaintext success body",
+            );
+        }
+    }
     let mut response = Response::new(Body::from(output));
     *response.status_mut() = status;
     if let Some(content_type) = content_type {
         response
             .headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, content_type);
+    }
+    response
+}
+
+/// Build the codex upstream request (target URL + forwarded headers + the
+/// current credential) and send it, WITHOUT consuming the body — so a gateway
+/// 401 can be retried after an airlock re-handshake. Returns the response plus
+/// the sealed request's BINDING (empty when unsealed) — the response is opened
+/// under it.
+async fn send_codex(
+    state: &BrokerState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> reqwest::Result<(reqwest::Response, Vec<u8>)> {
+    let mut request = state.client.post(&state.responses_url);
+    // Match the official Codex responses-api-proxy posture: preserve Codex's
+    // protocol/version/session headers, but replace auth and hop-by-hop framing.
+    // The overlay routing headers are OURS to set on the airlock path, never the
+    // child's (see the anthropic broker's note) — drop any it injected.
+    for (name, value) in headers {
+        if matches!(
+            name.as_str(),
+            "authorization"
+                | "host"
+                | "content-length"
+                | "connection"
+                | "transfer-encoding"
+                | "x-duck-authority"
+                | "origin"
+        ) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            request = request.header(name, value);
+        }
+    }
+    let (request, binding) = {
+        let auth = state.auth.lock().await;
+        match &*auth {
+            CodexAuth::Host(host) => {
+                let mut request = request.bearer_auth(&host.bearer).body(body.clone());
+                if let Some(account_id) = &host.account_id {
+                    request = request.header("ChatGPT-Account-ID", account_id);
+                }
+                (request, Vec::new())
+            }
+            // Sealed-body airlock session: encrypt under the handshake body key
+            // (fresh nonce per attempt, so the 401-retry re-seals safely) and
+            // carry the scoped session token; the enclave refuses plaintext.
+            CodexAuth::Airlock(session) => {
+                let sealed = airlock::bodyseal::seal_request(&session.keys, body);
+                let binding = airlock::bodyseal::request_binding(&sealed);
+                let request = request
+                    .body(sealed)
+                    .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1);
+                (session.gateway.route(request.bearer_auth(&session.token)), binding)
+            }
+        }
+    };
+    Ok((request.send().await?, binding))
+}
+
+/// Airlock only: re-mint the scoped session against the already-trusted seal key
+/// after a gateway 401. `true` iff it re-handshook (the caller retries once);
+/// the host arm and a failed handshake return `false`.
+async fn codex_airlock_reauth(state: &BrokerState) -> bool {
+    let mut auth = state.auth.lock().await;
+    let CodexAuth::Airlock(session) = &mut *auth else {
+        return false;
+    };
+    match session.gateway.open_session_sealed(&session.seal_pk, &session.sub).await {
+        Ok((token, keys)) => {
+            session.token = token;
+            session.keys = keys;
+            true
+        }
+        Err(_) => {
+            tracing::debug!(
+                target: "ducktape::agent",
+                event = "airlock_reauth",
+                reason = "handshake_failed",
+                "airlock session re-handshake failed"
+            );
+            false
+        }
+    }
+}
+
+/// Open a fully-buffered sealed response stream: feed every byte to the opener,
+/// require the authenticated Final marker, and return the inner content-type and
+/// concatenated plaintext. A stream that ends without Final is truncation, not a
+/// clean EOF — refused.
+fn open_sealed_buffer(
+    keys: &airlock::handshake::SessionKeys,
+    binding: &[u8],
+    sealed: &[u8],
+) -> Result<(Option<String>, Vec<u8>), String> {
+    use airlock::bodyseal::OpenedItem;
+    let mut opener = airlock::bodyseal::StreamOpener::new(keys, binding);
+    let items = opener.feed(sealed).map_err(|e| e.to_string())?;
+    if !opener.finished() {
+        return Err("sealed response truncated".into());
+    }
+    let mut inner_ct = None;
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            OpenedItem::Head(ct) => inner_ct = Some(ct),
+            OpenedItem::Data(data) => out.extend_from_slice(&data),
+            OpenedItem::Final => {}
+        }
+    }
+    Ok((inner_ct, out))
+}
+
+/// Assemble the buffered codex response the sandbox sees, tagged with the inner
+/// content-type recovered from the sealed head.
+fn codex_body(status: StatusCode, inner_ct: Option<String>, body: Vec<u8>) -> Response<Body> {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    if let Some(value) = inner_ct.and_then(|ct| HeaderValue::from_str(&ct).ok()) {
+        response.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
     }
     response
 }
@@ -995,40 +1198,58 @@ impl AnthropicAuth {
     /// Returns the `Airlock` arm and the URL the broker forwards `/v1/messages`
     /// to — the gateway itself, which swaps the token for the real credential.
     async fn airlock(cfg: AirlockConfig) -> Result<(Self, String), String> {
-        let mode: AttestMode = cfg
-            .attest
-            .parse()
-            .map_err(|e| format!("airlock attest mode: {e}"))?;
-        let expected =
-            Measurement::from_hex(&cfg.measurement).map_err(|e| format!("airlock measurement: {e}"))?;
-        // `base` is the host the broker POSTs to: the gateway itself (local) or
-        // the browser-gateway that routes the overlay hop (remote).
-        let (gateway, base) = match &cfg.gateway {
-            AirlockGateway::Local { url } => (Gateway::local(url.clone()), url.clone()),
-            AirlockGateway::Remote { handle, via } => {
-                (Gateway::remote(handle.clone(), via.clone()), via.clone())
-            }
-        };
-        let seal_pk = verify_gateway(&gateway, &cfg, mode, &expected).await?;
-        let (token, keys) = gateway
-            .open_session_sealed(&seal_pk, &cfg.sub)
-            .await
-            .map_err(|e| format!("airlock handshake: {e}"))?;
+        let (session, base) = open_airlock_session(cfg).await?;
         let messages_url = format!("{}/v1/messages", base.trim_end_matches('/'));
-        Ok((
-            Self::Airlock(AirlockSession {
-                gateway,
-                seal_pk,
-                sub: cfg.sub,
-                token,
-                keys,
-            }),
-            messages_url,
-        ))
+        Ok((Self::Airlock(session), messages_url))
     }
 }
 
+/// Shared airlock bring-up for both broker wire shapes: resolve the gateway
+/// handle, ESTABLISH TRUST (verify a TEE quote, or pin the on-chain seal_pk on
+/// the self-host path), then open ONE sealed session. Returns the session plus
+/// the base URL the broker forwards to (the gateway itself locally, or the
+/// browser-gateway that routes the overlay hop remotely).
+async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, String), String> {
+    let (gateway, base) = match &cfg.gateway {
+        AirlockGateway::Local { url } => (Gateway::local(url.clone()), url.clone()),
+        AirlockGateway::Remote { handle, via } => {
+            (Gateway::remote(handle.clone(), via.clone()), via.clone())
+        }
+    };
+    // ONE discriminant: how the seal key is trusted. `Attested` fetches and
+    // verifies the TEE quote and reads the seal_pk out of the attested
+    // REPORTDATA; `PinnedSealPk` is the self-host anchor — the on-chain seal_pk
+    // pinned directly, no quote to verify.
+    let (seal_pk, pinned) = match &cfg.trust {
+        AirlockTrust::Attested { measurement, attest } => {
+            let mode: AttestMode =
+                attest.parse().map_err(|e| format!("airlock attest mode: {e}"))?;
+            let expected = Measurement::from_hex(measurement)
+                .map_err(|e| format!("airlock measurement: {e}"))?;
+            (verify_gateway(&gateway, &cfg, mode, &expected).await?, false)
+        }
+        AirlockTrust::PinnedSealPk(pk) => (*pk, true),
+    };
+    // A lending session names the account it draws the grant on behalf of, so the
+    // owner's gateway can check it against the on-chain record and 403 an
+    // ungranted account (`credential_not_granted`). `None` on the env/Attested
+    // path, which runs no grant gate — the account is then simply unsent.
+    let handshake = match &cfg.account {
+        Some(account) => gateway.open_session_sealed_as(&seal_pk, &cfg.sub, account).await,
+        None => gateway.open_session_sealed(&seal_pk, &cfg.sub).await,
+    };
+    // On the pinned path a handshake failure IS the trust failure: the gateway's
+    // real seal key differs from the pin, so the sealed session token cannot be
+    // opened. Surface it as a named error BEFORE any credentialed request.
+    let (token, keys) = handshake.map_err(|e| match pinned {
+        true => "gateway_seal_pk_mismatch".to_string(),
+        false => format!("airlock handshake: {e}"),
+    })?;
+    Ok((AirlockSession { gateway, seal_pk, sub: cfg.sub, token, keys }, base))
+}
+
 /// Where the airlock gateway lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AirlockGateway {
     /// Same machine (Credential Provider == Computation Provider): a loopback URL.
     Local { url: String },
@@ -1037,14 +1258,60 @@ enum AirlockGateway {
     Remote { handle: String, via: String },
 }
 
-/// Opt-in airlock credential-source config, read from the environment. Absent
-/// unless a gateway is named, so the default broker path (a host-held Anthropic
-/// credential → api.anthropic.com) is unchanged.
-struct AirlockConfig {
+/// capability-host's OWN vendor tag for a credential — a MIRROR of the gateway
+/// module's `CredentialKind`. Kept separate on purpose: this crate must not
+/// depend on the gateway module crate, so the node maps between the two at the
+/// boundary when it resolves a record into a [`ResolvedCredential`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    Claude,
+    Codex,
+}
+
+/// A credential name resolved from consensus (the on-chain gateway record) into
+/// everything the broker needs to reach the owner's self-host gateway: WHERE it
+/// is (the `authority` duckdns handle, reached through the local node's browser
+/// gateway `via`), WHAT it is (`kind`), and the seal_pk the broker pins as its
+/// trust anchor — there is no TEE quote in self-host, so the on-chain key is the
+/// anchor.
+pub struct ResolvedCredential {
+    pub name: String,
+    pub kind: CredentialKind,
+    pub authority: String,
+    pub via: String,
+    pub seal_pk: [u8; 32],
+    /// the ACCOUNT the run acts on behalf of — the credential-grant subject the
+    /// owner's gateway checks the session against (the owner itself, or a granted
+    /// account). Sent as the sealed session's `account_b64`; without it a
+    /// grant-gated gateway refuses every session `credential_not_granted`.
+    pub account: Vec<u8>,
+}
+
+/// How the broker decides to trust a gateway's seal key — the one discriminant
+/// [`AnthropicAuth::airlock`] branches on. `Attested` verifies a TEE quote and
+/// reads the seal_pk out of the attested REPORTDATA; `PinnedSealPk` is the
+/// self-host anchor: the seal_pk published on consensus, pinned directly, with
+/// no quote to verify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AirlockTrust {
+    Attested { measurement: String, attest: String },
+    PinnedSealPk([u8; 32]),
+}
+
+/// Opt-in airlock credential-source config. Either read from the environment
+/// ([`from_env`], which builds [`AirlockTrust::Attested`]) or constructed from a
+/// consensus-resolved credential ([`self_host`], which pins the on-chain
+/// seal_pk). Absent on the default broker path (a host-held Anthropic credential
+/// → api.anthropic.com), which is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AirlockConfig {
     gateway: AirlockGateway,
-    measurement: String,
-    attest: String,
+    trust: AirlockTrust,
     sub: String,
+    /// self-host lending: the grant subject the session claims to act on behalf
+    /// of, sent as `account_b64` so the owner's grant-gated gateway can enforce
+    /// the grant. `None` on the env/Attested path (no grant gate).
+    account: Option<Vec<u8>>,
     /// attest=snp: the pinned AMD platform generation (parsed at config time).
     snp_product: Option<SnpProduct>,
     /// attest=snp: an out-of-band VCEK (file READ at config time); KDS otherwise.
@@ -1054,6 +1321,25 @@ struct AirlockConfig {
 }
 
 impl AirlockConfig {
+    /// Build a self-host airlock config from a consensus-resolved credential:
+    /// reach the owner's gateway over the overlay (`authority` through `via`),
+    /// draw on the named credential (`sub` = the credential name), and PIN its
+    /// on-chain seal_pk as the trust anchor. No env is read on this path.
+    pub fn self_host(resolved: &ResolvedCredential) -> AirlockConfig {
+        AirlockConfig {
+            gateway: AirlockGateway::Remote {
+                handle: resolved.authority.clone(),
+                via: resolved.via.clone(),
+            },
+            trust: AirlockTrust::PinnedSealPk(resolved.seal_pk),
+            sub: resolved.name.clone(),
+            account: Some(resolved.account.clone()),
+            snp_product: None,
+            snp_vcek: None,
+            pccs_url: None,
+        }
+    }
+
     /// `DUCKTAPE_AIRLOCK_GATEWAY=<url>` (local), or `DUCKTAPE_AIRLOCK_REMOTE=<handle>.duck`
     /// with `DUCKTAPE_AIRLOCK_VIA=<url>` (remote), turns airlock on;
     /// `DUCKTAPE_AIRLOCK_MEASUREMENT` (hex) and `DUCKTAPE_AIRLOCK_ATTEST` are then
@@ -1105,9 +1391,10 @@ impl AirlockConfig {
         };
         Some(Ok(Self {
             gateway,
-            measurement,
-            attest,
+            trust: AirlockTrust::Attested { measurement, attest },
             sub: env_nonempty("DUCKTAPE_AIRLOCK_SUB").unwrap_or_else(|| "compute-provider".into()),
+            // the boundary/TEE path runs no grant gate; the account is unsent.
+            account: None,
             snp_product,
             snp_vcek,
             pccs_url: env_nonempty("DUCKTAPE_AIRLOCK_PCCS_URL"),
@@ -1169,7 +1456,15 @@ fn test_trust_roots() -> &'static std::sync::Mutex<Option<TrustRoots>> {
 /// Resolve the Anthropic upstream: a verified airlock gateway when configured
 /// (env), else the operator's local credential + api.anthropic.com. Returns the
 /// auth arm and the URL the broker forwards `/v1/messages` to.
-async fn resolve_anthropic_upstream() -> Result<(AnthropicAuth, String), String> {
+async fn resolve_anthropic_upstream(
+    explicit: Option<AirlockConfig>,
+) -> Result<(AnthropicAuth, String), String> {
+    // Precedence: a per-run config passed in by the caller wins outright — and
+    // reads no env, so the self-host path is env-free. Only when absent do we
+    // fall back to the env boundary, then to a host-held credential.
+    if let Some(cfg) = explicit {
+        return AnthropicAuth::airlock(cfg).await;
+    }
     match AirlockConfig::from_env() {
         Some(cfg) => AnthropicAuth::airlock(cfg?).await,
         None => Ok((AnthropicAuth::from_host()?, ANTHROPIC_MESSAGES_URL.into())),
@@ -1300,21 +1595,27 @@ async fn oauth_refresh(
 
 impl RunBroker {
     /// start the Anthropic Messages broker for a Direct/Podman run (loopback).
-    pub(crate) async fn start_anthropic() -> Result<Self, String> {
-        let (auth, url) = resolve_anthropic_upstream().await?;
+    /// `airlock` is the per-run credential source (a self-host resolution); when
+    /// `None` the env boundary then a host credential decide the upstream.
+    pub(crate) async fn start_anthropic(airlock: Option<AirlockConfig>) -> Result<Self, String> {
+        let (auth, url) = resolve_anthropic_upstream(airlock).await?;
         Self::start_anthropic_with(auth, Reachability::Loopback, url).await
     }
 
     /// start it for a Tart guest — bind the host gateway the guest reaches as
     /// `ducktape-host`.
-    pub(crate) async fn start_anthropic_for_tart() -> Result<Self, String> {
-        let (auth, url) = resolve_anthropic_upstream().await?;
+    pub(crate) async fn start_anthropic_for_tart(
+        airlock: Option<AirlockConfig>,
+    ) -> Result<Self, String> {
+        let (auth, url) = resolve_anthropic_upstream(airlock).await?;
         Self::start_anthropic_with(auth, Reachability::HostGateway("ducktape-host"), url).await
     }
 
     /// start it for a private-netns Podman container (`host.containers.internal`).
-    pub(crate) async fn start_anthropic_for_podman_private() -> Result<Self, String> {
-        let (auth, url) = resolve_anthropic_upstream().await?;
+    pub(crate) async fn start_anthropic_for_podman_private(
+        airlock: Option<AirlockConfig>,
+    ) -> Result<Self, String> {
+        let (auth, url) = resolve_anthropic_upstream(airlock).await?;
         Self::start_anthropic_with(
             auth,
             Reachability::HostGateway("host.containers.internal"),
@@ -2445,8 +2746,10 @@ mod tests {
     async fn boot_airlock_gateway(upstream: &str) -> String {
         let (app, vendor) = airlock::server::build_with_quoter(
             airlock::server::GatewayConfig {
-                attest: "snp".into(),
-                    anthropic_base: upstream.into(),
+                attest: airlock::server::AttestMode::Tsm("snp".into()),
+                seal_keypair: None,
+                anthropic_base: upstream.into(),
+                openai_base: upstream.into(),
                 oauth_token_url: format!("{upstream}/oauth/token"),
                 oauth_client_id: "test-client".into(),
                 session_ttl_secs: 3600,
@@ -2454,7 +2757,7 @@ mod tests {
             },
             "snp",
             test_enclave().quoter(),
-            None,
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(vendor, "snp");
@@ -2486,7 +2789,13 @@ mod tests {
         let seal_pk = attest::split_report_data(&rd).0;
         gw.upload_sealed_credential(
             &seal_pk,
-            &airlock::wire::CredentialPayload::Refresh { refresh_token: "ref-seed".into() },
+            "test-sub",
+            airlock::wire::CredentialKind::Claude,
+            &airlock::wire::CredentialPayload::Refresh {
+                refresh_token: "ref-seed".into(),
+                access_token: String::new(),
+                expires_at: 0,
+            },
         )
         .await
         .unwrap();
@@ -2495,9 +2804,9 @@ mod tests {
         // NO host credential, just a verified gateway + session token.
         let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig {
             gateway: AirlockGateway::Local { url: gateway_url },
-            measurement: meas,
-            attest: "snp".into(),
+            trust: AirlockTrust::Attested { measurement: meas, attest: "snp".into() },
             sub: "test-sub".into(),
+            account: None,
             snp_product: None, // the test roots override supplies the chain
             snp_vcek: None,
             pccs_url: None,
@@ -2539,9 +2848,12 @@ mod tests {
         // gateway before any session is established or credential spent.
         let refused = AnthropicAuth::airlock(AirlockConfig {
             gateway: AirlockGateway::Local { url: gateway_url },
-            measurement: "22".repeat(attest::MRTD_LEN),
-            attest: "snp".into(),
+            trust: AirlockTrust::Attested {
+                measurement: "22".repeat(attest::MRTD_LEN),
+                attest: "snp".into(),
+            },
             sub: "test-sub".into(),
+            account: None,
             snp_product: None,
             snp_vcek: None,
             pccs_url: None,
@@ -2633,5 +2945,378 @@ mod tests {
             !body.windows(6).any(|w| w == b"prompt"),
             "the child's plaintext must never reach a path host"
         );
+    }
+
+    // ---- Self-host airlock trust (pinned seal_pk, no TEE) --------------------
+
+    /// A mock provider upstream that accepts ONLY `Bearer {expect}` (proving the
+    /// gateway swapped the session token for the seeded static bearer) and streams
+    /// a vendor-tagged SSE reply on both the claude and codex paths.
+    async fn bearer_upstream(expect: &'static str) -> String {
+        use axum::response::IntoResponse;
+        let guard = move |body: &'static str| {
+            move |headers: HeaderMap| async move {
+                let want = format!("Bearer {expect}");
+                let got = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if got != want {
+                    return (StatusCode::UNAUTHORIZED, format!("want {want:?} got {got:?}"))
+                        .into_response();
+                }
+                ([("content-type", "text/event-stream")], body).into_response()
+            }
+        };
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(guard("event: content_block_delta\ndata: AIRLOCK-OK\n\n")),
+            )
+            .route(
+                "/v1/responses",
+                post(guard("event: response.output_text.delta\ndata: CODEX-OK\n\n")),
+            );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A fresh self-host gateway keypair — the secret the gateway seals under, the
+    /// public key the broker pins (what `cred add` would publish on-chain).
+    fn seal_pair() -> (airlock::seal::SealKeypair, [u8; 32]) {
+        let kp = airlock::seal::SealKeypair::generate();
+        let pk = kp.public_bytes();
+        (kp, pk)
+    }
+
+    /// Boot a NO-TEE self-host gateway pinned to `seal_kp`, seeded with `seeds`,
+    /// pointed at `upstream` for both vendors. Returns its base URL.
+    async fn boot_self_host_gateway(
+        upstream: &str,
+        seal_kp: airlock::seal::SealKeypair,
+        seeds: Vec<(
+            String,
+            airlock::wire::CredentialKind,
+            airlock::wire::CredentialPayload,
+        )>,
+    ) -> String {
+        let (app, vendor) = airlock::server::build_seeded(
+            airlock::server::GatewayConfig {
+                attest: airlock::server::AttestMode::SelfHost,
+                seal_keypair: Some(seal_kp),
+                anthropic_base: upstream.into(),
+                openai_base: upstream.into(),
+                oauth_token_url: format!("{upstream}/oauth/token"),
+                oauth_client_id: "test-client".into(),
+                session_ttl_secs: 3600,
+                max_requests: 100,
+            },
+            seeds,
+        )
+        .unwrap();
+        assert_eq!(vendor, "self-host");
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn resolved(
+        name: &str,
+        kind: CredentialKind,
+        via: &str,
+        seal_pk: [u8; 32],
+    ) -> ResolvedCredential {
+        ResolvedCredential {
+            name: name.into(),
+            kind,
+            authority: "owner.duck".into(),
+            via: via.into(),
+            seal_pk,
+            account: b"owner-account".to_vec(),
+        }
+    }
+
+    /// Like [`boot_self_host_gateway`] but with the co-hosted-lending grant gate
+    /// wired: a session opens only when its claimed `account_b64` equals
+    /// `granted`. This is the production self-host mode (`user cred add` builds an
+    /// always-gated gateway), so a broker that fails to send the account 403s
+    /// here before any credentialed request.
+    async fn boot_grant_gated_gateway(
+        upstream: &str,
+        seal_kp: airlock::seal::SealKeypair,
+        seeds: Vec<(
+            String,
+            airlock::wire::CredentialKind,
+            airlock::wire::CredentialPayload,
+        )>,
+        granted: Vec<u8>,
+    ) -> String {
+        let check: airlock::server::GrantCheck = std::sync::Arc::new(move |_sub, account| {
+            let granted = granted.clone();
+            Box::pin(async move { account == granted })
+        });
+        let (app, vendor) = airlock::server::build_seeded_gated(
+            airlock::server::GatewayConfig {
+                attest: airlock::server::AttestMode::SelfHost,
+                seal_keypair: Some(seal_kp),
+                anthropic_base: upstream.into(),
+                openai_base: upstream.into(),
+                oauth_token_url: format!("{upstream}/oauth/token"),
+                oauth_client_id: "test-client".into(),
+                session_ttl_secs: 3600,
+                max_requests: 100,
+            },
+            seeds,
+            Some(check),
+        )
+        .unwrap();
+        assert_eq!(vendor, "self-host");
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The production round-trip the lending e2e never exercises through the
+    /// broker: a grant-GATED self-host gateway (what `user cred add` always
+    /// builds) admits the broker's sealed session ONLY because the broker names
+    /// the granted account in `account_b64`. A broker that dropped the account
+    /// (the bug this guards) would 403 `credential_not_granted` at session open.
+    #[tokio::test]
+    async fn broker_sends_the_grant_account_to_a_gated_gateway() {
+        let upstream = bearer_upstream("tok-grant").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_grant_gated_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+            )],
+            b"grantee".to_vec(),
+        )
+        .await;
+        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        rc.account = b"grantee".to_vec();
+        let (auth, messages_url) = AnthropicAuth::airlock(AirlockConfig::self_host(&rc))
+            .await
+            .expect("a granted account opens the gated session");
+        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+            .await
+            .unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", broker.endpoint.base_url))
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("AIRLOCK-OK"), "gated self-host round-trip");
+    }
+
+    /// The gate's teeth: an UNGRANTED account is refused at session open, before
+    /// any credentialed request — the broker's account reaches the gate and the
+    /// gate says no.
+    #[tokio::test]
+    async fn broker_session_is_refused_for_an_ungranted_account() {
+        let upstream = bearer_upstream("tok-grant").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_grant_gated_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-grant".into() },
+            )],
+            b"grantee".to_vec(),
+        )
+        .await;
+        let mut rc = resolved("owner-claude-1", CredentialKind::Claude, &gateway_url, seal_pk);
+        rc.account = b"stranger".to_vec();
+        let refused = AnthropicAuth::airlock(AirlockConfig::self_host(&rc)).await;
+        assert!(refused.is_err(), "an ungranted account must not open a session");
+    }
+
+    #[tokio::test]
+    async fn pinned_seal_pk_skips_quote_verification_and_seals_to_the_pin() {
+        let upstream = bearer_upstream("tok-e2e").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-e2e".into() },
+            )],
+        )
+        .await;
+        // No quote is fetched — the seal_pk is pinned directly from the record.
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        ));
+        let (auth, messages_url) = AnthropicAuth::airlock(cfg).await.unwrap();
+        assert!(matches!(auth, AnthropicAuth::Airlock(_)));
+        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+            .await
+            .unwrap();
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/messages", broker.endpoint.base_url))
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude","stream":true,"messages":[{"role":"user","content":"hi"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("AIRLOCK-OK"), "sealed self-host round-trip: {body}");
+    }
+
+    #[tokio::test]
+    async fn run_context_airlock_resolves_the_upstream_over_env() {
+        // the per-run AirlockConfig a RunContext carries reaches the broker
+        // through resolve_anthropic_upstream (the seam start_broker feeds
+        // start_anthropic): an explicit config wins outright and reads no env, so
+        // the self-host gateway is resolved even with DUCKTAPE_AIRLOCK_* unset.
+        let upstream = bearer_upstream("tok-ctx").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-ctx".into() },
+            )],
+        )
+        .await;
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        ));
+        let (auth, _url) = resolve_anthropic_upstream(Some(cfg)).await.unwrap();
+        assert!(
+            matches!(auth, AnthropicAuth::Airlock(_)),
+            "an explicit RunContext airlock resolves to the self-host gateway, not env/host"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_seal_pk_mismatch_refuses_the_gateway() {
+        let upstream = bearer_upstream("tok-e2e").await;
+        let (kp, _real_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-e2e".into() },
+            )],
+        )
+        .await;
+        // Pin the WRONG seal key: the sealed session token cannot be opened, so
+        // setup fails with the named error before any credentialed request.
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            [0u8; 32],
+        ));
+        let refused = AnthropicAuth::airlock(cfg).await;
+        assert_eq!(refused.err().as_deref(), Some("gateway_seal_pk_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn explicit_airlock_config_beats_env() {
+        // No DUCKTAPE_AIRLOCK_* env is configured in this process; the explicit
+        // config is still chosen — the Some(_) branch provably never reads env.
+        let upstream = bearer_upstream("tok-e2e").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-claude-1".into(),
+                airlock::wire::CredentialKind::Claude,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-e2e".into() },
+            )],
+        )
+        .await;
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-claude-1",
+            CredentialKind::Claude,
+            &gateway_url,
+            seal_pk,
+        ));
+        let (auth, _url) = resolve_anthropic_upstream(Some(cfg)).await.unwrap();
+        assert!(
+            matches!(auth, AnthropicAuth::Airlock(_)),
+            "an explicit per-run config must win over the env/host path"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_airlock_arm_round_trips_through_the_self_host_gateway() {
+        let upstream = bearer_upstream("tok-codex").await;
+        let (kp, seal_pk) = seal_pair();
+        let gateway_url = boot_self_host_gateway(
+            &upstream,
+            kp,
+            vec![(
+                "owner-codex-1".into(),
+                airlock::wire::CredentialKind::Codex,
+                airlock::wire::CredentialPayload::Bearer { access_token: "tok-codex".into() },
+            )],
+        )
+        .await;
+        let cfg = AirlockConfig::self_host(&resolved(
+            "owner-codex-1",
+            CredentialKind::Codex,
+            &gateway_url,
+            seal_pk,
+        ));
+        let (auth, responses_url) = CodexAuth::airlock(cfg).await.unwrap();
+        assert!(matches!(auth, CodexAuth::Airlock(_)));
+        let broker = RunBroker::start_codex(auth, responses_url, Reachability::Loopback)
+            .await
+            .unwrap();
+        // codex posts `/responses` to a base that already ends in `/v1`.
+        let resp = reqwest::Client::new()
+            .post(format!("{}/responses", broker.endpoint.base_url))
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt","input":"hi"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("CODEX-OK"), "sealed codex self-host round-trip: {body}");
     }
 }

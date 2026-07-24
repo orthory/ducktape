@@ -206,7 +206,11 @@ fn resolve_credential() -> Result<CredentialPayload> {
         return Ok(CredentialPayload::Bearer { access_token });
     }
     if let Some(refresh_token) = arg("--refresh-token") {
-        return Ok(CredentialPayload::Refresh { refresh_token });
+        return Ok(CredentialPayload::Refresh {
+            refresh_token,
+            access_token: String::new(),
+            expires_at: 0,
+        });
     }
     let Some(path) = arg("--credentials") else {
         bail!("provide --access-token, --refresh-token, or --credentials");
@@ -226,6 +230,8 @@ fn resolve_credential() -> Result<CredentialPayload> {
                 .as_str()
                 .context("claudeAiOauth.refreshToken not found")?
                 .to_string(),
+            access_token: oauth["accessToken"].as_str().unwrap_or("").to_string(),
+            expires_at: oauth["expiresAt"].as_u64().map(|ms| ms / 1000).unwrap_or(0),
         }),
         other => bail!("--cred-kind must be 'bearer' or 'refresh', got {other:?}"),
     }

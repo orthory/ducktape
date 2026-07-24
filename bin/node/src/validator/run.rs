@@ -101,6 +101,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) index: std::sync::Arc<indexer::IndexStore>,
     pub(super) blobs: noded::blobs::BlobHandle,
     pub(super) agent_provisioner: dispatch_oracle::SharedProvisioner,
+    pub(super) cred_resolver: dispatch_oracle::SharedCredentialResolver,
     pub(super) agent_dirs: capability_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status_public_key: String,
@@ -215,6 +216,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         index,
         blobs,
         agent_provisioner,
+        cred_resolver,
         agent_dirs,
         metrics,
         status_public_key,
@@ -351,6 +353,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         // the announced capacity IS the pool's ledger — one source, so the
         // scheduler never promises what this node can't seat.
         sandbox_capacity.clone(),
+        Some(cred_resolver.clone()),
     );
     let workers: Vec<Box<dyn host::worker::Worker>> = vec![oracle_worker];
     // the CODE readiness self-signaller for pending code swaps — verifies (or

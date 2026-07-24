@@ -49,6 +49,8 @@ pub(crate) enum UserCmd {
     WebauthnChallenge(EnrollArgs),
     /// print the hex bytes a software P256 key must ECDSA-sign to join
     P256Payload(EnrollArgs),
+    /// named, grantable API credentials co-hosted through this node's gateway
+    Cred(crate::cred_cli::CredArgs),
 }
 
 /// `user key` — a nested lifecycle subcommand, or (no subcommand) the legacy
@@ -268,6 +270,7 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
         UserCmd::RedeemInvite(args) => cmd_user_redeem_invite(args, &mut stdin),
         UserCmd::WebauthnChallenge(args) => cmd_user_webauthn_challenge(args),
         UserCmd::P256Payload(args) => cmd_user_p256_payload(args),
+        UserCmd::Cred(args) => crate::cred_cli::run(args, &mut stdin),
     }
 }
 
@@ -411,7 +414,7 @@ fn read_key_line(path: &std::path::Path) -> Result<String, String> {
 /// anything else (legacy plaintext, or absent — freshly generated) falls
 /// through to [`config::load_or_generate_identity`] UNCHANGED, reading no
 /// stdin at all — byte-identical to the pre-onboarding sign-verb behavior.
-fn load_user_signer(
+pub(crate) fn load_user_signer(
     key_path: &std::path::Path,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
@@ -786,7 +789,7 @@ fn cmd_user_sign_frame(args: FrameArgs, stdin: &mut impl std::io::BufRead) -> Co
 /// `--node <url>` wins, else `-n/--network <id>` resolves through the registry
 /// to the workspace node.toml's `http_listen`. a set-but-broken `--network`
 /// (unknown/ambiguous workspace, or one with no http listen) is a loud error.
-fn redeem_node(
+pub(crate) fn redeem_node(
     node: Option<&str>,
     network: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {

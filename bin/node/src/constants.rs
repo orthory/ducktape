@@ -182,13 +182,15 @@ pub(crate) const MODULE_STATE_SCHEMAS: [(&str, u32); 20] = [
     // 2: the root domain + snapshot magic reset to v1 tags (no-versioning
     // sweep) — the preimage bytes changed.
     ("forge", 2),
-    // 3: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
-    // revision 3 folds the `.duck` handle registry (the retired `duckdns`
-    // module's plane) into the same host-KV snapshot under one root — a
+    // 4: the MERGED gateway. Revision 2 was the routes-only wasm adapter port;
+    // revision 3 folded the `.duck` handle registry (the retired `duckdns`
+    // module's plane) into the same host-KV snapshot under one root; revision 4
+    // adds the named credential-record plane (owner-signed name -> owner/
+    // publisher/kind/seal_pk/grants) to the routes registry snapshot — a
     // state-schema break (beta re-genesis, no shim). governance stays at 2
     // (identity moved to 3 when it absorbed the client ACL — see below). The
     // per-network chain id still rides the GENESIS-CONFIG `__config`.
-    ("gateway", 3),
+    ("gateway", 4),
     ("governance", 2),
     ("hello", 1),
     // 3: identity absorbed the submit-door client ACL (the retired `clients`

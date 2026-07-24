@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
 use dispatch_oracle::{
-    AttemptControl, DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind,
-    max_concurrent_runs_from_env,
+    AttemptControl, DeliverFn, DispatchPool, SharedCredentialResolver, SharedProvisioner, SpawnFn,
+    SpawnKind, max_concurrent_runs_from_env,
 };
 use futures::SinkExt as _;
 use sdk::Msg;
@@ -47,6 +47,11 @@ pub(crate) fn build<C>(
     // Podman one. SAME map the capability announce carries, so the ledger and
     // the registry can never disagree.
     capacity: BTreeMap<String, u64>,
+    // resolves a run's named `sched --cred` credential into a self-host airlock
+    // source on THIS node. `None` on a node that never lends credentials — a run
+    // carrying a credential name then fails resolve rather than running on the
+    // host's own source.
+    resolver: Option<SharedCredentialResolver>,
 ) -> (
     Box<dyn host::worker::Worker>,
     AttemptControl,
@@ -98,6 +103,10 @@ where
         capacity,
         provisioner,
     );
+    let pool = match resolver {
+        Some(resolver) => pool.with_credential_resolver(resolver),
+        None => pool,
+    };
     let control = pool.attempt_control();
     (Box::new(pool), control, rx)
 }

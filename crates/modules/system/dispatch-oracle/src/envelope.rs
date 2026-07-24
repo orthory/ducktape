@@ -75,6 +75,14 @@ struct WireEnvelope {
     /// only send the agent at a door the tool plane refuses.
     library_readable: bool,
     result_contract: Option<WireResultContract>,
+    /// the on-chain gateway credential name this run draws its provider
+    /// subscription from (`ducktape agent sched --cred`). ABSENT for every
+    /// ordinary composer output — a chat/forge run uses the host's own broker
+    /// source. When present, the executing node resolves it to a self-host
+    /// airlock config against committed gateway state before the provider spawns
+    /// (see the pool's credential-resolver seam).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential: Option<String>,
 }
 
 /// a C4 skill ref: a read-only duckfs source subtree the wrapper mounts for the
@@ -110,6 +118,11 @@ pub struct Prepared {
     pub input: String,
     pub ctx: RunContext,
     pub workspace: PortablePlan,
+    /// the named gateway credential this run draws on, surfaced verbatim from
+    /// the envelope. `None` for every ordinary composer output. The pool
+    /// resolves it (on the executing node) into `ctx.airlock` before the
+    /// provider spawns; a resolve refusal fails the attempt.
+    pub credential: Option<String>,
 }
 
 /// turn one dispatch payload into the provider's input and per-run context.
@@ -186,7 +199,38 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
         input,
         ctx,
         workspace,
+        credential: envelope.credential,
     })
+}
+
+/// Compose the ONE payload shape a headless `sched` run carries: a minimal
+/// valid v3 run envelope with the prompt as its instructions, a fresh per-run
+/// duckfs workspace (no pinned snapshot — a headless prompt has no workspace to
+/// resume), no skills, no chat contract, and the given credential name. The CLI
+/// builder calls this so the envelope schema lives in exactly one place.
+pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) -> String {
+    let mut envelope = serde_json::json!({
+        "ducktape_run": RUN_ENVELOPE_VERSION,
+        "agent_id": "sched",
+        "agent_display_name": "sched",
+        "run_id": run_id,
+        "thread_key": null,
+        "instructions": prompt,
+        "contract": "",
+        "conversation": "",
+        "workspace": {
+            "kind": "duckfs",
+            "source_prefix": "/shared/agent-workspaces/sched",
+            "source_snapshot": null,
+        },
+        "skills": [],
+        "library_readable": false,
+        "result_contract": { "ducktape_runner_result": RUNNER_RESULT_VERSION },
+    });
+    if let Some(credential) = credential {
+        envelope["credential"] = serde_json::Value::String(credential.to_string());
+    }
+    serde_json::to_string(&envelope).expect("a headless envelope always serializes")
 }
 
 /// ACCEPT a portable envelope and surface its pinned plan, without
@@ -336,6 +380,29 @@ mod tests {
     }
 
     #[test]
+    fn headless_envelope_round_trips_the_credential() {
+        let json = compose_headless("sched\u{1f}d1", "summarize this", Some("jess-fable-1"));
+        let prepared = prepare(&json).expect("a valid v3 envelope");
+        assert_eq!(prepared.credential.as_deref(), Some("jess-fable-1"));
+        assert!(prepared.input.contains("summarize this"));
+    }
+
+    #[test]
+    fn credentialless_envelope_prepares_with_none() {
+        // an ordinary composer envelope (no `credential` key) still decodes.
+        let json = compose_headless("sched\u{1f}d2", "hello", None);
+        assert!(!json.contains("credential"), "no credential key is emitted");
+        assert!(prepare(&json).expect("valid").credential.is_none());
+    }
+
+    #[test]
+    fn an_ordinary_envelope_surfaces_no_credential() {
+        // the chat/forge composer output never carries the key, so its runs use
+        // the host's own broker source — never a resolved subscription.
+        assert!(prepare(&envelope_json()).unwrap().credential.is_none());
+    }
+
+    #[test]
     fn non_envelope_payloads_are_loud_errors_never_passthrough() {
         // FLAG DAY: the legacy flat-string passthrough is gone — anything
         // that is not a marker-carrying JSON object fails the run.
@@ -372,6 +439,7 @@ mod tests {
             input,
             ctx,
             workspace,
+            ..
         } = prepare(&envelope_json()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
@@ -446,6 +514,7 @@ mod tests {
             input,
             ctx,
             workspace,
+            ..
         } = prepare(&envelope_json()).unwrap();
         assert_eq!(input, "GENERIC\n\nCONTRACT\n\nCONVERSATION");
         assert_eq!(ctx.agent_id.as_deref(), Some("bot"));
@@ -593,6 +662,7 @@ mod tests {
             input,
             ctx,
             workspace,
+            ..
         } = prepare(&forge_envelope_json()).unwrap();
         assert_eq!(
             input,
