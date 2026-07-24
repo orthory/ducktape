@@ -10,8 +10,9 @@
 //! effect (work_dir, mounts+RW, netns=private→slirp4netns/pasta, dropped
 //! NET_ADMIN/NET_RAW in `.BoundingCaps`, cpu/mem limits, annotations); attach
 //! returns `101 UPGRADED` and the raw-stdin/framed-stdout demux round-trips; the
-//! egress ruleset, installed via `nsenter -U --net` + `nft` into the container
-//! netns, blocks the LAN + tailnet (incl. tailnet DNS) while the broker port,
+//! egress ruleset, installed via `nsenter -n` + `nft` into the container netns
+//! (netns only — the hook already runs in podman's rootless userns), blocks the
+//! LAN + tailnet (incl. tailnet DNS) while the broker port,
 //! the scoped resolver, and the public internet stay reachable. Pure logic is
 //! also unit-tested (HTTP parse, chunked decode, attach demux, spec JSON,
 //! ruleset order) so it stays green without podman.
