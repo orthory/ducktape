@@ -157,18 +157,19 @@ not just terminals.
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_AUTOUPDATER=1`, setting
   `skipWebFetchPreflight: true`. Upstream credential = the swappable knob. This is
   where the ToS decision bites, isolated to one module.
-- **PR 3 (SHIPPED, safe part): opt-in private netns + host-gateway.** A private
-  container netns replaces `--network=host`, so the container gets its OWN
-  loopback and can no longer scan the host's for other runs' brokers / the node
-  RPC — the primary lateral-reach weakness. The broker becomes reachable via
-  `host.containers.internal` (a new `broker::Reachability::HostGateway`, shared
-  with Tart), and this touches the **existing codex broker reachability** too.
-  **Opt-in** via `DUCKTAPE_SANDBOX_PRIVATE_NET` (off by default → `--network=host`
-  unchanged, nothing regresses) precisely because the podman networking specifics
-  can't be validated without a podman host. **DEFERRED, needs a podman host:**
-  whether the gateway forwards to host-loopback services (pasta `--map-gw`) or the
-  broker must bind the gateway address; and a full OUTBOUND egress allowlist (block
-  the internet, allow only broker + node RPC). Do **not** use the
+- **PR 3 (SHIPPED): private netns + host-gateway, now the ONLY posture.** Every
+  Podman run gets a private container netns (`--network=slirp4netns`), so the
+  container gets its OWN loopback and can no longer scan the host's for other
+  runs' brokers / the node RPC — the primary lateral-reach weakness, closed for
+  ALL runs (headless and terminal alike). The broker is reachable via
+  `host.containers.internal` (`broker::Reachability::HostGateway`, shared with
+  Tart), and the run-action URL is rewritten to the same gateway. The
+  `DUCKTAPE_SANDBOX_PRIVATE_NET` opt-in knob and the `--network=host` fallback
+  are **deleted** — validated live by the terminal plane (real Anthropic PONG
+  through the private netns), so the dual path is gone per No-Compat. `probe()`
+  now makes a missing `slirp4netns` a boot error. **STILL DEFERRED:** a full
+  OUTBOUND egress allowlist (block the internet, allow only broker + node RPC) —
+  a private netns alone still NATs outbound. Do **not** use the
   reference-devcontainer `NET_ADMIN` in-container firewall — an adversarial
   container must not hold `NET_ADMIN`; enforce egress from outside.
 - **PR 4: full-shell mode — DROPPED** (user call: "full shell은 별로"). A member
