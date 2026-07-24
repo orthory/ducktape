@@ -611,6 +611,31 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     }
 
     #[test]
+    fn history_windows_offer_a_jump_back_to_latest() {
+        let (mut app, _) = Ducktape::__boot();
+        app.loading = false;
+        app.active_channel = "general".into();
+
+        // landing on a search hit enters history mode…
+        let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
+            "general",
+            vec![message(7, "an old message", false)],
+        )));
+        assert!(app.history_view);
+
+        // …and a plain channel load (the Jump-to-latest path) leaves it
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
+            "general",
+            vec![message(50, "the latest", false)],
+        )));
+        assert!(!app.history_view);
+
+        let view = include_str!("ui/view.ice");
+        assert!(view.contains("button \"Jump to latest\""));
+        assert!(view.contains("-> choose_channel(active_channel)"));
+    }
+
+    #[test]
     fn message_actions_require_explicit_intent() {
         let (mut app, _) = Ducktape::__boot();
         app.mutation_phase = "idle".into();

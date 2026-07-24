@@ -167,6 +167,14 @@ view
               EmptyState title="Connect to a node" detail="Set the RPC endpoint in the sidebar."
             if connected && empty(messages)
               EmptyState title="No messages yet" detail="Create a channel or start the conversation."
+            if connected && !empty(messages) && history_view
+              container width=fill height=32.0 padding-left=10.0 padding-right=6.0 bg=primary/12 border=primary/26 border-w=1.0 r=9.0
+                row width=fill height=fill spacing=8.0 align=center
+                  text "Viewing history" width=fill size=11.0 wrapping=none font=medium @text-primary
+                  button "Jump to latest" height=24.0 padding=5.0 -> choose_channel(active_channel)
+                    active bg=primary/16 text=fg border=primary/30 border-w=1.0 r=7.0
+                    hovered bg=primary/24 text=fg
+                    pressed bg=primary/30 text=fg
             if connected && !empty(messages)
               stack width=fill height=fill
                 mouse move=chat_pointer_moved

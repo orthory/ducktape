@@ -51,7 +51,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   reply_editor = editor("")
   pending_reply = ""
   error = ""
-  run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_updated _ | failed _
+  run load_chat_hit(connected_rpc, channel_id, root_seq, target_seq) -> chat_hit_loaded _ | failed _
 
 on choose_channel(id)
   return if loading || mutation_phase != "idle"
@@ -203,6 +203,34 @@ on message_send_failed(cause)
   run live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
 
 on chat_updated(next)
+  history_view = false
+  channels = next.channels
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  active_channel = next.active_channel
+  active_channel_name = next.active_channel_name
+  active_channel_archived = next.active_channel_archived
+  active_channel_members_only = next.active_channel_members_only
+  active_channel_huddle_count = next.active_channel_huddle_count
+  channel_members = next.channel_members
+  selected_message_seq = next.selected_message_seq
+  selected_message_rev = next.selected_message_rev
+  message_action = "toolbar"
+  message_edit_draft = next.selected_message_body
+  active_thread_seq = next.active_thread_seq
+  thread_target_seq = next.thread_target_seq
+  thread_messages = next.thread_messages
+  thread_next_reply_offset = next.thread_next_reply_offset
+  thread_has_more = next.thread_has_more
+  thread_generation = thread_generation + 1
+  live_thread_generation = live_thread_generation + 1
+  thread_loading = false
+  loading = false
+  error = ""
+
+on chat_hit_loaded(next)
+  history_view = true
   channels = next.channels
   messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)

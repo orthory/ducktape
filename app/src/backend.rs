@@ -1936,18 +1936,25 @@ pub async fn search_chat(
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
-        let reply: chat::index::ChatViewReply = rpc
-            .view(
-                "chat",
-                &serde_json::json!({
-                    "search": {
-                        "text": text,
-                        "channel_id": (!channel_id.is_empty()).then_some(channel_id),
-                        "limit": 50
-                    }
-                }),
-            )
-            .await?;
+        // a `#tag` query filters by the exact hashtag (the index's tag
+        // postings); anything else is full-text search.
+        let query = match text.strip_prefix('#') {
+            Some(tag) if !tag.is_empty() => serde_json::json!({
+                "tag_search": {
+                    "tag": tag.to_lowercase(),
+                    "channel_id": (!channel_id.is_empty()).then_some(channel_id),
+                    "limit": 50
+                }
+            }),
+            _ => serde_json::json!({
+                "search": {
+                    "text": text,
+                    "channel_id": (!channel_id.is_empty()).then_some(channel_id),
+                    "limit": 50
+                }
+            }),
+        };
+        let reply: chat::index::ChatViewReply = rpc.view("chat", &query).await?;
         let chat::index::ChatViewReply::Hits(hits) = reply else {
             return Err("chat search returned an invalid reply".into());
         };

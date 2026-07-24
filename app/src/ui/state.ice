@@ -71,6 +71,7 @@ state
   chat_search_hits:[ChatSearchHit] = []
   chat_searching = false
   chat_search_generation:i64 = 0
+  history_view = false
   pages:[PageItem] = []
   blocks:[PageBlock] = []
   active_page = ""
