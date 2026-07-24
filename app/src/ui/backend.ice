@@ -65,6 +65,7 @@ extern crate::backend
   sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
   sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
+  sync connection_degraded(status:str) -> bool
   sync retain_for_endpoint(value:str, current:str, next:str) -> str
   sync mutation_failure_phase(committed:bool) -> str
   sync message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64

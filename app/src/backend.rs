@@ -980,6 +980,15 @@ fn rpc_client(input: &str) -> Result<RpcClient, String> {
     RpcClient::new(&configured).map_err(Into::into)
 }
 
+/// True when the live connection is in a state the shell should banner:
+/// the stream is down, retrying, or a resync failed and is backing off.
+pub fn connection_degraded(status: String) -> bool {
+    status == "Offline"
+        || status == "Sync delayed"
+        || status == "Reconnecting…"
+        || status == "Live · resyncing"
+}
+
 pub fn canonical_endpoint(input: String) -> String {
     let configured = input.trim();
     rpc_client(configured)

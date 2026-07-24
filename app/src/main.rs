@@ -1106,7 +1106,7 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     }
 
     #[test]
-    fn macos_shell_uses_layered_system_materials() {
+    fn shell_uses_warm_opaque_materials() {
         let ui = concat!(
             include_str!("ui/app.ice"),
             include_str!("ui/backend.ice"),
@@ -1123,41 +1123,48 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         for gradient in ["linear(", "radial(", "conic("] {
             assert!(!ui.contains(gradient), "{gradient}");
         }
-
+        // fully opaque: no window transparency, no blur, no white-alpha glass
+        // overlays — light-theme chrome responds with ink (`fg/N`) and tokens.
         let app = include_str!("ui/app.ice");
-        assert!(app.contains("transparent true"));
+        assert!(!app.contains("\n    transparent true"));
+        assert!(!app.contains("\n    blur true"));
         assert!(app.contains("titlebar-transparent true"));
         assert!(app.contains("fullsize-content-view true"));
         assert!(app.contains("font \"../../assets/InterVariable.ttf\""));
+        assert!(!ui.contains("white/"));
 
         let theme = include_str!("ui/theme.ice");
         assert!(theme.contains("font ui family=\"Inter\" weight=normal"));
         for material in [
-            "bg #0b0b10ec",
-            "surface #17171fe8",
-            "popover #20202be8",
-            "sidebar #101016ef",
-            "elevated #262631e8",
+            "bg #fcfcfc",
+            "surface #f5f5f5",
+            "popover #ffffff",
+            "sidebar #f9f9f9",
+            "elevated #efefef",
+            "fg #2c2b27",
         ] {
             assert!(theme.contains(material), "{material}");
         }
-        // The redesign introduces an indigo accent for life (avatars, selection,
-        // primary actions) while staying a layered dark system material set.
-        for accent in ["primary #6f6cf6", "primaryhi #8a88ff"] {
+        // the terracotta accent is the single color voice of the warm palette.
+        for accent in ["primary #a05a3c", "primaryhi #8a4a2e"] {
             assert!(theme.contains(accent), "{accent}");
         }
 
         let shell = include_str!("ui/components/shell.ice");
+        // the shell is titlebar + optional degradation banner over the panes.
+        assert!(shell.contains("component TitleBar(status:str, loading:bool)"));
+        assert!(shell.contains("component ConnectionBanner(status:str)"));
+        assert!(shell.contains("if degraded\n        ConnectionBanner status=status"));
         assert!(shell.contains(
-            "container width=sidebar_width height=fill padding=12.0 padding-top=38.0 bg=sidebar"
+            "container width=sidebar_width height=fill padding=12.0 bg=sidebar"
         ));
         // the rail width is drag-resizable via the divider resize-handle.
         assert!(shell.contains("resize-handle drag=sidebar_dragged cursor=resize-horizontal"));
 
         let view = include_str!("ui/view.ice");
-        assert!(view.contains("container width=fill padding=6.0 bg=transparent border=white/11"));
+        assert!(view.contains("container width=fill padding=6.0 bg=transparent border=fg/11"));
         assert!(view.contains("if active_thread_seq > 0 && !channel_settings_open"));
-        assert!(view.contains("container width=fill padding=5.0 bg=transparent border=white/12"));
+        assert!(view.contains("container width=fill padding=5.0 bg=transparent border=fg/12"));
     }
 
     #[test]
