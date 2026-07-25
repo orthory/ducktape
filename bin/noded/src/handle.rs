@@ -231,6 +231,12 @@ pub struct NodeHandle {
     /// a remote create remembers its host here; the ws input/resize handlers read
     /// it to pick the forward lane over the absent local session.
     pub(crate) remote_sessions: crate::term_remote::RemoteSessions,
+    /// the volatile catalog of service daemons signaling presence to this node.
+    /// Always present (Default) — it is a bounded in-memory map, never durable
+    /// and never consensus state, so there is no shape of node that wants the
+    /// routes to 503. An entry confers no standing: `ducktape service enable`
+    /// is the consent boundary.
+    pub(crate) services: crate::services::ServiceCatalog,
 }
 
 impl NodeHandle {
@@ -264,6 +270,7 @@ impl NodeHandle {
             terminals: None,
             session_lane: None,
             remote_sessions: crate::term_remote::RemoteSessions::default(),
+            services: crate::services::ServiceCatalog::default(),
         };
         (handle, cmd_rx, hub)
     }
@@ -352,6 +359,11 @@ impl NodeHandle {
     /// the guest-side session-id → host-node registry (always present).
     pub(crate) fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
         &self.remote_sessions
+    }
+
+    /// the volatile service signaling catalog (always present).
+    pub(crate) fn services(&self) -> &crate::services::ServiceCatalog {
+        &self.services
     }
 
     /// Point gateway requests at the full node's authenticated overlay

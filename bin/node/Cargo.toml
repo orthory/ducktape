@@ -16,6 +16,14 @@ path = "src/main.rs"
 [dependencies]
 async-trait = { workspace = true }
 clap = { workspace = true }
+# terminal styling for the operator verbs. Both already ride in on clap's own
+# dependency graph, so promoting them to direct deps adds no supply chain:
+# `anstyle` is the (escape-free) style vocabulary and `anstream` is the stream
+# wrapper that STRIPS those escapes when the destination is not a terminal or
+# NO_COLOR is set — which is where non-tty correctness is enforced, once,
+# instead of in every renderer.
+anstyle = "1.0"
+anstream = "1.0"
 host = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }

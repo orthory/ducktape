@@ -63,6 +63,11 @@ pub(crate) struct BootEnv {
     /// `provider_host::discover` call sites (validator + resident). `None`
     /// = consensus-only: no discovery, no announce, no oracle pool.
     pub(crate) sandbox: Option<SandboxBackend>,
+    /// the COMPUTE SERVICE's backend — the `[sandbox]` table gated on the
+    /// user's `services.toml` compute grant. `None` = no provider discovery,
+    /// no oracle pool, no capability announce. Distinct from `sandbox`, which
+    /// the terminal plane and airlock still key off directly.
+    pub(crate) compute_backend: Option<SandboxBackend>,
     /// the capacity a compute node announces AND enforces: the single source
     /// for both the dispatch pool's ledger and the capability announce's
     /// resources. EMPTY for a consensus-only node.
@@ -108,6 +113,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordinator_relay,
         wireguard_advertised,
         sandbox,
+        compute_backend,
         sandbox_capacity,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
@@ -341,6 +347,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         sync_index,
         announce_capabilities,
         sandbox,
+        compute_backend,
         sandbox_capacity,
         promoted,
     }

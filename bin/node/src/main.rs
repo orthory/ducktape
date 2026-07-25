@@ -91,6 +91,7 @@ mod resident_announce;
 mod resident_dispatch;
 mod resource_limits;
 mod rpc;
+mod services;
 mod sync;
 mod term_plane;
 mod userkey;
@@ -195,6 +196,9 @@ enum Family {
     /// the duckfs working-copy CLI
     #[command(subcommand)]
     Fs(fs_cli::FsCmd),
+    /// offchain service daemons: what is signaling, and what you have enabled
+    #[command(subcommand)]
+    Service(services::ServiceCmd),
     /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
     Agent(agent_cli::AgentArgs),
     /// the stdio MCP server an agent runner spawns
@@ -228,6 +232,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::User(cmd) => userkey_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
+        Family::Service(cmd) => services::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }
@@ -323,6 +328,7 @@ fn run_node(
         sync_index: _,
         announce_capabilities,
         sandbox,
+        compute_backend,
         sandbox_capacity,
         promoted,
     } = boot::env::derive(resolved, sync_only);
@@ -576,6 +582,7 @@ fn run_node(
                 checkpoint_blocks,
                 announce_capabilities,
                 sandbox.clone(),
+                compute_backend.clone(),
                 sandbox_capacity.clone(),
                 rpc_listener,
                 http_cmds,
@@ -632,6 +639,7 @@ fn run_node(
                 dev_demo,
                 announce_capabilities,
                 sandbox,
+                compute_backend,
                 sandbox_capacity,
                 stream_hub,
                 index,
@@ -679,6 +687,7 @@ fn run_node(
             dev_demo,
             announce_capabilities,
             sandbox,
+            compute_backend,
             sandbox_capacity,
             rpc_listener,
             http_cmds,

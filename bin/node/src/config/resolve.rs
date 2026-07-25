@@ -138,14 +138,44 @@ pub struct Resolved {
     /// consensus-only node. This one value is both
     /// the dispatch pool's ledger and the capability announce's resources.
     pub sandbox_capacity: BTreeMap<String, u64>,
+    /// the COMPUTE SERVICE's backend — `Some` only when both halves agree:
+    /// the operator's `[sandbox]` table says HOW runs are isolated on this
+    /// host, and the user's `services.toml` grant (`ducktape service enable
+    /// compute`) says WHETHER this node runs any. `None` = no provider
+    /// discovery, no oracle pool, no capability announce.
+    ///
+    /// Deliberately NOT the same value as `sandbox`: the interactive terminal
+    /// plane and the airlock gateway key off the table alone, so a node whose
+    /// operator wants pty sessions does not have to grant it a compute
+    /// service. Decided once here so no boot site re-derives the predicate.
+    pub compute_backend: Option<SandboxBackend>,
 }
 
-/// the podman provider image default — what `--compute` generation writes
-/// into a fresh `[sandbox] image`, and the commented example's value.
+/// the podman provider image default — what `[sandbox]` generation writes
+/// into a fresh table's `image`, and the commented example's value.
 pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/node:22-slim";
-/// the tart provider image default — what `--compute` generation writes on
+/// the tart provider image default — what `[sandbox]` generation writes on
 /// macOS. resolution never guesses an image: the table always carries one.
 pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:latest";
+
+/// Gate the resolved sandbox backend on the user's compute grant.
+///
+/// Two independent facts, and the compute service needs both: the `[sandbox]`
+/// table (HOW a run is isolated on this host, written by `init`/`join`) and a
+/// `services.toml` grant for `compute` (WHETHER this node may run one, minted
+/// by `ducktape service enable compute`). Absent either, this is `None` and
+/// the node has no compute capacity — the flag-day replacement for a node
+/// founded without the retired `node init --compute`.
+fn gate_on_compute_grant(
+    sandbox: Option<&SandboxBackend>,
+    workspace: &Path,
+) -> Result<Option<SandboxBackend>, String> {
+    let Some(backend) = sandbox else {
+        return Ok(None);
+    };
+    let granted = crate::services::grant_for(workspace, crate::services::COMPUTE_KIND)?;
+    Ok(granted.map(|_| backend.clone()))
+}
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
 /// (no table) = consensus-only node, no backend and no capacity; `"podman"`
@@ -309,6 +339,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
     let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), base)?;
+    let compute_backend = gate_on_compute_grant(sandbox.as_ref(), base)?;
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -348,6 +379,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
+        compute_backend,
     })
 }
 
@@ -522,6 +554,9 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         None => std::env::temp_dir().join(format!("ducktape-{}", raw.id)),
     };
     let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), &storage_dir)?;
+    // the dev shape's per-process state dir stands in as its workspace, so its
+    // grant file sits beside its storage — one rule for both shapes.
+    let compute_backend = gate_on_compute_grant(sandbox.as_ref(), &storage_dir)?;
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let invite_listen = resolved_intro_listener(
         raw.advertised.as_deref(),
@@ -629,6 +664,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         wireguard_advertised,
         sandbox,
         sandbox_capacity,
+        compute_backend,
     })
 }
 

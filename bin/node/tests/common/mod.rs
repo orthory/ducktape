@@ -87,6 +87,14 @@ pub struct Cluster {
     /// would not survive a respawn). set before the first spawn; empty by
     /// default so existing tests are byte-for-byte unchanged.
     pub extra_toml: Vec<String>,
+    /// grant every node the `compute` service, the harness twin of `ducktape
+    /// service enable compute`. The compute plane needs BOTH a `[sandbox]`
+    /// table (HOW runs are isolated — set via `extra_toml`) and this grant
+    /// (WHETHER this node runs any), so a test that expects provider
+    /// discovery, an oracle pool or a capability announce must set it. `false`
+    /// by default: a node nobody enabled has no compute capacity, exactly like
+    /// a real one.
+    pub compute: bool,
     /// extra environment variables for node `idx`'s process, index-aligned
     /// with `peer_ids` (what gives each node its own capability-provider
     /// surface: `DUCKTAPE_CAPABILITY_DIR`, spec `detect.env` overrides).
@@ -567,6 +575,7 @@ impl Cluster {
             bootstrap_addr_override: None,
             wireguard: false,
             extra_toml: Vec::new(),
+            compute: false,
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
@@ -623,7 +632,32 @@ impl Cluster {
             cfg.push('\n');
         }
         std::fs::write(&path, cfg).expect("write node config");
+        self.write_service_grants(idx);
         path
+    }
+
+    /// Write (or remove) the workspace `services.toml` the node reads at boot.
+    ///
+    /// Regenerated alongside node.toml on every spawn, so a respawn after
+    /// `wipe_storage` still finds its grant. The dev shape's `storage_dir` IS
+    /// its workspace, so the file lands beside the node's state.
+    fn write_service_grants(&self, idx: usize) {
+        let workspace = self.workspace(idx);
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        let path = workspace.join("services.toml");
+        if !self.compute {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        // any well-formed id/nonce pair does: the node only asks WHETHER a
+        // compute grant exists, never re-derives it.
+        let grant = format!(
+            "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+             nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = []\nscopes = []\n",
+            "11".repeat(32),
+            "22".repeat(16),
+        );
+        std::fs::write(&path, grant).expect("write services.toml");
     }
 
     /// spawn the node at `idx` as a validator/mesh member, stdout+stderr to a

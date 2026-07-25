@@ -220,6 +220,9 @@ pub(super) async fn park(
     checkpoint_blocks: u64,
     announce_capabilities: bool,
     sandbox: Option<provider_host::SandboxBackend>,
+    // the compute SERVICE's backend: the `[sandbox]` table gated on the
+    // user's `services.toml` grant. Drives discovery/pool/announce only.
+    compute_backend: Option<provider_host::SandboxBackend>,
     sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
@@ -675,10 +678,10 @@ pub(super) async fn park(
     // drained by the park loop's pump pass, so a minutes-long run
     // never stalls the serve window, boundary follow, or promotion
     // detection.
-    // no `node.toml [sandbox]` = no compute plane, same as the validator
-    // boot: nothing discovered, nothing announced, nothing spawnable.
     // node-private podman service up before discovery; held for the node's
     // life (see the validator boot for the rationale). fail-closed on error.
+    // keyed on the `[sandbox]` TABLE, not the compute grant — the terminal
+    // plane's ptys run in this same service.
     let self_exe = std::env::current_exe()
         .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
     let _podman_service = match &sandbox {
@@ -687,7 +690,10 @@ pub(super) async fn park(
             .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
         None => None,
     };
-    let resident_provider_set = match sandbox {
+    // no compute plane — no `[sandbox]` table, or no `service enable compute`
+    // grant — means nothing discovered, announced or spawnable, exactly as on
+    // the validator boot.
+    let resident_provider_set = match compute_backend {
         Some(backend) => provider_host::discover(
             &me_bytes,
             agent_dirs.clone(),

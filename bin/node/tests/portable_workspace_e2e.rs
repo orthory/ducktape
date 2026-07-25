@@ -390,6 +390,8 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // discovered or announced).
     cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.extra_toml.extend(sandbox_toml());
+    // the pool needs the compute grant as well as the [sandbox] table.
+    cluster.compute = true;
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),

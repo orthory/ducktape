@@ -797,6 +797,15 @@ fn resolve_network_in(root: &Path, needle: &str) -> Result<(PathBuf, Option<Stri
     Ok((dir, Some(http_base_of(&raw.http_listen))))
 }
 
+/// the node's HTTP base for a workspace DIRECTORY — the `--workspace <dir>`
+/// twin of [`resolve_network`], which addresses the same node by chain id. One
+/// resolver behind both so a family that accepts either selector dials the
+/// same URL.
+pub(crate) fn http_base_in(dir: &Path) -> Result<String, String> {
+    let (raw, _) = node_toml::load_node_toml(&dir.join("node.toml"))?;
+    Ok(http_base_of(&raw.http_listen))
+}
+
 /// `http://<host:port>` for a node.toml `http_listen`, rewriting a wildcard
 /// bind to the SAME family's loopback: a wildcard means "every interface", and
 /// a co-located CLI reaches the node over loopback. `0.0.0.0` → `127.0.0.1`,

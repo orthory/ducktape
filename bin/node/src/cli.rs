@@ -252,7 +252,7 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// the platform's compute adapter — podman on Linux, tart on macOS — as the
 /// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
-/// the probeable backend, so `--compute` and detection share one choice.
+/// the probeable backend, so generation and detection share one choice.
 fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     let (runtime, image, backend) = if cfg!(target_os = "macos") {
         ("tart", config::DEFAULT_TART_IMAGE, provider_host::SandboxBackend::Tart {
@@ -276,12 +276,15 @@ fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     (table, backend)
 }
 
-/// fresh-workspace compute detection (init without `--compute`, join): the
-/// platform adapter's runtime binary on PATH ⇒ a live `[sandbox]` table, with
-/// a stderr note; absent ⇒ `None` (today's commented example). Detection never
-/// flips `announce_capabilities` — publishing capacity to the network stays
-/// the explicit `--compute`/operator opt-in; this only makes the node's OWN
-/// compute (agent runs, the interactive terminal plane) work out of the box.
+/// fresh-workspace compute detection (`init`, `join`): the platform adapter's
+/// runtime binary on PATH ⇒ a live `[sandbox]` table, with a stderr note;
+/// absent ⇒ `None` (today's commented example).
+///
+/// The table says only HOW runs would be isolated on this host — it grants
+/// nothing. Whether this node runs a compute service at all is the user's
+/// `ducktape service enable compute`, so detection can stay eager: it makes
+/// the interactive terminal plane work out of the box and leaves the compute
+/// plane dark until someone consents to it.
 fn detect_platform_sandbox() -> Option<config::SandboxToml> {
     let (table, backend) = platform_sandbox();
     let Ok(runtime_path) = backend.probe() else {
@@ -364,17 +367,12 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
-    // `--compute` founds a workstation node: a [sandbox] table (podman on
-    // Linux, tart on macOS — chosen for the platform init runs on) and the
-    // capability announce. Without the flag a FRESH workspace still detects
-    // the platform runtime and writes the table (announce stays off); an
-    // existing node.toml keeps whatever the operator chose — a deleted table
-    // is never resurrected.
-    if args.compute {
-        let (sandbox, _) = platform_sandbox();
-        plumbing.sandbox = Some(sandbox);
-        plumbing.announce_capabilities = true;
-    } else if fresh_workspace {
+    // a FRESH workspace detects the platform runtime and writes the table (it
+    // describes HOW runs are isolated, and grants nothing); an existing
+    // node.toml keeps whatever the operator chose — a deleted table is never
+    // resurrected. Turning the compute plane ON is `ducktape service enable
+    // compute`, never an init flag.
+    if fresh_workspace {
         plumbing.sandbox = detect_platform_sandbox();
     }
 

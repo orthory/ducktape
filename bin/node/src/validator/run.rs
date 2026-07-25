@@ -129,6 +129,9 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) announce_capabilities: bool,
     pub(super) sandbox: Option<provider_host::SandboxBackend>,
+    /// the compute SERVICE's backend: the table gated on the user's
+    /// `services.toml` grant. Drives discovery/pool/announce only.
+    pub(super) compute_backend: Option<provider_host::SandboxBackend>,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     /// the local rpc bridge's parsed-request queue — the caller owns the
     /// listener spawn (a promoted node's listener pump carries over from
@@ -265,6 +268,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         sync_lease,
         announce_capabilities,
         sandbox,
+        compute_backend,
         sandbox_capacity,
         rpc_ingress,
         http_cmds,
@@ -367,13 +371,14 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // announced set to nothing — never the reverse). routing and
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
-    // no `node.toml [sandbox]` = no compute plane: nothing is discovered or
-    // announced and the pool below has nothing it could ever spawn — a bare
-    // host spawn is unrepresentable.
     // the node-private podman service (own socket + storage + egress hooks) must
     // be up before anything is discovered or spawned; held for the node's life.
     // A non-Podman backend yields `None`. Fail-closed: a start failure panics
     // like a broken spec would, never a silently unsandboxed node.
+    //
+    // keyed on the `[sandbox]` TABLE, not the compute grant: the interactive
+    // terminal plane runs its ptys in this same service, so a node the
+    // operator gave a sandbox but no compute service still needs it up.
     let self_exe = std::env::current_exe()
         .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
     let _podman_service = match &sandbox {
@@ -382,7 +387,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
             .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
         None => None,
     };
-    let providers = match sandbox {
+    // no compute plane — no `[sandbox]` table, or no `service enable compute`
+    // grant — means nothing is discovered or announced and the pool below has
+    // nothing it could ever spawn. A bare host spawn is unrepresentable.
+    let providers = match compute_backend {
         Some(backend) => provider_host::discover(
             signer.public_key().as_ref(),
             agent_dirs.clone(),

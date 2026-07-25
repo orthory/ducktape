@@ -628,6 +628,9 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
     cluster.extra_toml = sandbox_toml();
+    // the [sandbox] table is only HOW runs are isolated; the pool also
+    // needs the user's compute grant (`ducktape service enable compute`).
+    cluster.compute = true;
     cluster.env[0] = [provider.env(), hide_builtins(fixtures.path(), "node0")].concat();
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", CONVERGE);
@@ -738,6 +741,9 @@ fn an_ungranted_scheduled_run_is_refused_at_resolve() {
     let provider = ScriptProvider::stage(fixtures.path(), false);
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.extra_toml = sandbox_toml();
+    // the [sandbox] table is only HOW runs are isolated; the pool also
+    // needs the user's compute grant (`ducktape service enable compute`).
+    cluster.compute = true;
     cluster.env[0] = hide_builtins(fixtures.path(), "node0");
     cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.spawn(0);

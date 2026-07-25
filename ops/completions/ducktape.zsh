@@ -6,13 +6,13 @@
 # install: put this file on your $fpath as `_ducktape`, then `autoload -U _ducktape`.
 
 _ducktape() {
-    local families=(node user gateway fs agent mcp help --help -h version --version -V)
+    local families=(node user gateway fs service agent mcp help --help -h version --version -V)
 
     local node_verbs=(run key init invite admit join list status peers resident member help)
     local node_resident=(accept remove)
     local node_member=(promote remove leave status)
     local node_join=(requests state)
-    local node_flags=(--config -n --network --sync-only --json --out --dir --name --compute --listen
+    local node_flags=(--config -n --network --sync-only --json --out --dir --name --listen
         --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen
         --wireguard-advertised --invite-listen --wireguard-effect --role --ttl-days)
 
@@ -26,6 +26,8 @@ _ducktape() {
     local gateway_flags=(--workspace -n --network --label --port)
     local fs_verbs=(ls cat stat history diff checkout status commit pin help)
     local fs_flags=(-n --network --json --node --message -m --no-rebase --snapshot --limit --prefix)
+    local service_verbs=(list enable disable status help)
+    local service_flags=(--workspace -n --network --json --yes -y)
     local agent_verbs=(pty sched help)
     local agent_flags=(-n --network --node --cred --cpu --mem)
 
@@ -53,6 +55,7 @@ _ducktape() {
             ;;
         gateway) compadd -- $gateway_verbs $gateway_flags ;;
         fs)      compadd -- $fs_verbs $fs_flags ;;
+        service) compadd -- $service_verbs $service_flags ;;
         agent)   compadd -- $agent_verbs $agent_flags ;;
     esac
 }
