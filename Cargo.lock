@@ -4495,15 +4495,19 @@ name = "inbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
+ "commonware-runtime",
  "futures",
  "guest-adapter",
  "host",
+ "inbox",
  "index-guest",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
 ]
 
 [[package]]

@@ -1,0 +1,139 @@
+//! state-sync round-trip: a joiner reconstructs a byte-identical qmdb root by
+//! pulling a source store's operation range through commonware's qmdb sync,
+//! then wraps a fresh `Inbox` around the injected store — the same
+//! discriminating property the rest of the store-backed family proves, over
+//! the meta + item + member-count layout.
+//!
+//! the source delivers to two members, marks one item read (record
+//! overwrite), and clears a prefix (the op log carries item DELETES with the
+//! meta keeping its never-rewinding counter), so the joiner must reconstruct
+//! every record family — and a post-sync delivery must resume at the
+//! preserved next_seq, never a reused one.
+
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use inbox::{Inbox, InboxMsg, encode_msg};
+use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
+use sdk_testkit::TestCtx;
+use statesync::qmdb::QmdbStore;
+
+fn sys(height: u64) -> TestCtx {
+    TestCtx::with_env(Env {
+        height,
+        consensus_time: height,
+        origin: Origin::System,
+        me: "inbox".into(),
+    })
+}
+
+fn deliver(member: &str, kind: &str, body: &str) -> Msg {
+    Msg {
+        target: "inbox".into(),
+        payload: encode_msg(&InboxMsg::Deliver {
+            member: member.into(),
+            kind: kind.into(),
+            body: body.into(),
+        }),
+    }
+}
+
+fn mark_read(member: &str, up_to_seq: u64) -> Msg {
+    Msg {
+        target: "inbox".into(),
+        payload: encode_msg(&InboxMsg::MarkRead {
+            member: member.into(),
+            up_to_seq,
+        }),
+    }
+}
+
+fn clear(member: &str, up_to_seq: u64) -> Msg {
+    Msg {
+        target: "inbox".into(),
+        payload: encode_msg(&InboxMsg::Clear {
+            member: member.into(),
+            up_to_seq,
+        }),
+    }
+}
+
+async fn apply_commit(m: &mut Inbox, height: u64, op: Msg) {
+    let mut c = sys(height);
+    m.execute(&mut c, &op).await.unwrap();
+    m.commit_block().await.unwrap();
+}
+
+fn inbox_over(store: Box<dyn sdk::MerkleStore>) -> Inbox {
+    Inbox::new("inbox", store)
+}
+
+#[test]
+fn synced_store_reconstructs_source_root_queues_and_counters() {
+    deterministic::Runner::default().start(|context| async move {
+        // SOURCE: an empty store — inbox carries no genesis config.
+        let src_store = QmdbStore::init(context.child("src"), "src").await;
+        let genesis_root = src_store.root();
+        let mut src = inbox_over(Box::new(src_store));
+
+        apply_commit(&mut src, 1, deliver("alice", "mention", "hi")).await;
+        apply_commit(&mut src, 2, deliver("alice", "reply", "yo")).await;
+        apply_commit(&mut src, 3, deliver("bob", "k", "solo")).await;
+        // a read flip (record overwrite) and a prefix clear (item deletes;
+        // the meta keeps its never-rewinding counter).
+        apply_commit(&mut src, 4, mark_read("alice", 1)).await;
+        apply_commit(&mut src, 5, clear("bob", 1)).await;
+
+        let src_root: StateRoot = src.root();
+        assert_ne!(src_root, genesis_root, "the ops moved the root");
+        let src_alice = src.queue_view("alice").await.unwrap();
+        let src_bob = src.queue_view("bob").await.unwrap();
+
+        // the module consumed its store, so REOPEN the committed partitions
+        // as a bare store for the handoff (drop first — one owner at a time).
+        drop(src);
+        let src_store = QmdbStore::init(context.child("src_serve"), "src").await;
+        assert_eq!(
+            src_store.root(),
+            src_root,
+            "reopened store must recover the committed root"
+        );
+
+        // describe the target (root + op range), THEN hand the source off as
+        // the sync resolver (consumes it — order matters).
+        let target = src_store.sync_boundary_target().await;
+        let resolver = src_store.into_resolver();
+
+        // JOINER: reconstruct on a FRESH context + namespace by pulling from
+        // the resolver, then wrap the module around the injected store.
+        let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
+            .await
+            .expect("sync_from");
+        let mut synced = inbox_over(Box::new(store));
+
+        // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
+        // needs at the boundary height.
+        assert_eq!(
+            synced.root(),
+            src_root,
+            "synced store root must equal the source root"
+        );
+
+        // queues, read flags, and the cleared prefix synced together.
+        assert_eq!(synced.queue_view("alice").await.unwrap(), src_alice);
+        assert_eq!(synced.queue_view("bob").await.unwrap(), src_bob);
+
+        // the cleared member's counter survived the trip: the next delivery
+        // resumes at the preserved next_seq (2), never a reused seq 1.
+        apply_commit(&mut synced, 6, deliver("bob", "k", "after clear")).await;
+        let (next, items) = synced
+            .queue_view("bob")
+            .await
+            .unwrap()
+            .expect("bob exists");
+        assert_eq!(next, 3);
+        assert_eq!(
+            items.iter().map(|n| n.seq).collect::<Vec<_>>(),
+            vec![2],
+            "the post-sync delivery took seq 2 — next_seq did not rewind"
+        );
+    });
+}

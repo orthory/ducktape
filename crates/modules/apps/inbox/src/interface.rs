@@ -13,6 +13,7 @@
 //! not invent an auth scheme. `source` records the DELIVERING origin and is
 //! derived by the module from `Env.origin` (never caller-supplied).
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 // ---- write-time caps (consensus constants) ---------------------------------
@@ -35,7 +36,7 @@ pub const MAX_MEMBERS: usize = 65536;
 /// one delivered notification. `seq` is assigned per member, monotonic and
 /// gap-free within what was ever assigned (a `Clear` removes items but never
 /// rewinds the member's `next_seq`).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub seq: u64,
     /// the opaque member identity this notification belongs to.

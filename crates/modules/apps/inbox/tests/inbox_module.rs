@@ -1,14 +1,16 @@
 //! write-path consensus rules of the inbox module. the module serves NO
 //! queries (the read surface — paged lists, unread counts — is the index
 //! guest's job, `src/index.rs`), so committed state is asserted through
-//! `Module::root()` and the canonical `snapshot()` bytes: the encoding IS the
-//! root preimage, so a hand-encoded expected image proves state byte-for-byte.
+//! `Module::root()` and the testkit-gated record read (`Inbox::queue_view`);
+//! the qmdb continuity proof lives in `tests/sync_round_trip.rs`.
 
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use inbox::{Inbox, InboxMsg, MAX_BODY_BYTES, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, encode_msg};
-use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
-use sdk_testkit::TestCtx;
+use inbox::{
+    Inbox, InboxMsg, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, Notification, encode_msg,
+};
+use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
+use sdk_testkit::{MemStore, TestCtx};
 
 const INBOX: &str = "inbox";
 
@@ -56,62 +58,54 @@ fn sys(consensus_time: u64) -> TestCtx {
     ctx(Origin::System, consensus_time)
 }
 
-// ---- canonical snapshot bytes, hand-encoded ---------------------------------
-//
-// the module's canonical byte layout is BOTH the `root()` preimage and the
-// snapshot wire: member count, then per member (id, next_seq, item count,
-// items ascending by seq), length-prefixed strings and LE u64s throughout.
-// tests assert committed state by building these bytes and comparing them
-// against `snapshot()` (or the root they hash to).
-
-fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
+fn fresh() -> Inbox {
+    Inbox::new(INBOX, Box::new(MemStore::new()))
 }
 
-fn push_str(out: &mut Vec<u8>, value: &str) {
-    push_u64(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
+/// one member's committed-or-staged queue via the testkit read.
+async fn queue(inbox: &Inbox, member: &str) -> Option<(u64, Vec<Notification>)> {
+    inbox.queue_view(member).await.expect("queue view")
 }
 
-/// one item as `(seq, kind, body, source, created_at, read)`.
-type ItemBytes<'a> = (u64, &'a str, &'a str, &'a str, u64, bool);
-
-fn push_member(out: &mut Vec<u8>, member: &str, next_seq: u64, items: &[ItemBytes]) {
-    push_str(out, member);
-    push_u64(out, next_seq);
-    push_u64(out, items.len() as u64);
-    for (seq, kind, body, source, created_at, read) in items {
-        push_u64(out, *seq);
-        push_str(out, kind);
-        push_str(out, body);
-        push_str(out, source);
-        push_u64(out, *created_at);
-        out.push(*read as u8);
-    }
+/// the compact item shape assertions compare: `(seq, kind, body, source,
+/// created_at, read)`.
+fn item_tuple(n: &Notification) -> (u64, String, String, String, u64, bool) {
+    (
+        n.seq,
+        n.kind.clone(),
+        n.body.clone(),
+        n.source.clone(),
+        n.created_at,
+        n.read,
+    )
 }
 
-/// the full canonical image for a committed state (members ascending by id —
-/// the caller lists them in that order, as the module's BTreeMap encodes them).
-fn snapshot_bytes(members: &[(&str, u64, &[ItemBytes])]) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_u64(&mut out, members.len() as u64);
-    for (member, next_seq, items) in members {
-        push_member(&mut out, member, *next_seq, items);
-    }
-    out
+fn tuples(items: &[Notification]) -> Vec<(u64, String, String, String, u64, bool)> {
+    items.iter().map(item_tuple).collect()
 }
 
-/// the root a canonical byte image hashes to: the encoding IS the root
-/// preimage.
-fn root_of_bytes(bytes: &[u8]) -> StateRoot {
-    use sha2::{Digest, Sha256};
-    StateRoot(Sha256::digest(bytes).into())
+fn t(
+    seq: u64,
+    kind: &str,
+    body: &str,
+    source: &str,
+    created_at: u64,
+    read: bool,
+) -> (u64, String, String, String, u64, bool) {
+    (
+        seq,
+        kind.into(),
+        body.into(),
+        source.into(),
+        created_at,
+        read,
+    )
 }
 
 #[test]
 fn deliver_assigns_per_member_sequence() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
 
         inbox
             .execute(&mut sys(10), &deliver("alice", "mention", "hi"))
@@ -129,27 +123,26 @@ fn deliver_assigns_per_member_sequence() {
 
         // per-member seqs are monotonic from 1 and the queues independent
         // (bob restarts at 1); created_at is the block's consensus time and
-        // new items are unread — all pinned byte-for-byte in the canonical
-        // committed image.
-        let expected = snapshot_bytes(&[
-            (
-                "alice",
-                3,
-                &[
-                    (1, "mention", "hi", "system", 10, false),
-                    (2, "reply", "yo", "system", 11, false),
-                ],
-            ),
-            ("bob", 2, &[(1, "mention", "sup", "system", 12, false)]),
-        ]);
-        assert_eq!(inbox.snapshot(), expected);
+        // new items are unread.
+        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
+        assert_eq!(next, 3);
+        assert_eq!(
+            tuples(&items),
+            vec![
+                t(1, "mention", "hi", "system", 10, false),
+                t(2, "reply", "yo", "system", 11, false),
+            ]
+        );
+        let (next, items) = queue(&inbox, "bob").await.expect("bob exists");
+        assert_eq!(next, 2);
+        assert_eq!(tuples(&items), vec![t(1, "mention", "sup", "system", 12, false)]);
     });
 }
 
 #[test]
 fn source_is_derived_from_origin() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
 
         inbox
             .execute(
@@ -180,26 +173,25 @@ fn source_is_derived_from_origin() {
 
         // source = module id verbatim / "ext:"+hex of external bytes /
         // "system" — the ext: prefix domain-separates external keys from
-        // pure-hex module ids; never caller-supplied. all four land in the
-        // committed image.
-        let expected = snapshot_bytes(&[(
-            "m",
-            5,
-            &[
-                (1, "k", "from module", "chat", 1, false),
-                (2, "k", "from external", "ext:deadbeef", 2, false),
-                (3, "k", "from system", "system", 3, false),
-                (4, "k", "from anonymous external", "ext:", 4, false),
-            ],
-        )]);
-        assert_eq!(inbox.snapshot(), expected);
+        // pure-hex module ids; never caller-supplied.
+        let (next, items) = queue(&inbox, "m").await.expect("m exists");
+        assert_eq!(next, 5);
+        assert_eq!(
+            tuples(&items),
+            vec![
+                t(1, "k", "from module", "chat", 1, false),
+                t(2, "k", "from external", "ext:deadbeef", 2, false),
+                t(3, "k", "from system", "system", 3, false),
+                t(4, "k", "from anonymous external", "ext:", 4, false),
+            ]
+        );
     });
 }
 
 #[test]
 fn caps_reject_oversized_and_leave_root_unchanged() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
         let root0 = inbox.root();
 
         let big_body = "x".repeat(16 * 1024 + 1);
@@ -230,12 +222,11 @@ fn caps_reject_oversized_and_leave_root_unchanged() {
         assert_eq!(
             inbox.root(),
             root0,
-            "rejected deliveries never enter the root preimage"
+            "rejected deliveries never enter the root"
         );
-        assert_eq!(
-            inbox.snapshot(),
-            snapshot_bytes(&[]),
-            "nothing was staged: committed state is byte-empty"
+        assert!(
+            queue(&inbox, "alice").await.is_none(),
+            "nothing was staged for the rejected member"
         );
     });
 }
@@ -243,7 +234,7 @@ fn caps_reject_oversized_and_leave_root_unchanged() {
 #[test]
 fn queue_overflow_drops_oldest_item() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
         let cap = MAX_ITEMS_PER_MEMBER as u64;
         // one over the per-member cap, all in a single block.
         for i in 0..=cap {
@@ -256,20 +247,19 @@ fn queue_overflow_drops_oldest_item() {
 
         // seq 1 (the oldest) was dropped deterministically: the committed
         // window is exactly 2..=cap+1 (the queue holds the cap), and next_seq
-        // kept counting past the drop. item seq s was delivered at consensus
-        // time s-1.
-        let survivors: Vec<ItemBytes> = (2..=cap + 1)
-            .map(|seq| (seq, "k", "b", "system", seq - 1, false))
-            .collect();
-        let expected = snapshot_bytes(&[("alice", cap + 2, &survivors)]);
-        assert_eq!(inbox.snapshot(), expected);
+        // kept counting past the drop.
+        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
+        assert_eq!(next, cap + 2, "next_seq counted past the drop");
+        assert_eq!(items.len(), MAX_ITEMS_PER_MEMBER, "the queue holds the cap");
+        assert_eq!(items.first().map(|n| n.seq), Some(2), "seq 1 dropped");
+        assert_eq!(items.last().map(|n| n.seq), Some(cap + 1));
     });
 }
 
 #[test]
 fn member_cap_rejects_new_member() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
         // fill exactly MAX_MEMBERS distinct members in one block.
         for i in 0..MAX_MEMBERS as u64 {
             let member = format!("m{i}");
@@ -297,7 +287,7 @@ fn member_cap_rejects_new_member() {
 #[test]
 fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
         for _ in 0..3 {
             inbox
                 .execute(&mut sys(1), &deliver("alice", "k", "b"))
@@ -312,19 +302,16 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
             .await
             .expect("mark read");
         inbox.commit_block().await.expect("commit mark read");
-        let read_two = snapshot_bytes(&[(
-            "alice",
-            4,
-            &[
-                (1, "k", "b", "system", 1, true),
-                (2, "k", "b", "system", 1, true),
-                (3, "k", "b", "system", 1, false),
-            ],
-        )]);
-        assert_eq!(inbox.snapshot(), read_two, "only seqs 1,2 are read");
+        let (_, items) = queue(&inbox, "alice").await.expect("alice exists");
+        assert_eq!(
+            items.iter().map(|n| (n.seq, n.read)).collect::<Vec<_>>(),
+            vec![(1, true), (2, true), (3, false)],
+            "only seqs 1,2 are read"
+        );
         let root_after_ack = inbox.root();
 
-        // idempotent re-ack: the same MarkRead commits byte-identical state.
+        // idempotent re-ack: nothing flips, so nothing is staged and the
+        // root holds byte-identical.
         inbox
             .execute(&mut sys(2), &mark_read("alice", 2))
             .await
@@ -360,44 +347,38 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
             .await
             .expect("deliver after clear");
         inbox.commit_block().await.expect("commit clear+deliver");
-        let expected = snapshot_bytes(&[(
-            "alice",
-            5,
-            &[
-                (3, "k", "b", "system", 1, false),
-                (4, "k", "after clear", "system", 5, false),
-            ],
-        )]);
+        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
+        assert_eq!(next, 5);
         assert_eq!(
-            inbox.snapshot(),
-            expected,
+            tuples(&items),
+            vec![
+                t(3, "k", "b", "system", 1, false),
+                t(4, "k", "after clear", "system", 5, false),
+            ],
             "seq 1,2 cleared; the new delivery took seq 4 — next_seq did not rewind"
         );
     });
 }
 
 #[test]
-fn root_moves_only_on_commit_and_abort_is_byte_identical() {
+fn root_moves_only_on_commit_and_abort_leaves_no_trace() {
     block_on(async {
-        let mut inbox = Inbox::new(INBOX);
+        let mut inbox = fresh();
         let root0 = inbox.root();
-        let empty = inbox.snapshot();
 
         inbox
             .execute(&mut sys(1), &deliver("alice", "k", "b"))
             .await
             .expect("stage deliver");
         assert_eq!(inbox.root(), root0, "staged writes do not move the root");
-        assert_eq!(
-            inbox.snapshot(),
-            empty,
-            "snapshot is committed-state only — the stage is invisible"
+        assert!(
+            queue(&inbox, "alice").await.is_some(),
+            "read-your-writes sees the stage"
         );
 
         inbox.commit_block().await.expect("commit");
         let root1 = inbox.root();
         assert_ne!(root1, root0, "commit moves the root");
-        let committed = inbox.snapshot();
 
         inbox
             .execute(&mut sys(2), &deliver("alice", "k", "b2"))
@@ -410,97 +391,8 @@ fn root_moves_only_on_commit_and_abort_is_byte_identical() {
             root1,
             "abort leaves the root byte-identical to pre-block"
         );
-        assert_eq!(
-            inbox.snapshot(),
-            committed,
-            "the aborted delivery left no byte behind"
-        );
-    });
-}
-
-#[test]
-fn snapshot_install_round_trips() {
-    block_on(async {
-        let mut source = Inbox::new(INBOX);
-        source
-            .execute(
-                &mut ctx(Origin::Module("chat".into()), 5),
-                &deliver("alice", "mention", "hi"),
-            )
-            .await
-            .expect("deliver");
-        source
-            .execute(&mut sys(6), &deliver("alice", "k", "second"))
-            .await
-            .expect("deliver");
-        source
-            .execute(&mut sys(7), &deliver("bob", "k", "solo"))
-            .await
-            .expect("deliver");
-        source.commit_block().await.expect("commit");
-        // exercise read flags + a clear so the snapshot carries every field.
-        source
-            .execute(&mut sys(8), &mark_read("alice", 1))
-            .await
-            .expect("mark read");
-        source
-            .execute(&mut sys(9), &clear("bob", 1))
-            .await
-            .expect("clear bob (leaves empty queue, next_seq preserved)");
-        source.commit_block().await.expect("commit");
-
-        // the module advertises self-contained snapshot bytes...
-        let handle = source.state_sync_handle().expect("handle");
-        let bytes = match handle {
-            StateSyncHandle::SnapshotBytes(bytes) => bytes,
-            other => panic!("expected SnapshotBytes, got {other:?}"),
-        };
-
-        // ...that install verbatim against the source root.
-        let mut target = Inbox::new(INBOX);
-        target.install(&bytes, source.root()).expect("install");
-        assert_eq!(target.root(), source.root());
-        assert_eq!(
-            target.snapshot(),
-            bytes,
-            "install round-trips the canonical bytes verbatim"
-        );
-
-        // a wrong expected root is rejected before adopting.
-        let mut reject = Inbox::new(INBOX);
-        reject
-            .install(&bytes, StateRoot::ZERO)
-            .expect_err("root mismatch must be rejected");
-        assert_eq!(
-            reject.root(),
-            Inbox::new(INBOX).root(),
-            "state untouched on rejected install"
-        );
-
-        // next delivery to the cleared member resumes at the preserved
-        // next_seq: the full committed image after it pins alice's carried
-        // read flag AND bob's new item landing at seq 2, not a reused seq 1.
-        target
-            .execute(&mut sys(10), &deliver("bob", "k", "after clear"))
-            .await
-            .expect("deliver");
-        target.commit_block().await.expect("commit");
-        let expected = snapshot_bytes(&[
-            (
-                "alice",
-                3,
-                &[
-                    (1, "mention", "hi", "chat", 5, true),
-                    (2, "k", "second", "system", 6, false),
-                ],
-            ),
-            ("bob", 3, &[(2, "k", "after clear", "system", 10, false)]),
-        ]);
-        assert_eq!(
-            target.snapshot(),
-            expected,
-            "next_seq survived the clear across the snapshot"
-        );
+        let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
+        assert_eq!((next, items.len()), (2, 1), "the aborted delivery left no trace");
     });
 }
 
@@ -526,11 +418,27 @@ impl Module for Producer {
     }
 }
 
+/// the committed-state twin the P2 proofs compare against: a fresh inbox
+/// replaying the EXPECTED direct delivery — MemStore roots are a function of
+/// the record set alone, so root equality proves the follow-up landed with
+/// the emitting module as source and the block's consensus time.
+async fn expected_root(source: &str, consensus_time: u64) -> StateRoot {
+    let mut twin = fresh();
+    twin.execute(
+        &mut ctx(Origin::Module(source.into()), consensus_time),
+        &deliver("alice", "event", "produced"),
+    )
+    .await
+    .expect("twin deliver");
+    twin.commit_block().await.expect("twin commit");
+    twin.root()
+}
+
 #[test]
 fn module_follow_up_delivers_atomically_with_source_of_emitter() {
     block_on(async {
         let mut host =
-            Host::genesis(vec![Box::new(Inbox::new(INBOX)), Box::new(Producer)]).expect("genesis");
+            Host::genesis(vec![Box::new(fresh()), Box::new(Producer)]).expect("genesis");
         let app0 = host.root_hash();
 
         let out = host
@@ -549,16 +457,13 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
             .expect("submit producer op");
         assert_ne!(out.root_hash, app0, "the atomic delivery moves the root-hash");
 
-        // the committed inbox root IS the hash of the canonical bytes, so
-        // equality against this hand-encoded image proves the follow-up
+        // root equality against the replayed twin proves the follow-up
         // delivered in THIS block, with the EMITTING module as source (not
         // the external submitter) and the block's consensus time.
-        let expected = snapshot_bytes(&[(
-            "alice",
-            2,
-            &[(1, "event", "produced", "producer", 42, false)],
-        )]);
-        assert_eq!(host.module_root(INBOX), Some(root_of_bytes(&expected)));
+        assert_eq!(
+            host.module_root(INBOX),
+            Some(expected_root("producer", 42).await)
+        );
     });
 }
 
@@ -588,7 +493,7 @@ impl Module for ProducerWithAck {
 #[test]
 fn noop_ack_follow_up_does_not_abort_the_block() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(Inbox::new(INBOX)), Box::new(ProducerWithAck)])
+        let mut host = Host::genesis(vec![Box::new(fresh()), Box::new(ProducerWithAck)])
             .expect("genesis");
 
         host.submit_at(
@@ -605,85 +510,31 @@ fn noop_ack_follow_up_does_not_abort_the_block() {
         .await
         .expect("no-op ack must not fail the block");
 
-        // the delivery still committed — and the ghost ack left no trace in
-        // the committed image (no "ghost" member section).
-        let expected = snapshot_bytes(&[(
-            "alice",
-            2,
-            &[(1, "event", "produced", "producer-ack", 7, false)],
-        )]);
-        assert_eq!(host.module_root(INBOX), Some(root_of_bytes(&expected)));
+        // the delivery still committed — and the ghost ack left no trace
+        // (the twin never staged a "ghost" member).
+        assert_eq!(
+            host.module_root(INBOX),
+            Some(expected_root("producer-ack", 7).await)
+        );
     });
 }
 
-// ---- crafted snapshots: decode hardening + the seq-exhaustion boundary ------
-//
-// these tests hand-encode the module's canonical byte layout via the same
-// helpers the committed-image assertions use.
-
-/// one member with the given counter and items — a minimal crafted snapshot
-/// (source "system", created_at 0, unread).
-fn snapshot_of_member(member: &str, next_seq: u64, items: &[(u64, &str, &str)]) -> Vec<u8> {
-    let items: Vec<ItemBytes> = items
-        .iter()
-        .map(|(seq, kind, body)| (*seq, *kind, *body, "system", 0, false))
-        .collect();
-    snapshot_bytes(&[(member, next_seq, &items)])
-}
-
-#[test]
-fn snapshot_with_zero_next_seq_is_rejected() {
-    // next_seq starts at 1 and only increments; 0 is not execute-reachable.
-    let bytes = snapshot_of_member("alice", 0, &[]);
-    let err = Inbox::new(INBOX)
-        .install(&bytes, root_of_bytes(&bytes))
-        .expect_err("next_seq == 0 must be rejected");
-    assert!(
-        matches!(err, Error::Module(ref m) if m.contains("next_seq is zero")),
-        "unexpected error: {err:?}"
-    );
-}
-
-#[test]
-fn snapshot_with_over_cap_fields_is_rejected() {
-    // execute rejects over-cap fields before staging, so no honest validator
-    // can commit them — an image carrying one is corrupt or hostile.
-    let big_body = "x".repeat(MAX_BODY_BYTES + 1);
-    let bytes = snapshot_of_member("alice", 2, &[(1, "k", big_body.as_str())]);
-    let err = Inbox::new(INBOX)
-        .install(&bytes, root_of_bytes(&bytes))
-        .expect_err("over-cap body must be rejected");
-    assert!(
-        matches!(err, Error::Module(ref m) if m.contains("body exceeds cap")),
-        "unexpected error: {err:?}"
-    );
-
-    let big_member = "m".repeat(257);
-    let bytes = snapshot_of_member(&big_member, 1, &[]);
-    Inbox::new(INBOX)
-        .install(&bytes, root_of_bytes(&bytes))
-        .expect_err("over-cap member id must be rejected");
-
-    let big_kind = "k".repeat(65);
-    let bytes = snapshot_of_member("alice", 2, &[(1, big_kind.as_str(), "b")]);
-    Inbox::new(INBOX)
-        .install(&bytes, root_of_bytes(&bytes))
-        .expect_err("over-cap kind must be rejected");
-}
+// ---- the seq-exhaustion boundary --------------------------------------------
 
 #[test]
 fn seq_exhaustion_rejects_deterministically() {
     block_on(async {
         // next_seq == u64::MAX is execute-reachable in principle (2^64 - 2
-        // deliveries), so install must ACCEPT it...
-        let bytes = snapshot_of_member("alice", u64::MAX, &[(1, "k", "survivor")]);
-        let mut inbox = Inbox::new(INBOX);
+        // deliveries), so the testkit injector stands the boundary state up...
+        let mut inbox = fresh();
         inbox
-            .install(&bytes, root_of_bytes(&bytes))
-            .expect("a maxed-out counter is a valid committed state");
+            .testkit_saturate_seq("alice")
+            .await
+            .expect("saturate alice");
+        inbox.commit_block().await.expect("commit saturation");
         let root_installed = inbox.root();
 
-        // ...but the NEXT delivery to that member has no seq left: reject
+        // ...and the NEXT delivery to that member has no seq left: reject
         // deterministically, before any mutation — never panic or wrap.
         let err = inbox
             .execute(&mut sys(1), &deliver("alice", "k", "one too many"))
