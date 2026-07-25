@@ -1170,10 +1170,12 @@ dependencies = [
  "async-trait",
  "axum",
  "capability",
+ "capability-host",
  "futures",
  "libc",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "sandbox-host",
  "serde",
  "serde_json",
  "sha2",
@@ -7312,6 +7314,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sandbox-host"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
