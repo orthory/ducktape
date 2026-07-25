@@ -1005,48 +1005,75 @@ fn urlencode(value: &str) -> String {
 ///
 /// Dropping the handle stops the service child (its containers die with it via
 /// each run's own teardown; the boot reaper sweeps any that outlive a crash).
+/// the host's runtime dir for unix sockets: `$XDG_RUNTIME_DIR` when the session
+/// provides one (every systemd login does), else `/tmp`. Both are short by
+/// design, which is the entire point — see [`PodmanService::socket_path`].
+fn runtime_dir() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    }
+}
+
 pub struct PodmanService {
     socket: PathBuf,
     child: tokio::process::Child,
 }
 
 impl PodmanService {
-    /// the node-private socket path under `data_dir` — deterministic, so the
-    /// config layer can name the [`SandboxBackend::Podman`] socket the boot
-    /// layer will serve on, with no handshake between them.
-    pub fn socket_path(data_dir: &Path) -> PathBuf {
-        data_dir.join("podman").join("podman.sock")
+    /// where this service's socket lives: the RUNTIME dir, not the data dir.
+    ///
+    /// A unix socket path is capped at ~108 bytes by `sockaddr_un`, and a
+    /// workspace path is unbounded — `~/.ducktape/workspaces/<chain-id>/storage/
+    /// services/<kind>/podman/podman.sock` already spends most of the budget on
+    /// a default install, and a longer home or network name simply blows it
+    /// (`bind: invalid argument`, several layers from the cause). Runtime
+    /// sockets belong in `$XDG_RUNTIME_DIR` anyway; this name is bounded by
+    /// construction.
+    ///
+    /// `owner` distinguishes services on one host; `data_dir` is folded in so
+    /// two nodes running the same service kind never collide.
+    pub fn socket_path(data_dir: &Path, owner: &str) -> PathBuf {
+        // FNV-1a over the data dir. Not a security boundary and deliberately not
+        // sha2: this is a collision-avoidance tag between two nodes on one host,
+        // and a hash dependency for a filename would be a dependency for nothing.
+        let mut scope: u32 = 0x811c9dc5;
+        for byte in data_dir.as_os_str().as_encoded_bytes() {
+            scope ^= u32::from(*byte);
+            scope = scope.wrapping_mul(0x0100_0193);
+        }
+        runtime_dir().join(format!("ducktape-{scope:08x}-{owner}.sock"))
     }
 
     /// start the service for a resolved [`crate::SandboxBackend`] — a no-op
-    /// (returns `None`) for a non-Podman backend, so a boot path can call this
-    /// unconditionally and hold the returned guard for the node's lifetime. The
-    /// `data_dir` is derived from the backend's socket path (which
-    /// [`Self::socket_path`] built), and `podman` + `self_exe` are resolved
-    /// here. A start failure is fatal (fail-closed: no firewall, no runs).
+    /// (returns `None`) for a non-Podman backend, so a caller can call this
+    /// unconditionally and hold the returned guard for its process's lifetime.
+    /// The socket comes from the backend (which [`Self::socket_path`] named) and
+    /// `data_dir` is passed explicitly, because the two now live in different
+    /// places. A start failure is fatal (fail-closed: no firewall, no runs).
     pub async fn start_for(
         backend: &crate::SandboxBackend,
+        data_dir: &Path,
         self_exe: &Path,
     ) -> Result<Option<Self>, String> {
         let crate::SandboxBackend::Podman { socket, .. } = backend else {
             return Ok(None);
         };
-        // socket = <data_dir>/podman/podman.sock → data_dir is two parents up.
-        let data_dir = socket
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| format!("podman socket {} has no node data dir", socket.display()))?;
         let podman = find_system_tool("podman")
             .ok_or_else(|| "podman is not on PATH; the sandbox cannot start its service".to_string())?;
-        Self::start(data_dir, &podman, self_exe).await.map(Some)
+        Self::start(data_dir, socket, &podman, self_exe)
+            .await
+            .map(Some)
     }
 
-    /// start the node-private service under `data_dir`, writing the egress hook
-    /// JSON that points back at `self_exe __egress-hook`. Idempotent per node:
-    /// a stale socket file is removed first. `podman_bin` is the resolved
-    /// runtime (from [`SandboxBackend::probe`]).
+    /// start the private service: storage, runroot and hooks under `data_dir`,
+    /// answering on `socket`. Writes the egress hook JSON that points back at
+    /// `self_exe __egress-hook`. Idempotent: a stale socket file is removed
+    /// first. `podman_bin` is the resolved runtime (from
+    /// [`SandboxBackend::probe`]).
     pub async fn start(
         data_dir: &Path,
+        socket: &Path,
         podman_bin: &Path,
         self_exe: &Path,
     ) -> Result<Self, String> {
@@ -1054,7 +1081,11 @@ impl PodmanService {
         let storage = root.join("storage");
         let runroot = root.join("run");
         let hooks_dir = root.join("hooks");
-        let socket = root.join("podman.sock");
+        let socket = socket.to_path_buf();
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("podman service: create {}: {e}", parent.display()))?;
+        }
         for dir in [&storage, &runroot, &hooks_dir] {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("podman service: create {}: {e}", dir.display()))?;

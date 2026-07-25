@@ -86,7 +86,12 @@ async fn run(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     // the service child.
     let self_exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let _podman = provider_host::PodmanService::start_for(&backend, &self_exe).await?;
+    let _podman = provider_host::PodmanService::start_for(
+        &backend,
+        &crate::services::podman_data_dir(&resolved, &grant.kind),
+        &self_exe,
+    )
+    .await?;
     reap(&backend, &grant).await;
 
     let providers = agent_service::discover(

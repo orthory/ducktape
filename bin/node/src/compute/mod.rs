@@ -1,10 +1,10 @@
 //! `ducktape service run compute` — the standalone compute daemon.
 //!
 //! This is the compute plane. The node process constructs no provider set, no
-//! dispatch pool and no resource ledger any more; it keeps only the podman
-//! SERVICE (its still-in-node pty plane needs one) and the consensus lanes.
-//! Everything below runs in a separate process with its own failure domain, and
-//! reaches its node exactly the way the CLI does — over localhost `/v1` + ws.
+//! dispatch pool, no resource ledger and — since the agent carve — no podman
+//! service either; it keeps the consensus lanes and nothing else. Everything
+//! below runs in a separate process with its own failure domain, and reaches its
+//! node exactly the way the CLI does — over localhost `/v1` + ws.
 //!
 //! ## the seams, and where each one landed
 //!
@@ -93,7 +93,12 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     let backend = crate::services::podman_backend(&resolved, &grant.kind)?;
     let self_exe = std::env::current_exe()
         .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let _podman = provider_host::PodmanService::start_for(&backend, &self_exe).await?;
+    let _podman = provider_host::PodmanService::start_for(
+        &backend,
+        &crate::services::podman_data_dir(&resolved, &grant.kind),
+        &self_exe,
+    )
+    .await?;
     reap(&backend, &grant).await;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);

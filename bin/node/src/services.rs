@@ -47,16 +47,26 @@ fn daemon_for(kind: &str) -> Option<Daemon> {
     }
 }
 
-/// this service's OWN node-private podman: its socket, storage root and egress
-/// hook under `<storage>/services/<kind>`.
+/// where one service kind keeps its private podman state: storage root, runroot
+/// and egress hooks.
 ///
-/// Per-service roots rather than one shared socket, and that is a failure-domain
-/// decision, not tidiness: [`provider_host::PodmanService`] supervises the
-/// service child with `kill_on_drop`, so a socket shared between two daemons
-/// would die with whichever one happened to start it and take the other's live
-/// containers down with it — exactly the coupling separate processes exist to
-/// remove. The honest cost is two image stores: an image both services use is
-/// pulled twice.
+/// Per-service roots rather than one shared service, and that is a
+/// failure-domain decision, not tidiness: [`provider_host::PodmanService`]
+/// supervises the service child with `kill_on_drop`, so one service between two
+/// daemons would die with whichever started it and take the other's live
+/// containers along — exactly the coupling separate processes exist to remove.
+/// The honest cost is two image stores: an image both services use is pulled
+/// into each.
+pub(crate) fn podman_data_dir(resolved: &config::Resolved, kind: &str) -> PathBuf {
+    resolved.storage_dir.join("services").join(kind)
+}
+
+/// this service's OWN sandbox backend, with its socket named.
+///
+/// The socket lives in the RUNTIME dir, not under the data dir: a unix socket
+/// path is capped near 108 bytes and a workspace path is unbounded, so deriving
+/// one from the other is a latent `bind: invalid argument` on any host with a
+/// slightly long home or network name.
 ///
 /// Non-Podman backends (Tart) are returned unchanged — a Tart run clones and
 /// deletes a VM per run, so there is no service, no socket and no shared root.
@@ -73,7 +83,8 @@ pub(crate) fn podman_backend(
     Ok(provider_host::SandboxBackend::Podman {
         image,
         socket: provider_host::PodmanService::socket_path(
-            &resolved.storage_dir.join("services").join(kind),
+            &podman_data_dir(resolved, kind),
+            kind,
         ),
     })
 }
