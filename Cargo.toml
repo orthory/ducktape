@@ -18,10 +18,13 @@
 #                      valset, governance, identity, lifecycle, saga,
 #                      capability, dispatch, tagging, gateway + its
 #                      absorbed duckdns naming library) and their host-side
-#                      counterparts (blobstore, dispatch-host, capability-host)
+#                      counterparts (blobstore, capability-host)
 #   crates/modules/apps/   — application modules, the product features (forge,
 #                      chat, pages, agent, runs, tasks, vaults, automations,
 #                      inbox, files, jobs)
+#   crates/services/ — off-chain service crates: the host-side executors that
+#                      serve a consensus module without being one (compute —
+#                      the dispatch WorkSpec pool/ledger/gate)
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
 #   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
@@ -75,7 +78,6 @@ members = [
     "crates/modules/system/capability-host",
     "crates/modules/system/blobstore",
     "crates/modules/system/dispatch",
-    "crates/modules/system/dispatch/host",
     "crates/modules/system/tagging",
     "crates/modules/system/airlock",
     "crates/modules/system/duckdns",
@@ -97,6 +99,8 @@ members = [
     "crates/modules/apps/automations",
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
+    # services — off-chain host-side executors
+    "crates/services/compute",
     # examples — demo / test scaffolding modules
     "crates/examples/directory", "crates/examples/greeter",
     # testing — dev-only shared harness helpers (raw-http client, ports,
@@ -246,7 +250,6 @@ saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 blobstore = { path = "crates/modules/system/blobstore" }
 dispatch = { path = "crates/modules/system/dispatch" }
-dispatch-host = { path = "crates/modules/system/dispatch/host" }
 tagging = { path = "crates/modules/system/tagging" }
 duckdns = { path = "crates/modules/system/duckdns" }
 gateway = { path = "crates/modules/system/gateway" }
@@ -261,6 +264,8 @@ vaults = { path = "crates/modules/apps/vaults" }
 automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
+# internal — off-chain service crates
+compute-service = { path = "crates/services/compute" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }

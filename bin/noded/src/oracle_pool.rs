@@ -1,5 +1,5 @@
 //! off-loop oracle execution for the embedded daemon: wires
-//! [`dispatch_host::DispatchPool`] into the actor's runtime context and
+//! [`compute_service::DispatchPool`] into the actor's runtime context and
 //! the daemon's own command lane.
 //!
 //! the pool's gate (lease check, decode, dedup) runs inline where
@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use commonware_runtime::{Spawner, Supervisor};
-use dispatch_host::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind};
+use compute_service::{DeliverFn, DispatchPool, SharedProvisioner, SpawnFn, SpawnKind};
 use futures::SinkExt as _;
 use futures::channel::mpsc;
 use noded::{NodeCommand, ORACLE_ORIGIN};

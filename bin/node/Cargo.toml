@@ -40,7 +40,7 @@ capability-host = { workspace = true }
 # the task plane: recipe manifests + capability dispatch + its host worker.
 dispatch = { workspace = true }
 tagging = { workspace = true }
-dispatch-host = { workspace = true }
+compute-service = { workspace = true }
 forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }

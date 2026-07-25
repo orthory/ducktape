@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use dispatch_host::{
+use compute_service::{
     ProvisionedWorkspace, WorkspaceReceipt, WorkspaceSource, WorkspaceSpec, assemble_context_doc,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};

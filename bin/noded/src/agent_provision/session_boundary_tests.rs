@@ -34,7 +34,7 @@ use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
-use dispatch_host::{DeliverFn, DispatchPool, SpawnFn};
+use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};

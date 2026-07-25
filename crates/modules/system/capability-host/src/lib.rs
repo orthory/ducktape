@@ -257,7 +257,7 @@ pub struct RunContext {
     /// cross into another Ducktape node sharing the same rootless user.
     pub executing_node: Option<String>,
     /// an already-materialized workspace this specific run must execute in.
-    /// set only by the provisioning wrapper (`dispatch-host::bind_workspace`)
+    /// set only by the provisioning wrapper (`compute-service::bind_workspace`)
     /// after a successful per-run duckfs checkout — never a consensus-supplied
     /// path (D7). when set, the provider's cwd is the evidence-backed
     /// workspace; an unusable mount fails the run (W1), never falls back to
@@ -1472,7 +1472,7 @@ impl CliProvider {
     /// resolve the run's cwd to a per-run WRITABLE directory, creating it.
     ///
     /// a `workdir_override` is a workspace the provisioner ALREADY materialized
-    /// (the only setter is `dispatch-host`'s `bind_workspace`, after a
+    /// (the only setter is `compute-service`'s `bind_workspace`, after a
     /// successful checkout — the envelope itself carries no host path, D7). if
     /// creating it fails, the run must FAIL so the saga can retry elsewhere:
     /// falling back would silently execute the run in `self.workdir` — a single

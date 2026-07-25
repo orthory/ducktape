@@ -43,7 +43,7 @@ agent = { workspace = true }
 runs = { workspace = true }
 dispatch = { workspace = true }
 tagging = { workspace = true }
-dispatch-host = { workspace = true }
+compute-service = { workspace = true }
 # host-side provider discovery: the dispatch worker runs the operator's locally
 # installed executor CLIs (BYO), never any credential file.
 capability-host = { workspace = true }

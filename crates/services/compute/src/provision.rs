@@ -3,7 +3,7 @@
 //! vocabulary the pool passes across the reachability wall, and the SINGLE
 //! owner of the host-assembled [`WorkspaceReceipt`] + `RunnerResult` bytes.
 //!
-//! dispatch-host CANNOT depend on duckfs-client (the reachability wall — a
+//! compute-service CANNOT depend on duckfs-client (the reachability wall — a
 //! kernel/system crate must never touch the OS-side checkout engine), so this
 //! module speaks only plain data: the concrete `checkout_with`/`commit` calls
 //! live in the node binary's provisioner impl. the pool brackets a run with

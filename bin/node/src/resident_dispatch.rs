@@ -12,7 +12,7 @@
 //! served boundary's saga module for the pending attempts leased to this node
 //! (`SagaQuery::AssignedPending` — the exact [`WorkerRequest`]s the effect
 //! lane would have carried) and offers each, once, to the SAME off-loop
-//! [`dispatch_host::DispatchPool`] a validator runs (wired through
+//! [`compute_service::DispatchPool`] a validator runs (wired through
 //! `oracle_pool::build`): the gate verdict is inline and immediate, the
 //! provider CLI runs on a spawned background task, and a pump pass NEVER
 //! awaits a provider — a minutes-long run cannot stall the park loop's serve
@@ -42,7 +42,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use dispatch_host::AttemptControl;
+use compute_service::AttemptControl;
 use host::Host;
 use host::worker::{WorkOutcome, Worker};
 use saga::{SagaMsg, SagaQuery, SagaReply, WorkerRequest};
@@ -427,7 +427,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use dispatch::{AdmissionPolicy, WORK_SPEC_KIND, WorkSpec, encode_work_spec};
-    use dispatch_host::{
+    use compute_service::{
         DeliverFn, DispatchPool, ProvisionedWorkspace, SharedProvisioner, SpawnFn,
         WorkspaceProvisioner, WorkspaceReceipt, WorkspaceSpec,
     };
