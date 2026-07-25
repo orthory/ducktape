@@ -71,7 +71,7 @@ use crate::{NodeCommand, NodeHandle};
 
 /// how often the projector polls committed chat for new commands. A shared
 /// terminal is human-driven, so ~200 ms adds no perceptible latency while
-/// keeping the poll cheap (at most [`crate::term::MAX_TERM_SESSIONS`] live
+/// keeping the poll cheap (at most [`agent_service::MAX_TERM_SESSIONS`] live
 /// sessions, one bounded query each).
 /// `ponytail:` fixed interval poll; a block-commit watch (StreamHub already
 /// has `subscribe_blocks`) would cut idle polls and trim the latency floor if a
@@ -245,10 +245,12 @@ async fn projector_loop(handle: NodeHandle, session_id: String, channel: String)
     // restart), so there is no durable cursor to restore.
     let mut cursor = 0u64;
     loop {
-        // stop as soon as the pty is gone. `session()` returning None means the
-        // entry left the manager map; nothing more can be driven.
+        // stop as soon as the pty is gone. A session has a `mode` exactly while
+        // it is in the bridge's map, so `None` means the entry left it (EOF,
+        // close, reaper, or the agent service detaching) and nothing more can be
+        // driven.
         match handle.terminals() {
-            Some(terminals) if terminals.session(&session_id).is_some() => {}
+            Some(terminals) if terminals.mode(&session_id).is_some() => {}
             _ => break,
         }
         match query_messages(&handle, &channel, cursor + 1).await {

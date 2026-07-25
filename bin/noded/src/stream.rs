@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD;
 use duckfs_core::{Change, FilesMsg};
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::NodeHandle;
@@ -118,6 +118,29 @@ pub enum ClientMsg {
         stream: RunStream,
         line: String,
     },
+    /// a local service daemon claims this connection as its command link.
+    ///
+    /// The agent daemon owns the ptys behind this node's interactive plane, and
+    /// it is the only side that dials — so it must be able to say "commands for
+    /// the terminal plane come to me". Until one connection does this, the node
+    /// has no interactive plane and every create refuses.
+    ///
+    /// `build` is the skew gate: node and daemon are separate processes with
+    /// independent restart timing, so a mismatched build is REFUSED with a
+    /// nameable reason rather than negotiated. Only one connection may hold the
+    /// link at a time; a second attach is refused, which is what stops a local
+    /// impersonator from displacing the live daemon and receiving the create
+    /// commands (and lent-credential records) meant for it.
+    ServiceAttach {
+        kind: String,
+        build: String,
+    },
+    /// one lifecycle fact about a pty from the daemon that owns it. Honored ONLY
+    /// on a connection that has attached: without that gate, any local process
+    /// could inject output into a session's ring or fake its end.
+    AgentEvent {
+        event: agent_service::wire::Event,
+    },
 }
 
 // Serialize-only: the node SENDS frames and never parses its own, so there is
@@ -173,6 +196,12 @@ pub enum ServerFrame {
     /// app closes the pane); without it a client blocks forever on a dead topic.
     TermEnded {
         topic: String,
+    },
+    /// one command for the attached agent daemon: spawn a pty, feed it, resize
+    /// it, end it. Sent only on the connection that holds the service link, so
+    /// it never reaches an ordinary subscriber.
+    ServiceCommand {
+        command: agent_service::wire::Command,
     },
     Lagged {
         topic: String,
@@ -743,6 +772,12 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
     let mut term_cmd_rx = hub.term_commands().subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_INTERVAL_MS));
     let mut topics = BTreeMap::new();
+    // set once, by a `ServiceAttach` that this node accepts. The guard's Drop —
+    // on every `return` below, and on the task being cancelled — releases the
+    // link and ends every session the daemon was serving, so a client attached
+    // to a dead session's topic is told rather than left blocked.
+    let mut attached: Option<crate::term::AttachGuard> = None;
+    let mut service_rx: Option<mpsc::Receiver<agent_service::wire::Command>> = None;
 
     loop {
         tokio::select! {
@@ -770,6 +805,28 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                             // process produced the line.
                             Ok(ClientMsg::RunOutput { id, stream, line }) => {
                                 handle_run_output(&hub, id, stream, line);
+                            }
+                            // a service daemon claiming this connection as its
+                            // command link, and the events it publishes back.
+                            Ok(ClientMsg::ServiceAttach { kind, build }) => {
+                                match take_service_link(&handle, &kind, &build) {
+                                    Ok((guard, rx)) => {
+                                        attached = Some(guard);
+                                        service_rx = Some(rx);
+                                    }
+                                    Err(reason) => {
+                                        if !send_frame(&mut socket, ServerFrame::Error {
+                                            topic: String::new(),
+                                            code: StreamErrorCode::Unavailable,
+                                            detail: reason.to_string(),
+                                        }).await {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(ClientMsg::AgentEvent { event }) => {
+                                handle_agent_event(&handle, attached.is_some(), event);
                             }
                             Ok(msg) => {
                                 let frames = handle_client_msg(&handle, &mut topics, msg);
@@ -850,8 +907,99 @@ pub async fn stream_session(mut socket: WebSocket, handle: NodeHandle) {
                     return;
                 }
             }
+            // the service link's outbound half. Inert on every connection that
+            // is not the attached daemon (see `next_service_command`).
+            command = next_service_command(&mut service_rx) => {
+                if !send_frame(&mut socket, ServerFrame::ServiceCommand { command }).await {
+                    return;
+                }
+            }
         }
     }
+}
+
+/// the attached daemon's next command, or never.
+///
+/// A connection that holds no service link must not make this arm ready — it
+/// would spin the select loop — so it parks forever instead. Same for a link
+/// whose sender the bridge has already dropped: the guard tidies up when this
+/// socket closes, and until then there is nothing to send.
+async fn next_service_command(
+    rx: &mut Option<mpsc::Receiver<agent_service::wire::Command>>,
+) -> agent_service::wire::Command {
+    let Some(rx) = rx else {
+        return std::future::pending().await;
+    };
+    match rx.recv().await {
+        Some(command) => command,
+        None => std::future::pending().await,
+    }
+}
+
+/// Admit a service daemon's claim on this connection, or name why not.
+///
+/// Three refusals, each a stable reason an operator can act on: a kind this node
+/// hosts no plane for, a build that does not match this one (the skew gate — a
+/// loud refusal beats silent misbehavior between two independently-restarted
+/// processes), and a link another daemon already holds.
+fn take_service_link(
+    handle: &NodeHandle,
+    kind: &str,
+    build: &str,
+) -> Result<
+    (
+        crate::term::AttachGuard,
+        mpsc::Receiver<agent_service::wire::Command>,
+    ),
+    &'static str,
+> {
+    if kind != crate::services::AGENT_KIND {
+        return Err("only the agent service has a command link on this node");
+    }
+    // `None` fails closed: a node that cannot identify its own build refuses
+    // every attach rather than trusting an unverifiable peer.
+    let mine = crate::services::build_identity().ok_or(
+        "this node cannot identify its own build, so it refuses every service link",
+    )?;
+    if build != mine {
+        tracing::warn!(
+            target: "ducktape::service",
+            reason = "build_mismatch",
+            "agent service link refused"
+        );
+        return Err("build mismatch: restart the agent daemon on this node's build");
+    }
+    let terminals = handle
+        .terminals()
+        .ok_or("terminal sessions are not enabled on this node")?;
+    terminals
+        .attach()
+        .ok_or("an agent service is already attached to this node")
+}
+
+/// Apply one daemon-published event to the terminal plane, or drop it.
+///
+/// The `attached` gate is a trust boundary, not tidiness: these events append to
+/// scrollback rings and terminate sessions, so an unattached connection
+/// publishing one would be injecting into another member's terminal.
+fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service::wire::Event) {
+    if !attached {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "unattached_publisher",
+            "agent event dropped"
+        );
+        return;
+    }
+    let Some(terminals) = handle.terminals() else {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "no_terminal_plane",
+            "agent event dropped"
+        );
+        return;
+    };
+    terminals.on_event(event);
 }
 
 fn handle_client_msg(
@@ -876,7 +1024,9 @@ fn handle_client_msg(
         ClientMsg::TermInput { .. }
         | ClientMsg::TermResize { .. }
         | ClientMsg::TermCommand { .. }
-        | ClientMsg::RunOutput { .. } => Vec::new(),
+        | ClientMsg::RunOutput { .. }
+        | ClientMsg::ServiceAttach { .. }
+        | ClientMsg::AgentEvent { .. } => Vec::new(),
     }
 }
 
@@ -975,23 +1125,20 @@ async fn handle_term_input(
         tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
         return;
     };
-    let Some(live) = terminals.session(session) else {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
-        return;
-    };
     // raw keystrokes are the SINGLE-session path only. A shared session refuses
-    // them so nothing bypasses its ordered command lane (drive it with TermCommand).
+    // them so nothing bypasses its ordered command lane (drive it with
+    // TermCommand); an unknown id has no mode and is refused the same way.
     if terminals.mode(session) != Some(crate::term::SessionMode::Single) {
         tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
         return;
     }
-    let Ok(bytes) = STANDARD.decode(data_b64) else {
+    // decoded here purely to refuse a malformed frame at this boundary; the
+    // daemon takes the base64 as-is, so the bytes never round-trip.
+    if STANDARD.decode(data_b64).is_err() {
         tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
         return;
-    };
-    if let Err(err) = live.write_all(&bytes).await {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "write_failed", error = %err, "term input dropped");
     }
+    terminals.input(session, data_b64).await;
 }
 
 /// resize a session's pty. Same entitlement gate + no-op-on-unknown discipline
@@ -1025,13 +1172,7 @@ async fn handle_term_resize(
         tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
         return;
     };
-    let Some(live) = terminals.session(session) else {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term resize dropped");
-        return;
-    };
-    if let Err(err) = live.resize(cols, rows) {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "resize_failed", error = %err, "term resize dropped");
-    }
+    terminals.resize(session, cols, rows).await;
 }
 
 /// enqueue a submitted COMMAND onto a session's ordered command lane (the

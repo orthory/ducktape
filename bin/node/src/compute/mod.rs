@@ -18,12 +18,14 @@
 //! | `OutputSink` → stream hub | a `run_output` ws frame ([`link`]) |
 //! | `__egress-hook` | already a subcommand of THIS binary — the hook podman fires is `ducktape __egress-hook`, and the daemon ships in the same executable, so nothing moved |
 //!
-//! ## what the node still owns
+//! ## podman is this daemon's, not the node's
 //!
-//! The podman service itself: its socket, storage root and egress hook live
-//! under the node's data dir and its interactive terminal plane spawns ptys
-//! through them. The daemon is a CLIENT of that socket. Container ownership is
-//! therefore label-scoped, not socket-scoped — see [`reap`].
+//! This daemon starts its own node-private podman service under
+//! `<storage>/services/compute` — socket, storage root and egress hook. The node
+//! starts none, and neither does it share one with the agent daemon: a
+//! `kill_on_drop` service child shared between two processes would make them a
+//! single failure domain. Container ownership is label-scoped ON TOP of that —
+//! see [`reap`] — so the two guarantees are independent.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -83,10 +85,15 @@ async fn run(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     // not exist yet and then spin on an unreadable projection.
     await_node(&node).await;
 
-    let backend = resolved
-        .sandbox
-        .clone()
-        .ok_or("no [sandbox] table in node.toml: this host has no configured way to isolate a run")?;
+    // this daemon's OWN podman service, under `<storage>/services/compute`. The
+    // node used to start one for everybody; it does not any more, because a
+    // `kill_on_drop` service child shared between two daemons made them one
+    // failure domain. Fail-closed: a start failure ends the process rather than
+    // leaving a daemon that announces capacity it cannot sandbox.
+    let backend = crate::services::podman_backend(&resolved, &grant.kind)?;
+    let self_exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
+    let _podman = provider_host::PodmanService::start_for(&backend, &self_exe).await?;
     reap(&backend, &grant).await;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);

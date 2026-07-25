@@ -189,7 +189,6 @@ fn gate_on_compute_grant(
 /// error naming the audited adapters.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
-    workspace: &Path,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
     let Some(sandbox) = sandbox else {
         return Ok((None, BTreeMap::new()));
@@ -222,8 +221,19 @@ fn resolve_sandbox(
     let image = sandbox.image.clone();
     match sandbox.runtime.as_str() {
         "podman" => {
-            let socket = provider_host::PodmanService::socket_path(workspace);
-            Ok((Some(SandboxBackend::Podman { image, socket }), probed()?))
+            // NO socket here. There is no node-wide podman any more: each
+            // service daemon starts its own under `<storage>/services/<kind>`,
+            // so the only honest thing this layer can say is "podman, this
+            // image". `services::podman_backend` roots it for a kind, and it is
+            // the ONLY place that does — an unrooted socket is an empty path
+            // that fails loudly rather than silently dialing someone else's.
+            Ok((
+                Some(SandboxBackend::Podman {
+                    image,
+                    socket: PathBuf::new(),
+                }),
+                probed()?,
+            ))
         }
         "tart" => {
             let capacity = probed()?;
@@ -342,7 +352,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_listen,
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), base)?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
     let compute_backend = gate_on_compute_grant(sandbox.as_ref(), base)?;
 
     Ok(Resolved {
@@ -556,7 +566,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         Some(path) => absolute_runtime_path(Path::new(path))?,
         None => std::env::temp_dir().join(format!("ducktape-{}", raw.id)),
     };
-    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref(), &storage_dir)?;
+    let (sandbox, sandbox_capacity) = resolve_sandbox(raw.sandbox.as_ref())?;
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
     let compute_backend = gate_on_compute_grant(sandbox.as_ref(), &storage_dir)?;

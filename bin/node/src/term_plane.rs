@@ -34,7 +34,7 @@ use data_plane::{
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use provider_host::{AirlockConfig, ResolvedCredential};
+use provider_host::ResolvedCredential;
 use futures::SinkExt as _;
 use futures::channel::{mpsc as fmpsc, oneshot};
 use noded::{
@@ -560,9 +560,13 @@ async fn serve_create(
         // credential; the owner's gateway checks THIS account against the grant.
         account: creator_account,
     };
+    // the record travels to the agent daemon, which pins it as its broker's
+    // self-host airlock upstream. Nothing secret crosses: a name, an authority
+    // handle, this node's own gateway `via`, a PUBLIC seal key and the account
+    // the owner's gateway checks the grant against.
     let attach = PeerAttach {
         creator_node: peer.0,
-        airlock: AirlockConfig::self_host(&resolved),
+        credential: agent_service::credential_wire(&resolved),
         limits: admit.limits,
     };
     match sessions.create_for_peer(provider, attach).await {
@@ -729,30 +733,24 @@ async fn receive_input<S: AsyncRead + Unpin>(
 /// gate one input event on the creator, then apply it to the pty (write or
 /// resize). Shared by the remote input stream and the loopback client path.
 async fn deliver_input(sessions: &TerminalSessions, peer: PeerId, event: SessionInputEvent) {
-    let session = input_session(&event);
-    let permitted = input_permitted(sessions.creator_node(session), peer);
+    let session = input_session(&event).to_string();
+    let permitted = input_permitted(sessions.creator_node(&session), peer);
     if !permitted {
         tracing::warn!(target: "ducktape::term", reason = "input_not_creator", "forwarded input dropped");
         return;
     }
-    let Some(live) = sessions.session(session) else {
-        tracing::warn!(target: "ducktape::term", reason = "unknown_session", "forwarded input dropped");
-        return;
-    };
     match event {
         SessionInputEvent::Input { data_b64, .. } => {
-            let Ok(bytes) = STANDARD.decode(&data_b64) else {
+            // decoded only to refuse a malformed frame at this boundary; the
+            // daemon takes the base64 as-is, so the bytes never round-trip.
+            if STANDARD.decode(&data_b64).is_err() {
                 tracing::warn!(target: "ducktape::term", reason = "bad_base64", "forwarded input dropped");
                 return;
-            };
-            if let Err(err) = live.write_all(&bytes).await {
-                tracing::warn!(target: "ducktape::term", reason = "write_failed", error = %err, "forwarded input dropped");
             }
+            sessions.input(&session, &data_b64).await;
         }
         SessionInputEvent::Resize { cols, rows, .. } => {
-            if let Err(err) = live.resize(cols, rows) {
-                tracing::warn!(target: "ducktape::term", reason = "resize_failed", error = %err, "forwarded resize dropped");
-            }
+            sessions.resize(&session, cols, rows).await;
         }
     }
 }

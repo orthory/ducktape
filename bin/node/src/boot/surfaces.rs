@@ -260,33 +260,22 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // shape: a resident laptop routing a pty to a compute host must not need a
     // validator seat. Membership is not this gate's job: cross-node reach rides
     // the mesh session plane, which only has tunnels to nodes with standing, so
-    // an unadmitted joiner's directed create dies in the lane, not here. Sourced
-    // from the node's OWN config — the resolved `node.toml [sandbox]` backend and
-    // this node's signer identity (`node_key`) — so a consensus-only node has
-    // no terminal plane by construction, and Podman container reaping scopes
-    // to the SAME execution id as the node's real agent runs (validator/run.rs
-    // discovers its provider set under the same identity). Mirrors bin/noded's
-    // wiring; a sandboxed node's create returns a session (or a clear spawn
-    // error), an unsandboxed node's a "requires a configured sandbox" 503 —
-    // never the "terminal sessions are not enabled" 503 that meant the plane
-    // was missing entirely.
+    // an unadmitted joiner's directed create dies in the lane, not here.
+    //
+    // This node SPAWNS NO PTY. What is wired here is the rings, the per-session
+    // metadata and the admission entry points; the ptys themselves live in the
+    // agent daemon (`ducktape service run agent`), which attaches over this
+    // node's own ws and owns its own podman. So the gate is purely "is there an
+    // app surface to serve it on" — no sandbox backend, no provider discovery,
+    // no execution identity. With no daemon attached a create returns the
+    // "requires an agent service" 503, still distinct from the "terminal
+    // sessions are not enabled" 503 that means the plane is missing entirely.
     let terminals = if !sync_only && http_listen.is_some() {
-        let interactive = sandbox.and_then(|backend| {
-            noded::term::discover_interactive(
-                &node_key,
-                provider_host::AgentDirs::under(storage),
-                backend,
-            )
-        });
-        tracing::info!(
-            target: "ducktape::term",
-            enabled = interactive.is_some(),
-            "terminal_plane_ready"
-        );
+        // the boot marker an operator (and the parked-joiner regression test)
+        // looks for: the plane is WIRED. Whether it can serve is a second
+        // question, answered by whether an agent daemon has attached.
+        tracing::info!(target: "ducktape::term", "terminal_plane_ready");
         Some(noded::TerminalSessions::new(
-            interactive,
-            provider_host::execution_node_id(&node_key),
-            storage.join("term-sessions"),
             stream_hub.terminals(),
             stream_hub.term_commands(),
         ))

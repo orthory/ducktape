@@ -122,6 +122,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-service"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "provider-host",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5300,6 +5312,7 @@ name = "node-bin"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "agent-service",
  "airlock",
  "anstream",
  "anstyle",
@@ -5386,6 +5399,7 @@ name = "noded"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "agent-service",
  "async-trait",
  "automations",
  "axum",

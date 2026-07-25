@@ -130,7 +130,6 @@ pub(super) struct ValidatorLoopState<'a> {
     /// the workspace dir whose `services.toml` carries the compute grant —
     /// re-read by the announce pump, never latched at boot.
     pub(super) workspace: std::path::PathBuf,
-    pub(super) sandbox: Option<provider_host::SandboxBackend>,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     /// the local rpc bridge's parsed-request queue — the caller owns the
     /// listener spawn (a promoted node's listener pump carries over from
@@ -266,7 +265,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         checkpoint_blocks,
         sync_lease,
         workspace,
-        sandbox,
         sandbox_capacity,
         rpc_ingress,
         http_cmds,
@@ -365,20 +363,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // module notes, which is the honest diagnostic on a node whose daemon is
     // not running.
     //
-    // the node-private podman service (own socket + storage + egress hooks) is
-    // still the NODE's: its interactive terminal plane spawns ptys through it,
-    // and the compute daemon is a client of the same socket (container
-    // ownership is label-scoped, not socket-scoped). Held for the node's life.
-    // A non-Podman backend yields `None`. Fail-closed: a start failure panics,
-    // never a silently unsandboxed node.
-    let self_exe = std::env::current_exe()
-        .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
-    let _podman_service = match &sandbox {
-        Some(backend) => provider_host::PodmanService::start_for(backend, &self_exe)
-            .await
-            .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
-        None => None,
-    };
+    // PODMAN IS NOT THE NODE'S ANY MORE. Both planes that used to need it are
+    // out of process: compute serves dispatch work and agent serves interactive
+    // ptys, and each daemon starts its OWN node-private podman service under its
+    // own root (`<storage>/services/<kind>/podman`). Separate roots are what make
+    // them separate failure domains — one daemon restarting can no longer take
+    // the other's containers down with a shared `kill_on_drop` service child.
     let workers: Vec<Box<dyn host::worker::Worker>> = Vec::new();
     // the CODE readiness self-signaller for pending code swaps — verifies (or
     // fetches) the committed component bytes and emits one truthful

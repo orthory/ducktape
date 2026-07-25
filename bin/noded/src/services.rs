@@ -31,6 +31,13 @@ use serde::{Deserialize, Serialize};
 /// enabled-but-absent once it truly goes.
 pub const HELLO_TTL: Duration = Duration::from_secs(30);
 
+/// the compute service: dispatch-placed headless runs.
+pub const COMPUTE_KIND: &str = "compute";
+/// the agent service: user-attached interactive pty sessions. Sibling to
+/// compute, not a layer on it — both link the same provider/sandbox/broker
+/// libraries and spawn their own sandboxes, and their bus is the chain.
+pub const AGENT_KIND: &str = "agent";
+
 /// Cap on distinct kinds the catalog will hold. The kind in a hello is
 /// caller-chosen, so an unbounded map is a trivial memory-exhaustion vector
 /// for any local process — and a host running more than this many distinct

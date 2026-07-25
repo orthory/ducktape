@@ -216,9 +216,8 @@ pub(super) async fn park(
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
     checkpoint_blocks: u64,
-    sandbox: Option<provider_host::SandboxBackend>,
-    // the compute SERVICE's backend: the `[sandbox]` table gated on the
-    // user's `services.toml` grant. Drives discovery/pool/announce only.
+    // what this node ANNOUNCES it can seat. The capacity is the node's to
+    // publish; the sandbox that would honour it belongs to the service daemons.
     sandbox_capacity: std::collections::BTreeMap<String, u64>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
@@ -672,19 +671,8 @@ pub(super) async fn park(
     // compute daemon serves this node's assigned work and its announcements
     // over /v1, on both tiers alike.
     //
-    // the node-private podman service, up before the terminal plane needs it
-    // and held for the node's life (see the validator boot for the rationale).
-    // Fail-closed. Keyed on the `[sandbox]` TABLE, not the compute grant — the
-    // pty plane runs in this same service, and the compute DAEMON is a client
-    // of the same socket.
-    let self_exe = std::env::current_exe()
-        .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
-    let _podman_service = match &sandbox {
-        Some(backend) => provider_host::PodmanService::start_for(backend, &self_exe)
-            .await
-            .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
-        None => None,
-    };
+    // No podman service here either: each service daemon starts its own under
+    // its own root (see the validator boot for the rationale).
     // A resident discovers nothing and executes nothing: the compute daemon
     // does both, and reaches consensus through this node's own /v1 surface —
     // which serves a resident's committed queries and relays its submits

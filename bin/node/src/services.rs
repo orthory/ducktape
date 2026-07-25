@@ -27,10 +27,56 @@ use crate::config;
 pub const FILE_NAME: &str = "services.toml";
 const FORMAT_VERSION: u8 = 1;
 
-/// the compute service — the one kind the node itself acts on today (its
-/// provider discovery, oracle pool and capability announce). Every other kind
-/// is recorded and listed but drives no in-node wiring yet.
-pub const COMPUTE_KIND: &str = "compute";
+/// the two first-party service kinds. Defined in `noded` because both the
+/// node's own surfaces (the ws service link) and this CLI must name them.
+pub use noded::services::{AGENT_KIND, COMPUTE_KIND};
+
+/// which first-party daemon a kind names — the ONE discriminant `run` branches
+/// on. `None` = a kind this binary hosts no execution plane for: it signals,
+/// appears in `list`/`enable`, and executes nothing.
+enum Daemon {
+    Compute,
+    Agent,
+}
+
+fn daemon_for(kind: &str) -> Option<Daemon> {
+    match kind {
+        COMPUTE_KIND => Some(Daemon::Compute),
+        AGENT_KIND => Some(Daemon::Agent),
+        _ => None,
+    }
+}
+
+/// this service's OWN node-private podman: its socket, storage root and egress
+/// hook under `<storage>/services/<kind>`.
+///
+/// Per-service roots rather than one shared socket, and that is a failure-domain
+/// decision, not tidiness: [`provider_host::PodmanService`] supervises the
+/// service child with `kill_on_drop`, so a socket shared between two daemons
+/// would die with whichever one happened to start it and take the other's live
+/// containers down with it — exactly the coupling separate processes exist to
+/// remove. The honest cost is two image stores: an image both services use is
+/// pulled twice.
+///
+/// Non-Podman backends (Tart) are returned unchanged — a Tart run clones and
+/// deletes a VM per run, so there is no service, no socket and no shared root.
+pub(crate) fn podman_backend(
+    resolved: &config::Resolved,
+    kind: &str,
+) -> Result<provider_host::SandboxBackend, String> {
+    let backend = resolved.sandbox.clone().ok_or(
+        "no [sandbox] table in node.toml: this host has no configured way to isolate a run",
+    )?;
+    let provider_host::SandboxBackend::Podman { image, .. } = backend else {
+        return Ok(backend);
+    };
+    Ok(provider_host::SandboxBackend::Podman {
+        image,
+        socket: provider_host::PodmanService::socket_path(
+            &resolved.storage_dir.join("services").join(kind),
+        ),
+    })
+}
 
 /// bytes of randomness in a grant nonce, matching `INVITE_NONCE_LEN`.
 const GRANT_NONCE_LEN: usize = 16;
@@ -937,11 +983,11 @@ fn serve_kind(
     resolved: config::Resolved,
     base: &str,
 ) -> Result<Served, Box<dyn std::error::Error>> {
-    if kind != COMPUTE_KIND {
+    let Some(daemon) = daemon_for(kind) else {
         // every other kind is recorded, listed and signaled — and executes
         // nothing, because no first-party daemon exists for it yet.
         return Ok(Served::SignalOnly);
-    }
+    };
     let Some(grant) = load(workspace)?.grant(kind).cloned() else {
         // signaling without standing is the designed resting state, not an
         // error: the operator reviews the hello and enables when ready.
@@ -952,36 +998,59 @@ fn serve_kind(
         ))?;
         return Ok(Served::SignalOnly);
     };
-    crate::compute::serve(crate::compute::Compute {
-        grant,
-        resolved,
-        http_base: base.to_string(),
-    })?;
+    let http_base = base.to_string();
+    match daemon {
+        Daemon::Compute => crate::compute::serve(crate::compute::Compute {
+            grant,
+            resolved,
+            http_base,
+        })?,
+        Daemon::Agent => crate::agent::serve(crate::agent::Agent {
+            grant,
+            resolved,
+            http_base,
+        })?,
+    }
     Ok(Served::Stopped)
+}
+
+/// the grant scopes a kind's daemon actually exercises — what the consent
+/// screen shows and what `service status` lists.
+///
+/// Each token names a capability the code really uses; inventing one the code
+/// does not honor would make the consent screen a lie. The agent daemon's two
+/// are exactly what its link carries: it drives interactive pty sessions on this
+/// node, and it receives the consensus-resolved LENT credential records those
+/// sessions run under (the airlock contact point — the secret itself never
+/// leaves the lender's gateway, but the record is what points at it).
+///
+/// Compute's list is empty here and stays that way until its own seams are
+/// audited under the same rule; that is a known gap, not a claim that compute
+/// needs nothing.
+fn scopes_for(kind: &str) -> Vec<String> {
+    match daemon_for(kind) {
+        Some(Daemon::Agent) => vec!["term.sessions".into(), "credential.lent".into()],
+        Some(Daemon::Compute) | None => Vec::new(),
+    }
 }
 
 /// Build this host's hello: what it IS, and what it can actually run.
 ///
 /// The capability tags come from real discovery, not a config list — that is
-/// the whole point of signaling before enabling. `scopes` is empty on purpose:
-/// at this step the daemon executes nothing and therefore needs no credential
-/// access, and inventing scope names the code does not honor would make the
-/// consent screen a lie.
+/// the whole point of signaling before enabling.
 fn discover_hello(
     kind: &str,
     resolved: &config::Resolved,
 ) -> Result<noded::services::Hello, String> {
-    let backend = resolved
-        .sandbox
-        .clone()
-        .ok_or("no [sandbox] table in node.toml: this host has no configured way to isolate a run")?;
+    let backend = podman_backend(resolved, kind)?;
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
     backend.probe().map_err(|error| format!("sandbox: {error}"))?;
-    // discovery for the HELLO only — this set spawns nothing, so it is named
-    // for the kind rather than an instance id (there may be no grant yet: the
-    // hello is what the user reviews before minting one). The serving set is
-    // rediscovered under `compute#hex8` once a grant exists.
+    // discovery for the HELLO only — this set spawns nothing (and dials no
+    // socket), so it is named for the kind rather than an instance id: there may
+    // be no grant yet, since the hello is what the user reviews before minting
+    // one. The serving set is rediscovered under `<kind>#hex8` once a grant
+    // exists.
     let providers = provider_host::discover(
         resolved.signer.public_key().as_ref(),
         provider_host::AgentDirs::under(&resolved.storage_dir),
@@ -996,7 +1065,10 @@ fn discover_hello(
         version: env!("CARGO_PKG_VERSION").to_string(),
         build: build.to_string(),
         capabilities: providers.capabilities(),
-        scopes: Vec::new(),
+        scopes: scopes_for(kind),
+        // agent declares no needs: an interactive pty session is self-contained,
+        // so it is useful on a network with no compute capacity anywhere. The
+        // two are siblings, not layers.
         needs: Vec::new(),
     })
 }
