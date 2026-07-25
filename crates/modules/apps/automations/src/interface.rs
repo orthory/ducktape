@@ -5,12 +5,13 @@
 //! payload; the automations module decodes it inside its origin-gated hook arm
 //! (see [`AutomationsMsg::HookEvent`]).
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// what makes a rule fire: a chat message-posted filter. every `None` field is
 /// a wildcard; every `Some` field must match the triggering event. a flat
 /// single-shape struct in both the JSON wire and the snapshot codec.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 // deny_unknown_fields is load-bearing: every field is an Option, so without
 // it the RETIRED tagged shape ({"message_posted":{...}}) would silently parse
 // as an all-None trigger that fires on every message — a quiet-corruption
@@ -28,7 +29,7 @@ pub struct Trigger {
 }
 
 /// what a firing rule does.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// post `template` (after placeholder substitution) into `channel_id`. the
@@ -54,7 +55,7 @@ pub enum Action {
 }
 
 /// a user-defined automation rule.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Rule {
     pub rule_id: String,
     pub enabled: bool,
@@ -66,7 +67,7 @@ pub struct Rule {
 }
 
 /// one entry in the module's bounded global run-history ring.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
     pub rule_id: String,
     /// the triggering channel id.

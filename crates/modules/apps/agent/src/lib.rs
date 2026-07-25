@@ -63,7 +63,7 @@ use sdk::{
     Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use borsh::{BorshDeserialize, BorshSerialize};
 
 /// the canonical state form of an op origin (see [`SagaOrigin`]).
 fn canonical_origin(origin: &Origin) -> SagaOrigin {
@@ -181,11 +181,11 @@ impl AgentModule {
 
     async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
     where
-        T: DeserializeOwned,
+        T: BorshDeserialize,
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -193,11 +193,11 @@ impl AgentModule {
 
     fn store<T>(&mut self, key: Vec<u8>, value: &T)
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
         self.staged.stage(
             key,
-            serde_json::to_vec(value).expect("agent value is serializable"),
+            borsh::to_vec(value).expect("agent value is serializable"),
         );
     }
 
@@ -211,9 +211,9 @@ impl AgentModule {
         what: &str,
     ) -> Result<(), Error>
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
-        let bytes = serde_json::to_vec(value).expect("agent value is serializable");
+        let bytes = borsh::to_vec(value).expect("agent value is serializable");
         if bytes.len() > cap {
             return Err(Error::Module(format!(
                 "{what} record too large: {} > {cap} bytes",

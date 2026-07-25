@@ -112,7 +112,7 @@ use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle, require_non_empty,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use borsh::{BorshDeserialize, BorshSerialize};
 use tasks::{
     TaskMsg, TaskQuery, TaskReply, decode_task_reply as tasks_decode_reply,
     encode_task_msg as tasks_encode_msg, encode_task_query as tasks_encode_query,
@@ -170,7 +170,7 @@ const RUN_CURSOR_KEY: &[u8] = b"runcursor";
 /// when equal). consensus consumes it on every append — placing the new
 /// record and trimming the ring are decided from this record, never from a
 /// store scan — so it stays canonical.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Default, BorshSerialize, BorshDeserialize)]
 struct RunCursor {
     head: u64,
     next: u64,
@@ -213,11 +213,11 @@ impl Automations {
 
     async fn load<T>(&self, key: &[u8]) -> Result<Option<T>, Error>
     where
-        T: DeserializeOwned,
+        T: BorshDeserialize,
     {
         match self.staged.get(key).await? {
             Some(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
             )),
             None => Ok(None),
         }
@@ -228,11 +228,11 @@ impl Automations {
     /// poison-value paragraph. the roster goes through [`Self::store_bounded`].
     fn store<T>(&mut self, key: Vec<u8>, value: &T)
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
         self.staged.stage(
             key,
-            serde_json::to_vec(value).expect("automations value is serializable"),
+            borsh::to_vec(value).expect("automations value is serializable"),
         );
     }
 
@@ -246,9 +246,9 @@ impl Automations {
         what: &str,
     ) -> Result<(), Error>
     where
-        T: Serialize,
+        T: BorshSerialize,
     {
-        let bytes = serde_json::to_vec(value).expect("automations value is serializable");
+        let bytes = borsh::to_vec(value).expect("automations value is serializable");
         if bytes.len() > cap {
             return Err(Error::Module(format!(
                 "{what} record too large: {} > {cap} bytes",

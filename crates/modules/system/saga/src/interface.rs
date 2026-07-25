@@ -30,6 +30,7 @@
 //! decode it. reads go via [`SagaQuery`] -> [`SagaReply`].
 
 use sdk::codec;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -71,7 +72,7 @@ pub const MAX_CAPABILITY_BYTES: usize = 64;
 /// recorded trigger origin may act) and rides in the committed encoding —
 /// `sdk::Origin` itself is neither `Ord` nor serializable, so this type is the
 /// wire/state form.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SagaOrigin {
     /// an external submitter, identified by (e.g.) an ed25519 id.

@@ -12,10 +12,11 @@
 //! mode keys a ballot by that node; share mode resolves it to one Identity
 //! account, so no validator can forge another principal's ballot.
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// what a passing proposal DOES.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GovAction {
     /// admit a validator: emits `ValsetMsg::Join { key }` on execution.
@@ -76,14 +77,14 @@ pub enum GovAction {
 }
 
 /// one non-transferable governance-share allocation.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ShareAllocation {
     pub account_id: Vec<u8>,
     pub shares: u64,
 }
 
 /// what principal the proposal's ballot keys identify.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VoterKind {
     ValidatorNode,
@@ -91,7 +92,7 @@ pub enum VoterKind {
 }
 
 /// the exact decision rule frozen with a proposal.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum VotingRule {
     /// Pass once `yes_power >= required_yes`; this covers validator-set
@@ -147,7 +148,7 @@ pub enum GovMsg {
 }
 
 /// a proposal's lifecycle. `Open` accepts votes; the rest are terminal.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalStatus {
     Open,

@@ -19,6 +19,9 @@ guest = ["dep:guest-adapter"]
 # crate, pulled only when the guest build compiles this crate for wasm32.
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
+# the store-record codec (and, for interface types, the stored-embedded
+# derive): compact, canonical, deterministic. wire stays sdk::wire.
+borsh = { workspace = true }
 # default-features = false: only the wire types (SagaOrigin) cross this edge,
 # and the `agent` guest builds this crate for wasm32 — saga's native-only
 # index module (indexer -> unix-only IO) must not ride along. a direct path
