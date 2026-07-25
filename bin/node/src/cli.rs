@@ -253,16 +253,16 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// the platform's compute adapter — podman on Linux, tart on macOS — as the
 /// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
 /// the probeable backend, so `--compute` and detection share one choice.
-fn platform_sandbox() -> (config::SandboxToml, capability_host::SandboxBackend) {
+fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     let (runtime, image, backend) = if cfg!(target_os = "macos") {
-        ("tart", config::DEFAULT_TART_IMAGE, capability_host::SandboxBackend::Tart {
+        ("tart", config::DEFAULT_TART_IMAGE, provider_host::SandboxBackend::Tart {
             image: config::DEFAULT_TART_IMAGE.into(),
         })
     } else {
         // the socket is left empty here: `platform_sandbox` only writes the
         // default [sandbox] TOML at `node init`; the real socket is named by
         // `resolve_sandbox` from the workspace when the node actually boots.
-        ("podman", config::DEFAULT_PODMAN_IMAGE, capability_host::SandboxBackend::Podman {
+        ("podman", config::DEFAULT_PODMAN_IMAGE, provider_host::SandboxBackend::Podman {
             image: config::DEFAULT_PODMAN_IMAGE.into(),
             socket: std::path::PathBuf::new(),
         })

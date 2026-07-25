@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use capability_host::RunCancellation;
+use provider_host::RunCancellation;
 use tokio::sync::Notify;
 
 pub struct ResourceLedger {

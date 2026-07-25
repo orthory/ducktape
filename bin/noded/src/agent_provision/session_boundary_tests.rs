@@ -61,18 +61,18 @@ const CHANNEL: &str = "general";
 /// see, so `DUCKTAPE_RUN_ID` here is the id the MCP server would stamp onto every
 /// mid-run write.
 struct RecordingProvider {
-    seen: Arc<std::sync::Mutex<Option<capability_host::RunContext>>>,
+    seen: Arc<std::sync::Mutex<Option<provider_host::RunContext>>>,
 }
 
 #[async_trait::async_trait]
-impl capability_host::Provider for RecordingProvider {
+impl provider_host::Provider for RecordingProvider {
     fn capability(&self) -> &str {
         CAPABILITY
     }
     async fn run(
         &self,
         _prompt: &str,
-        ctx: &capability_host::RunContext,
+        ctx: &provider_host::RunContext,
     ) -> Result<String, String> {
         *self.seen.lock().unwrap() = Some(ctx.clone());
         Ok(r#"{"reply_blocks":[],"actions":[]}"#.to_string())
@@ -80,9 +80,9 @@ impl capability_host::Provider for RecordingProvider {
 }
 
 fn provider_set(
-    seen: Arc<std::sync::Mutex<Option<capability_host::RunContext>>>,
-) -> Arc<capability_host::ProviderSet> {
-    let spec = capability_host::CapabilitySpec::parse(
+    seen: Arc<std::sync::Mutex<Option<provider_host::RunContext>>>,
+) -> Arc<provider_host::ProviderSet> {
+    let spec = provider_host::CapabilitySpec::parse(
         &format!(
             r#"
 spec = 1
@@ -100,8 +100,8 @@ format = "text"
         "test",
     )
     .expect("the mock capability spec parses");
-    Arc::new(capability_host::ProviderSet::assemble(
-        capability_host::SpecSet::from_specs(vec![spec]),
+    Arc::new(provider_host::ProviderSet::assemble(
+        provider_host::SpecSet::from_specs(vec![spec]),
         vec![Box::new(RecordingProvider { seen })],
     ))
 }

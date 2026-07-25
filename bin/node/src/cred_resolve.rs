@@ -20,7 +20,7 @@
 //! (`NodeCommand::Query`) the agent provisioner uses, so it sees exactly what
 //! consensus committed.
 
-use capability_host::{AirlockConfig, CredentialKind, ResolvedCredential};
+use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential};
 use compute_service::{CredentialResolver, Resolved};
 use futures::SinkExt as _;
 use futures::channel::{mpsc, oneshot};

@@ -30,8 +30,6 @@ shows what is built and tested.
   boot-time replay.
 - `crates/kernel/indexer`: derived, node-local read index over the finalized
   op stream; never part of the root-hash.
-- `crates/system/capability-host`: machine-local executor providers behind the
-  capability seam.
 
 ## System
 
@@ -55,6 +53,10 @@ shows what is built and tested.
   store and `.duck` gateway route state.
 - `crates/services/compute`: the dispatcher's host-side worker half
   (`compute-service`), off-chain and outside the module tree.
+- `crates/services/provider`: machine-local executor providers behind the
+  capability seam (`provider-host`).
+- `crates/services/sandbox`, `broker`: the node-private podman/egress muscle
+  and the run-scoped credential loopback the provider run loop drives.
 - `crates/duckfs/client`: OS-side checkout/status/commit engine for duckfs; it
   stays off the consensus path.
 - wire surfaces: each module publishes its types-only payload and query shapes at its crate root (`src/interface.rs`).

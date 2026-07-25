@@ -11,7 +11,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", specs_dir.display());
 
     let mut files: Vec<_> = std::fs::read_dir(&specs_dir)
-        .expect("capability-host/specs directory")
+        .expect("provider-host/specs directory")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "toml"))
         .collect();

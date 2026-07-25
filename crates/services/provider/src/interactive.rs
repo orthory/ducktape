@@ -715,7 +715,7 @@ mod tests {
     /// the container through our argv + mount + broker + pty. `#[ignore]` — it
     /// needs podman + a host codex binary + `~/.codex/auth.json` (the broker's
     /// upstream) and runs a real container; drive with:
-    ///   PATH=<podman helpers> cargo test -p capability-host -- --ignored --nocapture codex_tui_renders
+    ///   PATH=<podman helpers> cargo test -p provider-host -- --ignored --nocapture codex_tui_renders
     /// It does NOT submit a prompt, so it makes no model call / spends nothing.
     #[tokio::test]
     #[ignore = "live: needs podman + host codex + ~/.codex/auth.json"]

@@ -3690,7 +3690,7 @@ args = []
     /// the demux-into-the-timeout-loop plumbing — against real podman.
     /// `#[ignore]`: needs a running podman socket at `$DUCKTAPE_PODMAN_SOCKET`.
     ///   DUCKTAPE_PODMAN_SOCKET=/run/user/1000/podman/dt-e2e.sock \
-    ///     cargo test -p capability-host --lib -- --ignored --nocapture podman_socket_echo
+    ///     cargo test -p provider-host --lib -- --ignored --nocapture podman_socket_echo
     #[tokio::test]
     #[ignore = "live: needs a running podman socket at $DUCKTAPE_PODMAN_SOCKET"]
     async fn podman_socket_echo_round_trips_through_invoke() {
@@ -3848,7 +3848,7 @@ printf 'sandbox-ok:%s' "$prompt""#,
 
     /// Real Podman gate for macOS hardware. Kept ignored because it requires a
     /// running Podman machine and a pulled image. Run it explicitly with
-    /// `cargo test -p capability-host macos_podman_hardware_smoke -- --ignored`.
+    /// `cargo test -p provider-host macos_podman_hardware_smoke -- --ignored`.
     #[tokio::test]
     #[ignore = "requires a live Podman machine"]
     async fn macos_podman_hardware_smoke() {

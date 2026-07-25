@@ -54,7 +54,7 @@ pub(crate) struct BindConfig<'a> {
     /// the compute plane (`node.toml [sandbox]`): a Podman/Tart backend, or
     /// `None` for a consensus-only node — which hosts no terminal plane and
     /// starts no auto airlock gateway.
-    pub(crate) sandbox: Option<capability_host::SandboxBackend>,
+    pub(crate) sandbox: Option<provider_host::SandboxBackend>,
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -312,7 +312,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         let interactive = sandbox.and_then(|backend| {
             noded::term::discover_interactive(
                 &node_key,
-                capability_host::AgentDirs::under(storage),
+                provider_host::AgentDirs::under(storage),
                 backend,
             )
         });
@@ -323,7 +323,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         );
         Some(noded::TerminalSessions::new(
             interactive,
-            capability_host::execution_node_id(&node_key),
+            provider_host::execution_node_id(&node_key),
             storage.join("term-sessions"),
             stream_hub.terminals(),
             stream_hub.term_commands(),

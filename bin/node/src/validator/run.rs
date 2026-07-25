@@ -128,7 +128,7 @@ pub(super) struct ValidatorLoopState<'a> {
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) announce_capabilities: bool,
-    pub(super) sandbox: Option<capability_host::SandboxBackend>,
+    pub(super) sandbox: Option<provider_host::SandboxBackend>,
     pub(super) sandbox_capacity: std::collections::BTreeMap<String, u64>,
     /// the local rpc bridge's parsed-request queue — the caller owns the
     /// listener spawn (a promoted node's listener pump carries over from
@@ -141,7 +141,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) blobs: noded::blobs::BlobHandle,
     pub(super) agent_provisioner: compute_service::SharedProvisioner,
     pub(super) cred_resolver: compute_service::SharedCredentialResolver,
-    pub(super) agent_dirs: capability_host::AgentDirs,
+    pub(super) agent_dirs: provider_host::AgentDirs,
     pub(super) metrics: noded::NodeMetrics,
     pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
@@ -377,20 +377,20 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let self_exe = std::env::current_exe()
         .unwrap_or_else(|e| panic!("cannot resolve this node's own executable: {e}"));
     let _podman_service = match &sandbox {
-        Some(backend) => capability_host::PodmanService::start_for(backend, &self_exe)
+        Some(backend) => provider_host::PodmanService::start_for(backend, &self_exe)
             .await
             .unwrap_or_else(|e| panic!("podman sandbox service failed to start: {e}")),
         None => None,
     };
     let providers = match sandbox {
-        Some(backend) => capability_host::discover(
+        Some(backend) => provider_host::discover(
             signer.public_key().as_ref(),
             agent_dirs.clone(),
             Some(stream_hub.run_output().output_sink()),
             backend,
         )
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
-        None => capability_host::ProviderSet::empty(),
+        None => provider_host::ProviderSet::empty(),
     };
     let my_capabilities = providers.capabilities();
     // OFF-LOOP execution: the pool gates effects inline (lease check —

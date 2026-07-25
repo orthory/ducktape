@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capability_host::{AirlockConfig, ProviderSet, RunCancellation};
+use provider_host::{AirlockConfig, ProviderSet, RunCancellation};
 use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
 use sdk::{Event, Msg};
@@ -197,7 +197,7 @@ impl Drop for AttemptTaskGuard {
 /// execute on a spawned task, submit the result through the delivery lane.
 ///
 /// Providers installed in this pool must observe [`RunCancellation`] in their
-/// [`capability_host::RunContext`], terminate and wait their exact child process
+/// [`provider_host::RunContext`], terminate and wait their exact child process
 /// tree/container, and only then resolve. The pool intentionally retains the
 /// attempt and its resource reservation until that provider future resolves.
 pub struct DispatchPool {
@@ -318,7 +318,7 @@ impl DispatchPool {
         let ledger = self.ledger.clone();
         let provisioner = self.provisioner.clone();
         let credential_resolver = self.credential_resolver.clone();
-        let executing_node = capability_host::execution_node_id(&self.node_key);
+        let executing_node = provider_host::execution_node_id(&self.node_key);
         let owner_spawn = self.spawn.clone();
         let attempt_guard = AttemptTaskGuard {
             key: key.clone(),
@@ -600,7 +600,7 @@ fn workspace_step_timeout() -> Duration {
 async fn execute(
     job: &ExecJob,
     prepared: crate::envelope::Prepared,
-    provider: &dyn capability_host::Provider,
+    provider: &dyn provider_host::Provider,
     provisioner: &SharedProvisioner,
     cancellation: &RunCancellation,
     permit: tokio::sync::OwnedSemaphorePermit,
@@ -777,11 +777,11 @@ async fn execute(
 /// no grace-drop escape hatch; reservation release before that future settles
 /// would allow replacement work to overlap a provider that may still be alive.
 async fn run_provider(
-    provider: &dyn capability_host::Provider,
+    provider: &dyn provider_host::Provider,
     input: &str,
-    ctx: &capability_host::RunContext,
+    ctx: &provider_host::RunContext,
     cancellation: &RunCancellation,
-) -> Result<capability_host::ProviderOutput, String> {
+) -> Result<provider_host::ProviderOutput, String> {
     let run = provider.run_with_usage(input, ctx);
     futures::pin_mut!(run);
     tokio::select! {
@@ -867,8 +867,8 @@ mod tests {
         SagaMsg, WorkerControl, WorkerRequest, encode_worker_control, encode_worker_request,
     };
 
-    fn spec_toml(tag: &str) -> capability_host::CapabilitySpec {
-        capability_host::CapabilitySpec::parse(
+    fn spec_toml(tag: &str) -> provider_host::CapabilitySpec {
+        provider_host::CapabilitySpec::parse(
             &format!(
                 r#"
 spec = 1
@@ -897,15 +897,15 @@ format = "text"
         executions: Arc<AtomicUsize>,
         current: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
-        last_run: Arc<Mutex<Option<(String, capability_host::RunContext)>>>,
+        last_run: Arc<Mutex<Option<(String, provider_host::RunContext)>>>,
         fail: bool,
-        usage: Option<capability_host::TokenUsage>,
+        usage: Option<provider_host::TokenUsage>,
     }
 
     struct FixedProvider(&'static str);
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for FixedProvider {
+    impl provider_host::Provider for FixedProvider {
         fn capability(&self) -> &str {
             "alpha"
         }
@@ -913,21 +913,21 @@ format = "text"
         async fn run(
             &self,
             _prompt: &str,
-            _ctx: &capability_host::RunContext,
+            _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             Ok(self.0.to_owned())
         }
     }
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for SlowProvider {
+    impl provider_host::Provider for SlowProvider {
         fn capability(&self) -> &str {
             &self.tag
         }
         async fn run(
             &self,
             prompt: &str,
-            ctx: &capability_host::RunContext,
+            ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             self.executions.fetch_add(1, Ordering::SeqCst);
             *self.last_run.lock().unwrap() = Some((prompt.to_string(), ctx.clone()));
@@ -958,11 +958,11 @@ format = "text"
         async fn run_with_usage(
             &self,
             prompt: &str,
-            ctx: &capability_host::RunContext,
-        ) -> Result<capability_host::ProviderOutput, String> {
+            ctx: &provider_host::RunContext,
+        ) -> Result<provider_host::ProviderOutput, String> {
             self.run(prompt, ctx)
                 .await
-                .map(|text| capability_host::ProviderOutput {
+                .map(|text| provider_host::ProviderOutput {
                     text,
                     usage: self.usage,
                 })
@@ -979,7 +979,7 @@ format = "text"
     }
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for FailClosedProvider {
+    impl provider_host::Provider for FailClosedProvider {
         fn capability(&self) -> &str {
             "alpha"
         }
@@ -987,7 +987,7 @@ format = "text"
         async fn run(
             &self,
             _prompt: &str,
-            _ctx: &capability_host::RunContext,
+            _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             self.entered.notify_one();
             self.release.notified().await;
@@ -1019,7 +1019,7 @@ format = "text"
     }
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for BlockingDropProvider {
+    impl provider_host::Provider for BlockingDropProvider {
         fn capability(&self) -> &str {
             "alpha"
         }
@@ -1027,7 +1027,7 @@ format = "text"
         async fn run(
             &self,
             _prompt: &str,
-            _ctx: &capability_host::RunContext,
+            _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             let _cleanup = BlockingCleanup {
                 entered: self.cleanup_entered.clone(),
@@ -1041,7 +1041,7 @@ format = "text"
     struct Probes {
         executions: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
-        last_run: Arc<Mutex<Option<(String, capability_host::RunContext)>>>,
+        last_run: Arc<Mutex<Option<(String, provider_host::RunContext)>>>,
     }
 
     fn slow_providers(delay: Duration, fail: bool) -> (Arc<ProviderSet>, Probes) {
@@ -1060,7 +1060,7 @@ format = "text"
             usage: None,
         };
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(provider)],
         ));
         (
@@ -1244,9 +1244,9 @@ format = "text"
     /// opaque here (private fields), so tests only assert that SOME config
     /// reached the run context.
     fn sample_airlock() -> AirlockConfig {
-        AirlockConfig::self_host(&capability_host::ResolvedCredential {
+        AirlockConfig::self_host(&provider_host::ResolvedCredential {
             name: "jess-fable-1".into(),
-            kind: capability_host::CredentialKind::Claude,
+            kind: provider_host::CredentialKind::Claude,
             authority: "airlock.owner.duck".into(),
             via: "http://127.0.0.1:0".into(),
             seal_pk: [7u8; 32],
@@ -1384,7 +1384,7 @@ format = "text"
     #[tokio::test]
     async fn fail_fast_occupied_settles_without_spawn_provider_or_provisioning() {
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             Vec::new(),
         ));
         let spawn_count = Arc::new(AtomicUsize::new(0));
@@ -1525,7 +1525,7 @@ format = "text"
         let release = Arc::new(tokio::sync::Notify::new());
         let finished = Arc::new(AtomicBool::new(false));
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(FailClosedProvider {
                 entered: entered.clone(),
                 release: release.clone(),
@@ -1823,7 +1823,7 @@ format = "text"
         let cleanup_entered = Arc::new(AtomicBool::new(false));
         let cleanup_release = Arc::new((Mutex::new(false), Condvar::new()));
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(BlockingDropProvider {
                 entered: entered.clone(),
                 cleanup_entered: cleanup_entered.clone(),
@@ -2039,7 +2039,7 @@ format = "text"
             peak: Arc::new(AtomicUsize::new(0)),
             last_run: Arc::new(Mutex::new(None)),
             fail: false,
-            usage: Some(capability_host::TokenUsage {
+            usage: Some(provider_host::TokenUsage {
                 input_tokens: 100,
                 cached_input_tokens: 60,
                 cache_write_input_tokens: 0,
@@ -2048,7 +2048,7 @@ format = "text"
             }),
         };
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(provider)],
         ));
         let (pool, mut rx) = pool_with(providers, 1);
@@ -2251,7 +2251,7 @@ format = "text"
         );
         let (_, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
         assert_eq!(ctx.run_key.as_deref(), Some("d1"));
-        let expected_node = capability_host::execution_node_id(b"me");
+        let expected_node = provider_host::execution_node_id(b"me");
         assert_eq!(ctx.executing_node.as_deref(), Some(expected_node.as_str()));
         assert!(ctx.cancellation.is_some());
     }
@@ -3065,7 +3065,7 @@ format = "text"
     async fn response_commit_message_reaches_the_workspace_commit_boundary_exactly() {
         let response = r#"{"reply_blocks":[],"actions":[],"commit_message":"fix: exact subject\n\nExact body."}"#;
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(FixedProvider(response))],
         ));
         let captured = Arc::new(Mutex::new(None));
@@ -3146,7 +3146,7 @@ format = "text"
         // the unwind guard covers the forge path exactly as duckfs: no commit,
         // no leaked per-run dir, the attempt settles as a failure.
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(PanicProvider {
                 tag: "alpha".into(),
             })],
@@ -3330,14 +3330,14 @@ format = "text"
     }
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for PanicProvider {
+    impl provider_host::Provider for PanicProvider {
         fn capability(&self) -> &str {
             &self.tag
         }
         async fn run(
             &self,
             _prompt: &str,
-            _ctx: &capability_host::RunContext,
+            _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             panic!("provider crashed hard")
         }
@@ -3346,7 +3346,7 @@ format = "text"
     #[tokio::test]
     async fn a_panicking_provider_still_cleans_up_and_fails_the_attempt() {
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(PanicProvider {
                 tag: "alpha".into(),
             })],
@@ -3428,7 +3428,7 @@ format = "text"
         // until deadline. an oversized prose answer must deliver TRUNCATED
         // (receipt intact) instead.
         let providers = Arc::new(ProviderSet::assemble(
-            capability_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
+            provider_host::SpecSet::from_specs(vec![spec_toml("alpha")]),
             vec![Box::new(HugeProvider {
                 tag: "alpha".into(),
             })],
@@ -3472,14 +3472,14 @@ format = "text"
     }
 
     #[async_trait::async_trait]
-    impl capability_host::Provider for HugeProvider {
+    impl provider_host::Provider for HugeProvider {
         fn capability(&self) -> &str {
             &self.tag
         }
         async fn run(
             &self,
             _prompt: &str,
-            _ctx: &capability_host::RunContext,
+            _ctx: &provider_host::RunContext,
         ) -> Result<String, String> {
             Ok("x".repeat(saga::MAX_RESULT_BYTES + 64 * 1024))
         }

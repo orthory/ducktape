@@ -20,7 +20,7 @@
 //! half-understood payload is exactly the quiet corruption this format exists
 //! to kill.
 
-use capability_host::RunContext;
+use provider_host::RunContext;
 use serde::Deserialize;
 use serde_json::Value;
 
