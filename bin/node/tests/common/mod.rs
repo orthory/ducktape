@@ -91,10 +91,14 @@ pub struct Cluster {
     /// service enable compute`. The compute plane needs BOTH a `[sandbox]`
     /// table (HOW runs are isolated — set via `extra_toml`) and this grant
     /// (WHETHER this node runs any), so a test that expects provider
-    /// discovery, an oracle pool or a capability announce must set it. `false`
-    /// by default: a node nobody enabled has no compute capacity, exactly like
-    /// a real one.
-    pub compute: bool,
+    /// discovery, an oracle pool or a capability announce must set it.
+    ///
+    /// The tags are what the grant CONSENTED to announce; the node announces
+    /// those intersected with what it actually discovers. `Some(vec![])` is
+    /// therefore the accept-lane-only provider (runs work, advertises
+    /// nothing) — the only way to express that state, since the retired
+    /// `announce_capabilities` key is gone. `None` = no grant at all.
+    pub compute_grant: Option<Vec<String>>,
     /// extra environment variables for node `idx`'s process, index-aligned
     /// with `peer_ids` (what gives each node its own capability-provider
     /// surface: `DUCKTAPE_CAPABILITY_DIR`, spec `detect.env` overrides).
@@ -575,7 +579,7 @@ impl Cluster {
             bootstrap_addr_override: None,
             wireguard: false,
             extra_toml: Vec::new(),
-            compute: false,
+            compute_grant: None,
             env: peer_ids.iter().map(|_| Vec::new()).collect(),
             dir,
             nodes: peer_ids.iter().map(|_| None).collect(),
@@ -645,15 +649,21 @@ impl Cluster {
         let workspace = self.workspace(idx);
         std::fs::create_dir_all(&workspace).expect("create workspace dir");
         let path = workspace.join("services.toml");
-        if !self.compute {
+        let Some(tags) = &self.compute_grant else {
             let _ = std::fs::remove_file(&path);
             return;
-        }
-        // any well-formed id/nonce pair does: the node only asks WHETHER a
-        // compute grant exists, never re-derives it.
+        };
+        let announced = tags
+            .iter()
+            .map(|tag| format!("{tag:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // any well-formed id/nonce pair does: the node asks WHETHER a compute
+        // grant exists and WHAT it announces, never re-deriving the id.
         let grant = format!(
             "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
-             nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = []\nscopes = []\n",
+             nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{announced}]\n\
+             scopes = []\n",
             "11".repeat(32),
             "22".repeat(16),
         );

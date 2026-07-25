@@ -33,22 +33,60 @@ pub(crate) fn query(
     Ok(serde_json::from_str(&body)?)
 }
 
+/// Why a node-local read did not produce an answer.
+///
+/// The distinction is the whole point: "the node is not running" is an
+/// ordinary state a read verb must render calmly, while "the node answered
+/// something unexpected" must be surfaced. Collapsing both into one error is
+/// how a 404 or a changed body shape comes to look like "nothing is there".
+pub(crate) enum ReadFailure {
+    /// nothing is listening on the node's HTTP surface.
+    Unreachable,
+    /// the node was reached but the exchange failed (status or body).
+    Rejected(String),
+}
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadFailure::Unreachable => write!(f, "the node is not running"),
+            ReadFailure::Rejected(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
 /// Read one node-local JSON surface over GET (the `/v1` read routes that are
 /// not module queries, e.g. the volatile service catalog).
-pub(crate) fn get_json(
-    base: &str,
-    path: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, ReadFailure> {
     let resp = reqwest::blocking::Client::new()
         .get(format!("{base}{path}"))
         .send()
-        .map_err(|e| format!("GET {base}{path}: {e}"))?;
+        .map_err(|error| match error.is_connect() {
+            // reqwest's Display does not mention the refusal — the cause is in
+            // the source chain — so ask the error what it IS rather than
+            // grepping how it prints.
+            true => ReadFailure::Unreachable,
+            false => ReadFailure::Rejected(format!("GET {path}: {error}")),
+        })?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("{path} rejected ({status}): {text}").into());
+        return Err(ReadFailure::Rejected(format!(
+            "{path} rejected ({status}): {text}"
+        )));
     }
-    Ok(serde_json::from_str(&text)?)
+    serde_json::from_str(&text)
+        .map_err(|error| ReadFailure::Rejected(format!("{path} returned undecodable JSON: {error}")))
+}
+
+/// POST one node-local JSON surface and return the decoded reply (the `/v1`
+/// routes that are not module submits, e.g. service signaling).
+pub(crate) fn post_json(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_str(&post(base, path, body)?)?)
 }
 
 /// One blocking POST of a JSON body, returning the response text or the node's

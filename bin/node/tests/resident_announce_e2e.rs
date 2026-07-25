@@ -183,26 +183,31 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     cluster.env[1] = [provider.env(), hide_builtins(fixtures.path(), "friend")].concat();
 
     // serving is opt-in (default OFF): this test exercises the resident
-    // announce path, so both the founder and the joining resident opt in by
-    // EDITING the generated line's value (the file is complete — every key
-    // already present, an append would be a duplicate-key parse error).
-    fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize) {
-        let path = cluster.config_file(idx);
-        let toml = std::fs::read_to_string(&path).expect("read node.toml");
-        assert!(
-            toml.contains("announce_capabilities = false"),
-            "generated file carries the key"
-        );
+    // announce path, so both the founder and the joining resident are granted
+    // the compute service announcing this provider's tag. The grant is the
+    // ONLY switch — node.toml carries no announce key any more.
+    fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize, tag: &str) {
+        let workspace = cluster
+            .config_file(idx)
+            .parent()
+            .expect("node.toml has a parent")
+            .to_path_buf();
         std::fs::write(
-            &path,
-            toml.replace("announce_capabilities = false", "announce_capabilities = true"),
+            workspace.join("services.toml"),
+            format!(
+                "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+                 nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{tag:?}]\n\
+                 scopes = []\n",
+                "11".repeat(32),
+                "22".repeat(16),
+            ),
         )
-        .expect("write node.toml");
+        .expect("write services.toml");
     }
 
     let chain_id = cluster.init_founder("resident-announce");
     assert!(!chain_id.is_empty(), "init should print the founded chain id");
-    opt_in_serving(&cluster, 0);
+    opt_in_serving(&cluster, 0, &provider.tag);
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -212,7 +217,7 @@ fn a_joined_resident_announces_and_executes_assigned_dispatch() {
     let friend_key_hex = cluster.join_friend(&invite);
     assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
     let friend_key = common::unhex(&friend_key_hex);
-    opt_in_serving(&cluster, 1);
+    opt_in_serving(&cluster, 1, &provider.tag);
     cluster.spawn(1);
     cluster.wait_marker(1, "joining:", Duration::from_secs(60));
     cluster.wait_admitted(1, CONVERGE);

@@ -16,7 +16,7 @@
 //!   result committed (the never-pop-stack rule, observed via the op index).
 //!
 //! - `unannounced_capable_nodes_race_accept_and_execute_once`: both provider
-//!   validators run `announce_capabilities = false` (accept-lane-only), so
+//!   validators run a compute grant announcing nothing (accept-lane-only), so
 //!   the agent's tag has an EMPTY rendezvous pool and the dispatch's
 //!   WorkerRequest goes out UNASSIGNED — an announcement. both capable nodes
 //!   race `SagaMsg::Accept`; consensus order seats exactly one winner, the
@@ -379,8 +379,9 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
     // serving is opt-in now (default OFF): this test wants the rendezvous
-    // pool, so it opts every node in explicitly.
-    cluster.extra_toml.push("announce_capabilities = true".into());
+    // pool, so it grants every node compute with both tags announced. Each
+    // node announces that set intersected with what it actually discovers.
+    cluster.compute_grant = Some(vec![text_provider.tag.clone(), json_provider.tag.clone()]);
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();
@@ -524,7 +525,9 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     );
 
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
-    cluster.extra_toml.push("announce_capabilities = false".into());
+    // a grant that announces NO tags: the accept-lane-only provider — it can
+    // still execute claimed work, but never enters a tag's rendezvous pool.
+    cluster.compute_grant = Some(vec![]);
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [racer_one.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [racer_two.env(), hide_builtins(fixtures.path(), "node2")].concat();

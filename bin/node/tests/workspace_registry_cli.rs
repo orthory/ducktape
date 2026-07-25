@@ -69,9 +69,10 @@ fn same_name_founds_two_distinct_registry_workspaces() {
 }
 
 /// init a workspace with the child's PATH pinned to `path_dir`, returning the
-/// generated node.toml — the seam that makes compute detection hermetic: the
-/// probe only checks executability on PATH, it never runs the binary.
-fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> String {
+/// generated node.toml and the workspace dir — the seam that makes compute
+/// detection hermetic: the probe only checks executability on PATH, it never
+/// runs the binary.
+fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::path::PathBuf) {
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
         .env("DUCKTAPE_HOME", home)
@@ -85,18 +86,16 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     let chain_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    std::fs::read_to_string(
-        home.join("workspaces")
-            .join(&chain_id)
-            .join("node.toml"),
-    )
-    .expect("read generated node.toml")
+    let workspace = home.join("workspaces").join(&chain_id);
+    let toml = std::fs::read_to_string(workspace.join("node.toml"))
+        .expect("read generated node.toml");
+    (toml, workspace)
 }
 
 /// fresh-workspace compute detection: the platform adapter's runtime on PATH
 /// (a fake executable — podman on Linux, tart on macOS) makes a flagless init
-/// write a LIVE `[sandbox]` table with the capability announce still off; an
-/// empty PATH keeps today's commented example.
+/// write a LIVE `[sandbox]` table while granting no service at all; an empty
+/// PATH keeps today's commented example.
 #[test]
 fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -120,21 +119,24 @@ fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
     }
 
     let home = tempfile::tempdir().expect("tempdir");
-    let toml = init_with_path(home.path(), "computed", bins.path());
+    let (toml, workspace) = init_with_path(home.path(), "computed", bins.path());
     assert!(toml.contains("\n[sandbox]"), "live table written:\n{toml}");
     assert!(
         toml.contains(&format!("runtime = \"{runtime}\"")),
         "the platform adapter is chosen:\n{toml}"
     );
-    // detection never opts the node into publishing capacity to the network.
+    // detection never opts the node into publishing capacity: the table says
+    // only HOW a run would be isolated. Announcing needs a compute grant,
+    // which init cannot mint (there is no daemon signaling yet), so a fresh
+    // workspace carries no services.toml at all.
     assert!(
-        toml.contains("announce_capabilities = false"),
-        "announce stays off:\n{toml}"
+        !workspace.join("services.toml").exists(),
+        "a fresh workspace grants no service"
     );
 
     let empty = tempfile::tempdir().expect("empty PATH dir");
     let home = tempfile::tempdir().expect("tempdir");
-    let toml = init_with_path(home.path(), "bare", empty.path());
+    let (toml, _) = init_with_path(home.path(), "bare", empty.path());
     assert!(
         toml.contains("#[sandbox]") && !toml.contains("\n[sandbox]"),
         "no runtime on PATH keeps the commented example:\n{toml}"

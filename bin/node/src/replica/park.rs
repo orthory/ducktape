@@ -218,7 +218,7 @@ pub(super) async fn park(
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
     checkpoint_blocks: u64,
-    announce_capabilities: bool,
+    granted_capabilities: Vec<String>,
     sandbox: Option<provider_host::SandboxBackend>,
     // the compute SERVICE's backend: the `[sandbox]` table gated on the
     // user's `services.toml` grant. Drives discovery/pool/announce only.
@@ -705,7 +705,11 @@ pub(super) async fn park(
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
         None => provider_host::ProviderSet::empty(),
     };
-    let resident_capabilities = resident_provider_set.capabilities();
+    // never more than the user granted, never more than the host provides.
+    let resident_capabilities = crate::services::announceable(
+        &granted_capabilities,
+        resident_provider_set.capabilities(),
+    );
     let mut resident_announcer = resident_announce::ResidentAnnouncer::new(
         me_bytes.clone(),
         resident_capabilities,
@@ -2132,12 +2136,11 @@ pub(super) async fn park(
                     let host = node_r.host();
                     let now = std::time::Instant::now();
                     // CAPABILITY ANNOUNCE (resident tier): mirrors the
-                    // validator pump, including the config gate — an
-                    // `announce_capabilities = false` resident stays an
+                    // validator pump. A grant announcing no tags leaves
+                    // the announcer's set empty, so a resident stays an
                     // accept-lane-only provider and never enters a
                     // tag's rendezvous pool.
-                    if announce_capabilities
-                        && let Some(msg) = resident_announcer.maybe_announce(host, now).await
+                    if let Some(msg) = resident_announcer.maybe_announce(host, now).await
                     {
                         match resident_relay.submit_unheld(
                             &signer,

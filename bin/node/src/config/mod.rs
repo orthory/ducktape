@@ -1116,7 +1116,7 @@ mod tests {
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
              coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n\
-             sync_index = false\nannounce_capabilities = false\n"
+             sync_index = false\n"
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir

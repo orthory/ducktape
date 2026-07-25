@@ -41,7 +41,15 @@ const MAX_SIGNALING: usize = 64;
 const MAX_KIND_LEN: usize = 32;
 /// the longest a version string may be.
 const MAX_VERSION_LEN: usize = 32;
-/// the most offered tags / requested scopes one hello may carry.
+/// the most capability tags one hello may offer.
+///
+/// Sized against reality, not a round number: a capability spec expands into
+/// one tag per `[[variants]]` entry, so the two BUILT-IN specs alone already
+/// declare ~37, and an operator spec dir adds more. A tight cap here does not
+/// harden anything — it just refuses ordinary hosts.
+const MAX_CAPABILITIES: usize = 512;
+/// the most grant scopes / declared needs one hello may carry. These are
+/// small by nature: a service asks for a handful of scopes, not hundreds.
 const MAX_LIST_LEN: usize = 32;
 /// the longest one offered tag / requested scope may be.
 const MAX_ITEM_LEN: usize = 64;
@@ -78,18 +86,85 @@ pub struct Hello {
     pub needs: Vec<String>,
 }
 
-/// This binary's build identity — the string a daemon must present in its
-/// hello and the node compares against its own.
+/// This binary's build identity — what a daemon must present in its hello and
+/// what the node compares against its own. `None` when the build could not be
+/// identified at compile time.
 ///
 /// The node and a service daemon are separate processes with independent
 /// restart timing, so skew is real even when one binary is on disk: an
 /// operator upgrades and restarts the node while yesterday's daemon is still
-/// running. Per the repo's no-versioning doctrine, a mismatch is REFUSED with
-/// a nameable reason rather than tolerated — there is no negotiation, no
-/// compat arm and no minimum-version window. One function so the two sides
-/// cannot drift in how they spell it.
-pub fn build_identity() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+/// running. Per the repo's no-versioning doctrine a mismatch is REFUSED with a
+/// nameable reason — no negotiation, no compat arm, no minimum-version window.
+///
+/// It is deliberately NOT the package version: version numbering is pinned at
+/// v1 permanently, so `CARGO_PKG_VERSION` is a constant and every skewed pair
+/// would compare equal — an inert gate that looks like a live one. `build.rs`
+/// stamps the commit (plus a working-tree digest when dirty).
+///
+/// `None` FAILS CLOSED: an unidentifiable build refuses every hello rather
+/// than falling back to a constant that admits all of them.
+pub fn build_identity() -> Option<&'static str> {
+    option_env!("DUCKTAPE_BUILD").filter(|id| !id.is_empty())
+}
+
+/// Why a hello was turned away. A typed reason rather than a bare string: the
+/// status and the stable `reason` token are derived from the variant, so they
+/// cannot drift apart and a typo cannot silently downgrade a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelloRefusal {
+    /// the hello itself is not well-formed.
+    Malformed(&'static str),
+    /// the daemon is a different build from this node.
+    BuildMismatch,
+    /// this node cannot identify its OWN build, so it can prove nothing about
+    /// anyone else's. Refuses everything by construction.
+    BuildIdentityUnavailable,
+    /// too many distinct kinds are already signaling.
+    CatalogFull,
+}
+
+impl HelloRefusal {
+    /// the stable snake_case token — greppable, countable, never prose.
+    pub fn reason(self) -> &'static str {
+        match self {
+            HelloRefusal::Malformed(_) => "malformed_hello",
+            HelloRefusal::BuildMismatch => "build_mismatch",
+            HelloRefusal::BuildIdentityUnavailable => "build_identity_unavailable",
+            HelloRefusal::CatalogFull => "catalog_full",
+        }
+    }
+
+    /// 400 for "you sent nonsense"; 409 for "you do not belong here"; 503 for
+    /// "this node cannot serve the check at all".
+    pub fn status(self) -> axum::http::StatusCode {
+        match self {
+            HelloRefusal::Malformed(_) => axum::http::StatusCode::BAD_REQUEST,
+            HelloRefusal::BuildMismatch => axum::http::StatusCode::CONFLICT,
+            HelloRefusal::BuildIdentityUnavailable => {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+            HelloRefusal::CatalogFull => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// the operator-facing sentence.
+    pub fn message(self) -> String {
+        match self {
+            HelloRefusal::Malformed(detail) => detail.to_string(),
+            HelloRefusal::BuildMismatch => format!(
+                "this node runs build {}; restart the service daemon from the same build",
+                build_identity().unwrap_or("unknown")
+            ),
+            HelloRefusal::BuildIdentityUnavailable => {
+                "this node cannot identify its own build, so it refuses every service hello; \
+                 rebuild it from a git checkout"
+                    .into()
+            }
+            HelloRefusal::CatalogFull => {
+                "too many services are signaling to this node".into()
+            }
+        }
+    }
 }
 
 /// A kind tag is lowercase alphanumeric plus `-`. This is a trust boundary:
@@ -114,18 +189,20 @@ fn item_is_well_formed(item: &str) -> bool {
 
 impl Hello {
     /// Reject a malformed hello at the boundary, naming one stable reason.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), HelloRefusal> {
         if !kind_is_well_formed(&self.kind) {
-            return Err("kind must be 1..32 chars of [a-z0-9-]");
+            return Err(HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]"));
         }
         if self.version.len() > MAX_VERSION_LEN || !item_is_well_formed(&self.version) {
-            return Err("version must be 1..32 printable ascii chars");
+            return Err(HelloRefusal::Malformed("version must be 1..32 printable ascii chars"));
         }
-        let lists_ok = self.capabilities.len() <= MAX_LIST_LEN
+        let lists_ok = self.capabilities.len() <= MAX_CAPABILITIES
             && self.scopes.len() <= MAX_LIST_LEN
             && self.needs.len() <= MAX_LIST_LEN;
         if !lists_ok {
-            return Err("at most 32 capabilities, 32 scopes and 32 needs");
+            return Err(HelloRefusal::Malformed(
+                "at most 512 capabilities, 32 scopes and 32 needs",
+            ));
         }
         let items_ok = self
             .capabilities
@@ -133,12 +210,12 @@ impl Hello {
             .chain(self.scopes.iter())
             .all(|item| item_is_well_formed(item));
         if !items_ok {
-            return Err("each capability/scope must be 1..64 printable ascii chars");
+            return Err(HelloRefusal::Malformed("each capability/scope must be 1..64 printable ascii chars"));
         }
         // a need names a KIND, so it obeys the kind grammar — that is what
         // makes it comparable against the grants without any normalizing.
         if !self.needs.iter().all(|need| kind_is_well_formed(need)) {
-            return Err("each need must be a service kind (1..32 chars of [a-z0-9-])");
+            return Err(HelloRefusal::Malformed("each need must be a service kind (1..32 chars of [a-z0-9-])"));
         }
         Ok(())
     }
@@ -174,25 +251,34 @@ impl ServiceCatalog {
     /// must re-signal within. Full catalog + a NEW kind is refused: refreshing
     /// an existing kind must never fail on capacity, or a full map would
     /// starve the daemons already in it.
-    pub fn hello(&self, hello: Hello, now: Instant) -> Result<Duration, &'static str> {
-        hello.validate()?;
-        // the refusal is loud and total: a daemon built against a different
-        // node does not get to signal, let alone be enabled.
-        if hello.build != build_identity() {
+    pub fn hello(&self, hello: Hello, now: Instant) -> Result<Duration, HelloRefusal> {
+        self.admit(hello, now).inspect_err(|refusal| {
             tracing::warn!(
                 target: "ducktape::service",
-                kind = %hello.kind,
-                reason = "build_mismatch",
+                reason = refusal.reason(),
                 "service hello refused"
             );
-            return Err("build_mismatch");
+        })
+    }
+
+    fn admit(&self, hello: Hello, now: Instant) -> Result<Duration, HelloRefusal> {
+        hello.validate()?;
+        // a node that cannot name its own build can prove nothing about
+        // anyone else's, so it refuses everything rather than waving it through.
+        let Some(mine) = build_identity() else {
+            return Err(HelloRefusal::BuildIdentityUnavailable);
+        };
+        // loud and total: a daemon built against a different node does not get
+        // to signal, let alone be enabled.
+        if hello.build != mine {
+            return Err(HelloRefusal::BuildMismatch);
         }
         let mut entries = self.0.lock().expect("service catalog lock poisoned");
         expire(&mut entries, now);
         let kind = hello.kind.clone();
         let known = entries.contains_key(&kind);
         if !known && entries.len() >= MAX_SIGNALING {
-            return Err("too many services are signaling to this node");
+            return Err(HelloRefusal::CatalogFull);
         }
         entries.insert(
             kind.clone(),
@@ -254,6 +340,14 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
 // local process can already read the node's key off disk. Signaling is
 // deliberately unprivileged: an entry grants NOTHING, so the weakest gate on
 // the surface is the right one. Consent happens in `ducktape service enable`.
+//
+// NOTE the transport assumption: unlike `/v1/submit`, which carries a signed
+// frame and is therefore safe wherever it is reachable, a hello is
+// UNAUTHENTICATED — it is trusted only because `http_listen` is expected to
+// stay on loopback or a private tailnet. Binding the node's HTTP surface to a
+// public interface would let any reachable host occupy a kind in this catalog
+// (and so appear in `service list` for a user to enable). The cap and TTL
+// bound the damage; they do not replace keeping the surface private.
 
 /// POST /v1/services/hello — a local service daemon declares (or refreshes)
 /// its presence. Returns the TTL it must re-signal within.
@@ -268,23 +362,12 @@ pub async fn hello(
             axum::Json(serde_json::json!({ "ttl_secs": ttl.as_secs() })),
         )
             .into_response(),
-        // a build mismatch is the node refusing a peer it cannot trust to be
-        // the same software, so it answers 409 (conflict) and names the reason
-        // as a stable token the CLI turns into "restart the daemon".
-        Err("build_mismatch") => (
-            axum::http::StatusCode::CONFLICT,
+        Err(refusal) => (
+            refusal.status(),
             axum::Json(serde_json::json!({
-                "error": format!(
-                    "this node runs build {}; restart the service daemon from the same build",
-                    build_identity()
-                ),
-                "reason": "build_mismatch",
+                "error": refusal.message(),
+                "reason": refusal.reason(),
             })),
-        )
-            .into_response(),
-        Err(reason) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({ "error": reason, "reason": "malformed_hello" })),
         )
             .into_response(),
     }
@@ -313,7 +396,7 @@ mod tests {
         Hello {
             kind: kind.into(),
             version: "1.2.3".into(),
-            build: build_identity().into(),
+            build: build_identity().expect("a test build is git-identifiable").into(),
             capabilities: vec!["agent.claude".into()],
             scopes: vec!["cred:read".into()],
             needs: Vec::new(),
@@ -395,7 +478,7 @@ mod tests {
         assert!(catalog.hello(long_kind, now).is_err());
 
         let mut too_many = hello("compute");
-        too_many.capabilities = (0..MAX_LIST_LEN + 1).map(|i| format!("tag{i}")).collect();
+        too_many.capabilities = (0..MAX_CAPABILITIES + 1).map(|i| format!("tag{i}")).collect();
         assert!(catalog.hello(too_many, now).is_err());
 
         let mut long_item = hello("compute");
@@ -410,6 +493,14 @@ mod tests {
 #[cfg(test)]
 mod build_gate_tests {
     use super::*;
+
+    /// the build this test binary was compiled as; `build_identity` must be
+    /// Some here, since the tests only ever run from a git checkout.
+    static TEST_BUILD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        build_identity()
+            .expect("tests run from a git checkout, so a build id exists")
+            .to_string()
+    });
 
     fn hello_from_build(build: &str) -> Hello {
         Hello {
@@ -432,7 +523,7 @@ mod build_gate_tests {
         for skewed in ["0.0.0-ancient", "99.99.99", ""] {
             assert_eq!(
                 catalog.hello(hello_from_build(skewed), now),
-                Err("build_mismatch"),
+                Err(HelloRefusal::BuildMismatch),
                 "build {skewed:?} must be refused"
             );
         }
@@ -443,7 +534,7 @@ mod build_gate_tests {
 
         // the node's own build is what passes.
         catalog
-            .hello(hello_from_build(build_identity()), now)
+            .hello(hello_from_build(TEST_BUILD.as_str()), now)
             .expect("matching build is admitted");
         assert_eq!(catalog.live(now).len(), 1);
     }
@@ -452,14 +543,14 @@ mod build_gate_tests {
     fn declared_needs_ride_the_hello_through_to_the_catalog() {
         let catalog = ServiceCatalog::default();
         let now = Instant::now();
-        let mut hello = hello_from_build(build_identity());
+        let mut hello = hello_from_build(TEST_BUILD.as_str());
         hello.kind = "agent".into();
         hello.needs = vec!["compute".into()];
         catalog.hello(hello, now).unwrap();
         assert_eq!(catalog.live(now)[0].needs, vec!["compute".to_string()]);
 
         // a need is a KIND, so a malformed one is refused like any other.
-        let mut bad = hello_from_build(build_identity());
+        let mut bad = hello_from_build(TEST_BUILD.as_str());
         bad.needs = vec!["Not A Kind".into()];
         assert!(catalog.hello(bad, now).is_err());
     }

@@ -484,7 +484,8 @@ fn issue_mention_runs_a_worktree_opens_a_pr_and_the_pr_session_survives_a_cas_ra
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
     // serving is opt-in now (default OFF): this test needs node 1 in the
     // rendezvous pool, so every node opts in.
-    cluster.extra_toml.push("announce_capabilities = true".into());
+    // serving is opt-in: the compute grant is what puts a node in the pool.
+    cluster.compute_grant = Some(vec![provider.tag.clone()]);
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),

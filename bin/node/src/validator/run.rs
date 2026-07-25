@@ -127,7 +127,7 @@ pub(super) struct ValidatorLoopState<'a> {
     /// sync retention lease (unix secs of the last served state-sync request)
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(super) announce_capabilities: bool,
+    pub(super) granted_capabilities: Vec<String>,
     pub(super) sandbox: Option<provider_host::SandboxBackend>,
     /// the compute SERVICE's backend: the table gated on the user's
     /// `services.toml` grant. Drives discovery/pool/announce only.
@@ -176,7 +176,6 @@ struct ValidatorRuntime<'a> {
     dev_demo: bool,
     checkpoint_blocks: u64,
     sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    announce_capabilities: bool,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     blobs: noded::blobs::BlobHandle,
@@ -266,7 +265,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        announce_capabilities,
+        granted_capabilities,
         sandbox,
         compute_backend,
         sandbox_capacity,
@@ -367,8 +366,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // CLIs (BYO — no credential handling here). the discovered tag set is
     // BOTH what the oracle worker can run and what this node announces to
     // the capability registry, so an announce can never claim more than
-    // the host provides (`announce_capabilities = false` narrows the
-    // announced set to nothing — never the reverse). routing and
+    // the host provides, and the user's grant narrows it further —
+    // never the reverse. routing and
     // default models live in the specs (docs/records/specs/capability-spec.md); a broken
     // operator spec is a boot error, not a silently dropped executor.
     // the node-private podman service (own socket + storage + egress hooks) must
@@ -400,7 +399,9 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         .unwrap_or_else(|e| panic!("capability specs failed to load: {e}")),
         None => provider_host::ProviderSet::empty(),
     };
-    let my_capabilities = providers.capabilities();
+    // never more than the user granted, never more than the host provides.
+    let my_capabilities =
+        crate::services::announceable(&granted_capabilities, providers.capabilities());
     // OFF-LOOP execution: the pool gates effects inline (lease check —
     // WorkerRequests leased to another node's key are skipped, not
     // double-run — under this node's submit key) but runs the provider
@@ -505,7 +506,6 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         dev_demo,
         checkpoint_blocks,
         sync_lease,
-        announce_capabilities,
         stream_hub,
         index,
         blobs,

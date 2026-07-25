@@ -161,11 +161,13 @@ fn is_hex(text: &str) -> bool {
 }
 
 /// Mint a service instance id: `sha256(domain ‖ node_id ‖ 0 ‖ kind ‖ 0 ‖
-/// nonce)`. Node-scoped (so two nodes never collide), kind-separated (so one
+/// nonce)`. `node_id` is a FIXED 32 bytes and `kind` cannot contain a NUL
+/// (the grammar forbids it), so the preimage parses one way only — the length
+/// is carried by the type rather than by a comment. Node-scoped (so two nodes never collide), kind-separated (so one
 /// node's compute grant is not its storage grant) and nonce-fresh (so a
 /// re-enable after a `disable` is a NEW id — the id doubles as the
 /// consent-epoch marker).
-pub fn mint_instance(node_id: &[u8], kind: &str, nonce: &[u8]) -> [u8; 32] {
+pub fn mint_instance(node_id: &[u8; 32], kind: &str, nonce: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(SERVICE_INSTANCE_DOMAIN);
     digest.update(node_id);
@@ -226,6 +228,22 @@ fn save(workspace: &Path, services: &Services) -> Result<(), String> {
         return Err(format!("replace {path:?}: {error}"));
     }
     Ok(())
+}
+
+/// The tags a node may announce: what the user's compute grant consented to,
+/// INTERSECTED with what this host actually discovered.
+///
+/// Neither side may widen the other. The grant cannot make a host advertise an
+/// executor it does not have, and discovery cannot advertise a tag the user
+/// never reviewed. An empty result — no grant, a grant carrying no tags, or a
+/// host that discovered nothing — means announce nothing, which is also how
+/// the accept-lane-only provider is expressed. There is deliberately no second
+/// switch: a bool in node.toml could disagree with the grant, and this cannot.
+pub(crate) fn announceable(granted: &[String], discovered: Vec<String>) -> Vec<String> {
+    discovered
+        .into_iter()
+        .filter(|tag| granted.iter().any(|allowed| allowed == tag))
+        .collect()
 }
 
 // ============================================================================
@@ -473,7 +491,7 @@ fn render_status(rows: &[ServiceRow]) -> String {
                     &format!(
                         "enabled but not signaling — is its daemon running, and on build {}? \
                          (a different build is refused: reason build_mismatch)",
-                        noded::services::build_identity()
+                        noded::services::build_identity().unwrap_or("unknown")
                     )
                 )
             ));
@@ -542,6 +560,8 @@ fn write_err(rendered: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// node process and `enable` is what turns it on.
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum ServiceCmd {
+    /// run a service daemon in the foreground (signals; systemd unit target)
+    Run(RunArgs),
     /// show services signaling to this node and those enabled in config
     List(ReadArgs),
     /// grant a service standing on this node (mints its instance id)
@@ -596,6 +616,46 @@ pub(crate) struct KindArgs {
 }
 
 #[derive(Debug, clap::Args)]
+pub(crate) struct RunArgs {
+    /// the service kind to run (`compute`)
+    #[arg(value_name = "KIND")]
+    kind: String,
+    #[command(flatten)]
+    workspace: WorkspaceArgs,
+    /// grant the service without asking — for scripts and systemd units
+    #[arg(long, conflicts_with = "no_enable")]
+    enable: bool,
+    /// never offer to grant the service; just signal
+    #[arg(long = "no-enable")]
+    no_enable: bool,
+}
+
+/// What `service run` should do about a kind that is not yet granted. ONE
+/// discriminant rather than two booleans steering the code below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnableOffer {
+    /// `--enable`: mint the grant without asking.
+    Always,
+    /// `--no-enable`: never offer; signal and say so once.
+    Never,
+    /// the default: ask, but only where someone can answer.
+    AskIfTty,
+}
+
+impl RunArgs {
+    fn offer(&self) -> EnableOffer {
+        // clap makes the pair mutually exclusive, so the fourth combination
+        // cannot arrive; it is spelled out rather than hidden behind a `_`.
+        match (self.enable, self.no_enable) {
+            (true, true) => unreachable!("clap refuses --enable with --no-enable"),
+            (true, false) => EnableOffer::Always,
+            (false, true) => EnableOffer::Never,
+            (false, false) => EnableOffer::AskIfTty,
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
 pub(crate) struct EnableArgs {
     /// the service kind (`compute`)
     #[arg(value_name = "KIND")]
@@ -610,6 +670,7 @@ pub(crate) struct EnableArgs {
 /// Run one verb of the `ducktape service` family.
 pub(super) fn run(cmd: ServiceCmd) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
+        ServiceCmd::Run(args) => run_service(args),
         ServiceCmd::List(args) => list(args),
         ServiceCmd::Enable(args) => enable(args),
         ServiceCmd::Disable(args) => disable(args),
@@ -621,13 +682,35 @@ pub(super) fn run(cmd: ServiceCmd) -> Result<(), Box<dyn std::error::Error>> {
 /// running is NOT an error here: nothing signaling is exactly what `list` must
 /// render, and the grants still come off disk.
 fn signaling_now(workspace: &Path) -> Vec<noded::services::Signaling> {
-    let Ok(base) = config::http_base_in(workspace) else {
-        return Vec::new();
-    };
-    let Ok(body) = crate::node_http::get_json(&base, "/v1/services") else {
-        return Vec::new();
-    };
-    serde_json::from_value(body["signaling"].clone()).unwrap_or_default()
+    match read_signaling(workspace) {
+        Ok(signaling) => signaling,
+        // A node that is not running is the ordinary case — `list` must still
+        // render the grants — so it stays quiet. Anything else (a 404, a 500,
+        // a body whose shape changed) would otherwise be indistinguishable
+        // from "nothing is signaling", which is exactly the wrong thing to
+        // tell someone who is about to consent to something.
+        Err(crate::node_http::ReadFailure::Unreachable) => Vec::new(),
+        Err(error) => {
+            let _ = write_err(&format!(
+                "{} could not read the signaling catalog: {error}\n",
+                paint(YELLOW, "warning:")
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn read_signaling(
+    workspace: &Path,
+) -> Result<Vec<noded::services::Signaling>, crate::node_http::ReadFailure> {
+    use crate::node_http::ReadFailure;
+    let base = config::http_base_in(workspace).map_err(ReadFailure::Rejected)?;
+    let body = crate::node_http::get_json(&base, "/v1/services")?;
+    let signaling = body.get("signaling").ok_or_else(|| {
+        ReadFailure::Rejected("/v1/services carries no `signaling` field".into())
+    })?;
+    serde_json::from_value(signaling.clone())
+        .map_err(|e| ReadFailure::Rejected(format!("unexpected /v1/services shape: {e}")))
 }
 
 
@@ -673,7 +756,7 @@ fn join_or_dash(items: &[String]) -> String {
 pub(crate) struct EnablePlan {
     pub kind: String,
     pub chain_id: String,
-    pub node_id: Vec<u8>,
+    pub node_id: [u8; 32],
     /// the reviewed hello, when the daemon is currently signaling.
     pub offered: Option<noded::services::Signaling>,
 }
@@ -681,7 +764,7 @@ pub(crate) struct EnablePlan {
 impl EnablePlan {
     /// the node's own short form, matching the `#hex8` display convention.
     fn node_hex8(&self) -> String {
-        config::hex_bytes(&self.node_id[..4.min(self.node_id.len())])
+        config::hex_bytes(&self.node_id[..4])
     }
 }
 
@@ -703,19 +786,25 @@ pub(crate) fn plan_enable(workspace: &Path, kind: &str) -> Result<EnablePlan, St
     // the node's own key scopes the id, so the mint reads the workspace
     // identity exactly the way every other node-scoped verb does.
     let resolved = config::resolve(&workspace.join("node.toml"))?;
-    // the grant is minted FROM the reviewed hello when the daemon is
-    // signaling. It is not required to be: at this step compute is still
-    // hosted in the node process, so there is no daemon to signal — enabling
-    // an absent kind is the documented `enabled-but-absent` state, which
-    // `status` surfaces as a warning rather than an error.
+    // the grant is minted FROM a reviewed hello, so there must BE one. A
+    // grant invented for an absent daemon would record no offered tags and no
+    // requested scopes — the consent screen would show nothing and the
+    // announce set would be empty — which is consent in name only.
     let offered = signaling_now(workspace)
         .into_iter()
-        .find(|entry| entry.kind == kind);
+        .find(|entry| entry.kind == kind)
+        .ok_or_else(|| {
+            format!(
+                "{kind} is not signaling to this node, so there is nothing to consent to — \
+                 start it first: ducktape service run {kind}"
+            )
+        })?;
     Ok(EnablePlan {
         kind: kind.to_string(),
         chain_id: resolved.chain_id,
-        node_id: resolved.signer.public_key().as_ref().to_vec(),
-        offered,
+        node_id: <[u8; 32]>::try_from(resolved.signer.public_key().as_ref())
+            .map_err(|_| "node identity key is not 32 bytes".to_string())?,
+        offered: Some(offered),
     })
 }
 
@@ -750,14 +839,173 @@ pub(crate) fn commit_enable(
         .unwrap_or_else(|position| position);
     services.grants.insert(position, grant.clone());
     save(workspace, &services)?;
-    set_capability_announce(workspace, &plan.kind, true)?;
+    // the grant mint is the audit-relevant event, and `service run` installs a
+    // subscriber before it can reach here, so this is recorded in daemon.log
+    // and the log ring on the daemon path. The one-shot CLI verb has no
+    // subscriber by design — there it is the printed output that informs.
     tracing::info!(
         target: "ducktape::service",
-        kind = %plan.kind,
+        kind = %grant.kind,
         instance = %grant.display_id(),
+        capabilities = grant.capabilities.len(),
         "service enabled"
     );
     Ok(grant)
+}
+
+/// How often the daemon re-signals. A third of the TTL, so two consecutive
+/// lost heartbeats still leave the entry alive.
+const HEARTBEAT: std::time::Duration =
+    std::time::Duration::from_secs(noded::services::HELLO_TTL.as_secs() / 3);
+
+/// `ducktape service run <kind>` — the first-party launcher.
+///
+/// It discovers what this host can actually execute, signals that to the node,
+/// offers to enable itself, and then keeps the signal alive. It deliberately
+/// does NOT execute work: the node still runs the compute plane in-process at
+/// this step, so this is the SURFACE arriving ahead of the move, not a second
+/// executor racing the first.
+fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // a foreground daemon logs; it is not a one-shot verb printing a value.
+    noded::log::init(None, None);
+    let kind = args.kind.clone();
+    if !kind_is_well_formed(&kind) {
+        return Err(format!("{kind:?} is not a service kind (1..32 chars of [a-z0-9-])").into());
+    }
+    let workspace = args.workspace.dir()?;
+    let resolved = config::resolve(&workspace.join("node.toml"))?;
+    let base = config::http_base_in(&workspace)?;
+
+    let hello = discover_hello(&kind, &resolved)?;
+    // the FIRST hello must land: a daemon that cannot signal has nothing to
+    // offer and must not sit in a retry loop pretending otherwise. A build
+    // mismatch or a down node is a loud exit, not a silent spin.
+    send_hello(&base, &hello)?;
+    write_err(&format!(
+        "{} {} · signaling to {} · offering {}\n",
+        paint(GREEN, "●"),
+        paint(BOLD, &kind),
+        resolved.chain_id,
+        join_or_dash(&hello.capabilities),
+    ))?;
+
+    offer_enable(&workspace, &kind, args.offer())?;
+    heartbeat(&base, &hello)
+}
+
+/// Build this host's hello: what it IS, and what it can actually run.
+///
+/// The capability tags come from real discovery, not a config list — that is
+/// the whole point of signaling before enabling. `scopes` is empty on purpose:
+/// at this step the daemon executes nothing and therefore needs no credential
+/// access, and inventing scope names the code does not honor would make the
+/// consent screen a lie.
+fn discover_hello(
+    kind: &str,
+    resolved: &config::Resolved,
+) -> Result<noded::services::Hello, String> {
+    let backend = resolved
+        .sandbox
+        .clone()
+        .ok_or("no [sandbox] table in node.toml: this host has no configured way to isolate a run")?;
+    // the same precondition the node's own boot enforces — a daemon must not
+    // advertise tags it has no runnable sandbox for.
+    backend.probe().map_err(|error| format!("sandbox: {error}"))?;
+    let providers = provider_host::discover(
+        resolved.signer.public_key().as_ref(),
+        provider_host::AgentDirs::under(&resolved.storage_dir),
+        None,
+        backend,
+    )?;
+    let build = noded::services::build_identity()
+        .ok_or("this binary has no build identity; rebuild it from a git checkout")?;
+    Ok(noded::services::Hello {
+        kind: kind.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build: build.to_string(),
+        capabilities: providers.capabilities(),
+        scopes: Vec::new(),
+        needs: Vec::new(),
+    })
+}
+
+fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<(), String> {
+    crate::node_http::post_json(base, "/v1/services/hello", &serde_json::to_value(hello).unwrap())
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Offer enablement once, at startup, per the posture the operator chose.
+fn offer_enable(
+    workspace: &Path,
+    kind: &str,
+    offer: EnableOffer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if load(workspace)?.grant(kind).is_some() {
+        // already granted: straight to serving, never a prompt.
+        return Ok(());
+    }
+    let hint = format!(
+        "  {} — enable it with: ducktape service enable {kind}\n",
+        paint(YELLOW, "not enabled")
+    );
+    let plan = match offer {
+        // a unit file and a pipe have no one to ask; say it once and serve.
+        EnableOffer::Never => return write_err(&hint),
+        EnableOffer::AskIfTty if !crate::tty::stdin_is_tty() => return write_err(&hint),
+        EnableOffer::Always | EnableOffer::AskIfTty => plan_enable(workspace, kind)?,
+    };
+    let asked = matches!(offer, EnableOffer::AskIfTty);
+    if asked {
+        write_err(&render_enable_summary(&plan))?;
+        let question = format!("Enable {kind} on this node now?");
+        // declining leaves the daemon running and signaling — never re-asked.
+        if !crate::tty::confirm(&question, true, false)? {
+            return write_err(&hint);
+        }
+    }
+    let grant = commit_enable(workspace, &plan)?;
+    write_err(&format!(
+        "  {} enabled {}\n",
+        paint(GREEN, ServiceState::Enabled.glyph()),
+        grant.display_id()
+    ))?;
+    write_err("  restart the node to start its compute plane: ducktape node run\n")?;
+    Ok(())
+}
+
+/// Keep the signal alive until the process is stopped.
+///
+/// A failed beat is not fatal: the node may be restarting, and the entry simply
+/// ages out and returns. Logged on the first failure and every 30th after it,
+/// carrying the attempt count — an unconditional warn here would be a log bomb
+/// on a node that stays down.
+fn heartbeat(base: &str, hello: &noded::services::Hello) -> Result<(), Box<dyn std::error::Error>> {
+    const LOG_EVERY: u64 = 30;
+    let mut failures: u64 = 0;
+    loop {
+        std::thread::sleep(HEARTBEAT);
+        match send_hello(base, hello) {
+            Ok(()) => {
+                if failures > 0 {
+                    tracing::info!(target: "ducktape::service", kind = %hello.kind, "signal restored");
+                }
+                failures = 0;
+            }
+            Err(error) => {
+                failures += 1;
+                if failures == 1 || failures.is_multiple_of(LOG_EVERY) {
+                    tracing::warn!(
+                        target: "ducktape::service",
+                        kind = %hello.kind,
+                        attempts = failures,
+                        reason = "hello_failed",
+                        "service signal not reaching the node: {error}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -767,7 +1015,7 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     write_err(&render_enable_summary(&plan))?;
     let question = format!("Enable {} on this node?", plan.kind);
     if !crate::tty::confirm(&question, crate::tty::stdin_is_tty(), args.yes)? {
-        eprintln!("not enabled");
+        write_err("not enabled\n")?;
         return Ok(());
     }
 
@@ -780,11 +1028,8 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         paint(GREEN, ServiceState::Enabled.glyph()),
         grant.display_id()
     ))?;
-    if plan.offered.is_none() {
-        eprintln!("  it is not signaling yet — status will show enabled-but-absent");
-    }
     if plan.kind == COMPUTE_KIND {
-        eprintln!("  restart the node to start its compute plane: ducktape node run");
+        write_err("  restart the node to start its compute plane: ducktape node run\n")?;
     }
     Ok(())
 }
@@ -800,43 +1045,21 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or_else(|| format!("{kind} is not enabled in {}", workspace.display()))?;
     let retired = services.grants.remove(position);
     save(&workspace, &services)?;
-    set_capability_announce(&workspace, &kind, false)?;
-    tracing::info!(
-        target: "ducktape::service",
-        %kind,
-        instance = %retired.display_id(),
-        "service disabled"
-    );
     println!("{}", retired.display_id());
-    eprintln!(
-        "disabled {kind}; {} is retired (a re-enable mints a fresh id)",
+    write_err(&format!(
+        "disabled {kind}; {} is retired (a re-enable mints a fresh id)\n",
         retired.display_id()
-    );
-    Ok(())
-}
-
-/// The capability announce follows the compute grant.
-///
-/// `node init --compute` used to set `announce_capabilities` at founding time;
-/// with the flag gone, enabling compute is what turns the announce on and
-/// disabling it is what turns it off — otherwise the flag day would leave an
-/// operator no way to advertise capacity short of hand-editing node.toml.
-/// Every other kind leaves node.toml alone. The rewrite goes through the same
-/// merge+render the `init`/`join` verbs use, so every other key keeps its
-/// current value.
-fn set_capability_announce(workspace: &Path, kind: &str, announce: bool) -> Result<(), String> {
-    let drives_the_compute_plane = kind == COMPUTE_KIND;
-    if !drives_the_compute_plane {
-        return Ok(());
+    ))?;
+    // the grant is read once, at boot. Until the node restarts it is still
+    // running this service and still announcing what the grant used to say —
+    // so the revocation is NOT in effect yet. `enable` says the same thing
+    // about starting; saying it only there would imply revocation is instant.
+    if kind == COMPUTE_KIND {
+        write_err(
+            "  restart the node to stop its compute plane: until then it keeps \
+             running work and announcing\n",
+        )?;
     }
-    let mut plumbing = config::merged_plumbing(
-        workspace, None, None, None, None, None, None, None, None, None,
-    )?;
-    if plumbing.announce_capabilities == announce {
-        return Ok(());
-    }
-    plumbing.announce_capabilities = announce;
-    config::write_node_toml(workspace, &plumbing)?;
     Ok(())
 }
 
@@ -1004,7 +1227,7 @@ mod tests {
         let plan = EnablePlan {
             kind: "compute".into(),
             chain_id: "dukenet#03f6df3d".into(),
-            node_id: NODE_A.to_vec(),
+            node_id: NODE_A,
             offered: Some(signaling("compute")),
         };
         let rendered = [
@@ -1083,6 +1306,68 @@ mod tests {
         assert!(crate::tty::confirm("Enable compute?", false, false).unwrap());
         assert!(crate::tty::confirm("Enable compute?", false, true).unwrap());
         assert!(crate::tty::confirm("Enable compute?", true, true).unwrap());
+    }
+
+    /// The hello cap must admit what a REAL host offers. The built-in specs
+    /// alone expand to one tag per `[[variants]]` entry, which a 32-tag cap
+    /// silently refused — a live `service run` died on its first hello with
+    /// `malformed_hello`. Pinned against the actual spec set so shrinking the
+    /// cap, or growing the specs past it, fails here instead of in the field.
+    #[test]
+    fn the_hello_cap_admits_a_real_hosts_capability_set() {
+        // the built-in spec set only (operator dir explicitly excluded, so the
+        // test does not depend on what this host has installed).
+        let builtin_tags = provider_host::SpecSet::load(None)
+            .expect("built-in specs load")
+            .iter()
+            .count();
+        assert!(
+            builtin_tags > 32,
+            "this test is only meaningful while the built-ins exceed the old cap ({builtin_tags})"
+        );
+        let hello = noded::services::Hello {
+            kind: "compute".into(),
+            version: "1.0.0".into(),
+            build: noded::services::build_identity().unwrap_or("test").into(),
+            capabilities: (0..builtin_tags).map(|i| format!("tag{i}")).collect(),
+            scopes: Vec::new(),
+            needs: Vec::new(),
+        };
+        assert!(
+            hello.validate().is_ok(),
+            "a real host's tag set must be admitted, not refused as malformed"
+        );
+    }
+
+    #[test]
+    fn the_announce_set_is_granted_intersect_discovered() {
+        let discovered = || vec!["agent.claude".to_string(), "agent.codex".to_string()];
+
+        // the ordinary case: the grant consented to what the host provides.
+        assert_eq!(
+            announceable(&["agent.claude".into(), "agent.codex".into()], discovered()),
+            discovered()
+        );
+
+        // a grant cannot widen the host: consenting to a tag this host does
+        // not provide announces nothing extra.
+        assert_eq!(
+            announceable(&["agent.claude".into(), "nope".into()], discovered()),
+            vec!["agent.claude".to_string()]
+        );
+
+        // the host cannot widen the grant: discovering more than was reviewed
+        // never advertises the surplus.
+        assert_eq!(
+            announceable(&["agent.codex".into()], discovered()),
+            vec!["agent.codex".to_string()]
+        );
+
+        // no grant, and a grant announcing nothing, both announce nothing —
+        // the accept-lane-only provider. There is no second switch that could
+        // disagree, because the empty set IS the switch.
+        assert!(announceable(&[], discovered()).is_empty());
+        assert!(announceable(&["agent.claude".into()], vec![]).is_empty());
     }
 
     #[test]

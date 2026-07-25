@@ -388,10 +388,12 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // (nothing may follow a toml table header) — every node boots a podman
     // compute plane; nodes 0/2 stay hermetic (empty spec dir → nothing
     // discovered or announced).
-    cluster.extra_toml.push("announce_capabilities = true".into());
     cluster.extra_toml.extend(sandbox_toml());
-    // the pool needs the compute grant as well as the [sandbox] table.
-    cluster.compute = true;
+    // the pool needs the compute grant as well as the [sandbox] table, and
+    // the grant is what opts these nodes into the rendezvous pool: the node
+    // announces the granted tags INTERSECTED with what it discovers, so the
+    // hermetic nodes 0/2 still announce nothing.
+    cluster.compute_grant = Some(vec![provider.tag.clone()]);
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),
