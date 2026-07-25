@@ -102,13 +102,14 @@ fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
     use std::os::unix::fs::PermissionsExt as _;
 
     // the probe wants the platform adapter AND its hard deps executable on
-    // PATH (podman additionally needs slirp4netns for the private netns), so
-    // the fake dir carries the full set — detection only writes a table the
-    // boot probe would accept.
+    // PATH, so the fake dir carries the full set — detection only writes a
+    // table the boot probe would accept. Podman's deps are `pasta` (the netns
+    // backend) plus `nft` + `nsenter` (the egress firewall the createRuntime
+    // hook installs); see `SandboxBackend::probe`.
     let (runtime, fake_bins): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("tart", &["tart"])
     } else {
-        ("podman", &["podman", "slirp4netns"])
+        ("podman", &["podman", "pasta", "nft", "nsenter"])
     };
     let bins = tempfile::tempdir().expect("fake bin dir");
     for bin in fake_bins {
