@@ -252,7 +252,7 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// the platform's compute adapter — podman on Linux, tart on macOS — as the
 /// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
-/// the probeable backend, so `--compute` and detection share one choice.
+/// the probeable backend, so generation and detection share one choice.
 fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     let (runtime, image, backend) = if cfg!(target_os = "macos") {
         ("tart", config::DEFAULT_TART_IMAGE, provider_host::SandboxBackend::Tart {
@@ -276,12 +276,15 @@ fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     (table, backend)
 }
 
-/// fresh-workspace compute detection (init without `--compute`, join): the
-/// platform adapter's runtime binary on PATH ⇒ a live `[sandbox]` table, with
-/// a stderr note; absent ⇒ `None` (today's commented example). Detection never
-/// flips `announce_capabilities` — publishing capacity to the network stays
-/// the explicit `--compute`/operator opt-in; this only makes the node's OWN
-/// compute (agent runs, the interactive terminal plane) work out of the box.
+/// fresh-workspace compute detection (`init`, `join`): the platform adapter's
+/// runtime binary on PATH ⇒ a live `[sandbox]` table, with a stderr note;
+/// absent ⇒ `None` (today's commented example).
+///
+/// The table says only HOW runs would be isolated on this host — it grants
+/// nothing. Whether this node runs a compute service at all is the user's
+/// `ducktape service enable compute`, so detection can stay eager: it makes
+/// the interactive terminal plane work out of the box and leaves the compute
+/// plane dark until someone consents to it.
 fn detect_platform_sandbox() -> Option<config::SandboxToml> {
     let (table, backend) = platform_sandbox();
     let Ok(runtime_path) = backend.probe() else {
@@ -364,17 +367,12 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
     )?;
-    // `--compute` founds a workstation node: a [sandbox] table (podman on
-    // Linux, tart on macOS — chosen for the platform init runs on) and the
-    // capability announce. Without the flag a FRESH workspace still detects
-    // the platform runtime and writes the table (announce stays off); an
-    // existing node.toml keeps whatever the operator chose — a deleted table
-    // is never resurrected.
-    if args.compute {
-        let (sandbox, _) = platform_sandbox();
-        plumbing.sandbox = Some(sandbox);
-        plumbing.announce_capabilities = true;
-    } else if fresh_workspace {
+    // a FRESH workspace detects the platform runtime and writes the table (it
+    // describes HOW runs are isolated, and grants nothing); an existing
+    // node.toml keeps whatever the operator chose — a deleted table is never
+    // resurrected. Turning the compute plane ON is `ducktape service enable
+    // compute`, never an init flag.
+    if fresh_workspace {
         plumbing.sandbox = detect_platform_sandbox();
     }
 
@@ -1510,14 +1508,31 @@ mod tests {
         (bash, zsh)
     }
 
+    /// the completion declarations belonging to ONE family: every line naming a
+    /// `<family>_*` variable.
+    ///
+    /// Scoping is what makes the guard real. A whole-file `contains` passes for
+    /// `service run` purely because `run` already appears under `node`, so a
+    /// family that borrows a verb name from a sibling would never be caught.
+    /// (Every family's declarations are kept on ONE line each so this filter is
+    /// a plain line match.)
+    fn family_scope(text: &str, family: &str) -> String {
+        let needle = format!("{family}_");
+        text.lines()
+            .filter(|line| line.contains(&needle))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// the drift guard: every verb token and every non-hidden long flag in the
-    /// CLAP TREE (the grammar itself, not a parallel table) — across EVERY
-    /// family — must appear in BOTH completion files. renaming a verb or
-    /// adding a flag without updating the hand-written completions fails here.
+    /// CLAP TREE (the grammar itself, not a parallel table) must appear in BOTH
+    /// completion files, WITHIN ITS OWN FAMILY's declarations. renaming a verb
+    /// or adding a flag without updating the hand-written completions fails
+    /// here, and so does adding one whose name a sibling family already uses.
     #[test]
-    fn completion_files_cover_the_verb_table() {
+    fn completion_files_cover_the_verb_table_per_family() {
         let (bash, zsh) = completions();
-        fn walk(cmd: &clap::Command, bash: &str, zsh: &str) {
+        fn walk(cmd: &clap::Command, scope: &str, file: &str, family: &str) {
             for sub in cmd.get_subcommands() {
                 if sub.is_hide_set() {
                     continue;
@@ -1527,10 +1542,9 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    bash.contains(token),
-                    "ducktape.bash missing token {token:?}"
+                    scope.contains(token),
+                    "{file}: family {family:?} is missing verb {token:?}"
                 );
-                assert!(zsh.contains(token), "ducktape.zsh missing token {token:?}");
                 for arg in sub.get_arguments() {
                     if arg.is_hide_set() {
                         continue;
@@ -1540,16 +1554,73 @@ mod tests {
                         continue;
                     }
                     let flag = format!("--{long}");
-                    assert!(bash.contains(&flag), "ducktape.bash missing flag {flag}");
-                    assert!(zsh.contains(&flag), "ducktape.zsh missing flag {flag}");
+                    assert!(
+                        scope.contains(&flag),
+                        "{file}: family {family:?} is missing flag {flag}"
+                    );
                 }
-                walk(sub, bash, zsh);
+                walk(sub, scope, file, family);
             }
         }
-        walk(
-            &<crate::Cli as clap::CommandFactory>::command(),
-            &bash,
-            &zsh,
+
+        let cli = <crate::Cli as clap::CommandFactory>::command();
+        for family in cli.get_subcommands() {
+            if family.is_hide_set() {
+                continue;
+            }
+            let name = family.get_name();
+            if name == "help" {
+                continue;
+            }
+            for (file, text) in [("ducktape.bash", &bash), ("ducktape.zsh", &zsh)] {
+                // the family token itself is offered at the top level.
+                assert!(text.contains(name), "{file}: missing family {name:?}");
+                let has_grammar = family.get_subcommands().next().is_some()
+                    || family
+                        .get_arguments()
+                        .any(|arg| !arg.is_hide_set() && arg.get_long().is_some_and(|l| l != "help"));
+                if !has_grammar {
+                    continue; // a bare family (`mcp`) declares no verbs to scope.
+                }
+                let scope = family_scope(text, name);
+                assert!(
+                    !scope.is_empty(),
+                    "{file}: family {name:?} has verbs but no {name}_* declarations"
+                );
+                walk(family, &scope, file, name);
+                for arg in family.get_arguments() {
+                    if arg.is_hide_set() {
+                        continue;
+                    }
+                    let Some(long) = arg.get_long() else { continue };
+                    if long == "help" {
+                        continue;
+                    }
+                    let flag = format!("--{long}");
+                    assert!(
+                        scope.contains(&flag),
+                        "{file}: family {name:?} is missing flag {flag}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// the guard must actually bite: a verb a sibling family happens to use is
+    /// NOT coverage. This is the hole the whole-file match had.
+    #[test]
+    fn the_family_scope_does_not_borrow_a_siblings_verb() {
+        let (bash, _zsh) = completions();
+        let service = family_scope(&bash, "service");
+        assert!(service.contains("run"), "service declares its own run verb");
+        // `promote` lives under `node member`; it must not read as covered here.
+        assert!(
+            !service.contains("promote"),
+            "the service scope must not see node's verbs"
+        );
+        assert!(
+            family_scope(&bash, "gateway").contains("bind"),
+            "a family scope still finds its own verbs"
         );
     }
 

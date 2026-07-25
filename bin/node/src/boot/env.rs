@@ -58,11 +58,19 @@ pub(crate) struct BootEnv {
     /// the shipped-index lane is swept as one follow-up removal.
     #[allow(dead_code)]
     pub(crate) sync_index: bool,
-    pub(crate) announce_capabilities: bool,
+    /// the capability tags the user's compute grant consented to; the
+    /// announce is these INTERSECTED with what this host discovers. Empty =
+    /// announce nothing. See `Resolved::granted_capabilities`.
+    pub(crate) granted_capabilities: Vec<String>,
     /// the compute plane (`node.toml [sandbox]`) — threaded to both
     /// `provider_host::discover` call sites (validator + resident). `None`
     /// = consensus-only: no discovery, no announce, no oracle pool.
     pub(crate) sandbox: Option<SandboxBackend>,
+    /// the COMPUTE SERVICE's backend — the `[sandbox]` table gated on the
+    /// user's `services.toml` compute grant. `None` = no provider discovery,
+    /// no oracle pool, no capability announce. Distinct from `sandbox`, which
+    /// the terminal plane and airlock still key off directly.
+    pub(crate) compute_backend: Option<SandboxBackend>,
     /// the capacity a compute node announces AND enforces: the single source
     /// for both the dispatch pool's ledger and the capability announce's
     /// resources. EMPTY for a consensus-only node.
@@ -100,7 +108,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         invite_wireguard,
         invite_fronts,
         sync_index,
-        announce_capabilities,
+        granted_capabilities,
         coordination,
         coord_cap,
         workspace,
@@ -108,6 +116,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordinator_relay,
         wireguard_advertised,
         sandbox,
+        compute_backend,
         sandbox_capacity,
     } = resolved;
     // a key outside the GENESIS validator set is not an error: post-genesis
@@ -339,8 +348,9 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         checkpoint_blocks,
         dev_demo,
         sync_index,
-        announce_capabilities,
+        granted_capabilities,
         sandbox,
+        compute_backend,
         sandbox_capacity,
         promoted,
     }

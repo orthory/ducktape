@@ -81,6 +81,9 @@ pub use term::{
 };
 
 pub mod term_remote;
+
+/// the volatile catalog of service daemons signaling presence to this node.
+pub mod services;
 pub use term_remote::{RemoteSessions, SessionInputWire, SessionJob, SessionLane};
 // PR2 consensus command source: the chat<->pty bridge (channel scheme + the
 // off-loop projector that drives committed chat commands into a session's pty).
@@ -603,6 +606,12 @@ pub fn router(handle: NodeHandle) -> Router {
         // term.rs). close is idempotent.
         .route("/v1/term/sessions", post(term::create_session))
         .route("/v1/term/sessions/{id}/close", post(term::close_session))
+        // ---- service signaling (node-local, off-chain, volatile) ----
+        // a local service daemon says hello; the entry ages out on its own
+        // TTL. Presence only — enablement lives in the workspace's
+        // services.toml and is never inferred from a hello (see services.rs).
+        .route("/v1/services/hello", post(services::hello))
+        .route("/v1/services", get(services::list))
         .route("/v1/fs/workspaces", post(workspaces::create_workspace))
         .route(
             "/v1/fs/workspaces/{id}/commit",

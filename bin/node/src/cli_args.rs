@@ -177,13 +177,6 @@ pub struct InitArgs {
     /// found the network here instead of the registry default
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
-    /// workstation node: run agent sessions in a sandbox and announce this
-    /// host's provider capabilities (writes a [sandbox] table, podman/tart by
-    /// platform, + announce). Without it a fresh workspace still writes the
-    /// table when the platform runtime is on PATH — announce stays off; delete
-    /// the [sandbox] table for a consensus-only node.
-    #[arg(long)]
-    pub compute: bool,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }

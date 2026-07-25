@@ -118,6 +118,25 @@ for _ in $(seq 1 80); do
 done
 curl -sf "$URL/v1/status" >/dev/null 2>&1 || die "node http never came up — see $WSDIR/seed.log"
 
+# ── 4b. grant the compute service ──────────────────────────────
+# The compute plane is consent-gated: a [sandbox] table says HOW a run would
+# be isolated, and the user's grant says WHETHER this node runs any. There is
+# no init flag for it any more, so the demo mints the grant the same way an
+# operator does — `service run` discovers this host's providers, signals them,
+# and --enable grants from that live hello. It only needs to run long enough
+# for the grant to land, so it is stopped once services.toml appears.
+"$NODE_BIN" service run compute --enable --workspace "$WSDIR" >"$WSDIR/service.log" 2>&1 &
+SVC_PID=$!
+for _ in $(seq 1 50); do [ -f "$WSDIR/services.toml" ] && break; sleep 0.1; done
+kill "$SVC_PID" 2>/dev/null; wait "$SVC_PID" 2>/dev/null
+if [ -f "$WSDIR/services.toml" ]; then
+  log "compute granted — agent runs available"
+else
+  log "compute NOT granted (no usable container runtime?) — see $WSDIR/service.log;"
+  log "  the demo still runs, just without agent runs. Grant it later with:"
+  log "  ducktape service run compute --workspace $WSDIR"
+fi
+
 # ── 5. seed ops ────────────────────────────────────────────────
 N=0
 submit(){ # submit <module> <payload-json>

@@ -80,9 +80,6 @@ pub struct NodeToml {
     /// node down to consensus-only: verified state, derived views empty at
     /// the boundary.
     pub sync_index: bool,
-    /// whether this node publishes its provider set into the capability
-    /// registry; `false` = accept-lane-only provider.
-    pub announce_capabilities: bool,
     /// the compute plane: PRESENT = provider runs execute in this sandbox;
     /// ABSENT = consensus-only node (no provider discovery, no announce, no
     /// terminal plane).
@@ -144,7 +141,6 @@ pub struct DevSeedToml {
     pub primary_coordinator: Option<String>,
     pub coordinator_relay: Option<String>,
     pub sync_index: Option<bool>,
-    pub announce_capabilities: Option<bool>,
     pub sandbox: Option<SandboxToml>,
 }
 
@@ -214,7 +210,6 @@ pub struct Plumbing {
     pub coordinator_relay: String,
     pub checkpoint_blocks: u64,
     pub sync_index: bool,
-    pub announce_capabilities: bool,
     pub sandbox: Option<SandboxToml>,
 }
 
@@ -298,7 +293,6 @@ pub fn merged_plumbing(
             .map(|r| r.checkpoint_blocks)
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
         sync_index: e.map(|r| r.sync_index).unwrap_or(true),
-        announce_capabilities: e.map(|r| r.announce_capabilities).unwrap_or(false),
         sandbox: e.and_then(|r| r.sandbox.clone()),
         wireguard_listen,
         primary_coordinator,
@@ -378,8 +372,6 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         "sealed blocks between recovery checkpoints");
     keyline(&mut s, "sync_index", format_args!("{}", p.sync_index),
         "false: consensus-only (skip the unverified index warm start on join)");
-    keyline(&mut s, "announce_capabilities", format_args!("{}", p.announce_capabilities),
-        "true: publish this node's provider set");
     // the [sandbox] table LAST — everything after a toml table header belongs
     // to the table, so no top-level key may follow it.
     match &p.sandbox {
@@ -460,7 +452,6 @@ mod tests {
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
         assert!(raw.sync_index);
-        assert!(!raw.announce_capabilities);
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);

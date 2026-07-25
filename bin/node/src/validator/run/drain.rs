@@ -1142,11 +1142,12 @@ impl ValidatorRuntime<'_> {
     // provider set differs from the committed registry
     // self-submits ONE declarative `Announce`. member-gated (the
     // module rejects non-members) and idempotent (committed-read
-    // + local latch). inert on a host with no executor CLIs, and
-    // suppressed entirely under `announce_capabilities = false`
-    // (the accept-lane-only provider: this node still executes
-    // what it can, but only by claiming unassigned announcements
-    // — it never enters a tag's rendezvous pool).
+    // + local latch). inert on a host with no executor CLIs and on
+    // one whose compute grant announces no tags (the accept-lane-only
+    // provider: it still executes what it can by claiming unassigned
+    // announcements, but never enters a tag's rendezvous pool). Both
+    // collapse to an EMPTY announce set — there is no separate switch
+    // that could disagree with the grant.
     async fn pump_capability_announce(&mut self) {
         let Self {
             node,
@@ -1154,12 +1155,10 @@ impl ValidatorRuntime<'_> {
             next_seq,
             signer,
             label,
-            announce_capabilities,
             announcer,
             ..
         } = self;
-        if *announce_capabilities
-            && orchestrator
+        if orchestrator
                 .current_members()
                 .contains(&signer.public_key())
             && let Some(msg) = announcer.maybe_announce(node.host()).await
