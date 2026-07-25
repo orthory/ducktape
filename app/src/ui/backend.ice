@@ -38,7 +38,8 @@ extern crate::backend
   sync bell_head(items:[BellItem]) -> i64
   load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
-  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta, bell:BellDelta)
+  ForgeRefresh(repo:str, number:i64, refs_moved:bool)
+  LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
   ComposerCmd()
   AppError(message:str, committed:bool)
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
@@ -108,13 +109,27 @@ extern crate::backend
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   ForgeRepo(name:str, head:str)
-  ForgeItem(number:i64, kind:str, title:str, state:str, author:str)
+  ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
   ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
-  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, branches:str, reviews:i64, diff:str)
+  ForgeReviewComment(anchor:str, body:str)
+  ForgeReview(author:str, author_name:str, verdict:str, body:str, commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
+  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
+  ForgeDiscussionData(generation:i64, channel_id:str, messages:[ChatMessage], members:[ChatMember])
+  ForgeMergeOutcome(repo:str, number:i64, merged:bool, merge_oid:str, conflicts:[str])
+  ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
+  load_forge_discussion(rpc:str, channel_id:str, generation:i64) -> ForgeDiscussionData ! HydrationError
+  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str) -> bool ! AppError
+  merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
+  forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, generation:i64) -> ForgeLiveData ! HydrationError
+  sync forge_live_hit(kind:str, module:str) -> bool
+  sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
+  sync forge_merge_note(merge_oid:str, branches:str) -> str
+  sync verdict_label(verdict:str) -> str
+  sync verdict_pick_label(current:str, key:str, label:str) -> str
   AgentRow(id:str, name:str, capability:str, status:str, actions:str, owner:str)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
@@ -169,6 +184,10 @@ extern crate::backend
   sync keep_str(loaded:bool, next:str, current:str) -> str
   sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
   sync keep_i64(loaded:bool, next:i64, current:i64) -> i64
+  sync keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
+  sync keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
+  sync keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
+  sync keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
   sync initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
   sync frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
   sync first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64

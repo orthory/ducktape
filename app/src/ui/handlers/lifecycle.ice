@@ -148,10 +148,14 @@ on live_updated(next)
   channel_reads = mark_channel_read(channel_reads, active_channel, channel_head_seq(channels, active_channel))
   bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
   bell_items = apply_bell(bell_items, next.bell)
-  return if !next.load_chat && !next.load_pages
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  run live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)
+  return if !forge_live_hit(next.kind, next.module) && !next.load_chat && !next.load_pages
+  forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
+  hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
+  hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages, 0, hydration_retry_attempt)
+  parallel
+    run live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+    run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, forge_generation) -> forge_refreshed _ | forge_failed _
 
 on live_resynced(next)
   return if next.generation != hydration_generation
@@ -320,6 +324,13 @@ on forge_repo_loaded(next)
 on forge_open_item(number)
   return if !connected || empty(forge_repo)
   forge_item_number = number
+  forge_review_verdict = "comment"
+  forge_review_draft = ""
+  forge_merge_conflicts = []
+  forge_discussion = []
+  forge_discussion_members = []
+  forge_discussion_pending = ""
+  forge_discussion_editor = editor("")
   forge_generation = forge_generation + 1
   run load_forge_item(connected_rpc, forge_repo, forge_item_number, forge_generation) -> forge_item_loaded _ | forge_failed _
 
@@ -330,13 +341,117 @@ on forge_item_loaded(next)
   forge_item_state = next.state
   forge_item_kind = next.kind
   forge_item_body = next.body
+  forge_item_author = next.author_name
   forge_item_branches = next.branches
-  forge_item_reviews = next.reviews
+  forge_item_channel = next.channel_id
+  forge_item_source_branch = next.source_branch
+  forge_item_source_oid = next.source_oid
+  forge_item_target_oid = next.target_oid
+  forge_item_merge_oid = next.merge_oid
   forge_item_diff = next.diff
+  forge_item_diff_truncated = next.diff_truncated
+  forge_item_files_changed = next.files_changed
+  forge_item_additions = next.additions
+  forge_item_deletions = next.deletions
+  forge_item_reviews = next.reviews
+  forge_item_approvals = next.approvals
+  forge_item_change_requests = next.change_requests
+  forge_discussion_generation = forge_discussion_generation + 1
+  return if empty(forge_item_channel)
+  run load_forge_discussion(connected_rpc, forge_item_channel, forge_discussion_generation) -> forge_discussion_loaded _ | forge_discussion_failed _
+
+on forge_discussion_loaded(next)
+  return if next.generation != forge_discussion_generation || next.channel_id != forge_item_channel
+  forge_discussion = next.messages
+  forge_discussion_members = next.members
+
+on forge_discussion_failed(cause)
+  return if cause.generation != forge_discussion_generation
+  error = cause.message
+
+on forge_review_pick(verdict)
+  forge_review_verdict = verdict
+
+on forge_review_submit
+  return if !connected || forge_review_busy || empty(forge_repo) || forge_item_number <= 0
+  forge_review_busy = true
+  run submit_forge_review(connected_rpc, password, forge_repo, forge_item_number, forge_review_verdict, forge_review_draft, forge_item_source_oid) -> forge_review_submitted _ | forge_review_failed _
+
+on forge_review_submitted(_)
+  forge_review_busy = false
+  forge_review_draft = ""
+  forge_review_verdict = "comment"
+  error = ""
+
+on forge_review_failed(cause)
+  forge_review_busy = false
+  error = cause.message
+
+on forge_merge_submit
+  return if !connected || forge_merge_busy || empty(forge_repo) || forge_item_number <= 0
+  forge_merge_busy = true
+  forge_merge_conflicts = []
+  run merge_forge_pr(connected_rpc, password, forge_repo, forge_item_number, forge_item_source_branch, forge_item_source_oid, forge_item_target_oid) -> forge_merged _ | forge_merge_failed _
+
+on forge_merged(next)
+  return if next.repo != forge_repo || next.number != forge_item_number
+  forge_merge_busy = false
+  forge_merge_conflicts = next.conflicts
+  error = ""
+
+on forge_merge_failed(cause)
+  forge_merge_busy = false
+  error = cause.message
+
+on forge_note_submit
+  return if loading || !connected || empty(forge_item_channel) || !empty(forge_discussion_pending) || empty(trim(editor_text(forge_discussion_editor)))
+  forge_discussion_pending = fresh_operation_id("forge-note")
+  run send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending, trim(editor_text(forge_discussion_editor)), forge_discussion_members) -> forge_note_sent _ | forge_note_failed _
+
+on forge_note_sent(next)
+  return if next.channel_id != forge_item_channel
+  forge_discussion_pending = ""
+  forge_discussion_editor = editor("")
+  error = ""
+
+on forge_note_failed(cause)
+  return if cause.scope_id != forge_item_channel
+  forge_discussion_pending = ""
+  error = cause.message
+
+on forge_refreshed(next)
+  return if next.generation != forge_generation
+  forge_repos = keep_forge_repos(next.repos_loaded, next.repos, forge_repos)
+  forge_branches = keep_branches(next.repo_loaded, next.branches, forge_branches)
+  forge_items = keep_forge_items(next.repo_loaded, next.items, forge_items)
+  forge_item_title = keep_str(next.item_loaded, next.item.title, forge_item_title)
+  forge_item_state = keep_str(next.item_loaded, next.item.state, forge_item_state)
+  forge_item_kind = keep_str(next.item_loaded, next.item.kind, forge_item_kind)
+  forge_item_body = keep_str(next.item_loaded, next.item.body, forge_item_body)
+  forge_item_author = keep_str(next.item_loaded, next.item.author_name, forge_item_author)
+  forge_item_branches = keep_str(next.item_loaded, next.item.branches, forge_item_branches)
+  forge_item_channel = keep_str(next.item_loaded, next.item.channel_id, forge_item_channel)
+  forge_item_source_branch = keep_str(next.item_loaded, next.item.source_branch, forge_item_source_branch)
+  forge_item_source_oid = keep_str(next.item_loaded, next.item.source_oid, forge_item_source_oid)
+  forge_item_target_oid = keep_str(next.item_loaded, next.item.target_oid, forge_item_target_oid)
+  forge_item_merge_oid = keep_str(next.item_loaded, next.item.merge_oid, forge_item_merge_oid)
+  forge_item_diff = keep_str(next.item_loaded, next.item.diff, forge_item_diff)
+  forge_item_diff_truncated = keep_bool(next.item_loaded, next.item.diff_truncated, forge_item_diff_truncated)
+  forge_item_files_changed = keep_i64(next.item_loaded, next.item.files_changed, forge_item_files_changed)
+  forge_item_additions = keep_i64(next.item_loaded, next.item.additions, forge_item_additions)
+  forge_item_deletions = keep_i64(next.item_loaded, next.item.deletions, forge_item_deletions)
+  forge_item_reviews = keep_forge_reviews(next.item_loaded, next.item.reviews, forge_item_reviews)
+  forge_item_approvals = keep_i64(next.item_loaded, next.item.approvals, forge_item_approvals)
+  forge_item_change_requests = keep_i64(next.item_loaded, next.item.change_requests, forge_item_change_requests)
 
 on forge_close_item
   forge_item_number = 0
   forge_item_diff = ""
+  forge_item_channel = ""
+  forge_discussion = []
+  forge_discussion_members = []
+  forge_discussion_pending = ""
+  forge_merge_conflicts = []
 
 on account_loaded(next)
   return if next.generation != account_generation

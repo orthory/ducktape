@@ -2909,6 +2909,8 @@ dependencies = [
  "chat",
  "commonware-cryptography",
  "ducktape-rpc",
+ "forge",
+ "git2",
  "governance",
  "iced",
  "identity",

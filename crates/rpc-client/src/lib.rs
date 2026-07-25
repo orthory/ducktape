@@ -310,6 +310,27 @@ impl Client {
         Ok(reply.digest)
     }
 
+    /// Land raw bytes in the node-local BLOB store (`POST /v1/files/blob`) —
+    /// the op-receipt lane forge fetches `PushRefs`/`MergePr` packfiles from by
+    /// digest. A distinct plane from [`Self::files_stage`]'s duckfs chunk lane:
+    /// a pack staged there would never be found by a `pack_digest` lookup.
+    pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
+        let response = self
+            .http
+            .post(self.url("v1/files/blob")?)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("RPC blob put failed: {error}")))?;
+        #[derive(Deserialize)]
+        struct Stored {
+            digest: String,
+        }
+        let reply: Stored = decode_json(response).await?;
+        Ok(reply.digest)
+    }
+
     /// Read the peers standing (`GET /v1/peers`), the node's own JSON view.
     pub async fn peers(&self) -> Result<serde_json::Value> {
         let response = self

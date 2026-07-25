@@ -941,6 +941,19 @@ fn word_spans(spans: &[Span]) -> Vec<ChatSpan> {
 // authorship + avatars — display identity derived from rendered handles
 // ============================================================================
 
+/// An [`AuthorRef`] as the rendered handle the display fns parse — the same
+/// vocabulary the index stamps (`user:{hex}`, `agent:{module}/{agent}`,
+/// `module:{id}`, `system`), so every module surface names an author
+/// identically.
+pub fn author_handle(author: &AuthorRef) -> String {
+    match author {
+        AuthorRef::User(key) => format!("user:{}", hex_encode(key)),
+        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
+        AuthorRef::Module(id) => format!("module:{id}"),
+        AuthorRef::System => "system".into(),
+    }
+}
+
 /// The display name for a rendered author string (`user:{id}`,
 /// `agent:{module}/{agent}`, `module:{id}`, or `system`).
 pub fn author_name(author: &str) -> String {

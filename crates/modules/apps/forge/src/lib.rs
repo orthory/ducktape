@@ -101,6 +101,7 @@ pub use interface::*;
 mod tracker_iface;
 pub use tracker_iface::*;
 
+pub mod client;
 mod codec;
 mod git;
 /// the multi-head pack builders, shared with bin/noded's git upload-pack

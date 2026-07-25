@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -26,6 +26,12 @@ pub use chat::client::{
     mark_message_groups, merge_message_send_result, merge_pending_messages,
     merge_thread_reply, optimistic_message, paragraph_blocks, parse_message_with_members,
     rollback_pending_message, short_label, thread_offset_after_reply,
+};
+// forge's client view model, same arrangement: the tracker rows, the item
+// pane (reviews + merge-box tallies), and the op-refresh classification.
+pub use forge::client::{
+    ForgeRefresh, ItemRow as ForgeItem, ReviewCommentRow as ForgeReviewComment,
+    ReviewRow as ForgeReview,
 };
 pub use inbox::client::{
     BellDelta, BellItem, apply_bell_items as fold_bell_items,
@@ -324,6 +330,8 @@ pub struct LiveUpdate {
     pub chat: ChatDelta,
     pub pages: PagesDelta,
     pub bell: BellDelta,
+    /// one committed forge op's invalidation scope (`kind == "forge"`).
+    pub forge: ForgeRefresh,
 }
 
 
@@ -1939,16 +1947,6 @@ pub struct ForgeRepo {
     pub head: String,
 }
 
-/// One tracker item row (issue or PR).
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ForgeItem {
-    pub number: i64,
-    pub kind: String,
-    pub title: String,
-    pub state: String,
-    pub author: String,
-}
-
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeData {
     pub generation: i64,
@@ -1963,7 +1961,8 @@ pub struct ForgeRepoData {
     pub items: Vec<ForgeItem>,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// One item in full — the module-owned view model plus the loader's scope.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ForgeItemData {
     pub generation: i64,
     pub repo: String,
@@ -1972,9 +1971,21 @@ pub struct ForgeItemData {
     pub state: String,
     pub kind: String,
     pub body: String,
+    pub author_name: String,
     pub branches: String,
-    pub reviews: i64,
+    pub channel_id: String,
+    pub source_branch: String,
+    pub source_oid: String,
+    pub target_oid: String,
+    pub merge_oid: String,
     pub diff: String,
+    pub diff_truncated: bool,
+    pub files_changed: i64,
+    pub additions: i64,
+    pub deletions: i64,
+    pub reviews: Vec<ForgeReview>,
+    pub approvals: i64,
+    pub change_requests: i64,
 }
 
 /// The repo namespace with committed heads.
@@ -2022,25 +2033,13 @@ pub async fn load_forge_repo(
             .into_iter()
             .filter_map(|branch| branch["name"].as_str().map(str::to_string))
             .collect();
-        let mut rows: Vec<ForgeItem> = items["items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|item| ForgeItem {
-                number: item["number"].as_i64().unwrap_or(0),
-                kind: tagged_name(&item["kind"]),
-                state: tagged_name(&item["state"]),
-                title: item["title"].as_str().unwrap_or_default().to_string(),
-                author: tagged_name(&item["author"]),
-            })
-            .collect();
-        rows.reverse();
+        let summaries: Vec<forge::ItemSummary> =
+            serde_json::from_value(items["items"].clone()).map_err(|error| error.to_string())?;
         Ok(ForgeRepoData {
             generation,
             repo,
             branches,
-            items: rows,
+            items: forge::client::item_rows(&summaries),
         })
     }
     .await
@@ -2070,41 +2069,50 @@ pub async fn load_forge_item(
         if item.is_null() {
             return Err("item was not found".to_string());
         }
-        let is_pr = tagged_name(&item["kind"]) == "pull";
-        let diff = match is_pr {
-            false => String::new(),
+        let detail: forge::ItemDetail =
+            serde_json::from_value(item.clone()).map_err(|error| error.to_string())?;
+        // the wire's snake_case kind — the shipped `== "pull"` check never
+        // matched it, so PR patches silently failed to load.
+        let is_pr = detail.summary.kind == forge::ItemKind::Pr;
+        let diff: Option<forge::PrDiff> = match is_pr {
+            false => None,
             true => rpc
                 .query::<_, serde_json::Value>(
                     "forge",
                     &serde_json::json!({ "pr_diff": { "repo": repo, "number": number } }),
                 )
                 .await
-                .map(|reply| {
-                    reply["pr_diff"]["patch"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string()
-                })
-                .unwrap_or_default(),
+                .ok()
+                .and_then(|reply| serde_json::from_value(reply["pr_diff"].clone()).ok()),
         };
-        let branches = match (
-            item["source_branch"].as_str(),
-            item["target_branch"].as_str(),
-        ) {
-            (Some(source), Some(target)) => format!("{source} → {target}"),
-            _ => String::new(),
+        let view = forge::client::item_view(&detail, diff.as_ref());
+        let branches = match view.source_branch.is_empty() {
+            true => String::new(),
+            false => format!("{} → {}", view.source_branch, view.target_branch),
         };
         Ok(ForgeItemData {
             generation,
             repo,
-            number: i64::try_from(number).unwrap_or(0),
-            title: item["title"].as_str().unwrap_or_default().to_string(),
-            state: tagged_name(&item["state"]),
-            kind: tagged_name(&item["kind"]),
-            body: item["body"].as_str().unwrap_or_default().to_string(),
-            reviews: count_i64(item["reviews"].as_array().map_or(0, |reviews| reviews.len())),
+            number: view.number,
+            title: view.title,
+            state: view.state,
+            kind: view.kind,
+            body: view.body,
+            author_name: view.author_name,
             branches,
-            diff,
+            channel_id: view.channel_id,
+            source_branch: view.source_branch,
+            source_oid: view.source_oid,
+            target_oid: view.target_oid,
+            merge_oid: view.merge_oid,
+            diff: view.diff,
+            diff_truncated: view.diff_truncated,
+            files_changed: view.files_changed,
+            additions: view.additions,
+            deletions: view.deletions,
+            reviews: view.reviews,
+            approvals: view.approvals,
+            change_requests: view.change_requests,
         })
     }
     .await
@@ -2114,17 +2122,485 @@ pub async fn load_forge_item(
     })
 }
 
-/// The name of an externally-tagged wire enum value (or the string itself).
-fn tagged_name(value: &serde_json::Value) -> String {
-    value
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .as_object()
-                .and_then(|tagged| tagged.keys().next().cloned())
+/// One forge item's discussion — the hidden `forge:<repo>:<n>` chat channel
+/// rendered through the exact same rows the chat pane uses.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeDiscussionData {
+    pub generation: i64,
+    pub channel_id: String,
+    pub messages: Vec<ChatMessage>,
+    /// the channel's members — the composer's mention vocabulary.
+    pub members: Vec<ChatMember>,
+}
+
+/// Hydrate one item's discussion channel: the message window off the channel
+/// record's head plus the mention vocabulary.
+pub async fn load_forge_discussion(
+    rpc: String,
+    channel_id: String,
+    generation: i64,
+) -> Result<ForgeDiscussionData, HydrationError> {
+    async {
+        let channel = load_channel_row(&rpc, &channel_id).await?;
+        let rpc = rpc_client(&rpc)?;
+        let head = u64::try_from(channel.head_seq).unwrap_or(0);
+        let messages = load_messages(&rpc, &channel_id, head).await?;
+        let members = load_channel_members(&rpc, &channel_id).await?;
+        Ok(ForgeDiscussionData {
+            generation,
+            channel_id,
+            messages,
+            members,
         })
-        .unwrap_or_default()
+    }
+    .await
+    .map_err(|message: String| HydrationError {
+        generation,
+        message,
+    })
+}
+
+/// Submit a batched review on a PR, pinned to the source head the reviewer
+/// saw. Approvals stay advisory — the wire never gates the merge.
+pub async fn submit_forge_review(
+    rpc: String,
+    password: String,
+    repo: String,
+    number: i64,
+    verdict: String,
+    body: String,
+    commit_oid: String,
+) -> Result<bool, AppError> {
+    async {
+        let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
+        let verdict = match verdict.as_str() {
+            "approve" => forge::ReviewVerdict::Approve,
+            "request_changes" => forge::ReviewVerdict::RequestChanges,
+            "comment" => forge::ReviewVerdict::Comment,
+            other => return Err(format!("unknown review verdict {other:?}")),
+        };
+        let body = bounded_exact_text(body, "review body", forge::MAX_BODY_BYTES)?;
+        if commit_oid.is_empty() {
+            return Err("the pull request diff has not loaded yet".to_string());
+        }
+        let rpc = rpc_client(&rpc)?;
+        signed_write(
+            &rpc,
+            "forge",
+            forge::encode_msg(&forge::ForgeMsg::SubmitReview {
+                repo,
+                number,
+                verdict,
+                body,
+                commit_oid,
+                comments: Vec::new(),
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// The merge box's outcome: either the CAS'd merge landed, or the merge
+/// conflicted locally and NOTHING was submitted.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeMergeOutcome {
+    pub repo: String,
+    pub number: i64,
+    pub merged: bool,
+    pub merge_oid: String,
+    pub conflicts: Vec<String>,
+}
+
+/// Merge an open PR the way the wire demands it: the merge commit is
+/// CLIENT-COMPUTED. Build it against a local bare mirror of the node's
+/// `/forge/{repo}` smart-HTTP remote, land the minimal pack in the node-local
+/// blob store, then submit the double-CAS'd `MergePr`.
+pub async fn merge_forge_pr(
+    rpc: String,
+    password: String,
+    repo: String,
+    number: i64,
+    source_branch: String,
+    expected_source_oid: String,
+    prev_target_oid: String,
+) -> Result<ForgeMergeOutcome, AppError> {
+    let outcome = async {
+        let item = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
+        if expected_source_oid.is_empty() || prev_target_oid.is_empty() {
+            return Err("the pull request diff has not loaded yet".to_string());
+        }
+        let message = format!("Merge pull request #{item} from {source_branch}");
+        let build = {
+            let endpoint = rpc.clone();
+            let repo = repo.clone();
+            let ours = prev_target_oid.clone();
+            let theirs = expected_source_oid.clone();
+            tokio::task::spawn_blocking(move || {
+                build_forge_merge(&endpoint, &repo, &ours, &theirs, &message)
+            })
+            .await
+            .map_err(|error| format!("merge build task failed: {error}"))??
+        };
+        let (merge_oid, pack) = match build {
+            MergeBuild::Conflicts(paths) => {
+                return Ok(ForgeMergeOutcome {
+                    repo,
+                    number,
+                    merged: false,
+                    merge_oid: String::new(),
+                    conflicts: paths,
+                });
+            }
+            MergeBuild::Clean { merge_oid, pack } => (merge_oid, pack),
+        };
+        let client = rpc_client(&rpc)?;
+        let pack_digest = client.put_blob(pack).await?.to_lowercase();
+        signed_write(
+            &client,
+            "forge",
+            forge::encode_msg(&forge::ForgeMsg::MergePr {
+                repo: repo.clone(),
+                number: item,
+                prev_target_oid,
+                expected_source_oid,
+                merge_oid: merge_oid.clone(),
+                pack_digest,
+            }),
+            password,
+        )
+        .await?;
+        Ok(ForgeMergeOutcome {
+            repo,
+            number,
+            merged: true,
+            merge_oid,
+            conflicts: Vec::new(),
+        })
+    }
+    .await;
+    outcome.map_err(app_error)
+}
+
+/// The local half of the client-computed merge.
+enum MergeBuild {
+    Clean { merge_oid: String, pack: Vec<u8> },
+    Conflicts(Vec<String>),
+}
+
+/// Build the merge commit for `theirs` (source head) into `ours` (target
+/// head) without touching the mirror: a throwaway bare repo whose odb reads
+/// the mirror's objects through a disk alternate, exactly the shape the
+/// decommissioned desktop shipped. Returns the new oid plus the MINIMAL pack —
+/// only objects reachable from the merge but from NEITHER parent.
+fn build_forge_merge(
+    endpoint: &str,
+    repo: &str,
+    ours: &str,
+    theirs: &str,
+    message: &str,
+) -> Result<MergeBuild, String> {
+    let mirror = sync_forge_mirror(endpoint, repo)?;
+    let ours_oid = git2::Oid::from_str(ours).map_err(git_err)?;
+    let theirs_oid = git2::Oid::from_str(theirs).map_err(git_err)?;
+    merge_against_mirror(&mirror, ours_oid, theirs_oid, message)
+}
+
+/// The mirror-independent half: merge two commits readable from `mirror`'s
+/// odb and pack what neither parent already carries.
+fn merge_against_mirror(
+    mirror: &git2::Repository,
+    ours_oid: git2::Oid,
+    theirs_oid: git2::Oid,
+    message: &str,
+) -> Result<MergeBuild, String> {
+    let scratch = ScratchDir::create()?;
+    let temp = git2::Repository::init_bare(scratch.path()).map_err(git_err)?;
+    let objects = mirror.path().join("objects");
+    let objects = objects
+        .to_str()
+        .ok_or_else(|| format!("non-utf8 objects path {}", objects.display()))?;
+    temp.odb()
+        .map_err(git_err)?
+        .add_disk_alternate(objects)
+        .map_err(git_err)?;
+
+    let ours_commit = temp.find_commit(ours_oid).map_err(|_| {
+        "the target head is not in the local mirror; the branch may have moved — reload the item"
+            .to_string()
+    })?;
+    let theirs_commit = temp.find_commit(theirs_oid).map_err(|_| {
+        "the source head is not in the local mirror; the branch may have moved — reload the item"
+            .to_string()
+    })?;
+    let mut index = temp
+        .merge_commits(&ours_commit, &theirs_commit, None)
+        .map_err(git_err)?;
+    if index.has_conflicts() {
+        let mut conflicts = Vec::new();
+        for conflict in index.conflicts().map_err(git_err)? {
+            let conflict = conflict.map_err(git_err)?;
+            let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) else {
+                continue;
+            };
+            conflicts.push(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+        conflicts.sort();
+        conflicts.dedup();
+        return Ok(MergeBuild::Conflicts(conflicts));
+    }
+
+    let tree_oid = index.write_tree_to(&temp).map_err(git_err)?;
+    let tree = temp.find_tree(tree_oid).map_err(git_err)?;
+    let signature = git2::Signature::now("ducktape", "ducktape@localhost").map_err(git_err)?;
+    let merge_oid = temp
+        .commit(
+            None,
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &[&ours_commit, &theirs_commit],
+        )
+        .map_err(git_err)?;
+
+    let mut builder = temp.packbuilder().map_err(git_err)?;
+    let mut walk = temp.revwalk().map_err(git_err)?;
+    walk.push(merge_oid).map_err(git_err)?;
+    walk.hide(ours_oid).map_err(git_err)?;
+    walk.hide(theirs_oid).map_err(git_err)?;
+    builder.insert_walk(&mut walk).map_err(git_err)?;
+    let mut buf = git2::Buf::new();
+    builder.write_buf(&mut buf).map_err(git_err)?;
+
+    Ok(MergeBuild::Clean {
+        merge_oid: merge_oid.to_string(),
+        pack: buf.to_vec(),
+    })
+}
+
+/// Open (creating on first use) and refresh the bare mirror of one repo's
+/// smart-HTTP remote. The mirror is a persistent per-endpoint cache under the
+/// same root the user key lives in, so two networks' repos never shadow each
+/// other.
+fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, String> {
+    let dir = forge_mirror_dir(endpoint, repo)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("create forge mirror dir {}: {error}", dir.display()))?;
+    let mirror = match git2::Repository::open_bare(&dir) {
+        Ok(existing) => existing,
+        Err(_) => git2::Repository::init_bare(&dir).map_err(git_err)?,
+    };
+    {
+        let mut remote = mirror
+            .remote_anonymous(&format!("{}/forge/{repo}", endpoint.trim_end_matches('/')))
+            .map_err(git_err)?;
+        remote
+            .fetch(&["+refs/heads/*:refs/heads/*"], None, None)
+            .map_err(|error| format!("fetch forge remote for {repo:?}: {error}"))?;
+    }
+    Ok(mirror)
+}
+
+/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root is the same
+/// resolution order the user key uses (`DUCKTAPE_HOME`, then `~/.ducktape`).
+fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
+    if repo.is_empty() || repo.contains('/') || repo.contains('\\') || repo.starts_with('.') {
+        return Err(format!("invalid forge repo name {repo:?}"));
+    }
+    let root = match std::env::var_os("DUCKTAPE_HOME") {
+        Some(home) => PathBuf::from(home),
+        None => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".ducktape"))
+            .ok_or_else(|| "cannot locate a home for the forge mirror".to_string())?,
+    };
+    let slug: String = endpoint
+        .chars()
+        .map(|character| match character.is_ascii_alphanumeric() {
+            true => character,
+            false => '-',
+        })
+        .collect();
+    Ok(root.join("forge-remote").join(slug).join(repo))
+}
+
+fn git_err(error: git2::Error) -> String {
+    error.message().to_string()
+}
+
+/// Process-unique throwaway directory under the OS temp dir, removed
+/// (best-effort) on drop — the merge scratch is one bare repo per click.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn create() -> Result<Self, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ducktape-forge-merge-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("create merge scratch dir {}: {error}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// True when one live update invalidates forge state: a folded forge op, a
+/// forge replay the stream could not fold (`resync`), or the stream (re)
+/// subscribing (`ready` — anything may have landed while it was down).
+pub fn forge_live_hit(kind: String, module: String) -> bool {
+    let folded_forge_op = kind == "forge";
+    let unfoldable_forge_replay = kind == "resync" && module == "forge";
+    let stream_caught_up = kind == "ready";
+    folded_forge_op || unfoldable_forge_replay || stream_caught_up
+}
+
+/// One scoped forge catch-up, flag-selected per slice like [`LiveRefresh`]:
+/// the repo list reloads on any forge hit; the open repo's slice and the open
+/// item reload only when the op's scope reaches them.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ForgeLiveData {
+    pub generation: i64,
+    pub repos_loaded: bool,
+    pub repos: Vec<ForgeRepo>,
+    pub repo_loaded: bool,
+    pub branches: Vec<String>,
+    pub items: Vec<ForgeItem>,
+    pub item_loaded: bool,
+    pub item: ForgeItemData,
+}
+
+/// Reload the forge slices one committed op (or an unfoldable replay)
+/// invalidated. A non-hit update no-ops with every flag false (the handler's
+/// keeps leave state untouched); an empty op scope means the scope is
+/// unknown — reload every open slice.
+pub async fn forge_live_refresh(
+    rpc: String,
+    open_repo: String,
+    open_item: i64,
+    kind: String,
+    module: String,
+    refresh: ForgeRefresh,
+    generation: i64,
+) -> Result<ForgeLiveData, HydrationError> {
+    let noop = ForgeLiveData {
+        generation,
+        repos_loaded: false,
+        repos: Vec::new(),
+        repo_loaded: false,
+        branches: Vec::new(),
+        items: Vec::new(),
+        item_loaded: false,
+        item: ForgeItemData {
+            generation,
+            ..ForgeItemData::default()
+        },
+    };
+    if !forge_live_hit(kind, module) {
+        return Ok(noop);
+    }
+    let scope_unknown = refresh.repo.is_empty();
+    let repo_hit = !open_repo.is_empty() && (scope_unknown || refresh.repo == open_repo);
+    let item_hit = repo_hit
+        && open_item > 0
+        && (scope_unknown || refresh.number == open_item || refresh.refs_moved);
+    let repos = load_forge(rpc.clone(), generation).await?;
+    let repo_slice = match repo_hit {
+        false => None,
+        true => Some(load_forge_repo(rpc.clone(), open_repo.clone(), generation).await?),
+    };
+    let item_slice = match item_hit {
+        false => None,
+        true => Some(load_forge_item(rpc, open_repo, open_item, generation).await?),
+    };
+    Ok(ForgeLiveData {
+        repos_loaded: true,
+        repos: repos.repos,
+        repo_loaded: repo_slice.is_some(),
+        branches: repo_slice
+            .as_ref()
+            .map(|slice| slice.branches.clone())
+            .unwrap_or_default(),
+        items: repo_slice.map(|slice| slice.items).unwrap_or_default(),
+        item_loaded: item_slice.is_some(),
+        ..noop
+    })
+}
+
+/// The PR stats line: `3 files · +12 −4`.
+pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
+    format!("{files} files · +{additions} −{deletions}")
+}
+
+/// The merged-state banner: the short merge oid plus the branch line.
+pub fn forge_merge_note(merge_oid: String, branches: String) -> String {
+    let short: String = merge_oid.chars().take(8).collect();
+    match branches.is_empty() {
+        true => format!("Merged as {short}"),
+        false => format!("Merged as {short} · {branches}"),
+    }
+}
+
+/// A review verdict key as its timeline verb.
+pub fn verdict_label(verdict: String) -> String {
+    match verdict.as_str() {
+        "approve" => "approved".into(),
+        "request_changes" => "requested changes".into(),
+        _ => "commented".into(),
+    }
+}
+
+/// A verdict picker label, dotted when it is the current pick.
+pub fn verdict_pick_label(current: String, key: String, label: String) -> String {
+    match current == key {
+        true => format!("● {label}"),
+        false => label,
+    }
+}
+
+pub fn keep_forge_repos(
+    loaded: bool,
+    next: Vec<ForgeRepo>,
+    current: Vec<ForgeRepo>,
+) -> Vec<ForgeRepo> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_branches(loaded: bool, next: Vec<String>, current: Vec<String>) -> Vec<String> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_forge_items(
+    loaded: bool,
+    next: Vec<ForgeItem>,
+    current: Vec<ForgeItem>,
+) -> Vec<ForgeItem> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_forge_reviews(
+    loaded: bool,
+    next: Vec<ForgeReview>,
+    current: Vec<ForgeReview>,
+) -> Vec<ForgeReview> {
+    if loaded { next } else { current }
 }
 
 /// One shell navigation entry.
@@ -2475,6 +2951,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                             "chat".to_string(),
                             "pages".to_string(),
                             "inbox".to_string(),
+                            "forge".to_string(),
                         ],
                         state.cursors.clone(),
                     )
@@ -2588,6 +3065,7 @@ async fn folded_update(
                 chat: delta,
                 pages: PagesDelta::default(),
                 bell: BellDelta::default(),
+                forge: ForgeRefresh::default(),
             })
         }
         "inbox" => {
@@ -2613,6 +3091,7 @@ async fn folded_update(
                     chat: ChatDelta::default(),
                     pages: PagesDelta::default(),
                     bell,
+                    forge: ForgeRefresh::default(),
                 }),
                 Ok(None) => None,
                 Err(_) => None,
@@ -2630,8 +3109,27 @@ async fn folded_update(
                 chat: ChatDelta::default(),
                 pages: delta,
                 bell: BellDelta::default(),
+                forge: ForgeRefresh::default(),
             }),
             Err(_) => Some(live_resync("pages", height)),
+        },
+        "forge" => match forge::client::refresh_from_op(&payload) {
+            Ok(refresh) => Some(LiveUpdate {
+                kind: "forge".into(),
+                status: format!("Live · block {height}"),
+                height,
+                module: "forge".into(),
+                load_chat: false,
+                load_pages: false,
+                // pushes arrive in bursts (one op per ref batch, then the
+                // tracker follow-ups) — coalesce the reloads like pages does.
+                debounce: true,
+                chat: ChatDelta::default(),
+                pages: PagesDelta::default(),
+                bell: BellDelta::default(),
+                forge: refresh,
+            }),
+            Err(_) => Some(live_resync("forge", height)),
         },
         _ => None,
     }
@@ -5207,6 +5705,7 @@ fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
         chat: ChatDelta::default(),
         pages: PagesDelta::default(),
         bell: BellDelta::default(),
+        forge: ForgeRefresh::default(),
     }
 }
 
@@ -6605,5 +7104,75 @@ mod tests {
             None,
         );
         rpc.submit_frame(frame).await.unwrap();
+    }
+
+    /// One commit in `repo` holding exactly `files`, on top of `parent`.
+    fn mirror_commit(
+        repo: &git2::Repository,
+        parent: Option<git2::Oid>,
+        files: &[(&str, &str)],
+    ) -> git2::Oid {
+        let mut tree = repo.treebuilder(None).unwrap();
+        for (path, contents) in files {
+            let blob = repo.blob(contents.as_bytes()).unwrap();
+            tree.insert(path, blob, 0o100644).unwrap();
+        }
+        let tree = repo.find_tree(tree.write().unwrap()).unwrap();
+        let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
+        let parents: Vec<git2::Commit> = parent
+            .map(|oid| vec![repo.find_commit(oid).unwrap()])
+            .unwrap_or_default();
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        repo.commit(None, &signature, &signature, "mule", &tree, &parent_refs)
+            .unwrap()
+    }
+
+    #[test]
+    fn merge_builder_produces_the_cas_commit_and_its_minimal_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = git2::Repository::init_bare(dir.path()).unwrap();
+        let base = mirror_commit(&mirror, None, &[("a.txt", "base\n"), ("b.txt", "keep\n")]);
+        let ours = mirror_commit(&mirror, Some(base), &[("a.txt", "ours\n"), ("b.txt", "keep\n")]);
+        let theirs =
+            mirror_commit(&mirror, Some(base), &[("a.txt", "base\n"), ("b.txt", "theirs\n")]);
+
+        let build = merge_against_mirror(&mirror, ours, theirs, "Merge pull request #1").unwrap();
+        let MergeBuild::Clean { merge_oid, pack } = build else {
+            panic!("disjoint edits must merge cleanly");
+        };
+
+        // land the pack in the mirror and read the merge commit back out —
+        // exactly what a validator does after the blob fan-out.
+        let odb = mirror.odb().unwrap();
+        let mut writepack = odb.packwriter().unwrap();
+        std::io::Write::write_all(&mut writepack, &pack).unwrap();
+        writepack.commit().unwrap();
+        let merged = mirror
+            .find_commit(git2::Oid::from_str(&merge_oid).unwrap())
+            .unwrap();
+        let parents: Vec<git2::Oid> = merged.parent_ids().collect();
+        assert_eq!(parents, vec![ours, theirs], "target first, source second");
+        let tree = merged.tree().unwrap();
+        let read = |path: &str| {
+            let entry = tree.get_path(Path::new(path)).unwrap();
+            String::from_utf8(mirror.find_blob(entry.id()).unwrap().content().to_vec()).unwrap()
+        };
+        assert_eq!(read("a.txt"), "ours\n");
+        assert_eq!(read("b.txt"), "theirs\n");
+    }
+
+    #[test]
+    fn merge_builder_reports_conflicts_and_builds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = git2::Repository::init_bare(dir.path()).unwrap();
+        let base = mirror_commit(&mirror, None, &[("a.txt", "base\n")]);
+        let ours = mirror_commit(&mirror, Some(base), &[("a.txt", "ours\n")]);
+        let theirs = mirror_commit(&mirror, Some(base), &[("a.txt", "theirs\n")]);
+
+        let build = merge_against_mirror(&mirror, ours, theirs, "Merge pull request #2").unwrap();
+        let MergeBuild::Conflicts(paths) = build else {
+            panic!("competing edits must conflict");
+        };
+        assert_eq!(paths, vec!["a.txt".to_string()]);
     }
 }
