@@ -89,9 +89,10 @@ const TASKS_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/tasks/component.wasm");
 const TASKS_MODULE_ID: &str = "tasks";
 
-/// tagging — an adapter-ported tenant whose ops resolve SIBLING READS
-/// (valset standing, identity bindings, content-module roots) through the
-/// runtime's memoized replay. the lifecycle module deliberately stays NATIVE:
+/// tagging — a STORE-BACKED tenant like pages/chat: the subscription plane
+/// rides a host-constructed qmdb store (pure point records — nothing
+/// enumerates scopes) and the wasm root is the store's merkle root. the
+/// lifecycle module deliberately stays NATIVE:
 /// its Advance decides over frozen end-of-block committed state, a surface the
 /// wit world's staged-over-committed reads cannot represent (kernel
 /// coordinators — valset, lifecycle — gate the machinery itself).
@@ -343,10 +344,10 @@ fn genesis_tasks_wasm() -> WasmModule {
         .expect("embedded tasks component loads")
 }
 
-/// tagging / capability at their GENESIS code (adapter-ported; see
-/// [`genesis_inbox_wasm`]).
-fn genesis_tagging_wasm() -> WasmModule {
-    WasmModule::from_bytes(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT)
+/// tagging at its GENESIS code over the host-constructed store (same three
+/// store lifecycles as [`pages_wasm`]).
+fn tagging_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(TAGGING_MODULE_ID, TAGGING_WASM_COMPONENT, store)
         .expect("embedded tagging component loads")
 }
 
@@ -609,6 +610,9 @@ pub(super) async fn genesis_host(
         .await;
         gateway_wasm(Box::new(store))
     };
+    let tagging = tagging_wasm(Box::new(
+        QmdbStore::init(context.child("tagging"), "tagging").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
     // lane before submit) can materialize locally; the pack never touches root.
@@ -661,7 +665,8 @@ pub(super) async fn genesis_host(
         dispatch: genesis_dispatch_wasm(),
         // the engagement plane: content modules report tags, subscriber
         // modules receive engagement events — router only, module-agnostic.
-        tagging: genesis_tagging_wasm(),
+        // store-backed over the host-constructed qmdb store.
+        tagging,
         tasks: genesis_tasks_wasm(),
         // the deterministic user->nodes binding registry: certificates are
         // chain-scoped (this network's chain id, riding its store-seeded
@@ -747,6 +752,9 @@ pub(super) async fn restore_host(
     let gateway = gateway_wasm(Box::new(
         QmdbStore::init(context.child("gateway"), "gateway").await,
     ));
+    let tagging = tagging_wasm(Box::new(
+        QmdbStore::init(context.child("tagging"), "tagging").await,
+    ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
     let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
@@ -797,12 +805,6 @@ pub(super) async fn restore_host(
     dispatch
         .install(bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
-
-    let mut tagging = genesis_tagging_wasm();
-    let (bytes, root) = snapshot_of(TAGGING_MODULE_ID)?;
-    tagging
-        .install(bytes, root)
-        .map_err(|e| format!("tagging install: {e}"))?;
 
     let mut tasks = genesis_tasks_wasm();
     let (bytes, root) = snapshot_of(TASKS_MODULE_ID)?;
@@ -1062,6 +1064,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         )
         .await?,
     ));
+
+    let (target, resolver) = fetch_target("tagging").await?;
+    let tagging = tagging_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("tagging")),
+            "tagging",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module).
     let snapshot_of = |module: &'static str| {
@@ -1099,12 +1112,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     dispatch
         .install(&bytes, root)
         .map_err(|e| format!("dispatch install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(TAGGING_MODULE_ID).await?;
-    let mut tagging = genesis_tagging_wasm();
-    tagging
-        .install(&bytes, root)
-        .map_err(|e| format!("tagging install: {e}"))?;
 
     // the lifecycle module-code registry joins like any in-memory module: adopt
     // the served snapshot, root-checked. the

@@ -5407,6 +5407,7 @@ dependencies = [
  "runs",
  "saga",
  "sdk",
+ "sdk-testkit",
  "serde",
  "serde_json",
  "sha2",
@@ -8003,13 +8004,15 @@ name = "tagging"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
+ "commonware-runtime",
  "futures",
  "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
- "sha2",
+ "statesync",
 ]
 
 [[package]]

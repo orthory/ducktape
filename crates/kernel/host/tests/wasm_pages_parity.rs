@@ -109,7 +109,10 @@ async fn native_host(context: &deterministic::Context) -> Host {
         // isolation: this proof is about the pages cutover, and an identical
         // native tagging on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(QueryProbe::new()),
     ])
     .expect("genesis")
@@ -123,7 +126,10 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
             // production builder chain (`Pages::new(..).with_tagging`) in.
             WasmModule::with_store("pages", PAGES_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(QueryProbe::new()),
     ])
     .expect("genesis")

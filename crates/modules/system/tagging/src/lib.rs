@@ -40,22 +40,28 @@
 //! SUBSCRIBER's own admin block, where a validation error aborting the whole
 //! registration is exactly the atomicity the caller wants.
 //!
-//! `root()` folds in every scope and subscriber, so any transition moves the
-//! root-hash. a joiner rebuilds this module from a peer via
-//! [`TaggingModule::snapshot`] / [`TaggingModule::install`]: the snapshot
-//! ships the committed map in the exact canonical encoding `root()` hashes,
-//! and install re-derives the root from the decoded temporaries before
-//! adopting them.
+//! ## State model
+//!
+//! pure logic over a host-injected [`sdk::MerkleStore`]: one point record per
+//! subscription scope (`scope\0{source}{SEP}{container}` → the sorted
+//! subscriber set, borsh). nothing enumerates scopes — every read the router
+//! makes is a point read — so there is no roster at all, and a record is
+//! bounded by construction ([`MAX_SUBSCRIBERS_PER_SCOPE`] ids under
+//! [`MAX_ID_BYTES`]-capped scope components). writes are staged during a
+//! block and flushed in one batch at `commit_block`; the module root IS the
+//! store's merkle root, and sync belongs to the store
+//! (`QmdbStore::sync_from`).
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
 pub use interface::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use sdk::codec;
-use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot};
-use sha2::{Digest as _, Sha256};
+use sdk::{
+    Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget,
+    StagedStore, StateRoot, StateSyncHandle,
+};
 
 /// the field separator inside composite scope keys (the shared
 /// [`sdk::KEY_SEP`]). rejected inside caller-chosen ids by [`sdk::validate_id`]
@@ -67,79 +73,13 @@ fn scope_key(source: &str, container: &str) -> String {
     format!("{source}{SEP}{container}")
 }
 
-// ---- state ---------------------------------------------------------------------
-
-/// everything `root()` commits to: subscription scopes → subscriber sets.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Committed {
-    subscriptions: BTreeMap<String, BTreeSet<ModuleId>>,
-}
-
-// ---- canonical encoding ----------------------------------------------------------
-
-/// canonical byte encoding of the committed state: u64-le counts, sorted-key
-/// order, u64-le length prefixes (via [`sdk::codec`]). this is the exact
-/// preimage `root()` hashes AND the snapshot format.
-fn encode_committed(c: &Committed) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(c.subscriptions.len() as u64).to_le_bytes());
-    for (key, subscribers) in &c.subscriptions {
-        codec::push_bytes(&mut out, key.as_bytes());
-        out.extend_from_slice(&(subscribers.len() as u64).to_le_bytes());
-        for subscriber in subscribers {
-            codec::push_bytes(&mut out, subscriber.as_bytes());
-        }
-    }
+/// the per-scope record key: prefix + 0 + the composite scope key.
+fn scope_record_key(key: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + 1 + key.len());
+    out.extend_from_slice(b"scope");
+    out.push(0);
+    out.extend_from_slice(key.as_bytes());
     out
-}
-
-fn committed_root(c: &Committed) -> StateRoot {
-    StateRoot(Sha256::digest(encode_committed(c)).into())
-}
-
-// ---- strict decode (untrusted snapshot bytes) -------------------------------------
-// over the shared `sdk::codec::Cursor`: every accessor bounds-checks before it
-// reads, and `bound` rejects a forged count the remaining bytes cannot hold.
-
-fn decode_committed(bytes: &[u8]) -> Result<Committed, Error> {
-    let mut cur = codec::Cursor::new(bytes);
-    let mut c = Committed::default();
-    let scopes = cur.u64("scope count")?;
-    // every scope costs at least its two fixed-width counts (8 + 8); a count
-    // the input cannot possibly hold is rejected before the loop builds
-    // anything.
-    cur.bound(scopes, 8 + 8, "scope")?;
-    for _ in 0..scopes {
-        let key = cur.string("scope key")?;
-        if let Some((last, _)) = c.subscriptions.iter().next_back()
-            && last.as_str() >= key.as_str()
-        {
-            return Err(Error::Module("snapshot keys not strictly ascending".into()));
-        }
-        let count = cur.u64("subscriber count")?;
-        cur.bound(count, 8, "subscriber")?;
-        let mut subscribers = BTreeSet::new();
-        for _ in 0..count {
-            let subscriber = cur.string("subscriber")?;
-            match subscribers.iter().next_back() {
-                Some(last) if *last >= subscriber => {
-                    return Err(Error::Module(
-                        "snapshot subscribers not strictly ascending".into(),
-                    ));
-                }
-                _ => {}
-            }
-            subscribers.insert(subscriber);
-        }
-        if subscribers.is_empty() {
-            // committed state never holds an empty scope (unsubscribe of the
-            // last subscriber removes the key), so a snapshot must not either.
-            return Err(Error::Module("snapshot has an empty subscription scope".into()));
-        }
-        c.subscriptions.insert(key, subscribers);
-    }
-    cur.finish("snapshot")?;
-    Ok(c)
 }
 
 // ---- the module -----------------------------------------------------------------
@@ -152,21 +92,19 @@ pub struct TaggingModule {
     /// registered module could make that module reject the foreign event and
     /// abort the content block.
     direct_owners: BTreeSet<ModuleId>,
-    /// committed state — what `root()` and the root-hash commit to.
-    committed: Committed,
-    /// this block's staged writes, read ahead of committed state
-    /// (read-your-writes) but merged in only at `commit_block`. a staged
-    /// empty set is a scope removal.
-    staged: BTreeMap<String, BTreeSet<ModuleId>>,
+    /// the host-injected authenticated store plus this block's staging overlay
+    /// (read-your-writes, folded into `root()` at `commit_block`). store key
+    /// is `sha256(logical_key)`, owned by [`StagedStore`].
+    staged: StagedStore,
 }
 
 impl TaggingModule {
-    pub fn new(id: impl Into<ModuleId>) -> Self {
+    /// wrap the host-constructed store under module identity `id`.
+    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
         Self {
             id: id.into(),
             direct_owners: BTreeSet::new(),
-            committed: Committed::default(),
-            staged: BTreeMap::new(),
+            staged: StagedStore::new(store),
         }
     }
 
@@ -178,13 +116,30 @@ impl TaggingModule {
         self
     }
 
-    // ---- staged-overlay reads ----------------------------------------------------
+    // ---- staged-over-committed reads ----------------------------------------------
 
-    fn subscribers(&self, key: &str) -> Option<&BTreeSet<ModuleId>> {
-        match self.staged.get(key) {
-            Some(set) if set.is_empty() => None,
-            Some(set) => Some(set),
-            None => self.committed.subscriptions.get(key),
+    /// one scope's subscriber set through the staged overlay — a point read;
+    /// absence (including a staged delete) is `None`.
+    async fn subscribers(&self, key: &str) -> Result<Option<BTreeSet<ModuleId>>, Error> {
+        match self.staged.get(&scope_record_key(key)).await? {
+            Some(bytes) => Ok(Some(
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// stage one scope's subscriber set — bounded by construction
+    /// ([`MAX_SUBSCRIBERS_PER_SCOPE`] capped ids); an empty set deletes the
+    /// record.
+    fn stage_subscribers(&mut self, key: &str, set: &BTreeSet<ModuleId>) {
+        if set.is_empty() {
+            self.staged.delete(scope_record_key(key));
+        } else {
+            self.staged.stage(
+                scope_record_key(key),
+                borsh::to_vec(set).expect("tagging value is serializable"),
+            );
         }
     }
 
@@ -212,7 +167,7 @@ impl TaggingModule {
 
     // ---- the subscription arm (validating — rides the subscriber's block) -----------
 
-    fn on_subscribe(
+    async fn on_subscribe(
         &mut self,
         ctx: &mut dyn Ctx,
         source: String,
@@ -229,7 +184,7 @@ impl TaggingModule {
             )));
         }
         let key = scope_key(&source, &container);
-        let mut set = self.subscribers(&key).cloned().unwrap_or_default();
+        let mut set = self.subscribers(&key).await?.unwrap_or_default();
         if set.contains(&subscriber) {
             // idempotent: re-subscribing stages nothing.
             return Ok(());
@@ -240,11 +195,11 @@ impl TaggingModule {
             )));
         }
         set.insert(subscriber);
-        self.staged.insert(key, set);
+        self.stage_subscribers(&key, &set);
         Ok(())
     }
 
-    fn on_unsubscribe(
+    async fn on_unsubscribe(
         &mut self,
         ctx: &mut dyn Ctx,
         source: String,
@@ -252,23 +207,23 @@ impl TaggingModule {
     ) -> Result<(), Error> {
         let subscriber = Self::acting_module(&ctx.env().origin)?;
         let key = scope_key(&source, &container);
-        let Some(set) = self.subscribers(&key) else {
+        let Some(mut set) = self.subscribers(&key).await? else {
             // idempotent: unsubscribing an absent subscription stages nothing.
             return Ok(());
         };
         if !set.contains(&subscriber) {
             return Ok(());
         }
-        let mut set = set.clone();
         set.remove(&subscriber);
-        // a staged empty set removes the scope at commit.
-        self.staged.insert(key, set);
+        // an emptied set deletes the record — committed state never holds an
+        // empty scope.
+        self.stage_subscribers(&key, &set);
         Ok(())
     }
 
     // ---- the tag intake (NO-FAIL — rides the content's block) -----------------------
 
-    fn on_tag(&mut self, ctx: &mut dyn Ctx, event: TagEvent) -> Result<(), Error> {
+    async fn on_tag(&mut self, ctx: &mut dyn Ctx, event: TagEvent) -> Result<(), Error> {
         let source = Self::acting_module(&ctx.env().origin)?;
         let TagEvent {
             container,
@@ -307,7 +262,7 @@ impl TaggingModule {
         // comment thread). Deduping keeps a watched chat mention single-shot.
         let mut recipients = self
             .subscribers(&scope_key(&source, &container))
-            .cloned()
+            .await?
             .unwrap_or_default();
         for tag in &tags {
             // Registry membership is genesis-fixed, so malformed/unknown
@@ -337,23 +292,6 @@ impl TaggingModule {
         Ok(())
     }
 
-    // ---- state-sync -----------------------------------------------------------------
-
-    /// serialize the COMMITTED state (never the staged overlay) into the
-    /// canonical encoding `root()` commits to.
-    pub fn snapshot(&self) -> Vec<u8> {
-        encode_committed(&self.committed)
-    }
-
-    /// adopt a peer's snapshot — only after the decoded temporaries re-derive
-    /// `expected` via the exact `root()` algorithm. all-or-nothing.
-    pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let committed = decode_committed(bytes)?;
-        sdk::verify_snapshot_root(committed_root(&committed), expected)?;
-        self.committed = committed;
-        self.staged.clear();
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -362,12 +300,25 @@ impl Module for TaggingModule {
         self.id.clone()
     }
 
+    /// the store's merkle root over all committed records, verbatim — the
+    /// staged overlay is invisible here until `commit_block`.
     fn root(&self) -> StateRoot {
-        committed_root(&self.committed)
+        self.staged.root()
     }
 
-    fn snapshot_bytes(&self) -> Option<Vec<u8>> {
-        Some(self.snapshot())
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        self.staged.state_sync_handle()
+    }
+
+    /// the network state-sync serve lane: answers the shared qmdb wire requests
+    /// (historical proof-carrying op ranges) from committed state. read-only;
+    /// the joiner's sync engine merkle-verifies every batch.
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.staged.serve_sync(req).await
+    }
+
+    async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+        self.staged.sync_target().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -384,28 +335,23 @@ impl Module for TaggingModule {
         };
         match decoded {
             TaggingMsg::Subscribe { source, container } => {
-                self.on_subscribe(ctx, source, container)
+                self.on_subscribe(ctx, source, container).await
             }
             TaggingMsg::Unsubscribe { source, container } => {
-                self.on_unsubscribe(ctx, source, container)
+                self.on_unsubscribe(ctx, source, container).await
             }
-            TaggingMsg::Tag(event) => self.on_tag(ctx, event),
+            TaggingMsg::Tag(event) => self.on_tag(ctx, event).await,
         }
     }
 
+    /// publish the block's staged writes in ONE store batch. no-op (and no
+    /// root movement) if nothing was staged.
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (key, set) in std::mem::take(&mut self.staged) {
-            if set.is_empty() {
-                self.committed.subscriptions.remove(&key);
-            } else {
-                self.committed.subscriptions.insert(key, set);
-            }
-        }
-        Ok(())
+        self.staged.commit().await
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.staged.clear();
+        self.staged.abort();
         Ok(())
     }
 }
@@ -438,7 +384,8 @@ mod tests {
     }
 
     fn module() -> TaggingModule {
-        TaggingModule::new("tagging").with_direct_owner("runs")
+        TaggingModule::new("tagging", Box::new(sdk_testkit::MemStore::new()))
+            .with_direct_owner("runs")
     }
     fn exec(m: &mut TaggingModule, ctx: &mut TestCtx, payload: &TaggingMsg) -> Result<(), Error> {
         let msg = Msg {
@@ -667,7 +614,8 @@ mod tests {
         let mut ctx = from_module("agent");
         exec(&mut m, &mut ctx, &subscribe("chat", "general")).unwrap();
         commit(&mut m);
-        let empty_root = TaggingModule::new("tagging").root();
+        let empty_root =
+            TaggingModule::new("tagging", Box::new(sdk_testkit::MemStore::new())).root();
         assert_ne!(m.root(), empty_root);
 
         let mut ctx = from_module("agent");
@@ -725,27 +673,6 @@ mod tests {
         assert!(ctx.msgs().is_empty());
     }
 
-    #[test]
-    fn snapshot_install_roundtrip_and_rejects() {
-        let mut m = module();
-        let mut ctx = from_module("agent");
-        exec(&mut m, &mut ctx, &subscribe("chat", "general")).unwrap();
-        exec(&mut m, &mut ctx, &subscribe("pages", "space-1")).unwrap();
-        commit(&mut m);
-
-        let mut fresh = module();
-        fresh.install(&m.snapshot(), m.root()).unwrap();
-        assert_eq!(fresh.root(), m.root());
-
-        // a wrong expected root refuses to install.
-        let mut fresh = module();
-        assert!(fresh.install(&m.snapshot(), StateRoot::ZERO).is_err());
-        // trailing bytes refuse to decode.
-        let mut bytes = m.snapshot();
-        bytes.push(0);
-        let mut fresh = module();
-        assert!(fresh.install(&bytes, m.root()).is_err());
-    }
 }
 
 // the wasm-guest port: the dispatch shell that adapts this module to the

@@ -108,7 +108,10 @@ async fn native_host(context: &deterministic::Context) -> Host {
         // isolation: this proof is about the chat cutover, and an identical
         // native tagging on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(HookSink::new()),
     ])
     .expect("genesis")
@@ -122,7 +125,10 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
             // production builder chain (`Chat::new(..).with_tagging`) in.
             WasmModule::with_store("chat", CHAT_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new("tagging")),
+        Box::new(TaggingModule::new(
+            "tagging",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(HookSink::new()),
     ])
     .expect("genesis")
