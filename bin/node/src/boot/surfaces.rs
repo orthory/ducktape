@@ -15,8 +15,8 @@ pub(crate) struct Surfaces {
     pub(crate) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     pub(crate) code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
     pub(crate) blobs: noded::blobs::BlobHandle,
-    pub(crate) agent_provisioner: dispatch_host::SharedProvisioner,
-    pub(crate) cred_resolver: dispatch_host::SharedCredentialResolver,
+    pub(crate) agent_provisioner: compute_service::SharedProvisioner,
+    pub(crate) cred_resolver: compute_service::SharedCredentialResolver,
     pub(crate) gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     pub(crate) gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     /// the host-side session manager (a clone of the one on the http handle), so
@@ -256,7 +256,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // LIVE for every agent run: this binary wires the files module
     // unconditionally, so the runs composer emits v1. a misconfigured
     // root (inside <storage>) is a boot error, never a silent D7 hole.
-    let agent_provisioner: dispatch_host::SharedProvisioner = std::sync::Arc::new(
+    let agent_provisioner: compute_service::SharedProvisioner = std::sync::Arc::new(
         noded::agent_provision::NodedProvisioner::new(
             http_handle.clone(),
             noded::agent_provision::agent_runs_root(storage)
@@ -288,7 +288,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // lane the provisioner uses (before the serve/drop match consumes the
     // handle). A `sched --cred` run's named credential resolves through this into
     // a self-host airlock source, gated on the run's committed saga origin.
-    let cred_resolver: dispatch_host::SharedCredentialResolver =
+    let cred_resolver: compute_service::SharedCredentialResolver =
         std::sync::Arc::new(crate::cred_resolve::NodeCredentialResolver::new(&http_handle));
     // the node-local, off-chain interactive terminal-session plane (lives on the
     // http handle like the stream hub — never consensus). Wired wherever the app

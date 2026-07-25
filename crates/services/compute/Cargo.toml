@@ -1,5 +1,5 @@
 [package]
-name = "dispatch-host"
+name = "compute-service"
 edition.workspace = true
 version.workspace = true
 

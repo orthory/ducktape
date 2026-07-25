@@ -51,10 +51,10 @@ shows what is built and tested.
 - `crates/system/lifecycle`, `capability`, `dispatch`, and `tagging`: the
   module code registry, executor capabilities, capability-routed dispatch, and
   engagement routing.
-- `crates/system/blobstore`, `gateway`, `dispatch/host`: node-local
-  content-addressed blob store, `.duck` gateway route state, and the
-  dispatcher's host-side worker half (`dispatch-host`, living inside the
-  `dispatch` module directory).
+- `crates/system/blobstore`, `gateway`: node-local content-addressed blob
+  store and `.duck` gateway route state.
+- `crates/services/compute`: the dispatcher's host-side worker half
+  (`compute-service`), off-chain and outside the module tree.
 - `crates/duckfs/client`: OS-side checkout/status/commit engine for duckfs; it
   stays off the consensus path.
 - wire surfaces: each module publishes its types-only payload and query shapes at its crate root (`src/interface.rs`).

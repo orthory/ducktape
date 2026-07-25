@@ -69,7 +69,7 @@ pub const MAX_REGISTERED_AGENTS: usize = 1024;
 /// line in the assembled context document, and an `Always` one costs its whole
 /// body. [`MAX_AGENT_RECORD_BYTES`] bounds the BYTES and usually bites first;
 /// this bounds the SHAPE, and it is the same number the host-side assembler
-/// checks (`dispatch_host::assemble_context_doc`) — one rule, not two that
+/// checks (`compute_service::assemble_context_doc`) — one rule, not two that
 /// could drift into a record consensus accepts but no run can load.
 ///
 /// deliberately generous, because curation is not the only door: an uncurated
