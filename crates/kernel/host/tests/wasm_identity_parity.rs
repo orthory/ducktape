@@ -1,29 +1,33 @@
-//! the adapter-port equivalence proof for the identity cutover: the
-//! `identity` guest component (the NATIVE `identity` crate compiled to wasm
-//! behind `guest-adapter`) and the native `Identity` module answer the SAME op
-//! sequence with IDENTICAL query replies, and their roots move in lockstep
-//! (move on commit, hold on no-ops and abort). the roots THEMSELVES differ —
-//! the port persists the native canonical snapshot as one host-KV value, an
-//! intentional greenfield root break pinned by this proof.
+//! the STORE-BACKED cutover-continuity proof for identity: the `identity`
+//! guest component over `WasmModule::with_store(QmdbStore)` and the native
+//! `Identity` over the same store shape are ROOT-CONTINUOUS — the same op
+//! sequence commits the IDENTICAL qmdb merkle root after every block (both
+//! roots ARE the store's root; qmdb's batch canonicalizes mutations by hashed
+//! key, so the native logical-key commit order and the wasm hashed-key drain
+//! order produce the same op log).
 //!
-//! identity is the first ported module whose native constructor takes a
-//! PER-NETWORK parameter: the chain id every certificate preimage folds in. a
-//! wasm component is fixed bytes, so the id travels as GENESIS CONFIG — a
-//! host-installed `__config` store entry (`sdk::genesis_config`) adopted at
-//! construction. this proof pins the two consequences: the config is IN the
-//! root (two networks' genesis roots differ — honestly, they are different
-//! consensus states), and the config GOVERNS the guest (a certificate minted
-//! for one chain id verifies only on the host configured with it).
+//! identity's per-network parameter is the CHAIN ID every certificate
+//! preimage folds in, which travels as GENESIS CONFIG — a `__config` RECORD
+//! seeded into the qmdb store under `sdk::store_key` (the production
+//! `seed_store_config` seam), read back by the guest's
+//! `store_genesis_chain_id` per dispatch. BOTH runtimes' stores carry the
+//! identical record here (root-continuity demands it; the native twin reads
+//! its chain id from the constructor and simply carries the record in its
+//! root). the config-in-the-root and config-governs-the-guest pins ride at
+//! the end of this file.
 //!
 //! the wasm host carries a REAL genesis-seeded `valset::Valset` sibling, so
 //! the member gate on `BindNode` resolves through the runtime's memoized
 //! replay under real dispatch. the WebAuthn (passkey) and multi-scheme member
 //! verifies run IN the guest — deterministic pure-Rust p256 on wasm32 — and
-//! must answer byte-identically to the native module.
+//! must answer byte-identically to the native module. the client-ACL facet
+//! (governance-origin grants/revokes, the sorted `Clients` read) rides the
+//! same store and is pinned by the same matrix.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
+use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{
     IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
@@ -31,8 +35,9 @@ use identity::{
     add_member_preimage, bind_preimage, encode_msg, encode_query, remove_member_preimage,
     unbind_preimage,
 };
-use sdk::{Error, Module as _, Msg, Origin, StateRoot};
+use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
 use sha2::{Digest as _, Sha256};
+use statesync::qmdb::QmdbStore;
 use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
@@ -41,30 +46,49 @@ use wasm_host::WasmModule;
 const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/identity.component.wasm");
 
 /// the chain id BOTH runtimes are constructed with — natively as a constructor
-/// argument, on the wasm side as the host-installed genesis config.
+/// argument, on the wasm side through the store-seeded genesis config.
 const CHAIN_ID: &str = "test-chain";
 
-/// the wasm identity at a given chain id: component + the host-computed
-/// initial store carrying the `__config` genesis parameters — exactly the
-/// production construction (`bin/node/src/host_state.rs`).
-fn wasm_identity_with_chain(chain_id: &str) -> WasmModule {
-    let mut module = WasmModule::from_bytes("identity", IDENTITY_WASM).expect("load component");
+/// a fresh qmdb store carrying the seeded `__config` chain-id record —
+/// exactly the production genesis seam (`bin/node/src/host_state.rs`
+/// `seed_store_config`). BOTH runtimes' stores get the identical record:
+/// root-continuity demands it, and the guest reads its chain id from it.
+/// `label` doubles as the store id: the deterministic runtime keys storage
+/// partitions by id alone (child labels do not namespace them), so a shared
+/// id would make the second store REPLAY the first's journal. the id is not
+/// part of the qmdb root, so distinct ids cost nothing.
+async fn identity_store(
+    context: &deterministic::Context,
+    label: &'static str,
+    chain_id: &str,
+) -> QmdbStore<deterministic::Context> {
+    let mut store = QmdbStore::init(context.child(label), label).await;
     let config = sdk::genesis_config::encode_config(&[("chain_id", chain_id.as_bytes())]);
-    let (bytes, root) = wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, &config)]);
-    module
-        .install(&bytes, root)
-        .expect("install genesis config");
-    module
+    store
+        .commit_batch(vec![(
+            sdk::store_key(sdk::genesis_config::CONFIG_KEY),
+            Some(config),
+        )])
+        .await
+        .expect("seed genesis config");
+    store
 }
 
-fn wasm_identity() -> WasmModule {
-    wasm_identity_with_chain(CHAIN_ID)
+/// the wasm identity over the host-constructed (config-seeded) store —
+/// exactly the production construction (`bin/node/src/host_state.rs`).
+fn wasm_identity(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store("identity", IDENTITY_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim: identity is valset-gated under this
-/// network's chain id.
-fn native_identity() -> Identity {
-    Identity::new("identity", Some("valset".into()), CHAIN_ID.to_string())
+/// network's chain id (the native builder chain is what the guest compiles in).
+fn native_identity(store: Box<dyn sdk::MerkleStore>) -> Identity {
+    Identity::new(
+        "identity",
+        store,
+        Some("valset".into()),
+        CHAIN_ID.to_string(),
+    )
 }
 
 fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
@@ -75,17 +99,19 @@ fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
     valset
 }
 
-fn native_host(validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = identity_store(context, "native_id", CHAIN_ID).await;
     Host::genesis(vec![
-        Box::new(native_identity()),
+        Box::new(native_identity(Box::new(store))),
         Box::new(seeded_valset(validators)),
     ])
     .expect("genesis")
 }
 
-fn wasm_host_(validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+    let store = identity_store(context, "wasm_id", CHAIN_ID).await;
     Host::genesis(vec![
-        Box::new(wasm_identity()),
+        Box::new(wasm_identity(Box::new(store))),
         Box::new(seeded_valset(validators)),
     ])
     .expect("genesis")
@@ -195,9 +221,10 @@ fn root_of(h: &Host) -> StateRoot {
     h.module_root("identity").expect("identity registered")
 }
 
-/// the read matrix: every query family — the paginated listing (full, a
-/// window, an empty window), per-account gets (present + absent), and both
-/// index resolvers over every key the test knows about.
+/// the read matrix: every query family — the roster-served paginated listing
+/// (full, a window, an empty window), per-account gets (present + absent),
+/// both ownership-index resolvers over every key the test knows about, and
+/// the client-ACL set.
 async fn replies(
     h: &Host,
     accounts: &[Vec<u8>],
@@ -220,6 +247,7 @@ async fn replies(
         encode_query(&IdentityQuery::OfMember {
             member_key: b"absent".to_vec(),
         }),
+        encode_query(&IdentityQuery::Clients),
     ];
     for a in accounts {
         queries.push(encode_query(&IdentityQuery::Get {
@@ -288,7 +316,8 @@ impl World {
 }
 
 /// submit one accepted op to BOTH hosts and assert the parity invariants:
-/// identical replies, lockstep root movement, and the pinned schema break.
+/// identical replies, lockstep root movement, and THE continuity property —
+/// both roots are the same store root after every block.
 async fn roundtrip(
     native: &mut Host,
     wasm: &mut Host,
@@ -319,30 +348,41 @@ async fn roundtrip(
         assert_eq!(root_of(native), n_before, "native root moved at {height}");
         assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
     }
-    assert_ne!(root_of(native), root_of(wasm));
+    // THE continuity property: both roots ARE the same store root.
+    assert_eq!(
+        root_of(native),
+        root_of(wasm),
+        "the two runtimes diverged at {height}"
+    );
 }
 
 #[test]
-fn same_ops_same_replies_roots_in_lockstep_schema_break_pinned() {
-    futures::executor::block_on(same_ops_inner());
+fn same_ops_same_replies_roots_in_lockstep_and_continuous() {
+    deterministic::Runner::default().start(|context| async move {
+        same_ops_inner(&context).await;
+    });
 }
 
-async fn same_ops_inner() {
+async fn same_ops_inner(context: &deterministic::Context) {
     let w = World::new();
     let (a_id, rp) = (ed_pub(&w.founder_a), "ducktape");
     let validators = vec![w.node_a.clone()];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
-    // the schema break is visible from GENESIS, and asymmetrically: the native
-    // empty registry is the ZERO sentinel, while the wasm root commits to the
-    // host-KV store already carrying the genesis config.
-    assert_eq!(root_of(&native), StateRoot::ZERO, "native genesis sentinel");
+    // ROOT-CONTINUITY from GENESIS: both roots are the store's merkle root,
+    // and the store already carries the seeded `__config` record — a real
+    // (non-sentinel) root, identical across the runtimes.
     assert_ne!(
         root_of(&native),
+        StateRoot::ZERO,
+        "the config record is in the root from block zero"
+    );
+    assert_eq!(
+        root_of(&native),
         root_of(&wasm),
-        "genesis roots must differ — the port is a DECLARED schema break"
+        "genesis roots must be continuous across the runtimes"
     );
     assert_eq!(
         replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
@@ -529,6 +569,48 @@ async fn same_ops_inner() {
     )
     .await;
 
+    // h12/h13: the client-ACL facet — a governance-shaped SYSTEM origin
+    // grants submit-door standing, and a duplicate grant stages nothing (the
+    // root holds). the sorted Clients read rides the reply matrix.
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &w,
+        12,
+        Origin::System,
+        msg(&IdentityMsg::GrantClient {
+            key: ed_pub(&w.joiner),
+        }),
+        true,
+    )
+    .await;
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &w,
+        13,
+        Origin::System,
+        msg(&IdentityMsg::GrantClient {
+            key: ed_pub(&w.joiner),
+        }),
+        false,
+    )
+    .await;
+    // h14: revoking the LAST client deletes the record — back to the
+    // never-granted store shape on both runtimes.
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &w,
+        14,
+        Origin::System,
+        msg(&IdentityMsg::RevokeClient {
+            key: ed_pub(&w.joiner),
+        }),
+        true,
+    )
+    .await;
+
     // decoded spot check on the wasm side: the surviving membership is the
     // founder + the passkey, the name trimmed, node C evicted.
     let reply = wasm
@@ -584,17 +666,19 @@ async fn same_ops_inner() {
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    futures::executor::block_on(rejections_inner());
+    deterministic::Runner::default().start(|context| async move {
+        rejections_inner(&context).await;
+    });
 }
 
-async fn rejections_inner() {
+async fn rejections_inner(context: &deterministic::Context) {
     let w = World::new();
     let a_id = ed_pub(&w.founder_a);
     let outsider = ed_pub(&ed(99));
     let validators = vec![w.node_a.clone()];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
     // seed both worlds identically: node B gains resident standing, A is
     // founded and bound to node A.
@@ -613,8 +697,9 @@ async fn rejections_inner() {
     // the rejection matrix: every distinct refusal family — the valset gate
     // (decided by sibling reads inside the wasm runtime), certificate
     // verification (stale nonce), the registered-kind pin, single-ownership,
-    // membership invariants, origin shapes, and the decode seam. each rejected
-    // block must leave BOTH roots byte-identical (abort: no trace).
+    // membership invariants, the client-ACL origin/shape gates, origin
+    // shapes, and the decode seam. each rejected block must leave BOTH roots
+    // byte-identical (abort: no trace).
     let stale_bind = bind(&w.founder_a, &w.node_b.clone(), 0); // A's nonce is 1 now
     let mut forged_kind = ed_auth(
         &w.founder_a,
@@ -718,6 +803,20 @@ async fn rejections_inner() {
             }),
             "exceeds the 64-byte limit",
         ),
+        // the client ACL: an external key cannot self-grant, and a malformed
+        // key is refused even from the authorized origin.
+        (
+            Origin::External(w.node_a.clone()),
+            msg(&IdentityMsg::GrantClient {
+                key: ed_pub(&w.joiner),
+            }),
+            "only via governance",
+        ),
+        (
+            Origin::System,
+            msg(&IdentityMsg::GrantClient { key: vec![0; 16] }),
+            "expected 32 bytes",
+        ),
         // origin shapes: system and empty-external submitters.
         (
             Origin::System,
@@ -767,6 +866,7 @@ async fn rejections_inner() {
 
         assert_eq!(root_of(&native), n_before, "native root moved on reject");
         assert_eq!(root_of(&wasm), w_before, "wasm root moved on reject");
+        assert_eq!(root_of(&native), root_of(&wasm));
         assert_eq!(
             replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
             replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await
@@ -776,22 +876,24 @@ async fn rejections_inner() {
 
 #[test]
 fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    futures::executor::block_on(multi_dispatch_inner());
+    deterministic::Runner::default().start(|context| async move {
+        multi_dispatch_inner(&context).await;
+    });
 }
 
-async fn multi_dispatch_inner() {
+async fn multi_dispatch_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let validators = vec![w.node_a.clone(), w.node_b.clone()];
 
-    let mut native = native_host(&validators);
-    let mut wasm = wasm_host_(&validators);
+    let mut native = native_host(context, &validators).await;
+    let mut wasm = wasm_host_(context, &validators).await;
 
     // ONE block, two ops: the bind founds account B, and the SetAccountName
     // from the SAME node reads that bind STAGED IN THIS BLOCK — on the wasm
-    // side dispatch 2 reloads dispatch 1's staged `__state` (the
-    // read-your-writes seam the adapter relies on), while dispatch 1's member
-    // gate resolves through memoized replay.
+    // side dispatch 2 reads dispatch 1's staged store writes through the
+    // host's outer staged overlay (the read-your-writes seam), while dispatch
+    // 1's member gate resolves through memoized replay.
     let batch = vec![
         (
             Origin::External(w.node_b.clone()),
@@ -821,6 +923,7 @@ async fn multi_dispatch_inner() {
             out.members
         );
     }
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
         replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
         replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await
@@ -855,6 +958,7 @@ async fn multi_dispatch_inner() {
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
+    assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
         replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
         replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await
@@ -863,22 +967,24 @@ async fn multi_dispatch_inner() {
 
 #[test]
 fn genesis_config_is_consensus_state_and_governs_the_guest() {
-    futures::executor::block_on(genesis_config_inner());
+    deterministic::Runner::default().start(|context| async move {
+        genesis_config_inner(&context).await;
+    });
 }
 
-async fn genesis_config_inner() {
-    // the config is IN the root: two networks' identity tenants differ at
-    // GENESIS (the config is part of the root preimage), and the same network
-    // constructs the identical root — per-network genesis roots, honestly.
-    let here = wasm_identity_with_chain(CHAIN_ID);
-    let same = wasm_identity_with_chain(CHAIN_ID);
-    let other = wasm_identity_with_chain("other-chain");
+async fn genesis_config_inner(context: &deterministic::Context) {
+    // the config record is IN the store root: per-network genesis roots,
+    // honestly.
+    let here = identity_store(context, "cfg_here", CHAIN_ID).await;
+    let same = identity_store(context, "cfg_same", CHAIN_ID).await;
+    let other = identity_store(context, "cfg_other", "other-chain").await;
     assert_eq!(here.root(), same.root(), "same config, same genesis root");
     assert_ne!(
         here.root(),
         other.root(),
         "a different chain id IS a different genesis consensus state"
     );
+    drop((here, same));
 
     // and the config GOVERNS the guest: the same bind certificate (minted for
     // CHAIN_ID) is accepted by the tenant configured with CHAIN_ID and
@@ -886,9 +992,9 @@ async fn genesis_config_inner() {
     // proof the parameter actually reaches the ported logic, not just the root.
     let w = World::new();
     let validators = vec![w.node_a.clone()];
-    let mut wasm = wasm_host_(&validators);
+    let mut wasm = wasm_host_(context, &validators).await;
     let mut other_host = Host::genesis(vec![
-        Box::new(wasm_identity_with_chain("other-chain")),
+        Box::new(wasm_identity(Box::new(other))),
         Box::new(seeded_valset(&validators)),
     ])
     .expect("genesis");

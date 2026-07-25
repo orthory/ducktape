@@ -429,7 +429,26 @@ pub fn genesis_chain_id(module_label: &str) -> Result<String, host::Error> {
     let raw = load_config().ok_or_else(|| {
         host::Error::Rejected(format!("{module_label} genesis config missing (__config)"))
     })?;
-    let params = sdk::genesis_config::decode_config(&raw)
+    decode_chain_id(&raw, module_label)
+}
+
+/// the [`genesis_chain_id`] twin for STORE-BACKED tenants: the identical
+/// decode over [`load_store_config`] — the `__config` record the host seeded
+/// into the module's qmdb store at genesis construction
+/// (`bin/node/src/host_state.rs` `seed_store_config`). same wiring-corruption
+/// contract: missing or malformed config rejects deterministically, never a
+/// guessed default.
+pub fn store_genesis_chain_id(module_label: &str) -> Result<String, host::Error> {
+    let raw = load_store_config().ok_or_else(|| {
+        host::Error::Rejected(format!("{module_label} genesis config missing (__config)"))
+    })?;
+    decode_chain_id(&raw, module_label)
+}
+
+/// decode the `chain_id` parameter out of raw genesis-config bytes — the
+/// shared tail of the two loaders above.
+fn decode_chain_id(raw: &[u8], module_label: &str) -> Result<String, host::Error> {
+    let params = sdk::genesis_config::decode_config(raw)
         .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
     let chain_id = sdk::genesis_config::find(&params, "chain_id").ok_or_else(|| {
         host::Error::Rejected(format!("{module_label} genesis config carries no chain_id"))

@@ -102,17 +102,22 @@ const CAPABILITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/capability/component.wasm");
 const CAPABILITY_MODULE_ID: &str = "capability";
 
-/// identity / gateway — adapter-ported tenants whose native constructors take
-/// PER-NETWORK parameters (the identity chain id). a wasm component is fixed
-/// bytes, so those parameters travel as GENESIS CONFIG: the builders below
-/// install an initial store carrying the reserved `__config` key
-/// (`sdk::genesis_config`) at construction, and the guest decodes it per
-/// dispatch. the config is consensus state — identical on every node, in the
-/// module root (hence the root-hash) from genesis, and carried by checkpoint
-/// snapshots like any other store key.
+/// identity — a STORE-BACKED tenant like pages/chat/agent/automations, with
+/// the governance seam: its per-network chain id travels as GENESIS CONFIG
+/// seeded INTO the qmdb store ([`seed_store_config`]) instead of an installed
+/// host-KV snapshot, so the config is an ordinary store record in the merkle
+/// root from genesis and rides state-sync like every other record.
 const IDENTITY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/identity/component.wasm");
 const IDENTITY_MODULE_ID: &str = "identity";
+/// gateway — an adapter-ported tenant whose native constructor takes a
+/// PER-NETWORK parameter (the chain id). a wasm component is fixed bytes, so
+/// the parameter travels as GENESIS CONFIG: the builder below installs an
+/// initial store carrying the reserved `__config` key (`sdk::genesis_config`)
+/// at construction, and the guest decodes it per dispatch. the config is
+/// consensus state — identical on every node, in the module root (hence the
+/// root-hash) from genesis, and carried by checkpoint snapshots like any
+/// other store key.
 const GATEWAY_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/gateway/component.wasm");
 const GATEWAY_MODULE_ID: &str = "gateway";
@@ -446,15 +451,14 @@ fn genesis_config_wasm(
     module
 }
 
-/// identity at its GENESIS code + config. The per-network chain id rides
-/// `__config`, and the submit-door client ACL is part of the account snapshot.
-fn genesis_identity_wasm(bindings: NetworkBindings<'_>) -> WasmModule {
-    genesis_config_wasm(
-        IDENTITY_MODULE_ID,
-        IDENTITY_WASM_COMPONENT,
-        &[("chain_id", bindings.identity_chain_id.as_bytes())],
-        "identity",
-    )
+/// identity at its GENESIS code over the host-constructed store (same three
+/// store lifecycles as [`pages_wasm`]). the per-network chain id every signed
+/// certificate preimage folds in is a `__config` STORE RECORD, seeded at
+/// genesis by [`seed_store_config`]; the submit-door client ACL and both
+/// ownership indexes are ordinary store records in the same root.
+fn identity_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(IDENTITY_MODULE_ID, IDENTITY_WASM_COMPONENT, store)
+        .expect("embedded identity component loads")
 }
 
 /// gateway at its GENESIS code + config. It owns the `.duck` handle and route
@@ -599,13 +603,23 @@ pub(super) async fn genesis_host(
     let automations = automations_wasm(Box::new(
         QmdbStore::init(context.child("automations"), "automations").await,
     ));
-    // governance is store-backed too; its per-network invite binding is
-    // seeded into the store as the `__config` record before the wrapper
-    // composes (part of the merkle root from block zero).
+    // governance and identity are store-backed too; each per-network
+    // parameter is seeded into its store as the `__config` record before the
+    // wrapper composes (part of the merkle root from block zero).
     let governance = {
         let mut store = QmdbStore::init(context.child("governance"), "governance").await;
         seed_store_config(&mut store, &[("invite", bindings.invite)], "governance").await;
         governance_wasm(Box::new(store))
+    };
+    let identity = {
+        let mut store = QmdbStore::init(context.child("identity"), "identity").await;
+        seed_store_config(
+            &mut store,
+            &[("chain_id", bindings.identity_chain_id.as_bytes())],
+            "identity",
+        )
+        .await;
+        identity_wasm(Box::new(store))
     };
     seed_genesis_components(&blobs);
     // forge shares the blob plane so a Push's packfile (staged on the blob
@@ -662,10 +676,11 @@ pub(super) async fn genesis_host(
         tagging: genesis_tagging_wasm(),
         tasks: genesis_tasks_wasm(),
         // the deterministic user->nodes binding registry: certificates are
-        // chain-scoped (this network's chain id, riding its GENESIS CONFIG),
-        // member-gated binds via valset, and account display names have this
-        // single canonical owner.
-        identity: genesis_identity_wasm(bindings),
+        // chain-scoped (this network's chain id, riding its store-seeded
+        // GENESIS CONFIG), member-gated binds via valset, and account display
+        // names have this single canonical owner. store-backed over the
+        // host-constructed qmdb store.
+        identity,
         // the MERGED gateway: the whole `.duck` name → AccountId → route
         // pipeline in ONE module — the route plane PLUS the optional human-name
         // handle plane absorbed from the retired `duckdns` module. Files owns
@@ -731,10 +746,13 @@ pub(super) async fn restore_host(
     let automations = automations_wasm(Box::new(
         QmdbStore::init(context.child("automations"), "automations").await,
     ));
-    // governance reopens like the other store-backed tenants; the `__config`
-    // invite-binding record is committed store state, so no re-seeding.
+    // governance and identity reopen like the other store-backed tenants;
+    // each `__config` record is committed store state, so no re-seeding.
     let governance = governance_wasm(Box::new(
         QmdbStore::init(context.child("governance"), "governance").await,
+    ));
+    let identity = identity_wasm(Box::new(
+        QmdbStore::init(context.child("identity"), "identity").await,
     ));
     seed_genesis_components(&blobs);
     // forge shares the blob plane (see genesis_host) for Push materialization.
@@ -804,12 +822,6 @@ pub(super) async fn restore_host(
     tasks
         .install(bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
-
-    let mut identity = genesis_identity_wasm(bindings);
-    let (bytes, root) = snapshot_of(IDENTITY_MODULE_ID)?;
-    identity
-        .install(bytes, root)
-        .map_err(|e| format!("identity install: {e}"))?;
 
     let mut gateway = genesis_gateway_wasm(bindings);
     let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID)?;
@@ -1024,7 +1036,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         .await?,
     ));
 
-    // governance joins the same way; the `__config` invite-binding record is
+    // governance and identity join the same way; each `__config` record is
     // ordinary store state, so it arrives with the synced op range and the
     // rebuilt root commits to it exactly like the source's.
     let (target, resolver) = fetch_target("governance").await?;
@@ -1032,6 +1044,17 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         QmdbStore::sync_from(
             scratch_context.child(child_label("governance")),
             "governance",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
+
+    let (target, resolver) = fetch_target("identity").await?;
+    let identity = identity_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("identity")),
+            "identity",
             target,
             resolver,
         )
@@ -1110,12 +1133,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     tasks
         .install(&bytes, root)
         .map_err(|e| format!("tasks install: {e}"))?;
-
-    let (bytes, root) = snapshot_of(IDENTITY_MODULE_ID).await?;
-    let mut identity = genesis_identity_wasm(bindings);
-    identity
-        .install(&bytes, root)
-        .map_err(|e| format!("identity install: {e}"))?;
 
     let (bytes, root) = snapshot_of(GATEWAY_MODULE_ID).await?;
     let mut gateway = genesis_gateway_wasm(bindings);

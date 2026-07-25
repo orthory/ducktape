@@ -4039,6 +4039,7 @@ dependencies = [
  "runs",
  "saga",
  "sdk",
+ "sdk-testkit",
  "serde_json",
  "sha2",
  "statesync",
@@ -4433,8 +4434,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
+ "commonware-runtime",
  "commonware-utils",
  "futures",
  "guest-adapter",
@@ -4444,6 +4447,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "statesync",
  "valset",
 ]
 

@@ -100,7 +100,12 @@ fn gov_host() -> Host {
     valset.insert(key_bytes(&keypair(2)));
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Identity::new("identity", None, "testnet".into())),
+        Box::new(Identity::new(
+            "identity",
+            Box::new(MemStore::new()),
+            None,
+            "testnet".into(),
+        )),
         Box::new(
             Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
                 .with_invite_binding(BINDING),

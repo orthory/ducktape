@@ -27,6 +27,10 @@ dispatch = { workspace = true }
 [dev-dependencies]
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
+# MemStore: the in-memory MerkleStore double behind store-backed NATIVE
+# siblings in harnesses without a commonware context (the gateway/governance
+# parity proofs' identity sibling).
+sdk-testkit = { workspace = true }
 # the live-code-update proof stands a real wasm module on the host and swaps its
 # component across a code-registry activation boundary (lifecycle is a normal dep).
 wasm-host = { workspace = true }
