@@ -115,7 +115,7 @@ const PROVIDER_CONTROL_TOKEN_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 /// never enter a real run; only the test-only bare harness inherits the parent
 /// env and must actively remove them (which is exactly what the tests pin).
 /// covers both the OpenAI (codex) and Anthropic (claude) upstreams.
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 const UPSTREAM_CREDENTIAL_ENV: [&str; 4] =
     ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
 
@@ -153,21 +153,24 @@ pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential
 // are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
 #[cfg(unix)]
 mod interactive;
+// the sandbox muscle lives in `sandbox-host`; both modules are re-bound here
+// under their original names so the run loop's `podman_api::` / `sandbox::`
+// paths — and every downstream import of the re-exports below — are unchanged.
 // the libpod socket client: the sandbox drives podman over its rootless unix
 // socket, never the CLI binary. unix-only (unix-socket transport). the egress
 // ruleset generator the node's __egress-hook calls is re-exported.
 #[cfg(unix)]
-mod podman_api;
+pub(crate) use sandbox_host::podman_api;
 #[cfg(unix)]
-pub use podman_api::{PodmanService, egress_nftables, run_egress_hook};
-mod sandbox;
+pub use sandbox_host::podman_api::{PodmanService, egress_nftables, run_egress_hook};
+pub(crate) use sandbox_host::sandbox;
 mod session;
 mod spec;
 mod variants;
 mod workspace;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
-pub use sandbox::{SandboxBackend, TART_MIN_CORES};
+pub use sandbox_host::{SandboxBackend, TART_MIN_CORES};
 pub use session::{ResumeArgv, SessionCapture, SessionSpec};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 pub use workspace::WorkspaceMode;
@@ -597,7 +600,7 @@ impl CliProvider {
 
     // in a non-test build only the two error arms remain, so the inputs the Bare
     // arm consumes are unused — expected, not a defect.
-    #[cfg_attr(not(test), allow(unused_variables))]
+    #[cfg_attr(not(any(test, feature = "testkit")), allow(unused_variables))]
     fn prepared_command(
         &self,
         args: &[String],
@@ -616,7 +619,7 @@ impl CliProvider {
             SandboxBackend::Tart { .. } => {
                 Err("internal error: Tart command bypassed its VM lifecycle".into())
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
                 let args = self.broker_argv(args, workdir, auth);
                 let mut command = self.bare_command(&args, ctx, auth)?;
@@ -639,7 +642,7 @@ impl CliProvider {
     /// binary has no bare spawn — the sandbox backend (fresh mount namespace,
     /// only the spec's `[sandbox] rw_dirs` under HOME) is the D7 isolation
     /// mechanism on every real node.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     fn bare_command(
         &self,
         args: &[String],
@@ -3492,13 +3495,8 @@ fn resolve_bin(
         .find(|candidate| is_executable(candidate))
 }
 
-pub(crate) fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    p.is_file()
-        && std::fs::metadata(p)
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-}
+// shared with the sandbox runtime probe, so it lives with the sandbox muscle.
+pub(crate) use sandbox_host::is_executable;
 
 #[cfg(test)]
 mod tests {

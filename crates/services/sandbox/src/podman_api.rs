@@ -42,7 +42,7 @@ const API: &str = "/v5.0.0/libpod";
 /// the neutral container root every host path is mounted under. a guest sees
 /// `/ducktape/workspace`, `/ducktape/home/...`, `/ducktape/bin/<name>` — never
 /// the real host path, so the operator's identity and layout stay hidden.
-pub(crate) const GUEST_ROOT: &str = "/ducktape";
+pub const GUEST_ROOT: &str = "/ducktape";
 
 // ---------------------------------------------------------------------------
 // neutral mount plan + path translation (Part A: hide host paths)
@@ -51,20 +51,20 @@ pub(crate) const GUEST_ROOT: &str = "/ducktape";
 /// one host→container bind mount, rendered into a `SpecGenerator` mount and
 /// used by [`translate`] to rewrite host-path substrings in env/argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Mount {
-    pub(crate) host: PathBuf,
-    pub(crate) guest: PathBuf,
-    pub(crate) read_only: bool,
+pub struct Mount {
+    pub host: PathBuf,
+    pub guest: PathBuf,
+    pub read_only: bool,
 }
 
 /// the neutral guest layout for one run: the bind mounts plus the three guest
 /// paths the caller needs to build the spec (workdir, bin, home).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MountPlan {
-    pub(crate) mounts: Vec<Mount>,
-    pub(crate) guest_workdir: PathBuf,
-    pub(crate) guest_bin: PathBuf,
-    pub(crate) guest_home: PathBuf,
+pub struct MountPlan {
+    pub mounts: Vec<Mount>,
+    pub guest_workdir: PathBuf,
+    pub guest_bin: PathBuf,
+    pub guest_home: PathBuf,
 }
 
 /// build the neutral `/ducktape/*` mount plan from a run's HOST paths. every
@@ -75,7 +75,7 @@ pub(crate) struct MountPlan {
 /// - a FILE in `ro_paths` (the workspace-parent context doc) → `/ducktape/<name>`,
 ///   one level above the workspace so `../<name>` still resolves
 /// - every other `ro_path` (PATH dirs, skills tree) → `/ducktape/ro<i>` (ro)
-pub(crate) fn plan_mounts(
+pub fn plan_mounts(
     workdir: &Path,
     bin: &Path,
     ro_paths: &[PathBuf],
@@ -144,7 +144,7 @@ pub(crate) fn plan_mounts(
 /// larger string (the codex `projects."<workdir>"` TOML key). `home` maps to
 /// the guest home so any stray `$HOME`-prefixed value is sanitized even though
 /// HOME itself is never bind-mounted.
-pub(crate) fn translate(value: &str, mounts: &[Mount], home: &Path, guest_home: &Path) -> String {
+pub fn translate(value: &str, mounts: &[Mount], home: &Path, guest_home: &Path) -> String {
     let mut pairs: Vec<(String, String)> = mounts
         .iter()
         .map(|m| {
@@ -331,7 +331,7 @@ fn install_nft_in_netns(pid: i32, ruleset: &str) -> Result<(), String> {
 /// resolve a system tool by PATH, then the standard sbin/bin dirs a non-root
 /// PATH usually omits — `nft` ships in `/usr/sbin`. Shared with the sandbox boot
 /// probe ([`crate::SandboxBackend::probe`]).
-pub(crate) fn find_system_tool(bin: &str) -> Option<PathBuf> {
+pub fn find_system_tool(bin: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let cand = dir.join(bin);
@@ -352,7 +352,7 @@ pub(crate) fn find_system_tool(bin: &str) -> Option<PathBuf> {
 
 /// an OCI bind mount as libpod's create endpoint expects it.
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct OciMount {
+pub struct OciMount {
     pub destination: String,
     #[serde(rename = "type")]
     pub kind: String,
@@ -368,24 +368,24 @@ pub(crate) struct OciMount {
 /// ([`crate::SandboxBackend::probe`] enforces it); it ships with podman 6 and is
 /// the `passt` package on older hosts.
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct Namespace {
+pub struct Namespace {
     pub nsmode: String,
 }
 
 /// OCI CPU limits; `cpus` become a quota over the standard 100 000 µs period.
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct CpuLimit {
+pub struct CpuLimit {
     pub quota: i64,
     pub period: u64,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub(crate) struct MemoryLimit {
+pub struct MemoryLimit {
     pub limit: i64,
 }
 
 #[derive(Debug, Default, Serialize, PartialEq, Eq)]
-pub(crate) struct ResourceLimits {
+pub struct ResourceLimits {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<CpuLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,7 +395,7 @@ pub(crate) struct ResourceLimits {
 /// the container-create body. Only the fields a provider run sets are present;
 /// everything else takes podman's default. Field names are libpod's json tags.
 #[derive(Debug, Serialize)]
-pub(crate) struct SpecGenerator {
+pub struct SpecGenerator {
     pub image: String,
     pub command: Vec<String>,
     pub work_dir: String,
@@ -418,7 +418,7 @@ pub(crate) struct SpecGenerator {
 
 /// the parameters the sandbox hands the spec builder — the neutral guest paths
 /// already resolved, env/argv already translated.
-pub(crate) struct SpecInputs<'a> {
+pub struct SpecInputs<'a> {
     pub image: &'a str,
     pub guest_bin: &'a Path,
     pub guest_workdir: &'a Path,
@@ -436,7 +436,7 @@ impl SpecGenerator {
     /// assemble the create body. `NET_ADMIN`/`NET_RAW` are always dropped so the
     /// workload cannot touch the egress firewall or open raw sockets; the netns
     /// is always the private slirp4netns with host-loopback + IPv6 off.
-    pub(crate) fn build(inputs: SpecInputs<'_>) -> Self {
+    pub fn build(inputs: SpecInputs<'_>) -> Self {
         let mut command = vec![inputs.guest_bin.display().to_string()];
         command.extend(inputs.args.iter().cloned());
 
@@ -495,7 +495,7 @@ impl SpecGenerator {
     /// link-local defaults [`PASTA_HOST`] / [`PASTA_DNS`], which the hook uses
     /// directly, so nothing about them is host-computed. Host-side only — none
     /// of this reaches the guest.
-    pub(crate) fn set_egress(&mut self, ports: &[u16]) {
+    pub fn set_egress(&mut self, ports: &[u16]) {
         let ports = ports
             .iter()
             .map(u16::to_string)
@@ -512,7 +512,7 @@ impl SpecGenerator {
 /// the host's loopback to. The container reaches this run's broker + node RPC
 /// there, so the egress rule that allows those ports targets exactly this.
 /// (Verified live on native-Linux pasta: stable across runs at `169.254.1.2`.)
-pub(crate) const PASTA_HOST: &str = "169.254.1.2";
+pub const PASTA_HOST: &str = "169.254.1.2";
 
 /// pasta's fixed DNS forwarder — the link-local resolver pasta injects as the
 /// container's primary nameserver, forwarding to the host's real DNS. The egress
@@ -520,7 +520,7 @@ pub(crate) const PASTA_HOST: &str = "169.254.1.2";
 /// resolvers that pasta also copies into `resolv.conf` stay blocked. (Verified
 /// live: primary nameserver `169.254.1.1`, name resolution works, tailnet DNS
 /// dropped.)
-pub(crate) const PASTA_DNS: &str = "169.254.1.1";
+pub const PASTA_DNS: &str = "169.254.1.1";
 
 // ---------------------------------------------------------------------------
 // the socket client
@@ -528,7 +528,7 @@ pub(crate) const PASTA_DNS: &str = "169.254.1.1";
 
 /// which multiplexed stream an attach frame carries (headless, non-tty attach).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrameStream {
+pub enum FrameStream {
     Stdout,
     Stderr,
 }
@@ -536,17 +536,17 @@ pub(crate) enum FrameStream {
 /// a libpod client bound to one rootless podman socket. Each call opens a fresh
 /// connection (runs are infrequent; no pool needed).
 #[derive(Debug, Clone)]
-pub(crate) struct Podman {
+pub struct Podman {
     socket: PathBuf,
 }
 
 impl Podman {
-    pub(crate) fn new(socket: PathBuf) -> Self {
+    pub fn new(socket: PathBuf) -> Self {
         Self { socket }
     }
 
     /// create a container from `spec`; returns its id.
-    pub(crate) async fn create(&self, spec: &SpecGenerator) -> Result<String, String> {
+    pub async fn create(&self, spec: &SpecGenerator) -> Result<String, String> {
         let body = serde_json::to_vec(spec).map_err(|e| format!("encode create spec: {e}"))?;
         let resp = self
             .request("POST", &format!("{API}/containers/create"), Some(&body))
@@ -562,7 +562,7 @@ impl Podman {
         Ok(created.id)
     }
 
-    pub(crate) async fn start(&self, id: &str) -> Result<(), String> {
+    pub async fn start(&self, id: &str) -> Result<(), String> {
         self.request("POST", &format!("{API}/containers/{id}/start"), None)
             .await?
             .ok()
@@ -570,7 +570,7 @@ impl Podman {
 
     /// wait for the container to exit; returns its exit code. libpod returns the
     /// code as a bare integer in the response body.
-    pub(crate) async fn wait(&self, id: &str) -> Result<i32, String> {
+    pub async fn wait(&self, id: &str) -> Result<i32, String> {
         let resp = self
             .request(
                 "POST",
@@ -585,7 +585,7 @@ impl Podman {
             .map_err(|e| format!("decode wait exit code {text:?}: {e}"))
     }
 
-    pub(crate) async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
+    pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
         self.request(
             "POST",
             &format!("{API}/containers/{id}/resize?w={cols}&h={rows}"),
@@ -595,7 +595,7 @@ impl Podman {
         .ok()
     }
 
-    pub(crate) async fn kill(&self, id: &str, signal: &str) -> Result<(), String> {
+    pub async fn kill(&self, id: &str, signal: &str) -> Result<(), String> {
         self.request(
             "POST",
             &format!("{API}/containers/{id}/kill?signal={signal}"),
@@ -605,7 +605,7 @@ impl Podman {
         .ok()
     }
 
-    pub(crate) async fn remove(&self, id: &str) -> Result<(), String> {
+    pub async fn remove(&self, id: &str) -> Result<(), String> {
         // force + remove volumes: teardown must not leave the container behind.
         self.request("DELETE", &format!("{API}/containers/{id}?force=true&v=true"), None)
             .await?
@@ -615,7 +615,7 @@ impl Podman {
     /// container ids (running or not) carrying `label` — the boot reaper's query
     /// for this node's orphaned sandbox containers. `label` is a bare key or
     /// `key=value`; libpod wants it JSON-encoded in the `filters` query.
-    pub(crate) async fn list_by_label(&self, label: &str) -> Result<Vec<String>, String> {
+    pub async fn list_by_label(&self, label: &str) -> Result<Vec<String>, String> {
         let filters = format!("{{\"label\":[{:?}]}}", label);
         let query = crate::podman_api::urlencode(&filters);
         let resp = self
@@ -635,7 +635,7 @@ impl Podman {
     /// attach stdin+stdout+stderr to a running container. The HTTP connection is
     /// hijacked: after the response headers, the socket carries raw bytes (tty)
     /// or Docker-multiplexed frames (non-tty). Returns the split stream.
-    pub(crate) async fn attach(&self, id: &str, tty: bool) -> Result<AttachStream, String> {
+    pub async fn attach(&self, id: &str, tty: bool) -> Result<AttachStream, String> {
         let mut stream = UnixStream::connect(&self.socket)
             .await
             .map_err(|e| format!("connect podman socket for attach: {e}"))?;
@@ -709,7 +709,7 @@ impl Podman {
 /// interactive session need to WRITE stdin while READING output concurrently,
 /// so the only thing you do with one is [`AttachStream::into_split`] it into an
 /// independently-owned write half (container stdin) and read half.
-pub(crate) struct AttachStream {
+pub struct AttachStream {
     read: OwnedReadHalf,
     write: OwnedWriteHalf,
     /// bytes already read past the response head — the start of the raw stream.
@@ -721,7 +721,7 @@ impl AttachStream {
     /// split into the container-stdin write half (an `OwnedWriteHalf`, already
     /// `AsyncWrite`) and the output read half. The two halves are moved into
     /// separate tasks (input feed vs output pump).
-    pub(crate) fn into_split(self) -> (OwnedWriteHalf, AttachReader) {
+    pub fn into_split(self) -> (OwnedWriteHalf, AttachReader) {
         (
             self.write,
             AttachReader {
@@ -735,7 +735,7 @@ impl AttachStream {
 
 /// the read half of an attach stream: raw for a tty session, Docker-multiplexed
 /// frames for a headless run.
-pub(crate) struct AttachReader {
+pub struct AttachReader {
     read: OwnedReadHalf,
     leftover: Vec<u8>,
     tty: bool,
@@ -744,7 +744,7 @@ pub(crate) struct AttachReader {
 impl AttachReader {
     /// read the next raw chunk (tty session). Drains any leftover first, then
     /// the socket. `Ok(0)` is EOF (container exited / stream closed).
-    pub(crate) async fn read_raw(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    pub async fn read_raw(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if !self.leftover.is_empty() {
             let n = buf.len().min(self.leftover.len());
             buf[..n].copy_from_slice(&self.leftover[..n]);
@@ -757,7 +757,7 @@ impl AttachReader {
     /// read one demuxed frame (headless, non-tty). `None` at EOF. The Docker
     /// mux header is 8 bytes: `[stream, 0,0,0, len_be_u32]`, `stream` 1=stdout
     /// 2=stderr, followed by `len` payload bytes.
-    pub(crate) async fn read_frame(&mut self) -> std::io::Result<Option<(FrameStream, Vec<u8>)>> {
+    pub async fn read_frame(&mut self) -> std::io::Result<Option<(FrameStream, Vec<u8>)>> {
         debug_assert!(!self.tty, "read_frame is for non-tty attach only");
         let mut header = [0u8; 8];
         if !self.fill(&mut header).await? {
@@ -812,15 +812,15 @@ impl AttachReader {
 /// container stdin, `stdout`/`stderr` are the demuxed halves. A background pump
 /// task reads attach frames and forwards each to the matching duplex; it ends
 /// (closing both, so the readers see EOF) when the attach stream EOFs.
-pub(crate) struct HeadlessIo {
-    pub(crate) stdin: OwnedWriteHalf,
-    pub(crate) stdout: tokio::io::DuplexStream,
-    pub(crate) stderr: tokio::io::DuplexStream,
-    pub(crate) pump: tokio::task::JoinHandle<()>,
+pub struct HeadlessIo {
+    pub stdin: OwnedWriteHalf,
+    pub stdout: tokio::io::DuplexStream,
+    pub stderr: tokio::io::DuplexStream,
+    pub pump: tokio::task::JoinHandle<()>,
 }
 
 /// adapt an attach stream into [`HeadlessIo`] (see its doc).
-pub(crate) fn headless_io(attach: AttachStream) -> HeadlessIo {
+pub fn headless_io(attach: AttachStream) -> HeadlessIo {
     let (stdin, reader) = attach.into_split();
     // 64 KiB matches the invoke loop's read buffer granularity; the pump never
     // blocks long because the loop drains continuously.
@@ -1096,7 +1096,7 @@ impl PodmanService {
     }
 
     /// a client bound to this service's socket.
-    pub(crate) fn client(&self) -> Podman {
+    pub fn client(&self) -> Podman {
         Podman::new(self.socket.clone())
     }
 

@@ -39,11 +39,12 @@ pub enum SandboxBackend {
     Tart {
         image: String,
     },
-    /// test-harness spawn: the bin exec'd directly, compiled ONLY into this
-    /// crate's unit tests so the run loop stays testable without a container
-    /// runtime on the test host. a shipped binary cannot express a bare
-    /// spawn — the variant does not exist outside `cfg(test)`.
-    #[cfg(test)]
+    /// test-harness spawn: the bin exec'd directly, compiled ONLY into test
+    /// builds so the run loop stays testable without a container runtime on the
+    /// test host. a shipped binary cannot express a bare spawn — the variant
+    /// does not exist outside `cfg(test)` / the `testkit` feature, and nothing
+    /// but a dev-dependency turns that feature on.
+    #[cfg(any(test, feature = "testkit"))]
     Bare,
 }
 
@@ -53,19 +54,19 @@ impl SandboxBackend {
         match self {
             SandboxBackend::Podman { .. } => "podman",
             SandboxBackend::Tart { .. } => "tart",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => "sh",
         }
     }
 
     /// whether this run spawns through the test-only bare harness (host paths,
     /// no mount canonicalization). always false in shipped code.
-    pub(crate) fn is_bare_test(&self) -> bool {
-        #[cfg(test)]
+    pub fn is_bare_test(&self) -> bool {
+        #[cfg(any(test, feature = "testkit"))]
         {
             matches!(self, SandboxBackend::Bare)
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "testkit")))]
         {
             false
         }
@@ -140,7 +141,7 @@ struct TartMount {
 /// script. Resource configuration is deliberately not here: Tart accepts it on
 /// `tart set`, which the lifecycle runs between clone and boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TartPlan {
+pub struct TartPlan {
     pub vm: String,
     pub run_argv: Vec<String>,
     pub guest_script: String,
@@ -236,7 +237,7 @@ fn translate_value(
 /// context keeps its parent relationship without exposing the workspace's host
 /// siblings or committing the temporary context file.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn tart_plan(
+pub fn tart_plan(
     vm: &str,
     bin: &Path,
     args: &[String],
@@ -412,7 +413,7 @@ pub(crate) fn tart_plan(
     })
 }
 
-pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str, tty: bool) -> Vec<String> {
+pub fn tart_ssh_argv(ip: &str, guest_script: &str, tty: bool) -> Vec<String> {
     // -T for a headless run (no pty); -tt forces a remote pty for an interactive
     // session, so the guest TUI sees a terminal and SIGWINCH/size relay works.
     let pty_flag = if tty { "-tt" } else { "-T" };
@@ -435,7 +436,7 @@ pub(crate) fn tart_ssh_argv(ip: &str, guest_script: &str, tty: bool) -> Vec<Stri
     ]
 }
 
-pub(crate) fn tart_set_argv(
+pub fn tart_set_argv(
     vm: &str,
     limits: &BTreeMap<String, u64>,
 ) -> Result<Option<Vec<String>>, String> {

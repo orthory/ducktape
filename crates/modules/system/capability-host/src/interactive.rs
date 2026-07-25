@@ -388,7 +388,7 @@ impl CliProvider {
                 command.current_dir(&workdir);
                 InteractiveSession::spawn_on_pty(command, Some(guard), broker, config_home)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
                 unreachable!("interactive sessions never run under the bare test harness")
             }

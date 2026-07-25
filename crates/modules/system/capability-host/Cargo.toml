@@ -22,6 +22,10 @@ capability = { workspace = true }
 # scoped session token, forward the run's traffic to it (the gateway swaps the
 # token for the real credential in-enclave). `client` = the async Gateway.
 airlock = { path = "../airlock", features = ["client", "verify"] }
+# the sandbox muscle: SandboxBackend + its boot probe, the Tart guest plan, and
+# the node-private rootless podman (libpod socket) + egress firewall. carved out
+# of this crate; re-exported from src/lib.rs so callers see no move.
+sandbox-host = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
@@ -41,7 +45,21 @@ tracing = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# the bare test-harness spawn (`SandboxBackend::Bare`) and the run-loop arms
+# that construct it. `cfg(test)` cannot reach across a crate boundary, so the
+# variant now hangs off sandbox-host's feature of the same name and this one
+# forwards to it — the two must be on or off TOGETHER, or the run loop's match
+# on the backend goes non-exhaustive. the self dev-dependency below is what
+# keeps them in lockstep. no shipped build enables either.
+testkit = ["sandbox-host/testkit"]
+
 [dev-dependencies]
+# depending on ourselves with `testkit` on is how a test-only feature is turned
+# on for our OWN unit tests (cargo allows dev-dependency cycles). it also means
+# `sandbox-host/testkit` can only ever be on in a graph where our `testkit` is
+# on too — the lockstep the feature comment above requires.
+capability-host = { path = ".", features = ["testkit"] }
 # the in-process airlock custody test boots the gateway HTTP service itself
 # (server feature) to drive sandbox → broker → gateway → upstream end to end.
 airlock = { path = "../airlock", features = ["client", "server", "verify", "testkit"] }
